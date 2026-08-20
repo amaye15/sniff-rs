@@ -3,8 +3,8 @@
 A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
-Parquet, Arrow IPC/Feather, Avro, Excel, and SQLite, and writes Markdown or
-JSON.
+Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, and MessagePack, and writes
+Markdown, this tool's own rich JSON, or json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -38,6 +38,7 @@ every format. See "Testing" below.
 | Avro | `.avro` | `--features avro` | recurses into records/arrays/unions |
 | Excel | `.xlsx`, `.xls`, `.xlsb`, `.ods` | `--features xlsx` | one section per sheet, like SQLite (see below) |
 | SQLite | `.db`, `.sqlite`, `.sqlite3` | `--features sqlite` | one section per table (see below) |
+| MessagePack | `.msgpack`, `.mp` | `--features msgpack` | stream of concatenated records, or a single top-level array |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous.
@@ -128,7 +129,7 @@ engine (`suggest_ideal_type`) over the raw strings to produce a
 `ColumnProfile`.
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
-nest (JSON, Avro, Parquet's Struct/List/Map columns). This recurses: objects
+nest (JSON, Avro, MessagePack, Parquet's Struct/List/Map columns). This recurses: objects
 flatten into dot-notation sub-columns (`metadata.risk_score`), arrays get
 unwrapped and pooled (nested arrays flatten transparently), and the result
 is *this path's own row followed by every descendant row*, so nesting is
@@ -140,6 +141,12 @@ flattener**, rather than reimplementing recursion per format:
 
 - Avro decodes each record to `serde_json::Value` (`avro_value_to_json`)
   and calls `profile_json_records` — identical code path to a `.json` file.
+- MessagePack does the same (`msgpack_value_to_json`), reading a stream of
+  concatenated top-level values (records are self-delimiting, so they don't
+  need a separator the way JSON Lines needs newlines) - or, if the file
+  holds exactly one top-level value and it's an array, that array's
+  elements instead, mirroring how the JSON reader treats a single top-level
+  `[...]`.
 - Parquet/Arrow IPC's Struct/List/Map columns get bridged through Arrow's
   own JSON writer (`arrow::json::writer::ArrayWriter`) into the same
   `serde_json::Map` shape, then call `profile_json_path` directly (a Map
@@ -214,10 +221,11 @@ for, and it's left to a human.
 Three questions determine the shape of a new reader:
 
 1. **Is it naturally row-oriented and possibly nested** (a record format
-   like Avro, TOML with tables, MessagePack)? Decode each record to
+   like Avro, MessagePack, TOML with tables)? Decode each record to
    `serde_json::Value` (or bridge to one) and call `profile_json_records`.
    This is almost always the least code for a new format — see
-   `columns_from_avro` for the ~20-line pattern.
+   `columns_from_avro` or `columns_from_msgpack` for the pattern (both
+   under ~40 lines including the value-conversion helper).
 2. **Is it flat/columnar with no nesting** (fixed-width text, a new
    spreadsheet-like format)? Build `Vec<ColumnInput>` (name, current_type,
    raw string values, total count) and map through `profile_column`. See
@@ -266,7 +274,8 @@ reporting, Parquet's no-data-loss-on-strings case, Parquet's Map-column
 flattening and dictionary-encoding resolution, Excel's does-lose-data case
 (the same value, opposite outcome, by design), Excel's one-table-per-sheet
 output, SQLite's multi-table output and type-affinity detection, the
-`json-schema` output's type mapping and nullability handling, and that
+`json-schema` output's type mapping and nullability handling, MessagePack's
+concatenated-records reading and its no-data-loss-on-strings case, and that
 Markdown output never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin

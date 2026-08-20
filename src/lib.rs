@@ -9,7 +9,8 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
-/// Arrow IPC/Feather, Avro, Excel, or SQLite file: one row per column, with
+/// Arrow IPC/Feather, Avro, Excel, SQLite, or MessagePack file: one row per
+/// column, with
 /// a current type, a heuristic "ideal" type suggestion, missing %, sample
 /// values, and a blank Description field to fill in by hand. Output is
 /// Markdown tables (default), this tool's own rich JSON (--output-format
@@ -21,13 +22,14 @@ use serde_json::json;
 /// produces exactly one implicit table - all of it renders through the same
 /// path. Format is inferred from the file extension unless --format is
 /// given. Parquet and Arrow IPC/Feather need --features parquet; Avro needs --features avro;
-/// Excel needs --features xlsx; SQLite needs --features sqlite (or use
-/// --features full for everything).
+/// Excel needs --features xlsx; SQLite needs --features sqlite; MessagePack
+/// needs --features msgpack (or use --features full for everything).
 #[derive(Parser)]
 #[command(name = "sniff-rs")]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
-    /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3)
+    /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
+    /// .msgpack/.mp)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -37,7 +39,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, or sqlite
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, or msgpack
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -832,6 +834,121 @@ fn columns_from_avro(
     )
 }
 
+// --- MessagePack reader (opt-in via --features msgpack) ---
+// Decodes each top-level value to serde_json::Value and reuses the exact
+// same column-extraction/flattening path as JSON/Avro files.
+
+#[cfg(feature = "msgpack")]
+fn msgpack_key_to_string(k: &rmpv::Value) -> String {
+    if let rmpv::Value::String(s) = k
+        && let Some(s) = s.as_str()
+    {
+        return s.to_string();
+    }
+    msgpack_value_to_json(k).to_string()
+}
+
+#[cfg(feature = "msgpack")]
+fn msgpack_value_to_json(v: &rmpv::Value) -> JsonValue {
+    use rmpv::Value as MpValue;
+    match v {
+        MpValue::Nil => JsonValue::Null,
+        MpValue::Boolean(b) => JsonValue::Bool(*b),
+        MpValue::Integer(i) => i
+            .as_i64()
+            .map(JsonValue::from)
+            .or_else(|| i.as_u64().map(JsonValue::from))
+            .unwrap_or(JsonValue::Null),
+        MpValue::F32(f) => {
+            serde_json::Number::from_f64(f64::from(*f)).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        MpValue::F64(f) => {
+            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        MpValue::String(s) => JsonValue::String(match s.as_str() {
+            Some(s) => s.to_string(),
+            None => s.as_bytes().iter().map(|b| format!("{b:02x}")).collect(),
+        }),
+        MpValue::Binary(b) => {
+            JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+        MpValue::Array(items) => {
+            JsonValue::Array(items.iter().map(msgpack_value_to_json).collect())
+        }
+        MpValue::Map(pairs) => JsonValue::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| (msgpack_key_to_string(k), msgpack_value_to_json(v)))
+                .collect(),
+        ),
+        MpValue::Ext(kind, data) => JsonValue::String(format!("ext({kind}, {} bytes)", data.len())),
+    }
+}
+
+/// Reads a stream of top-level MessagePack values (each value is
+/// self-delimiting, so records can just be concatenated back-to-back in the
+/// file - the common convention for a MessagePack *data* file, as opposed to
+/// a single MessagePack-encoded document). If the file holds exactly one
+/// top-level value and it's an array, that array's elements are treated as
+/// the records instead, mirroring how the JSON reader treats a single
+/// top-level `[...]` array.
+#[cfg(feature = "msgpack")]
+fn columns_from_msgpack(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use std::fs::File;
+    use std::io::BufRead;
+    use std::io::BufReader;
+
+    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut reader = BufReader::new(file);
+
+    let mut top_values = Vec::new();
+    while !reader
+        .fill_buf()
+        .with_context(|| format!("failed reading {path:?}"))?
+        .is_empty()
+    {
+        let v = rmpv::decode::read_value(&mut reader)
+            .with_context(|| format!("failed decoding a MessagePack value from {path:?}"))?;
+        top_values.push(v);
+    }
+
+    let values: Vec<rmpv::Value> = if top_values.len() == 1 {
+        match top_values.into_iter().next().unwrap() {
+            rmpv::Value::Array(items) => items,
+            other => vec![other],
+        }
+    } else {
+        top_values
+    };
+
+    let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+    for v in values {
+        match msgpack_value_to_json(&v) {
+            JsonValue::Object(m) => records.push(m),
+            _ => bail!("expected each MessagePack record to decode to a map in {path:?}"),
+        }
+    }
+    if let Some(n) = nrows {
+        records.truncate(n);
+    }
+    Ok(profile_json_records(&records, n_samples))
+}
+
+#[cfg(not(feature = "msgpack"))]
+fn columns_from_msgpack(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "MessagePack support isn't compiled in - rebuild with `cargo build --release --features msgpack` (or --features full)"
+    )
+}
+
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -1057,6 +1174,7 @@ enum InputFormat {
     Avro,
     Xlsx,
     Sqlite,
+    MsgPack,
 }
 
 impl InputFormat {
@@ -1070,6 +1188,7 @@ impl InputFormat {
             InputFormat::Avro => "avro",
             InputFormat::Xlsx => "xlsx",
             InputFormat::Sqlite => "sqlite",
+            InputFormat::MsgPack => "msgpack",
         }
     }
 }
@@ -1085,9 +1204,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "avro" => Ok(InputFormat::Avro),
             "xlsx" | "xls" | "xlsb" | "ods" => Ok(InputFormat::Xlsx),
             "sqlite" | "db" => Ok(InputFormat::Sqlite),
+            "msgpack" | "mp" => Ok(InputFormat::MsgPack),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, or sqlite)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, or msgpack)"
                 )
             }
         };
@@ -1106,8 +1226,9 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "avro" => Ok(InputFormat::Avro),
         "xlsx" | "xls" | "xlsb" | "ods" => Ok(InputFormat::Xlsx),
         "db" | "sqlite" | "sqlite3" => Ok(InputFormat::Sqlite),
+        "msgpack" | "mp" => Ok(InputFormat::MsgPack),
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack explicitly"
         ),
     }
 }
@@ -1381,6 +1502,9 @@ pub fn run() -> Result<()> {
                     columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?
                 }
                 InputFormat::Avro => columns_from_avro(&args.input_path, args.nrows, args.samples)?,
+                InputFormat::MsgPack => {
+                    columns_from_msgpack(&args.input_path, args.nrows, args.samples)?
+                }
                 InputFormat::Sqlite | InputFormat::Xlsx => unreachable!("handled above"),
             };
             std::iter::once((file_stem, profiles)).collect()

@@ -271,6 +271,25 @@ fn avro_bridges_to_the_same_json_flattening_path() {
     );
 }
 
+#[cfg(feature = "msgpack")]
+#[test]
+fn msgpack_reads_concatenated_records_and_preserves_string_types() {
+    let doc = run_json("sample.msgpack", &[]);
+    let cols = table(&doc, "sample");
+
+    let user_id = column(cols, "user_id");
+    assert_eq!(user_id["missing_pct"].as_f64().unwrap(), 0.0);
+
+    // MessagePack (unlike CSV) genuinely stores this as a string - the
+    // leading zero was never at risk of being consumed by a numeric parse.
+    let zip = column(cols, "zip_code");
+    assert_eq!(zip["current_type"], "String");
+    assert!(!zip["notes"].as_str().unwrap().contains("already lost"));
+
+    let age = column(cols, "age");
+    assert!((age["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_writer_silently_mangling_a_zip_code_gets_caught() {
