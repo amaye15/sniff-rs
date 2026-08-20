@@ -211,6 +211,29 @@ fn excel_writer_silently_mangling_a_zip_code_gets_caught() {
     assert!(zip["notes"].as_str().unwrap().contains("already lost"));
 }
 
+#[cfg(feature = "xlsx")]
+#[test]
+fn excel_reports_one_table_per_sheet() {
+    let doc = run_json("multi_sheet.xlsx", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(
+        tables.len(),
+        2,
+        "fixture has two sheets (customers, products), expected one table each"
+    );
+
+    let customers = table(&doc, "customers");
+    assert!(customers.iter().any(|c| c["name"] == "customer_id"));
+    let zip = column(customers, "zip_code");
+    assert_eq!(zip["current_type"], "i64");
+    assert!(zip["notes"].as_str().unwrap().contains("already lost"));
+
+    let products = table(&doc, "products");
+    assert!(products.iter().any(|c| c["name"] == "sku"));
+    let in_stock = column(products, "in_stock");
+    assert_eq!(in_stock["ideal_type"], "bool");
+}
+
 #[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_reports_multiple_tables_and_catches_a_type_affinity_violation() {

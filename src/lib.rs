@@ -13,10 +13,11 @@ use serde_json::Value as JsonValue;
 /// values, and a blank Description field to fill in by hand. Output is
 /// Markdown tables (default) or structured JSON (--output-format json), and
 /// either can be written to stdout by passing "-" as the output path.
-/// SQLite files (possibly multiple tables) and every other format (always
-/// exactly one implicit table) render through the same path. Format is
-/// inferred from the file extension unless --format is given. Parquet and
-/// Arrow IPC/Feather need --features parquet; Avro needs --features avro;
+/// SQLite files (one table per database table) and Excel workbooks (one
+/// table per sheet) can produce multiple tables; every other format always
+/// produces exactly one implicit table - all of it renders through the same
+/// path. Format is inferred from the file extension unless --format is
+/// given. Parquet and Arrow IPC/Feather need --features parquet; Avro needs --features avro;
 /// Excel needs --features xlsx; SQLite needs --features sqlite (or use
 /// --features full for everything).
 #[derive(Parser)]
@@ -821,65 +822,86 @@ fn columns_from_avro(
 }
 
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
+// A workbook can hold multiple sheets, so - like SQLite - this returns one
+// profile list per sheet rather than assuming a single implicit table.
+// Empty sheets are skipped rather than erroring, the same way SQLite skips
+// its own internal `sqlite_%` tables.
 
 #[cfg(feature = "xlsx")]
-fn columns_from_xlsx(path: &Path, nrows: Option<usize>) -> Result<Vec<ColumnInput>> {
+fn columns_from_xlsx(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
     use calamine::{DataType as _, Reader, open_workbook_auto};
 
     let mut workbook =
         open_workbook_auto(path).with_context(|| format!("failed to open {path:?}"))?;
-    let sheet_name = workbook
-        .sheet_names()
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no sheets found in {path:?}"))?;
-    let range = workbook
-        .worksheet_range(&sheet_name)
-        .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
-
-    let mut rows = range.rows();
-    let header_row = rows
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("sheet '{sheet_name}' in {path:?} is empty"))?;
-    let headers: Vec<String> = header_row.iter().map(|c| c.to_string()).collect();
-
-    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-    for (i, row) in rows.enumerate() {
-        if nrows.is_some_and(|limit| i >= limit) {
-            break;
-        }
-        for (col_idx, col) in raw.iter_mut().enumerate() {
-            let value = match row.get(col_idx) {
-                Some(cell) if !cell.is_empty() => Some(cell.to_string()),
-                _ => None,
-            };
-            col.push(value);
-        }
+    let sheet_names = workbook.sheet_names().to_vec();
+    if sheet_names.is_empty() {
+        bail!("no sheets found in {path:?}");
     }
 
-    let mut columns = Vec::new();
-    for (i, name) in headers.into_iter().enumerate() {
-        let total = raw[i].len();
-        let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
-        let current_type = if non_null.is_empty() {
-            "String".to_string()
-        } else {
-            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-            naive_current_type(&refs).to_string()
+    let mut out = Vec::new();
+    for sheet_name in sheet_names {
+        let range = workbook
+            .worksheet_range(&sheet_name)
+            .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
+
+        let mut rows = range.rows();
+        let Some(header_row) = rows.next() else {
+            continue; // empty sheet - no header row, contributes no table
         };
-        columns.push(ColumnInput {
-            name,
-            current_type,
-            raw_values: non_null,
-            total,
-            skip_heuristics: false,
-        });
+        let headers: Vec<String> = header_row.iter().map(|c| c.to_string()).collect();
+
+        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
+        for (i, row) in rows.enumerate() {
+            if nrows.is_some_and(|limit| i >= limit) {
+                break;
+            }
+            for (col_idx, col) in raw.iter_mut().enumerate() {
+                let value = match row.get(col_idx) {
+                    Some(cell) if !cell.is_empty() => Some(cell.to_string()),
+                    _ => None,
+                };
+                col.push(value);
+            }
+        }
+
+        let mut profiles = Vec::new();
+        for (i, name) in headers.into_iter().enumerate() {
+            let total = raw[i].len();
+            let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+            let current_type = if non_null.is_empty() {
+                "String".to_string()
+            } else {
+                let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                naive_current_type(&refs).to_string()
+            };
+            let col = ColumnInput {
+                name,
+                current_type,
+                raw_values: non_null,
+                total,
+                skip_heuristics: false,
+            };
+            profiles.push(profile_column(col, n_samples));
+        }
+        out.push((sheet_name, profiles));
     }
-    Ok(columns)
+
+    if out.is_empty() {
+        bail!("no non-empty sheets found in {path:?}");
+    }
+    Ok(out)
 }
 
 #[cfg(not(feature = "xlsx"))]
-fn columns_from_xlsx(_path: &Path, _nrows: Option<usize>) -> Result<Vec<ColumnInput>> {
+fn columns_from_xlsx(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
     bail!(
         "Excel support isn't compiled in - rebuild with `cargo build --release --features xlsx` (or --features full)"
     )
@@ -1205,45 +1227,48 @@ pub fn run() -> Result<()> {
 
     // Every format ends up as the same shape - a table name mapped to its column
     // profiles - so JSON/Markdown rendering never needs to special-case SQLite's
-    // multiple tables vs. everything else's single implicit one.
-    let tables: BTreeMap<String, Vec<ColumnProfile>> = if matches!(format, InputFormat::Sqlite) {
-        columns_from_sqlite(&args.input_path, args.nrows, args.samples)?
+    // (and Excel's) multiple tables vs. everything else's single implicit one.
+    let tables: BTreeMap<String, Vec<ColumnProfile>> =
+        if matches!(format, InputFormat::Sqlite | InputFormat::Xlsx) {
+            match format {
+                InputFormat::Sqlite => {
+                    columns_from_sqlite(&args.input_path, args.nrows, args.samples)?
+                }
+                InputFormat::Xlsx => columns_from_xlsx(&args.input_path, args.nrows, args.samples)?,
+                _ => unreachable!("handled by the outer matches! guard"),
+            }
             .into_iter()
             .collect()
-    } else {
-        let profiles: Vec<ColumnProfile> = match format {
-            InputFormat::Csv => columns_from_csv(
-                &args.input_path,
-                args.nrows,
-                args.delimiter.unwrap_or(',') as u8,
-            )?
-            .into_iter()
-            .map(|c| profile_column(c, args.samples))
-            .collect(),
-            InputFormat::Tsv => columns_from_csv(
-                &args.input_path,
-                args.nrows,
-                args.delimiter.unwrap_or('\t') as u8,
-            )?
-            .into_iter()
-            .map(|c| profile_column(c, args.samples))
-            .collect(),
-            InputFormat::Json => columns_from_json(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Parquet => {
-                columns_from_parquet(&args.input_path, args.nrows, args.samples)?
-            }
-            InputFormat::ArrowIpc => {
-                columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?
-            }
-            InputFormat::Avro => columns_from_avro(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Xlsx => columns_from_xlsx(&args.input_path, args.nrows)?
+        } else {
+            let profiles: Vec<ColumnProfile> = match format {
+                InputFormat::Csv => columns_from_csv(
+                    &args.input_path,
+                    args.nrows,
+                    args.delimiter.unwrap_or(',') as u8,
+                )?
                 .into_iter()
                 .map(|c| profile_column(c, args.samples))
                 .collect(),
-            InputFormat::Sqlite => unreachable!("handled above"),
+                InputFormat::Tsv => columns_from_csv(
+                    &args.input_path,
+                    args.nrows,
+                    args.delimiter.unwrap_or('\t') as u8,
+                )?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+                InputFormat::Json => columns_from_json(&args.input_path, args.nrows, args.samples)?,
+                InputFormat::Parquet => {
+                    columns_from_parquet(&args.input_path, args.nrows, args.samples)?
+                }
+                InputFormat::ArrowIpc => {
+                    columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?
+                }
+                InputFormat::Avro => columns_from_avro(&args.input_path, args.nrows, args.samples)?,
+                InputFormat::Sqlite | InputFormat::Xlsx => unreachable!("handled above"),
+            };
+            std::iter::once((file_stem, profiles)).collect()
         };
-        std::iter::once((file_stem, profiles)).collect()
-    };
 
     let rendered = if output_json {
         render_json(&file_name, &format, &tables)?

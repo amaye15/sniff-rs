@@ -36,7 +36,7 @@ every format. See "Testing" below.
 | Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List |
 | Arrow IPC / Feather | `.arrow`, `.feather` | `--features parquet` | shares Parquet's Arrow infrastructure |
 | Avro | `.avro` | `--features avro` | recurses into records/arrays/unions |
-| Excel | `.xlsx`, `.xls`, `.xlsb`, `.ods` | `--features xlsx` | first sheet only, treated like CSV once read |
+| Excel | `.xlsx`, `.xls`, `.xlsb`, `.ods` | `--features xlsx` | one section per sheet, like SQLite (see below) |
 | SQLite | `.db`, `.sqlite`, `.sqlite3` | `--features sqlite` | one section per table (see below) |
 
 `--features full` enables all of the above. `--format <name>` overrides
@@ -119,10 +119,15 @@ Parquet and Arrow IPC additionally share one function,
 type — adding Arrow IPC support was a new file-opening call wired into
 existing logic, not new logic.
 
-SQLite is architecturally different (one file, many tables), so `main()`
-normalizes *everything* — single-table formats and SQLite alike — into
+SQLite and Excel are architecturally different from the rest (one file, many
+tables — SQLite's tables, Excel's sheets), so `run()` normalizes *everything*
+— single-table formats and these two alike — into
 `BTreeMap<String, Vec<ColumnProfile>>` before rendering, so the
 Markdown/JSON renderers never know or care how many tables a source had.
+`columns_from_xlsx` follows the exact shape `columns_from_sqlite` already
+established (`Vec<(String, Vec<ColumnProfile>)>`, one entry per table),
+skipping empty sheets the same way SQLite skips its own internal
+`sqlite_%` tables — no new rendering logic needed for either.
 
 ## Design philosophy: trust observed data, not declared types
 
@@ -220,9 +225,9 @@ itself) and asserts on parsed JSON output. Coverage includes: the
 leading-zero and date-format heuristics on CSV, nested object + array-of-
 objects flattening with the local missing-% calculation, mixed-type count
 reporting, Parquet's no-data-loss-on-strings case, Excel's does-lose-data
-case (the same value, opposite outcome, by design), SQLite's multi-table
-output and type-affinity detection, and that Markdown output never has a
-trailing blank line.
+case (the same value, opposite outcome, by design), Excel's one-table-per-
+sheet output, SQLite's multi-table output and type-affinity detection, and
+that Markdown output never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
@@ -240,9 +245,6 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
   `json-schema.org`'s `{"type": "object", "properties": {...}}` vocabulary.
   Could be added as a third `--output-format` if a consumer specifically
   needs the standard.
-- **Excel: first sheet only.** No multi-sheet support yet; would follow the
-  same `BTreeMap<String, Vec<ColumnProfile>>` pattern SQLite already
-  established if added.
 - **Parquet nested types stop at Struct/List.** Map and dictionary-encoded
   types aren't specifically handled (they'd likely fall through the
   `is_nested_arrow_type` check as unrecognized and get stringified via the
