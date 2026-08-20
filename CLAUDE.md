@@ -4,9 +4,9 @@ A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
-CBOR, INI, XML, and fixed-width text — any of them gzip- or zstd-compressed
-too — and writes Markdown, this tool's own rich JSON, or json-schema.org-
-standard JSON.
+CBOR, INI, XML, fixed-width text, and NumPy — any of them gzip- or
+zstd-compressed too — and writes Markdown, this tool's own rich JSON, or
+json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -50,6 +50,8 @@ every format. See "Testing" below.
 | Fixed-width text | *(none — `--format fixed-width` only)* | *(default)* | needs `--widths 10,5,20`; no delimiter, so boundaries are never guessed |
 | gzip | any of the above + `.gz`/`.gzip` | *(default)* | transparently decompressed before the inner format's own reader runs |
 | zstd | any of the above + `.zst`/`.zstd` | `--features zstd` | same as gzip |
+| NumPy | `.npy` | `--features npy` | structured (record) dtype = one column per field; plain dtype = positional `col_0..col_N` (2D) or one `value` column (1D) |
+| NumPy archive | `.npz` | `--features npy` | zip of named `.npy` arrays; one table per array, like SQLite (see below) |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -78,6 +80,13 @@ logical name (`data.csv.gz` behaves like `data.csv`); the JSON/Markdown
 gzip is via `flate2` (pure Rust, no C toolchain, so always available); zstd
 needs `--features zstd` since the `zstd` crate compiles a small vendored C
 library.
+
+NumPy's `npyz` crate is worth a dependency note: its `npz` feature (for
+`.npz` archives) depends on the `zip` crate without trimming its default
+features, which pulls in `bzip2` and a second, older copy of `zstd`
+alongside this project's own. That's a handful of small, fast-compiling
+extra crates — nothing like the DuckDB situation below — so it was judged
+worth it for `.npz` support rather than treated as a reason to skip it.
 
 ## Output formats
 
@@ -152,11 +161,27 @@ guessing:
 Two shared building blocks carry almost the entire tool:
 
 **`ColumnInput` → `profile_column`** — for formats that are naturally flat
-(CSV, TSV, Excel) or already fully typed with no nesting concept (Parquet's
-scalar columns). A reader collects each column's non-null raw string values
-plus a `current_type` label, and `profile_column` runs the shared heuristic
-engine (`suggest_ideal_type`) over the raw strings to produce a
-`ColumnProfile`.
+(CSV, TSV, Excel, fixed-width text) or already fully typed with no nesting
+concept (Parquet's scalar columns). A reader collects each column's
+non-null raw string values plus a `current_type` label, and `profile_column`
+runs the shared heuristic engine (`suggest_ideal_type`) over the raw
+strings to produce a `ColumnProfile`. NumPy also lands here, but is the one
+reader that decodes a binary layout by hand instead of leaning on a crate's
+own typed API: `npyz::Deserialize` requires a Rust type known at compile
+time, which doesn't work for an arbitrary user's `.npy` file whose dtype is
+only known at runtime, so `npy_scalar_to_string`/`npy_value_to_string`
+interpret each field's raw bytes directly from its `TypeStr`
+(`TypeChar` + byte width + endianness) - int/uint/float by width, fixed-
+width byte/unicode strings trimmed of right-zero-padding, and anything not
+representable as a simple value (a sub-array field, `f16`/`f128`, the
+pickled `object` dtype) falling back to a hex dump rather than fabricating
+a value or failing the whole file. A structured (record) dtype gives one
+`ColumnInput` per named field - the genuinely tabular case; a plain dtype
+has no field names at all (numpy doesn't carry them), so it's treated like
+a headerless CSV: 1D is a single `value` column, 2D gets positional
+`col_0..col_N` columns (row-major/`C` or column-major/`Fortran` order both
+handled), and anything higher-dimensional is a clear error rather than a
+guessed flattening.
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
 nest (JSON, Avro, MessagePack, TOML, YAML, CBOR, XML, Parquet's Struct/List/Map columns). This recurses: objects
@@ -227,18 +252,20 @@ Parquet and Arrow IPC additionally share one function,
 type — adding Arrow IPC support was a new file-opening call wired into
 existing logic, not new logic.
 
-SQLite, Excel, and INI are architecturally different from the rest (one
-file, many tables — SQLite's tables, Excel's sheets, INI's sections), so
-`run()` normalizes *everything* — single-table formats and these three
-alike — into `BTreeMap<String, Vec<ColumnProfile>>` before rendering, so
-the Markdown/JSON renderers never know or care how many tables a source
-had. `columns_from_xlsx` and `columns_from_ini` both follow the exact shape
-`columns_from_sqlite` already established
-(`Vec<(String, Vec<ColumnProfile>)>`, one entry per table) — Excel skips
-empty sheets and INI skips an absent default section the same way SQLite
-skips its own internal `sqlite_%` tables, and none of the three needed any
-new rendering logic. INI additionally has no repeating-row concept within
-a section (it's a flat set of `key=value` pairs), so each section is
+SQLite, Excel, INI, and `.npz` are architecturally different from the rest
+(one file, many tables — SQLite's tables, Excel's sheets, INI's sections,
+`.npz`'s named arrays), so `run()` normalizes *everything* — single-table
+formats and these four alike — into `BTreeMap<String, Vec<ColumnProfile>>`
+before rendering, so the Markdown/JSON renderers never know or care how
+many tables a source had. `columns_from_xlsx`, `columns_from_ini`, and
+`columns_from_npz` all follow the exact shape `columns_from_sqlite` already
+established (`Vec<(String, Vec<ColumnProfile>)>`, one entry per table) —
+Excel skips empty sheets and INI skips an absent default section the same
+way SQLite skips its own internal `sqlite_%` tables, and none of the four
+needed any new rendering logic (`.npz` and plain `.npy` share the exact
+same per-array reading core, `columns_from_npy_reader` — a `.npz` is just a
+zip of named `.npy` streams). INI additionally has no repeating-row concept
+within a section (it's a flat set of `key=value` pairs), so each section is
 profiled as a single record via `profile_json_records`, the same choice
 TOML/YAML make for their own single-document shapes — and a key repeated
 within one section (which INI permits) pools into an array value rather
@@ -307,12 +334,18 @@ Three questions determine the shape of a new reader:
    count) and map through `profile_column`. See `columns_from_xlsx` or
    `columns_from_fixed_width` — the latter also shows what to do when
    there's no delimiter or schema to read structure from: require it
-   explicitly (`--widths`) rather than guess at column boundaries.
+   explicitly (`--widths`) rather than guess at column boundaries. If the
+   format is binary with a runtime-only-known layout (no crate ships a
+   generic dynamic value type for it), see `columns_from_npy` /
+   `npy_value_to_string` for the pattern: decode by hand from the format's
+   own type descriptor, and fall back to a hex dump for anything not
+   representable as a simple value rather than fabricating one.
 3. **Can one file hold multiple tables** (another embedded-database
-   format, or anything with named sections/sheets)? Return
+   format, or anything with named sections/sheets/arrays)? Return
    `Vec<(String, Vec<ColumnProfile>)>` like `columns_from_sqlite`,
-   `columns_from_xlsx`, or `columns_from_ini` and let `run()`'s `BTreeMap`
-   unification handle the rest — don't special-case rendering.
+   `columns_from_xlsx`, `columns_from_ini`, or `columns_from_npz` and let
+   `run()`'s `BTreeMap` unification handle the rest — don't special-case
+   rendering.
 
 Then, regardless of which shape:
 
@@ -362,8 +395,11 @@ records detection and `@`-prefixed attribute columns, fixed-width text's
 character-based column slicing and its actionable error when `--widths`
 is missing, gzip/zstd transparently decompressing to their inner format
 (plus an actionable error on a corrupt/mislabeled `.gz` and on `.zst`
-without `--features zstd`), and that Markdown output never has a trailing
-blank line.
+without `--features zstd`), NumPy's structured-dtype-to-columns decoding
+(including that `current_type` reflects the real declared dtype, not a
+guess), its row-major positional-column reading of a plain 2D array, and
+`.npz`'s one-table-per-array output, and that Markdown output never has a
+trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

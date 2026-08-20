@@ -431,6 +431,65 @@ fn xml_treats_homogeneous_children_as_records_and_attributes_as_at_columns() {
     assert_eq!(date["ideal_type"], "NaiveDate / DateTime");
 }
 
+#[cfg(feature = "npy")]
+#[test]
+fn npy_structured_array_gives_one_column_per_named_field() {
+    let doc = run_json("sample_structured.npy", &[]);
+    let cols = table(&doc, "sample_structured");
+
+    // current_type reflects the declared numpy dtype (this format actually
+    // knows it, unlike CSV's naive text parse), so there's no spurious
+    // "numeric strings" note the way there would be for an already-typed
+    // field.
+    let age = column(cols, "age");
+    assert_eq!(age["current_type"], "i64");
+    assert_eq!(age["notes"], "");
+
+    // A fixed-width byte-string field ('S5') still triggers the
+    // leading-zero heuristic on its decoded text.
+    let zip = column(cols, "zip_code");
+    assert_eq!(zip["current_type"], "String");
+    assert!(zip["notes"].as_str().unwrap().contains("leading zeros"));
+
+    let active = column(cols, "active");
+    assert_eq!(active["current_type"], "bool");
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn npy_plain_2d_array_gets_positional_columns_in_row_major_order() {
+    let doc = run_json("sample_matrix.npy", &[]);
+    let cols = table(&doc, "sample_matrix");
+
+    assert!(cols.iter().any(|c| c["name"] == "col_0"));
+    let col0 = column(cols, "col_0");
+    assert_eq!(col0["current_type"], "f64");
+    // Row-major: col_0 should be the first element of each row (1.5, 4.5, 7.5).
+    assert_eq!(
+        col0["sample_values"],
+        serde_json::json!(["1.5", "4.5", "7.5"])
+    );
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn npz_reports_one_table_per_named_array() {
+    let doc = run_json("sample.npz", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(
+        tables.len(),
+        2,
+        "fixture has two named arrays (users, scores)"
+    );
+
+    let scores = table(&doc, "scores");
+    let value = column(scores, "value");
+    assert_eq!(value["current_type"], "i64");
+
+    let users = table(&doc, "users");
+    assert!(users.iter().any(|c| c["name"] == "user_id"));
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {

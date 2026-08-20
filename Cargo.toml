@@ -24,6 +24,7 @@ xmltree = { version = "0.12.0", features = ["attribute-order"], optional = true 
 flate2 = "1.1.9"
 tempfile = "3.27.0"
 zstd = { version = "0.13.3", optional = true }
+npyz = { version = "0.9.1", features = ["npz"], optional = true }
 
 [features]
 default = []
@@ -32,7 +33,7 @@ default = []
 parquet = ["dep:arrow", "dep:parquet"]
 xlsx = ["dep:calamine"]
 avro = ["dep:apache-avro"]
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy"]
 sqlite = ["dep:rusqlite"]
 msgpack = ["dep:rmpv"]
 toml = ["dep:toml"]
@@ -44,3 +45,4 @@ cbor = ["dep:ciborium"]
 ini = ["dep:rust-ini"]
 xml = ["dep:xmltree"]
 zstd = ["dep:zstd"]
+npy = ["dep:npyz"]

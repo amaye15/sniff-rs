@@ -10,17 +10,18 @@ use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
-/// INI, XML, or fixed-width text file: one row per column, with a current
-/// type, a heuristic "ideal" type
-/// suggestion, missing %, sample values, and a blank Description field to
-/// fill in by hand. Output is Markdown tables (default), this tool's own
-/// rich JSON (--output-format json), or json-schema.org-vocabulary JSON
+/// INI, XML, fixed-width text, or NumPy (.npy/.npz) file: one row per
+/// column, with a current type, a heuristic "ideal" type suggestion,
+/// missing %, sample values, and a blank Description field to fill in by
+/// hand. Output is Markdown tables (default), this tool's own rich JSON
+/// (--output-format json), or json-schema.org-vocabulary JSON
 /// (--output-format json-schema); any of the three can be written to
 /// stdout by passing "-" as the output path. SQLite files (one table per
-/// database table), Excel workbooks (one table per sheet), and INI files
-/// (one table per section) can produce multiple tables; every other format
-/// always produces exactly one implicit table - all of it renders through
-/// the same path. Format is inferred from the file extension unless
+/// database table), Excel workbooks (one table per sheet), INI files (one
+/// table per section), and .npz archives (one table per named array) can
+/// produce multiple tables; every other format always produces exactly
+/// one implicit table - all of it renders through the same path. Format is
+/// inferred from the file extension unless
 /// --format is given. A .gz or .zst extension is transparently decompressed
 /// first, so e.g. data.csv.gz reads exactly like data.csv (gzip always
 /// available; zstd needs --features zstd). Every optional format needs its
@@ -31,7 +32,7 @@ use serde_json::json;
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml)
+    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -41,7 +42,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, or fixed-width
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, or npz
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -1496,6 +1497,373 @@ fn columns_from_xml(
     )
 }
 
+// --- NumPy reader (opt-in via --features npy; covers .npy and .npz) ---
+// A structured (record) dtype is the genuinely tabular case - one named
+// field per column - and is handled precisely: fields are read byte-for-
+// byte per npyz's own DType/TypeStr description, decoded per TypeChar
+// (int/uint/float by width and endianness, fixed-width byte/unicode
+// strings trimmed of their right-zero-padding), with anything not
+// representable as a simple value (a fixed-size sub-array field, `f16`,
+// pickled `object` dtype) falling back to a hex dump rather than fabricating
+// a value or failing the whole file. A plain (non-structured) array has no
+// field names at all - numpy doesn't carry them - so it's treated like a
+// headerless CSV: a 1D array is one column, a 2D array gets positional
+// `col_0..col_N` columns; anything higher-dimensional doesn't have an
+// honest 2D tabular reading, so it's a clear error rather than a guess.
+// .npz is just a zip of named .npy arrays, so - like SQLite's tables and
+// Excel's sheets - each array becomes its own table.
+
+#[cfg(feature = "npy")]
+fn npy_read_uint(bytes: &[u8], big_endian: bool) -> Option<u64> {
+    Some(match bytes.len() {
+        1 => bytes[0] as u64,
+        2 => {
+            let b: [u8; 2] = bytes.try_into().ok()?;
+            if big_endian {
+                u16::from_be_bytes(b)
+            } else {
+                u16::from_le_bytes(b)
+            }
+            .into()
+        }
+        4 => {
+            let b: [u8; 4] = bytes.try_into().ok()?;
+            if big_endian {
+                u32::from_be_bytes(b)
+            } else {
+                u32::from_le_bytes(b)
+            }
+            .into()
+        }
+        8 => {
+            let b: [u8; 8] = bytes.try_into().ok()?;
+            if big_endian {
+                u64::from_be_bytes(b)
+            } else {
+                u64::from_le_bytes(b)
+            }
+        }
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "npy")]
+fn npy_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(feature = "npy")]
+fn npy_scalar_to_string(ty: &npyz::TypeStr, bytes: &[u8]) -> String {
+    use npyz::{Endianness, TypeChar};
+
+    let big_endian = ty.endianness() == Endianness::Big;
+    match ty.type_char() {
+        TypeChar::Bool => (bytes.first() == Some(&1)).to_string(),
+        TypeChar::Int => match (bytes.len(), npy_read_uint(bytes, big_endian)) {
+            (1, Some(v)) => (v as u8 as i8).to_string(),
+            (2, Some(v)) => (v as u16 as i16).to_string(),
+            (4, Some(v)) => (v as u32 as i32).to_string(),
+            (8, Some(v)) => (v as i64).to_string(),
+            _ => npy_hex(bytes),
+        },
+        TypeChar::Uint | TypeChar::TimeDelta | TypeChar::DateTime => {
+            npy_read_uint(bytes, big_endian).map_or_else(|| npy_hex(bytes), |v| v.to_string())
+        }
+        TypeChar::Float => match bytes.len() {
+            4 => {
+                let b: [u8; 4] = bytes.try_into().unwrap();
+                if big_endian {
+                    f32::from_be_bytes(b)
+                } else {
+                    f32::from_le_bytes(b)
+                }
+                .to_string()
+            }
+            8 => {
+                let b: [u8; 8] = bytes.try_into().unwrap();
+                if big_endian {
+                    f64::from_be_bytes(b)
+                } else {
+                    f64::from_le_bytes(b)
+                }
+                .to_string()
+            }
+            _ => npy_hex(bytes), // f16/f128 - rare, not worth a half-precision dependency
+        },
+        TypeChar::ByteStr => {
+            let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+            String::from_utf8_lossy(trimmed).into_owned()
+        }
+        TypeChar::UnicodeStr => {
+            let mut s = String::new();
+            for chunk in bytes.chunks_exact(4) {
+                let code = npy_read_uint(chunk, big_endian).unwrap_or(0) as u32;
+                if code == 0 {
+                    break; // right-zero-padded, like ByteStr
+                }
+                if let Some(c) = char::from_u32(code) {
+                    s.push(c);
+                }
+            }
+            s
+        }
+        // Complex, Object (pickled - caught earlier via uses_pickled_array),
+        // RawData, and any future TypeChar variant: hex is always safe.
+        _ => npy_hex(bytes),
+    }
+}
+
+#[cfg(feature = "npy")]
+fn npy_value_to_string(dtype: &npyz::DType, bytes: &[u8]) -> String {
+    match dtype {
+        npyz::DType::Plain(ty) => npy_scalar_to_string(ty, bytes),
+        npyz::DType::Array(n, inner) => {
+            let Some(elem_size) = inner.num_bytes() else {
+                return npy_hex(bytes);
+            };
+            (0..*n as usize)
+                .filter_map(|i| bytes.get(i * elem_size..(i + 1) * elem_size))
+                .map(|chunk| npy_value_to_string(inner, chunk))
+                .collect::<Vec<_>>()
+                .join(";")
+        }
+        npyz::DType::Record(_) => npy_hex(bytes), // a field nested inside a field - rare
+    }
+}
+
+/// The declared numpy dtype, mapped to this tool's type labels - this is
+/// `current_type`, i.e. what the format *says* it is (mirrors
+/// `arrow_type_label` for Parquet/Arrow IPC). `profile_column` still
+/// independently re-derives `ideal_type` from the stringified values
+/// regardless of this label, same as every other format.
+#[cfg(feature = "npy")]
+fn npy_type_label(dtype: &npyz::DType) -> String {
+    use npyz::TypeChar;
+    match dtype {
+        npyz::DType::Plain(ty) => match ty.type_char() {
+            TypeChar::Bool => "bool".to_string(),
+            TypeChar::Int | TypeChar::Uint => "i64".to_string(),
+            TypeChar::Float => "f64".to_string(),
+            TypeChar::ByteStr | TypeChar::UnicodeStr => "String".to_string(),
+            TypeChar::TimeDelta | TypeChar::DateTime => "Timestamp".to_string(),
+            TypeChar::Complex => "Complex".to_string(),
+            TypeChar::RawData => "Bytes".to_string(),
+            _ => "Object".to_string(),
+        },
+        npyz::DType::Array(_, inner) => format!("Vec<{}>", npy_type_label(inner)),
+        npyz::DType::Record(_) => "Struct".to_string(),
+    }
+}
+
+/// Reads one already-opened `.npy` stream (a standalone file, or one array
+/// inside a `.npz` archive - the two share this same core). A structured
+/// dtype gives one column per field; a plain dtype gets positional
+/// `col_0..col_N` columns for a 2D array, or a single `value` column for 1D.
+#[cfg(feature = "npy")]
+fn columns_from_npy_reader<R: std::io::Read>(
+    npy: npyz::NpyFile<R>,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    let header = npy.header().clone();
+    let dtype = header.dtype();
+    if dtype.uses_pickled_array() {
+        bail!(
+            "this array uses numpy's pickled 'object' dtype, which isn't a fixed byte layout \
+             this tool can read - re-save it with a concrete dtype"
+        );
+    }
+    let shape = header.shape().to_vec();
+    let order = header.order();
+    let mut reader = npy.into_inner();
+
+    let fields: Vec<npyz::Field> = match &dtype {
+        npyz::DType::Record(fields) => fields.clone(),
+        other => vec![npyz::Field {
+            name: "value".to_string(),
+            dtype: other.clone(),
+        }],
+    };
+    let is_record = matches!(dtype, npyz::DType::Record(_));
+
+    // A plain (unnamed) dtype with a 2D shape gets one positional column per
+    // trailing-axis element instead of a single "value" column - the closest
+    // honest equivalent of a headerless CSV's columns. Anything with more
+    // axes than that has no natural row/column reading, so it's a clear
+    // error instead of silently flattening or guessing.
+    let n_cols = if is_record {
+        1
+    } else {
+        match shape.len() {
+            0 | 1 => 1,
+            2 => usize::try_from(shape[1]).context("array width overflows usize")?,
+            n => bail!(
+                "a {n}-dimensional plain (non-structured) array has no natural row/column \
+                 reading - only 1D, 2D, or a structured (record) dtype are supported"
+            ),
+        }
+    };
+    let n_rows = usize::try_from(shape.first().copied().unwrap_or(1))
+        .context("array length overflows usize")?;
+
+    let field_sizes: Vec<usize> = fields
+        .iter()
+        .map(|f| {
+            f.dtype
+                .num_bytes()
+                .with_context(|| format!("field '{}' has no fixed byte size", f.name))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut columns: Vec<Vec<String>> = if is_record {
+        vec![Vec::new(); fields.len()]
+    } else {
+        vec![Vec::new(); n_cols]
+    };
+    let rows_to_read = nrows.map_or(n_rows, |limit| limit.min(n_rows));
+
+    if is_record {
+        // A structured array's records are always laid out contiguously one
+        // after another (there's no "order" concept for records), so this
+        // can stream one record at a time.
+        let record_size: usize = field_sizes.iter().sum();
+        let mut buf = vec![0u8; record_size];
+        for row in 0..rows_to_read {
+            reader
+                .read_exact(&mut buf)
+                .with_context(|| format!("failed reading row {row}"))?;
+            let mut offset = 0;
+            for (col_idx, (field, size)) in fields.iter().zip(&field_sizes).enumerate() {
+                columns[col_idx].push(npy_value_to_string(
+                    &field.dtype,
+                    &buf[offset..offset + size],
+                ));
+                offset += size;
+            }
+        }
+    } else {
+        // A plain array has no such guarantee - in particular, Fortran
+        // (column-major) order means a single row's elements are scattered
+        // stride-n_rows apart through the whole file, not contiguous - so
+        // this reads every element up front and computes each one's flat
+        // index explicitly rather than trying to stream row-sized chunks.
+        let elem_size = field_sizes[0];
+        let total_elems = n_rows * n_cols;
+        let mut buf = vec![0u8; total_elems * elem_size];
+        reader
+            .read_exact(&mut buf)
+            .with_context(|| format!("failed reading the array body ({total_elems} elements)"))?;
+        for row in 0..rows_to_read {
+            for (col_idx, column) in columns.iter_mut().enumerate() {
+                let flat_index = match order {
+                    npyz::Order::C => row * n_cols + col_idx,
+                    npyz::Order::Fortran => col_idx * n_rows + row,
+                };
+                let start = flat_index * elem_size;
+                column.push(npy_value_to_string(
+                    &fields[0].dtype,
+                    &buf[start..start + elem_size],
+                ));
+            }
+        }
+    }
+
+    let names: Vec<String> = if is_record {
+        fields.iter().map(|f| f.name.clone()).collect()
+    } else if n_cols == 1 {
+        vec!["value".to_string()]
+    } else {
+        (0..n_cols).map(|i| format!("col_{i}")).collect()
+    };
+    let current_types: Vec<String> = if is_record {
+        fields.iter().map(|f| npy_type_label(&f.dtype)).collect()
+    } else {
+        vec![npy_type_label(&fields[0].dtype); n_cols]
+    };
+
+    Ok(names
+        .into_iter()
+        .zip(current_types)
+        .zip(columns)
+        .map(|((name, current_type), values)| {
+            let total = values.len();
+            profile_column(
+                ColumnInput {
+                    name,
+                    current_type,
+                    raw_values: values,
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            )
+        })
+        .collect())
+}
+
+#[cfg(feature = "npy")]
+fn columns_from_npy(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let npy = npyz::NpyFile::new(BufReader::new(file))
+        .with_context(|| format!("failed to parse {path:?} as a .npy file"))?;
+    columns_from_npy_reader(npy, nrows, n_samples)
+}
+
+#[cfg(not(feature = "npy"))]
+fn columns_from_npy(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "NumPy support isn't compiled in - rebuild with `cargo build --release --features npy` (or --features full)"
+    )
+}
+
+#[cfg(feature = "npy")]
+fn columns_from_npz(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    let mut archive = npyz::npz::NpzArchive::open(path)
+        .with_context(|| format!("failed to open {path:?} as a .npz archive"))?;
+    let names: Vec<String> = archive.array_names().map(str::to_string).collect();
+    if names.is_empty() {
+        bail!("no arrays found in {path:?}");
+    }
+
+    let mut out = Vec::new();
+    for name in names {
+        let npy = archive
+            .by_name(&name)
+            .with_context(|| format!("failed reading array '{name}' from {path:?}"))?
+            .ok_or_else(|| anyhow::anyhow!("array '{name}' disappeared while reading {path:?}"))?;
+        let profiles = columns_from_npy_reader(npy, nrows, n_samples)
+            .with_context(|| format!("failed reading array '{name}' from {path:?}"))?;
+        out.push((name, profiles));
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "npy"))]
+fn columns_from_npz(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "NumPy support isn't compiled in - rebuild with `cargo build --release --features npy` (or --features full)"
+    )
+}
+
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -1728,6 +2096,8 @@ enum InputFormat {
     Ini,
     Xml,
     FixedWidth,
+    Npy,
+    Npz,
 }
 
 impl InputFormat {
@@ -1748,6 +2118,8 @@ impl InputFormat {
             InputFormat::Ini => "ini",
             InputFormat::Xml => "xml",
             InputFormat::FixedWidth => "fixed_width",
+            InputFormat::Npy => "npy",
+            InputFormat::Npz => "npz",
         }
     }
 }
@@ -1770,9 +2142,11 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "ini" => Ok(InputFormat::Ini),
             "xml" => Ok(InputFormat::Xml),
             "fixed-width" | "fixed_width" | "fwf" => Ok(InputFormat::FixedWidth),
+            "npy" => Ok(InputFormat::Npy),
+            "npz" => Ok(InputFormat::Npz),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, or fixed-width)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, or npz)"
                 )
             }
         };
@@ -1797,11 +2171,13 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "cbor" => Ok(InputFormat::Cbor),
         "ini" => Ok(InputFormat::Ini),
         "xml" => Ok(InputFormat::Xml),
+        "npy" => Ok(InputFormat::Npy),
+        "npz" => Ok(InputFormat::Npz),
         // No extension convention reliably means fixed-width (.txt/.dat are
         // used for all sorts of things), so it's --format-only, never
         // inferred - matching how --widths must also be given explicitly.
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz explicitly"
         ),
     }
 }
@@ -2116,16 +2492,17 @@ pub fn run() -> Result<()> {
 
     // Every format ends up as the same shape - a table name mapped to its column
     // profiles - so JSON/Markdown rendering never needs to special-case SQLite's
-    // (and Excel's, and INI's) multiple tables vs. everything else's single
-    // implicit one.
+    // (and Excel's, and INI's, and .npz's) multiple tables vs. everything
+    // else's single implicit one.
     let tables: BTreeMap<String, Vec<ColumnProfile>> = if matches!(
         format,
-        InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini
+        InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz
     ) {
         match format {
             InputFormat::Sqlite => columns_from_sqlite(&read_path, args.nrows, args.samples)?,
             InputFormat::Xlsx => columns_from_xlsx(&read_path, args.nrows, args.samples)?,
             InputFormat::Ini => columns_from_ini(&read_path, args.samples)?,
+            InputFormat::Npz => columns_from_npz(&read_path, args.nrows, args.samples)?,
             _ => unreachable!("handled by the outer matches! guard"),
         }
         .into_iter()
@@ -2164,7 +2541,8 @@ pub fn run() -> Result<()> {
                     .map(|c| profile_column(c, args.samples))
                     .collect()
             }
-            InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini => {
+            InputFormat::Npy => columns_from_npy(&read_path, args.nrows, args.samples)?,
+            InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
         };
