@@ -6,13 +6,16 @@ use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, NaiveDateTime};
 use clap::Parser;
 use serde_json::Value as JsonValue;
+use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, or SQLite file: one row per column, with
 /// a current type, a heuristic "ideal" type suggestion, missing %, sample
 /// values, and a blank Description field to fill in by hand. Output is
-/// Markdown tables (default) or structured JSON (--output-format json), and
-/// either can be written to stdout by passing "-" as the output path.
+/// Markdown tables (default), this tool's own rich JSON (--output-format
+/// json), or json-schema.org-vocabulary JSON (--output-format json-schema);
+/// any of the three can be written to stdout by passing "-" as the output
+/// path.
 /// SQLite files (one table per database table) and Excel workbooks (one
 /// table per sheet) can produce multiple tables; every other format always
 /// produces exactly one implicit table - all of it renders through the same
@@ -40,7 +43,8 @@ struct Args {
     /// Override the field delimiter for csv/tsv (single character)
     #[arg(long)]
     delimiter: Option<char>,
-    /// Output format: md (markdown tables) or json (structured, for scripts/agents)
+    /// Output format: md (markdown tables), json (this tool's own rich shape), or
+    /// json-schema (json-schema.org vocabulary, for schema-consuming tools)
     #[arg(long, default_value = "md")]
     output_format: String,
 }
@@ -1202,14 +1206,119 @@ fn render_json(
     serde_json::to_string_pretty(&doc).context("failed to serialize JSON output")
 }
 
+// --- JSON-Schema-standard output (--output-format json-schema) ---
+// A third, more interoperable JSON shape alongside this tool's own rich one
+// above: json-schema.org's {"type": ..., "properties": {...}} vocabulary,
+// built from each column's ideal_type. Deliberately lossy wherever
+// ideal_type itself is lossy or ambiguous (mixed(...) types, flattened
+// structs, "enum / category" without the full value list - only samples are
+// kept, not the full domain) - those fall back to an unconstrained `{}`
+// schema (valid JSON Schema for "anything goes") rather than guessing.
+
+/// Maps an `ideal_type` label to a (JSON Schema type keyword, optional
+/// "format" keyword) pair, for the scalar types that map cleanly onto one.
+/// `None` covers everything else (mixed/struct/empty/unrecognized).
+fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'static str>)> {
+    match ideal_type {
+        "String" | "enum / category" => Some(("string", None)),
+        "i64" => Some(("integer", None)),
+        "f64" => Some(("number", None)),
+        "bool" => Some(("boolean", None)),
+        "NaiveDate / DateTime" => Some(("string", Some("date-time"))),
+        _ => None,
+    }
+}
+
+/// Nullable columns (missing_pct > 0) get a ["type", "null"] union instead of
+/// a bare type string - the same "missing values never fake a type change"
+/// principle the rest of this tool applies, expressed in schema form.
+fn json_schema_type_value(base: &str, nullable: bool) -> JsonValue {
+    if nullable {
+        json!([base, "null"])
+    } else {
+        json!(base)
+    }
+}
+
+fn json_schema_property(p: &ColumnProfile) -> JsonValue {
+    let nullable = p.missing_pct > 0.0;
+
+    if let Some(inner) = p
+        .ideal_type
+        .strip_prefix("Vec<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        let items = match json_schema_scalar_type(inner) {
+            Some((t, Some(fmt))) => json!({"type": t, "format": fmt}),
+            Some((t, None)) => json!({"type": t}),
+            None => json!({}),
+        };
+        return json!({"type": json_schema_type_value("array", nullable), "items": items});
+    }
+
+    match json_schema_scalar_type(&p.ideal_type) {
+        Some((t, Some(fmt))) => {
+            json!({"type": json_schema_type_value(t, nullable), "format": fmt})
+        }
+        Some((t, None)) => json!({"type": json_schema_type_value(t, nullable)}),
+        None => json!({}),
+    }
+}
+
+fn render_json_schema(
+    file_name: &str,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> Result<String> {
+    let mut table_schemas = serde_json::Map::new();
+    for (table_name, profiles) in tables {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for p in profiles {
+            properties.insert(p.name.clone(), json_schema_property(p));
+            if p.missing_pct == 0.0 {
+                required.push(JsonValue::String(p.name.clone()));
+            }
+        }
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".to_string(), json!("object"));
+        schema.insert("properties".to_string(), JsonValue::Object(properties));
+        if !required.is_empty() {
+            schema.insert("required".to_string(), JsonValue::Array(required));
+        }
+        table_schemas.insert(table_name.clone(), JsonValue::Object(schema));
+    }
+
+    let doc = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "file": file_name,
+        "tables": table_schemas,
+    });
+    serde_json::to_string_pretty(&doc).context("failed to serialize JSON Schema output")
+}
+
+enum OutputFormat {
+    Markdown,
+    Json,
+    JsonSchema,
+}
+
+impl OutputFormat {
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "md" | "markdown" => Ok(OutputFormat::Markdown),
+            "json" => Ok(OutputFormat::Json),
+            "json-schema" | "jsonschema" => Ok(OutputFormat::JsonSchema),
+            other => {
+                bail!("unrecognized --output-format '{other}' (expected md, json, or json-schema)")
+            }
+        }
+    }
+}
+
 pub fn run() -> Result<()> {
     let args = Args::parse();
 
-    let output_json = match args.output_format.to_lowercase().as_str() {
-        "md" | "markdown" => false,
-        "json" => true,
-        other => bail!("unrecognized --output-format '{other}' (expected md or json)"),
-    };
+    let output_format = OutputFormat::parse(&args.output_format)?;
 
     let format = detect_format(&args.input_path, &args.format)?;
     let file_name = args
@@ -1270,10 +1379,10 @@ pub fn run() -> Result<()> {
             std::iter::once((file_stem, profiles)).collect()
         };
 
-    let rendered = if output_json {
-        render_json(&file_name, &format, &tables)?
-    } else {
-        render_markdown(&file_name, &tables)
+    let rendered = match output_format {
+        OutputFormat::Markdown => render_markdown(&file_name, &tables),
+        OutputFormat::Json => render_json(&file_name, &format, &tables)?,
+        OutputFormat::JsonSchema => render_json_schema(&file_name, &tables)?,
     };
 
     let table_count = tables.len();
@@ -1286,10 +1395,10 @@ pub fn run() -> Result<()> {
         print!("{rendered}");
         eprintln!("{table_count} tables, {col_count} columns -> (stdout)");
     } else {
-        let default_ext = if output_json {
-            "dictionary.json"
-        } else {
-            "dictionary.md"
+        let default_ext = match output_format {
+            OutputFormat::Markdown => "dictionary.md",
+            OutputFormat::Json => "dictionary.json",
+            OutputFormat::JsonSchema => "dictionary.schema.json",
         };
         let output_path = args
             .output_path

@@ -50,14 +50,15 @@ a format should follow the same shape — see the cookbook below.
 
 ## Output formats
 
-`--output-format md` (default) or `--output-format json`. Pass `-` as the
-output path to write to stdout instead of a file — the status line
-(`N tables, M columns -> ...`) always goes to stderr, so stdout stays pure
-data for piping (`... | jq .`, `... > out.json`).
+`--output-format md` (default), `--output-format json`, or
+`--output-format json-schema`. Pass `-` as the output path to write to
+stdout instead of a file — the status line (`N tables, M columns -> ...`)
+always goes to stderr, so stdout stays pure data for piping
+(`... | jq .`, `... > out.json`).
 
-JSON shape — every format renders through the same structure, so a consumer
-never needs to special-case SQLite's multiple tables vs. everything else's
-implicit single one:
+JSON shape (`json`) — every format renders through the same structure, so a
+consumer never needs to special-case SQLite's/Excel's multiple tables vs.
+everything else's implicit single one:
 
 ```json
 {
@@ -82,6 +83,38 @@ implicit single one:
 `description` is always empty — intentionally left for a human (or an agent
 downstream of this one) to fill in; no heuristic should be guessing what a
 column *means*.
+
+JSON-Schema shape (`json-schema`) — a second, more interoperable JSON
+rendering for consumers that want `json-schema.org` vocabulary instead of
+this tool's own rich shape above. Each table becomes its own
+`{"type": "object", "properties": {...}}` schema, keyed by table name under
+`tables` the same way; `ideal_type` drives each property's `type`
+(`i64`→`integer`, `f64`→`number`, `bool`→`boolean`,
+`NaiveDate / DateTime`→`{"type": "string", "format": "date-time"}`,
+`Vec<T>`→`{"type": "array", "items": ...}`); a column with any missing
+values gets a `["type", "null"]` union instead of a bare type, and is left
+out of the table's `"required"` list. Deliberately lossy wherever
+`ideal_type` itself is lossy or ambiguous — `mixed(...)` current types,
+flattened structs, and `enum / category` (only sample values are kept, not
+the full domain) all fall back to an unconstrained `{}` schema rather than
+guessing:
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "file": "data.csv",
+  "tables": {
+    "data": {
+      "type": "object",
+      "properties": {
+        "zip_code": { "type": "string" },
+        "age": { "type": ["integer", "null"] }
+      },
+      "required": ["zip_code"]
+    }
+  }
+}
+```
 
 ## Architecture
 
@@ -226,8 +259,9 @@ leading-zero and date-format heuristics on CSV, nested object + array-of-
 objects flattening with the local missing-% calculation, mixed-type count
 reporting, Parquet's no-data-loss-on-strings case, Excel's does-lose-data
 case (the same value, opposite outcome, by design), Excel's one-table-per-
-sheet output, SQLite's multi-table output and type-affinity detection, and
-that Markdown output never has a trailing blank line.
+sheet output, SQLite's multi-table output and type-affinity detection, the
+`json-schema` output's type mapping and nullability handling, and that
+Markdown output never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
@@ -240,11 +274,6 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
 
 ## Known limitations / roadmap
 
-- **No JSON-Schema-standard output.** The JSON mode is this tool's own
-  shape (rich: current/ideal type, notes, samples), not
-  `json-schema.org`'s `{"type": "object", "properties": {...}}` vocabulary.
-  Could be added as a third `--output-format` if a consumer specifically
-  needs the standard.
 - **Parquet nested types stop at Struct/List.** Map and dictionary-encoded
   types aren't specifically handled (they'd likely fall through the
   `is_nested_arrow_type` check as unrecognized and get stringified via the

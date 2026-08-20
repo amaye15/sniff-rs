@@ -19,11 +19,20 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Runs the binary against a fixture with --output-format json, writing to
-/// stdout ("-"), and returns the parsed document.
-fn run_json(fixture_name: &str, extra_args: &[&str]) -> serde_json::Value {
+/// Runs the binary against a fixture with the given --output-format, writing
+/// to stdout ("-"), and returns the parsed document.
+fn run_with_format(
+    fixture_name: &str,
+    output_format: &str,
+    extra_args: &[&str],
+) -> serde_json::Value {
     let path = fixture(fixture_name);
-    let mut args: Vec<&str> = vec![path.to_str().unwrap(), "-", "--output-format", "json"];
+    let mut args: Vec<&str> = vec![
+        path.to_str().unwrap(),
+        "-",
+        "--output-format",
+        output_format,
+    ];
     args.extend_from_slice(extra_args);
     let output = Command::new(bin())
         .args(&args)
@@ -40,6 +49,12 @@ fn run_json(fixture_name: &str, extra_args: &[&str]) -> serde_json::Value {
             String::from_utf8_lossy(&output.stdout)
         )
     })
+}
+
+/// Runs the binary against a fixture with --output-format json, writing to
+/// stdout ("-"), and returns the parsed document.
+fn run_json(fixture_name: &str, extra_args: &[&str]) -> serde_json::Value {
+    run_with_format(fixture_name, "json", extra_args)
 }
 
 fn table<'a>(doc: &'a serde_json::Value, name: &str) -> &'a Vec<serde_json::Value> {
@@ -74,6 +89,39 @@ fn csv_leading_zero_and_date_heuristics() {
     assert_eq!(
         balance["ideal_type"], "f64",
         "comma-formatted currency string should still resolve to f64"
+    );
+}
+
+#[test]
+fn json_schema_output_maps_types_and_nullability() {
+    let doc = run_with_format("sample.csv", "json-schema", &[]);
+    assert_eq!(doc["$schema"], "http://json-schema.org/draft-07/schema#");
+
+    let schema = &doc["tables"]["sample"];
+    assert_eq!(schema["type"], "object");
+
+    // Leading-zero heuristic keeps this a string, not an integer.
+    assert_eq!(schema["properties"]["zip_code"]["type"], "string");
+    assert_eq!(schema["properties"]["account_balance"]["type"], "number");
+    assert_eq!(
+        schema["properties"]["signup_date"],
+        serde_json::json!({"type": "string", "format": "date-time"})
+    );
+
+    // "age" has one missing value in the fixture -> nullable union, and
+    // excluded from "required"; "zip_code" has none -> required.
+    assert_eq!(
+        schema["properties"]["age"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    let required = schema["required"].as_array().unwrap();
+    assert!(
+        !required.iter().any(|v| v == "age"),
+        "a nullable column shouldn't be in required: {required:?}"
+    );
+    assert!(
+        required.iter().any(|v| v == "zip_code"),
+        "a fully-populated column should be in required: {required:?}"
     );
 }
 
