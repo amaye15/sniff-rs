@@ -4,7 +4,7 @@ A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
-CBOR, and INI, and writes Markdown, this tool's own rich JSON, or
+CBOR, INI, and XML, and writes Markdown, this tool's own rich JSON, or
 json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
@@ -44,6 +44,7 @@ every format. See "Testing" below.
 | YAML | `.yaml`, `.yml` | `--features yaml` | single mapping = one row, single sequence = array-of-records, `---`-multi-doc = one row per document |
 | CBOR | `.cbor` | `--features cbor` | same convention as MessagePack: concatenated records, or a single top-level array |
 | INI | `.ini` | `--features ini` | one section per table, like SQLite (see below); a repeated key pools into an array |
+| XML | `.xml` | `--features xml` | homogeneous same-tag children of the root = records; otherwise the root = one row; attributes become `@name` columns |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous.
@@ -134,7 +135,7 @@ engine (`suggest_ideal_type`) over the raw strings to produce a
 `ColumnProfile`.
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
-nest (JSON, Avro, MessagePack, TOML, YAML, CBOR, Parquet's Struct/List/Map columns). This recurses: objects
+nest (JSON, Avro, MessagePack, TOML, YAML, CBOR, XML, Parquet's Struct/List/Map columns). This recurses: objects
 flatten into dot-notation sub-columns (`metadata.risk_score`), arrays get
 unwrapped and pooled (nested arrays flatten transparently), and the result
 is *this path's own row followed by every descendant row*, so nesting is
@@ -172,6 +173,19 @@ flattener**, rather than reimplementing recursion per format:
   `ciborium` crate): a stream of concatenated self-delimiting top-level
   values, or a single top-level array's elements. Same convention, same
   ~15 lines beyond the value-conversion helper.
+- XML is the one exception to "bridge via a ready-made dynamic Value type" -
+  an XML element can carry attributes, text, and child elements all at
+  once, which doesn't map onto a single generic enum the way
+  toml::Value/serde_norway::Value/rmpv::Value/ciborium::Value do, so
+  `xml_element_to_json` builds the bridge by hand from `xmltree`'s DOM tree:
+  attributes become `@name` keys, text becomes a `#text` key (or, for a
+  leaf element with only text and no attributes, the bare string, so
+  `<name>Alice</name>` becomes `"Alice"` rather than `{"#text": "Alice"}`),
+  and repeated same-name child elements pool into an array. Record
+  detection then mirrors the other formats' own dual-mode choices: if the
+  root's children are all the same tag (`<root><item/><item/></root>`),
+  each is a record; otherwise the whole document is one record, TOML's and
+  an INI section's choice for their own single-document shapes.
 - Parquet/Arrow IPC's Struct/List/Map columns get bridged through Arrow's
   own JSON writer (`arrow::json::writer::ArrayWriter`) into the same
   `serde_json::Map` shape, then call `profile_json_path` directly (a Map
@@ -317,8 +331,9 @@ output, SQLite's multi-table output and type-affinity detection, the
 and CBOR's concatenated-records reading and their no-data-loss-on-strings
 case, TOML's whole-document-as-one-row profiling and array-of-tables
 flattening, YAML's multi-document-stream reading, INI's one-table-per-
-section output and duplicate-key pooling, and that Markdown output never
-has a trailing blank line.
+section output and duplicate-key pooling, XML's homogeneous-children-as-
+records detection and `@`-prefixed attribute columns, and that Markdown
+output never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

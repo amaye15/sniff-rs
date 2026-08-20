@@ -309,6 +309,30 @@ fn cbor_reads_concatenated_records_and_preserves_string_types() {
     assert!((age["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
 }
 
+#[cfg(feature = "xml")]
+#[test]
+fn xml_treats_homogeneous_children_as_records_and_attributes_as_at_columns() {
+    let doc = run_json("sample.xml", &[]);
+    let cols = table(&doc, "sample");
+
+    // 3 <user> elements under the root, all the same tag - each is a record.
+    let id = column(cols, "@id");
+    assert_eq!(id["sample_values"].as_array().unwrap().len(), 3);
+
+    // Attributes become @-prefixed columns rather than being dropped.
+    let active = column(cols, "@active");
+    assert_eq!(active["ideal_type"], "bool");
+
+    // Child elements with only text content are the bare string, not
+    // wrapped in a {"#text": ...} object.
+    let zip = column(cols, "zip_code");
+    assert_eq!(zip["current_type"], "String");
+    assert!(zip["notes"].as_str().unwrap().contains("leading zeros"));
+
+    let date = column(cols, "signup_date");
+    assert_eq!(date["ideal_type"], "NaiveDate / DateTime");
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {

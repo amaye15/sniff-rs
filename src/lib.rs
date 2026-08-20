@@ -9,8 +9,8 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
-/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR, or
-/// INI file: one row per column, with a current type, a heuristic "ideal" type
+/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
+/// INI, or XML file: one row per column, with a current type, a heuristic "ideal" type
 /// suggestion, missing %, sample values, and a blank Description field to
 /// fill in by hand. Output is Markdown tables (default), this tool's own
 /// rich JSON (--output-format json), or json-schema.org-vocabulary JSON
@@ -28,7 +28,7 @@ use serde_json::json;
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini)
+    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -38,7 +38,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, or ini
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, or xml
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -1278,6 +1278,139 @@ fn columns_from_ini(_path: &Path, _n_samples: usize) -> Result<Vec<(String, Vec<
     )
 }
 
+// --- XML reader (opt-in via --features xml) ---
+// XML's mixed content model (an element can carry attributes, text, and
+// child elements all at once) doesn't map onto a single generic Value enum
+// the way TOML/YAML/CBOR/MessagePack do, so this bridges by hand instead of
+// via a ready-made dynamic type: attributes become `@name` keys, text
+// content becomes a `#text` key (or, for a leaf element with only text and
+// no attributes, the bare string - so `<name>Alice</name>` becomes "Alice"
+// rather than {"#text": "Alice"}), and repeated same-name child elements
+// pool into an array, same convention as everywhere else in this file.
+
+#[cfg(feature = "xml")]
+fn xml_element_to_json(el: &xmltree::Element) -> JsonValue {
+    use xmltree::XMLNode;
+
+    let mut obj = serde_json::Map::new();
+    for (k, v) in &el.attributes {
+        obj.insert(format!("@{k}"), JsonValue::String(v.clone()));
+    }
+
+    let mut text = String::new();
+    let mut child_order: Vec<String> = Vec::new();
+    let mut child_values: HashMap<String, Vec<JsonValue>> = HashMap::new();
+    for node in &el.children {
+        match node {
+            XMLNode::Element(child) => {
+                child_values
+                    .entry(child.name.clone())
+                    .or_insert_with(|| {
+                        child_order.push(child.name.clone());
+                        Vec::new()
+                    })
+                    .push(xml_element_to_json(child));
+            }
+            XMLNode::Text(t) | XMLNode::CData(t) => text.push_str(t),
+            XMLNode::Comment(_) | XMLNode::ProcessingInstruction(..) => {}
+        }
+    }
+    for name in child_order {
+        let mut values = child_values.remove(&name).unwrap();
+        let value = if values.len() == 1 {
+            values.pop().unwrap()
+        } else {
+            JsonValue::Array(values)
+        };
+        obj.insert(name, value);
+    }
+
+    let text = text.trim();
+    if !text.is_empty() {
+        if obj.is_empty() {
+            return JsonValue::String(text.to_string());
+        }
+        obj.insert("#text".to_string(), JsonValue::String(text.to_string()));
+    }
+
+    if obj.is_empty() {
+        JsonValue::Null
+    } else {
+        JsonValue::Object(obj)
+    }
+}
+
+/// If the root element's children all share one tag name (the common
+/// `<root><item>...</item><item>...</item></root>` shape), each becomes a
+/// record - mirroring the JSON reader's `[...]` array-of-objects mode.
+/// Otherwise the whole document is one record, the same choice TOML and an
+/// INI section make for their own single-document shapes.
+#[cfg(feature = "xml")]
+fn columns_from_xml(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use xmltree::XMLNode;
+
+    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let root = xmltree::Element::parse(BufReader::new(file))
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed to parse {path:?} as XML"))?;
+
+    let child_elements: Vec<&xmltree::Element> = root
+        .children
+        .iter()
+        .filter_map(|n| match n {
+            XMLNode::Element(el) => Some(el),
+            _ => None,
+        })
+        .collect();
+    let homogeneous = child_elements.len() > 1
+        && child_elements
+            .iter()
+            .all(|e| e.name == child_elements[0].name);
+
+    let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+    if homogeneous {
+        for el in child_elements {
+            match xml_element_to_json(el) {
+                JsonValue::Object(m) => records.push(m),
+                other => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("#text".to_string(), other);
+                    records.push(m);
+                }
+            }
+        }
+    } else {
+        match xml_element_to_json(&root) {
+            JsonValue::Object(m) => records.push(m),
+            _ => bail!(
+                "expected the root XML element in {path:?} to have attributes or child elements"
+            ),
+        }
+    }
+
+    if let Some(n) = nrows {
+        records.truncate(n);
+    }
+    Ok(profile_json_records(&records, n_samples))
+}
+
+#[cfg(not(feature = "xml"))]
+fn columns_from_xml(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "XML support isn't compiled in - rebuild with `cargo build --release --features xml` (or --features full)"
+    )
+}
+
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -1508,6 +1641,7 @@ enum InputFormat {
     Yaml,
     Cbor,
     Ini,
+    Xml,
 }
 
 impl InputFormat {
@@ -1526,6 +1660,7 @@ impl InputFormat {
             InputFormat::Yaml => "yaml",
             InputFormat::Cbor => "cbor",
             InputFormat::Ini => "ini",
+            InputFormat::Xml => "xml",
         }
     }
 }
@@ -1546,9 +1681,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "yaml" | "yml" => Ok(InputFormat::Yaml),
             "cbor" => Ok(InputFormat::Cbor),
             "ini" => Ok(InputFormat::Ini),
+            "xml" => Ok(InputFormat::Xml),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, or ini)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, or xml)"
                 )
             }
         };
@@ -1572,8 +1708,9 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "yaml" | "yml" => Ok(InputFormat::Yaml),
         "cbor" => Ok(InputFormat::Cbor),
         "ini" => Ok(InputFormat::Ini),
+        "xml" => Ok(InputFormat::Xml),
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml explicitly"
         ),
     }
 }
@@ -1855,6 +1992,7 @@ pub fn run() -> Result<()> {
             InputFormat::Toml => columns_from_toml(&args.input_path, args.samples)?,
             InputFormat::Yaml => columns_from_yaml(&args.input_path, args.nrows, args.samples)?,
             InputFormat::Cbor => columns_from_cbor(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Xml => columns_from_xml(&args.input_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini => {
                 unreachable!("handled above")
             }

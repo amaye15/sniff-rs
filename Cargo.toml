@@ -20,6 +20,7 @@ toml = { version = "1.1.4", optional = true }
 serde_norway = { version = "0.9.42", optional = true }
 ciborium = { version = "0.2.2", optional = true }
 rust-ini = { version = "0.21.3", optional = true }
+xmltree = { version = "0.12.0", features = ["attribute-order"], optional = true }
 
 [features]
 default = []
@@ -28,7 +29,7 @@ default = []
 parquet = ["dep:arrow", "dep:parquet"]
 xlsx = ["dep:calamine"]
 avro = ["dep:apache-avro"]
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml"]
 sqlite = ["dep:rusqlite"]
 msgpack = ["dep:rmpv"]
 toml = ["dep:toml"]
@@ -38,3 +39,4 @@ toml = ["dep:toml"]
 yaml = ["dep:serde_norway"]
 cbor = ["dep:ciborium"]
 ini = ["dep:rust-ini"]
+xml = ["dep:xmltree"]

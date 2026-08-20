@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<users>
+  <user id="U1001" active="true">
+    <zip_code>02134</zip_code>
+    <plan>gold</plan>
+    <signup_date>2024-01-15</signup_date>
+  </user>
+  <user id="U1002" active="false">
+    <zip_code>90210</zip_code>
+    <plan>silver</plan>
+    <signup_date>2024-02-20</signup_date>
+  </user>
+  <user id="U1003" active="true">
+    <zip_code>00501</zip_code>
+    <plan>gold</plan>
+    <signup_date>2024-03-05</signup_date>
+  </user>
+</users>
