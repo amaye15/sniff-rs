@@ -220,6 +220,31 @@ fn parquet_string_column_preserves_leading_zero_with_no_data_loss() {
 
 #[cfg(feature = "parquet")]
 #[test]
+fn parquet_map_and_dictionary_columns_are_handled() {
+    let doc = run_json("nested_types.parquet", &[]);
+    let cols = table(&doc, "nested_types");
+
+    // Dictionary-encoded strings (Parquet's low-cardinality string encoding)
+    // should resolve transparently to the value type underneath, not report
+    // the encoding itself as the type.
+    let category = column(cols, "category");
+    assert_eq!(category["current_type"], "String");
+    assert_eq!(category["sample_values"][0], "gold");
+
+    // A Map column bridges through the same JSON flattener as Struct/List -
+    // it becomes a JSON object per row, then flattens into dot-notation
+    // sub-columns exactly like a nested object would.
+    let attributes = column(cols, "attributes");
+    assert_eq!(attributes["current_type"], "object");
+    assert!(cols.iter().any(|c| c["name"] == "attributes.color"));
+    assert!(cols.iter().any(|c| c["name"] == "attributes.size"));
+
+    let color = column(cols, "attributes.color");
+    assert_eq!(color["current_type"], "String");
+}
+
+#[cfg(feature = "parquet")]
+#[test]
 fn feather_reads_via_the_shared_arrow_batch_profiler() {
     // No dedicated fixture file to keep the repo lean - Parquet already proves
     // the shared profile_arrow_batches path works, so this just checks the

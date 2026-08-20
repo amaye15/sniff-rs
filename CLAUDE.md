@@ -33,7 +33,7 @@ every format. See "Testing" below.
 | CSV / TSV | `.csv`, `.tsv` | *(default)* | `--delimiter` overrides the separator |
 | JSON | `.json` | *(default)* | array-of-objects or JSON Lines, auto-detected by content |
 | JSON Lines / NDJSON | `.jsonl`, `.ndjson` | *(default)* | same reader as JSON |
-| Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List |
+| Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List/Map |
 | Arrow IPC / Feather | `.arrow`, `.feather` | `--features parquet` | shares Parquet's Arrow infrastructure |
 | Avro | `.avro` | `--features avro` | recurses into records/arrays/unions |
 | Excel | `.xlsx`, `.xls`, `.xlsb`, `.ods` | `--features xlsx` | one section per sheet, like SQLite (see below) |
@@ -128,7 +128,7 @@ engine (`suggest_ideal_type`) over the raw strings to produce a
 `ColumnProfile`.
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
-nest (JSON, Avro, Parquet's Struct/List columns). This recurses: objects
+nest (JSON, Avro, Parquet's Struct/List/Map columns). This recurses: objects
 flatten into dot-notation sub-columns (`metadata.risk_score`), arrays get
 unwrapped and pooled (nested arrays flatten transparently), and the result
 is *this path's own row followed by every descendant row*, so nesting is
@@ -140,12 +140,17 @@ flattener**, rather than reimplementing recursion per format:
 
 - Avro decodes each record to `serde_json::Value` (`avro_value_to_json`)
   and calls `profile_json_records` — identical code path to a `.json` file.
-- Parquet/Arrow IPC's Struct/List columns get bridged through Arrow's own
-  JSON writer (`arrow::json::writer::ArrayWriter`) into the same
-  `serde_json::Map` shape, then call `profile_json_path` directly. Scalar
-  columns skip this entirely and take the fast direct-stringify path
-  (`array_value_to_string`) — the bridge only runs for files that actually
-  have nested columns.
+- Parquet/Arrow IPC's Struct/List/Map columns get bridged through Arrow's
+  own JSON writer (`arrow::json::writer::ArrayWriter`) into the same
+  `serde_json::Map` shape, then call `profile_json_path` directly (a Map
+  column becomes a JSON object per row and flattens by key exactly like a
+  Struct does). Scalar columns skip this entirely and take the fast
+  direct-stringify path (`array_value_to_string`) — the bridge only runs
+  for files that actually have nested columns. Dictionary-encoded columns
+  (Parquet's compact encoding for low-cardinality values, e.g. strings)
+  aren't nested at all — `arrow_type_label` resolves them to their
+  underlying value type recursively, so a dictionary-encoded string column
+  reports as `String`, not as the encoding wrapping it.
 
 Parquet and Arrow IPC additionally share one function,
 `profile_arrow_batches`, since they both decode to the same `RecordBatch`
@@ -257,9 +262,10 @@ cargo test --features full    # everything, including format-gated tests
 itself) and asserts on parsed JSON output. Coverage includes: the
 leading-zero and date-format heuristics on CSV, nested object + array-of-
 objects flattening with the local missing-% calculation, mixed-type count
-reporting, Parquet's no-data-loss-on-strings case, Excel's does-lose-data
-case (the same value, opposite outcome, by design), Excel's one-table-per-
-sheet output, SQLite's multi-table output and type-affinity detection, the
+reporting, Parquet's no-data-loss-on-strings case, Parquet's Map-column
+flattening and dictionary-encoding resolution, Excel's does-lose-data case
+(the same value, opposite outcome, by design), Excel's one-table-per-sheet
+output, SQLite's multi-table output and type-affinity detection, the
 `json-schema` output's type mapping and nullability handling, and that
 Markdown output never has a trailing blank line.
 
@@ -274,10 +280,6 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
 
 ## Known limitations / roadmap
 
-- **Parquet nested types stop at Struct/List.** Map and dictionary-encoded
-  types aren't specifically handled (they'd likely fall through the
-  `is_nested_arrow_type` check as unrecognized and get stringified via the
-  scalar path, which is untested).
 - **No ORC.** Deliberately skipped — Rust ecosystem support is weak enough
   that it wasn't worth the dependency risk.
 - **Category-detection threshold is fixed**, not configurable: ≤50 unique

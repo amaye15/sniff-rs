@@ -567,6 +567,12 @@ fn arrow_type_label(dt: &arrow::datatypes::DataType) -> String {
             "List".to_string()
         }
         DataType::Struct(_) => "Struct".to_string(),
+        DataType::Map(..) => "Map".to_string(),
+        // Dictionary encoding is a storage detail (a compact index into a
+        // value dictionary, typically for low-cardinality strings) - it
+        // hasn't lost or changed the logical type, so report the value
+        // type underneath rather than the encoding wrapping it.
+        DataType::Dictionary(_, value_type) => arrow_type_label(value_type),
         other => format!("{other:?}"),
     }
 }
@@ -580,6 +586,7 @@ fn is_nested_arrow_type(dt: &arrow::datatypes::DataType) -> bool {
             | DataType::LargeList(_)
             | DataType::FixedSizeList(..)
             | DataType::Struct(_)
+            | DataType::Map(..)
     )
 }
 
