@@ -290,6 +290,38 @@ fn msgpack_reads_concatenated_records_and_preserves_string_types() {
     assert!((age["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
 }
 
+#[cfg(feature = "toml")]
+#[test]
+fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {
+    let doc = run_json("sample.toml", &[]);
+    let cols = table(&doc, "sample");
+
+    // Top-level scalar keys become their own columns, each with exactly one
+    // value - a TOML document is one record, not a table of many rows.
+    let title = column(cols, "title");
+    assert_eq!(title["current_type"], "String");
+    assert_eq!(title["missing_pct"].as_f64().unwrap(), 0.0);
+
+    // A plain table ([owner]) flattens into dot-notation sub-columns just
+    // like a nested JSON object would.
+    assert!(cols.iter().any(|c| c["name"] == "owner.name"));
+    let owner_zip = column(cols, "owner.zip_code");
+    assert!(
+        owner_zip["notes"]
+            .as_str()
+            .unwrap()
+            .contains("leading zeros")
+    );
+
+    // An array of tables ([[servers]]) becomes a Vec<object> column that
+    // pools both entries and flattens the same way.
+    let servers = column(cols, "servers");
+    assert_eq!(servers["current_type"], "Vec<object>");
+    assert!(cols.iter().any(|c| c["name"] == "servers.name"));
+    let server_names = column(cols, "servers.name");
+    assert_eq!(server_names["missing_pct"].as_f64().unwrap(), 0.0);
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_writer_silently_mangling_a_zip_code_gets_caught() {

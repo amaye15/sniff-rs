@@ -9,8 +9,8 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
-/// Arrow IPC/Feather, Avro, Excel, SQLite, or MessagePack file: one row per
-/// column, with
+/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, or TOML file: one
+/// row per column, with
 /// a current type, a heuristic "ideal" type suggestion, missing %, sample
 /// values, and a blank Description field to fill in by hand. Output is
 /// Markdown tables (default), this tool's own rich JSON (--output-format
@@ -23,13 +23,14 @@ use serde_json::json;
 /// path. Format is inferred from the file extension unless --format is
 /// given. Parquet and Arrow IPC/Feather need --features parquet; Avro needs --features avro;
 /// Excel needs --features xlsx; SQLite needs --features sqlite; MessagePack
-/// needs --features msgpack (or use --features full for everything).
+/// needs --features msgpack; TOML needs --features toml (or use
+/// --features full for everything).
 #[derive(Parser)]
 #[command(name = "sniff-rs")]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp)
+    /// .msgpack/.mp, .toml)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -39,7 +40,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, or msgpack
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, or toml
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -949,6 +950,54 @@ fn columns_from_msgpack(
     )
 }
 
+// --- TOML reader (opt-in via --features toml) ---
+// A TOML file is a single document, not inherently a table of many rows -
+// unlike every other reader in this file, there's no natural "row" to
+// repeat. Rather than invent a fake row count, the whole document is
+// profiled as one record via profile_json_records (total = 1), so an
+// array-of-tables section (`[[servers]]`) becomes a `Vec<object>` column
+// that flattens exactly like any other JSON array of objects would.
+
+#[cfg(feature = "toml")]
+fn toml_value_to_json(v: &toml::Value) -> JsonValue {
+    match v {
+        toml::Value::String(s) => JsonValue::String(s.clone()),
+        toml::Value::Integer(i) => JsonValue::from(*i),
+        toml::Value::Float(f) => {
+            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        toml::Value::Boolean(b) => JsonValue::Bool(*b),
+        toml::Value::Datetime(dt) => JsonValue::String(dt.to_string()),
+        toml::Value::Array(items) => {
+            JsonValue::Array(items.iter().map(toml_value_to_json).collect())
+        }
+        toml::Value::Table(t) => JsonValue::Object(
+            t.iter()
+                .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(feature = "toml")]
+fn columns_from_toml(path: &Path, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let value: toml::Value =
+        toml::from_str(&content).with_context(|| format!("failed to parse {path:?} as TOML"))?;
+    let record = match toml_value_to_json(&value) {
+        JsonValue::Object(m) => m,
+        _ => bail!("expected a TOML document with top-level key-value pairs in {path:?}"),
+    };
+    Ok(profile_json_records(&[record], n_samples))
+}
+
+#[cfg(not(feature = "toml"))]
+fn columns_from_toml(_path: &Path, _n_samples: usize) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "TOML support isn't compiled in - rebuild with `cargo build --release --features toml` (or --features full)"
+    )
+}
+
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -1175,6 +1224,7 @@ enum InputFormat {
     Xlsx,
     Sqlite,
     MsgPack,
+    Toml,
 }
 
 impl InputFormat {
@@ -1189,6 +1239,7 @@ impl InputFormat {
             InputFormat::Xlsx => "xlsx",
             InputFormat::Sqlite => "sqlite",
             InputFormat::MsgPack => "msgpack",
+            InputFormat::Toml => "toml",
         }
     }
 }
@@ -1205,9 +1256,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "xlsx" | "xls" | "xlsb" | "ods" => Ok(InputFormat::Xlsx),
             "sqlite" | "db" => Ok(InputFormat::Sqlite),
             "msgpack" | "mp" => Ok(InputFormat::MsgPack),
+            "toml" => Ok(InputFormat::Toml),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, or msgpack)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, or toml)"
                 )
             }
         };
@@ -1227,8 +1279,9 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "xlsx" | "xls" | "xlsb" | "ods" => Ok(InputFormat::Xlsx),
         "db" | "sqlite" | "sqlite3" => Ok(InputFormat::Sqlite),
         "msgpack" | "mp" => Ok(InputFormat::MsgPack),
+        "toml" => Ok(InputFormat::Toml),
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml explicitly"
         ),
     }
 }
@@ -1505,6 +1558,7 @@ pub fn run() -> Result<()> {
                 InputFormat::MsgPack => {
                     columns_from_msgpack(&args.input_path, args.nrows, args.samples)?
                 }
+                InputFormat::Toml => columns_from_toml(&args.input_path, args.samples)?,
                 InputFormat::Sqlite | InputFormat::Xlsx => unreachable!("handled above"),
             };
             std::iter::once((file_stem, profiles)).collect()

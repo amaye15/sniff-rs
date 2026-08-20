@@ -1,0 +1,17 @@
+title = "sample config"
+version = 3
+debug = true
+
+[owner]
+name = "Alice"
+zip_code = "02134"
+
+[[servers]]
+name = "alpha"
+ip = "10.0.0.1"
+active = true
+
+[[servers]]
+name = "beta"
+ip = "10.0.0.2"
+active = false
