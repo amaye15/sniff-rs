@@ -3,9 +3,9 @@
 A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
-Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, and
-YAML, and writes Markdown, this tool's own rich JSON, or json-schema.org-
-standard JSON.
+Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
+and CBOR, and writes Markdown, this tool's own rich JSON, or
+json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -42,6 +42,7 @@ every format. See "Testing" below.
 | MessagePack | `.msgpack`, `.mp` | `--features msgpack` | stream of concatenated records, or a single top-level array |
 | TOML | `.toml` | `--features toml` | whole document = one row; array-of-tables flattens like a nested JSON array |
 | YAML | `.yaml`, `.yml` | `--features yaml` | single mapping = one row, single sequence = array-of-records, `---`-multi-doc = one row per document |
+| CBOR | `.cbor` | `--features cbor` | same convention as MessagePack: concatenated records, or a single top-level array |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous.
@@ -132,7 +133,7 @@ engine (`suggest_ideal_type`) over the raw strings to produce a
 `ColumnProfile`.
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
-nest (JSON, Avro, MessagePack, TOML, YAML, Parquet's Struct/List/Map columns). This recurses: objects
+nest (JSON, Avro, MessagePack, TOML, YAML, CBOR, Parquet's Struct/List/Map columns). This recurses: objects
 flatten into dot-notation sub-columns (`metadata.risk_score`), arrays get
 unwrapped and pooled (nested arrays flatten transparently), and the result
 is *this path's own row followed by every descendant row*, so nesting is
@@ -166,6 +167,10 @@ flattener**, rather than reimplementing recursion per format:
   record (TOML's whole-document-as-one-row choice); a `---`-separated
   multi-document stream is one record per document (YAML's own equivalent
   of JSON Lines, but self-delimiting rather than newline-delimited).
+- CBOR does exactly what MessagePack does (`cbor_value_to_json`, via the
+  `ciborium` crate): a stream of concatenated self-delimiting top-level
+  values, or a single top-level array's elements. Same convention, same
+  ~15 lines beyond the value-conversion helper.
 - Parquet/Arrow IPC's Struct/List/Map columns get bridged through Arrow's
   own JSON writer (`arrow::json::writer::ArrayWriter`) into the same
   `serde_json::Map` shape, then call `profile_json_path` directly (a Map
@@ -300,10 +305,10 @@ flattening and dictionary-encoding resolution, Excel's does-lose-data case
 (the same value, opposite outcome, by design), Excel's one-table-per-sheet
 output, SQLite's multi-table output and type-affinity detection, the
 `json-schema` output's type mapping and nullability handling, MessagePack's
-concatenated-records reading and its no-data-loss-on-strings case, TOML's
-whole-document-as-one-row profiling and array-of-tables flattening, YAML's
-multi-document-stream reading, and that Markdown output never has a
-trailing blank line.
+and CBOR's concatenated-records reading and their no-data-loss-on-strings
+case, TOML's whole-document-as-one-row profiling and array-of-tables
+flattening, YAML's multi-document-stream reading, and that Markdown output
+never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

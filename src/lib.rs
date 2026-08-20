@@ -9,28 +9,25 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
-/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, or YAML file:
-/// one row per column, with
-/// a current type, a heuristic "ideal" type suggestion, missing %, sample
-/// values, and a blank Description field to fill in by hand. Output is
-/// Markdown tables (default), this tool's own rich JSON (--output-format
-/// json), or json-schema.org-vocabulary JSON (--output-format json-schema);
-/// any of the three can be written to stdout by passing "-" as the output
-/// path.
-/// SQLite files (one table per database table) and Excel workbooks (one
-/// table per sheet) can produce multiple tables; every other format always
-/// produces exactly one implicit table - all of it renders through the same
-/// path. Format is inferred from the file extension unless --format is
-/// given. Parquet and Arrow IPC/Feather need --features parquet; Avro needs --features avro;
-/// Excel needs --features xlsx; SQLite needs --features sqlite; MessagePack
-/// needs --features msgpack; TOML needs --features toml; YAML needs
-/// --features yaml (or use --features full for everything).
+/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, or CBOR
+/// file: one row per column, with a current type, a heuristic "ideal" type
+/// suggestion, missing %, sample values, and a blank Description field to
+/// fill in by hand. Output is Markdown tables (default), this tool's own
+/// rich JSON (--output-format json), or json-schema.org-vocabulary JSON
+/// (--output-format json-schema); any of the three can be written to
+/// stdout by passing "-" as the output path. SQLite files (one table per
+/// database table) and Excel workbooks (one table per sheet) can produce
+/// multiple tables; every other format always produces exactly one
+/// implicit table - all of it renders through the same path. Format is
+/// inferred from the file extension unless --format is given. Every
+/// optional format needs its own --features flag (see the Supported
+/// formats table in CLAUDE.md), or use --features full for everything.
 #[derive(Parser)]
 #[command(name = "sniff-rs")]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp, .toml, .yaml/.yml)
+    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -40,7 +37,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, or yaml
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, or cbor
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -1118,6 +1115,117 @@ fn columns_from_yaml(
     )
 }
 
+// --- CBOR reader (opt-in via --features cbor) ---
+// Same shape as the MessagePack reader above: CBOR values are
+// self-delimiting, so a data file is read as a stream of concatenated
+// top-level values (or, if there's exactly one top-level value and it's an
+// array, that array's elements instead - mirroring the JSON reader's
+// `[...]` mode).
+
+#[cfg(feature = "cbor")]
+fn cbor_key_to_string(k: &ciborium::Value) -> String {
+    if let ciborium::Value::Text(s) = k {
+        return s.clone();
+    }
+    match cbor_value_to_json(k) {
+        JsonValue::String(s) => s,
+        other => other.to_string(),
+    }
+}
+
+#[cfg(feature = "cbor")]
+fn cbor_value_to_json(v: &ciborium::Value) -> JsonValue {
+    use ciborium::Value as CborValue;
+    match v {
+        CborValue::Null => JsonValue::Null,
+        CborValue::Bool(b) => JsonValue::Bool(*b),
+        CborValue::Integer(i) => i64::try_from(*i)
+            .map(JsonValue::from)
+            .unwrap_or_else(|_| JsonValue::String(i128::from(*i).to_string())),
+        CborValue::Float(f) => {
+            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        CborValue::Text(s) => JsonValue::String(s.clone()),
+        CborValue::Bytes(b) => {
+            JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+        CborValue::Array(items) => JsonValue::Array(items.iter().map(cbor_value_to_json).collect()),
+        CborValue::Map(pairs) => JsonValue::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| (cbor_key_to_string(k), cbor_value_to_json(v)))
+                .collect(),
+        ),
+        // A tagged value (CBOR's major type 6, e.g. a date-time or bignum
+        // hint) - best-effort: keep the tag number visible rather than
+        // silently dropping it, same choice as YAML's `!Tag` handling.
+        CborValue::Tag(tag, inner) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(format!("tag({tag})"), cbor_value_to_json(inner));
+            JsonValue::Object(obj)
+        }
+        _ => JsonValue::Null, // ciborium::Value is #[non_exhaustive]
+    }
+}
+
+#[cfg(feature = "cbor")]
+fn columns_from_cbor(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use std::fs::File;
+    use std::io::BufRead;
+    use std::io::BufReader;
+
+    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut reader = BufReader::new(file);
+
+    let mut top_values: Vec<ciborium::Value> = Vec::new();
+    while !reader
+        .fill_buf()
+        .with_context(|| format!("failed reading {path:?}"))?
+        .is_empty()
+    {
+        let v: ciborium::Value = ciborium::from_reader(&mut reader)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
+        top_values.push(v);
+    }
+
+    let values: Vec<ciborium::Value> = if top_values.len() == 1 {
+        match top_values.into_iter().next().unwrap() {
+            ciborium::Value::Array(items) => items,
+            other => vec![other],
+        }
+    } else {
+        top_values
+    };
+
+    let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+    for v in values {
+        match cbor_value_to_json(&v) {
+            JsonValue::Object(m) => records.push(m),
+            _ => bail!("expected each CBOR record to decode to a map in {path:?}"),
+        }
+    }
+    if let Some(n) = nrows {
+        records.truncate(n);
+    }
+    Ok(profile_json_records(&records, n_samples))
+}
+
+#[cfg(not(feature = "cbor"))]
+fn columns_from_cbor(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "CBOR support isn't compiled in - rebuild with `cargo build --release --features cbor` (or --features full)"
+    )
+}
+
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -1346,6 +1454,7 @@ enum InputFormat {
     MsgPack,
     Toml,
     Yaml,
+    Cbor,
 }
 
 impl InputFormat {
@@ -1362,6 +1471,7 @@ impl InputFormat {
             InputFormat::MsgPack => "msgpack",
             InputFormat::Toml => "toml",
             InputFormat::Yaml => "yaml",
+            InputFormat::Cbor => "cbor",
         }
     }
 }
@@ -1380,9 +1490,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "msgpack" | "mp" => Ok(InputFormat::MsgPack),
             "toml" => Ok(InputFormat::Toml),
             "yaml" | "yml" => Ok(InputFormat::Yaml),
+            "cbor" => Ok(InputFormat::Cbor),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, or yaml)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, or cbor)"
                 )
             }
         };
@@ -1404,8 +1515,9 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "msgpack" | "mp" => Ok(InputFormat::MsgPack),
         "toml" => Ok(InputFormat::Toml),
         "yaml" | "yml" => Ok(InputFormat::Yaml),
+        "cbor" => Ok(InputFormat::Cbor),
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor explicitly"
         ),
     }
 }
@@ -1684,6 +1796,7 @@ pub fn run() -> Result<()> {
                 }
                 InputFormat::Toml => columns_from_toml(&args.input_path, args.samples)?,
                 InputFormat::Yaml => columns_from_yaml(&args.input_path, args.nrows, args.samples)?,
+                InputFormat::Cbor => columns_from_cbor(&args.input_path, args.nrows, args.samples)?,
                 InputFormat::Sqlite | InputFormat::Xlsx => unreachable!("handled above"),
             };
             std::iter::once((file_stem, profiles)).collect()
