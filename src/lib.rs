@@ -21,9 +21,11 @@ use serde_json::json;
 /// (one table per section) can produce multiple tables; every other format
 /// always produces exactly one implicit table - all of it renders through
 /// the same path. Format is inferred from the file extension unless
-/// --format is given. Every
-/// optional format needs its own --features flag (see the Supported
-/// formats table in CLAUDE.md), or use --features full for everything.
+/// --format is given. A .gz or .zst extension is transparently decompressed
+/// first, so e.g. data.csv.gz reads exactly like data.csv (gzip always
+/// available; zstd needs --features zstd). Every optional format needs its
+/// own --features flag (see the Supported formats table in CLAUDE.md), or
+/// use --features full for everything.
 #[derive(Parser)]
 #[command(name = "sniff-rs")]
 struct Args {
@@ -1995,6 +1997,80 @@ fn render_json_schema(
     serde_json::to_string_pretty(&doc).context("failed to serialize JSON Schema output")
 }
 
+// --- Transparent gzip/zstd decompression ---
+// Not a format of its own - a preprocessing step in front of every reader
+// above. Every reader just opens a plain file path, so materializing
+// compressed input to a real temporary file (rather than trying to hand
+// each reader a generic Read stream) means compressed input needs zero
+// per-format changes, including formats that need actual random file
+// access rather than a stream (Parquet, SQLite, Excel). gzip (via flate2,
+// pure Rust, no C toolchain) is always available; zstd needs
+// --features zstd since the zstd crate compiles a small vendored C library.
+
+enum Compression {
+    Gzip,
+    Zstd,
+}
+
+fn compression_from_extension(path: &Path) -> Option<Compression> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "gz" | "gzip" => Some(Compression::Gzip),
+        "zst" | "zstd" => Some(Compression::Zstd),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn decompress_zstd(reader: std::fs::File, out: &mut std::fs::File, path: &Path) -> Result<()> {
+    let mut decoder = zstd::stream::read::Decoder::new(reader)
+        .with_context(|| format!("failed to open {path:?} as zstd"))?;
+    std::io::copy(&mut decoder, out).with_context(|| format!("failed to decompress {path:?}"))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "zstd"))]
+fn decompress_zstd(_reader: std::fs::File, _out: &mut std::fs::File, path: &Path) -> Result<()> {
+    bail!(
+        "zstd support isn't compiled in - rebuild with `cargo build --release --features zstd` (or --features full) to read {path:?}"
+    )
+}
+
+/// If `path` ends in `.gz`/`.gzip` or `.zst`/`.zstd`, decompresses it into a
+/// real temporary file and returns (the path to actually read bytes from,
+/// the compression-stripped logical path used for format detection and
+/// default output naming, a guard that deletes the temp file on drop).
+/// Non-compressed input passes through unchanged with no guard.
+fn decompress_if_needed(
+    path: &Path,
+) -> Result<(PathBuf, PathBuf, Option<tempfile::NamedTempFile>)> {
+    use std::fs::File;
+
+    let Some(compression) = compression_from_extension(path) else {
+        return Ok((path.to_path_buf(), path.to_path_buf(), None));
+    };
+
+    let input = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut tmp = tempfile::NamedTempFile::new()
+        .context("failed to create a temporary file for decompression")?;
+    match compression {
+        Compression::Gzip => {
+            let mut decoder = flate2::read::GzDecoder::new(input);
+            std::io::copy(&mut decoder, tmp.as_file_mut())
+                .with_context(|| format!("failed to decompress {path:?}"))?;
+        }
+        Compression::Zstd => decompress_zstd(input, tmp.as_file_mut(), path)?,
+    }
+
+    let logical_path = path.with_extension("");
+    Ok((tmp.path().to_path_buf(), logical_path, Some(tmp)))
+}
+
 enum OutputFormat {
     Markdown,
     Json,
@@ -2019,15 +2095,20 @@ pub fn run() -> Result<()> {
 
     let output_format = OutputFormat::parse(&args.output_format)?;
 
-    let format = detect_format(&args.input_path, &args.format)?;
+    // data.csv.gz reads exactly like data.csv from here on: read_path points
+    // at the real (decompressed) bytes every reader below opens, logical_path
+    // is the compression-stripped name used for format detection and default
+    // output naming, and _decompressed_tmp just needs to outlive the reads.
+    let (read_path, logical_path, _decompressed_tmp) = decompress_if_needed(&args.input_path)?;
+
+    let format = detect_format(&logical_path, &args.format)?;
     let file_name = args
         .input_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let file_stem = args
-        .input_path
+    let file_stem = logical_path
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
@@ -2042,53 +2123,43 @@ pub fn run() -> Result<()> {
         InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini
     ) {
         match format {
-            InputFormat::Sqlite => columns_from_sqlite(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Xlsx => columns_from_xlsx(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Ini => columns_from_ini(&args.input_path, args.samples)?,
+            InputFormat::Sqlite => columns_from_sqlite(&read_path, args.nrows, args.samples)?,
+            InputFormat::Xlsx => columns_from_xlsx(&read_path, args.nrows, args.samples)?,
+            InputFormat::Ini => columns_from_ini(&read_path, args.samples)?,
             _ => unreachable!("handled by the outer matches! guard"),
         }
         .into_iter()
         .collect()
     } else {
         let profiles: Vec<ColumnProfile> = match format {
-            InputFormat::Csv => columns_from_csv(
-                &args.input_path,
-                args.nrows,
-                args.delimiter.unwrap_or(',') as u8,
-            )?
-            .into_iter()
-            .map(|c| profile_column(c, args.samples))
-            .collect(),
-            InputFormat::Tsv => columns_from_csv(
-                &args.input_path,
-                args.nrows,
-                args.delimiter.unwrap_or('\t') as u8,
-            )?
-            .into_iter()
-            .map(|c| profile_column(c, args.samples))
-            .collect(),
-            InputFormat::Json => columns_from_json(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Parquet => {
-                columns_from_parquet(&args.input_path, args.nrows, args.samples)?
+            InputFormat::Csv => {
+                columns_from_csv(&read_path, args.nrows, args.delimiter.unwrap_or(',') as u8)?
+                    .into_iter()
+                    .map(|c| profile_column(c, args.samples))
+                    .collect()
             }
-            InputFormat::ArrowIpc => {
-                columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?
+            InputFormat::Tsv => {
+                columns_from_csv(&read_path, args.nrows, args.delimiter.unwrap_or('\t') as u8)?
+                    .into_iter()
+                    .map(|c| profile_column(c, args.samples))
+                    .collect()
             }
-            InputFormat::Avro => columns_from_avro(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::MsgPack => {
-                columns_from_msgpack(&args.input_path, args.nrows, args.samples)?
-            }
-            InputFormat::Toml => columns_from_toml(&args.input_path, args.samples)?,
-            InputFormat::Yaml => columns_from_yaml(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Cbor => columns_from_cbor(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Xml => columns_from_xml(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Json => columns_from_json(&read_path, args.nrows, args.samples)?,
+            InputFormat::Parquet => columns_from_parquet(&read_path, args.nrows, args.samples)?,
+            InputFormat::ArrowIpc => columns_from_arrow_ipc(&read_path, args.nrows, args.samples)?,
+            InputFormat::Avro => columns_from_avro(&read_path, args.nrows, args.samples)?,
+            InputFormat::MsgPack => columns_from_msgpack(&read_path, args.nrows, args.samples)?,
+            InputFormat::Toml => columns_from_toml(&read_path, args.samples)?,
+            InputFormat::Yaml => columns_from_yaml(&read_path, args.nrows, args.samples)?,
+            InputFormat::Cbor => columns_from_cbor(&read_path, args.nrows, args.samples)?,
+            InputFormat::Xml => columns_from_xml(&read_path, args.nrows, args.samples)?,
             InputFormat::FixedWidth => {
                 let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
                     anyhow::anyhow!(
                         "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
                     )
                 })?;
-                columns_from_fixed_width(&args.input_path, args.nrows, widths)?
+                columns_from_fixed_width(&read_path, args.nrows, widths)?
                     .into_iter()
                     .map(|c| profile_column(c, args.samples))
                     .collect()
@@ -2124,7 +2195,7 @@ pub fn run() -> Result<()> {
         let output_path = args
             .output_path
             .clone()
-            .unwrap_or_else(|| args.input_path.with_extension(default_ext));
+            .unwrap_or_else(|| logical_path.with_extension(default_ext));
         fs::write(&output_path, &rendered)
             .with_context(|| format!("failed to write {output_path:?}"))?;
         eprintln!(

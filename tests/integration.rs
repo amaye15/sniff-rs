@@ -248,6 +248,63 @@ fn fixed_width_without_widths_gives_an_actionable_error() {
     );
 }
 
+#[test]
+fn gzip_input_reads_transparently_as_its_inner_format() {
+    let doc = run_json("sample.csv.gz", &[]);
+
+    // The reported file stays the real (compressed) name, but detection,
+    // table naming, and the heuristics all operate on the decompressed
+    // inner CSV exactly as if it had never been gzipped.
+    assert_eq!(doc["file"], "sample.csv.gz");
+    assert_eq!(doc["format"], "csv");
+    let cols = table(&doc, "sample");
+    let zip = column(cols, "zip_code");
+    assert_eq!(zip["current_type"], "i64");
+    assert!(zip["notes"].as_str().unwrap().contains("already lost"));
+}
+
+#[test]
+fn gzip_with_an_invalid_header_gives_an_actionable_error_not_a_panic() {
+    let bad_gz = fixture("_scratch_not_actually_gzip.csv.gz");
+    std::fs::write(&bad_gz, b"this is not gzip data").unwrap();
+    let output = Command::new(bin())
+        .args([bad_gz.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&bad_gz).ok();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gzip"),
+        "error should mention gzip, not panic: {stderr}"
+    );
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_input_reads_transparently_as_its_inner_format() {
+    let doc = run_json("nested.jsonl.zst", &[]);
+    assert_eq!(doc["file"], "nested.jsonl.zst");
+    assert_eq!(doc["format"], "json");
+    let cols = table(&doc, "nested");
+    assert!(cols.iter().any(|c| c["name"] == "metadata.risk_score"));
+}
+
+#[cfg(not(feature = "zstd"))]
+#[test]
+fn zstd_without_the_feature_gives_an_actionable_error() {
+    let output = Command::new(bin())
+        .args([fixture("nested.jsonl.zst").to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--features zstd"),
+        "error should point at the --features zstd rebuild: {stderr}"
+    );
+}
+
 #[cfg(feature = "parquet")]
 #[test]
 fn parquet_string_column_preserves_leading_zero_with_no_data_loss() {

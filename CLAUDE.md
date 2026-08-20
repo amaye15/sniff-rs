@@ -4,8 +4,9 @@ A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
-CBOR, INI, XML, and fixed-width text, and writes Markdown, this tool's own
-rich JSON, or json-schema.org-standard JSON.
+CBOR, INI, XML, and fixed-width text — any of them gzip- or zstd-compressed
+too — and writes Markdown, this tool's own rich JSON, or json-schema.org-
+standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -22,6 +23,7 @@ cargo build --release --features full      # every format, ~7-9 min clean cache
 ./target/release/sniff-rs data.csv
 ./target/release/sniff-rs events.jsonl out.md --samples 5
 ./target/release/sniff-rs warehouse.db - --output-format json | jq .
+./target/release/sniff-rs data.csv.gz                       # gzip decompressed transparently
 ```
 
 `cargo test` covers the default build; `cargo test --features full` covers
@@ -46,6 +48,8 @@ every format. See "Testing" below.
 | INI | `.ini` | `--features ini` | one section per table, like SQLite (see below); a repeated key pools into an array |
 | XML | `.xml` | `--features xml` | homogeneous same-tag children of the root = records; otherwise the root = one row; attributes become `@name` columns |
 | Fixed-width text | *(none — `--format fixed-width` only)* | *(default)* | needs `--widths 10,5,20`; no delimiter, so boundaries are never guessed |
+| gzip | any of the above + `.gz`/`.gzip` | *(default)* | transparently decompressed before the inner format's own reader runs |
+| zstd | any of the above + `.zst`/`.zstd` | `--features zstd` | same as gzip |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -60,6 +64,20 @@ a format should follow the same shape — see the cookbook below. Fixed-width
 text is the one exception: it needs no new dependency (pure `std` string
 slicing), so it's always compiled in, gated by nothing but the required
 `--widths` flag.
+
+gzip/zstd decompression (`decompress_if_needed`) isn't a format of its own —
+it's a preprocessing step in front of every reader above, not a new
+`InputFormat` variant. A `.gz`/`.zst` input gets decompressed into a real
+temporary file (via `tempfile::NamedTempFile`, cleaned up on drop) *before*
+format detection ever runs, so every reader keeps opening a plain file path
+exactly as before, with zero per-format changes — including formats that
+need actual random file access rather than a stream (Parquet, SQLite,
+Excel). Detection and default output naming use the compression-stripped
+logical name (`data.csv.gz` behaves like `data.csv`); the JSON/Markdown
+`file` field still reports the real, original filename for traceability.
+gzip is via `flate2` (pure Rust, no C toolchain, so always available); zstd
+needs `--features zstd` since the `zstd` crate compiles a small vendored C
+library.
 
 ## Output formats
 
@@ -342,7 +360,10 @@ flattening, YAML's multi-document-stream reading, INI's one-table-per-
 section output and duplicate-key pooling, XML's homogeneous-children-as-
 records detection and `@`-prefixed attribute columns, fixed-width text's
 character-based column slicing and its actionable error when `--widths`
-is missing, and that Markdown output never has a trailing blank line.
+is missing, gzip/zstd transparently decompressing to their inner format
+(plus an actionable error on a corrupt/mislabeled `.gz` and on `.zst`
+without `--features zstd`), and that Markdown output never has a trailing
+blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
