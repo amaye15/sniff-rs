@@ -490,6 +490,83 @@ fn npz_reports_one_table_per_named_array() {
     assert!(users.iter().any(|c| c["name"] == "user_id"));
 }
 
+#[cfg(feature = "weblog")]
+#[test]
+fn combined_log_splits_request_and_treats_dash_as_missing() {
+    let doc = run_with_format("sample_combined.log", "json", &["--format", "combined-log"]);
+    let cols = table(&doc, "sample_combined");
+
+    // "-" is the format's own placeholder for "not present", not a literal
+    // value - ident is "-" on every line in the fixture.
+    let ident = column(cols, "ident");
+    assert_eq!(ident["missing_pct"].as_f64().unwrap(), 100.0);
+
+    // The quoted request splits into its own columns rather than staying
+    // one opaque field.
+    let method = column(cols, "method");
+    assert!(
+        method["sample_values"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("GET"))
+    );
+    let path = column(cols, "path");
+    assert!(
+        path["sample_values"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("/login"))
+    );
+
+    // The Apache/Combined timestamp format resolves to a real date type.
+    let timestamp = column(cols, "timestamp");
+    assert_eq!(timestamp["ideal_type"], "NaiveDate / DateTime");
+
+    let status = column(cols, "status");
+    assert_eq!(status["current_type"], "i64");
+
+    // Combined-only columns are present; a "-" bytes field (the 401 line)
+    // is missing rather than the literal string "-".
+    let bytes = column(cols, "bytes");
+    assert!((bytes["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
+    assert!(cols.iter().any(|c| c["name"] == "referer"));
+    assert!(cols.iter().any(|c| c["name"] == "user_agent"));
+}
+
+#[cfg(feature = "weblog")]
+#[test]
+fn common_log_has_no_referer_or_user_agent_columns() {
+    let doc = run_with_format("sample_common.log", "json", &["--format", "common-log"]);
+    let cols = table(&doc, "sample_common");
+    assert!(!cols.iter().any(|c| c["name"] == "referer"));
+    assert!(!cols.iter().any(|c| c["name"] == "user_agent"));
+    let status = column(cols, "status");
+    assert_eq!(status["current_type"], "i64");
+}
+
+#[cfg(feature = "weblog")]
+#[test]
+fn combined_log_line_rejects_common_log_format_with_an_actionable_error() {
+    // sample_combined.log has trailing referer/user-agent fields the
+    // Common Log grammar doesn't expect - it shouldn't silently truncate
+    // or misparse them, it should say so.
+    let output = Command::new(bin())
+        .args([
+            fixture("sample_combined.log").to_str().unwrap(),
+            "-",
+            "--format",
+            "common-log",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Common Log"),
+        "error should name the format that failed to match: {stderr}"
+    );
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {

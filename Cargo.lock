@@ -1915,6 +1915,7 @@ dependencies = [
  "flate2",
  "npyz",
  "parquet",
+ "regex",
  "rmpv",
  "rusqlite",
  "rust-ini",

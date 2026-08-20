@@ -25,6 +25,7 @@ flate2 = "1.1.9"
 tempfile = "3.27.0"
 zstd = { version = "0.13.3", optional = true }
 npyz = { version = "0.9.1", features = ["npz"], optional = true }
+regex = { version = "1.13.1", optional = true }
 
 [features]
 default = []
@@ -33,7 +34,7 @@ default = []
 parquet = ["dep:arrow", "dep:parquet"]
 xlsx = ["dep:calamine"]
 avro = ["dep:apache-avro"]
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog"]
 sqlite = ["dep:rusqlite"]
 msgpack = ["dep:rmpv"]
 toml = ["dep:toml"]
@@ -46,3 +47,4 @@ ini = ["dep:rust-ini"]
 xml = ["dep:xmltree"]
 zstd = ["dep:zstd"]
 npy = ["dep:npyz"]
+weblog = ["dep:regex"]

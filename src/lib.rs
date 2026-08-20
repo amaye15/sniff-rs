@@ -10,19 +10,19 @@ use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
-/// INI, XML, fixed-width text, or NumPy (.npy/.npz) file: one row per
-/// column, with a current type, a heuristic "ideal" type suggestion,
-/// missing %, sample values, and a blank Description field to fill in by
-/// hand. Output is Markdown tables (default), this tool's own rich JSON
-/// (--output-format json), or json-schema.org-vocabulary JSON
-/// (--output-format json-schema); any of the three can be written to
-/// stdout by passing "-" as the output path. SQLite files (one table per
-/// database table), Excel workbooks (one table per sheet), INI files (one
-/// table per section), and .npz archives (one table per named array) can
-/// produce multiple tables; every other format always produces exactly
-/// one implicit table - all of it renders through the same path. Format is
-/// inferred from the file extension unless
-/// --format is given. A .gz or .zst extension is transparently decompressed
+/// INI, XML, fixed-width text, NumPy (.npy/.npz), or a Common/Combined Log
+/// Format access log file: one row per column, with a current type, a
+/// heuristic "ideal" type suggestion, missing %, sample values, and a
+/// blank Description field to fill in by hand. Output is Markdown tables
+/// (default), this tool's own rich JSON (--output-format json), or
+/// json-schema.org-vocabulary JSON (--output-format json-schema); any of
+/// the three can be written to stdout by passing "-" as the output path.
+/// SQLite files (one table per database table), Excel workbooks (one
+/// table per sheet), INI files (one table per section), and .npz archives
+/// (one table per named array) can produce multiple tables; every other
+/// format always produces exactly one implicit table - all of it renders
+/// through the same path. Format is inferred from the file extension
+/// unless --format is given. A .gz or .zst extension is transparently decompressed
 /// first, so e.g. data.csv.gz reads exactly like data.csv (gzip always
 /// available; zstd needs --features zstd). Every optional format needs its
 /// own --features flag (see the Supported formats table in CLAUDE.md), or
@@ -32,7 +32,9 @@ use serde_json::json;
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz)
+    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz;
+    /// fixed-width text and access logs have no extension convention and
+    /// are only reachable via --format)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -42,7 +44,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, or npz
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, or combined-log
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -70,6 +72,7 @@ const DATE_FORMATS: &[&str] = &[
     "%m-%d-%Y",
     "%d %b %Y",
     "%b %d, %Y",
+    "%d/%b/%Y:%H:%M:%S %z", // Common/Combined Log Format's timestamp
 ];
 
 // --- Shared intermediate representation, produced by each format's reader ---
@@ -316,6 +319,139 @@ fn columns_from_fixed_width(
         });
     }
     Ok(columns)
+}
+
+// --- Web server access log readers (opt-in via --features weblog) ---
+// Common Log Format and its Combined extension are fixed, well-known text
+// grammars - like fixed-width text, there's no reliable extension to infer
+// this from (access logs are commonly .log/.txt/extensionless), so both are
+// --format-only, never auto-detected. "-" is each format's own documented
+// placeholder for "field not present" (not a guess this tool is making),
+// so it's treated as a missing value rather than a literal string. The
+// quoted request ("METHOD path PROTOCOL") is split into its own
+// method/path/protocol columns instead of kept as one opaque field; a line
+// whose request doesn't cleanly split into three tokens just gets missing
+// values there rather than a guessed split.
+
+#[cfg(feature = "weblog")]
+fn weblog_regex(combined: bool) -> regex::Regex {
+    let pattern = if combined {
+        r#"^(\S+) (\S+) (\S+) \[([^\]]+)\] "([^"]*)" (\d{3}|-) (\d+|-) "([^"]*)" "([^"]*)"$"#
+    } else {
+        r#"^(\S+) (\S+) (\S+) \[([^\]]+)\] "([^"]*)" (\d{3}|-) (\d+|-)$"#
+    };
+    regex::Regex::new(pattern).expect("hardcoded weblog regex is always valid")
+}
+
+#[cfg(feature = "weblog")]
+fn weblog_dash_to_none(s: &str) -> Option<String> {
+    if s == "-" { None } else { Some(s.to_string()) }
+}
+
+#[cfg(feature = "weblog")]
+fn columns_from_weblog(
+    path: &Path,
+    nrows: Option<usize>,
+    combined: bool,
+) -> Result<Vec<ColumnInput>> {
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let re = weblog_regex(combined);
+    let request_re = regex::Regex::new(r"^(\S+) (\S+) (\S+)$").expect("hardcoded regex is valid");
+
+    let mut names: Vec<&str> = vec![
+        "host",
+        "ident",
+        "authuser",
+        "timestamp",
+        "method",
+        "path",
+        "protocol",
+        "status",
+        "bytes",
+    ];
+    if combined {
+        names.extend(["referer", "user_agent"]);
+    }
+
+    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
+    let mut total = 0usize;
+    for (line_no, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if nrows.is_some_and(|limit| total >= limit) {
+            break;
+        }
+        let format_name = if combined {
+            "Combined Log"
+        } else {
+            "Common Log"
+        };
+        let caps = re.captures(line).ok_or_else(|| {
+            anyhow::anyhow!(
+                "line {} doesn't match {format_name} Format: {line:?}",
+                line_no + 1
+            )
+        })?;
+
+        let (method, req_path, protocol) = match request_re.captures(&caps[5]) {
+            Some(c) => (
+                Some(c[1].to_string()),
+                Some(c[2].to_string()),
+                Some(c[3].to_string()),
+            ),
+            None => (None, None, None),
+        };
+        let mut values = vec![
+            weblog_dash_to_none(&caps[1]),
+            weblog_dash_to_none(&caps[2]),
+            weblog_dash_to_none(&caps[3]),
+            Some(caps[4].to_string()),
+            method,
+            req_path,
+            protocol,
+            weblog_dash_to_none(&caps[6]),
+            weblog_dash_to_none(&caps[7]),
+        ];
+        if combined {
+            values.push(weblog_dash_to_none(&caps[8]));
+            values.push(weblog_dash_to_none(&caps[9]));
+        }
+        for (col_idx, value) in values.into_iter().enumerate() {
+            raw[col_idx].push(value);
+        }
+        total += 1;
+    }
+
+    let mut columns = Vec::new();
+    for (col_idx, name) in names.into_iter().enumerate() {
+        let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+        let current_type = if non_null.is_empty() {
+            "String".to_string()
+        } else {
+            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+            naive_current_type(&refs).to_string()
+        };
+        columns.push(ColumnInput {
+            name: name.to_string(),
+            current_type,
+            raw_values: non_null,
+            total,
+            skip_heuristics: false,
+        });
+    }
+    Ok(columns)
+}
+
+#[cfg(not(feature = "weblog"))]
+fn columns_from_weblog(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _combined: bool,
+) -> Result<Vec<ColumnInput>> {
+    bail!(
+        "web server log support isn't compiled in - rebuild with `cargo build --release --features weblog` (or --features full)"
+    )
 }
 
 // --- JSON / JSON Lines reader ---
@@ -2098,6 +2234,8 @@ enum InputFormat {
     FixedWidth,
     Npy,
     Npz,
+    CommonLog,
+    CombinedLog,
 }
 
 impl InputFormat {
@@ -2120,6 +2258,8 @@ impl InputFormat {
             InputFormat::FixedWidth => "fixed_width",
             InputFormat::Npy => "npy",
             InputFormat::Npz => "npz",
+            InputFormat::CommonLog => "common_log",
+            InputFormat::CombinedLog => "combined_log",
         }
     }
 }
@@ -2144,9 +2284,11 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "fixed-width" | "fixed_width" | "fwf" => Ok(InputFormat::FixedWidth),
             "npy" => Ok(InputFormat::Npy),
             "npz" => Ok(InputFormat::Npz),
+            "common-log" | "common_log" | "clf" | "common" => Ok(InputFormat::CommonLog),
+            "combined-log" | "combined_log" | "combined" => Ok(InputFormat::CombinedLog),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, or npz)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, or combined-log)"
                 )
             }
         };
@@ -2173,11 +2315,11 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "xml" => Ok(InputFormat::Xml),
         "npy" => Ok(InputFormat::Npy),
         "npz" => Ok(InputFormat::Npz),
-        // No extension convention reliably means fixed-width (.txt/.dat are
-        // used for all sorts of things), so it's --format-only, never
-        // inferred - matching how --widths must also be given explicitly.
+        // No extension convention reliably means fixed-width or an access
+        // log (.txt/.log/no extension are all ambiguous), so both are
+        // --format-only, never inferred.
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log explicitly"
         ),
     }
 }
@@ -2542,6 +2684,14 @@ pub fn run() -> Result<()> {
                     .collect()
             }
             InputFormat::Npy => columns_from_npy(&read_path, args.nrows, args.samples)?,
+            InputFormat::CommonLog => columns_from_weblog(&read_path, args.nrows, false)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+            InputFormat::CombinedLog => columns_from_weblog(&read_path, args.nrows, true)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }

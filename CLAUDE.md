@@ -4,9 +4,9 @@ A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
-CBOR, INI, XML, fixed-width text, and NumPy — any of them gzip- or
-zstd-compressed too — and writes Markdown, this tool's own rich JSON, or
-json-schema.org-standard JSON.
+CBOR, INI, XML, fixed-width text, NumPy, and Common/Combined Log Format
+access logs — any of them gzip- or zstd-compressed too — and writes
+Markdown, this tool's own rich JSON, or json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -52,11 +52,15 @@ every format. See "Testing" below.
 | zstd | any of the above + `.zst`/`.zstd` | `--features zstd` | same as gzip |
 | NumPy | `.npy` | `--features npy` | structured (record) dtype = one column per field; plain dtype = positional `col_0..col_N` (2D) or one `value` column (1D) |
 | NumPy archive | `.npz` | `--features npy` | zip of named `.npy` arrays; one table per array, like SQLite (see below) |
+| Common Log Format | *(none — `--format common-log` only)* | `--features weblog` | `host ident authuser [ts] "req" status bytes`; request splits into method/path/protocol |
+| Combined Log Format | *(none — `--format combined-log` only)* | `--features weblog` | Common Log plus `"referer" "user-agent"` |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
-text has no extension convention reliable enough to infer from at all, so
-it's reachable only via `--format fixed-width`, never auto-detected.
+text and the two access log formats have no extension convention reliable
+enough to infer from at all (access logs are commonly `.log`/`.txt`/no
+extension), so all three are reachable only via `--format`, never
+auto-detected.
 
 Every optional format has a matching Cargo feature that gates both the
 dependency (`dep:x` in `[features]`) and the reader function itself
@@ -182,6 +186,19 @@ a headerless CSV: 1D is a single `value` column, 2D gets positional
 `col_0..col_N` columns (row-major/`C` or column-major/`Fortran` order both
 handled), and anything higher-dimensional is a clear error rather than a
 guessed flattening.
+
+Common/Combined Log Format also land here (`columns_from_weblog`), via a
+fixed `regex` per format matching each grammar's exact field layout. The
+quoted `"METHOD path PROTOCOL"` request is split into its own
+`method`/`path`/`protocol` columns rather than kept as one opaque field -
+a line whose request doesn't cleanly split into three tokens just gets
+missing values there for that row, not a guessed split. `-` is each
+format's own documented placeholder for "field not present", so it's
+converted to a missing value rather than kept as a literal string. A line
+that doesn't match the chosen format's grammar at all (e.g. a Combined
+line read as `--format common-log`, which has two extra trailing quoted
+fields the Common grammar doesn't expect) is a hard error naming the line
+number, not a silent skip or a truncated parse.
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
 nest (JSON, Avro, MessagePack, TOML, YAML, CBOR, XML, Parquet's Struct/List/Map columns). This recurses: objects
@@ -339,7 +356,12 @@ Three questions determine the shape of a new reader:
    generic dynamic value type for it), see `columns_from_npy` /
    `npy_value_to_string` for the pattern: decode by hand from the format's
    own type descriptor, and fall back to a hex dump for anything not
-   representable as a simple value rather than fabricating one.
+   representable as a simple value rather than fabricating one. If it's a
+   fixed text grammar with no delimiter-based structure (a log format, a
+   report with a known layout), see `columns_from_weblog` for the pattern:
+   one `regex` per variant, split any compound fields into their own
+   columns, and hard-error with the line number on a line that doesn't
+   match rather than skip or misparse it.
 3. **Can one file hold multiple tables** (another embedded-database
    format, or anything with named sections/sheets/arrays)? Return
    `Vec<(String, Vec<ColumnProfile>)>` like `columns_from_sqlite`,
@@ -397,9 +419,11 @@ is missing, gzip/zstd transparently decompressing to their inner format
 (plus an actionable error on a corrupt/mislabeled `.gz` and on `.zst`
 without `--features zstd`), NumPy's structured-dtype-to-columns decoding
 (including that `current_type` reflects the real declared dtype, not a
-guess), its row-major positional-column reading of a plain 2D array, and
-`.npz`'s one-table-per-array output, and that Markdown output never has a
-trailing blank line.
+guess), its row-major positional-column reading of a plain 2D array,
+`.npz`'s one-table-per-array output, Combined Log's request-splitting and
+dash-as-missing conversion, Common Log's narrower column set, a
+format-mismatched log line's actionable error, and that Markdown output
+never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
