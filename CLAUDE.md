@@ -224,13 +224,14 @@ case (the same value, opposite outcome, by design), SQLite's multi-table
 output and type-affinity detection, and that Markdown output never has a
 trailing blank line.
 
-There's no unit-test layer (the binary has no `lib.rs` to unit test
-against) — everything is integration-level, black-box, output-driven. If
-this changes (e.g. the crate gets split into a lib + thin binary), the
-heuristic functions (`suggest_ideal_type`, `has_leading_zero`,
-`matching_date_format`, `describe_kinds`) are the highest-value things to
-unit test directly, since they're the part most likely to grow subtle bugs
-under a small direct test.
+The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
+binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
+black-box integration tests there's also a `#[cfg(test)] mod tests` at the
+bottom of `lib.rs` unit-testing the heuristic functions directly
+(`suggest_ideal_type`, `has_leading_zero`, `matching_date_format`,
+`describe_kinds`) — they're the part most likely to grow subtle bugs under
+a small direct test, and being private functions in the same file, they
+don't need any `pub` just to be reachable from `#[cfg(test)]`.
 
 ## Known limitations / roadmap
 
