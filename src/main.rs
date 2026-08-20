@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, NaiveDateTime};
 use clap::Parser;
 use serde_json::Value as JsonValue;
@@ -111,7 +111,10 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     }
 
     if values.iter().all(|v| is_bool_word(v)) {
-        return ("bool".to_string(), "values are yes/no/true/false".to_string());
+        return (
+            "bool".to_string(),
+            "values are yes/no/true/false".to_string(),
+        );
     }
 
     if let Some(fmt) = matching_date_format(values) {
@@ -125,11 +128,19 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     let cleaned_refs: Vec<&str> = cleaned.iter().map(|s| s.as_str()).collect();
 
     if cleaned_refs.iter().all(|v| v.parse::<i64>().is_ok()) {
-        let note = if current == "i64" { String::new() } else { "numeric strings".to_string() };
+        let note = if current == "i64" {
+            String::new()
+        } else {
+            "numeric strings".to_string()
+        };
         return ("i64".to_string(), note);
     }
     if cleaned_refs.iter().all(|v| v.parse::<f64>().is_ok()) {
-        let note = if current == "f64" { String::new() } else { "numeric strings".to_string() };
+        let note = if current == "f64" {
+            String::new()
+        } else {
+            "numeric strings".to_string()
+        };
         return ("f64".to_string(), note);
     }
 
@@ -185,7 +196,11 @@ fn columns_from_csv(path: &Path, nrows: Option<usize>, delimiter: u8) -> Result<
         }
         let record = result?;
         for (col_idx, field) in record.iter().enumerate() {
-            let value = if field.trim().is_empty() { None } else { Some(field.to_string()) };
+            let value = if field.trim().is_empty() {
+                None
+            } else {
+                Some(field.to_string())
+            };
             raw[col_idx].push(value);
         }
     }
@@ -200,7 +215,13 @@ fn columns_from_csv(path: &Path, nrows: Option<usize>, delimiter: u8) -> Result<
             let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
             naive_current_type(&refs).to_string()
         };
-        columns.push(ColumnInput { name, current_type, raw_values: non_null, total, skip_heuristics: false });
+        columns.push(ColumnInput {
+            name,
+            current_type,
+            raw_values: non_null,
+            total,
+            skip_heuristics: false,
+        });
     }
     Ok(columns)
 }
@@ -238,9 +259,16 @@ fn describe_kinds(counts: &HashMap<JsonKind, usize>) -> String {
     if counts.len() == 1 {
         return kind_label(*counts.keys().next().unwrap()).to_string();
     }
-    let mut parts: Vec<(String, usize)> = counts.iter().map(|(k, c)| (kind_label(*k).to_string(), *c)).collect();
+    let mut parts: Vec<(String, usize)> = counts
+        .iter()
+        .map(|(k, c)| (kind_label(*k).to_string(), *c))
+        .collect();
     parts.sort_by(|a, b| a.0.cmp(&b.0));
-    let inner = parts.iter().map(|(label, count)| format!("{label}: {count}")).collect::<Vec<_>>().join(", ");
+    let inner = parts
+        .iter()
+        .map(|(label, count)| format!("{label}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("mixed({inner})")
 }
 
@@ -276,8 +304,8 @@ fn read_json_records(path: &Path) -> Result<Vec<serde_json::Map<String, JsonValu
     let trimmed = content.trim_start();
 
     if trimmed.starts_with('[') {
-        let values: Vec<JsonValue> =
-            serde_json::from_str(&content).with_context(|| format!("failed to parse {path:?} as a JSON array"))?;
+        let values: Vec<JsonValue> = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse {path:?} as a JSON array"))?;
         values
             .into_iter()
             .map(|v| match v {
@@ -306,9 +334,18 @@ fn read_json_records(path: &Path) -> Result<Vec<serde_json::Map<String, JsonValu
 /// found there. Returns this path's own row followed by every descendant row
 /// (dot-notation), in order, so nested content always ends up reported, not
 /// just labelled.
-fn profile_json_path(name: String, total: usize, values: Vec<&JsonValue>, n_samples: usize) -> Vec<ColumnProfile> {
+fn profile_json_path(
+    name: String,
+    total: usize,
+    values: Vec<&JsonValue>,
+    n_samples: usize,
+) -> Vec<ColumnProfile> {
     let missing = total.saturating_sub(values.len());
-    let missing_pct = round1(if total > 0 { missing as f64 / total as f64 * 100.0 } else { 0.0 });
+    let missing_pct = round1(if total > 0 {
+        missing as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    });
 
     if values.is_empty() {
         return vec![ColumnProfile {
@@ -323,7 +360,13 @@ fn profile_json_path(name: String, total: usize, values: Vec<&JsonValue>, n_samp
     }
 
     let (pool, saw_array) = unwrap_arrays(&values);
-    let wrap = |s: &str| if saw_array { format!("Vec<{s}>") } else { s.to_string() };
+    let wrap = |s: &str| {
+        if saw_array {
+            format!("Vec<{s}>")
+        } else {
+            s.to_string()
+        }
+    };
 
     let mut kind_counts: HashMap<JsonKind, usize> = HashMap::new();
     let mut scalar_raw: Vec<String> = Vec::new();
@@ -340,7 +383,11 @@ fn profile_json_path(name: String, total: usize, values: Vec<&JsonValue>, n_samp
                 scalar_raw.push(b.to_string());
             }
             JsonValue::Number(n) => {
-                let k = if n.is_i64() || n.is_u64() { JsonKind::Integer } else { JsonKind::Float };
+                let k = if n.is_i64() || n.is_u64() {
+                    JsonKind::Integer
+                } else {
+                    JsonKind::Float
+                };
                 *kind_counts.entry(k).or_insert(0) += 1;
                 scalar_raw.push(n.to_string());
             }
@@ -348,15 +395,25 @@ fn profile_json_path(name: String, total: usize, values: Vec<&JsonValue>, n_samp
                 *kind_counts.entry(JsonKind::Str).or_insert(0) += 1;
                 scalar_raw.push(s.clone());
             }
-            JsonValue::Null | JsonValue::Array(_) => unreachable!("unwrap_arrays already removed these"),
+            JsonValue::Null | JsonValue::Array(_) => {
+                unreachable!("unwrap_arrays already removed these")
+            }
         }
     }
 
     let (current_type, ideal_type, mut notes) = if pool.is_empty() {
         // saw_array must be true here: values was non-empty but every array found was empty.
-        (wrap("empty"), wrap("empty"), "array is always empty - can't infer an element type".to_string())
+        (
+            wrap("empty"),
+            wrap("empty"),
+            "array is always empty - can't infer an element type".to_string(),
+        )
     } else if !object_maps.is_empty() && scalar_raw.is_empty() {
-        (wrap("object"), wrap("struct"), format!("flattened into {name}.* below"))
+        (
+            wrap("object"),
+            wrap("struct"),
+            format!("flattened into {name}.* below"),
+        )
     } else if !scalar_raw.is_empty() && object_maps.is_empty() {
         let base_current = describe_kinds(&kind_counts);
         let refs: Vec<&str> = scalar_raw.iter().map(|s| s.as_str()).collect();
@@ -364,19 +421,27 @@ fn profile_json_path(name: String, total: usize, values: Vec<&JsonValue>, n_samp
         (wrap(&base_current), wrap(&ideal), note)
     } else {
         let base_current = describe_kinds(&kind_counts);
-        let note = format!("mix of scalars and objects - object fields listed separately under {name}.*");
+        let note =
+            format!("mix of scalars and objects - object fields listed separately under {name}.*");
         (wrap(&base_current), wrap("String"), note)
     };
 
     if missing_pct > 0.0 {
         let extra = "has missing values -> wrap in Option<T> / handle nulls";
-        notes = if notes.is_empty() { extra.to_string() } else { format!("{notes}; {extra}") };
+        notes = if notes.is_empty() {
+            extra.to_string()
+        } else {
+            format!("{notes}; {extra}")
+        };
     }
 
     let sample_pool: Vec<String> = if !scalar_raw.is_empty() {
         scalar_raw.clone()
     } else {
-        object_maps.iter().map(|m| JsonValue::Object((*m).clone()).to_string()).collect()
+        object_maps
+            .iter()
+            .map(|m| JsonValue::Object((*m).clone()).to_string())
+            .collect()
     };
     let mut seen = HashSet::new();
     let mut samples = Vec::new();
@@ -411,9 +476,17 @@ fn profile_json_path(name: String, total: usize, values: Vec<&JsonValue>, n_samp
         }
         let child_total = object_maps.len();
         for key in order {
-            let child_values: Vec<&JsonValue> =
-                object_maps.iter().filter_map(|m| m.get(&key)).filter(|v| !v.is_null()).collect();
-            result.extend(profile_json_path(format!("{name}.{key}"), child_total, child_values, n_samples));
+            let child_values: Vec<&JsonValue> = object_maps
+                .iter()
+                .filter_map(|m| m.get(&key))
+                .filter(|v| !v.is_null())
+                .collect();
+            result.extend(profile_json_path(
+                format!("{name}.{key}"),
+                child_total,
+                child_values,
+                n_samples,
+            ));
         }
     }
 
@@ -423,7 +496,10 @@ fn profile_json_path(name: String, total: usize, values: Vec<&JsonValue>, n_samp
 /// Shared by any format that decodes to a list of named-field records
 /// (JSON files today, Avro below) - extracts top-level columns in
 /// first-seen order and profiles each, recursing into nested content.
-fn profile_json_records(records: &[serde_json::Map<String, JsonValue>], n_samples: usize) -> Vec<ColumnProfile> {
+fn profile_json_records(
+    records: &[serde_json::Map<String, JsonValue>],
+    n_samples: usize,
+) -> Vec<ColumnProfile> {
     let total = records.len();
     let mut order: Vec<String> = Vec::new();
     let mut seen_keys = HashSet::new();
@@ -437,14 +513,21 @@ fn profile_json_records(records: &[serde_json::Map<String, JsonValue>], n_sample
 
     let mut out = Vec::new();
     for name in order {
-        let values: Vec<&JsonValue> =
-            records.iter().filter_map(|r| r.get(&name)).filter(|v| !v.is_null()).collect();
+        let values: Vec<&JsonValue> = records
+            .iter()
+            .filter_map(|r| r.get(&name))
+            .filter(|v| !v.is_null())
+            .collect();
         out.extend(profile_json_path(name, total, values, n_samples));
     }
     out
 }
 
-fn columns_from_json(path: &Path, nrows: Option<usize>, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+fn columns_from_json(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
     let mut records = read_json_records(path)?;
     if let Some(n) = nrows {
         records.truncate(n);
@@ -475,7 +558,9 @@ fn arrow_type_label(dt: &arrow::datatypes::DataType) -> String {
         DataType::Date32 | DataType::Date64 => "Date".to_string(),
         DataType::Timestamp(..) => "Timestamp".to_string(),
         DataType::Decimal128(..) | DataType::Decimal256(..) => "Decimal".to_string(),
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) => "List".to_string(),
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) => {
+            "List".to_string()
+        }
         DataType::Struct(_) => "Struct".to_string(),
         other => format!("{other:?}"),
     }
@@ -486,7 +571,10 @@ fn is_nested_arrow_type(dt: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::DataType;
     matches!(
         dt,
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) | DataType::Struct(_)
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(..)
+            | DataType::Struct(_)
     )
 }
 
@@ -499,15 +587,25 @@ fn is_nested_arrow_type(dt: &arrow::datatypes::DataType) -> bool {
 fn profile_arrow_batches(
     path: &Path,
     schema: &arrow::datatypes::Schema,
-    reader: impl Iterator<Item = std::result::Result<arrow::record_batch::RecordBatch, arrow::error::ArrowError>>,
+    reader: impl Iterator<
+        Item = std::result::Result<arrow::record_batch::RecordBatch, arrow::error::ArrowError>,
+    >,
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
     use arrow::util::display::array_value_to_string;
 
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-    let nested: Vec<bool> = schema.fields().iter().map(|f| is_nested_arrow_type(f.data_type())).collect();
-    let type_labels: Vec<String> = schema.fields().iter().map(|f| arrow_type_label(f.data_type())).collect();
+    let nested: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| is_nested_arrow_type(f.data_type()))
+        .collect();
+    let type_labels: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow_type_label(f.data_type()))
+        .collect();
     let any_nested = nested.iter().any(|&n| n);
 
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
@@ -515,12 +613,17 @@ fn profile_arrow_batches(
     let mut rows_read = 0usize;
 
     'batches: for batch_result in reader {
-        let batch = batch_result.with_context(|| format!("failed reading a batch from {path:?}"))?;
+        let batch =
+            batch_result.with_context(|| format!("failed reading a batch from {path:?}"))?;
 
         let json_rows: Vec<serde_json::Map<String, JsonValue>> = if any_nested {
             let mut writer = arrow::json::writer::ArrayWriter::new(Vec::new());
-            writer.write(&batch).with_context(|| format!("failed converting a batch to JSON in {path:?}"))?;
-            writer.finish().with_context(|| format!("failed finishing JSON conversion in {path:?}"))?;
+            writer
+                .write(&batch)
+                .with_context(|| format!("failed converting a batch to JSON in {path:?}"))?;
+            writer
+                .finish()
+                .with_context(|| format!("failed finishing JSON conversion in {path:?}"))?;
             let buf = writer.into_inner();
             serde_json::from_slice(&buf)
                 .with_context(|| format!("failed parsing converted JSON for a batch in {path:?}"))?
@@ -534,7 +637,10 @@ fn profile_arrow_batches(
             }
             for (col_idx, array) in batch.columns().iter().enumerate() {
                 if nested[col_idx] {
-                    let found = json_rows.get(row).and_then(|m| m.get(&names[col_idx])).filter(|v| !v.is_null());
+                    let found = json_rows
+                        .get(row)
+                        .and_then(|m| m.get(&names[col_idx]))
+                        .filter(|v| !v.is_null());
                     if let Some(v) = found {
                         nested_values[col_idx].push(v.clone());
                     }
@@ -572,7 +678,11 @@ fn profile_arrow_batches(
 }
 
 #[cfg(feature = "parquet")]
-fn columns_from_parquet(path: &Path, nrows: Option<usize>, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+fn columns_from_parquet(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
 
@@ -580,30 +690,48 @@ fn columns_from_parquet(path: &Path, nrows: Option<usize>, n_samples: usize) -> 
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("failed to read parquet metadata from {path:?}"))?;
     let schema = builder.schema().clone();
-    let reader = builder.build().with_context(|| format!("failed to build a reader for {path:?}"))?;
+    let reader = builder
+        .build()
+        .with_context(|| format!("failed to build a reader for {path:?}"))?;
     profile_arrow_batches(path, &schema, reader, nrows, n_samples)
 }
 
 #[cfg(not(feature = "parquet"))]
-fn columns_from_parquet(_path: &Path, _nrows: Option<usize>, _n_samples: usize) -> Result<Vec<ColumnProfile>> {
-    bail!("Parquet support isn't compiled in - rebuild with `cargo build --release --features parquet` (or --features full)")
+fn columns_from_parquet(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "Parquet support isn't compiled in - rebuild with `cargo build --release --features parquet` (or --features full)"
+    )
 }
 
 #[cfg(feature = "parquet")]
-fn columns_from_arrow_ipc(path: &Path, nrows: Option<usize>, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+fn columns_from_arrow_ipc(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
     use arrow::ipc::reader::FileReader;
     use std::fs::File;
 
     let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let reader =
-        FileReader::try_new(file, None).with_context(|| format!("failed to read Arrow IPC/Feather file {path:?}"))?;
+    let reader = FileReader::try_new(file, None)
+        .with_context(|| format!("failed to read Arrow IPC/Feather file {path:?}"))?;
     let schema = reader.schema();
     profile_arrow_batches(path, schema.as_ref(), reader, nrows, n_samples)
 }
 
 #[cfg(not(feature = "parquet"))]
-fn columns_from_arrow_ipc(_path: &Path, _nrows: Option<usize>, _n_samples: usize) -> Result<Vec<ColumnProfile>> {
-    bail!("Arrow IPC/Feather support isn't compiled in - rebuild with `cargo build --release --features parquet` (or --features full)")
+fn columns_from_arrow_ipc(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "Arrow IPC/Feather support isn't compiled in - rebuild with `cargo build --release --features parquet` (or --features full)"
+    )
 }
 
 // --- Avro reader (opt-in via --features avro) ---
@@ -620,40 +748,59 @@ fn avro_value_to_json(v: &apache_avro::types::Value) -> JsonValue {
         AvroValue::Long(i) | AvroValue::TimestampMillis(i) | AvroValue::TimestampMicros(i) => {
             JsonValue::Number((*i).into())
         }
-        AvroValue::Float(f) => serde_json::Number::from_f64(f64::from(*f)).map_or(JsonValue::Null, JsonValue::Number),
-        AvroValue::Double(f) => serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number),
+        AvroValue::Float(f) => {
+            serde_json::Number::from_f64(f64::from(*f)).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        AvroValue::Double(f) => {
+            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+        }
         AvroValue::String(s) | AvroValue::Enum(_, s) => JsonValue::String(s.clone()),
         AvroValue::Bytes(b) | AvroValue::Fixed(_, b) => {
             JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
         }
         AvroValue::Union(_, inner) => avro_value_to_json(inner),
         AvroValue::Array(items) => JsonValue::Array(items.iter().map(avro_value_to_json).collect()),
-        AvroValue::Map(m) => JsonValue::Object(m.iter().map(|(k, v)| (k.clone(), avro_value_to_json(v))).collect()),
-        AvroValue::Record(fields) => {
-            JsonValue::Object(fields.iter().map(|(k, v)| (k.clone(), avro_value_to_json(v))).collect())
-        }
+        AvroValue::Map(m) => JsonValue::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), avro_value_to_json(v)))
+                .collect(),
+        ),
+        AvroValue::Record(fields) => JsonValue::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), avro_value_to_json(v)))
+                .collect(),
+        ),
         AvroValue::Date(days) => chrono::DateTime::UNIX_EPOCH
             .checked_add_signed(chrono::Duration::days(i64::from(*days)))
-            .map_or(JsonValue::Null, |d| JsonValue::String(d.format("%Y-%m-%d").to_string())),
+            .map_or(JsonValue::Null, |d| {
+                JsonValue::String(d.format("%Y-%m-%d").to_string())
+            }),
         AvroValue::Uuid(u) => JsonValue::String(u.to_string()),
         other => JsonValue::String(format!("{other:?}")), // best-effort for Decimal/Duration/local timestamps etc.
     }
 }
 
 #[cfg(feature = "avro")]
-fn columns_from_avro(path: &Path, nrows: Option<usize>, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+fn columns_from_avro(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
     use apache_avro::Reader as AvroReader;
     use std::fs::File;
 
     let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let reader = AvroReader::new(file).with_context(|| format!("failed to read Avro file {path:?}"))?;
+    let reader =
+        AvroReader::new(file).with_context(|| format!("failed to read Avro file {path:?}"))?;
 
     let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
     for (i, value_result) in reader.enumerate() {
         if nrows.is_some_and(|limit| i >= limit) {
             break;
         }
-        let value = value_result.with_context(|| format!("failed decoding a record from {path:?}"))?;
+        let value =
+            value_result.with_context(|| format!("failed decoding a record from {path:?}"))?;
         match avro_value_to_json(&value) {
             JsonValue::Object(m) => records.push(m),
             _ => bail!("expected each Avro record to decode to an object in {path:?}"),
@@ -663,17 +810,24 @@ fn columns_from_avro(path: &Path, nrows: Option<usize>, n_samples: usize) -> Res
 }
 
 #[cfg(not(feature = "avro"))]
-fn columns_from_avro(_path: &Path, _nrows: Option<usize>, _n_samples: usize) -> Result<Vec<ColumnProfile>> {
-    bail!("Avro support isn't compiled in - rebuild with `cargo build --release --features avro` (or --features full)")
+fn columns_from_avro(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "Avro support isn't compiled in - rebuild with `cargo build --release --features avro` (or --features full)"
+    )
 }
 
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 
 #[cfg(feature = "xlsx")]
 fn columns_from_xlsx(path: &Path, nrows: Option<usize>) -> Result<Vec<ColumnInput>> {
-    use calamine::{open_workbook_auto, DataType as _, Reader};
+    use calamine::{DataType as _, Reader, open_workbook_auto};
 
-    let mut workbook = open_workbook_auto(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut workbook =
+        open_workbook_auto(path).with_context(|| format!("failed to open {path:?}"))?;
     let sheet_name = workbook
         .sheet_names()
         .first()
@@ -684,7 +838,9 @@ fn columns_from_xlsx(path: &Path, nrows: Option<usize>) -> Result<Vec<ColumnInpu
         .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
 
     let mut rows = range.rows();
-    let header_row = rows.next().ok_or_else(|| anyhow::anyhow!("sheet '{sheet_name}' in {path:?} is empty"))?;
+    let header_row = rows
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("sheet '{sheet_name}' in {path:?} is empty"))?;
     let headers: Vec<String> = header_row.iter().map(|c| c.to_string()).collect();
 
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
@@ -711,14 +867,22 @@ fn columns_from_xlsx(path: &Path, nrows: Option<usize>) -> Result<Vec<ColumnInpu
             let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
             naive_current_type(&refs).to_string()
         };
-        columns.push(ColumnInput { name, current_type, raw_values: non_null, total, skip_heuristics: false });
+        columns.push(ColumnInput {
+            name,
+            current_type,
+            raw_values: non_null,
+            total,
+            skip_heuristics: false,
+        });
     }
     Ok(columns)
 }
 
 #[cfg(not(feature = "xlsx"))]
 fn columns_from_xlsx(_path: &Path, _nrows: Option<usize>) -> Result<Vec<ColumnInput>> {
-    bail!("Excel support isn't compiled in - rebuild with `cargo build --release --features xlsx` (or --features full)")
+    bail!(
+        "Excel support isn't compiled in - rebuild with `cargo build --release --features xlsx` (or --features full)"
+    )
 }
 
 // --- SQLite reader (opt-in via --features sqlite) ---
@@ -736,14 +900,22 @@ fn describe_sql_kinds(counts: &HashMap<&'static str, usize>) -> String {
     }
     let mut parts: Vec<(&str, usize)> = counts.iter().map(|(k, c)| (*k, *c)).collect();
     parts.sort_by(|a, b| a.0.cmp(b.0));
-    let inner = parts.iter().map(|(label, count)| format!("{label}: {count}")).collect::<Vec<_>>().join(", ");
+    let inner = parts
+        .iter()
+        .map(|(label, count)| format!("{label}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("mixed({inner})")
 }
 
 #[cfg(feature = "sqlite")]
-fn columns_from_sqlite(path: &Path, nrows: Option<usize>, n_samples: usize) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-    use rusqlite::types::ValueRef;
+fn columns_from_sqlite(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
     use rusqlite::Connection;
+    use rusqlite::types::ValueRef;
 
     let conn = Connection::open(path).with_context(|| format!("failed to open {path:?}"))?;
     let mut table_stmt = conn
@@ -765,19 +937,26 @@ fn columns_from_sqlite(path: &Path, nrows: Option<usize>, n_samples: usize) -> R
             Some(n) => format!("SELECT * FROM \"{table}\" LIMIT {n}"),
             None => format!("SELECT * FROM \"{table}\""),
         };
-        let mut stmt = conn.prepare(&query).with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
+        let mut stmt = conn
+            .prepare(&query)
+            .with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
         let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let n_cols = col_names.len();
 
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
         let mut kind_counts: Vec<HashMap<&'static str, usize>> = vec![HashMap::new(); n_cols];
 
-        let mut rows = stmt.query([]).with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
-        while let Some(row) = rows.next().with_context(|| format!("failed reading a row from '{table}' in {path:?}"))? {
+        let mut rows = stmt
+            .query([])
+            .with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
+        while let Some(row) = rows
+            .next()
+            .with_context(|| format!("failed reading a row from '{table}' in {path:?}"))?
+        {
             for i in 0..n_cols {
-                let value_ref = row
-                    .get_ref(i)
-                    .with_context(|| format!("failed reading a value from '{table}' in {path:?}"))?;
+                let value_ref = row.get_ref(i).with_context(|| {
+                    format!("failed reading a value from '{table}' in {path:?}")
+                })?;
                 let value = match value_ref {
                     ValueRef::Null => None,
                     ValueRef::Integer(v) => {
@@ -804,9 +983,18 @@ fn columns_from_sqlite(path: &Path, nrows: Option<usize>, n_samples: usize) -> R
         let mut profiles = Vec::new();
         for (i, name) in col_names.into_iter().enumerate() {
             let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
-            let current_type =
-                if kind_counts[i].is_empty() { "null".to_string() } else { describe_sql_kinds(&kind_counts[i]) };
-            let col = ColumnInput { name, current_type, raw_values: non_null, total: raw[i].len(), skip_heuristics: false };
+            let current_type = if kind_counts[i].is_empty() {
+                "null".to_string()
+            } else {
+                describe_sql_kinds(&kind_counts[i])
+            };
+            let col = ColumnInput {
+                name,
+                current_type,
+                raw_values: non_null,
+                total: raw[i].len(),
+                skip_heuristics: false,
+            };
             profiles.push(profile_column(col, n_samples));
         }
         out.push((table, profiles));
@@ -815,8 +1003,14 @@ fn columns_from_sqlite(path: &Path, nrows: Option<usize>, n_samples: usize) -> R
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn columns_from_sqlite(_path: &Path, _nrows: Option<usize>, _n_samples: usize) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-    bail!("SQLite support isn't compiled in - rebuild with `cargo build --release --features sqlite` (or --features full)")
+fn columns_from_sqlite(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "SQLite support isn't compiled in - rebuild with `cargo build --release --features sqlite` (or --features full)"
+    )
 }
 
 // --- Format detection ---
@@ -859,11 +1053,17 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "xlsx" | "xls" | "xlsb" | "ods" => Ok(InputFormat::Xlsx),
             "sqlite" | "db" => Ok(InputFormat::Sqlite),
             other => {
-                bail!("unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, or sqlite)")
+                bail!(
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, or sqlite)"
+                )
             }
         };
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     match ext.as_str() {
         "csv" => Ok(InputFormat::Csv),
         "tsv" => Ok(InputFormat::Tsv),
@@ -884,12 +1084,19 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
 fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
     let non_null = &col.raw_values;
     let missing = col.total.saturating_sub(non_null.len());
-    let missing_pct = round1(if col.total > 0 { missing as f64 / col.total as f64 * 100.0 } else { 0.0 });
+    let missing_pct = round1(if col.total > 0 {
+        missing as f64 / col.total as f64 * 100.0
+    } else {
+        0.0
+    });
 
     let (ideal_type, mut notes) = if non_null.is_empty() {
         ("String".to_string(), "column is empty/all null".to_string())
     } else if col.skip_heuristics {
-        ("String".to_string(), "nested value (array/object) - consider flattening before typing".to_string())
+        (
+            "String".to_string(),
+            "nested value (array/object) - consider flattening before typing".to_string(),
+        )
     } else {
         let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
         suggest_ideal_type(&refs, &col.current_type)
@@ -897,7 +1104,11 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
 
     if missing_pct > 0.0 {
         let extra = "has missing values -> wrap in Option<T> / handle nulls";
-        notes = if notes.is_empty() { extra.to_string() } else { format!("{notes}; {extra}") };
+        notes = if notes.is_empty() {
+            extra.to_string()
+        } else {
+            format!("{notes}; {extra}")
+        };
     }
 
     let mut seen = HashSet::new();
@@ -950,14 +1161,22 @@ fn render_markdown(file_name: &str, tables: &BTreeMap<String, Vec<ColumnProfile>
     md
 }
 
-fn render_json(file_name: &str, format: &InputFormat, tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Result<String> {
+fn render_json(
+    file_name: &str,
+    format: &InputFormat,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> Result<String> {
     #[derive(serde::Serialize)]
     struct DataDictionary<'a> {
         file: &'a str,
         format: &'a str,
         tables: &'a BTreeMap<String, Vec<ColumnProfile>>,
     }
-    let doc = DataDictionary { file: file_name, format: format.as_str(), tables };
+    let doc = DataDictionary {
+        file: file_name,
+        format: format.as_str(),
+        tables,
+    };
     serde_json::to_string_pretty(&doc).context("failed to serialize JSON output")
 }
 
@@ -971,27 +1190,51 @@ fn main() -> Result<()> {
     };
 
     let format = detect_format(&args.input_path, &args.format)?;
-    let file_name = args.input_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let file_stem = args.input_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let file_name = args
+        .input_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let file_stem = args
+        .input_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
 
     // Every format ends up as the same shape - a table name mapped to its column
     // profiles - so JSON/Markdown rendering never needs to special-case SQLite's
     // multiple tables vs. everything else's single implicit one.
     let tables: BTreeMap<String, Vec<ColumnProfile>> = if matches!(format, InputFormat::Sqlite) {
-        columns_from_sqlite(&args.input_path, args.nrows, args.samples)?.into_iter().collect()
+        columns_from_sqlite(&args.input_path, args.nrows, args.samples)?
+            .into_iter()
+            .collect()
     } else {
         let profiles: Vec<ColumnProfile> = match format {
-            InputFormat::Csv => columns_from_csv(&args.input_path, args.nrows, args.delimiter.unwrap_or(',') as u8)?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
-            InputFormat::Tsv => columns_from_csv(&args.input_path, args.nrows, args.delimiter.unwrap_or('\t') as u8)?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
+            InputFormat::Csv => columns_from_csv(
+                &args.input_path,
+                args.nrows,
+                args.delimiter.unwrap_or(',') as u8,
+            )?
+            .into_iter()
+            .map(|c| profile_column(c, args.samples))
+            .collect(),
+            InputFormat::Tsv => columns_from_csv(
+                &args.input_path,
+                args.nrows,
+                args.delimiter.unwrap_or('\t') as u8,
+            )?
+            .into_iter()
+            .map(|c| profile_column(c, args.samples))
+            .collect(),
             InputFormat::Json => columns_from_json(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::Parquet => columns_from_parquet(&args.input_path, args.nrows, args.samples)?,
-            InputFormat::ArrowIpc => columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Parquet => {
+                columns_from_parquet(&args.input_path, args.nrows, args.samples)?
+            }
+            InputFormat::ArrowIpc => {
+                columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?
+            }
             InputFormat::Avro => columns_from_avro(&args.input_path, args.nrows, args.samples)?,
             InputFormat::Xlsx => columns_from_xlsx(&args.input_path, args.nrows)?
                 .into_iter()
@@ -1018,10 +1261,21 @@ fn main() -> Result<()> {
         print!("{rendered}");
         eprintln!("{table_count} tables, {col_count} columns -> (stdout)");
     } else {
-        let default_ext = if output_json { "dictionary.json" } else { "dictionary.md" };
-        let output_path = args.output_path.clone().unwrap_or_else(|| args.input_path.with_extension(default_ext));
-        fs::write(&output_path, &rendered).with_context(|| format!("failed to write {output_path:?}"))?;
-        eprintln!("{table_count} tables, {col_count} columns -> {}", output_path.display());
+        let default_ext = if output_json {
+            "dictionary.json"
+        } else {
+            "dictionary.md"
+        };
+        let output_path = args
+            .output_path
+            .clone()
+            .unwrap_or_else(|| args.input_path.with_extension(default_ext));
+        fs::write(&output_path, &rendered)
+            .with_context(|| format!("failed to write {output_path:?}"))?;
+        eprintln!(
+            "{table_count} tables, {col_count} columns -> {}",
+            output_path.display()
+        );
     }
 
     Ok(())
