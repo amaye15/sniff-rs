@@ -322,6 +322,28 @@ fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {
     assert_eq!(server_names["missing_pct"].as_f64().unwrap(), 0.0);
 }
 
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_reads_a_multi_document_stream_as_one_record_per_document() {
+    let doc = run_json("sample.yaml", &[]);
+    let cols = table(&doc, "sample");
+
+    // 3 `---`-separated documents in the fixture -> 3 pooled records.
+    let user_id = column(cols, "user_id");
+    assert_eq!(user_id["sample_values"].as_array().unwrap().len(), 3);
+    assert_eq!(user_id["missing_pct"].as_f64().unwrap(), 0.0);
+
+    let zip = column(cols, "zip_code");
+    assert!(zip["notes"].as_str().unwrap().contains("leading zeros"));
+
+    let date = column(cols, "signup_date");
+    assert_eq!(date["ideal_type"], "NaiveDate / DateTime");
+
+    // "active" only appears in 1 of the 3 documents.
+    let active = column(cols, "active");
+    assert!((active["missing_pct"].as_f64().unwrap() - 66.7).abs() < 0.01);
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_writer_silently_mangling_a_zip_code_gets_caught() {

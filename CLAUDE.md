@@ -3,8 +3,9 @@
 A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
-Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, and TOML, and
-writes Markdown, this tool's own rich JSON, or json-schema.org-standard JSON.
+Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, and
+YAML, and writes Markdown, this tool's own rich JSON, or json-schema.org-
+standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -40,6 +41,7 @@ every format. See "Testing" below.
 | SQLite | `.db`, `.sqlite`, `.sqlite3` | `--features sqlite` | one section per table (see below) |
 | MessagePack | `.msgpack`, `.mp` | `--features msgpack` | stream of concatenated records, or a single top-level array |
 | TOML | `.toml` | `--features toml` | whole document = one row; array-of-tables flattens like a nested JSON array |
+| YAML | `.yaml`, `.yml` | `--features yaml` | single mapping = one row, single sequence = array-of-records, `---`-multi-doc = one row per document |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous.
@@ -130,7 +132,7 @@ engine (`suggest_ideal_type`) over the raw strings to produce a
 `ColumnProfile`.
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
-nest (JSON, Avro, MessagePack, TOML, Parquet's Struct/List/Map columns). This recurses: objects
+nest (JSON, Avro, MessagePack, TOML, YAML, Parquet's Struct/List/Map columns). This recurses: objects
 flatten into dot-notation sub-columns (`metadata.risk_score`), arrays get
 unwrapped and pooled (nested arrays flatten transparently), and the result
 is *this path's own row followed by every descendant row*, so nesting is
@@ -149,13 +151,21 @@ flattener**, rather than reimplementing recursion per format:
   elements instead, mirroring how the JSON reader treats a single top-level
   `[...]`.
 - TOML also bridges to `serde_json::Value` (`toml_value_to_json`), but with
-  a twist: unlike every other format here, a TOML file is one document, not
-  a table of many rows, so there's no natural row count to iterate. Rather
-  than invent one, the whole document is profiled as a single record
+  a twist: a TOML file is one document, not a table of many rows, so
+  there's no natural row count to iterate. Rather than invent one, the
+  whole document is profiled as a single record
   (`profile_json_records(&[record], ...)`, `total = 1`) - an array-of-tables
   section (`[[servers]]`) still becomes a `Vec<object>` column and flattens
   exactly like any other JSON array of objects would, since that part of
   the pipeline doesn't care how many top-level records it started with.
+- YAML (via `serde_norway`, a maintained fork of the archived `serde_yaml`
+  with the same API shape) bridges the same way (`yaml_value_to_json`), but
+  `columns_from_yaml` picks its record list based on what's actually in the
+  file rather than assuming one shape: a single top-level sequence is an
+  array of records (JSON's `[...]` mode); a single top-level mapping is one
+  record (TOML's whole-document-as-one-row choice); a `---`-separated
+  multi-document stream is one record per document (YAML's own equivalent
+  of JSON Lines, but self-delimiting rather than newline-delimited).
 - Parquet/Arrow IPC's Struct/List/Map columns get bridged through Arrow's
   own JSON writer (`arrow::json::writer::ArrayWriter`) into the same
   `serde_json::Map` shape, then call `profile_json_path` directly (a Map
@@ -230,14 +240,17 @@ for, and it's left to a human.
 Three questions determine the shape of a new reader:
 
 1. **Is it naturally row-oriented and possibly nested** (a record format
-   like Avro, MessagePack, or a config-like format such as YAML)? Decode
-   each record to `serde_json::Value` (or bridge to one) and call
-   `profile_json_records`. This is almost always the least code for a new
-   format — see `columns_from_avro` or `columns_from_msgpack` for the
-   pattern (both under ~40 lines including the value-conversion helper), or
-   `columns_from_toml` for the variant where the format is a single
-   document rather than many records (profile it as one record instead of
-   inventing a fake row count).
+   like Avro or MessagePack)? Decode each record to `serde_json::Value` (or
+   bridge to one) and call `profile_json_records`. This is almost always
+   the least code for a new format — see `columns_from_avro` or
+   `columns_from_msgpack` for the pattern (both under ~40 lines including
+   the value-conversion helper). If the format is naturally a single
+   document rather than many records (TOML), or can be either depending on
+   the file (YAML), see `columns_from_toml` / `columns_from_yaml` — profile
+   a lone document as one record rather than inventing a fake row count,
+   and pick the record list based on what's actually in the file (a
+   top-level sequence vs. a top-level mapping vs., for formats that support
+   it, a multi-document stream) rather than assuming one shape.
 2. **Is it flat/columnar with no nesting** (fixed-width text, a new
    spreadsheet-like format)? Build `Vec<ColumnInput>` (name, current_type,
    raw string values, total count) and map through `profile_column`. See
@@ -288,8 +301,9 @@ flattening and dictionary-encoding resolution, Excel's does-lose-data case
 output, SQLite's multi-table output and type-affinity detection, the
 `json-schema` output's type mapping and nullability handling, MessagePack's
 concatenated-records reading and its no-data-loss-on-strings case, TOML's
-whole-document-as-one-row profiling and array-of-tables flattening, and
-that Markdown output never has a trailing blank line.
+whole-document-as-one-row profiling and array-of-tables flattening, YAML's
+multi-document-stream reading, and that Markdown output never has a
+trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

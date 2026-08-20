@@ -9,8 +9,8 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
-/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, or TOML file: one
-/// row per column, with
+/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, or YAML file:
+/// one row per column, with
 /// a current type, a heuristic "ideal" type suggestion, missing %, sample
 /// values, and a blank Description field to fill in by hand. Output is
 /// Markdown tables (default), this tool's own rich JSON (--output-format
@@ -23,14 +23,14 @@ use serde_json::json;
 /// path. Format is inferred from the file extension unless --format is
 /// given. Parquet and Arrow IPC/Feather need --features parquet; Avro needs --features avro;
 /// Excel needs --features xlsx; SQLite needs --features sqlite; MessagePack
-/// needs --features msgpack; TOML needs --features toml (or use
-/// --features full for everything).
+/// needs --features msgpack; TOML needs --features toml; YAML needs
+/// --features yaml (or use --features full for everything).
 #[derive(Parser)]
 #[command(name = "sniff-rs")]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp, .toml)
+    /// .msgpack/.mp, .toml, .yaml/.yml)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -40,7 +40,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, or toml
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, or yaml
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -998,6 +998,126 @@ fn columns_from_toml(_path: &Path, _n_samples: usize) -> Result<Vec<ColumnProfil
     )
 }
 
+// --- YAML reader (opt-in via --features yaml, via the serde_norway crate -
+// a maintained fork of the archived serde_yaml, same API shape) ---
+// YAML has three shapes a data file commonly takes, so the record list is
+// built differently depending on what's actually in the file rather than
+// assuming one: a single top-level sequence is an array of records (like
+// JSON's `[...]` mode); a single top-level mapping is one record (the
+// whole document is the row - the same choice TOML makes for its own
+// single-document format); a `---`-separated multi-document stream is one
+// record per document (YAML's own equivalent of JSON Lines).
+
+#[cfg(feature = "yaml")]
+fn yaml_key_to_string(k: &serde_norway::Value) -> String {
+    match k {
+        serde_norway::Value::String(s) => s.clone(),
+        other => match yaml_value_to_json(other) {
+            JsonValue::String(s) => s,
+            other => other.to_string(),
+        },
+    }
+}
+
+#[cfg(feature = "yaml")]
+fn yaml_value_to_json(v: &serde_norway::Value) -> JsonValue {
+    use serde_norway::Value as YamlValue;
+    match v {
+        YamlValue::Null => JsonValue::Null,
+        YamlValue::Bool(b) => JsonValue::Bool(*b),
+        YamlValue::Number(n) => n
+            .as_i64()
+            .map(JsonValue::from)
+            .or_else(|| n.as_u64().map(JsonValue::from))
+            .or_else(|| {
+                n.as_f64()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(JsonValue::Number)
+            })
+            .unwrap_or(JsonValue::Null),
+        YamlValue::String(s) => JsonValue::String(s.clone()),
+        YamlValue::Sequence(items) => {
+            JsonValue::Array(items.iter().map(yaml_value_to_json).collect())
+        }
+        YamlValue::Mapping(m) => JsonValue::Object(
+            m.iter()
+                .map(|(k, v)| (yaml_key_to_string(k), yaml_value_to_json(v)))
+                .collect(),
+        ),
+        // A tagged scalar/sequence/mapping (YAML's `!Tag value` syntax) -
+        // best-effort: keep the tag visible rather than silently dropping it.
+        YamlValue::Tagged(t) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(t.tag.to_string(), yaml_value_to_json(&t.value));
+            JsonValue::Object(obj)
+        }
+    }
+}
+
+#[cfg(feature = "yaml")]
+fn yaml_document_to_record(
+    v: serde_norway::Value,
+    path: &Path,
+) -> Result<serde_json::Map<String, JsonValue>> {
+    match yaml_value_to_json(&v) {
+        JsonValue::Object(m) => Ok(m),
+        _ => bail!("expected each YAML document/record to be a mapping in {path:?}"),
+    }
+}
+
+#[cfg(feature = "yaml")]
+fn columns_from_yaml(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use serde::Deserialize;
+
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+
+    let mut documents: Vec<serde_norway::Value> = Vec::new();
+    for doc in serde_norway::Deserializer::from_str(&content) {
+        let value = serde_norway::Value::deserialize(doc)
+            .with_context(|| format!("failed to parse a YAML document in {path:?}"))?;
+        if !value.is_null() {
+            documents.push(value);
+        }
+    }
+
+    let mut records = Vec::new();
+    match documents.len() {
+        1 => match documents.into_iter().next().unwrap() {
+            serde_norway::Value::Sequence(items) => {
+                for item in items {
+                    records.push(yaml_document_to_record(item, path)?);
+                }
+            }
+            other => records.push(yaml_document_to_record(other, path)?),
+        },
+        _ => {
+            for doc in documents {
+                records.push(yaml_document_to_record(doc, path)?);
+            }
+        }
+    }
+
+    if let Some(n) = nrows {
+        records.truncate(n);
+    }
+    Ok(profile_json_records(&records, n_samples))
+}
+
+#[cfg(not(feature = "yaml"))]
+fn columns_from_yaml(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "YAML support isn't compiled in - rebuild with `cargo build --release --features yaml` (or --features full)"
+    )
+}
+
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -1225,6 +1345,7 @@ enum InputFormat {
     Sqlite,
     MsgPack,
     Toml,
+    Yaml,
 }
 
 impl InputFormat {
@@ -1240,6 +1361,7 @@ impl InputFormat {
             InputFormat::Sqlite => "sqlite",
             InputFormat::MsgPack => "msgpack",
             InputFormat::Toml => "toml",
+            InputFormat::Yaml => "yaml",
         }
     }
 }
@@ -1257,9 +1379,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "sqlite" | "db" => Ok(InputFormat::Sqlite),
             "msgpack" | "mp" => Ok(InputFormat::MsgPack),
             "toml" => Ok(InputFormat::Toml),
+            "yaml" | "yml" => Ok(InputFormat::Yaml),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, or toml)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, or yaml)"
                 )
             }
         };
@@ -1280,8 +1403,9 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "db" | "sqlite" | "sqlite3" => Ok(InputFormat::Sqlite),
         "msgpack" | "mp" => Ok(InputFormat::MsgPack),
         "toml" => Ok(InputFormat::Toml),
+        "yaml" | "yml" => Ok(InputFormat::Yaml),
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml explicitly"
         ),
     }
 }
@@ -1559,6 +1683,7 @@ pub fn run() -> Result<()> {
                     columns_from_msgpack(&args.input_path, args.nrows, args.samples)?
                 }
                 InputFormat::Toml => columns_from_toml(&args.input_path, args.samples)?,
+                InputFormat::Yaml => columns_from_yaml(&args.input_path, args.nrows, args.samples)?,
                 InputFormat::Sqlite | InputFormat::Xlsx => unreachable!("handled above"),
             };
             std::iter::once((file_stem, profiles)).collect()
