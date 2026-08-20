@@ -318,6 +318,19 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
 
 - **No ORC.** Deliberately skipped — Rust ecosystem support is weak enough
   that it wasn't worth the dependency risk.
+- **No DuckDB.** Considered and deliberately skipped for the same reason as
+  ORC: dependency weight. `duckdb`'s `bundled` feature compiles its C++
+  engine from a tarball shipped in the crate (no network fetch, same trust
+  model as `rusqlite`'s own `bundled` feature) - that part is fine. But
+  `libduckdb-sys` also carries an HTTP+TLS client (`ureq`, `rustls`, ...)
+  plus `tar`/`zip`/`xattr` as *unconditional* build-dependencies purely to
+  support a download fallback the bundled path never uses, and `duckdb`
+  itself pulls in a second, different version of `arrow` as a plain runtime
+  dependency alongside the one this project already depends on for
+  Parquet/Arrow IPC - not deduped, just duplicated. ~40 extra crates and a
+  duplicate Arrow stack for one format was judged not worth it here; would
+  reconsider if the crate trims that footprint, or if there's a concrete
+  need for `.duckdb` files.
 - **Category-detection threshold is fixed**, not configurable: ≤50 unique
   values *and* a uniqueness ratio under 5% of total rows. Works fine at
   hundreds-plus rows; on very small files it under-triggers (nothing to do
