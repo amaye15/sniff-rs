@@ -20,7 +20,7 @@ use serde_json::Value as JsonValue;
 /// Excel needs --features xlsx; SQLite needs --features sqlite (or use
 /// --features full for everything).
 #[derive(Parser)]
-#[command(name = "csv_data_dictionary")]
+#[command(name = "sniff-rs")]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3)
@@ -1013,7 +1013,7 @@ fn main() -> Result<()> {
 
     // '-' means "write to stdout" - and when it does, the status line goes to
     // stderr so stdout stays pure output a script or agent can pipe directly
-    // (e.g. `csv_data_dictionary data.csv - --output-format json | jq .`).
+    // (e.g. `sniff-rs data.csv - --output-format json | jq .`).
     if args.output_path.as_deref() == Some(Path::new("-")) {
         print!("{rendered}");
         eprintln!("{table_count} tables, {col_count} columns -> (stdout)");

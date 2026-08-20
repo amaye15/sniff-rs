@@ -678,23 +678,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "csv_data_dictionary"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "apache-avro",
- "arrow",
- "calamine",
- "chrono",
- "clap",
- "csv",
- "parquet",
- "rusqlite",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1516,6 +1499,23 @@ name = "snap"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
+
+[[package]]
+name = "sniff-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "apache-avro",
+ "arrow",
+ "calamine",
+ "chrono",
+ "clap",
+ "csv",
+ "parquet",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "sqlite-wasm-rs"

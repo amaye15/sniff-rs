@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_csv_data_dictionary"))
+    PathBuf::from(env!("CARGO_BIN_EXE_sniff-rs"))
 }
 
 fn fixture(name: &str) -> PathBuf {

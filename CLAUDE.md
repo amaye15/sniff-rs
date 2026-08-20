@@ -1,4 +1,4 @@
-# csv_data_dictionary
+# sniff-rs
 
 A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
@@ -18,9 +18,9 @@ reason most of the code is shaped the way it is.
 cargo build --release                      # CSV/TSV/JSON/JSONL only, ~5-35s
 cargo build --release --features full      # every format, ~7-9 min clean cache
 
-./target/release/csv_data_dictionary data.csv
-./target/release/csv_data_dictionary events.jsonl out.md --samples 5
-./target/release/csv_data_dictionary warehouse.db - --output-format json | jq .
+./target/release/sniff-rs data.csv
+./target/release/sniff-rs events.jsonl out.md --samples 5
+./target/release/sniff-rs warehouse.db - --output-format json | jq .
 ```
 
 `cargo test` covers the default build; `cargo test --features full` covers
