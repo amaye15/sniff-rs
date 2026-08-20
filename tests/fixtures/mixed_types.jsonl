@@ -1,0 +1,3 @@
+{"zip_numeric": 2134, "score": 12, "flag": "yes"}
+{"zip_numeric": 90210, "score": "8.5", "flag": "no"}
+{"zip_numeric": 501, "score": 3, "flag": true}
