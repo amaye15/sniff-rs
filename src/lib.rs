@@ -10,7 +10,8 @@ use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
-/// INI, or XML file: one row per column, with a current type, a heuristic "ideal" type
+/// INI, XML, or fixed-width text file: one row per column, with a current
+/// type, a heuristic "ideal" type
 /// suggestion, missing %, sample values, and a blank Description field to
 /// fill in by hand. Output is Markdown tables (default), this tool's own
 /// rich JSON (--output-format json), or json-schema.org-vocabulary JSON
@@ -38,12 +39,17 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, or xml
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, or fixed-width
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
     #[arg(long)]
     delimiter: Option<char>,
+    /// Column widths for --format fixed-width, as comma-separated character
+    /// counts (e.g. --widths 10,5,20) - there's no delimiter to split on, so
+    /// this format only runs when widths are given explicitly
+    #[arg(long, value_delimiter = ',')]
+    widths: Option<Vec<usize>>,
     /// Output format: md (markdown tables), json (this tool's own rich shape), or
     /// json-schema (json-schema.org vocabulary, for schema-consuming tools)
     #[arg(long, default_value = "md")]
@@ -209,6 +215,83 @@ fn columns_from_csv(path: &Path, nrows: Option<usize>, delimiter: u8) -> Result<
             };
             raw[col_idx].push(value);
         }
+    }
+
+    let mut columns = Vec::new();
+    for (col_idx, name) in headers.into_iter().enumerate() {
+        let total = raw[col_idx].len();
+        let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+        let current_type = if non_null.is_empty() {
+            "String".to_string()
+        } else {
+            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+            naive_current_type(&refs).to_string()
+        };
+        columns.push(ColumnInput {
+            name,
+            current_type,
+            raw_values: non_null,
+            total,
+            skip_heuristics: false,
+        });
+    }
+    Ok(columns)
+}
+
+// --- Fixed-width text reader (only reachable via --format fixed-width,
+// since there's no reliable extension convention to infer it from) ---
+// There's no delimiter to split fields on, so column boundaries must be
+// given explicitly via --widths rather than guessed - a fuzzy "infer the
+// boundaries from whitespace alignment" heuristic could easily misparse a
+// column whose values happen to align by chance, which is exactly the kind
+// of guess this tool's design philosophy avoids (see CLAUDE.md). The first
+// line is still assumed to be a header row, same as CSV/TSV/Excel.
+
+/// Slices one line into `widths.len()` fields by character count (not byte
+/// count, so multi-byte UTF-8 doesn't split a field mid-character), padding
+/// with empty fields if the line is shorter than the declared widths.
+fn slice_fixed_width(line: &str, widths: &[usize]) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut pos = 0;
+    let mut fields = Vec::with_capacity(widths.len());
+    for &w in widths {
+        let end = (pos + w).min(chars.len());
+        let field: String = if pos < chars.len() {
+            chars[pos..end].iter().collect()
+        } else {
+            String::new()
+        };
+        fields.push(field.trim().to_string());
+        pos += w;
+    }
+    fields
+}
+
+fn columns_from_fixed_width(
+    path: &Path,
+    nrows: Option<usize>,
+    widths: &[usize],
+) -> Result<Vec<ColumnInput>> {
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let mut lines = content.lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{path:?} is empty"))?;
+    let headers = slice_fixed_width(header_line, widths);
+
+    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); widths.len()];
+    let mut i = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue; // e.g. a trailing blank line at EOF
+        }
+        if nrows.is_some_and(|limit| i >= limit) {
+            break;
+        }
+        for (col_idx, field) in slice_fixed_width(line, widths).into_iter().enumerate() {
+            raw[col_idx].push(if field.is_empty() { None } else { Some(field) });
+        }
+        i += 1;
     }
 
     let mut columns = Vec::new();
@@ -1642,6 +1725,7 @@ enum InputFormat {
     Cbor,
     Ini,
     Xml,
+    FixedWidth,
 }
 
 impl InputFormat {
@@ -1661,6 +1745,7 @@ impl InputFormat {
             InputFormat::Cbor => "cbor",
             InputFormat::Ini => "ini",
             InputFormat::Xml => "xml",
+            InputFormat::FixedWidth => "fixed_width",
         }
     }
 }
@@ -1682,9 +1767,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "cbor" => Ok(InputFormat::Cbor),
             "ini" => Ok(InputFormat::Ini),
             "xml" => Ok(InputFormat::Xml),
+            "fixed-width" | "fixed_width" | "fwf" => Ok(InputFormat::FixedWidth),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, or xml)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, or fixed-width)"
                 )
             }
         };
@@ -1709,8 +1795,11 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "cbor" => Ok(InputFormat::Cbor),
         "ini" => Ok(InputFormat::Ini),
         "xml" => Ok(InputFormat::Xml),
+        // No extension convention reliably means fixed-width (.txt/.dat are
+        // used for all sorts of things), so it's --format-only, never
+        // inferred - matching how --widths must also be given explicitly.
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width explicitly"
         ),
     }
 }
@@ -1993,6 +2082,17 @@ pub fn run() -> Result<()> {
             InputFormat::Yaml => columns_from_yaml(&args.input_path, args.nrows, args.samples)?,
             InputFormat::Cbor => columns_from_cbor(&args.input_path, args.nrows, args.samples)?,
             InputFormat::Xml => columns_from_xml(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::FixedWidth => {
+                let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
+                    )
+                })?;
+                columns_from_fixed_width(&args.input_path, args.nrows, widths)?
+                    .into_iter()
+                    .map(|c| profile_column(c, args.samples))
+                    .collect()
+            }
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini => {
                 unreachable!("handled above")
             }

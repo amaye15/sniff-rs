@@ -207,6 +207,47 @@ fn unrecognized_extension_gives_an_actionable_error_not_a_panic() {
     );
 }
 
+#[test]
+fn fixed_width_slices_columns_by_declared_character_widths() {
+    let doc = run_with_format(
+        "sample.fwf",
+        "json",
+        &["--format", "fixed-width", "--widths", "8,4,9,8"],
+    );
+    let cols = table(&doc, "sample");
+
+    let age = column(cols, "age");
+    assert_eq!(age["current_type"], "i64");
+    assert!((age["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
+
+    // Leading-zero heuristic works the same as CSV once fields are sliced.
+    let zip = column(cols, "zip_code");
+    assert_eq!(zip["current_type"], "i64");
+    assert!(zip["notes"].as_str().unwrap().contains("already lost"));
+
+    let plan = column(cols, "plan");
+    assert_eq!(plan["current_type"], "String");
+}
+
+#[test]
+fn fixed_width_without_widths_gives_an_actionable_error() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.fwf").to_str().unwrap(),
+            "-",
+            "--format",
+            "fixed-width",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--widths"),
+        "error should point at the --widths flag: {stderr}"
+    );
+}
+
 #[cfg(feature = "parquet")]
 #[test]
 fn parquet_string_column_preserves_leading_zero_with_no_data_loss() {

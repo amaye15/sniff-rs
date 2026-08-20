@@ -4,8 +4,8 @@ A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
-CBOR, INI, and XML, and writes Markdown, this tool's own rich JSON, or
-json-schema.org-standard JSON.
+CBOR, INI, XML, and fixed-width text, and writes Markdown, this tool's own
+rich JSON, or json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -45,15 +45,21 @@ every format. See "Testing" below.
 | CBOR | `.cbor` | `--features cbor` | same convention as MessagePack: concatenated records, or a single top-level array |
 | INI | `.ini` | `--features ini` | one section per table, like SQLite (see below); a repeated key pools into an array |
 | XML | `.xml` | `--features xml` | homogeneous same-tag children of the root = records; otherwise the root = one row; attributes become `@name` columns |
+| Fixed-width text | *(none — `--format fixed-width` only)* | *(default)* | needs `--widths 10,5,20`; no delimiter, so boundaries are never guessed |
 
 `--features full` enables all of the above. `--format <name>` overrides
-extension-based detection when a file is misnamed or ambiguous.
+extension-based detection when a file is misnamed or ambiguous — fixed-width
+text has no extension convention reliable enough to infer from at all, so
+it's reachable only via `--format fixed-width`, never auto-detected.
 
 Every optional format has a matching Cargo feature that gates both the
 dependency (`dep:x` in `[features]`) and the reader function itself
 (`#[cfg(feature = "x")]` with a `#[cfg(not(...))]` stub that gives a clear
 "rebuild with --features x" error rather than "unrecognized format"). Adding
-a format should follow the same shape — see the cookbook below.
+a format should follow the same shape — see the cookbook below. Fixed-width
+text is the one exception: it needs no new dependency (pure `std` string
+slicing), so it's always compiled in, gated by nothing but the required
+`--widths` flag.
 
 ## Output formats
 
@@ -278,10 +284,12 @@ Three questions determine the shape of a new reader:
    and pick the record list based on what's actually in the file (a
    top-level sequence vs. a top-level mapping vs., for formats that support
    it, a multi-document stream) rather than assuming one shape.
-2. **Is it flat/columnar with no nesting** (fixed-width text, a new
-   spreadsheet-like format)? Build `Vec<ColumnInput>` (name, current_type,
-   raw string values, total count) and map through `profile_column`. See
-   `columns_from_xlsx`.
+2. **Is it flat/columnar with no nesting** (a new spreadsheet-like format)?
+   Build `Vec<ColumnInput>` (name, current_type, raw string values, total
+   count) and map through `profile_column`. See `columns_from_xlsx` or
+   `columns_from_fixed_width` — the latter also shows what to do when
+   there's no delimiter or schema to read structure from: require it
+   explicitly (`--widths`) rather than guess at column boundaries.
 3. **Can one file hold multiple tables** (another embedded-database
    format, or anything with named sections/sheets)? Return
    `Vec<(String, Vec<ColumnProfile>)>` like `columns_from_sqlite`,
@@ -332,8 +340,9 @@ and CBOR's concatenated-records reading and their no-data-loss-on-strings
 case, TOML's whole-document-as-one-row profiling and array-of-tables
 flattening, YAML's multi-document-stream reading, INI's one-table-per-
 section output and duplicate-key pooling, XML's homogeneous-children-as-
-records detection and `@`-prefixed attribute columns, and that Markdown
-output never has a trailing blank line.
+records detection and `@`-prefixed attribute columns, fixed-width text's
+character-based column slicing and its actionable error when `--widths`
+is missing, and that Markdown output never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
