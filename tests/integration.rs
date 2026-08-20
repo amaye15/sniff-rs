@@ -399,6 +399,33 @@ fn excel_reports_one_table_per_sheet() {
     assert_eq!(in_stock["ideal_type"], "bool");
 }
 
+#[cfg(feature = "ini")]
+#[test]
+fn ini_reports_one_table_per_section_and_pools_duplicate_keys() {
+    let doc = run_json("sample.ini", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(
+        tables.len(),
+        3,
+        "fixture has a default section plus [owner] and [database]"
+    );
+
+    // Keys before the first [header] land in an implicit default section.
+    let default = table(&doc, "(default)");
+    assert!(default.iter().any(|c| c["name"] == "app_name"));
+
+    let owner = table(&doc, "owner");
+    let zip = column(owner, "zip_code");
+    assert!(zip["notes"].as_str().unwrap().contains("leading zeros"));
+
+    // INI allows a key to repeat within a section - both values should be
+    // pooled into one column rather than the second silently winning.
+    let database = table(&doc, "database");
+    let tag = column(database, "tag");
+    assert_eq!(tag["current_type"], "Vec<String>");
+    assert_eq!(tag["sample_values"].as_array().unwrap().len(), 2);
+}
+
 #[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_reports_multiple_tables_and_catches_a_type_affinity_violation() {

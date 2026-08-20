@@ -4,7 +4,7 @@ A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
-and CBOR, and writes Markdown, this tool's own rich JSON, or
+CBOR, and INI, and writes Markdown, this tool's own rich JSON, or
 json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
@@ -43,6 +43,7 @@ every format. See "Testing" below.
 | TOML | `.toml` | `--features toml` | whole document = one row; array-of-tables flattens like a nested JSON array |
 | YAML | `.yaml`, `.yml` | `--features yaml` | single mapping = one row, single sequence = array-of-records, `---`-multi-doc = one row per document |
 | CBOR | `.cbor` | `--features cbor` | same convention as MessagePack: concatenated records, or a single top-level array |
+| INI | `.ini` | `--features ini` | one section per table, like SQLite (see below); a repeated key pools into an array |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous.
@@ -188,15 +189,22 @@ Parquet and Arrow IPC additionally share one function,
 type — adding Arrow IPC support was a new file-opening call wired into
 existing logic, not new logic.
 
-SQLite and Excel are architecturally different from the rest (one file, many
-tables — SQLite's tables, Excel's sheets), so `run()` normalizes *everything*
-— single-table formats and these two alike — into
-`BTreeMap<String, Vec<ColumnProfile>>` before rendering, so the
-Markdown/JSON renderers never know or care how many tables a source had.
-`columns_from_xlsx` follows the exact shape `columns_from_sqlite` already
-established (`Vec<(String, Vec<ColumnProfile>)>`, one entry per table),
-skipping empty sheets the same way SQLite skips its own internal
-`sqlite_%` tables — no new rendering logic needed for either.
+SQLite, Excel, and INI are architecturally different from the rest (one
+file, many tables — SQLite's tables, Excel's sheets, INI's sections), so
+`run()` normalizes *everything* — single-table formats and these three
+alike — into `BTreeMap<String, Vec<ColumnProfile>>` before rendering, so
+the Markdown/JSON renderers never know or care how many tables a source
+had. `columns_from_xlsx` and `columns_from_ini` both follow the exact shape
+`columns_from_sqlite` already established
+(`Vec<(String, Vec<ColumnProfile>)>`, one entry per table) — Excel skips
+empty sheets and INI skips an absent default section the same way SQLite
+skips its own internal `sqlite_%` tables, and none of the three needed any
+new rendering logic. INI additionally has no repeating-row concept within
+a section (it's a flat set of `key=value` pairs), so each section is
+profiled as a single record via `profile_json_records`, the same choice
+TOML/YAML make for their own single-document shapes — and a key repeated
+within one section (which INI permits) pools into an array value rather
+than the second occurrence silently overwriting the first.
 
 ## Design philosophy: trust observed data, not declared types
 
@@ -261,9 +269,10 @@ Three questions determine the shape of a new reader:
    raw string values, total count) and map through `profile_column`. See
    `columns_from_xlsx`.
 3. **Can one file hold multiple tables** (another embedded-database
-   format)? Return `Vec<(String, Vec<ColumnProfile>)>` like
-   `columns_from_sqlite` and let `main()`'s `BTreeMap` unification handle
-   the rest — don't special-case rendering.
+   format, or anything with named sections/sheets)? Return
+   `Vec<(String, Vec<ColumnProfile>)>` like `columns_from_sqlite`,
+   `columns_from_xlsx`, or `columns_from_ini` and let `run()`'s `BTreeMap`
+   unification handle the rest — don't special-case rendering.
 
 Then, regardless of which shape:
 
@@ -275,7 +284,7 @@ Then, regardless of which shape:
   `bail!("... isn't compiled in - rebuild with --features ...")`.
 - Add a variant to `InputFormat`, wire it into `detect_format` (both the
   `--format` override arm and the extension-inference arm), give it a label
-  in `InputFormat::as_str`, and add a dispatch arm in `main()`.
+  in `InputFormat::as_str`, and add a dispatch arm in `run()`.
 - Build a small fixture, run it, and eyeball the output before trusting it —
   this project's whole history is heuristics that looked right and weren't
   (see "Design philosophy"). Then add a `tests/fixtures/` file and a
@@ -307,8 +316,9 @@ output, SQLite's multi-table output and type-affinity detection, the
 `json-schema` output's type mapping and nullability handling, MessagePack's
 and CBOR's concatenated-records reading and their no-data-loss-on-strings
 case, TOML's whole-document-as-one-row profiling and array-of-tables
-flattening, YAML's multi-document-stream reading, and that Markdown output
-never has a trailing blank line.
+flattening, YAML's multi-document-stream reading, INI's one-table-per-
+section output and duplicate-key pooling, and that Markdown output never
+has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

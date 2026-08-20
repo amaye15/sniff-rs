@@ -9,17 +9,18 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
-/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, or CBOR
-/// file: one row per column, with a current type, a heuristic "ideal" type
+/// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR, or
+/// INI file: one row per column, with a current type, a heuristic "ideal" type
 /// suggestion, missing %, sample values, and a blank Description field to
 /// fill in by hand. Output is Markdown tables (default), this tool's own
 /// rich JSON (--output-format json), or json-schema.org-vocabulary JSON
 /// (--output-format json-schema); any of the three can be written to
 /// stdout by passing "-" as the output path. SQLite files (one table per
-/// database table) and Excel workbooks (one table per sheet) can produce
-/// multiple tables; every other format always produces exactly one
-/// implicit table - all of it renders through the same path. Format is
-/// inferred from the file extension unless --format is given. Every
+/// database table), Excel workbooks (one table per sheet), and INI files
+/// (one table per section) can produce multiple tables; every other format
+/// always produces exactly one implicit table - all of it renders through
+/// the same path. Format is inferred from the file extension unless
+/// --format is given. Every
 /// optional format needs its own --features flag (see the Supported
 /// formats table in CLAUDE.md), or use --features full for everything.
 #[derive(Parser)]
@@ -27,7 +28,7 @@ use serde_json::json;
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor)
+    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -37,7 +38,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, or cbor
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, or ini
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -1226,6 +1227,57 @@ fn columns_from_cbor(
     )
 }
 
+// --- INI reader (opt-in via --features ini) ---
+// An INI file's sections are already "multiple named groups of key=value
+// pairs", so - like SQLite's tables and Excel's sheets - this returns one
+// profile list per section rather than assuming a single implicit table.
+// Within a section there's no repeating "row" concept (it's a flat set of
+// keys), so each section is profiled as a single record, the same choice
+// TOML/YAML make for their own single-document shapes. A key repeated
+// within one section (INI permits this) pools into one array value rather
+// than the second occurrence silently overwriting the first.
+
+#[cfg(feature = "ini")]
+fn columns_from_ini(path: &Path, n_samples: usize) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    let conf = ini::Ini::load_from_file(path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed to parse {path:?} as INI"))?;
+
+    let mut out = Vec::new();
+    for (section_name, props) in conf.iter() {
+        if props.is_empty() {
+            continue; // e.g. no general section before the first [header]
+        }
+        let mut record = serde_json::Map::new();
+        for (k, v) in props.iter() {
+            match record.get_mut(k) {
+                Some(JsonValue::Array(values)) => values.push(JsonValue::String(v.to_string())),
+                Some(existing) => {
+                    let first = existing.clone();
+                    *existing = JsonValue::Array(vec![first, JsonValue::String(v.to_string())]);
+                }
+                None => {
+                    record.insert(k.to_string(), JsonValue::String(v.to_string()));
+                }
+            }
+        }
+        let name = section_name.unwrap_or("(default)").to_string();
+        out.push((name, profile_json_records(&[record], n_samples)));
+    }
+
+    if out.is_empty() {
+        bail!("no sections found in {path:?}");
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "ini"))]
+fn columns_from_ini(_path: &Path, _n_samples: usize) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "INI support isn't compiled in - rebuild with `cargo build --release --features ini` (or --features full)"
+    )
+}
+
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -1455,6 +1507,7 @@ enum InputFormat {
     Toml,
     Yaml,
     Cbor,
+    Ini,
 }
 
 impl InputFormat {
@@ -1472,6 +1525,7 @@ impl InputFormat {
             InputFormat::Toml => "toml",
             InputFormat::Yaml => "yaml",
             InputFormat::Cbor => "cbor",
+            InputFormat::Ini => "ini",
         }
     }
 }
@@ -1491,9 +1545,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "toml" => Ok(InputFormat::Toml),
             "yaml" | "yml" => Ok(InputFormat::Yaml),
             "cbor" => Ok(InputFormat::Cbor),
+            "ini" => Ok(InputFormat::Ini),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, or cbor)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, or ini)"
                 )
             }
         };
@@ -1516,8 +1571,9 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "toml" => Ok(InputFormat::Toml),
         "yaml" | "yml" => Ok(InputFormat::Yaml),
         "cbor" => Ok(InputFormat::Cbor),
+        "ini" => Ok(InputFormat::Ini),
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini explicitly"
         ),
     }
 }
@@ -1753,54 +1809,58 @@ pub fn run() -> Result<()> {
 
     // Every format ends up as the same shape - a table name mapped to its column
     // profiles - so JSON/Markdown rendering never needs to special-case SQLite's
-    // (and Excel's) multiple tables vs. everything else's single implicit one.
-    let tables: BTreeMap<String, Vec<ColumnProfile>> =
-        if matches!(format, InputFormat::Sqlite | InputFormat::Xlsx) {
-            match format {
-                InputFormat::Sqlite => {
-                    columns_from_sqlite(&args.input_path, args.nrows, args.samples)?
-                }
-                InputFormat::Xlsx => columns_from_xlsx(&args.input_path, args.nrows, args.samples)?,
-                _ => unreachable!("handled by the outer matches! guard"),
-            }
+    // (and Excel's, and INI's) multiple tables vs. everything else's single
+    // implicit one.
+    let tables: BTreeMap<String, Vec<ColumnProfile>> = if matches!(
+        format,
+        InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini
+    ) {
+        match format {
+            InputFormat::Sqlite => columns_from_sqlite(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Xlsx => columns_from_xlsx(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Ini => columns_from_ini(&args.input_path, args.samples)?,
+            _ => unreachable!("handled by the outer matches! guard"),
+        }
+        .into_iter()
+        .collect()
+    } else {
+        let profiles: Vec<ColumnProfile> = match format {
+            InputFormat::Csv => columns_from_csv(
+                &args.input_path,
+                args.nrows,
+                args.delimiter.unwrap_or(',') as u8,
+            )?
             .into_iter()
-            .collect()
-        } else {
-            let profiles: Vec<ColumnProfile> = match format {
-                InputFormat::Csv => columns_from_csv(
-                    &args.input_path,
-                    args.nrows,
-                    args.delimiter.unwrap_or(',') as u8,
-                )?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
-                InputFormat::Tsv => columns_from_csv(
-                    &args.input_path,
-                    args.nrows,
-                    args.delimiter.unwrap_or('\t') as u8,
-                )?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
-                InputFormat::Json => columns_from_json(&args.input_path, args.nrows, args.samples)?,
-                InputFormat::Parquet => {
-                    columns_from_parquet(&args.input_path, args.nrows, args.samples)?
-                }
-                InputFormat::ArrowIpc => {
-                    columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?
-                }
-                InputFormat::Avro => columns_from_avro(&args.input_path, args.nrows, args.samples)?,
-                InputFormat::MsgPack => {
-                    columns_from_msgpack(&args.input_path, args.nrows, args.samples)?
-                }
-                InputFormat::Toml => columns_from_toml(&args.input_path, args.samples)?,
-                InputFormat::Yaml => columns_from_yaml(&args.input_path, args.nrows, args.samples)?,
-                InputFormat::Cbor => columns_from_cbor(&args.input_path, args.nrows, args.samples)?,
-                InputFormat::Sqlite | InputFormat::Xlsx => unreachable!("handled above"),
-            };
-            std::iter::once((file_stem, profiles)).collect()
+            .map(|c| profile_column(c, args.samples))
+            .collect(),
+            InputFormat::Tsv => columns_from_csv(
+                &args.input_path,
+                args.nrows,
+                args.delimiter.unwrap_or('\t') as u8,
+            )?
+            .into_iter()
+            .map(|c| profile_column(c, args.samples))
+            .collect(),
+            InputFormat::Json => columns_from_json(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Parquet => {
+                columns_from_parquet(&args.input_path, args.nrows, args.samples)?
+            }
+            InputFormat::ArrowIpc => {
+                columns_from_arrow_ipc(&args.input_path, args.nrows, args.samples)?
+            }
+            InputFormat::Avro => columns_from_avro(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::MsgPack => {
+                columns_from_msgpack(&args.input_path, args.nrows, args.samples)?
+            }
+            InputFormat::Toml => columns_from_toml(&args.input_path, args.samples)?,
+            InputFormat::Yaml => columns_from_yaml(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Cbor => columns_from_cbor(&args.input_path, args.nrows, args.samples)?,
+            InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini => {
+                unreachable!("handled above")
+            }
         };
+        std::iter::once((file_stem, profiles)).collect()
+    };
 
     let rendered = match output_format {
         OutputFormat::Markdown => render_markdown(&file_name, &tables),
