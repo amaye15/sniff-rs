@@ -5,7 +5,7 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, RFC 3164/5424 syslog, and dBase — any of them gzip- or
+logs, RFC 3164/5424 syslog, dBase, and Stata — any of them gzip- or
 zstd-compressed too — and writes Markdown, this tool's own rich JSON, or
 json-schema.org-standard JSON.
 
@@ -58,6 +58,7 @@ every format. See "Testing" below.
 | Syslog (RFC 3164) | *(none — `--format syslog` only)* | `--features syslog` | `<PRI>Mmm dd hh:mm:ss host tag[pid]: msg`; PRI decodes to facility/severity names |
 | Syslog (RFC 5424) | *(none — `--format syslog5424` only)* | `--features syslog` | structured variant: adds version/app-name/procid/msgid/structured-data |
 | dBase | `.dbf` | `--features dbase` | soft-deleted records skipped (dBase's own convention); `current_type` can reveal a Numeric field that's really an integer |
+| Stata | `.dta` | `--features stata` | every DTA release (102-119); Stata's own missing markers become missing values, not literal strings |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -203,6 +204,22 @@ field type doesn't distinguish int from float at the storage level, so
 exactly the kind of gap `ideal_type`'s independent re-derivation from the
 actual values exists to surface, the same way CSV's leading-zero check
 does for a different reason.
+
+Stata (`columns_from_stata`, via the `dta` crate) is architecturally the
+same shape again, with its own version of the same lesson: a DTA file
+marks each individual value present-or-missing explicitly (`.` through
+`.z`, decoded by the crate itself), so a `Missing` value is simply omitted
+from `raw_values` - the same treatment every other reader here already
+gives an absent value - while a genuinely present value keeps going
+through the normal `current_type`/`ideal_type` split (a Stata `double`
+column pandas wrote to hold one `NaN` alongside otherwise-integer data is
+exactly this tool's "missing values never fake a type change" principle
+in someone else's file format). A `strL` long-string reference needs a
+second read pass over a different file section to resolve, which this
+tool doesn't do, so it's a visible placeholder rather than a silent drop.
+Variable and value labels - Stata's own human-authored variable
+descriptions and coded-value names (`1`/`2`/`3` meaning
+`"male"`/`"female"`/`"other"`) - aren't surfaced; see Known limitations.
 
 Common/Combined Log Format also land here (`columns_from_weblog`), via a
 fixed `regex` per format matching each grammar's exact field layout. The
@@ -457,8 +474,10 @@ dash-as-missing conversion, Common Log's narrower column set, a
 format-mismatched log line's actionable error, syslog RFC 3164's
 PRI-to-facility/severity decoding and PID extraction, RFC 5424's
 nilvalue-as-missing handling, dBase's current-vs-ideal-type gap on a
-Numeric field that's really an integer, and that Markdown output never
-has a trailing blank line.
+Numeric field that's really an integer, Stata's missing-marker-as-absent
+handling and its own current-vs-ideal-type gap (a double column holding
+one `NaN` alongside otherwise-integer data), and that Markdown output
+never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
@@ -486,6 +505,17 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
   duplicate Arrow stack for one format was judged not worth it here; would
   reconsider if the crate trims that footprint, or if there's a concrete
   need for `.duckdb` files.
+- **Stata variable/value labels aren't surfaced.** A `.dta` file can carry
+  a human-authored description per variable (a "variable label") and a
+  named mapping for coded values (a "value label", e.g. `1`/`2`/`3` →
+  `"male"`/`"female"`/`"other"`) - both genuinely useful, authoritative
+  metadata, not a guess. Deliberately out of scope for now: surfacing them
+  well would mean either overloading the existing (always-empty)
+  `description` field with format-provided text - a different kind of
+  content than what it's documented to hold - or adding a new field to
+  `ColumnProfile`, which is shared by every format's renderer and output
+  shape. Worth adding if there's real demand; `Variable::label()` in the
+  `dta` crate already exposes the variable label.
 - **Category-detection threshold is fixed**, not configurable: ≤50 unique
   values *and* a uniqueness ratio under 5% of total rows. Works fine at
   hundreds-plus rows; on very small files it under-triggers (nothing to do

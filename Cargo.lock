@@ -885,6 +885,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dta"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dc1471d5023b6710062b4db0c09b786ac37e5bdba62a350eacd44912bc73bef"
+dependencies = [
+ "encoding_rs",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1930,6 +1939,7 @@ dependencies = [
  "clap",
  "csv",
  "dbase",
+ "dta",
  "flate2",
  "npyz",
  "parquet",

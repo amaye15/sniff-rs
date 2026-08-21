@@ -666,6 +666,28 @@ fn dbase_reveals_a_numeric_field_that_is_really_an_integer() {
     assert_eq!(signup["ideal_type"], "NaiveDate / DateTime");
 }
 
+#[cfg(feature = "stata")]
+#[test]
+fn stata_treats_missing_marker_as_absent_and_recovers_int_from_a_double() {
+    let doc = run_json("sample.dta", &[]);
+    let cols = table(&doc, "sample");
+
+    // The fixture has one NaN age - Stata's own "." missing-value marker,
+    // not a value this tool invented - omitted from raw_values entirely
+    // rather than kept as a literal string.
+    let age = column(cols, "age");
+    assert!((age["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
+
+    // pandas wrote this column as a Stata double (forced by the NaN), but
+    // the two present values are genuinely integers - ideal_type still
+    // catches that independently of current_type.
+    assert_eq!(age["current_type"], "f64");
+    assert_eq!(age["ideal_type"], "i64");
+
+    let user_id = column(cols, "user_id");
+    assert_eq!(user_id["current_type"], "String");
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {

@@ -11,7 +11,8 @@ use serde_json::json;
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
 /// INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
-/// Format access log, an RFC 3164/5424 syslog file, or dBase (.dbf): one
+/// Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), or a
+/// Stata (.dta) file: one
 /// row per column, with a current type, a heuristic "ideal" type
 /// suggestion, missing %, sample values, and a blank Description field to
 /// fill in by hand. Output is Markdown tables (default), this tool's own
@@ -34,7 +35,7 @@ struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
     /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz,
-    /// .dbf; fixed-width text and the log formats have no extension
+    /// .dbf, .dta; fixed-width text and the log formats have no extension
     /// convention and are only reachable via --format)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
@@ -45,7 +46,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, or dbase
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, or stata
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -749,6 +750,132 @@ fn columns_from_dbase(
 ) -> Result<Vec<ColumnProfile>> {
     bail!(
         "dBase support isn't compiled in - rebuild with `cargo build --release --features dbase` (or --features full)"
+    )
+}
+
+// --- Stata .dta reader (opt-in via --features stata) ---
+// Stata's own missing-value marker (`.` through `.z`) is a real, explicit
+// per-value flag in the file format, not something this tool infers - a
+// Missing value is simply omitted from raw_values, the same way every
+// other reader here treats an absent/blank value. A `strL` long-string
+// reference needs a second read pass over a separate file section to
+// resolve (not just the row bytes already in hand), which this tool
+// doesn't do - it's represented as a visible placeholder rather than
+// silently dropped or guessed at. Variable/value labels (Stata's own
+// human-authored variable descriptions and coded-value names, e.g.
+// 1/2/3 meaning "male"/"female"/"other") aren't surfaced - see CLAUDE.md's
+// Known limitations.
+
+#[cfg(feature = "stata")]
+fn stata_value_to_string(v: &dta::stata::dta::value::Value) -> Option<String> {
+    use dta::stata::dta::value::Value;
+    use dta::stata::stata_byte::StataByte;
+    use dta::stata::stata_double::StataDouble;
+    use dta::stata::stata_float::StataFloat;
+    use dta::stata::stata_int::StataInt;
+    use dta::stata::stata_long::StataLong;
+    match v {
+        Value::Byte(StataByte::Present(x)) => Some(x.to_string()),
+        Value::Byte(StataByte::Missing(_)) => None,
+        Value::Int(StataInt::Present(x)) => Some(x.to_string()),
+        Value::Int(StataInt::Missing(_)) => None,
+        Value::Long(StataLong::Present(x)) => Some(x.to_string()),
+        Value::Long(StataLong::Missing(_)) => None,
+        Value::Float(StataFloat::Present(x)) => Some(x.to_string()),
+        Value::Float(StataFloat::Missing(_)) => None,
+        Value::Double(StataDouble::Present(x)) => Some(x.to_string()),
+        Value::Double(StataDouble::Missing(_)) => None,
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Value::LongStringRef(_) => Some("<strL: long string not resolved>".to_string()),
+    }
+}
+
+#[cfg(feature = "stata")]
+fn stata_type_label(t: dta::stata::dta::variable_type::VariableType) -> &'static str {
+    use dta::stata::dta::variable_type::VariableType;
+    match t {
+        VariableType::Byte | VariableType::Int | VariableType::Long => "i64",
+        VariableType::Float | VariableType::Double => "f64",
+        VariableType::FixedString(_) | VariableType::LongString => "String",
+    }
+}
+
+#[cfg(feature = "stata")]
+fn columns_from_stata(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use dta::stata::dta::dta_reader::DtaReader;
+
+    let mut characteristic_reader = DtaReader::new()
+        .from_path(path)
+        .with_context(|| format!("failed to open {path:?}"))?
+        .read_header()
+        .with_context(|| format!("failed to read the header of {path:?}"))?
+        .read_schema()
+        .with_context(|| format!("failed to read the schema of {path:?}"))?;
+    characteristic_reader
+        .skip_to_end()
+        .with_context(|| format!("failed to skip characteristics in {path:?}"))?;
+
+    let mut record_reader = characteristic_reader
+        .into_record_reader()
+        .with_context(|| format!("failed to start reading records from {path:?}"))?;
+    let variables: Vec<(String, &'static str)> = record_reader
+        .schema()
+        .variables()
+        .iter()
+        .map(|v| (v.name().to_string(), stata_type_label(v.variable_type())))
+        .collect();
+
+    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); variables.len()];
+    let mut total = 0usize;
+    while let Some(record) = record_reader
+        .read_record()
+        .with_context(|| format!("failed reading a record from {path:?}"))?
+    {
+        if nrows.is_some_and(|limit| total >= limit) {
+            break;
+        }
+        for (col_idx, value) in record.values().iter().enumerate() {
+            raw[col_idx].push(stata_value_to_string(value));
+        }
+        total += 1;
+    }
+
+    let mut columns = Vec::new();
+    for ((name, current_type), values) in variables.into_iter().zip(raw) {
+        let non_null: Vec<String> = values.into_iter().flatten().collect();
+        columns.push(profile_column(
+            ColumnInput {
+                name,
+                current_type: current_type.to_string(),
+                raw_values: non_null,
+                total,
+                skip_heuristics: false,
+            },
+            n_samples,
+        ));
+    }
+    Ok(columns)
+}
+
+#[cfg(not(feature = "stata"))]
+fn columns_from_stata(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "Stata support isn't compiled in - rebuild with `cargo build --release --features stata` (or --features full)"
     )
 }
 
@@ -2537,6 +2664,7 @@ enum InputFormat {
     Syslog,
     Syslog5424,
     Dbase,
+    Stata,
 }
 
 impl InputFormat {
@@ -2564,6 +2692,7 @@ impl InputFormat {
             InputFormat::Syslog => "syslog",
             InputFormat::Syslog5424 => "syslog5424",
             InputFormat::Dbase => "dbase",
+            InputFormat::Stata => "stata",
         }
     }
 }
@@ -2593,9 +2722,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "syslog" | "syslog3164" | "rfc3164" => Ok(InputFormat::Syslog),
             "syslog5424" | "rfc5424" => Ok(InputFormat::Syslog5424),
             "dbase" | "dbf" => Ok(InputFormat::Dbase),
+            "stata" | "dta" => Ok(InputFormat::Stata),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, or dbase)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, or stata)"
                 )
             }
         };
@@ -2623,11 +2753,12 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "npy" => Ok(InputFormat::Npy),
         "npz" => Ok(InputFormat::Npz),
         "dbf" => Ok(InputFormat::Dbase),
+        "dta" => Ok(InputFormat::Stata),
         // No extension convention reliably means fixed-width or a log
         // format (.txt/.log/no extension are all ambiguous), so all of
         // these are --format-only, never inferred.
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata explicitly"
         ),
     }
 }
@@ -3009,6 +3140,7 @@ pub fn run() -> Result<()> {
                 .map(|c| profile_column(c, args.samples))
                 .collect(),
             InputFormat::Dbase => columns_from_dbase(&read_path, args.nrows, args.samples)?,
+            InputFormat::Stata => columns_from_stata(&read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
