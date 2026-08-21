@@ -11,8 +11,8 @@ use serde_json::json;
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
 /// INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
-/// Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), or a
-/// Stata (.dta) file: one
+/// Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
+/// (.dta), or SAS7BDAT: one
 /// row per column, with a current type, a heuristic "ideal" type
 /// suggestion, missing %, sample values, and a blank Description field to
 /// fill in by hand. Output is Markdown tables (default), this tool's own
@@ -35,7 +35,7 @@ struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
     /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz,
-    /// .dbf, .dta; fixed-width text and the log formats have no extension
+    /// .dbf, .dta, .sas7bdat; fixed-width text and the log formats have no extension
     /// convention and are only reachable via --format)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
@@ -46,7 +46,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, or stata
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, or sas7bdat
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -876,6 +876,124 @@ fn columns_from_stata(
 ) -> Result<Vec<ColumnProfile>> {
     bail!(
         "Stata support isn't compiled in - rebuild with `cargo build --release --features stata` (or --features full)"
+    )
+}
+
+// --- SAS7BDAT reader (opt-in via --features sas7bdat) ---
+// current_type comes from the file's own declared LogicalType metadata
+// (Dataset::columns()) rather than being inferred from observed row
+// values - the same "trust the format's own declaration, then let
+// ideal_type independently verify it" split every other binary/typed
+// format here already gets. A variable label (SAS's own human-authored
+// per-column description) exists in ColumnMeta but isn't surfaced, the
+// same considered decision as Stata's variable/value labels - see
+// CLAUDE.md's Known limitations.
+
+#[cfg(feature = "sas7bdat")]
+fn sas_logical_type_label(t: sas7bdat::LogicalType) -> &'static str {
+    use sas7bdat::LogicalType;
+    match t {
+        LogicalType::Integer => "i64",
+        LogicalType::Float => "f64",
+        LogicalType::String | LogicalType::Bytes => "String",
+        LogicalType::Date => "Date",
+        LogicalType::DateTime => "Timestamp",
+        LogicalType::Time => "Time",
+    }
+}
+
+#[cfg(feature = "sas7bdat")]
+fn sas_cell_to_string(v: &sas7bdat::CellValue) -> Option<String> {
+    use sas7bdat::CellValue;
+    match v {
+        CellValue::Null => None,
+        CellValue::Int32(x) => Some(x.to_string()),
+        CellValue::Int64(x) => Some(x.to_string()),
+        CellValue::Float64(x) => Some(x.to_string()),
+        CellValue::Str(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        CellValue::Bytes(b) => Some(b.iter().map(|byte| format!("{byte:02x}")).collect()),
+        CellValue::Date(d) => chrono::DateTime::UNIX_EPOCH
+            .checked_add_signed(chrono::Duration::days(i64::from(d.unix_days())))
+            .map(|dt| dt.format("%Y-%m-%d").to_string()),
+        CellValue::DateTime(dt) => chrono::DateTime::UNIX_EPOCH
+            .checked_add_signed(chrono::Duration::seconds(dt.unix_seconds()))
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+        CellValue::Time(t) => chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+            u32::try_from(t.seconds_since_midnight).unwrap_or(0),
+            0,
+        )
+        .map(|nt| nt.format("%H:%M:%S").to_string()),
+    }
+}
+
+#[cfg(feature = "sas7bdat")]
+fn columns_from_sas7bdat(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use std::ops::ControlFlow;
+
+    let ds = sas7bdat::Dataset::open(path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed to open {path:?}"))?;
+
+    let names: Vec<String> = ds.columns().iter().map(|c| c.name.clone()).collect();
+    let current_types: Vec<&'static str> = ds
+        .columns()
+        .iter()
+        .map(|c| sas_logical_type_label(c.logical_type))
+        .collect();
+
+    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
+    let mut total = 0usize;
+    ds.scan()
+        .visit_rows(|row| {
+            for (col_idx, value) in row.iter().enumerate() {
+                raw[col_idx].push(sas_cell_to_string(value));
+            }
+            total += 1;
+            if nrows.is_some_and(|limit| total >= limit) {
+                Ok(ControlFlow::Break(()))
+            } else {
+                Ok(ControlFlow::Continue(()))
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed reading records from {path:?}"))?;
+
+    let mut columns = Vec::new();
+    for ((name, current_type), values) in names.into_iter().zip(current_types).zip(raw) {
+        let non_null: Vec<String> = values.into_iter().flatten().collect();
+        columns.push(profile_column(
+            ColumnInput {
+                name,
+                current_type: current_type.to_string(),
+                raw_values: non_null,
+                total,
+                skip_heuristics: false,
+            },
+            n_samples,
+        ));
+    }
+    Ok(columns)
+}
+
+#[cfg(not(feature = "sas7bdat"))]
+fn columns_from_sas7bdat(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "SAS7BDAT support isn't compiled in - rebuild with `cargo build --release --features sas7bdat` (or --features full)"
     )
 }
 
@@ -2665,6 +2783,7 @@ enum InputFormat {
     Syslog5424,
     Dbase,
     Stata,
+    Sas7bdat,
 }
 
 impl InputFormat {
@@ -2693,6 +2812,7 @@ impl InputFormat {
             InputFormat::Syslog5424 => "syslog5424",
             InputFormat::Dbase => "dbase",
             InputFormat::Stata => "stata",
+            InputFormat::Sas7bdat => "sas7bdat",
         }
     }
 }
@@ -2723,9 +2843,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "syslog5424" | "rfc5424" => Ok(InputFormat::Syslog5424),
             "dbase" | "dbf" => Ok(InputFormat::Dbase),
             "stata" | "dta" => Ok(InputFormat::Stata),
+            "sas7bdat" | "sas" => Ok(InputFormat::Sas7bdat),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, or stata)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, or sas7bdat)"
                 )
             }
         };
@@ -2754,11 +2875,12 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "npz" => Ok(InputFormat::Npz),
         "dbf" => Ok(InputFormat::Dbase),
         "dta" => Ok(InputFormat::Stata),
+        "sas7bdat" => Ok(InputFormat::Sas7bdat),
         // No extension convention reliably means fixed-width or a log
         // format (.txt/.log/no extension are all ambiguous), so all of
         // these are --format-only, never inferred.
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat explicitly"
         ),
     }
 }
@@ -3141,6 +3263,7 @@ pub fn run() -> Result<()> {
                 .collect(),
             InputFormat::Dbase => columns_from_dbase(&read_path, args.nrows, args.samples)?,
             InputFormat::Stata => columns_from_stata(&read_path, args.nrows, args.samples)?,
+            InputFormat::Sas7bdat => columns_from_sas7bdat(&read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }

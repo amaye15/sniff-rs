@@ -5,9 +5,9 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, RFC 3164/5424 syslog, dBase, and Stata — any of them gzip- or
-zstd-compressed too — and writes Markdown, this tool's own rich JSON, or
-json-schema.org-standard JSON.
+logs, RFC 3164/5424 syslog, dBase, Stata, and SAS7BDAT — any of them gzip-
+or zstd-compressed too — and writes Markdown, this tool's own rich JSON,
+or json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -59,6 +59,7 @@ every format. See "Testing" below.
 | Syslog (RFC 5424) | *(none — `--format syslog5424` only)* | `--features syslog` | structured variant: adds version/app-name/procid/msgid/structured-data |
 | dBase | `.dbf` | `--features dbase` | soft-deleted records skipped (dBase's own convention); `current_type` can reveal a Numeric field that's really an integer |
 | Stata | `.dta` | `--features stata` | every DTA release (102-119); Stata's own missing markers become missing values, not literal strings |
+| SAS7BDAT | `.sas7bdat` | `--features sas7bdat` | `current_type` from the file's own declared type; SAS stores nearly all numerics as doubles, so `ideal_type` often narrows further |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -220,6 +221,19 @@ tool doesn't do, so it's a visible placeholder rather than a silent drop.
 Variable and value labels - Stata's own human-authored variable
 descriptions and coded-value names (`1`/`2`/`3` meaning
 `"male"`/`"female"`/`"other"`) - aren't surfaced; see Known limitations.
+
+SAS7BDAT (`columns_from_sas7bdat`, via the `sas7bdat` crate) follows the
+same shape, but its `current_type` comes straight from the file's own
+`Dataset::columns()` metadata (a `LogicalType` per column) rather than
+being inferred from row values, the same as `arrow_type_label` does for
+Parquet/Arrow. That declared type is genuinely worth cross-checking: SAS
+stores nearly all numeric data as 8-byte doubles internally regardless of
+the value's real precision, so `current_type: "f64"` with `ideal_type`
+correctly narrowing to `"i64"` for a whole-number column isn't a bug in
+either the crate or this tool - it's the same "declared type is a hint,
+not the truth" lesson Parquet/Avro/dBase/Stata all already demonstrate,
+in one more format's own way of losing that distinction. SAS also has
+per-column labels (same considered non-surfacing decision as Stata's).
 
 Common/Combined Log Format also land here (`columns_from_weblog`), via a
 fixed `regex` per format matching each grammar's exact field layout. The
@@ -476,8 +490,9 @@ PRI-to-facility/severity decoding and PID extraction, RFC 5424's
 nilvalue-as-missing handling, dBase's current-vs-ideal-type gap on a
 Numeric field that's really an integer, Stata's missing-marker-as-absent
 handling and its own current-vs-ideal-type gap (a double column holding
-one `NaN` alongside otherwise-integer data), and that Markdown output
-never has a trailing blank line.
+one `NaN` alongside otherwise-integer data), SAS7BDAT being wired up
+(see Known limitations for why it has no dedicated fixture), and that
+Markdown output never has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
@@ -505,17 +520,30 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
   duplicate Arrow stack for one format was judged not worth it here; would
   reconsider if the crate trims that footprint, or if there's a concrete
   need for `.duckdb` files.
-- **Stata variable/value labels aren't surfaced.** A `.dta` file can carry
-  a human-authored description per variable (a "variable label") and a
-  named mapping for coded values (a "value label", e.g. `1`/`2`/`3` →
-  `"male"`/`"female"`/`"other"`) - both genuinely useful, authoritative
-  metadata, not a guess. Deliberately out of scope for now: surfacing them
-  well would mean either overloading the existing (always-empty)
-  `description` field with format-provided text - a different kind of
-  content than what it's documented to hold - or adding a new field to
-  `ColumnProfile`, which is shared by every format's renderer and output
-  shape. Worth adding if there's real demand; `Variable::label()` in the
-  `dta` crate already exposes the variable label.
+- **Stata/SAS7BDAT variable/value labels aren't surfaced.** A `.dta` or
+  `.sas7bdat` file can carry a human-authored description per variable (a
+  "variable label") and, for Stata, a named mapping for coded values (a
+  "value label", e.g. `1`/`2`/`3` → `"male"`/`"female"`/`"other"`) - both
+  genuinely useful, authoritative metadata, not a guess. Deliberately out
+  of scope for now: surfacing them well would mean either overloading the
+  existing (always-empty) `description` field with format-provided text -
+  a different kind of content than what it's documented to hold - or
+  adding a new field to `ColumnProfile`, which is shared by every format's
+  renderer and output shape. Worth adding if there's real demand;
+  `Variable::label()` in the `dta` crate and `ColumnMeta::label` in the
+  `sas7bdat` crate already expose it.
+- **No SAS7BDAT test fixture is committed.** Unlike every other format in
+  this project, there's no tool available in this development environment
+  that can *write* a `.sas7bdat` file (it's a proprietary binary format;
+  `pyreadstat`, the usual option, only writes `.dta`/`.sav`/`.xport`, not
+  sas7bdat itself), and copying a third-party sample file of unclear
+  provenance into the repo wasn't worth the licensing risk. The reader was
+  manually verified against the `sas7bdat` crate's own bundled test
+  fixture during development (schema, non-ASCII text, and the same
+  `current_type`/`ideal_type` gap dBase and Stata already demonstrate);
+  the committed test only confirms the format is wired up, the same
+  fallback Feather already uses for the same underlying reason (no
+  fixture, not a missing capability).
 - **Category-detection threshold is fixed**, not configurable: ≤50 unique
   values *and* a uniqueness ratio under 5% of total rows. Works fine at
   hundreds-plus rows; on very small files it under-triggers (nothing to do
