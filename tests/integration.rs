@@ -567,6 +567,77 @@ fn combined_log_line_rejects_common_log_format_with_an_actionable_error() {
     );
 }
 
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_rfc3164_decodes_pri_and_extracts_pid() {
+    let doc = run_with_format("sample_rfc3164.log", "json", &["--format", "syslog"]);
+    let cols = table(&doc, "sample_rfc3164");
+
+    // PRI 34 = facility 4 (auth) * 8 + severity 2 (critical).
+    let facility = column(cols, "facility");
+    assert!(
+        facility["sample_values"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("auth"))
+    );
+    let severity = column(cols, "severity");
+    assert!(
+        severity["sample_values"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("critical"))
+    );
+
+    // Only the first and third lines have a [PID] on the tag.
+    let pid = column(cols, "pid");
+    assert_eq!(pid["current_type"], "i64");
+    assert!((pid["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
+
+    let message = column(cols, "message");
+    assert!(
+        message["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "'su root' failed for lonvick on /dev/pts/8")
+    );
+}
+
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_rfc5424_treats_nilvalue_dash_as_missing() {
+    let doc = run_with_format("sample_rfc5424.log", "json", &["--format", "syslog5424"]);
+    let cols = table(&doc, "sample_rfc5424");
+
+    // "-" is RFC 5424's own nilvalue convention for "field not specified".
+    let procid = column(cols, "procid");
+    assert!((procid["missing_pct"].as_f64().unwrap() - 66.7).abs() < 0.01);
+    let structured_data = column(cols, "structured_data");
+    assert!((structured_data["missing_pct"].as_f64().unwrap() - 66.7).abs() < 0.01);
+
+    let version = column(cols, "version");
+    assert_eq!(version["current_type"], "i64");
+}
+
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_line_that_does_not_match_the_grammar_is_an_actionable_error() {
+    let bad = fixture("_scratch_not_syslog.log");
+    std::fs::write(&bad, "<34>Oct 11 22:14:15 mymachine su[1234]: ok\nnope\n").unwrap();
+    let output = Command::new(bin())
+        .args([bad.to_str().unwrap(), "-", "--format", "syslog"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&bad).ok();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("line 2"),
+        "error should name the offending line: {stderr}"
+    );
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {

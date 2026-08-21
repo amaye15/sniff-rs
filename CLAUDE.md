@@ -4,9 +4,10 @@ A Rust CLI that profiles a data file and produces a data dictionary — one row
 per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
-CBOR, INI, XML, fixed-width text, NumPy, and Common/Combined Log Format
-access logs — any of them gzip- or zstd-compressed too — and writes
-Markdown, this tool's own rich JSON, or json-schema.org-standard JSON.
+CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
+logs, and RFC 3164/5424 syslog — any of them gzip- or zstd-compressed too
+— and writes Markdown, this tool's own rich JSON, or json-schema.org-
+standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -54,13 +55,15 @@ every format. See "Testing" below.
 | NumPy archive | `.npz` | `--features npy` | zip of named `.npy` arrays; one table per array, like SQLite (see below) |
 | Common Log Format | *(none — `--format common-log` only)* | `--features weblog` | `host ident authuser [ts] "req" status bytes`; request splits into method/path/protocol |
 | Combined Log Format | *(none — `--format combined-log` only)* | `--features weblog` | Common Log plus `"referer" "user-agent"` |
+| Syslog (RFC 3164) | *(none — `--format syslog` only)* | `--features syslog` | `<PRI>Mmm dd hh:mm:ss host tag[pid]: msg`; PRI decodes to facility/severity names |
+| Syslog (RFC 5424) | *(none — `--format syslog5424` only)* | `--features syslog` | structured variant: adds version/app-name/procid/msgid/structured-data |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
-text and the two access log formats have no extension convention reliable
-enough to infer from at all (access logs are commonly `.log`/`.txt`/no
-extension), so all three are reachable only via `--format`, never
-auto-detected.
+text and all four log formats (web access + syslog) have no extension
+convention reliable enough to infer from at all (logs are commonly
+`.log`/`.txt`/no extension), so all five are reachable only via `--format`,
+never auto-detected.
 
 Every optional format has a matching Cargo feature that gates both the
 dependency (`dep:x` in `[features]`) and the reader function itself
@@ -199,6 +202,19 @@ that doesn't match the chosen format's grammar at all (e.g. a Combined
 line read as `--format common-log`, which has two extra trailing quoted
 fields the Common grammar doesn't expect) is a hard error naming the line
 number, not a silent skip or a truncated parse.
+
+Syslog (RFC 3164 and RFC 5424, `columns_from_syslog`) follows the exact
+same shape as the web access logs - same crate, same "hard error naming
+the line" behavior for a mismatched line, same `-`-as-nilvalue-so-missing
+convention for RFC 5424's optional fields. Its one extra step is decoding
+the leading `<PRI>`: `facility = PRI / 8`, `severity = PRI % 8` are the
+RFC's own fixed numeric-to-name tables (`SYSLOG_FACILITIES`,
+`SYSLOG_SEVERITIES`), not a guess, so both get mapped to their standard
+names as separate columns rather than left as one opaque number. RFC
+3164's timestamp has no year field at all - a real, well-known limitation
+of that specific RFC, not something worth working around - so it's left
+as a plain string instead of being forced through `matching_date_format`
+(which needs a full date and would only ever fail on it).
 
 **`profile_json_path` / `profile_json_records`** — for anything that can
 nest (JSON, Avro, MessagePack, TOML, YAML, CBOR, XML, Parquet's Struct/List/Map columns). This recurses: objects
@@ -358,9 +374,11 @@ Three questions determine the shape of a new reader:
    own type descriptor, and fall back to a hex dump for anything not
    representable as a simple value rather than fabricating one. If it's a
    fixed text grammar with no delimiter-based structure (a log format, a
-   report with a known layout), see `columns_from_weblog` for the pattern:
-   one `regex` per variant, split any compound fields into their own
-   columns, and hard-error with the line number on a line that doesn't
+   report with a known layout), see `columns_from_weblog` or
+   `columns_from_syslog` for the pattern: one `regex` per variant, split
+   any compound fields into their own columns, decode any packed numeric
+   codes against the format's own fixed lookup table rather than leaving
+   them opaque, and hard-error with the line number on a line that doesn't
    match rather than skip or misparse it.
 3. **Can one file hold multiple tables** (another embedded-database
    format, or anything with named sections/sheets/arrays)? Return
@@ -422,8 +440,10 @@ without `--features zstd`), NumPy's structured-dtype-to-columns decoding
 guess), its row-major positional-column reading of a plain 2D array,
 `.npz`'s one-table-per-array output, Combined Log's request-splitting and
 dash-as-missing conversion, Common Log's narrower column set, a
-format-mismatched log line's actionable error, and that Markdown output
-never has a trailing blank line.
+format-mismatched log line's actionable error, syslog RFC 3164's
+PRI-to-facility/severity decoding and PID extraction, RFC 5424's
+nilvalue-as-missing handling, and that Markdown output never has a
+trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

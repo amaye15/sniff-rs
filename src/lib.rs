@@ -10,10 +10,11 @@ use serde_json::json;
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
-/// INI, XML, fixed-width text, NumPy (.npy/.npz), or a Common/Combined Log
-/// Format access log file: one row per column, with a current type, a
-/// heuristic "ideal" type suggestion, missing %, sample values, and a
-/// blank Description field to fill in by hand. Output is Markdown tables
+/// INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
+/// Format access log, or an RFC 3164/5424 syslog file: one row per column,
+/// with a current type, a heuristic "ideal" type suggestion, missing %,
+/// sample values, and a blank Description field to fill in by hand.
+/// Output is Markdown tables
 /// (default), this tool's own rich JSON (--output-format json), or
 /// json-schema.org-vocabulary JSON (--output-format json-schema); any of
 /// the three can be written to stdout by passing "-" as the output path.
@@ -33,8 +34,8 @@ struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
     /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz;
-    /// fixed-width text and access logs have no extension convention and
-    /// are only reachable via --format)
+    /// fixed-width text and the log formats have no extension convention
+    /// and are only reachable via --format)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -44,7 +45,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, or combined-log
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, or syslog5424
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -451,6 +452,203 @@ fn columns_from_weblog(
 ) -> Result<Vec<ColumnInput>> {
     bail!(
         "web server log support isn't compiled in - rebuild with `cargo build --release --features weblog` (or --features full)"
+    )
+}
+
+// --- Syslog readers (opt-in via --features syslog) ---
+// RFC 3164 (the classic BSD format, still what most syslog daemons emit by
+// default) and RFC 5424 (the newer structured format) are, like the web
+// access log formats above, fixed text grammars with no reliable extension
+// to infer from - --format-only, never auto-detected. PRI decodes
+// deterministically into facility/severity per the RFC's own numeric
+// tables (not a guess), and RFC 5424's "-" nilvalue is the format's own
+// documented placeholder for "field not specified", so it becomes a
+// missing value the same way it does for the web access logs. RFC 3164's
+// timestamp famously has no year field at all - a real limitation of the
+// format itself, not something this tool can paper over - so it's left as
+// a plain string rather than forced through the date-matching heuristic.
+
+#[cfg(feature = "syslog")]
+const SYSLOG_FACILITIES: [&str; 24] = [
+    "kernel",
+    "user",
+    "mail",
+    "daemon",
+    "auth",
+    "syslog",
+    "lpr",
+    "news",
+    "uucp",
+    "cron",
+    "authpriv",
+    "ftp",
+    "ntp",
+    "security",
+    "console",
+    "solaris-cron",
+    "local0",
+    "local1",
+    "local2",
+    "local3",
+    "local4",
+    "local5",
+    "local6",
+    "local7",
+];
+
+#[cfg(feature = "syslog")]
+const SYSLOG_SEVERITIES: [&str; 8] = [
+    "emergency",
+    "alert",
+    "critical",
+    "error",
+    "warning",
+    "notice",
+    "informational",
+    "debug",
+];
+
+#[cfg(feature = "syslog")]
+fn syslog_facility_name(pri: u32) -> String {
+    SYSLOG_FACILITIES
+        .get((pri / 8) as usize)
+        .map_or_else(|| (pri / 8).to_string(), |s| (*s).to_string())
+}
+
+#[cfg(feature = "syslog")]
+fn syslog_severity_name(pri: u32) -> String {
+    SYSLOG_SEVERITIES
+        .get((pri % 8) as usize)
+        .map_or_else(|| (pri % 8).to_string(), |s| (*s).to_string())
+}
+
+#[cfg(feature = "syslog")]
+fn syslog_regex(rfc5424: bool) -> regex::Regex {
+    let pattern = if rfc5424 {
+        r#"^<(\d{1,3})>(\d+) (\S+) (\S+) (\S+) (\S+) (\S+) (-|\[[^\]]*\]) ?(.*)$"#
+    } else {
+        r"^<(\d{1,3})>([A-Za-z]{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}) (\S+) ([^:\[\s]+)(?:\[(\d+)\])?: ?(.*)$"
+    };
+    regex::Regex::new(pattern).expect("hardcoded syslog regex is always valid")
+}
+
+#[cfg(feature = "syslog")]
+fn syslog_dash_to_none(s: &str) -> Option<String> {
+    if s == "-" { None } else { Some(s.to_string()) }
+}
+
+#[cfg(feature = "syslog")]
+fn columns_from_syslog(
+    path: &Path,
+    nrows: Option<usize>,
+    rfc5424: bool,
+) -> Result<Vec<ColumnInput>> {
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let re = syslog_regex(rfc5424);
+
+    let names: Vec<&str> = if rfc5424 {
+        vec![
+            "facility",
+            "severity",
+            "version",
+            "timestamp",
+            "hostname",
+            "app_name",
+            "procid",
+            "msgid",
+            "structured_data",
+            "message",
+        ]
+    } else {
+        vec![
+            "facility",
+            "severity",
+            "timestamp",
+            "hostname",
+            "tag",
+            "pid",
+            "message",
+        ]
+    };
+
+    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
+    let mut total = 0usize;
+    for (line_no, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if nrows.is_some_and(|limit| total >= limit) {
+            break;
+        }
+        let format_name = if rfc5424 { "RFC 5424" } else { "RFC 3164" };
+        let caps = re.captures(line).ok_or_else(|| {
+            anyhow::anyhow!(
+                "line {} doesn't match syslog {format_name}: {line:?}",
+                line_no + 1
+            )
+        })?;
+        let pri: u32 = caps[1]
+            .parse()
+            .with_context(|| format!("line {}: PRI '{}' isn't a number", line_no + 1, &caps[1]))?;
+
+        let values: Vec<Option<String>> = if rfc5424 {
+            vec![
+                Some(syslog_facility_name(pri)),
+                Some(syslog_severity_name(pri)),
+                Some(caps[2].to_string()),
+                Some(caps[3].to_string()),
+                syslog_dash_to_none(&caps[4]),
+                syslog_dash_to_none(&caps[5]),
+                syslog_dash_to_none(&caps[6]),
+                syslog_dash_to_none(&caps[7]),
+                syslog_dash_to_none(&caps[8]),
+                Some(caps[9].to_string()),
+            ]
+        } else {
+            vec![
+                Some(syslog_facility_name(pri)),
+                Some(syslog_severity_name(pri)),
+                Some(caps[2].to_string()),
+                Some(caps[3].to_string()),
+                Some(caps[4].to_string()),
+                caps.get(5).map(|m| m.as_str().to_string()),
+                Some(caps[6].to_string()),
+            ]
+        };
+        for (col_idx, value) in values.into_iter().enumerate() {
+            raw[col_idx].push(value);
+        }
+        total += 1;
+    }
+
+    let mut columns = Vec::new();
+    for (col_idx, name) in names.into_iter().enumerate() {
+        let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+        let current_type = if non_null.is_empty() {
+            "String".to_string()
+        } else {
+            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+            naive_current_type(&refs).to_string()
+        };
+        columns.push(ColumnInput {
+            name: name.to_string(),
+            current_type,
+            raw_values: non_null,
+            total,
+            skip_heuristics: false,
+        });
+    }
+    Ok(columns)
+}
+
+#[cfg(not(feature = "syslog"))]
+fn columns_from_syslog(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _rfc5424: bool,
+) -> Result<Vec<ColumnInput>> {
+    bail!(
+        "syslog support isn't compiled in - rebuild with `cargo build --release --features syslog` (or --features full)"
     )
 }
 
@@ -2236,6 +2434,8 @@ enum InputFormat {
     Npz,
     CommonLog,
     CombinedLog,
+    Syslog,
+    Syslog5424,
 }
 
 impl InputFormat {
@@ -2260,6 +2460,8 @@ impl InputFormat {
             InputFormat::Npz => "npz",
             InputFormat::CommonLog => "common_log",
             InputFormat::CombinedLog => "combined_log",
+            InputFormat::Syslog => "syslog",
+            InputFormat::Syslog5424 => "syslog5424",
         }
     }
 }
@@ -2286,9 +2488,11 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "npz" => Ok(InputFormat::Npz),
             "common-log" | "common_log" | "clf" | "common" => Ok(InputFormat::CommonLog),
             "combined-log" | "combined_log" | "combined" => Ok(InputFormat::CombinedLog),
+            "syslog" | "syslog3164" | "rfc3164" => Ok(InputFormat::Syslog),
+            "syslog5424" | "rfc5424" => Ok(InputFormat::Syslog5424),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, or combined-log)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, or syslog5424)"
                 )
             }
         };
@@ -2315,11 +2519,11 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "xml" => Ok(InputFormat::Xml),
         "npy" => Ok(InputFormat::Npy),
         "npz" => Ok(InputFormat::Npz),
-        // No extension convention reliably means fixed-width or an access
-        // log (.txt/.log/no extension are all ambiguous), so both are
-        // --format-only, never inferred.
+        // No extension convention reliably means fixed-width or a log
+        // format (.txt/.log/no extension are all ambiguous), so all of
+        // these are --format-only, never inferred.
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424 explicitly"
         ),
     }
 }
@@ -2689,6 +2893,14 @@ pub fn run() -> Result<()> {
                 .map(|c| profile_column(c, args.samples))
                 .collect(),
             InputFormat::CombinedLog => columns_from_weblog(&read_path, args.nrows, true)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+            InputFormat::Syslog => columns_from_syslog(&read_path, args.nrows, false)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+            InputFormat::Syslog5424 => columns_from_syslog(&read_path, args.nrows, true)?
                 .into_iter()
                 .map(|c| profile_column(c, args.samples))
                 .collect(),
