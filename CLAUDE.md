@@ -5,9 +5,9 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, and RFC 3164/5424 syslog — any of them gzip- or zstd-compressed too
-— and writes Markdown, this tool's own rich JSON, or json-schema.org-
-standard JSON.
+logs, RFC 3164/5424 syslog, and dBase — any of them gzip- or
+zstd-compressed too — and writes Markdown, this tool's own rich JSON, or
+json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -57,6 +57,7 @@ every format. See "Testing" below.
 | Combined Log Format | *(none — `--format combined-log` only)* | `--features weblog` | Common Log plus `"referer" "user-agent"` |
 | Syslog (RFC 3164) | *(none — `--format syslog` only)* | `--features syslog` | `<PRI>Mmm dd hh:mm:ss host tag[pid]: msg`; PRI decodes to facility/severity names |
 | Syslog (RFC 5424) | *(none — `--format syslog5424` only)* | `--features syslog` | structured variant: adds version/app-name/procid/msgid/structured-data |
+| dBase | `.dbf` | `--features dbase` | soft-deleted records skipped (dBase's own convention); `current_type` can reveal a Numeric field that's really an integer |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -189,6 +190,19 @@ a headerless CSV: 1D is a single `value` column, 2D gets positional
 `col_0..col_N` columns (row-major/`C` or column-major/`Fortran` order both
 handled), and anything higher-dimensional is a clear error rather than a
 guessed flattening.
+
+dBase is a more conventional flat reader (`columns_from_dbase`), but with
+one thing worth calling out: column order comes from `Reader::fields()`
+(the file's own field table) rather than iterating `Record`'s internal
+`HashMap`, whose order isn't guaranteed stable. Soft-deleted records
+(dBase's own "marked for deletion" flag) are skipped by the `dbase` crate
+itself before this code ever sees them - that's the format's own
+convention, not something this tool is choosing to hide. Its `Numeric`
+field type doesn't distinguish int from float at the storage level, so
+`current_type` reports the same `f64` for every numeric field regardless -
+exactly the kind of gap `ideal_type`'s independent re-derivation from the
+actual values exists to surface, the same way CSV's leading-zero check
+does for a different reason.
 
 Common/Combined Log Format also land here (`columns_from_weblog`), via a
 fixed `regex` per format matching each grammar's exact field layout. The
@@ -442,8 +456,9 @@ guess), its row-major positional-column reading of a plain 2D array,
 dash-as-missing conversion, Common Log's narrower column set, a
 format-mismatched log line's actionable error, syslog RFC 3164's
 PRI-to-facility/severity decoding and PID extraction, RFC 5424's
-nilvalue-as-missing handling, and that Markdown output never has a
-trailing blank line.
+nilvalue-as-missing handling, dBase's current-vs-ideal-type gap on a
+Numeric field that's really an integer, and that Markdown output never
+has a trailing blank line.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

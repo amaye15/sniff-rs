@@ -11,11 +11,11 @@ use serde_json::json;
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
 /// INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
-/// Format access log, or an RFC 3164/5424 syslog file: one row per column,
-/// with a current type, a heuristic "ideal" type suggestion, missing %,
-/// sample values, and a blank Description field to fill in by hand.
-/// Output is Markdown tables
-/// (default), this tool's own rich JSON (--output-format json), or
+/// Format access log, an RFC 3164/5424 syslog file, or dBase (.dbf): one
+/// row per column, with a current type, a heuristic "ideal" type
+/// suggestion, missing %, sample values, and a blank Description field to
+/// fill in by hand. Output is Markdown tables (default), this tool's own
+/// rich JSON (--output-format json), or
 /// json-schema.org-vocabulary JSON (--output-format json-schema); any of
 /// the three can be written to stdout by passing "-" as the output path.
 /// SQLite files (one table per database table), Excel workbooks (one
@@ -33,9 +33,9 @@ use serde_json::json;
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
-    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz;
-    /// fixed-width text and the log formats have no extension convention
-    /// and are only reachable via --format)
+    /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz,
+    /// .dbf; fixed-width text and the log formats have no extension
+    /// convention and are only reachable via --format)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
@@ -45,7 +45,7 @@ struct Args {
     /// Only read the first N rows/records (for large files)
     #[arg(long)]
     nrows: Option<usize>,
-    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, or syslog5424
+    /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, or dbase
     #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
@@ -74,6 +74,7 @@ const DATE_FORMATS: &[&str] = &[
     "%d %b %Y",
     "%b %d, %Y",
     "%d/%b/%Y:%H:%M:%S %z", // Common/Combined Log Format's timestamp
+    "%Y%m%d",               // dBase's own Date field rendering
 ];
 
 // --- Shared intermediate representation, produced by each format's reader ---
@@ -649,6 +650,105 @@ fn columns_from_syslog(
 ) -> Result<Vec<ColumnInput>> {
     bail!(
         "syslog support isn't compiled in - rebuild with `cargo build --release --features syslog` (or --features full)"
+    )
+}
+
+// --- dBase reader (opt-in via --features dbase) ---
+// A soft-deleted record (dBase's own "marked for deletion" flag) is skipped
+// by the crate itself before this code ever sees it - the same convention
+// dBase and every tool built on it already treats as "logically absent",
+// not something this tool is choosing to hide. Column order comes from
+// Reader::fields() (the file's own field table) rather than from Record's
+// internal HashMap, whose iteration order isn't guaranteed to be stable.
+
+#[cfg(feature = "dbase")]
+fn dbase_field_type_label(t: dbase::FieldType) -> &'static str {
+    match t {
+        dbase::FieldType::Character | dbase::FieldType::Memo => "String",
+        dbase::FieldType::Numeric
+        | dbase::FieldType::Float
+        | dbase::FieldType::Double
+        | dbase::FieldType::Currency => "f64",
+        dbase::FieldType::Integer => "i64",
+        dbase::FieldType::Logical => "bool",
+        dbase::FieldType::Date => "Date",
+        dbase::FieldType::DateTime => "Timestamp",
+    }
+}
+
+#[cfg(feature = "dbase")]
+fn dbase_value_to_string(v: &dbase::FieldValue) -> Option<String> {
+    use dbase::FieldValue;
+    match v {
+        FieldValue::Character(s) => s.clone(),
+        FieldValue::Numeric(n) => n.map(|x| x.to_string()),
+        FieldValue::Logical(b) => b.map(|x| x.to_string()),
+        FieldValue::Date(d) => d.map(|x| x.to_string()),
+        FieldValue::Float(f) => f.map(|x| x.to_string()),
+        FieldValue::Integer(i) => Some(i.to_string()),
+        FieldValue::Currency(c) => Some(c.to_string()),
+        FieldValue::DateTime(dt) => Some(format!(
+            "{} {:02}:{:02}:{:02}",
+            dt.date(),
+            dt.time().hours(),
+            dt.time().minutes(),
+            dt.time().seconds()
+        )),
+        FieldValue::Double(d) => Some(d.to_string()),
+        FieldValue::Memo(s) => Some(s.clone()),
+    }
+}
+
+#[cfg(feature = "dbase")]
+fn columns_from_dbase(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    let mut reader =
+        dbase::Reader::from_path(path).with_context(|| format!("failed to open {path:?}"))?;
+    let fields: Vec<(String, &'static str)> = reader
+        .fields()
+        .iter()
+        .map(|f| (f.name().to_string(), dbase_field_type_label(f.field_type())))
+        .collect();
+
+    let mut records = reader
+        .read()
+        .with_context(|| format!("failed reading records from {path:?}"))?;
+    if let Some(n) = nrows {
+        records.truncate(n);
+    }
+    let total = records.len();
+
+    let mut columns = Vec::new();
+    for (name, current_type) in fields {
+        let raw_values: Vec<String> = records
+            .iter()
+            .filter_map(|r| r.get(&name).and_then(dbase_value_to_string))
+            .collect();
+        columns.push(profile_column(
+            ColumnInput {
+                name,
+                current_type: current_type.to_string(),
+                raw_values,
+                total,
+                skip_heuristics: false,
+            },
+            n_samples,
+        ));
+    }
+    Ok(columns)
+}
+
+#[cfg(not(feature = "dbase"))]
+fn columns_from_dbase(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "dBase support isn't compiled in - rebuild with `cargo build --release --features dbase` (or --features full)"
     )
 }
 
@@ -2436,6 +2536,7 @@ enum InputFormat {
     CombinedLog,
     Syslog,
     Syslog5424,
+    Dbase,
 }
 
 impl InputFormat {
@@ -2462,6 +2563,7 @@ impl InputFormat {
             InputFormat::CombinedLog => "combined_log",
             InputFormat::Syslog => "syslog",
             InputFormat::Syslog5424 => "syslog5424",
+            InputFormat::Dbase => "dbase",
         }
     }
 }
@@ -2490,9 +2592,10 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             "combined-log" | "combined_log" | "combined" => Ok(InputFormat::CombinedLog),
             "syslog" | "syslog3164" | "rfc3164" => Ok(InputFormat::Syslog),
             "syslog5424" | "rfc5424" => Ok(InputFormat::Syslog5424),
+            "dbase" | "dbf" => Ok(InputFormat::Dbase),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, or syslog5424)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, or dbase)"
                 )
             }
         };
@@ -2519,11 +2622,12 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "xml" => Ok(InputFormat::Xml),
         "npy" => Ok(InputFormat::Npy),
         "npz" => Ok(InputFormat::Npz),
+        "dbf" => Ok(InputFormat::Dbase),
         // No extension convention reliably means fixed-width or a log
         // format (.txt/.log/no extension are all ambiguous), so all of
         // these are --format-only, never inferred.
         other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424 explicitly"
+            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase explicitly"
         ),
     }
 }
@@ -2904,6 +3008,7 @@ pub fn run() -> Result<()> {
                 .into_iter()
                 .map(|c| profile_column(c, args.samples))
                 .collect(),
+            InputFormat::Dbase => columns_from_dbase(&read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }

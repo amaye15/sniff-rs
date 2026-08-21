@@ -638,6 +638,34 @@ fn syslog_line_that_does_not_match_the_grammar_is_an_actionable_error() {
     );
 }
 
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_reveals_a_numeric_field_that_is_really_an_integer() {
+    let doc = run_json("sample.dbf", &[]);
+    let cols = table(&doc, "sample");
+
+    // dBase's Numeric field type doesn't distinguish int from float at the
+    // storage level - current_type reflects that (f64), while ideal_type
+    // still independently re-derives from the actual values and correctly
+    // narrows to i64, exactly the current-vs-ideal gap this tool exists to
+    // surface.
+    let age = column(cols, "AGE");
+    assert_eq!(age["current_type"], "f64");
+    assert_eq!(age["ideal_type"], "i64");
+
+    let balance = column(cols, "BALANCE");
+    assert_eq!(balance["current_type"], "f64");
+    assert_eq!(balance["ideal_type"], "f64");
+
+    let active = column(cols, "ACTIVE");
+    assert_eq!(active["current_type"], "bool");
+
+    // dBase's own Date rendering (YYYYMMDD) resolves via the date format
+    // added to DATE_FORMATS specifically for it.
+    let signup = column(cols, "SIGNUP");
+    assert_eq!(signup["ideal_type"], "NaiveDate / DateTime");
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {
