@@ -520,6 +520,17 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
   duplicate Arrow stack for one format was judged not worth it here; would
   reconsider if the crate trims that footprint, or if there's a concrete
   need for `.duckdb` files.
+- **No SPSS (`.sav`/`.zsav`).** Considered alongside Stata and SAS7BDAT,
+  and declined for the same duplicate-dependency reason as DuckDB, just at
+  smaller scale. `ambers` is the only pure-Rust SPSS reader on crates.io,
+  and its `Cargo.toml` depends on `arrow` v57 *unconditionally* - no
+  feature flag disables it - alongside the `arrow` v59.2 this project
+  already depends on for Parquet/Arrow IPC; not deduped, just duplicated
+  (~10-13 extra crates, though unlike DuckDB there's no HTTP client or
+  other unrelated baggage riding along). The only other option,
+  `polars-readstat-rs`, pulls in all of Polars instead, which is heavier
+  still. Would reconsider if `ambers` makes `arrow` optional, or if
+  there's a concrete need for `.sav` files.
 - **Stata/SAS7BDAT variable/value labels aren't surfaced.** A `.dta` or
   `.sas7bdat` file can carry a human-authored description per variable (a
   "variable label") and, for Stata, a named mapping for coded values (a
