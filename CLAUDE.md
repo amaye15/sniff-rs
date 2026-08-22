@@ -432,6 +432,30 @@ entirely:
   `45`), so the note says so explicitly instead of treating both as the
   same kind of formatting noise.
 
+- **RFC 3339 / ISO 8601 timestamps with a 'Z' suffix or numeric offset**,
+  e.g. `"2023-01-01T12:00:00Z"` or `"...+00:00"` - ubiquitous in JSON APIs,
+  but unmatched by the older, offset-less `DATE_FORMATS` entries (which
+  only covered the bare `"...T12:00:00"` form). `%.f` tolerates a value
+  with no fractional seconds at all, and `%z` accepts a colon offset
+  (`"+00:00"`) as well as the bare form (`"+0000"`) - both verified
+  empirically against real chrono behavior before being relied on, per this
+  project's usual practice, rather than assumed.
+- **Time-of-day values with no date component** (`"14:30:00"`,
+  `"2:30 PM"`) previously fell through every check straight to `String` -
+  there was no time-only detection at all, only date/datetime.
+  `matching_time_format`/`TIME_FORMATS` (parallel to
+  `matching_date_format`/`DATE_FORMATS`) add a `NaiveTime` ideal type,
+  mapped to json-schema's `format: time`.
+- **Date/time detection now runs before the leading-zero heuristic**, not
+  after. This fixed a real, pre-existing bug the time-of-day work above
+  surfaced: `has_leading_zero` only inspects a value's first two
+  characters, so a value like `"01/15/2024"` or `"09:00:00"` was being
+  misclassified as "a numeric ID that lost a leading zero" before the
+  date/time checks ever got a chance to run - even though the value fully,
+  unambiguously matches a known date/time grammar. The more specific match
+  now wins, the same principle already applied to placing UUID/Email/IPv4/
+  IPv6/URL ahead of leading-zero.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -625,8 +649,8 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
 - **`missing_pct` is rounded to 1 decimal place** at construction time
   (`round1`), in both Markdown and JSON. This is a display choice, not a
   precision bug — full float precision was never meaningful here.
-- **Date-format detection is a fixed candidate list** (`DATE_FORMATS`), not
-  a fuzzy parser. Deliberate: a fuzzy parser can silently misparse a
-  numeric ID as a date; a fixed list either matches every value in a column
-  or reports nothing, which is a safer failure mode. Extend the list if a
-  reasonable format is missing one.
+- **Date/time-format detection is a fixed candidate list** (`DATE_FORMATS`,
+  `TIME_FORMATS`), not a fuzzy parser. Deliberate: a fuzzy parser can
+  silently misparse a numeric ID as a date; a fixed list either matches
+  every value in a column or reports nothing, which is a safer failure
+  mode. Extend the list if a reasonable format is missing one.

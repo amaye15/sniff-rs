@@ -910,6 +910,27 @@ fn csv_normalizes_percentages_and_parenthesized_negative_currency() {
 }
 
 #[test]
+fn csv_recognizes_rfc3339_timestamps_and_time_of_day() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    // "2024-01-15T10:00:00Z" - UTC 'Z' suffix, ubiquitous in JSON APIs.
+    let created = column(cols, "created_at");
+    assert_eq!(created["ideal_type"], "NaiveDate / DateTime");
+
+    // "2024-01-15T10:00:00+00:00" - numeric offset instead of 'Z'.
+    let updated = column(cols, "updated_at");
+    assert_eq!(updated["ideal_type"], "NaiveDate / DateTime");
+
+    // "09:00:00" - time-of-day only, no date component at all. Also proves
+    // the leading-zero heuristic no longer preempts a structured time match
+    // ("09" looks like a leading-zero-then-digit ID prefix on its own).
+    let checkin = column(cols, "checkin_time");
+    assert_eq!(checkin["ideal_type"], "NaiveTime");
+    assert!(!checkin["notes"].as_str().unwrap().contains("leading zeros"));
+}
+
+#[test]
 fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     let doc = run_with_format("type_detection.csv", "json-schema", &[]);
     let props = &doc["tables"]["type_detection"]["properties"];
@@ -933,5 +954,9 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(
         props["homepage"],
         serde_json::json!({"type": "string", "format": "uri"})
+    );
+    assert_eq!(
+        props["checkin_time"],
+        serde_json::json!({"type": "string", "format": "time"})
     );
 }

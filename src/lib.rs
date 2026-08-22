@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use clap::Parser;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -77,7 +77,28 @@ const DATE_FORMATS: &[&str] = &[
     "%b %d, %Y",
     "%d/%b/%Y:%H:%M:%S %z", // Common/Combined Log Format's timestamp
     "%Y%m%d",               // dBase's own Date field rendering
+    // RFC 3339 / ISO 8601, as commonly produced by JSON APIs. %.f tolerates
+    // a value with no fractional seconds at all, and %z accepts both a
+    // colon and non-colon offset ("+00:00" and "+0000" alike) - both
+    // verified empirically, not assumed - so each of these also covers its
+    // own no-fraction/no-colon variant without a separate duplicate entry.
+    "%Y-%m-%dT%H:%M:%S%.fZ",  // UTC, e.g. "2023-01-01T12:00:00.123Z"
+    "%Y-%m-%dT%H:%M:%S%.f%z", // offset, e.g. "...+0000" or "...+00:00"
+    "%Y-%m-%dT%H:%M:%S%.f",   // no offset at all, fractional seconds only
 ];
+
+/// Candidate time-of-day formats, tried the same way DATE_FORMATS is: first
+/// one every value matches wins. %.f tolerates a value with no fractional
+/// seconds (verified the same way as the DATE_FORMATS entries above).
+const TIME_FORMATS: &[&str] = &["%H:%M:%S%.f", "%H:%M", "%I:%M:%S %p", "%I:%M %p"];
+
+fn matching_time_format(values: &[&str]) -> Option<&'static str> {
+    TIME_FORMATS.iter().copied().find(|fmt| {
+        values
+            .iter()
+            .all(|v| NaiveTime::parse_from_str(v, fmt).is_ok())
+    })
+}
 
 // --- Shared intermediate representation, produced by each format's reader ---
 
@@ -264,6 +285,24 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return ("URL".to_string(), "matches URL format".to_string());
     }
 
+    // Date/time formats are checked before the leading-zero heuristic below:
+    // a value like "01/15/2024" or "09:00:00" has a leading zero on its
+    // month/hour, but it's a structured date/time, not a numeric ID that
+    // lost a zero - the more specific, fully-explaining match should win.
+    if let Some(fmt) = matching_date_format(values) {
+        return (
+            "NaiveDate / DateTime".to_string(),
+            format!("all values match date format \"{fmt}\""),
+        );
+    }
+
+    if let Some(fmt) = matching_time_format(values) {
+        return (
+            "NaiveTime".to_string(),
+            format!("all values match time format \"{fmt}\""),
+        );
+    }
+
     if values.iter().any(|v| has_leading_zero(v)) {
         let mut note = "leading zeros in raw values (likely an ID/code)".to_string();
         if current == "i64" || current == "f64" {
@@ -276,13 +315,6 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "bool".to_string(),
             "values are yes/no/true/false".to_string(),
-        );
-    }
-
-    if let Some(fmt) = matching_date_format(values) {
-        return (
-            "NaiveDate / DateTime".to_string(),
-            format!("all values match date format \"{fmt}\""),
         );
     }
 
@@ -3149,6 +3181,7 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "f64" => Some(("number", None)),
         "bool" => Some(("boolean", None)),
         "NaiveDate / DateTime" => Some(("string", Some("date-time"))),
+        "NaiveTime" => Some(("string", Some("time"))),
         "UUID" => Some(("string", Some("uuid"))),
         "Email" => Some(("string", Some("email"))),
         "IPv4" => Some(("string", Some("ipv4"))),
@@ -3554,6 +3587,46 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&values, "String");
         assert_eq!(ideal, "enum / category");
         assert!(note.contains("constant"));
+    }
+
+    #[test]
+    fn matching_date_format_recognizes_rfc3339_with_z_and_numeric_offset() {
+        assert_eq!(
+            matching_date_format(&["2023-01-01T12:00:00Z", "2023-06-15T08:30:00.5Z"]),
+            Some("%Y-%m-%dT%H:%M:%S%.fZ")
+        );
+        assert_eq!(
+            matching_date_format(&["2023-01-01T12:00:00+0000"]),
+            Some("%Y-%m-%dT%H:%M:%S%.f%z")
+        );
+        // %z accepts a colon offset too, not just the bare form.
+        assert_eq!(
+            matching_date_format(&["2023-01-01T12:00:00+00:00"]),
+            Some("%Y-%m-%dT%H:%M:%S%.f%z")
+        );
+    }
+
+    #[test]
+    fn matching_time_format_recognizes_24h_and_12h_clock_forms() {
+        assert_eq!(
+            matching_time_format(&["14:30:00", "09:00:00"]),
+            Some("%H:%M:%S%.f")
+        );
+        assert_eq!(matching_time_format(&["14:30", "09:00"]), Some("%H:%M"));
+        assert_eq!(matching_time_format(&["not-a-time"]), None);
+    }
+
+    #[test]
+    fn suggest_ideal_type_prefers_date_and_time_formats_over_leading_zero() {
+        // "01/15/2024" and "09:00:00" both have a leading-zero-then-digit
+        // prefix, but they're structured dates/times, not IDs that lost a
+        // zero - the more specific match must win.
+        let (ideal, _) = suggest_ideal_type(&["01/15/2024", "02/20/2024"], "String");
+        assert_eq!(ideal, "NaiveDate / DateTime");
+
+        let (ideal, note) = suggest_ideal_type(&["09:00:00", "14:30:00"], "String");
+        assert_eq!(ideal, "NaiveTime");
+        assert!(!note.contains("leading zeros"));
     }
 
     #[test]
