@@ -297,6 +297,86 @@ fn is_mac_address(s: &str) -> bool {
             .all(|g| g.len() == 2 && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// ISO 7064 mod-97-10 IBAN checksum: move the first 4 characters to the
+/// end, expand each letter to its two-digit value (A=10..Z=35), and the
+/// resulting decimal number must be ≡ 1 (mod 97). Computed digit-by-digit
+/// via a running remainder rather than building the (up to ~70-digit)
+/// number directly, since it doesn't fit in a u64. Verified against three
+/// real IBANs (GB/DE/FR, including FR's letter-containing BBAN) and one
+/// deliberately-corrupted checksum before being relied on.
+fn is_iban(s: &str) -> bool {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| *c != ' ')
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let len = cleaned.len();
+    if !(15..=34).contains(&len) {
+        return false;
+    }
+    let b = cleaned.as_bytes();
+    if !(b[0].is_ascii_alphabetic()
+        && b[1].is_ascii_alphabetic()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit())
+    {
+        return false;
+    }
+    if !cleaned[4..].chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+
+    let rearranged = format!("{}{}", &cleaned[4..], &cleaned[0..4]);
+    let mut remainder: u64 = 0;
+    for c in rearranged.chars() {
+        let value = if c.is_ascii_digit() {
+            u64::from(c.to_digit(10).unwrap())
+        } else {
+            u64::from(c as u32 - 'A' as u32) + 10
+        };
+        if value >= 10 {
+            remainder = (remainder * 10 + value / 10) % 97;
+            remainder = (remainder * 10 + value % 10) % 97;
+        } else {
+            remainder = (remainder * 10 + value) % 97;
+        }
+    }
+    remainder == 1
+}
+
+/// Luhn (mod 10) checksum - used by credit card numbers among other
+/// identifier schemes.
+fn luhn_checksum_valid(digits: &[u32]) -> bool {
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i % 2 == 1 {
+                let doubled = d * 2;
+                if doubled > 9 { doubled - 9 } else { doubled }
+            } else {
+                d
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+/// A Luhn-valid digit string of plausible card length (12-19 digits, the
+/// ISO/IEC 7812-1 range), tolerant of the spaces/dashes real card numbers
+/// are commonly typed with. The checksum is what makes this safe: a random
+/// digit string passes Luhn only 1 time in 10, so combined with the length
+/// bound this is a strong signal, not a shape-only guess.
+fn is_credit_card_number(s: &str) -> bool {
+    let cleaned: String = s.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
+    if !(12..=19).contains(&cleaned.len()) || !cleaned.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let digits: Vec<u32> = cleaned.chars().map(|c| c.to_digit(10).unwrap()).collect();
+    luhn_checksum_valid(&digits)
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
@@ -305,6 +385,18 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "MAC Address".to_string(),
             "matches MAC address format".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_iban(v)) {
+        return (
+            "IBAN".to_string(),
+            "matches IBAN format (mod-97 checksum valid)".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_credit_card_number(v)) {
+        return (
+            "Credit Card Number".to_string(),
+            "matches card number format (Luhn checksum valid)".to_string(),
         );
     }
     if values.iter().all(|v| is_uuid(v)) {
@@ -3246,6 +3338,8 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         // an unconstrained {} the way an unrecognized ideal_type would -
         // the underlying value is known for certain to be a string.
         "MAC Address" => Some(("string", None)),
+        "IBAN" => Some(("string", None)),
+        "Credit Card Number" => Some(("string", None)),
         _ => None,
     }
 }
@@ -3736,6 +3830,35 @@ mod tests {
         assert!(is_mac_address("00-1A-2B-3C-4D-5E"));
         assert!(!is_mac_address("2001:db8::1")); // IPv6, not a MAC
         assert!(!is_mac_address("00:1A:2B:3C:4D")); // only 5 groups
+    }
+
+    #[test]
+    fn is_iban_validates_real_ibans_and_rejects_a_corrupted_checksum() {
+        assert!(is_iban("GB29NWBK60161331926819"));
+        assert!(is_iban("DE89370400440532013000"));
+        assert!(is_iban("FR1420041010050500013M02606")); // letter in the BBAN
+        assert!(!is_iban("GB29NWBK60161331926820")); // last digit tampered
+        assert!(!is_iban("not an iban at all"));
+    }
+
+    #[test]
+    fn is_credit_card_number_validates_luhn_and_rejects_a_bad_checksum() {
+        assert!(is_credit_card_number("4111111111111111")); // standard test Visa number
+        assert!(is_credit_card_number("4111 1111 1111 1111")); // spaces tolerated
+        assert!(!is_credit_card_number("4111111111111112")); // tampered last digit
+        assert!(!is_credit_card_number("123")); // too short
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_iban_and_credit_card_number() {
+        let (ideal, _) = suggest_ideal_type(
+            &["GB29NWBK60161331926819", "DE89370400440532013000"],
+            "String",
+        );
+        assert_eq!(ideal, "IBAN");
+
+        let (ideal, _) = suggest_ideal_type(&["4111111111111111", "5500005555555559"], "String");
+        assert_eq!(ideal, "Credit Card Number");
     }
 
     #[test]

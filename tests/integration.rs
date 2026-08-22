@@ -945,6 +945,22 @@ fn csv_recognizes_hex_literals_and_mac_addresses() {
 }
 
 #[test]
+fn csv_recognizes_iban_and_credit_card_numbers_via_checksum() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let iban = column(cols, "iban");
+    assert_eq!(iban["ideal_type"], "IBAN");
+
+    // Card numbers are plain digit strings that fit i64 - current_type says
+    // i64, but ideal_type correctly identifies an opaque identifier rather
+    // than a quantity, the same current-vs-ideal gap this tool exists for.
+    let card = column(cols, "credit_card");
+    assert_eq!(card["current_type"], "i64");
+    assert_eq!(card["ideal_type"], "Credit Card Number");
+}
+
+#[test]
 fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     let doc = run_with_format("type_detection.csv", "json-schema", &[]);
     let props = &doc["tables"]["type_detection"]["properties"];
@@ -973,7 +989,10 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
         props["checkin_time"],
         serde_json::json!({"type": "string", "format": "time"})
     );
-    // MAC Address has no registered json-schema.org format keyword - still
-    // gets a plain "string" type rather than falling through to {}.
+    // MAC Address, IBAN, and Credit Card Number all have no registered
+    // json-schema.org format keyword - still get a plain "string" type
+    // rather than falling through to {}.
     assert_eq!(props["mac_address"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["iban"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["credit_card"], serde_json::json!({"type": "string"}));
 }

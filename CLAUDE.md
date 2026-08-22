@@ -470,6 +470,21 @@ entirely:
   `"::"` is rejected by `std`'s own strict parser), so the two checks can
   never actually disagree on a real value regardless of ordering - the
   ordering just documents the intent.
+- **IBAN and credit card numbers are checksum-validated, not shape-only.**
+  `is_iban` implements the ISO 7064 mod-97-10 check (move the first 4
+  characters to the end, expand each letter to its two-digit value, the
+  result must be ≡ 1 mod 97 - computed digit-by-digit via a running
+  remainder, since the expanded number is too big for a `u64`).
+  `is_credit_card_number` implements the Luhn (mod 10) check. Both are
+  meaningfully stronger evidence than a length/shape regex: a random digit
+  string passes Luhn only 1 time in 10, and mod-97 similarly rejects the
+  overwhelming majority of non-IBAN strings, so combined with the length
+  bound there's essentially no false-positive risk - the same category of
+  confidence UUID's fixed grammar already has, just via a checksum instead
+  of a fixed dash pattern. Verified against three real IBANs (UK/Germany/
+  France, including France's letter-containing BBAN) plus a deliberately
+  corrupted checksum, and against several widely-published test card
+  numbers, before being relied on.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
