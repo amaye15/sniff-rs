@@ -528,6 +528,51 @@ entirely:
   (`"nested value (array/object) - consider flattening before typing"`),
   just discovered from the string content instead of the format's own
   type system.
+- **Literal `"infinity"`/`"nan"` text silently became a clean-looking f64
+  column with zero warning** - a real bug found via adversarial testing,
+  not a hypothetical. Rust's own `f64::from_str` accepts `"inf"`,
+  `"infinity"`, and `"nan"` (any case, optionally signed) as legitimate
+  IEEE-754 values, not a parse error, so a stray `"Infinity"` typed into an
+  otherwise-clean numeric column (a serialization bug, an overflow marker
+  from another system, a human data-entry mistake) sailed straight through
+  to `ideal_type: f64` with nothing to indicate anything was unusual.
+  `ideal_type` still resolves to `f64` - it genuinely is a legal float
+  value, and some domains do use ±infinity deliberately - but the f64
+  branch of `suggest_ideal_type` now checks `!f.is_finite()` on every
+  parsed value and appends an explicit note when it fires, so the surprise
+  is disclosed rather than hidden.
+- **A column of digit strings too large for `i64` silently lost precision
+  as f64, also with zero warning** - the second bug adversarial testing
+  found. Once a value's magnitude overflows `i64` (~9.2e18) it falls
+  through to the f64 check, but f64 can only represent integers *exactly*
+  up to 2^53 (~9e15) - three orders of magnitude smaller - so the fallback
+  silently rounds real digits away. `is_plain_integer_literal` identifies a
+  value that's a bare integer literal (no `.`, no exponent) which
+  *individually* failed `i64::parse` (not just present in a column some
+  *other*, differently-shaped value blocked from the i64 branch - the two
+  are easy to conflate and an earlier draft of this fix did exactly that,
+  caught by `suggest_ideal_type_does_not_flag_precision_loss_for_ordinary_i64_sized_values`)
+  and adds a note when it does, since by construction such a value is
+  already too large for `i64`'s range, which is itself well past f64's
+  exact-integer range - precision loss is guaranteed, not just risked.
+- **A dedicated adversarial/robustness test suite** exists specifically to
+  keep catching this class of bug. It covers three things distinct from
+  the correctness tests above: (1) every validator survives a grab-bag of
+  hostile input - empty strings, control characters, multi-byte unicode
+  including 4-byte emoji, SQL/shell/template-injection-style payloads, and
+  a 100,000-character string - without panicking, regardless of what it
+  returns; (2) `is_iban` and `normalize_numeric_str` both do raw
+  byte-offset string slicing (`&s[4..]`, `&s[1..len-1]`) that's only safe
+  because a preceding check guarantees the bytes at those offsets are
+  single-byte ASCII - proven directly with adversarial multi-byte input at
+  exactly those code paths, not just reasoned about; (3) every checksum
+  and fixed-grammar check is proven to genuinely discriminate, not just
+  check shape - a real, valid IBAN/credit-card/ISBN-10/ISBN-13/EAN-13
+  number with exactly one digit tampered is confirmed rejected, and
+  `suggest_ideal_type`'s `.all(...)` semantics are confirmed to veto a
+  whole column's classification on a single non-conforming value (a
+  "mostly UUIDs" column is not a trustworthy UUID column) rather than
+  taking a majority vote.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
@@ -637,6 +682,13 @@ handling and its own current-vs-ideal-type gap (a double column holding
 one `NaN` alongside otherwise-integer data), SAS7BDAT being wired up
 (see Known limitations for why it has no dedicated fixture), and that
 Markdown output never has a trailing blank line.
+
+The `#[cfg(test)] mod tests` block in `lib.rs` additionally has an
+adversarial/robustness section (see the design-philosophy note above) that
+every validator must survive without panicking - hostile unicode, control
+characters, injection-style payloads, extreme length - plus proof that
+every checksum genuinely discriminates near-miss values rather than just
+checking shape.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
