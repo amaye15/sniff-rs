@@ -455,6 +455,21 @@ entirely:
   unambiguously matches a known date/time grammar. The more specific match
   now wins, the same principle already applied to placing UUID/Email/IPv4/
   IPv6/URL ahead of leading-zero.
+- **Base-prefixed integer literals** (`"0x1A"`, `"0b1010"`, `"0o17"`) used
+  to fall through to plain `String` with no note at all - `i64::parse`
+  doesn't understand these prefixes. `parse_prefixed_int` recognizes them
+  and resolves to `i64`, but deliberately *only* with an explicit `0x`/
+  `0b`/`0o` prefix - a bare hex string with no prefix is exactly as
+  ambiguous as a hash/opaque ID (see the UUID note above), so it's left
+  alone.
+- **MAC addresses** (`"00:1A:2B:3C:4D:5E"`, dash- or colon-separated) are a
+  fixed IEEE 802 grammar - six exactly-2-hex-digit groups - checked ahead
+  of IPv6 for the same "more specific match wins" reason as everything
+  else in this list. Verified separately (not assumed) that this shape
+  never parses as a valid `Ipv6Addr` in the first place (6 groups with no
+  `"::"` is rejected by `std`'s own strict parser), so the two checks can
+  never actually disagree on a real value regardless of ordering - the
+  ordering just documents the intent.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and

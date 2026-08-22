@@ -931,6 +931,20 @@ fn csv_recognizes_rfc3339_timestamps_and_time_of_day() {
 }
 
 #[test]
+fn csv_recognizes_hex_literals_and_mac_addresses() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let hex = column(cols, "hex_value");
+    assert_eq!(hex["current_type"], "String");
+    assert_eq!(hex["ideal_type"], "i64");
+    assert!(hex["notes"].as_str().unwrap().contains("0x"));
+
+    let mac = column(cols, "mac_address");
+    assert_eq!(mac["ideal_type"], "MAC Address");
+}
+
+#[test]
 fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     let doc = run_with_format("type_detection.csv", "json-schema", &[]);
     let props = &doc["tables"]["type_detection"]["properties"];
@@ -959,4 +973,7 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
         props["checkin_time"],
         serde_json::json!({"type": "string", "format": "time"})
     );
+    // MAC Address has no registered json-schema.org format keyword - still
+    // gets a plain "string" type rather than falling through to {}.
+    assert_eq!(props["mac_address"], serde_json::json!({"type": "string"}));
 }

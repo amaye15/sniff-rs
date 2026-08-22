@@ -256,10 +256,57 @@ fn numeric_note(current: &str, target: &str, any_percent: bool) -> String {
     parts.join("; ")
 }
 
+/// Parses an explicitly base-prefixed integer literal ("0x1A", "0b1010",
+/// "0o17"). The prefix is the unambiguous signal - a bare hex string with no
+/// prefix (which could just as easily be a hash or an opaque ID) is
+/// deliberately not matched here; see is_uuid for the same reasoning
+/// applied to dashed hex.
+fn parse_prefixed_int(s: &str) -> Option<i64> {
+    let (rest, radix) = if let Some(r) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        (r, 16)
+    } else if let Some(r) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        (r, 2)
+    } else if let Some(r) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+        (r, 8)
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    i64::from_str_radix(rest, radix).ok()
+}
+
+/// Six colon- or dash-separated 2-hex-digit groups - the fixed IEEE 802
+/// grammar, not the loose "hex-ish string" that a bare hash could also
+/// satisfy. Verified separately that this shape never parses as a valid
+/// Ipv6Addr (6 groups with no "::" is rejected by std's own strict parser),
+/// so there's no risk of the two checks disagreeing on the same value.
+fn is_mac_address(s: &str) -> bool {
+    let sep = if s.contains(':') {
+        ':'
+    } else if s.contains('-') {
+        '-'
+    } else {
+        return false;
+    };
+    let groups: Vec<&str> = s.split(sep).collect();
+    groups.len() == 6
+        && groups
+            .iter()
+            .all(|g| g.len() == 2 && g.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
     // (leading-zero, in particular) firing on a substring pattern instead.
+    if values.iter().all(|v| is_mac_address(v)) {
+        return (
+            "MAC Address".to_string(),
+            "matches MAC address format".to_string(),
+        );
+    }
     if values.iter().all(|v| is_uuid(v)) {
         return ("UUID".to_string(), "matches UUID format".to_string());
     }
@@ -283,6 +330,13 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     }
     if values.iter().all(|v| is_url(v)) {
         return ("URL".to_string(), "matches URL format".to_string());
+    }
+
+    if values.iter().all(|v| parse_prefixed_int(v).is_some()) {
+        return (
+            "i64".to_string(),
+            "base-prefixed literal (0x/0b/0o), decoded from its declared base".to_string(),
+        );
     }
 
     // Date/time formats are checked before the leading-zero heuristic below:
@@ -3187,6 +3241,11 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "IPv4" => Some(("string", Some("ipv4"))),
         "IPv6" => Some(("string", Some("ipv6"))),
         "URL" => Some(("string", Some("uri"))),
+        // No registered json-schema.org format keyword exists for these, so
+        // they still map to a plain "string" rather than falling through to
+        // an unconstrained {} the way an unrecognized ideal_type would -
+        // the underlying value is known for certain to be a string.
+        "MAC Address" => Some(("string", None)),
         _ => None,
     }
 }
@@ -3653,6 +3712,30 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&["(120.50)", "300.00", "(12.00)"], "String");
         assert_eq!(ideal, "f64");
         assert!(!note.contains('%'));
+    }
+
+    #[test]
+    fn parse_prefixed_int_decodes_hex_binary_and_octal_but_not_bare_hex() {
+        assert_eq!(parse_prefixed_int("0x1A"), Some(26));
+        assert_eq!(parse_prefixed_int("0b1010"), Some(10));
+        assert_eq!(parse_prefixed_int("0o17"), Some(15));
+        assert_eq!(parse_prefixed_int("1A"), None); // no prefix - not matched
+        assert_eq!(parse_prefixed_int("0x"), None); // prefix with nothing after it
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_base_prefixed_literals() {
+        let (ideal, note) = suggest_ideal_type(&["0x1A", "0xFF", "0x00"], "String");
+        assert_eq!(ideal, "i64");
+        assert!(note.contains("0x"));
+    }
+
+    #[test]
+    fn is_mac_address_requires_six_hex_pairs_and_rejects_ipv6_shaped_strings() {
+        assert!(is_mac_address("00:1A:2B:3C:4D:5E"));
+        assert!(is_mac_address("00-1A-2B-3C-4D-5E"));
+        assert!(!is_mac_address("2001:db8::1")); // IPv6, not a MAC
+        assert!(!is_mac_address("00:1A:2B:3C:4D")); // only 5 groups
     }
 
     #[test]
