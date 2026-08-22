@@ -973,6 +973,22 @@ fn csv_recognizes_isbn13_and_ean_upc_barcodes() {
 }
 
 #[test]
+fn csv_recognizes_semver_and_flags_embedded_json_in_a_text_cell() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let version = column(cols, "app_version");
+    assert_eq!(version["ideal_type"], "SemVer");
+
+    // A cell that's itself a serialized JSON object stays String (it's
+    // still literally a string in this CSV column), but with a note
+    // flagging that it's worth parsing separately.
+    let config = column(cols, "config_blob");
+    assert_eq!(config["ideal_type"], "String");
+    assert!(config["notes"].as_str().unwrap().contains("embedded JSON"));
+}
+
+#[test]
 fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     let doc = run_with_format("type_detection.csv", "json-schema", &[]);
     let props = &doc["tables"]["type_detection"]["properties"];
@@ -1009,4 +1025,5 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(props["credit_card"], serde_json::json!({"type": "string"}));
     assert_eq!(props["isbn"], serde_json::json!({"type": "string"}));
     assert_eq!(props["ean_upc"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["app_version"], serde_json::json!({"type": "string"}));
 }

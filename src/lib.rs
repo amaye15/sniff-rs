@@ -449,6 +449,51 @@ fn is_isbn10(s: &str) -> bool {
     sum.is_multiple_of(11)
 }
 
+/// A SemVer numeric identifier: digits only, and no leading zero unless the
+/// whole identifier is just "0" - the exact rule semver.org itself
+/// specifies for the MAJOR/MINOR/PATCH components.
+fn is_numeric_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))
+}
+
+/// A reasonably faithful (not 100% spec-exhaustive) semver.org check:
+/// MAJOR.MINOR.PATCH, each a leading-zero-free numeric identifier, plus an
+/// optional "-prerelease" and/or "+build" suffix. Deliberately requires
+/// exactly 3 dot-separated core components, so it never collides with
+/// is_ipv4's 4-octet grammar - see the known-limitations note on this
+/// still being ambiguous with a plain dotted numeric code that isn't
+/// actually a version (the same irreducible ambiguity IPv4 already has
+/// with a dotted version string).
+fn is_semver(s: &str) -> bool {
+    let without_build = s.split_once('+').map_or(s, |(base, _)| base);
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (without_build, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| is_numeric_identifier(p))
+        && prerelease.is_none_or(|pre| {
+            !pre.is_empty()
+                && pre.split('.').all(|id| {
+                    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+        })
+}
+
+/// True if the whole cell is itself a serialized JSON object or array - a
+/// text/CSV column that's secretly holding structured data. Deliberately
+/// excludes a bare scalar ("5", "true", "\"hello\"" are all technically
+/// valid JSON too) since those are already handled correctly, and more
+/// specifically, by the bool/numeric checks elsewhere - this check only
+/// fires on the case those can't already explain.
+fn is_embedded_json(s: &str) -> bool {
+    matches!(
+        serde_json::from_str::<JsonValue>(s),
+        Ok(JsonValue::Object(_) | JsonValue::Array(_))
+    )
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
@@ -517,6 +562,12 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
             "matches IPv6 address format".to_string(),
         );
     }
+    if values.iter().all(|v| is_semver(v)) {
+        return (
+            "SemVer".to_string(),
+            "matches MAJOR.MINOR.PATCH semver.org format".to_string(),
+        );
+    }
     if values.iter().all(|v| is_url(v)) {
         return ("URL".to_string(), "matches URL format".to_string());
     }
@@ -525,6 +576,13 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "i64".to_string(),
             "base-prefixed literal (0x/0b/0o), decoded from its declared base".to_string(),
+        );
+    }
+
+    if values.iter().all(|v| is_embedded_json(v)) {
+        return (
+            "String".to_string(),
+            "cell holds embedded JSON (object/array) - consider parsing it separately".to_string(),
         );
     }
 
@@ -3437,7 +3495,7 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "MAC Address" => Some(("string", None)),
         "IBAN" => Some(("string", None)),
         "Credit Card Number" => Some(("string", None)),
-        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" => Some(("string", None)),
+        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" | "SemVer" => Some(("string", None)),
         _ => None,
     }
 }
@@ -3985,6 +4043,35 @@ mod tests {
 
         let (ideal, _) = suggest_ideal_type(&["4006381333931", "036000291452"], "String");
         assert_eq!(ideal, "EAN-13 / UPC-A");
+    }
+
+    #[test]
+    fn is_semver_accepts_core_prerelease_and_build_forms_rejects_leading_zeros() {
+        assert!(is_semver("1.2.3"));
+        assert!(is_semver("2.0.0-beta.1"));
+        assert!(is_semver("1.0.0+build.123"));
+        assert!(is_semver("1.0.0-rc.1+build.5"));
+        assert!(!is_semver("01.2.3")); // leading zero on a numeric identifier
+        assert!(!is_semver("1.2")); // only 2 components
+        assert!(!is_semver("1.2.3.4")); // 4 components - would be an IPv4 octet count instead
+    }
+
+    #[test]
+    fn is_embedded_json_accepts_object_and_array_but_not_a_bare_scalar() {
+        assert!(is_embedded_json(r#"{"a":1,"b":2}"#));
+        assert!(is_embedded_json("[1,2,3]"));
+        assert!(!is_embedded_json("5")); // bare scalar - handled by the numeric check instead
+        assert!(!is_embedded_json("not json"));
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_semver_and_embedded_json() {
+        let (ideal, _) = suggest_ideal_type(&["1.2.3", "2.0.0-beta.1"], "String");
+        assert_eq!(ideal, "SemVer");
+
+        let (ideal, note) = suggest_ideal_type(&[r#"{"a":1}"#, "[1,2,3]"], "String");
+        assert_eq!(ideal, "String");
+        assert!(note.contains("embedded JSON"));
     }
 
     #[test]

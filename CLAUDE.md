@@ -505,6 +505,29 @@ entirely:
   relied on - not derived and trusted on the first attempt, since check-
   digit weighting is exactly the kind of arithmetic that's easy to get
   subtly wrong (an off-by-one in which position gets which weight).
+- **SemVer** (`"1.2.3"`, `"2.0.0-beta.1"`, `"1.0.0+build.5"`) - a
+  reasonably faithful but not 100%-spec-exhaustive check of semver.org's
+  own grammar (MAJOR.MINOR.PATCH, each numeric with no leading zero unless
+  the identifier is literally `"0"`, plus an optional `-prerelease` and/or
+  `+build` suffix). Deliberately requires exactly 3 dot-separated core
+  components so it can never collide with `is_ipv4`'s 4-octet grammar -
+  but it carries the exact same kind of irreducible ambiguity IPv4 already
+  has with a dotted version string: a plain 3-part dotted numeric code
+  that isn't actually a software version is indistinguishable from a real
+  one at the string level, and there's no column-name-based guessing here
+  to break the tie.
+- **Embedded JSON in a text cell** - a CSV/text value that's itself a
+  serialized JSON object or array (`is_embedded_json`, via `serde_json`,
+  already a core dependency - no new one needed). Deliberately excludes a
+  bare scalar (`"5"`, `"true"`, `"\"hello\""` are all technically valid
+  JSON too), since those are already correctly handled by the numeric/bool
+  checks - this only fires on the object/array case those can't already
+  explain. `ideal_type` stays `String` (it genuinely still is one), but
+  gets a note flagging it's worth parsing separately - the same treatment
+  a genuinely-nested source column already gets in `profile_json_path`
+  (`"nested value (array/object) - consider flattening before typing"`),
+  just discovered from the string content instead of the format's own
+  type system.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
