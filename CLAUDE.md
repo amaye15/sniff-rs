@@ -384,6 +384,21 @@ entirely:
   fakery anywhere, because nothing here uses NumPy-style arrays — a column
   with missing values just gets a `has missing values -> wrap in Option<T>`
   note alongside its real type.
+- **CSV/TSV/fixed-width missing-value sentinels**: these three formats have
+  no native null - every field is plain text, so a genuinely-missing value
+  can only be an empty field or one of a handful of well-established
+  placeholder conventions (`NA`, `N/A`, `NULL`, `None`, `NaN`, `-`, `?`,
+  `unknown`, ...) - the exact same tokens pandas' `read_csv` treats as
+  missing by default. Left unrecognized, a single stray `"NA"` in an
+  otherwise-clean integer column used to derail `i64` detection for the
+  *whole column* and undercount `missing_pct` at the same time - a real,
+  reproducible loss, not a guess. `is_missing_sentinel` (matched
+  case-insensitively against the trimmed field) catches this at read time
+  in `columns_from_csv`/`columns_from_fixed_width`, the same place an empty
+  field already becomes `None`. Deliberately *not* applied to JSON or any
+  other format with a real native null - a JSON string field that literally
+  contains `"NA"` (Namibia's ISO country code, notably) is a value someone
+  chose to write, not a stand-in for absence.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and

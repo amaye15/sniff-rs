@@ -848,3 +848,22 @@ fn sqlite_reports_multiple_tables_and_catches_a_type_affinity_violation() {
         "expected a type-affinity violation, got {current_type}"
     );
 }
+
+#[test]
+fn csv_treats_missing_value_sentinels_as_null_not_literal_strings() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    // "age" has "NA" (row 2) and "null" (row 6) among otherwise-clean
+    // integers - without sentinel recognition those two literal strings
+    // would derail i64 detection entirely and undercount missing_pct.
+    let age = column(cols, "age");
+    assert_eq!(age["current_type"], "i64");
+    assert_eq!(age["ideal_type"], "i64");
+    assert_eq!(age["missing_pct"].as_f64().unwrap(), 25.0);
+    assert!(
+        age["notes"].as_str().unwrap().contains("missing values"),
+        "notes: {:?}",
+        age["notes"]
+    );
+}

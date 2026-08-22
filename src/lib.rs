@@ -106,6 +106,20 @@ fn has_leading_zero(s: &str) -> bool {
     b.len() >= 2 && b[0] == b'0' && b[1].is_ascii_digit()
 }
 
+/// Common placeholder tokens a human/tool writes in place of a real value in
+/// a format with no native null (CSV/TSV/fixed-width all encode every field
+/// as plain text - the "missing" case can only be an actual empty field, or
+/// one of these well-established conventions, the same ones pandas'
+/// `read_csv` treats as missing by default). Matched case-insensitively
+/// against the trimmed field, so " NA " and "na" both count.
+const MISSING_SENTINELS: &[&str] = &[
+    "na", "n/a", "null", "none", "nan", "nil", "-", "--", "?", "unknown", "missing", "#n/a",
+];
+
+fn is_missing_sentinel(s: &str) -> bool {
+    MISSING_SENTINELS.contains(&s.trim().to_ascii_lowercase().as_str())
+}
+
 fn is_bool_word(s: &str) -> bool {
     matches!(
         s.to_ascii_lowercase().as_str(),
@@ -217,7 +231,8 @@ fn columns_from_csv(path: &Path, nrows: Option<usize>, delimiter: u8) -> Result<
         }
         let record = result?;
         for (col_idx, field) in record.iter().enumerate() {
-            let value = if field.trim().is_empty() {
+            let trimmed = field.trim();
+            let value = if trimmed.is_empty() || is_missing_sentinel(trimmed) {
                 None
             } else {
                 Some(field.to_string())
@@ -298,7 +313,8 @@ fn columns_from_fixed_width(
             break;
         }
         for (col_idx, field) in slice_fixed_width(line, widths).into_iter().enumerate() {
-            raw[col_idx].push(if field.is_empty() { None } else { Some(field) });
+            let missing = field.is_empty() || is_missing_sentinel(&field);
+            raw[col_idx].push(if missing { None } else { Some(field) });
         }
         i += 1;
     }
@@ -3395,5 +3411,15 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&values, "String");
         assert_eq!(ideal, "String");
         assert!(note.is_empty());
+    }
+
+    #[test]
+    fn is_missing_sentinel_matches_common_placeholder_tokens_case_insensitively() {
+        assert!(is_missing_sentinel("NA"));
+        assert!(is_missing_sentinel("n/a"));
+        assert!(is_missing_sentinel(" Null "));
+        assert!(is_missing_sentinel("-"));
+        assert!(!is_missing_sentinel("Namibia")); // must not substring-match "NA"
+        assert!(!is_missing_sentinel("42"));
     }
 }
