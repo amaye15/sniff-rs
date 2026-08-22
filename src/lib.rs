@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -136,7 +137,94 @@ fn matching_date_format(values: &[&str]) -> Option<&'static str> {
     })
 }
 
+/// Recognizes RFC 4122 UUID string form (8-4-4-4-12 hex digits, dashes at
+/// fixed positions) - a fixed, unambiguous grammar that can't misfire the
+/// way a looser pattern could.
+fn is_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, &c)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// A deliberately conservative email check - not RFC 5322-complete, just
+/// precise enough to avoid false positives: exactly one '@', a non-empty
+/// local part, no whitespace anywhere, and a domain ending in an
+/// alphabetic top-level label.
+fn is_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else {
+        return false;
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return false;
+    }
+    if s.contains(char::is_whitespace) {
+        return false;
+    }
+    let Some((_, tld)) = domain.rsplit_once('.') else {
+        return false;
+    };
+    !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !tld.is_empty()
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Only http(s)/ftp URLs with a non-empty, whitespace-free remainder - not a
+/// full URL grammar, just enough to distinguish a real link from anything
+/// else that might otherwise fall through to plain String.
+fn is_url(s: &str) -> bool {
+    let rest = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .or_else(|| s.strip_prefix("ftp://"));
+    matches!(rest, Some(r) if !r.is_empty() && !r.contains(char::is_whitespace))
+}
+
+fn is_ipv4(s: &str) -> bool {
+    s.parse::<Ipv4Addr>().is_ok()
+}
+
+fn is_ipv6(s: &str) -> bool {
+    // Ipv4Addr strings never satisfy this (Ipv6Addr::from_str requires a
+    // colon), but the explicit check keeps the intent visible.
+    s.contains(':') && s.parse::<Ipv6Addr>().is_ok()
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
+    // Precise, unambiguous grammars are checked first - each one fully
+    // explains the whole string, so there's no risk of a cruder check
+    // (leading-zero, in particular) firing on a substring pattern instead.
+    if values.iter().all(|v| is_uuid(v)) {
+        return ("UUID".to_string(), "matches UUID format".to_string());
+    }
+    if values.iter().all(|v| is_email(v)) {
+        return (
+            "Email".to_string(),
+            "matches email address format".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_ipv4(v)) {
+        return (
+            "IPv4".to_string(),
+            "matches IPv4 address format".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_ipv6(v)) {
+        return (
+            "IPv6".to_string(),
+            "matches IPv6 address format".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_url(v)) {
+        return ("URL".to_string(), "matches URL format".to_string());
+    }
+
     if values.iter().any(|v| has_leading_zero(v)) {
         let mut note = "leading zeros in raw values (likely an ID/code)".to_string();
         if current == "i64" || current == "f64" {
@@ -3031,6 +3119,11 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "f64" => Some(("number", None)),
         "bool" => Some(("boolean", None)),
         "NaiveDate / DateTime" => Some(("string", Some("date-time"))),
+        "UUID" => Some(("string", Some("uuid"))),
+        "Email" => Some(("string", Some("email"))),
+        "IPv4" => Some(("string", Some("ipv4"))),
+        "IPv6" => Some(("string", Some("ipv6"))),
+        "URL" => Some(("string", Some("uri"))),
         _ => None,
     }
 }
@@ -3431,6 +3524,62 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&values, "String");
         assert_eq!(ideal, "enum / category");
         assert!(note.contains("constant"));
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_uuid_email_ipv4_ipv6_and_url() {
+        let (ideal, note) = suggest_ideal_type(
+            &[
+                "550e8400-e29b-41d4-a716-446655440000",
+                "16fd2706-8baf-433b-82eb-8c7fada847da",
+            ],
+            "String",
+        );
+        assert_eq!(ideal, "UUID");
+        assert!(note.contains("UUID"));
+
+        let (ideal, _) = suggest_ideal_type(&["alice@example.com", "bob@example.org"], "String");
+        assert_eq!(ideal, "Email");
+
+        let (ideal, _) = suggest_ideal_type(&["192.168.1.1", "10.0.0.5"], "String");
+        assert_eq!(ideal, "IPv4");
+
+        let (ideal, _) = suggest_ideal_type(&["2001:db8::1", "2001:db8::2"], "String");
+        assert_eq!(ideal, "IPv6");
+
+        let (ideal, _) =
+            suggest_ideal_type(&["https://example.com/a", "http://example.org/b"], "String");
+        assert_eq!(ideal, "URL");
+    }
+
+    #[test]
+    fn is_uuid_rejects_wrong_length_and_non_hex_segments() {
+        assert!(is_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!is_uuid("550e8400-e29b-41d4-a716-44665544000")); // 35 chars
+        assert!(!is_uuid("not-a-uuid-at-all-not-a-uuid-at-all"));
+    }
+
+    #[test]
+    fn is_email_rejects_missing_at_or_dotless_domain() {
+        assert!(is_email("user@example.com"));
+        assert!(!is_email("user example.com"));
+        assert!(!is_email("user@localhost")); // no '.' in domain
+        assert!(!is_email("user@@example.com"));
+    }
+
+    #[test]
+    fn is_url_requires_a_recognized_scheme_and_non_empty_rest() {
+        assert!(is_url("https://example.com"));
+        assert!(!is_url("example.com"));
+        assert!(!is_url("https://"));
+    }
+
+    #[test]
+    fn is_ipv4_and_is_ipv6_only_match_their_own_grammar() {
+        assert!(is_ipv4("127.0.0.1"));
+        assert!(!is_ipv4("2001:db8::1"));
+        assert!(is_ipv6("2001:db8::1"));
+        assert!(!is_ipv6("127.0.0.1"));
     }
 
     #[test]

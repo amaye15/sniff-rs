@@ -141,6 +141,8 @@ this tool's own rich shape above. Each table becomes its own
 `tables` the same way; `ideal_type` drives each property's `type`
 (`i64`→`integer`, `f64`→`number`, `bool`→`boolean`,
 `NaiveDate / DateTime`→`{"type": "string", "format": "date-time"}`,
+`UUID`/`Email`/`IPv4`/`IPv6`/`URL`→`{"type": "string", "format": "uuid" /
+"email" / "ipv4" / "ipv6" / "uri"}`,
 `Vec<T>`→`{"type": "array", "items": ...}`); a column with any missing
 values gets a `["type", "null"]` union instead of a bare type, and is left
 out of the table's `"required"` list. Deliberately lossy wherever
@@ -399,6 +401,24 @@ entirely:
   other format with a real native null - a JSON string field that literally
   contains `"NA"` (Namibia's ISO country code, notably) is a value someone
   chose to write, not a stand-in for absence.
+- **Semantic type detection (UUID/Email/IPv4/IPv6/URL)**: five more
+  `ideal_type` values beyond the storage-level ones, each backed by a fixed,
+  unambiguous grammar rather than a fuzzy pattern - `is_uuid` checks exact
+  length and dash positions, `is_ipv4`/`is_ipv6` lean on
+  `std::net::Ipv4Addr`/`Ipv6Addr`'s own strict parsers, `is_email`/`is_url`
+  are deliberately conservative (not RFC 5322/full-URL-grammar complete) so
+  they only fire when there's no real ambiguity. Checked *before* the
+  leading-zero heuristic in `suggest_ideal_type`, since leading-zero only
+  looks at the first two characters and would otherwise misfire on a UUID
+  that happens to start with a digit-then-digit prefix. All five map to
+  `json-schema.org`'s own standard `format` keywords (`uuid`, `email`,
+  `ipv4`, `ipv6`, `uri`) in `--output-format json-schema`, the same way
+  `NaiveDate / DateTime` already maps to `format: date-time`. No new
+  dependency: hand-rolled rather than pulling in `regex` (or a `uuid`/`url`
+  crate) as an unconditional dependency of the *default* build, which today
+  needs nothing beyond `std` for CSV/TSV/JSON — see "No DuckDB" below for
+  why this project treats default-build dependency weight as worth
+  protecting deliberately, not just incidentally.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
@@ -570,6 +590,18 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
   the committed test only confirms the format is wired up, the same
   fallback Feather already uses for the same underlying reason (no
   fixture, not a missing capability).
+- **A dotted-quad value valid as IPv4 is always reported as IPv4**, even if
+  it's semantically something else - a version string like `"1.2.3.4"` is
+  indistinguishable from an address at the string level, and there's no
+  column-name-based guessing here (see the design philosophy above) to
+  break the tie. Same story, smaller stakes, for `"12:30"` legitimately
+  being a ratio/score rather than a time.
+- **`is_email`/`is_url` are intentionally not standards-complete.** They
+  catch the overwhelmingly common shapes (one `@` and a dotted alphabetic
+  TLD; an `http(s)://`/`ftp://` prefix with a non-empty rest) and reject
+  anything with a real ambiguity, rather than implementing RFC 5322 or a
+  full URL grammar by hand - a false negative just falls back to `String`
+  (still correct, only less specific), which is the safer failure mode.
 - **Category-detection threshold is fixed**, not configurable: ≤50 unique
   values *and* a uniqueness ratio under 5% of total rows. Works fine at
   hundreds-plus rows; on very small files it under-triggers (nothing to do

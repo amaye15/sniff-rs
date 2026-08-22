@@ -879,3 +879,42 @@ fn csv_flags_a_constant_column_even_on_a_small_file() {
     assert_eq!(status["ideal_type"], "enum / category");
     assert!(status["notes"].as_str().unwrap().contains("constant"));
 }
+
+#[test]
+fn csv_recognizes_uuid_email_ipv4_ipv6_and_url_columns() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(column(cols, "ipv6_address")["ideal_type"], "IPv6");
+    assert_eq!(column(cols, "homepage")["ideal_type"], "URL");
+}
+
+#[test]
+fn json_schema_maps_semantic_types_to_standard_format_keywords() {
+    let doc = run_with_format("type_detection.csv", "json-schema", &[]);
+    let props = &doc["tables"]["type_detection"]["properties"];
+
+    assert_eq!(
+        props["user_uuid"],
+        serde_json::json!({"type": "string", "format": "uuid"})
+    );
+    assert_eq!(
+        props["contact_email"],
+        serde_json::json!({"type": "string", "format": "email"})
+    );
+    assert_eq!(
+        props["ip_address"],
+        serde_json::json!({"type": "string", "format": "ipv4"})
+    );
+    assert_eq!(
+        props["ipv6_address"],
+        serde_json::json!({"type": "string", "format": "ipv6"})
+    );
+    assert_eq!(
+        props["homepage"],
+        serde_json::json!({"type": "string", "format": "uri"})
+    );
+}
