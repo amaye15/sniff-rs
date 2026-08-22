@@ -867,3 +867,15 @@ fn csv_treats_missing_value_sentinels_as_null_not_literal_strings() {
         age["notes"]
     );
 }
+
+#[test]
+fn csv_flags_a_constant_column_even_on_a_small_file() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    // "status" is "active" on all 8 rows - 12.5% cardinality, which the old
+    // ratio-only (< 5%) check would have missed.
+    let status = column(cols, "status");
+    assert_eq!(status["ideal_type"], "enum / category");
+    assert!(status["notes"].as_str().unwrap().contains("constant"));
+}

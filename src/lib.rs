@@ -180,6 +180,16 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     }
 
     let unique: HashSet<&str> = values.iter().copied().collect();
+    // A single unique value is a degenerate case the ratio check below can
+    // never catch on a small file (10 rows / 1 unique value = 10%
+    // cardinality, already past the 5% bar) - constant is constant
+    // regardless of row count, so it's checked unconditionally first.
+    if unique.len() == 1 {
+        return (
+            "enum / category".to_string(),
+            "constant column (1 unique value)".to_string(),
+        );
+    }
     let ratio = unique.len() as f64 / values.len() as f64;
     if unique.len() <= 50 && ratio < 0.05 {
         return (
@@ -3411,6 +3421,16 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&values, "String");
         assert_eq!(ideal, "String");
         assert!(note.is_empty());
+    }
+
+    #[test]
+    fn suggest_ideal_type_flags_a_constant_column_even_on_a_small_file() {
+        // 8 rows, 1 unique value = 12.5% cardinality - the old ratio-only
+        // check (< 5%) would have missed this entirely.
+        let values = ["active"; 8];
+        let (ideal, note) = suggest_ideal_type(&values, "String");
+        assert_eq!(ideal, "enum / category");
+        assert!(note.contains("constant"));
     }
 
     #[test]

@@ -574,7 +574,10 @@ don't need any `pub` just to be reachable from `#[cfg(test)]`.
   values *and* a uniqueness ratio under 5% of total rows. Works fine at
   hundreds-plus rows; on very small files it under-triggers (nothing to do
   about that mathematically — 3 unique values in a 5-row file is 60%
-  cardinality no matter how you slice it).
+  cardinality no matter how you slice it). The one exception is a
+  genuinely constant column (exactly 1 unique value) — that's flagged
+  unconditionally regardless of row count, since "constant" doesn't need a
+  ratio to be true no matter how few rows there are.
 - **`missing_pct` is rounded to 1 decimal place** at construction time
   (`round1`), in both Markdown and JSON. This is a display choice, not a
   precision bug — full float precision was never meaningful here.
