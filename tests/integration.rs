@@ -1027,3 +1027,146 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(props["ean_upc"], serde_json::json!({"type": "string"}));
     assert_eq!(props["app_version"], serde_json::json!({"type": "string"}));
 }
+
+// --- Adversarial / robustness tests ----------------------------------
+// These run the full pipeline (reader + heuristics + renderer) against
+// deliberately hostile input, not just the unit-level validator functions
+// tested in lib.rs - proving end to end that a near-miss value never false-
+// positives into a specific type, that a stray non-finite/oversized number
+// gets flagged rather than silently absorbed, and that a malformed file
+// produces a clean actionable error instead of a panic.
+
+#[test]
+fn adversarial_csv_never_false_positives_on_any_near_miss_column() {
+    let doc = run_json("adversarial.csv", &[]);
+    let cols = table(&doc, "adversarial");
+
+    // A perfectly ordinary float column gets no note at all - the fixes
+    // below must not make an unrelated, clean column noisier.
+    let clean = column(cols, "clean_float");
+    assert_eq!(clean["ideal_type"], "f64");
+    assert_eq!(clean["notes"], "");
+
+    // A literal "infinity"/"NaN"/"-inf" value must not sail through a
+    // numeric column silently.
+    let infinity = column(cols, "infinity_mix");
+    assert_eq!(infinity["ideal_type"], "f64");
+    assert!(infinity["notes"].as_str().unwrap().contains("non-finite"));
+
+    // Digit strings beyond i64's range must be flagged, not silently
+    // rounded via an unqualified f64.
+    let oversized = column(cols, "oversized_int");
+    assert_eq!(oversized["ideal_type"], "f64");
+    assert!(oversized["notes"].as_str().unwrap().contains("exceed i64"));
+
+    // Every near-miss column below must NOT resolve to the specific type
+    // its values were deliberately corrupted away from.
+    assert_ne!(column(cols, "near_uuid")["ideal_type"], "UUID");
+    assert_ne!(column(cols, "near_email")["ideal_type"], "Email");
+    assert_ne!(column(cols, "near_ipv4")["ideal_type"], "IPv4");
+    assert_ne!(column(cols, "near_iban")["ideal_type"], "IBAN");
+    assert_ne!(
+        column(cols, "near_credit_card")["ideal_type"],
+        "Credit Card Number"
+    );
+    assert_ne!(column(cols, "near_isbn13")["ideal_type"], "ISBN-13");
+    assert_ne!(column(cols, "near_mac")["ideal_type"], "MAC Address");
+
+    // A column that's 3 real UUIDs and 1 clearly-not-a-UUID value must not
+    // be classified as UUID - one bad value vetoes the whole column.
+    assert_ne!(column(cols, "mostly_uuid")["ideal_type"], "UUID");
+
+    // Injection-style payloads (SQL/shell/template) and heavy unicode
+    // (emoji, CJK, zero-width spaces) are just opaque data - no crash, no
+    // bogus type.
+    let injection = column(cols, "injection");
+    assert!(matches!(
+        injection["ideal_type"].as_str().unwrap(),
+        "String" | "enum / category"
+    ));
+    let unicode = column(cols, "unicode_heavy");
+    assert!(matches!(
+        unicode["ideal_type"].as_str().unwrap(),
+        "String" | "enum / category"
+    ));
+}
+
+#[test]
+fn empty_csv_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("malformed_empty.csv", &[]);
+    let cols = table(&doc, "malformed_empty");
+    assert!(cols.is_empty());
+}
+
+#[test]
+fn header_only_csv_reports_every_column_as_empty_not_a_crash() {
+    let doc = run_json("malformed_header_only.csv", &[]);
+    let cols = table(&doc, "malformed_header_only");
+    assert_eq!(cols.len(), 3);
+    for c in cols {
+        assert_eq!(c["missing_pct"].as_f64().unwrap(), 0.0);
+        assert!(c["notes"].as_str().unwrap().contains("empty/all null"));
+    }
+}
+
+#[test]
+fn whitespace_only_csv_treats_the_blank_value_as_missing_not_a_crash() {
+    let doc = run_json("malformed_whitespace_only.csv", &[]);
+    let cols = table(&doc, "malformed_whitespace_only");
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0]["missing_pct"].as_f64().unwrap(), 100.0);
+}
+
+#[test]
+fn bom_prefixed_csv_reads_clean_column_names_not_a_crash() {
+    let doc = run_json("malformed_bom.csv", &[]);
+    let cols = table(&doc, "malformed_bom");
+    // The BOM must not leak into the first header's name.
+    assert!(cols.iter().any(|c| c["name"] == "name"));
+    assert!(cols.iter().any(|c| c["name"] == "value"));
+}
+
+#[test]
+fn ragged_csv_rows_produce_an_actionable_error_not_a_panic() {
+    let output = Command::new(bin())
+        .args([fixture("malformed_ragged.csv").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("record") || stderr.contains("field"),
+        "expected a CSV-shape error naming the problem, got: {stderr}"
+    );
+}
+
+#[test]
+fn invalid_utf8_csv_produces_an_actionable_error_not_a_panic() {
+    let output = Command::new(bin())
+        .args([fixture("malformed_invalid_utf8.csv").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("utf-8") || stderr.contains("UTF-8"),
+        "expected an actionable UTF-8 error, got: {stderr}"
+    );
+}
+
+#[test]
+fn deeply_nested_json_fails_cleanly_instead_of_a_stack_overflow() {
+    // A classic adversarial-JSON pattern (unbounded nesting depth) - proves
+    // serde_json's own recursion limit protects the recursive flattener in
+    // profile_json_path, rather than the process crashing.
+    let output = Command::new(bin())
+        .args([fixture("malformed_deeply_nested.json").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("recursion limit"),
+        "expected a recursion-limit error, got: {stderr}"
+    );
+}

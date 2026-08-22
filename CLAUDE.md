@@ -690,6 +690,29 @@ characters, injection-style payloads, extreme length - plus proof that
 every checksum genuinely discriminates near-miss values rather than just
 checking shape.
 
+`tests/integration.rs` mirrors this at the full-pipeline level (reader +
+heuristics + renderer together, via the compiled binary) with its own
+adversarial section, backed by two kinds of dedicated fixtures:
+`tests/fixtures/adversarial.csv` packs one column per semantic type with
+values deliberately corrupted away from it (a UUID one character short, a
+credit card with its Luhn digit tampered, an IPv4 octet of 256, a "mostly
+UUID" column with one non-UUID value mixed in, SQL/shell/template-
+injection-style payloads, heavy unicode/emoji/CJK/zero-width-space
+content) plus the two silent-data-loss cases described above (a literal
+"infinity"/"NaN" value, a digit string beyond i64's range) - every single
+column is asserted to *not* resolve to the type it was corrupted away
+from, and the two loss cases are asserted to carry their explicit notes.
+A family of `tests/fixtures/malformed_*` files (an empty file, a header
+with zero data rows, an all-whitespace file, a UTF-8 BOM-prefixed file, a
+file with a ragged/inconsistent column count, a file with genuinely
+invalid UTF-8 bytes, and a 200-levels-deep nested JSON document) each get
+a test asserting the tool either produces sane output or fails with a
+clean, actionable error naming the actual problem - never a panic, and
+for the deeply-nested JSON case specifically, never a stack overflow
+(serde_json's own built-in recursion limit is what actually protects
+`profile_json_path`'s own recursive flattening here, confirmed rather
+than assumed).
+
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
 black-box integration tests there's also a `#[cfg(test)] mod tests` at the
