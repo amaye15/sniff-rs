@@ -893,6 +893,23 @@ fn csv_recognizes_uuid_email_ipv4_ipv6_and_url_columns() {
 }
 
 #[test]
+fn csv_normalizes_percentages_and_parenthesized_negative_currency() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    // "10%", "25%", ... all strip to clean integers -> i64, with a note
+    // distinct from plain currency/thousands-separator stripping.
+    let discount = column(cols, "discount_pct");
+    assert_eq!(discount["ideal_type"], "i64");
+    assert!(discount["notes"].as_str().unwrap().contains('%'));
+
+    // "(45.00)" is standard accounting notation for -45.00.
+    let adjustment = column(cols, "adjustment");
+    assert_eq!(adjustment["ideal_type"], "f64");
+    assert!(!adjustment["notes"].as_str().unwrap().contains('%'));
+}
+
+#[test]
 fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     let doc = run_with_format("type_detection.csv", "json-schema", &[]);
     let props = &doc["tables"]["type_detection"]["properties"];

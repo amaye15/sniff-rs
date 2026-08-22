@@ -419,6 +419,18 @@ entirely:
   needs nothing beyond `std` for CSV/TSV/JSON — see "No DuckDB" below for
   why this project treats default-build dependency weight as worth
   protecting deliberately, not just incidentally.
+- **Numeric formatting robustness**: `normalize_numeric_str` (feeding the
+  existing i64/f64 parse checks, in place of the old bare
+  `.replace([',', '$'], "")`) now also trims stray surrounding whitespace,
+  recognizes parenthesized negatives (`"(123.45)"` → `-123.45`, standard
+  accounting notation for a loss/deduction), strips `€`/`£`/`¥` alongside
+  the existing `$`, and strips a trailing `%`. A stripped `%` gets its own
+  note (`"'%' stripped from percentage values"`), kept separate from the
+  existing `"numeric strings"` note - unlike currency/thousands-separator
+  noise, a percentage changes what the number *means* (a column of `"45%"`
+  becoming `45` is not the same claim as a column of `"$45"` becoming
+  `45`), so the note says so explicitly instead of treating both as the
+  same kind of formatting noise.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and

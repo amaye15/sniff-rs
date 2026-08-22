@@ -196,6 +196,45 @@ fn is_ipv6(s: &str) -> bool {
     s.contains(':') && s.parse::<Ipv6Addr>().is_ok()
 }
 
+/// Normalizes a numeric-looking string by stripping formatting noise a raw
+/// parse would otherwise choke on: surrounding whitespace, thousands-
+/// separator commas, currency symbols ($/€/£/¥), parenthesized negatives
+/// ("(123)" -> "-123", standard accounting notation), and a trailing '%'.
+/// Returns the cleaned string plus whether a '%' was stripped - a
+/// percentage changes the value's actual meaning (45% is not the number
+/// 45), unlike currency/thousands-separator noise, so it earns its own note
+/// rather than being silently folded into "numeric strings".
+fn normalize_numeric_str(s: &str) -> (String, bool) {
+    let trimmed = s.trim();
+    let (body, parenthesized) =
+        if trimmed.len() >= 2 && trimmed.starts_with('(') && trimmed.ends_with(')') {
+            (trimmed[1..trimmed.len() - 1].trim(), true)
+        } else {
+            (trimmed, false)
+        };
+
+    let mut cleaned = body.replace([',', '$', '€', '£', '¥'], "");
+    let is_percent = cleaned.ends_with('%');
+    if is_percent {
+        cleaned.pop();
+    }
+    if parenthesized && !cleaned.starts_with('-') {
+        cleaned = format!("-{cleaned}");
+    }
+    (cleaned, is_percent)
+}
+
+fn numeric_note(current: &str, target: &str, any_percent: bool) -> String {
+    let mut parts = Vec::new();
+    if current != target {
+        parts.push("numeric strings".to_string());
+    }
+    if any_percent {
+        parts.push("'%' stripped from percentage values".to_string());
+    }
+    parts.join("; ")
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
@@ -247,24 +286,15 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         );
     }
 
-    let cleaned: Vec<String> = values.iter().map(|v| v.replace([',', '$'], "")).collect();
-    let cleaned_refs: Vec<&str> = cleaned.iter().map(|s| s.as_str()).collect();
+    let normalized: Vec<(String, bool)> = values.iter().map(|v| normalize_numeric_str(v)).collect();
+    let any_percent = normalized.iter().any(|(_, pct)| *pct);
+    let cleaned_refs: Vec<&str> = normalized.iter().map(|(s, _)| s.as_str()).collect();
 
     if cleaned_refs.iter().all(|v| v.parse::<i64>().is_ok()) {
-        let note = if current == "i64" {
-            String::new()
-        } else {
-            "numeric strings".to_string()
-        };
-        return ("i64".to_string(), note);
+        return ("i64".to_string(), numeric_note(current, "i64", any_percent));
     }
     if cleaned_refs.iter().all(|v| v.parse::<f64>().is_ok()) {
-        let note = if current == "f64" {
-            String::new()
-        } else {
-            "numeric strings".to_string()
-        };
-        return ("f64".to_string(), note);
+        return ("f64".to_string(), numeric_note(current, "f64", any_percent));
     }
 
     let unique: HashSet<&str> = values.iter().copied().collect();
@@ -3524,6 +3554,32 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&values, "String");
         assert_eq!(ideal, "enum / category");
         assert!(note.contains("constant"));
+    }
+
+    #[test]
+    fn normalize_numeric_str_handles_parens_negative_percent_and_currency() {
+        assert_eq!(
+            normalize_numeric_str("(123.45)"),
+            ("-123.45".to_string(), false)
+        );
+        assert_eq!(normalize_numeric_str("45%"), ("45".to_string(), true));
+        assert_eq!(
+            normalize_numeric_str("€1,250.50"),
+            ("1250.50".to_string(), false)
+        );
+        assert_eq!(normalize_numeric_str("  42  "), ("42".to_string(), false));
+        assert_eq!(normalize_numeric_str("(8%)"), ("-8".to_string(), true));
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_percentages_and_parenthesized_negatives() {
+        let (ideal, note) = suggest_ideal_type(&["45%", "10%", "8%"], "String");
+        assert_eq!(ideal, "i64");
+        assert!(note.contains('%'));
+
+        let (ideal, note) = suggest_ideal_type(&["(120.50)", "300.00", "(12.00)"], "String");
+        assert_eq!(ideal, "f64");
+        assert!(!note.contains('%'));
     }
 
     #[test]
