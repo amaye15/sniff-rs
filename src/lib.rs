@@ -377,6 +377,78 @@ fn is_credit_card_number(s: &str) -> bool {
     luhn_checksum_valid(&digits)
 }
 
+fn digits_of(s: &str) -> Option<Vec<u32>> {
+    s.chars()
+        .all(|c| c.is_ascii_digit())
+        .then(|| s.chars().map(|c| c.to_digit(10).unwrap()).collect())
+}
+
+/// EAN-13/UPC-A/ISBN-13 check digit: all three use the same weighted mod-10
+/// algorithm, since UPC-A is exactly an EAN-13 with an implicit leading
+/// zero (0 contributes nothing to the weighted sum either way, so padding a
+/// 12-digit UPC-A to 13 digits and applying EAN-13's rule reproduces UPC-A's
+/// own rule exactly) and ISBN-13 is a 978/979-prefixed EAN-13. Digits at
+/// even index (0-based) count once, odd index counts x3; the trailing
+/// digit must make the total's last decimal digit 0. Hand-verified against
+/// known-valid EAN-13 ("4006381333931"), UPC-A ("036000291452"), and
+/// ISBN-13 ("9780306406157") numbers, plus a tampered checksum, before
+/// being relied on.
+fn ean_check_digit_valid(digits: &[u32]) -> bool {
+    let padded: Vec<u32> = std::iter::repeat_n(0, 13 - digits.len())
+        .chain(digits.iter().copied())
+        .collect();
+    let sum: u32 = padded[..12]
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| if i.is_multiple_of(2) { d } else { d * 3 })
+        .sum();
+    (10 - sum % 10) % 10 == padded[12]
+}
+
+fn is_ean_or_upc(s: &str) -> bool {
+    matches!(s.len(), 12 | 13) && digits_of(s).is_some_and(|d| ean_check_digit_valid(&d))
+}
+
+fn is_isbn13(s: &str) -> bool {
+    let cleaned: String = s.chars().filter(|c| *c != '-' && *c != ' ').collect();
+    cleaned.len() == 13
+        && (cleaned.starts_with("978") || cleaned.starts_with("979"))
+        && digits_of(&cleaned).is_some_and(|d| ean_check_digit_valid(&d))
+}
+
+/// ISBN-10's own mod-11 check digit (an older, different scheme than
+/// ISBN-13/EAN's): weights count down from 10 to 1 across all 10 positions
+/// (the check digit itself weighted 1), total must be divisible by 11. The
+/// check digit may be 'X', standing for 10. Verified against a known-valid
+/// ISBN-10 ("0306406152"), a tampered one, and one with an 'X' check digit
+/// ("097522980X") before being relied on.
+fn is_isbn10(s: &str) -> bool {
+    let cleaned: String = s.chars().filter(|c| *c != '-' && *c != ' ').collect();
+    if cleaned.len() != 10 {
+        return false;
+    }
+    let b = cleaned.as_bytes();
+    if !b[..9].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    if !(b[9].is_ascii_digit() || b[9] == b'X' || b[9] == b'x') {
+        return false;
+    }
+    let sum: u32 = b
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let v = if c == b'X' || c == b'x' {
+                10
+            } else {
+                u32::from(c - b'0')
+            };
+            v * (10 - i as u32)
+        })
+        .sum();
+    sum.is_multiple_of(11)
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
@@ -391,6 +463,31 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "IBAN".to_string(),
             "matches IBAN format (mod-97 checksum valid)".to_string(),
+        );
+    }
+    // ISBN/EAN/UPC are checked ahead of the broader-range credit card check
+    // below: they only match an exact 10, 12, or 13-digit length, so the
+    // more narrowly-scoped match should win a tie (a 13-digit number can in
+    // principle satisfy both a card issuer's Luhn check and EAN-13's own
+    // mod-10 check by coincidence - genuinely undecidable from the digits
+    // alone without domain context, the same kind of irreducible ambiguity
+    // as a dotted-quad value being valid as both IPv4 and a version string).
+    if values.iter().all(|v| is_isbn10(v)) {
+        return (
+            "ISBN-10".to_string(),
+            "matches ISBN-10 format (mod-11 checksum valid)".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_isbn13(v)) {
+        return (
+            "ISBN-13".to_string(),
+            "matches ISBN-13 format (978/979 prefix, EAN-13 checksum valid)".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_ean_or_upc(v)) {
+        return (
+            "EAN-13 / UPC-A".to_string(),
+            "matches EAN-13/UPC-A barcode format (checksum valid)".to_string(),
         );
     }
     if values.iter().all(|v| is_credit_card_number(v)) {
@@ -3340,6 +3437,7 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "MAC Address" => Some(("string", None)),
         "IBAN" => Some(("string", None)),
         "Credit Card Number" => Some(("string", None)),
+        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" => Some(("string", None)),
         _ => None,
     }
 }
@@ -3847,6 +3945,46 @@ mod tests {
         assert!(is_credit_card_number("4111 1111 1111 1111")); // spaces tolerated
         assert!(!is_credit_card_number("4111111111111112")); // tampered last digit
         assert!(!is_credit_card_number("123")); // too short
+    }
+
+    #[test]
+    fn ean_check_digit_valid_accepts_known_real_ean13_upc_a_and_isbn13() {
+        assert!(ean_check_digit_valid(&digits_of("4006381333931").unwrap()));
+        assert!(ean_check_digit_valid(&digits_of("036000291452").unwrap()));
+        assert!(ean_check_digit_valid(&digits_of("9780306406157").unwrap()));
+        assert!(!ean_check_digit_valid(&digits_of("4006381333930").unwrap())); // tampered
+    }
+
+    #[test]
+    fn is_isbn10_accepts_a_known_valid_isbn_and_an_x_check_digit() {
+        assert!(is_isbn10("0306406152"));
+        assert!(!is_isbn10("0306406153")); // tampered
+        assert!(is_isbn10("097522980X"));
+    }
+
+    #[test]
+    fn is_isbn13_requires_the_bookland_prefix_not_just_a_valid_checksum() {
+        assert!(is_isbn13("9780306406157"));
+        assert!(!is_isbn13("4006381333931")); // valid EAN-13 checksum, but no 978/979 prefix
+    }
+
+    #[test]
+    fn is_ean_or_upc_accepts_12_or_13_digit_checksummed_barcodes() {
+        assert!(is_ean_or_upc("4006381333931")); // EAN-13
+        assert!(is_ean_or_upc("036000291452")); // UPC-A
+        assert!(!is_ean_or_upc("036000291453")); // tampered
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_isbn_and_ean_upc() {
+        let (ideal, _) = suggest_ideal_type(&["0306406152", "097522980X"], "String");
+        assert_eq!(ideal, "ISBN-10");
+
+        let (ideal, _) = suggest_ideal_type(&["9780306406157"], "String");
+        assert_eq!(ideal, "ISBN-13");
+
+        let (ideal, _) = suggest_ideal_type(&["4006381333931", "036000291452"], "String");
+        assert_eq!(ideal, "EAN-13 / UPC-A");
     }
 
     #[test]

@@ -961,6 +961,18 @@ fn csv_recognizes_iban_and_credit_card_numbers_via_checksum() {
 }
 
 #[test]
+fn csv_recognizes_isbn13_and_ean_upc_barcodes() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let isbn = column(cols, "isbn");
+    assert_eq!(isbn["ideal_type"], "ISBN-13");
+
+    let ean = column(cols, "ean_upc");
+    assert_eq!(ean["ideal_type"], "EAN-13 / UPC-A");
+}
+
+#[test]
 fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     let doc = run_with_format("type_detection.csv", "json-schema", &[]);
     let props = &doc["tables"]["type_detection"]["properties"];
@@ -995,4 +1007,6 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(props["mac_address"], serde_json::json!({"type": "string"}));
     assert_eq!(props["iban"], serde_json::json!({"type": "string"}));
     assert_eq!(props["credit_card"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["isbn"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["ean_upc"], serde_json::json!({"type": "string"}));
 }

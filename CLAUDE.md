@@ -485,6 +485,26 @@ entirely:
   France, including France's letter-containing BBAN) plus a deliberately
   corrupted checksum, and against several widely-published test card
   numbers, before being relied on.
+- **ISBN-10, ISBN-13, and EAN-13/UPC-A barcodes** share one checksum
+  function (`ean_check_digit_valid`) for the latter two: UPC-A is exactly
+  an EAN-13 with an implicit leading zero (0 contributes nothing to the
+  weighted sum either way, verified by hand against a real UPC-A number),
+  and ISBN-13 is just a 978/979-prefixed EAN-13. ISBN-10 uses an older,
+  different mod-11 scheme (`is_isbn10`), including its own quirk - the
+  check digit can be the letter `X`, standing for 10. All three checked
+  *ahead* of the broader-range Credit Card Number check, since they only
+  match an exact 10/12/13-digit length: the more narrowly-scoped match
+  should win a tie. That tie is real, not hypothetical - a 13-digit number
+  can in principle satisfy both a card issuer's Luhn check and EAN-13's
+  mod-10 check by coincidence, which is genuinely undecidable from the
+  digits alone without domain context, the same category of irreducible
+  ambiguity as a dotted-quad value being valid as both IPv4 and a version
+  string (see below). Every checksum here was hand-verified against known-
+  real numbers (a real EAN-13, a real UPC-A, two real ISBNs of the same
+  book in both formats) plus a deliberately tampered one, before being
+  relied on - not derived and trusted on the first attempt, since check-
+  digit weighting is exactly the kind of arithmetic that's easy to get
+  subtly wrong (an off-by-one in which position gets which weight).
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
