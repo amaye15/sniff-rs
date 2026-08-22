@@ -945,6 +945,23 @@ fn csv_recognizes_hex_literals_and_mac_addresses() {
 }
 
 #[test]
+fn csv_recognizes_hex_colors_and_imei() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let color = column(cols, "hex_color");
+    assert_eq!(color["ideal_type"], "Hex Color");
+
+    // IMEIs are plain digit strings that fit i64 - current_type says i64,
+    // but ideal_type correctly identifies an opaque device identifier
+    // rather than a quantity, the same current-vs-ideal gap as credit
+    // card numbers.
+    let imei = column(cols, "imei");
+    assert_eq!(imei["current_type"], "i64");
+    assert_eq!(imei["ideal_type"], "IMEI");
+}
+
+#[test]
 fn csv_recognizes_iban_and_credit_card_numbers_via_checksum() {
     let doc = run_json("type_detection.csv", &[]);
     let cols = table(&doc, "type_detection");
@@ -1026,6 +1043,8 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(props["isbn"], serde_json::json!({"type": "string"}));
     assert_eq!(props["ean_upc"], serde_json::json!({"type": "string"}));
     assert_eq!(props["app_version"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["hex_color"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["imei"], serde_json::json!({"type": "string"}));
 }
 
 // --- Adversarial / robustness tests ----------------------------------
@@ -1071,6 +1090,8 @@ fn adversarial_csv_never_false_positives_on_any_near_miss_column() {
     );
     assert_ne!(column(cols, "near_isbn13")["ideal_type"], "ISBN-13");
     assert_ne!(column(cols, "near_mac")["ideal_type"], "MAC Address");
+    assert_ne!(column(cols, "near_hex_color")["ideal_type"], "Hex Color");
+    assert_ne!(column(cols, "near_imei")["ideal_type"], "IMEI");
 
     // A column that's 3 real UUIDs and 1 clearly-not-a-UUID value must not
     // be classified as UUID - one bad value vetoes the whole column.

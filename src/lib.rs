@@ -506,10 +506,35 @@ fn is_embedded_json(s: &str) -> bool {
     )
 }
 
+/// '#' followed by exactly 3 (RGB), 4 (RGBA), 6 (RRGGBB), or 8 (RRGGBBAA)
+/// hex digits - the '#' prefix is the unambiguous signal, the same role
+/// "0x" plays for parse_prefixed_int.
+fn is_hex_color(s: &str) -> bool {
+    s.strip_prefix('#').is_some_and(|rest| {
+        matches!(rest.len(), 3 | 4 | 6 | 8) && rest.chars().all(|c| c.is_ascii_hexdigit())
+    })
+}
+
+/// 15-digit mobile device identifier - IMEI uses the exact same Luhn (mod
+/// 10) checksum as a credit card number, just at a fixed 15-digit length,
+/// so this reuses luhn_checksum_valid directly rather than a second
+/// implementation. Verified against a well-known real IMEI ("490154203237518",
+/// widely used as the reference example in Luhn-algorithm documentation)
+/// plus a tampered counterpart.
+fn is_imei(s: &str) -> bool {
+    s.len() == 15 && digits_of(s).is_some_and(|d| luhn_checksum_valid(&d))
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
     // (leading-zero, in particular) firing on a substring pattern instead.
+    if values.iter().all(|v| is_hex_color(v)) {
+        return (
+            "Hex Color".to_string(),
+            "matches #RGB/#RGBA/#RRGGBB/#RRGGBBAA hex color format".to_string(),
+        );
+    }
     if values.iter().all(|v| is_mac_address(v)) {
         return (
             "MAC Address".to_string(),
@@ -522,13 +547,14 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
             "matches IBAN format (mod-97 checksum valid)".to_string(),
         );
     }
-    // ISBN/EAN/UPC are checked ahead of the broader-range credit card check
-    // below: they only match an exact 10, 12, or 13-digit length, so the
-    // more narrowly-scoped match should win a tie (a 13-digit number can in
-    // principle satisfy both a card issuer's Luhn check and EAN-13's own
-    // mod-10 check by coincidence - genuinely undecidable from the digits
-    // alone without domain context, the same kind of irreducible ambiguity
-    // as a dotted-quad value being valid as both IPv4 and a version string).
+    // ISBN/EAN/UPC/IMEI are all checked ahead of the broader-range credit
+    // card check below: they only match an exact 10, 12, 13, or 15-digit
+    // length, so the more narrowly-scoped match should win a tie (a
+    // 13-digit number can in principle satisfy both a card issuer's Luhn
+    // check and EAN-13's own mod-10 check by coincidence - genuinely
+    // undecidable from the digits alone without domain context, the same
+    // kind of irreducible ambiguity as a dotted-quad value being valid as
+    // both IPv4 and a version string).
     if values.iter().all(|v| is_isbn10(v)) {
         return (
             "ISBN-10".to_string(),
@@ -545,6 +571,12 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "EAN-13 / UPC-A".to_string(),
             "matches EAN-13/UPC-A barcode format (checksum valid)".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_imei(v)) {
+        return (
+            "IMEI".to_string(),
+            "matches IMEI format (15 digits, Luhn checksum valid)".to_string(),
         );
     }
     if values.iter().all(|v| is_credit_card_number(v)) {
@@ -3540,7 +3572,9 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "MAC Address" => Some(("string", None)),
         "IBAN" => Some(("string", None)),
         "Credit Card Number" => Some(("string", None)),
-        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" | "SemVer" => Some(("string", None)),
+        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" | "SemVer" | "Hex Color" | "IMEI" => {
+            Some(("string", None))
+        }
         _ => None,
     }
 }
@@ -4184,6 +4218,33 @@ mod tests {
     }
 
     #[test]
+    fn is_hex_color_accepts_all_four_lengths_and_rejects_near_misses() {
+        assert!(is_hex_color("#FF5733"));
+        assert!(is_hex_color("#fff"));
+        assert!(is_hex_color("#00000000"));
+        assert!(!is_hex_color("FF5733")); // missing '#'
+        assert!(!is_hex_color("#GG5733")); // non-hex digit
+        assert!(!is_hex_color("#FF573")); // 5 digits - not 3/4/6/8
+    }
+
+    #[test]
+    fn is_imei_validates_a_known_real_imei_and_rejects_a_tampered_one() {
+        // A widely-used reference IMEI in Luhn-algorithm documentation.
+        assert!(is_imei("490154203237518"));
+        assert!(!is_imei("490154203237519")); // last digit tampered
+        assert!(!is_imei("49015420323751")); // 14 digits, too short
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_hex_color_and_imei() {
+        let (ideal, _) = suggest_ideal_type(&["#FF5733", "#00FF00", "#000"], "String");
+        assert_eq!(ideal, "Hex Color");
+
+        let (ideal, _) = suggest_ideal_type(&["490154203237518"], "String");
+        assert_eq!(ideal, "IMEI");
+    }
+
+    #[test]
     fn suggest_ideal_type_recognizes_uuid_email_ipv4_ipv6_and_url() {
         let (ideal, note) = suggest_ideal_type(
             &[
@@ -4322,6 +4383,8 @@ mod tests {
             let _ = is_ean_or_upc(s);
             let _ = is_semver(s);
             let _ = is_embedded_json(s);
+            let _ = is_hex_color(s);
+            let _ = is_imei(s);
             let _ = parse_prefixed_int(s);
             let _ = is_missing_sentinel(s);
             let _ = has_leading_zero(s);
@@ -4348,6 +4411,8 @@ mod tests {
             let _ = is_ean_or_upc(s);
             let _ = is_semver(s);
             let _ = is_embedded_json(s);
+            let _ = is_hex_color(s);
+            let _ = is_imei(s);
             let _ = normalize_numeric_str(s);
             let _ = suggest_ideal_type(&[s], "String");
         }
@@ -4392,6 +4457,7 @@ mod tests {
         assert!(!is_isbn10("0306406151")); // last digit off by one
         assert!(!is_isbn13("9780306406156")); // last digit off by one
         assert!(!is_ean_or_upc("4006381333930")); // last digit off by one
+        assert!(!is_imei("490154203237519")); // last digit off by one
     }
 
     #[test]
@@ -4409,6 +4475,8 @@ mod tests {
         assert!(!is_mac_address("00:1A:2B:3C:4D")); // only 5 groups
         assert!(!is_mac_address("00:1A:2B:3C:4D:5E:6F")); // 7 groups
         assert!(!is_mac_address("GG:1A:2B:3C:4D:5E")); // non-hex group
+        assert!(!is_hex_color("#12345")); // 5 digits - not a valid length
+        assert!(!is_hex_color("123456")); // missing '#'
     }
 
     #[test]

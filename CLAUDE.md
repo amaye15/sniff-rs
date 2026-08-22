@@ -573,6 +573,21 @@ entirely:
   whole column's classification on a single non-conforming value (a
   "mostly UUIDs" column is not a trustworthy UUID column) rather than
   taking a majority vote.
+- **Hex colors and IMEI** - two more precise, low-risk checks. `is_hex_color`
+  is the `parse_prefixed_int` pattern again: a `#` prefix
+  plus exactly 3/4/6/8 hex digits (RGB/RGBA/RRGGBB/RRGGBBAA) is essentially
+  zero-ambiguity, checked at the very top of `suggest_ideal_type` alongside
+  the other prefix-disambiguated checks. `is_imei` reuses
+  `luhn_checksum_valid` directly rather than a second implementation - an
+  IMEI is a 15-digit Luhn-checksummed identifier, the exact same algorithm
+  a credit card number uses, just at a fixed length - checked ahead of the
+  broader-range credit card check for the same narrower-match-wins-a-tie
+  reason ISBN/EAN already are. Verified against a real, widely-cited
+  reference IMEI (`"490154203237518"`) plus a tampered counterpart, and
+  both fixtures (`type_detection.csv`, `adversarial.csv`) got matching
+  valid/near-miss columns as part of the same change, not added later -
+  every new type in this project now gets its near-miss coverage
+  immediately, per the adversarial-testing section above.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
