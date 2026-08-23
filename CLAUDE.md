@@ -381,6 +381,32 @@ unwrapped and pooled (nested arrays flatten transparently), and the result
 is *this path's own row followed by every descendant row*, so nesting is
 never force-fit into one opaque cell.
 
+Recursion never trades away typing precision: a pooled array of scalars
+(`unwrap_arrays`, which walks arbitrarily-nested arrays down to their
+non-array, non-null leaves) is run through the exact same `suggest_ideal_type`
+engine a top-level scalar column gets, wrapped as `Vec<T>` (a column of UUID
+strings resolves to `Vec<UUID>`, not a generic `Vec<String>`), and every
+dot-notation sub-column produced by flattening an object - at any nesting
+depth - is itself profiled from scratch the same way, so a value three
+levels deep (`object -> object -> array of objects -> leaf`) gets exactly
+as precise a type as a flat top-level column would. Verified directly via
+`profile_json_path_types_a_plain_array_of_scalars_precisely`,
+`profile_json_path_types_every_field_of_an_array_of_objects`, and
+`profile_json_path_resolves_a_leaf_three_levels_deep` in `lib.rs`'s
+`#[cfg(test)]` module, and end-to-end via
+`nested_arrays_and_objects_are_recursively_typed_at_every_leaf` in
+`tests/integration.rs`. The one deliberate exception: an array that mixes
+raw scalars and objects together (`[1, 2, {"x": 1}]`) can't honestly claim
+one precise scalar type for the column as a whole - some elements are
+structurally objects, not near-misses of the same scalar type - so the
+scalar portion falls back to `String`/`Vec<String>` with a note explaining
+why, the same "no partial credit" rule `suggest_ideal_type`'s `.all(...)`
+checks already enforce everywhere else in this file (e.g. a "mostly UUID"
+column isn't a trustworthy UUID column). The object portion of a mixed
+array is still recursed into and typed normally regardless -
+`profile_json_path_does_not_overclaim_a_precise_type_for_a_scalar_and_object_mix`
+locks this exact tradeoff in.
+
 The load-bearing design decision is that **non-native nested formats are
 bridged into `serde_json::Value` and handed to the exact same recursive
 flattener**, rather than reimplementing recursion per format:

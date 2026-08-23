@@ -4562,6 +4562,87 @@ mod tests {
         assert_eq!(describe_kinds(&counts), "mixed(String: 2, bool: 1)");
     }
 
+    // profile_json_path is what every nested/array-of-objects format
+    // (JSON, Avro, MessagePack, TOML, YAML, CBOR, XML, and Parquet/Arrow's
+    // Struct/List/Map columns) shares for recursion - see CLAUDE.md's
+    // architecture section. These prove every leaf value it reaches,
+    // no matter how deeply nested, goes through the exact same precise
+    // suggest_ideal_type engine a top-level scalar column would - not just
+    // that flattening produces the right column names/shape (that
+    // narrower claim already has its own coverage via
+    // json_flattens_nested_object_and_array_of_objects and
+    // nested_arrays_and_objects_are_recursively_typed_at_every_leaf in
+    // tests/integration.rs).
+
+    #[test]
+    fn profile_json_path_types_a_plain_array_of_scalars_precisely() {
+        let uuids = serde_json::json!([
+            "a4d1e6b0-1111-4a1a-9a1a-000000000001",
+            "a4d1e6b0-1111-4a1a-9a1a-000000000002"
+        ]);
+        let profiles = profile_json_path("tags".to_string(), 1, vec![&uuids], 3);
+        assert_eq!(profiles.len(), 1); // no nested object fields to recurse into
+        assert_eq!(profiles[0].current_type, "Vec<String>");
+        assert_eq!(profiles[0].ideal_type, "Vec<UUID>");
+    }
+
+    #[test]
+    fn profile_json_path_types_every_field_of_an_array_of_objects() {
+        let events = serde_json::json!([
+            {"user_email": "alice@example.com", "amount": 50},
+            {"user_email": "bob@example.com", "amount": 75}
+        ]);
+        let profiles = profile_json_path("events".to_string(), 1, vec![&events], 3);
+
+        let email = profiles
+            .iter()
+            .find(|c| c.name == "events.user_email")
+            .expect("events.user_email column missing");
+        assert_eq!(email.ideal_type, "Email");
+
+        let amount = profiles
+            .iter()
+            .find(|c| c.name == "events.amount")
+            .expect("events.amount column missing");
+        assert_eq!(amount.ideal_type, "i64");
+    }
+
+    #[test]
+    fn profile_json_path_resolves_a_leaf_three_levels_deep() {
+        // object -> object -> array of objects -> leaf
+        let deep = serde_json::json!({"outer": {"inner_list": [{"score": 1}, {"score": 2}]}});
+        let profiles = profile_json_path("deep".to_string(), 1, vec![&deep], 3);
+
+        let score = profiles
+            .iter()
+            .find(|c| c.name == "deep.outer.inner_list.score")
+            .expect("deep.outer.inner_list.score column missing");
+        assert_eq!(score.ideal_type, "i64");
+    }
+
+    #[test]
+    fn profile_json_path_does_not_overclaim_a_precise_type_for_a_scalar_and_object_mix() {
+        // An array mixing raw scalars with objects can't honestly claim one
+        // precise scalar type for the whole column - some elements are
+        // structurally objects, not scalars at all. This is the same "no
+        // partial credit" rule suggest_ideal_type's .all(...) checks
+        // already apply everywhere else in this file (e.g. a "mostly
+        // UUID" column isn't a trustworthy UUID column) - not a gap. The
+        // object portion is still recursed into and typed normally.
+        let mixed = serde_json::json!([1, 2, {"x": 1}]);
+        let profiles = profile_json_path("mixed_list".to_string(), 1, vec![&mixed], 3);
+
+        let root = &profiles[0];
+        assert_eq!(root.ideal_type, "Vec<String>");
+        assert!(root.notes.contains("mix of scalars and objects"));
+
+        let x = profiles
+            .iter()
+            .find(|c| c.name == "mixed_list.x")
+            .expect("mixed_list.x column missing");
+        assert_eq!(x.ideal_type, "i64");
+    }
+
     #[test]
     fn suggest_ideal_type_flags_leading_zeros_already_lost_by_numeric_parse() {
         let (ideal, note) = suggest_ideal_type(&["02134", "90210"], "i64");

@@ -157,6 +157,56 @@ fn json_flattens_nested_object_and_array_of_objects() {
     assert!((amount["missing_pct"].as_f64().unwrap() - 66.7).abs() < 0.01);
 }
 
+/// nested_typed.jsonl's own test: json_flattens_nested_object_and_array_of_objects
+/// above already proves flattening produces the right column *names* and
+/// missing-% math. This proves the other half of the claim - that every
+/// leaf value reached through that flattening, no matter how deeply
+/// nested, goes through the exact same precise heuristic engine a
+/// top-level column would (UUID/Email/date/i64 detection, not just a
+/// generic "String"/"object" shape).
+#[test]
+fn nested_arrays_and_objects_are_recursively_typed_at_every_leaf() {
+    let doc = run_json("nested_typed.jsonl", &[]);
+    let cols = table(&doc, "nested_typed");
+
+    // A plain array of scalar UUID strings - pooled across all 3 records
+    // and precisely typed, not left as a generic Vec<String>.
+    let tags = column(cols, "tags");
+    assert_eq!(tags["current_type"], "Vec<String>");
+    assert_eq!(tags["ideal_type"], "Vec<UUID>");
+
+    // An array of objects flattens into dot-path sub-columns, each typed
+    // with the same precision a top-level column would get.
+    let email = column(cols, "events.user_email");
+    assert_eq!(email["ideal_type"], "Email");
+    let amount = column(cols, "events.amount");
+    assert_eq!(amount["ideal_type"], "i64");
+    let when = column(cols, "events.when");
+    assert_eq!(when["ideal_type"], "NaiveDate / DateTime");
+
+    // Three levels deep: object -> object -> array of objects -> leaf -
+    // still resolves correctly at the bottom.
+    let score = column(cols, "deep.outer.inner_list.score");
+    assert_eq!(score["ideal_type"], "i64");
+
+    // An array that mixes raw scalars with objects in the same list can't
+    // honestly claim one precise scalar type (some elements are
+    // structurally objects, not scalars at all) - this is the same
+    // "no partial credit" rule suggest_ideal_type's .all(...) checks
+    // already apply everywhere else, not a gap. The object portion is
+    // still recursed into and typed normally.
+    let mixed_list = column(cols, "mixed_list");
+    assert_eq!(mixed_list["ideal_type"], "Vec<String>");
+    assert!(
+        mixed_list["notes"]
+            .as_str()
+            .unwrap()
+            .contains("mix of scalars and objects")
+    );
+    let mixed_x = column(cols, "mixed_list.x");
+    assert_eq!(mixed_x["ideal_type"], "i64");
+}
+
 #[test]
 fn mixed_types_report_counts_not_just_a_list() {
     let doc = run_json("mixed_types.jsonl", &[]);
