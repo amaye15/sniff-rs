@@ -13,6 +13,11 @@ arrow = { version = "59.2.0", features = ["ipc", "ipc_compression"], optional = 
 parquet = { version = "59.2.0", features = ["arrow"], optional = true }
 calamine = { version = "0.36.1", optional = true }
 apache-avro = { version = "0.22.0", optional = true }
+# Already a transitive dependency of apache-avro itself (its Decimal value
+# type wraps a num_bigint::BigInt internally) - depending on it directly
+# too adds zero new crates to the build, just exposes a type that's
+# already being compiled whenever --features avro is on.
+num-bigint = { version = "0.4", optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 rmpv = { version = "1.3.1", optional = true }
@@ -36,7 +41,7 @@ default = []
 # formats sharing the same `arrow` crate, so there's no separate compile cost to split them.
 parquet = ["dep:arrow", "dep:parquet"]
 xlsx = ["dep:calamine"]
-avro = ["dep:apache-avro"]
+avro = ["dep:apache-avro", "dep:num-bigint"]
 full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat"]
 sqlite = ["dep:rusqlite"]
 msgpack = ["dep:rmpv"]

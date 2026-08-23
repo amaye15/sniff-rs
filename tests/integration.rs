@@ -919,6 +919,22 @@ fn csv_treats_missing_value_sentinels_as_null_not_literal_strings() {
 }
 
 #[test]
+fn csv_treats_backslash_n_as_missing_not_a_literal_string() {
+    // MySQL's SELECT INTO OUTFILE, Hive's default text SerDe, and
+    // Redshift's UNLOAD ... NULL AS '\N' all write literal backslash-N for
+    // a null field - common enough in cloud-warehouse CSV/TSV exports that
+    // it's its own missing-sentinel entry, not just a pandas default.
+    let path = fixture("_scratch_backslash_n_null.csv");
+    std::fs::write(&path, "id,amount\n1,10.50\n2,\\N\n3,30.00\n").unwrap();
+    let doc = run_json("_scratch_backslash_n_null.csv", &[]);
+    std::fs::remove_file(&path).ok();
+    let cols = table(&doc, "_scratch_backslash_n_null");
+    let amount = column(cols, "amount");
+    assert_eq!(amount["ideal_type"], "f64");
+    assert_eq!(amount["missing_pct"].as_f64().unwrap(), 33.3);
+}
+
+#[test]
 fn csv_flags_a_constant_column_even_on_a_small_file() {
     let doc = run_json("type_detection.csv", &[]);
     let cols = table(&doc, "type_detection");
@@ -1491,6 +1507,54 @@ fn avro_recognizes_uuid_email_ipv4_and_date_columns() {
         column(cols, "signup_date")["ideal_type"],
         "NaiveDate / DateTime"
     );
+}
+
+#[cfg(feature = "avro")]
+#[test]
+fn avro_resolves_logical_types_instead_of_leaving_them_as_raw_numbers_or_debug_output() {
+    // Cloud-platform Avro producers (Kinesis Firehose, Event Hubs Capture,
+    // Pub/Sub) lean heavily on Avro's logical-type mechanism for
+    // timestamps and precise decimals - found via exactly this kind of
+    // adversarial probing that two of them were silently broken:
+    // timestamp-millis/-micros rendered as opaque epoch integers (the
+    // semantic meaning the schema declares was being thrown away), and
+    // decimal rendered as Rust's own Debug output on the internal wrapper
+    // struct ("Decimal(Decimal { value: 12345, len: 2 })"), unusable and
+    // arguably worse than the raw bytes. See avro_value_to_json's doc
+    // comment for the fix (decimal needs the schema's scale, which only
+    // the value's sibling schema node carries, not the value itself).
+    let doc = run_json("avro_logical_types.avro", &[]);
+    let cols = table(&doc, "avro_logical_types");
+
+    assert_eq!(
+        column(cols, "event_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(
+        column(cols, "event_ts_millis")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(
+        column(cols, "event_ts_micros")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(column(cols, "event_time_millis")["ideal_type"], "NaiveTime");
+    assert_eq!(column(cols, "record_uuid")["ideal_type"], "UUID");
+
+    // Decimal: positive, negative, and zero values in the same top-level
+    // column, plus the same logical type nested inside a record and an
+    // array - proves the schema co-recursion resolves scale correctly at
+    // every nesting shape, not just the flat top-level case.
+    let price = column(cols, "price");
+    assert_eq!(price["ideal_type"], "f64");
+    assert_eq!(
+        price["sample_values"],
+        serde_json::json!(["123.45", "-45.67", "0.00"])
+    );
+    let inner_price = column(cols, "nested.inner_price");
+    assert_eq!(inner_price["sample_values"][1], "0.001"); // zero-padded, not "1" with the point misplaced
+    let price_list = column(cols, "price_list");
+    assert_eq!(price_list["ideal_type"], "Vec<f64>");
 }
 
 #[cfg(feature = "xlsx")]

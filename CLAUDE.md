@@ -413,6 +413,25 @@ flattener**, rather than reimplementing recursion per format:
 
 - Avro decodes each record to `serde_json::Value` (`avro_value_to_json`)
   and calls `profile_json_records` — identical code path to a `.json` file.
+  Unlike every other bridge in this list, it also takes the record's
+  `Schema` alongside the value and co-recurses over both together, because
+  one Avro logical type - `decimal` - genuinely can't be rendered correctly
+  from the value alone: Avro stores only the unscaled two's-complement
+  integer in the value, the scale that says where the decimal point goes
+  lives in the schema. `avro_decimal_to_string` gets that scale from the
+  matching schema node (falling back gracefully to `None`/untyped
+  recursion on any schema/value shape mismatch, which shouldn't happen for
+  a spec-compliant file) and delegates the actual big-integer decoding to
+  `num_bigint::BigInt` - already a transitive dependency of `apache-avro`
+  itself, so depending on it directly too adds zero new crates, the same
+  "don't reimplement what's already there for free" call this project
+  makes for chrono/serde_json elsewhere. `timestamp-millis`/`-micros`/
+  `-nanos`, their `local-*` counterparts, and `time-millis`/`-micros` all
+  get resolved to real date-time/time-of-day strings the same way `date`
+  already was, rather than being left as opaque epoch integers - see the
+  design philosophy section for how this was found (cloud-platform Avro
+  producers like Kinesis Firehose, Event Hubs Capture, and Pub/Sub lean
+  heavily on exactly these logical types).
 - MessagePack does the same (`msgpack_value_to_json`), reading a stream of
   concatenated top-level values (records are self-delimiting, so they don't
   need a separator the way JSON Lines needs newlines) - or, if the file
@@ -745,6 +764,37 @@ entirely:
   legitimate complex XML either (comments/CDATA containing literal
   `<`/`>` characters, self-closing tags, thousands of wide-but-shallow
   siblings).
+- **Avro's `timestamp-millis`/`-micros` logical types were silently reduced
+  to opaque epoch integers, and `decimal` rendered as unusable Rust Debug
+  output** - found while checking whether files produced by cloud-platform
+  data services (Kinesis Firehose, Event Hubs Capture, Pub/Sub, all of
+  which lean on Avro logical types for timestamps and precise numerics)
+  actually read correctly, not by auditing the code in the abstract.
+  `avro_value_to_json`'s old match arm merged `TimestampMillis`/
+  `TimestampMicros` in with plain `Long` (`AvroValue::Long(i) |
+  AvroValue::TimestampMillis(i) | ... => JsonValue::Number((*i).into())`),
+  discarding the exact semantic information the schema's logical-type
+  annotation exists to carry - a real, if quieter, cousin of the leading-
+  zero and infinity/NaN bugs elsewhere on this list: the schema *told* the
+  reader this was a timestamp, and the reader threw that away anyway. The
+  Decimal case was worse - `apache_avro::types::Value`'s catch-all fallback
+  (`other => JsonValue::String(format!("{other:?}"))`) rendered a decimal
+  field as `"Decimal(Decimal { value: 12345, len: 2 })"`, confirmed by
+  actually writing an Avro file with a `decimal` field and reading it back.
+  Both are fixed now (see the Architecture section's Avro paragraph) and
+  verified against positive, negative, zero, and zero-padded-fraction
+  decimal values, plus the same logical type nested inside a record, an
+  array, and a nullable union, to prove the schema co-recursion resolves
+  scale correctly at every nesting shape it could plausibly appear in, not
+  just the flat top-level case that was tested first.
+- **`\N` (literal backslash-N) joined the missing-value sentinel list** -
+  not a bug, but a genuine gap found the same way: checking what cloud
+  data-warehouse export tools actually write for NULL. MySQL's `SELECT
+  INTO OUTFILE`, Hive's default text SerDe, and Redshift's `UNLOAD ...
+  NULL AS '\N'` all use it, and none of pandas' own default `na_values`
+  (which the rest of this list deliberately mirrors) happen to include it -
+  so this one entry is justified on its own real-world-convention merits
+  rather than by that usual "matches pandas" reasoning.
 - **Hex colors and IMEI** - two more precise, low-risk checks. `is_hex_color`
   is the `parse_prefixed_int` pattern again: a `#` prefix
   plus exactly 3/4/6/8 hex digits (RGB/RGBA/RRGGBB/RRGGBBAA) is essentially
@@ -986,7 +1036,10 @@ itself) and asserts on parsed JSON output. Coverage includes: the
 leading-zero and date-format heuristics on CSV, nested object + array-of-
 objects flattening with the local missing-% calculation, mixed-type count
 reporting, Parquet's no-data-loss-on-strings case, Parquet's Map-column
-flattening and dictionary-encoding resolution, Excel's does-lose-data case
+flattening and dictionary-encoding resolution, Avro's logical-type
+resolution (`date`/`timestamp-millis`/`timestamp-micros`/decimal,
+including decimal nested inside a record/array/nullable union - see the
+Cloud-platform file compatibility section), Excel's does-lose-data case
 (the same value, opposite outcome, by design), Excel's one-table-per-sheet
 output, SQLite's multi-table output and type-affinity detection, the
 `json-schema` output's type mapping and nullability handling, MessagePack's
@@ -1195,6 +1248,62 @@ benchmark needs and a `std::time::Instant` harness can't easily give it):
   overhead than the flat-columnar readers), Excel slowest by a clear
   margin (~29ms, zip decompression plus XML parsing on top of everything
   else).
+
+## Cloud-platform file compatibility
+
+This tool never touches the network - no cloud SDKs, no credentials, no
+`s3://`/`az://`/`gs://` URIs. "Cloud compatibility" here means something
+narrower and more concrete: once a file produced by an AWS/Azure/GCP-native
+data service has been downloaded locally, does it read the same as any
+other file of that format? A deliberate pass was made checking exactly
+that, empirically rather than by inspection - some things already worked
+and just needed confirming, one format needed a real fix (see the design
+philosophy section above for the Avro logical-type and `\N`-sentinel
+entries).
+
+**Already correct, verified rather than assumed:**
+
+- **Parquet compression codecs** - Snappy (the near-universal default
+  across Athena/Glue/EMR/BigQuery/Synapse), gzip, Brotli, LZ4, and Zstd all
+  read correctly. The `parquet` crate's own `default` feature set already
+  enables every codec (`snap`, `brotli`, `flate2-zlib-rs`, `lz4`, `zstd`),
+  and this project's `Cargo.toml` never disables default features on it -
+  confirmed by actually writing the same small dataset through pandas
+  with each codec and reading every file back.
+- **Legacy Parquet `INT96` timestamps** - still common from Hive/Athena/
+  EMR-lineage writers despite being deprecated in favor of the logical
+  `timestamp` type. Reads identically to a modern `INT64`-encoded
+  timestamp column, confirmed by writing the same data both ways
+  (`use_deprecated_int96_timestamps=True/False` in pyarrow) and diffing
+  the output.
+- **Parquet `DECIMAL128`** - unlike Avro's decimal (see below), this
+  already renders correctly (`"123.45"`, `"-45.67"`, `"0.00"`) because it
+  goes through Arrow's own mature `Decimal128Array` type, not a hand-
+  rolled bridge - confirmed with the same positive/negative/zero values
+  used to verify the Avro fix.
+
+**Found broken and fixed** (both detailed in the design philosophy section
+above): Avro's `timestamp-millis`/`-micros`/`-nanos` and their `local-*`
+counterparts were being silently reduced to opaque epoch integers, and
+`decimal` rendered as unusable Rust Debug output
+(`"Decimal(Decimal { value: 12345, len: 2 })"`) instead of a real number -
+both real risks for cloud-streaming Avro producers (Kinesis Firehose,
+Event Hubs Capture, Pub/Sub) that lean on exactly these logical types.
+`\N`, the literal NULL marker MySQL/Hive/Redshift `UNLOAD` all write in
+text exports, is now recognized as a missing-value sentinel.
+
+**Not covered, and out of scope for this pass:** Avro's `Duration` logical
+type (months/days/milliseconds, a compound value with no single natural
+string form) still falls through to the same best-effort Debug-formatted
+fallback every truly-unhandled `Value` variant gets - genuinely rare in
+practice compared to decimal/timestamp, and left as a disclosed gap rather
+than guessed at. `BigDecimal` (Avro's newer, unscaled-in-the-schema
+decimal variant) delegates to the `bigdecimal` crate's own `Display` impl,
+which should already be correct since (unlike the fixed-scale `Decimal`)
+it carries its own scale - but this specific path has lower verification
+confidence than the rest of this section, since `fastavro` (the tool used
+to generate every other test fixture here) doesn't support writing
+`big-decimal` test data the way it does for `decimal`.
 
 ## Known limitations / roadmap
 

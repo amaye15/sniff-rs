@@ -137,9 +137,15 @@ fn has_leading_zero(s: &str) -> bool {
 /// as plain text - the "missing" case can only be an actual empty field, or
 /// one of these well-established conventions, the same ones pandas'
 /// `read_csv` treats as missing by default). Matched case-insensitively
-/// against the trimmed field, so " NA " and "na" both count.
+/// against the trimmed field, so " NA " and "na" both count. `"\N"` is the
+/// one entry here that isn't a pandas default - it's MySQL/Hive/Redshift
+/// `UNLOAD`'s own literal NULL marker for text exports (`SELECT INTO
+/// OUTFILE`, Hive's default text SerDe, and Redshift's `UNLOAD ... NULL AS
+/// '\N'` all write it), common enough in cloud-warehouse-produced CSV/TSV
+/// that it earns a place in this list on its own merits.
 const MISSING_SENTINELS: &[&str] = &[
     "na", "n/a", "null", "none", "nan", "nil", "-", "--", "?", "unknown", "missing", "#n/a",
+    "\\n",
 ];
 
 fn is_missing_sentinel(s: &str) -> bool {
@@ -2499,16 +2505,97 @@ fn columns_from_arrow_ipc(
 // Decodes each record to serde_json::Value and reuses the exact same
 // column-extraction/flattening path as JSON files.
 
+/// Avro's decimal logical type stores only the unscaled two's-complement
+/// integer in the *value* - the scale that says where the decimal point
+/// goes lives in the *schema*, not the value, so rendering a decimal
+/// column correctly needs both together (see avro_value_to_json's
+/// Option<&Schema> parameter). Delegates the actual big-integer decoding
+/// to num_bigint (already a transitive dependency of apache-avro itself -
+/// see the Cargo.toml comment) rather than hand-rolling two's-complement
+/// arithmetic, the same "don't reimplement what a well-tested crate
+/// already does for free" call this project makes elsewhere (chrono,
+/// serde_json).
 #[cfg(feature = "avro")]
-fn avro_value_to_json(v: &apache_avro::types::Value) -> JsonValue {
+fn avro_decimal_to_string(decimal: apache_avro::Decimal, scale: usize) -> String {
+    let unscaled: num_bigint::BigInt = decimal.into();
+    let signed = unscaled.to_string();
+    let (negative, digits) = match signed.strip_prefix('-') {
+        Some(rest) => (true, rest.to_string()),
+        None => (false, signed),
+    };
+    let mut out = if digits.len() <= scale {
+        format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
+    } else {
+        digits
+    };
+    if scale > 0 {
+        out.insert(out.len() - scale, '.');
+    }
+    if negative {
+        out.insert(0, '-');
+    }
+    out
+}
+
+#[cfg(feature = "avro")]
+fn avro_millis_to_string(millis: i64) -> JsonValue {
+    chrono::DateTime::from_timestamp_millis(millis).map_or(JsonValue::Null, |dt| {
+        JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string())
+    })
+}
+
+#[cfg(feature = "avro")]
+fn avro_micros_to_string(micros: i64) -> JsonValue {
+    chrono::DateTime::from_timestamp_micros(micros).map_or(JsonValue::Null, |dt| {
+        JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
+    })
+}
+
+#[cfg(feature = "avro")]
+fn avro_nanos_to_string(nanos: i64) -> JsonValue {
+    let secs = nanos.div_euclid(1_000_000_000);
+    let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+    chrono::DateTime::from_timestamp(secs, subsec_nanos).map_or(JsonValue::Null, |dt| {
+        JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.9f").to_string())
+    })
+}
+
+#[cfg(feature = "avro")]
+fn avro_time_millis_to_string(millis: i32) -> JsonValue {
+    let secs = (millis.div_euclid(1000)).rem_euclid(86_400) as u32;
+    let nanos = millis.rem_euclid(1000) as u32 * 1_000_000;
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos).map_or(
+        JsonValue::Null,
+        |t| JsonValue::String(t.format("%H:%M:%S%.3f").to_string()),
+    )
+}
+
+#[cfg(feature = "avro")]
+fn avro_time_micros_to_string(micros: i64) -> JsonValue {
+    let secs = (micros.div_euclid(1_000_000)).rem_euclid(86_400) as u32;
+    let nanos = micros.rem_euclid(1_000_000) as u32 * 1000;
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos).map_or(
+        JsonValue::Null,
+        |t| JsonValue::String(t.format("%H:%M:%S%.6f").to_string()),
+    )
+}
+
+/// `schema` co-recurses alongside `v` so logical types whose meaning isn't
+/// recoverable from the value alone - decimal's scale is the one real case
+/// here, see avro_decimal_to_string - can still be resolved correctly. A
+/// schema/value shape mismatch (which shouldn't happen with a
+/// spec-compliant file) degrades gracefully to `None` at that point rather
+/// than failing the whole record - every other case here doesn't actually
+/// need the schema at all, so recursion continues unaffected.
+#[cfg(feature = "avro")]
+fn avro_value_to_json(v: &apache_avro::types::Value, schema: Option<&apache_avro::Schema>) -> JsonValue {
+    use apache_avro::Schema;
     use apache_avro::types::Value as AvroValue;
     match v {
         AvroValue::Null => JsonValue::Null,
         AvroValue::Boolean(b) => JsonValue::Bool(*b),
         AvroValue::Int(i) => JsonValue::Number((*i).into()),
-        AvroValue::Long(i) | AvroValue::TimestampMillis(i) | AvroValue::TimestampMicros(i) => {
-            JsonValue::Number((*i).into())
-        }
+        AvroValue::Long(i) => JsonValue::Number((*i).into()),
         AvroValue::Float(f) => {
             serde_json::Number::from_f64(f64::from(*f)).map_or(JsonValue::Null, JsonValue::Number)
         }
@@ -2519,26 +2606,83 @@ fn avro_value_to_json(v: &apache_avro::types::Value) -> JsonValue {
         AvroValue::Bytes(b) | AvroValue::Fixed(_, b) => {
             JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
         }
-        AvroValue::Union(_, inner) => avro_value_to_json(inner),
-        AvroValue::Array(items) => JsonValue::Array(items.iter().map(avro_value_to_json).collect()),
-        AvroValue::Map(m) => JsonValue::Object(
-            m.iter()
-                .map(|(k, v)| (k.clone(), avro_value_to_json(v)))
-                .collect(),
-        ),
-        AvroValue::Record(fields) => JsonValue::Object(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), avro_value_to_json(v)))
-                .collect(),
-        ),
+        AvroValue::Union(idx, inner) => {
+            let variant_schema = match schema {
+                Some(Schema::Union(u)) => u.get_variant(*idx as usize).ok(),
+                _ => None,
+            };
+            avro_value_to_json(inner, variant_schema)
+        }
+        AvroValue::Array(items) => {
+            let item_schema = match schema {
+                Some(Schema::Array(a)) => Some(a.items.as_ref()),
+                _ => None,
+            };
+            JsonValue::Array(
+                items
+                    .iter()
+                    .map(|i| avro_value_to_json(i, item_schema))
+                    .collect(),
+            )
+        }
+        AvroValue::Map(m) => {
+            let value_schema = match schema {
+                Some(Schema::Map(ms)) => Some(ms.types.as_ref()),
+                _ => None,
+            };
+            JsonValue::Object(
+                m.iter()
+                    .map(|(k, v)| (k.clone(), avro_value_to_json(v, value_schema)))
+                    .collect(),
+            )
+        }
+        AvroValue::Record(fields) => {
+            let record_schema = match schema {
+                Some(Schema::Record(rs)) => Some(rs),
+                _ => None,
+            };
+            JsonValue::Object(
+                fields
+                    .iter()
+                    .map(|(k, v)| {
+                        let field_schema = record_schema.and_then(|rs| {
+                            rs.lookup
+                                .get(k)
+                                .and_then(|&i| rs.fields.get(i))
+                                .map(|f| &f.schema)
+                        });
+                        (k.clone(), avro_value_to_json(v, field_schema))
+                    })
+                    .collect(),
+            )
+        }
         AvroValue::Date(days) => chrono::DateTime::UNIX_EPOCH
             .checked_add_signed(chrono::Duration::days(i64::from(*days)))
             .map_or(JsonValue::Null, |d| {
                 JsonValue::String(d.format("%Y-%m-%d").to_string())
             }),
         AvroValue::Uuid(u) => JsonValue::String(u.to_string()),
-        other => JsonValue::String(format!("{other:?}")), // best-effort for Decimal/Duration/local timestamps etc.
+        AvroValue::TimestampMillis(ms) | AvroValue::LocalTimestampMillis(ms) => {
+            avro_millis_to_string(*ms)
+        }
+        AvroValue::TimestampMicros(us) | AvroValue::LocalTimestampMicros(us) => {
+            avro_micros_to_string(*us)
+        }
+        AvroValue::TimestampNanos(ns) | AvroValue::LocalTimestampNanos(ns) => {
+            avro_nanos_to_string(*ns)
+        }
+        AvroValue::TimeMillis(ms) => avro_time_millis_to_string(*ms),
+        AvroValue::TimeMicros(us) => avro_time_micros_to_string(*us),
+        AvroValue::Decimal(d) => match schema {
+            Some(Schema::Decimal(ds)) => JsonValue::String(avro_decimal_to_string(d.clone(), ds.scale)),
+            // No schema/scale available - shouldn't happen for a
+            // spec-compliant file (the writer schema always carries the
+            // scale), so fall back to a visible placeholder rather than
+            // guessing a scale and silently showing the wrong number.
+            _ => JsonValue::String(format!("{d:?}")),
+        },
+        AvroValue::BigDecimal(bg) => JsonValue::String(bg.to_string()),
+        other => JsonValue::String(format!("{other:?}")), // best-effort for Duration, the one remaining compound logical type
     }
 }
 
@@ -2554,6 +2698,11 @@ fn columns_from_avro(
     let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
     let reader =
         AvroReader::new(file).with_context(|| format!("failed to read Avro file {path:?}"))?;
+    // Cloned before `reader` is consumed by `.enumerate()` below - needed so
+    // avro_value_to_json can resolve logical-type metadata (a decimal
+    // field's scale, the one case that isn't recoverable from the value
+    // alone) that only the schema carries.
+    let schema = reader.writer_schema().clone();
 
     let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
     for (i, value_result) in reader.enumerate() {
@@ -2562,7 +2711,7 @@ fn columns_from_avro(
         }
         let value =
             value_result.with_context(|| format!("failed decoding a record from {path:?}"))?;
-        match avro_value_to_json(&value) {
+        match avro_value_to_json(&value, Some(&schema)) {
             JsonValue::Object(m) => records.push(m),
             _ => bail!("expected each Avro record to decode to an object in {path:?}"),
         }
@@ -4756,6 +4905,49 @@ mod tests {
         assert!(!xml_nesting_too_deep(&wide));
     }
 
+    // avro_decimal_to_string is what stands between Avro's decimal logical
+    // type and a Rust Debug dump like "Decimal(Decimal { value: 12345, len:
+    // 2 })" - found via exactly this kind of direct testing while checking
+    // whether cloud-platform-produced Avro files (Kinesis/Event Hubs/
+    // Pub-Sub, which lean on decimal for money/precise numeric fields)
+    // actually render correctly. Every case here was hand-verified against
+    // the digit-shifting logic before being relied on (see the comment
+    // above avro_decimal_to_string's definition for the worked examples).
+
+    #[cfg(feature = "avro")]
+    fn avro_decimal_from_i64(unscaled: i64) -> apache_avro::Decimal {
+        let big = num_bigint::BigInt::from(unscaled);
+        apache_avro::Decimal::from(big.to_signed_bytes_be())
+    }
+
+    #[cfg(feature = "avro")]
+    #[test]
+    fn avro_decimal_to_string_places_the_decimal_point_correctly() {
+        assert_eq!(
+            avro_decimal_to_string(avro_decimal_from_i64(12345), 2),
+            "123.45"
+        );
+        assert_eq!(
+            avro_decimal_to_string(avro_decimal_from_i64(-100), 2),
+            "-1.00"
+        );
+        assert_eq!(avro_decimal_to_string(avro_decimal_from_i64(100), 0), "100");
+    }
+
+    #[cfg(feature = "avro")]
+    #[test]
+    fn avro_decimal_to_string_zero_pads_a_magnitude_smaller_than_the_scale() {
+        // unscaled=5, scale=2 must become "0.05", not "0.5" or ".05" - the
+        // exact off-by-one a naive "just insert a dot N digits from the
+        // right" implementation would get wrong on a short digit string.
+        assert_eq!(avro_decimal_to_string(avro_decimal_from_i64(5), 2), "0.05");
+        assert_eq!(
+            avro_decimal_to_string(avro_decimal_from_i64(-5), 2),
+            "-0.05"
+        );
+        assert_eq!(avro_decimal_to_string(avro_decimal_from_i64(0), 2), "0.00");
+    }
+
     #[test]
     fn suggest_ideal_type_flags_leading_zeros_already_lost_by_numeric_parse() {
         let (ideal, note) = suggest_ideal_type(&["02134", "90210"], "i64");
@@ -5344,6 +5536,17 @@ mod tests {
         assert!(is_missing_sentinel("-"));
         assert!(!is_missing_sentinel("Namibia")); // must not substring-match "NA"
         assert!(!is_missing_sentinel("42"));
+    }
+
+    #[test]
+    fn is_missing_sentinel_matches_mysql_hive_redshift_backslash_n() {
+        // MySQL's SELECT INTO OUTFILE, Hive's default text SerDe, and
+        // Redshift's UNLOAD ... NULL AS '\N' all write literal backslash-N
+        // for a null field - a real, common convention in cloud-warehouse
+        // CSV/TSV exports, not a pandas default like the rest of this list.
+        assert!(is_missing_sentinel("\\N"));
+        assert!(is_missing_sentinel("\\n")); // matched case-insensitively, like every other entry
+        assert!(!is_missing_sentinel("N")); // the backslash is load-bearing, not just the letter
     }
 
     // --- Adversarial / robustness tests -----------------------------------
