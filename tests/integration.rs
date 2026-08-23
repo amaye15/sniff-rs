@@ -1328,6 +1328,79 @@ fn header_only_csv_reports_every_column_as_empty_not_a_crash() {
     }
 }
 
+// Found via real-world testing (Ask A Manager's public salary survey CSV,
+// and independently the HPI Pollock data-loading benchmark's own
+// file_preamble.csv fixture) rather than reasoned about in advance: a
+// title/banner row above the real header is a real shape human-authored
+// spreadsheets export as. preamble.csv reproduces the same shape at fixture
+// scale - see detect_preamble_rows's doc comment in lib.rs for the exact
+// structural signal this fires on.
+
+#[test]
+fn preamble_row_is_auto_detected_and_skipped() {
+    let doc = run_json("preamble.csv", &[]);
+    let cols = table(&doc, "preamble");
+    let names: Vec<&str> = cols.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["id", "name", "age"]);
+    let id = column(cols, "id");
+    assert_eq!(id["sample_values"], serde_json::json!(["1", "2"]));
+}
+
+#[test]
+fn explicit_skip_rows_matches_auto_detection() {
+    let doc = run_json("preamble.csv", &["--skip-rows", "1"]);
+    let cols = table(&doc, "preamble");
+    let names: Vec<&str> = cols.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["id", "name", "age"]);
+}
+
+#[test]
+fn explicit_skip_rows_zero_disables_auto_detection() {
+    // The banner row (4 fields, trailing commas) becomes the header
+    // itself, so the very next row ("id,name,age", 3 fields) is a genuine
+    // header/data mismatch - proving --skip-rows 0 really does override
+    // auto-detection rather than being indistinguishable from "not passed".
+    let output = std::process::Command::new(bin())
+        .args([
+            fixture("preamble.csv").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+            "--skip-rows",
+            "0",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("field"),
+        "expected a header/data field-count mismatch error, got: {stderr}"
+    );
+}
+
+#[test]
+fn clean_csv_has_no_preamble_detected() {
+    // sample.csv has no banner row - auto-detection must not fire on an
+    // already-clean file, and no "detected N preamble row(s)" note should
+    // appear on stderr.
+    let output = std::process::Command::new(bin())
+        .args([
+            fixture("sample.csv").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("preamble"),
+        "auto-detection should not have fired on a clean CSV, got: {stderr}"
+    );
+}
+
 #[test]
 fn whitespace_only_csv_treats_the_blank_value_as_missing_not_a_crash() {
     let doc = run_json("malformed_whitespace_only.csv", &[]);

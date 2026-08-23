@@ -34,7 +34,7 @@ every format. See "Testing" below.
 
 | Format | Extensions | Needs | Notes |
 |---|---|---|---|
-| CSV / TSV | `.csv`, `.tsv` | *(default)* | `--delimiter` overrides the separator |
+| CSV / TSV | `.csv`, `.tsv` | *(default)* | `--delimiter` overrides the separator; `--skip-rows` skips N leading rows before the header (auto-detected when not given - see below) |
 | JSON | `.json` | *(default)* | array-of-objects or JSON Lines, auto-detected by content |
 | JSON Lines / NDJSON | `.jsonl`, `.ndjson` | *(default)* | same reader as JSON |
 | Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List/Map |
@@ -983,6 +983,56 @@ entirely:
   10 - the check is a strict `<`, so precisely 5.0% is confirmed to *not*
   count).
 
+- **A title/banner row above the real header - a common shape in
+  human-authored spreadsheets exported to CSV - used to silently become the
+  header itself, demoting the real header row to a data value.** Found via
+  real-world testing rather than reasoned about in advance: a public,
+  35,000-row salary survey (Ask A Manager's) has an instructions banner
+  line above its real header, and independently, the HPI Pollock data-
+  loading benchmark's own `file_preamble.csv` fixture (from its survey of
+  245,000+ real open-data-portal CSVs) showed the exact same shape - two
+  unrelated real-world sources landing on one bug. `detect_preamble_rows`
+  fixes this the same way every other heuristic in this file is held to a
+  confident-signal bar: it only ever fires on row *structure*, never on
+  cell content or column-name guessing. A leading row counts as preamble
+  only if it has at least two fields and at most one of them is non-empty
+  (a real header virtually always names every column; requiring >= 2
+  fields specifically rules out misreading a genuine single-column
+  dataset, whose every row is trivially "1 of 1 fields populated"), and
+  the run of such rows must be immediately followed by a row where *every*
+  field is populated - the strongest available signal that row is the
+  real header rather than just another sparse one. `MAX_PREAMBLE_SCAN`
+  (5) bounds the run so a genuinely sparse dataset can never have an
+  unbounded chunk silently skipped, and a header that legitimately has an
+  empty/unlabeled column correctly leaves auto-detection off rather than
+  misfiring (verified via a dedicated test) - either signal failing to
+  hold leaves `skip_rows` at 0, the same old behavior, rather than
+  guessing. Auto-detection only runs when `--skip-rows` isn't given
+  explicitly, and always discloses what it did to stderr (`detected N
+  preamble row(s) before the header - skipping`) rather than silently
+  changing the output - the same "never hidden" treatment every other
+  auto-behavior in this file gets (compare content-based format sniffing).
+  Implementing `--skip-rows` correctly surfaced a real, separate bug of
+  its own along the way: seeking a fresh strict (non-flexible) `csv::Reader`
+  to resume past the skipped rows calls the crate's own `byte_headers()`
+  internally, which - confirmed directly against the `csv` crate's own
+  source (`Reader::seek`, `ReaderState::add_record`), not assumed - reads
+  a record from *byte 0 of the file* purely to populate its own cache
+  before the seek happens, silently seeding the crate's internal
+  ragged-row tracker from whatever that first record's field count was
+  (the preamble's, not the header's) and never re-seeding it from the real
+  header afterward. On a real file whose header and data rows happen to
+  have different field counts (also found via the same real-world sweep,
+  not hypothesized - three files hit this exact shape), this let a
+  genuinely ragged row silently pass through instead of erroring, causing
+  an out-of-bounds panic downstream rather than the clean error this
+  project always guarantees for malformed CSV. The fix sidesteps the
+  crate's internal state machine entirely rather than fighting it: the
+  resumed reader is `flexible(true)`, and every record's length is checked
+  explicitly against `headers.len()` in this project's own code - stating
+  the actual invariant ("every row matches the header") directly instead
+  of depending on which record happened to seed an internal tracker first.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1209,6 +1259,40 @@ the same as the malformed-input family: none of it needed a code fix, all
 of it was already handled correctly and simply lacked a test locking the
 behavior in.
 
+**Real-world corpus validation** is a distinct exercise from the fixture-
+based testing above: rather than synthetic or hand-crafted files, this ran
+the compiled binary against large *external* corpora of real, messy data no
+one on this project authored, specifically to check for crashes and
+correctness gaps that only show up at real-world scale and variety. Two
+corpora, neither committed to the repo (both are large, externally-hosted,
+and not this project's to redistribute - the fixtures the findings produced
+*are* committed, see below): the HPI Pollock data-loading benchmark's
+`survey/csv` directory (3,712 real CSVs crawled from government/open-data
+portals as part of their own published study of 245,000+ files' RFC-4180
+violations) and the public, 35,000-row "Ask A Manager" salary survey (real
+human-entered free text - job titles, locations, currencies, salaries with
+thousands separators). Result: 3,709 of the 3,712 Pollock files parsed
+correctly and the remaining 3 failed with a clean, actionable ragged-row
+error (genuinely malformed files) - zero panics, zero silent misparses,
+both before and after the preamble-detection work below. Pollock's own 21
+synthetic structural-pollution variants (delimiter swapped to `;`/tab/
+space, quote character changed, escape character changed, multi-row
+headers, a preamble, a multi-table file, no header, an empty file, CRLF/CR/
+LF-only line endings, no trailing newline) also produced zero crashes -
+delimiter/quote/escape mismatches correctly surface as a clean ragged-row
+error rather than a silent misparse, exactly as documented above (this
+tool doesn't auto-sniff CSV dialect; `--delimiter` is the escape hatch).
+This pass is what found both real bugs described in the preamble-detection
+entry above (the previously-undetected header-swallowed-by-banner-row
+behavior, and the seek-poisoning ragged-row panic introduced while fixing
+it) - real-world testing here served the same role adversarial fixture
+testing already serves elsewhere in this file: surfacing failures no one
+would have thought to write a synthetic test for in advance.
+`tests/fixtures/preamble.csv` and its four integration tests distill the
+finding into a small, permanent, committed regression test, so the
+external corpora themselves don't need to be present for `cargo test` to
+keep proving the fix holds.
+
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
 there's also a `#[cfg(test)] mod tests` at the bottom of `lib.rs`
@@ -1431,3 +1515,13 @@ to generate every other test fixture here) doesn't support writing
   irreducible-ambiguity tradeoff as IPv4-vs-version-string; the second is a
   separate concern (transport encoding, not data format) that was out of
   scope for what this feature was asked to solve.
+- **Preamble-row auto-detection (`detect_preamble_rows`) is capped at
+  `MAX_PREAMBLE_SCAN` (5) leading rows**, and only ever fires on the
+  specific fill-pattern described in the design philosophy section above
+  (a leading run of at-most-one-field-populated rows immediately followed
+  by a fully-populated row). A banner that spans more than 5 rows, or a
+  header that legitimately has an empty/unlabeled column right after the
+  banner, both fall back to `skip_rows = 0` - the same old behavior,
+  disclosed nowhere further since nothing auto-fired - rather than a wrong
+  guess. `--skip-rows N` is the explicit, always-correct escape hatch for
+  either case.

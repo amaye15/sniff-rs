@@ -57,6 +57,13 @@ struct Args {
     /// Override the field delimiter for csv/tsv (single character)
     #[arg(long)]
     delimiter: Option<char>,
+    /// Skip N leading rows before the header (csv/tsv only) - for a
+    /// title/instructions banner row some spreadsheet exports carry above
+    /// the real header. If not given, a small run of leading rows is
+    /// auto-skipped when it shows a strong structural signal of being a
+    /// preamble rather than the header - see detect_preamble_rows.
+    #[arg(long)]
+    skip_rows: Option<usize>,
     /// Column widths for --format fixed-width, as comma-separated character
     /// counts (e.g. --widths 10,5,20) - there's no delimiter to split on, so
     /// this format only runs when widths are given explicitly
@@ -203,8 +210,7 @@ fn has_leading_zero(s: &str) -> bool {
 /// '\N'` all write it), common enough in cloud-warehouse-produced CSV/TSV
 /// that it earns a place in this list on its own merits.
 const MISSING_SENTINELS: &[&str] = &[
-    "na", "n/a", "null", "none", "nan", "nil", "-", "--", "?", "unknown", "missing", "#n/a",
-    "\\n",
+    "na", "n/a", "null", "none", "nan", "nil", "-", "--", "?", "unknown", "missing", "#n/a", "\\n",
 ];
 
 fn is_missing_sentinel(s: &str) -> bool {
@@ -1249,19 +1255,84 @@ fn naive_current_type(values: &[&str]) -> &'static str {
     }
 }
 
-fn columns_from_csv(path: &Path, nrows: Option<usize>, delimiter: u8) -> Result<Vec<ColumnInput>> {
-    let mut reader = csv::ReaderBuilder::new()
+fn columns_from_csv(
+    path: &Path,
+    nrows: Option<usize>,
+    delimiter: u8,
+    skip_rows: usize,
+) -> Result<Vec<ColumnInput>> {
+    // Two passes, because a skipped preamble row often doesn't share the
+    // real header's field count (a banner line with no commas at all,
+    // above a 9-column header, is a real shape - see
+    // detect_preamble_rows), which the strict reader below would otherwise
+    // reject as ragged before ever getting to decide it's not a data row.
+    // Pass one is flexible specifically to tolerate that while walking
+    // past skip_rows rows to the header; pass two seeks a strict
+    // (non-flexible) reader to resume exactly where pass one left off, so
+    // a genuinely ragged *data* row is still the same hard, actionable
+    // csv-crate error it always has been - flexible(true) for the whole
+    // read would have silently swallowed that instead.
+    let mut header_reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
         .from_path(path)
         .with_context(|| format!("failed to open {path:?}"))?;
-    let headers: Vec<String> = reader.headers()?.iter().map(|s| s.to_string()).collect();
+    let mut rec = csv::StringRecord::new();
+    let mut headers: Vec<String> = Vec::new();
+    for i in 0..=skip_rows {
+        if !header_reader.read_record(&mut rec)? {
+            break;
+        }
+        if i == skip_rows {
+            headers = rec.iter().map(|s| s.to_string()).collect();
+        }
+    }
+    let resume_at = header_reader.position().clone();
 
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("failed to open {path:?}"))?;
+    // seek() internally calls byte_headers(), which - if headers haven't
+    // been read yet - reads a record from the *start* of the file (the
+    // skipped preamble, not the header) purely to populate its own cache,
+    // before the actual seek happens. Pre-seeding a dummy header
+    // short-circuits that internal read (byte_headers only reads when
+    // `state.headers` is still `None`), so seek() performs a pure position
+    // jump with no wasted side-read.
+    reader.set_headers(csv::StringRecord::new());
+    reader.seek(resume_at)?;
+
+    // Deliberately flexible(true) plus a manual length check here, rather
+    // than leaning on the csv crate's own strict-mode ragged-row
+    // detection: that detection anchors itself to whichever record it
+    // happens to read *first* on a given Reader (tracked internally,
+    // starting from None), and after a seek there's no way to seed it
+    // with the header's field count directly - confirmed directly against
+    // the csv crate's own source (`ReaderState::add_record`), not
+    // assumed, after an earlier version of this function silently passed
+    // through a real ragged header/data mismatch instead of erroring
+    // because of exactly this gap. Checking every record's length against
+    // `headers.len()` explicitly sidesteps that internal state machine
+    // entirely and states the actual invariant this tool cares about -
+    // every row matches the header - rather than "every row matches
+    // whatever the first one happened to be."
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
     for (i, result) in reader.records().enumerate() {
         if nrows.is_some_and(|limit| i >= limit) {
             break;
         }
         let record = result?;
+        if record.len() != headers.len() {
+            bail!(
+                "CSV error: found record with {} fields, but the header has {} fields",
+                record.len(),
+                headers.len()
+            );
+        }
         for (col_idx, field) in record.iter().enumerate() {
             let trimmed = field.trim();
             let value = if trimmed.is_empty() || is_missing_sentinel(trimmed) {
@@ -1292,6 +1363,85 @@ fn columns_from_csv(path: &Path, nrows: Option<usize>, delimiter: u8) -> Result<
         });
     }
     Ok(columns)
+}
+
+// A leading title/instructions row above the real header is a real,
+// observed pattern in human-authored spreadsheets exported to CSV (found
+// via real-world testing against the Ask A Manager salary survey and the
+// HPI Pollock benchmark's own file_preamble.csv fixture, both independently
+// showing the same shape). Detecting it only ever fires on a structural
+// fill-pattern, never on cell content or column-name guessing, the same
+// bar every other heuristic in this file holds to: a leading row counts as
+// "preamble" only if it has at least two fields and at most one of them is
+// non-empty (a real header virtually always names every column; a real
+// single-column data row is the one thing this rules out on purpose, by
+// requiring >= 2 fields), and the run of such rows must be immediately
+// followed by a row where *every* field is non-empty (the strongest
+// available signal that this is the real header, not just another sparse
+// row). Capped at MAX_PREAMBLE_SCAN so a genuinely sparse dataset can never
+// have an unbounded chunk silently skipped. Either condition failing to
+// hold leaves skip_rows at 0 - the safe, old-behavior direction - rather
+// than guessing.
+const MAX_PREAMBLE_SCAN: usize = 5;
+
+fn detect_preamble_rows(path: &Path, delimiter: u8) -> usize {
+    let Ok(reader) = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_path(path)
+    else {
+        return 0;
+    };
+    let records: Vec<csv::StringRecord> = reader
+        .into_records()
+        .take(MAX_PREAMBLE_SCAN + 1)
+        .filter_map(|r| r.ok())
+        .collect();
+
+    fn fill(record: &csv::StringRecord) -> (usize, usize) {
+        let total = record.len();
+        let non_empty = record.iter().filter(|f| !f.trim().is_empty()).count();
+        (non_empty, total)
+    }
+
+    let mut skip = 0;
+    while skip < records.len().saturating_sub(1) && skip < MAX_PREAMBLE_SCAN {
+        let (non_empty, total) = fill(&records[skip]);
+        if total >= 2 && non_empty <= 1 {
+            skip += 1;
+        } else {
+            break;
+        }
+    }
+    if skip == 0 || skip >= records.len() {
+        return 0;
+    }
+    let (non_empty, total) = fill(&records[skip]);
+    if total >= 2 && non_empty == total {
+        skip
+    } else {
+        0
+    }
+}
+
+/// Explicit --skip-rows always wins; otherwise falls back to
+/// detect_preamble_rows and, if it fires, discloses what happened to
+/// stderr rather than silently changing the output - the same "never
+/// hidden" treatment every other auto-behavior in this file gets.
+fn resolve_skip_rows(explicit: Option<usize>, path: &Path, delimiter: u8) -> usize {
+    match explicit {
+        Some(n) => n,
+        None => {
+            let detected = detect_preamble_rows(path, delimiter);
+            if detected > 0 {
+                eprintln!(
+                    "detected {detected} preamble row(s) before the header - skipping (pass --skip-rows to override)"
+                );
+            }
+            detected
+        }
+    }
 }
 
 // --- Fixed-width text reader (only reachable via --format fixed-width,
@@ -2623,20 +2773,20 @@ fn avro_nanos_to_string(nanos: i64) -> JsonValue {
 fn avro_time_millis_to_string(millis: i32) -> JsonValue {
     let secs = (millis.div_euclid(1000)).rem_euclid(86_400) as u32;
     let nanos = millis.rem_euclid(1000) as u32 * 1_000_000;
-    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos).map_or(
-        JsonValue::Null,
-        |t| JsonValue::String(t.format("%H:%M:%S%.3f").to_string()),
-    )
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+        .map_or(JsonValue::Null, |t| {
+            JsonValue::String(t.format("%H:%M:%S%.3f").to_string())
+        })
 }
 
 #[cfg(feature = "avro")]
 fn avro_time_micros_to_string(micros: i64) -> JsonValue {
     let secs = (micros.div_euclid(1_000_000)).rem_euclid(86_400) as u32;
     let nanos = micros.rem_euclid(1_000_000) as u32 * 1000;
-    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos).map_or(
-        JsonValue::Null,
-        |t| JsonValue::String(t.format("%H:%M:%S%.6f").to_string()),
-    )
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+        .map_or(JsonValue::Null, |t| {
+            JsonValue::String(t.format("%H:%M:%S%.6f").to_string())
+        })
 }
 
 /// `schema` co-recurses alongside `v` so logical types whose meaning isn't
@@ -2647,7 +2797,10 @@ fn avro_time_micros_to_string(micros: i64) -> JsonValue {
 /// than failing the whole record - every other case here doesn't actually
 /// need the schema at all, so recursion continues unaffected.
 #[cfg(feature = "avro")]
-fn avro_value_to_json(v: &apache_avro::types::Value, schema: Option<&apache_avro::Schema>) -> JsonValue {
+fn avro_value_to_json(
+    v: &apache_avro::types::Value,
+    schema: Option<&apache_avro::Schema>,
+) -> JsonValue {
     use apache_avro::Schema;
     use apache_avro::types::Value as AvroValue;
     match v {
@@ -2733,7 +2886,9 @@ fn avro_value_to_json(v: &apache_avro::types::Value, schema: Option<&apache_avro
         AvroValue::TimeMillis(ms) => avro_time_millis_to_string(*ms),
         AvroValue::TimeMicros(us) => avro_time_micros_to_string(*us),
         AvroValue::Decimal(d) => match schema {
-            Some(Schema::Decimal(ds)) => JsonValue::String(avro_decimal_to_string(d.clone(), ds.scale)),
+            Some(Schema::Decimal(ds)) => {
+                JsonValue::String(avro_decimal_to_string(d.clone(), ds.scale))
+            }
             // No schema/scale available - shouldn't happen for a
             // spec-compliant file (the writer schema always carries the
             // scale), so fall back to a visible placeholder rather than
@@ -4706,13 +4861,17 @@ pub fn run() -> Result<()> {
     } else {
         let profiles: Vec<ColumnProfile> = match format {
             InputFormat::Csv => {
-                columns_from_csv(&read_path, args.nrows, args.delimiter.unwrap_or(',') as u8)?
+                let delim = args.delimiter.unwrap_or(',') as u8;
+                let skip_rows = resolve_skip_rows(args.skip_rows, &read_path, delim);
+                columns_from_csv(&read_path, args.nrows, delim, skip_rows)?
                     .into_iter()
                     .map(|c| profile_column(c, args.samples))
                     .collect()
             }
             InputFormat::Tsv => {
-                columns_from_csv(&read_path, args.nrows, args.delimiter.unwrap_or('\t') as u8)?
+                let delim = args.delimiter.unwrap_or('\t') as u8;
+                let skip_rows = resolve_skip_rows(args.skip_rows, &read_path, delim);
+                columns_from_csv(&read_path, args.nrows, delim, skip_rows)?
                     .into_iter()
                     .map(|c| profile_column(c, args.samples))
                     .collect()
@@ -5115,10 +5274,7 @@ mod tests {
             Some("%a, %d %b %Y %H:%M:%S %z")
         );
         assert_eq!(
-            matching_date_format(&[
-                "Mon Jan 15 10:00:00 2024",
-                "Tue Feb 20 11:30:00 2024"
-            ]),
+            matching_date_format(&["Mon Jan 15 10:00:00 2024", "Tue Feb 20 11:30:00 2024"]),
             Some("%a %b %d %H:%M:%S %Y")
         );
     }
@@ -6081,6 +6237,97 @@ mod tests {
         let refs: Vec<&str> = just_under_5_pct.iter().map(String::as_str).collect();
         let (ideal, _) = suggest_ideal_type(&refs, "String");
         assert_eq!(ideal, "enum / category"); // just under 5% - now it counts
+    }
+
+    // --- Preamble-row detection tests -----------------------------------
+    // Found via real-world testing (Ask A Manager's salary survey CSV, and
+    // independently the HPI Pollock benchmark's own file_preamble.csv
+    // fixture) rather than reasoned about in advance - both showed the
+    // exact same shape: a title/banner row above the real header. See
+    // detect_preamble_rows's doc comment for the exact structural signal.
+
+    fn preamble_rows(csv_text: &str) -> usize {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, csv_text.as_bytes()).unwrap();
+        detect_preamble_rows(tmp.path(), b',')
+    }
+
+    #[test]
+    fn detect_preamble_rows_finds_a_single_banner_row() {
+        let csv = "Banner text here,,,,\nid,name,age,city,country\n1,Alice,30,NYC,US\n";
+        assert_eq!(preamble_rows(csv), 1);
+    }
+
+    #[test]
+    fn detect_preamble_rows_finds_a_multi_row_preamble() {
+        let csv = "PREAMBLE,,,\n,,,\nid,name,age,city\n1,Alice,30,NYC\n";
+        assert_eq!(preamble_rows(csv), 2);
+    }
+
+    #[test]
+    fn detect_preamble_rows_finds_nothing_on_a_clean_csv() {
+        let csv = "id,name,age\n1,Alice,30\n2,Bob,40\n";
+        assert_eq!(preamble_rows(csv), 0);
+    }
+
+    #[test]
+    fn detect_preamble_rows_does_not_misfire_on_a_single_column_file() {
+        // Every leading row here is "mostly empty" by field count (1 of 1
+        // fields populated), but there's only ever one field at all - the
+        // >= 2 fields requirement exists specifically to keep this from
+        // being misread as a preamble.
+        let csv = "id\n1\n2\n3\n";
+        assert_eq!(preamble_rows(csv), 0);
+    }
+
+    #[test]
+    fn detect_preamble_rows_does_not_misfire_when_the_real_header_has_a_blank_column() {
+        // A real header can legitimately have an unnamed column (a
+        // duplicate/unlabeled field). The confirming row here is NOT fully
+        // populated, so this must not be mistaken for a preamble - the
+        // safe direction is a false negative, not a false positive.
+        let csv = "id,name,,age\n1,Alice,x,30\n";
+        assert_eq!(preamble_rows(csv), 0);
+    }
+
+    #[test]
+    fn detect_preamble_rows_is_capped_at_max_preamble_scan() {
+        // Ten leading mostly-empty rows in a row is far more than any real
+        // banner/preamble pattern seen in practice - this must not treat
+        // an oddly-shaped file as one giant preamble.
+        let mut csv = String::new();
+        for _ in 0..10 {
+            csv.push_str("x,,\n");
+        }
+        csv.push_str("id,name,age\n1,Alice,30\n");
+        assert_eq!(preamble_rows(&csv), 0);
+    }
+
+    #[test]
+    fn detect_preamble_rows_does_not_error_on_an_empty_file() {
+        assert_eq!(preamble_rows(""), 0);
+    }
+
+    #[test]
+    fn columns_from_csv_skip_rows_matches_manual_preamble_removal() {
+        let with_preamble = "Banner,,,,\nid,name,age\n1,Alice,30\n2,Bob,40\n";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, with_preamble.as_bytes()).unwrap();
+
+        let cols = columns_from_csv(tmp.path(), None, b',', 1).unwrap();
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name", "age"]);
+        assert_eq!(cols[0].raw_values, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn columns_from_csv_skip_rows_past_everything_yields_an_empty_table_not_an_error() {
+        let tiny = "id,name\n1,Alice\n";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, tiny.as_bytes()).unwrap();
+
+        let cols = columns_from_csv(tmp.path(), None, b',', 100).unwrap();
+        assert!(cols.is_empty());
     }
 
     // --- Content-sniffing tests ---------------------------------------
