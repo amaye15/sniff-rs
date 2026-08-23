@@ -6157,6 +6157,25 @@ mod tests {
     }
 
     #[test]
+    fn is_email_accepts_real_domains_with_digits_and_hyphens() {
+        // Found via a real-world sweep against the "userdata" sample Avro
+        // dataset: these are all genuine, currently-in-use domains
+        // (163.com is a major Chinese email provider, t-online.de a major
+        // German ISP, so-net.ne.jp a real multi-level Japanese domain) -
+        // only the final TLD segment needs to be alphabetic, so digits and
+        // hyphens earlier in the domain never disqualify it. Locks in a
+        // real finding: the dataset's own email column staying untyped
+        // turned out to be caused by unrelated empty-string values, not a
+        // gap here - this proves that conclusion rather than just
+        // asserting it in a comment.
+        assert!(is_email("bcollins18@list-manage.com"));
+        assert!(is_email("gferguson1h@51.la"));
+        assert!(is_email("wpalmer1k@t-online.de"));
+        assert!(is_email("afuller9z@163.com"));
+        assert!(is_email("acoleman6h@so-net.ne.jp"));
+    }
+
+    #[test]
     fn is_url_requires_a_recognized_scheme_and_non_empty_rest() {
         assert!(is_url("https://example.com"));
         assert!(!is_url("example.com"));

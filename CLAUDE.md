@@ -1632,11 +1632,16 @@ adversarial files still being accepted rather than rejected) confirmed to
 be limits of the underlying `parquet`/`arrow` crate's own metadata/batch
 decoding, not this project's code - the same "delegate real parsing to
 the crate" boundary the YAML pass drew. `tests/fixtures/
-edge_map_non_string_key.parquet` (generated with `pyarrow`, matching this
-project's own established fixture-generation convention rather than
-vendoring a third-party file even though `parquet-testing` is Apache-2.0
-licensed and permits it) and its integration test lock the map-key fix
-in permanently.
+edge_map_non_string_key.parquet` and `tests/fixtures/edge_named_timezone.parquet`
+(both generated with `pyarrow`, matching this project's own established
+fixture-generation convention rather than vendoring a third-party file
+even though `parquet-testing` is Apache-2.0 licensed and permits it) and
+their integration tests lock both fixes in - the named-timezone fixture's
+test was added in a follow-up coverage audit after the original pass
+verified the fix manually but hadn't yet turned it into a committed
+regression test; its own comment records that the fix was re-confirmed by
+temporarily reverting `chrono-tz` and rebuilding before the test was
+trusted, not just assumed correct from the earlier manual check.
 
 A fifth pass, for Avro: the Apache Avro project's own interop test data
 (`share/test/` in the `apache/avro` repo - weather data in several
@@ -1654,6 +1659,22 @@ things that are actually broken. `tests/fixtures/edge_avro_snappy_codec.avro`
 and `tests/fixtures/edge_avro_scalar_records.avro` (both generated with
 `fastavro`, matching this project's fixture-generation convention) plus
 two integration tests lock both fixes in.
+
+A follow-up coverage audit across all five passes above (prompted by an
+explicit request to double-check every finding actually got a committed
+regression test, not just a fix and a manual verification) closed two
+more real gaps it found: the Parquet named-timezone fix (see above) had
+been verified by hand but never turned into a test, and the JSON reader's
+zero-byte-file behavior (`n_structure_no_data.json`/`n_single_space.json`
+from the JSONTestSuite sweep both being treated as zero records, matching
+every other lenient format) had been confirmed correct during that sweep
+but was the one format in that family without a committed
+`edge_empty_doc.<ext>` test locking it in - `json_zero_byte_file_produces_an_empty_table_not_a_crash`
+closes that gap alongside `msgpack`/`cbor`/`toml`/`yaml`'s existing
+equivalents. A third addition, `is_email_accepts_real_domains_with_digits_and_hyphens`,
+turns the Avro pass's `is_email` non-finding from a claim in this document
+into something a future change to that function would actually have to
+break a test to get wrong.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests

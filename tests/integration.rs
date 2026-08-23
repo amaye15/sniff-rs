@@ -419,6 +419,35 @@ fn parquet_map_with_non_string_keys_does_not_sink_the_rest_of_the_file() {
     assert_eq!(plain["missing_pct"].as_f64().unwrap(), 0.0);
 }
 
+// Found in the same real-world sweep: a Timestamp column carrying a
+// *named* timezone ("UTC", as opposed to a raw numeric offset) - the
+// exact shape of a real field (`ul_observation_date`) in
+// nested_structs.rust.parquet from the official apache/parquet-testing
+// corpus - failed Arrow's JSON writer ("only offset based timezones
+// supported without chrono-tz feature") until this project's `arrow`
+// dependency enabled that feature. Verified directly (not just inferred
+// from the crate's docs): temporarily removing the feature and rebuilding
+// reproduced the exact failure this fixture is meant to catch, before
+// restoring it.
+#[cfg(feature = "parquet")]
+#[test]
+fn parquet_named_timezone_timestamp_resolves_instead_of_failing() {
+    let doc = run_json("edge_named_timezone.parquet", &[]);
+    let cols = table(&doc, "edge_named_timezone");
+
+    let started_at = column(cols, "session.started_at");
+    assert_eq!(started_at["ideal_type"], "NaiveDate / DateTime");
+    assert!(
+        !started_at["notes"]
+            .as_str()
+            .unwrap()
+            .contains("could not be converted")
+    );
+
+    let count = column(cols, "session.count");
+    assert_eq!(count["ideal_type"], "i64");
+}
+
 #[cfg(feature = "parquet")]
 #[test]
 fn feather_reads_via_the_shared_arrow_batch_profiler() {
@@ -2269,6 +2298,18 @@ fn npy_zero_length_array_is_an_empty_column_not_a_crash() {
             .unwrap()
             .contains("empty/all null")
     );
+}
+
+// Confirmed via a real-world sweep against nst/JSONTestSuite
+// (n_structure_no_data.json and n_single_space.json, both technically
+// invalid per strict JSON grammar - a document must contain exactly one
+// value) that this was already the JSON reader's behavior before any of
+// this session's JSON fixes; this just locks it in, matching every other
+// format's own zero-byte-file test below.
+#[test]
+fn json_zero_byte_file_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("edge_empty_doc.json", &[]);
+    assert!(table(&doc, "edge_empty_doc").is_empty());
 }
 
 #[cfg(feature = "msgpack")]
