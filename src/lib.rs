@@ -68,7 +68,31 @@ struct Args {
     output_format: String,
 }
 
+// chrono's `%Y` accepts variable-width numeric input while parsing (it only
+// zero-pads to 4 digits on *output*), so it will happily parse a genuinely
+// 2-digit year like "24" as the literal year 24 AD rather than rejecting
+// it - confirmed directly (`NaiveDate::parse_from_str("01/15/24",
+// "%m/%d/%Y")` succeeds as `0024-01-15`, not an error). Wherever this list
+// has both a %y and a %Y form of the same layout below, the %y form is
+// placed *first*, specifically so it wins for genuinely 2-digit years -
+// %y in turn correctly *rejects* an actually-4-digit year ("trailing
+// input", also confirmed directly), so this ordering changes nothing for
+// already-4-digit data and only fixes the 2-digit case, from silently
+// wrong to correct. This is a real, general characteristic of chrono
+// itself, not something fully closed off for every %Y-anchored entry
+// below - only the layouts that have an established 2-digit-year
+// convention in practice got a %y sibling added.
 const DATE_FORMATS: &[&str] = &[
+    // Two-digit-year variants, deliberately ordered before their %Y
+    // counterparts just below (see the module-level comment above) -
+    // common in older exports and some spreadsheet defaults. chrono's `%y`
+    // follows the standard strptime pivot (00-68 -> 2000-2068, 69-99 ->
+    // 1969-1999), the same convention every other tool assumes; this is a
+    // real, disclosed ambiguity for genuinely 100+-year-old dates, not
+    // something this project can resolve any more precisely than the
+    // format itself allows.
+    "%m/%d/%y", // e.g. "01/15/24"
+    "%d/%m/%y", // e.g. "15/01/24"
     "%Y-%m-%d",
     "%Y/%m/%d",
     "%m/%d/%Y",
@@ -89,6 +113,41 @@ const DATE_FORMATS: &[&str] = &[
     "%Y-%m-%dT%H:%M:%S%.fZ",  // UTC, e.g. "2023-01-01T12:00:00.123Z"
     "%Y-%m-%dT%H:%M:%S%.f%z", // offset, e.g. "...+0000" or "...+00:00"
     "%Y-%m-%dT%H:%M:%S%.f",   // no offset at all, fractional seconds only
+    // European/international dot- and dot-order variants - each verified
+    // against real chrono behavior before being added, the same as every
+    // entry above.
+    "%d.%m.%Y", // e.g. "15.01.2024" - the common German/European convention
+    "%Y.%m.%d", // e.g. "2024.01.15" - ISO field order, dot-separated
+    // Full month name, as an addition alongside the existing abbreviated
+    // (%b) forms above.
+    "%B %d, %Y", // e.g. "January 15, 2024"
+    "%d %B %Y",  // e.g. "15 January 2024"
+    // RFC 2822 / RFC 1123 - the HTTP `Date` header and email `Date` field's
+    // own standard format. Verified that chrono actually cross-validates
+    // %a against the parsed date (a value claiming the wrong weekday for
+    // its actual date is correctly rejected, not just shape-matched).
+    "%a, %d %b %Y %H:%M:%S %z", // e.g. "Mon, 15 Jan 2024 10:00:00 +0000"
+    // Unix `date`/`ctime()`'s own default textual format (also git log's
+    // default), e.g. "Mon Jan 15 10:00:00 2024" - a real, distinct field
+    // order from RFC 2822 above (weekday/month/day before year, no comma,
+    // no offset).
+    "%a %b %d %H:%M:%S %Y",
+    // Oracle's own default NLS_DATE_FORMAT ('DD-MON-YY'/'DD-MON-RR'), a
+    // very common shape in database exports. %y form first - same reason
+    // as the module-level comment above.
+    "%d-%b-%y", // e.g. "15-Jan-24"
+    "%d-%b-%Y", // e.g. "15-Jan-2024"
+    // Datetime combinations not already covered above: US-ordered with a
+    // time component, and ISO with no seconds (the latter is what an
+    // HTML5 `<input type="datetime-local">` field submits).
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %I:%M:%S %p", // e.g. "01/15/2024 10:00:00 AM"
+    "%m/%d/%Y %H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M",
+    // Compact/"Basic" ISO 8601 - no punctuation at all, e.g. common in
+    // generated filenames and log timestamps: "20240115T100000".
+    "%Y%m%dT%H%M%S",
 ];
 
 /// Candidate time-of-day formats, tried the same way DATE_FORMATS is: first
@@ -5019,6 +5078,125 @@ mod tests {
         assert_eq!(
             matching_date_format(&["2023-01-01T12:00:00+00:00"]),
             Some("%Y-%m-%dT%H:%M:%S%.f%z")
+        );
+    }
+
+    #[test]
+    fn matching_date_format_recognizes_international_and_full_month_variants() {
+        assert_eq!(
+            matching_date_format(&["15.01.2024", "20.02.2024"]),
+            Some("%d.%m.%Y")
+        );
+        assert_eq!(
+            matching_date_format(&["2024.01.15", "2024.02.20"]),
+            Some("%Y.%m.%d")
+        );
+        assert_eq!(
+            matching_date_format(&["January 15, 2024", "February 20, 2024"]),
+            Some("%B %d, %Y")
+        );
+        assert_eq!(
+            matching_date_format(&["15 January 2024", "20 February 2024"]),
+            Some("%d %B %Y")
+        );
+    }
+
+    #[test]
+    fn matching_date_format_recognizes_rfc2822_and_unix_ctime_forms() {
+        // Both are real Jan 15 2024 / Feb 20 2024 dates, correctly labeled
+        // Monday/Tuesday - chrono cross-validates %a against the parsed
+        // date rather than treating it as a shape-only token, confirmed
+        // separately by the mismatched-weekday test below.
+        assert_eq!(
+            matching_date_format(&[
+                "Mon, 15 Jan 2024 10:00:00 +0000",
+                "Tue, 20 Feb 2024 11:30:00 +0000"
+            ]),
+            Some("%a, %d %b %Y %H:%M:%S %z")
+        );
+        assert_eq!(
+            matching_date_format(&[
+                "Mon Jan 15 10:00:00 2024",
+                "Tue Feb 20 11:30:00 2024"
+            ]),
+            Some("%a %b %d %H:%M:%S %Y")
+        );
+    }
+
+    #[test]
+    fn matching_date_format_rejects_a_weekday_that_does_not_match_its_date() {
+        // Jan 15 2024 was genuinely a Monday - claiming Tuesday must fail,
+        // proving %a is cross-validated against the date, not just parsed
+        // as an arbitrary three-letter token.
+        assert_eq!(
+            matching_date_format(&["Tue, 15 Jan 2024 10:00:00 +0000"]),
+            None
+        );
+    }
+
+    #[test]
+    fn matching_date_format_two_digit_year_takes_priority_over_four_digit_for_short_years() {
+        // A real, pre-existing chrono characteristic this test locks in:
+        // %Y accepts variable-width numeric input while parsing (it only
+        // zero-pads on output), so "01/15/24" would otherwise silently
+        // parse under %m/%d/%Y as year 24 AD instead of being recognized
+        // as a 2-digit year. DATE_FORMATS orders %y forms before their %Y
+        // counterparts specifically to prevent this - this test fails if
+        // that ordering ever regresses.
+        assert_eq!(
+            matching_date_format(&["01/15/24", "02/20/24"]),
+            Some("%m/%d/%y")
+        );
+        assert_eq!(
+            matching_date_format(&["15/01/24", "20/02/24"]),
+            Some("%d/%m/%y")
+        );
+        assert_eq!(
+            matching_date_format(&["15-Jan-24", "20-Feb-24"]),
+            Some("%d-%b-%y")
+        );
+        // A genuinely 4-digit year must still resolve to the %Y form - %y
+        // correctly rejects the extra trailing digits rather than
+        // truncating, so the fallback here is real, not coincidental.
+        assert_eq!(
+            matching_date_format(&["01/15/2024", "02/20/2024"]),
+            Some("%m/%d/%Y")
+        );
+        assert_eq!(
+            matching_date_format(&["15-Jan-2024", "20-Feb-2024"]),
+            Some("%d-%b-%Y")
+        );
+    }
+
+    #[test]
+    fn matching_date_format_recognizes_oracle_style_and_compact_iso_forms() {
+        assert_eq!(
+            matching_date_format(&["15-Jan-2024", "20-Feb-2024"]),
+            Some("%d-%b-%Y")
+        );
+        assert_eq!(
+            matching_date_format(&["20240115T100000", "20240220T113000"]),
+            Some("%Y%m%dT%H%M%S")
+        );
+    }
+
+    #[test]
+    fn matching_date_format_recognizes_datetime_variants_without_seconds() {
+        assert_eq!(
+            matching_date_format(&["2024-01-15 10:00", "2024-02-20 11:30"]),
+            Some("%Y-%m-%d %H:%M")
+        );
+        assert_eq!(
+            matching_date_format(&["2024-01-15T10:00", "2024-02-20T11:30"]),
+            Some("%Y-%m-%dT%H:%M")
+        );
+        assert_eq!(
+            matching_date_format(&["01/15/2024 10:00", "02/20/2024 11:30"]),
+            Some("%m/%d/%Y %H:%M")
+        );
+        assert_eq!(
+            matching_date_format(&["01/15/2024 10:00:00 AM", "02/20/2024 11:30:00 AM"]),
+            Some("%m/%d/%Y %I:%M:%S %p")
         );
     }
 

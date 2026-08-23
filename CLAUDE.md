@@ -611,6 +611,36 @@ entirely:
   (`"+00:00"`) as well as the bare form (`"+0000"`) - both verified
   empirically against real chrono behavior before being relied on, per this
   project's usual practice, rather than assumed.
+- **A much wider `DATE_FORMATS` list**: European/international dot-
+  separated dates (`"15.01.2024"`, `"2024.01.15"`), full month names
+  alongside the existing abbreviated (`%b`) forms (`"January 15, 2024"`,
+  `"15 January 2024"`), RFC 2822/1123 - the HTTP and email `Date` header's
+  own format (`"Mon, 15 Jan 2024 10:00:00 +0000"`) - Unix `date`/`ctime()`'s
+  default textual format (`"Mon Jan 15 10:00:00 2024"`, also git log's
+  default), Oracle's own default `NLS_DATE_FORMAT` (`"15-Jan-2024"` /
+  `"15-Jan-24"`), two-digit-year variants of the existing `%m/%d`/`%d/%m`
+  forms, datetime combinations with no seconds field (including the
+  literal shape an HTML5 `<input type="datetime-local">` submits), and
+  compact/"Basic" ISO 8601 with no punctuation at all
+  (`"20240115T100000"`). Verifying RFC 2822 surfaced a detail worth
+  confirming rather than assuming: chrono actually cross-validates the
+  `%a` weekday token against the parsed date, rejecting e.g. a date
+  correctly computed as a Monday if the string itself claims Tuesday,
+  rather than treating `%a` as a shape-only three-letter token.
+  Adding the two-digit-year forms surfaced a real, pre-existing
+  correctness gap in chrono itself, not something newly introduced: `%Y`
+  accepts variable-width numeric input while *parsing* (it only zero-pads
+  to 4 digits on *output*), so `NaiveDate::parse_from_str("01/15/24",
+  "%m/%d/%Y")` silently succeeds as `0024-01-15` - year 24 AD - rather than
+  failing outright. Confirmed directly, not assumed, alongside the
+  corresponding fact that made the fix free: `%y` correctly *rejects* an
+  actually-4-digit year with a "trailing input" error rather than
+  truncating it. `DATE_FORMATS` places every `%y` form immediately before
+  its `%Y` counterpart specifically so a genuinely 2-digit year matches
+  the honest interpretation first, while an already-4-digit year still
+  falls through to `%Y` exactly as before - this ordering constraint is
+  general to any future `%Y`-anchored entry that gains a `%y` sibling, not
+  just the ones added here.
 - **Time-of-day values with no date component** (`"14:30:00"`,
   `"2:30 PM"`) previously fell through every check straight to `String` -
   there was no time-only detection at all, only date/datetime.
@@ -1384,7 +1414,16 @@ to generate every other test fixture here) doesn't support writing
   `TIME_FORMATS`), not a fuzzy parser. Deliberate: a fuzzy parser can
   silently misparse a numeric ID as a date; a fixed list either matches
   every value in a column or reports nothing, which is a safer failure
-  mode. Extend the list if a reasonable format is missing one.
+  mode. Extend the list if a reasonable format is missing one - but if the
+  new entry is a `%Y`-anchored format that also has a real-world 2-digit-
+  year convention (like `%m/%d/%Y`'s `%m/%d/%y`), add the `%y` form
+  *immediately before* it, not anywhere else in the list. `%Y` accepts
+  variable-width numeric input while parsing (confirmed directly against
+  chrono, not assumed) and will silently misparse a 2-digit year as a
+  literal single/double/triple-digit year rather than rejecting it, so
+  ordering is the only thing standing between a 2-digit year value and a
+  wrong, misleading answer - see the design philosophy section above for
+  the worked example.
 - **Content-based format sniffing doesn't cover CSV, TSV, TOML, YAML, or
   INI**, and doesn't extend to detecting gzip/zstd compression on an
   extensionless file - see "Content-based format auto-detection" above for

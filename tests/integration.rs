@@ -997,6 +997,42 @@ fn csv_recognizes_rfc3339_timestamps_and_time_of_day() {
 }
 
 #[test]
+fn csv_recognizes_international_rfc2822_ctime_and_oracle_style_dates() {
+    let doc = run_json("date_formats.csv", &[]);
+    let cols = table(&doc, "date_formats");
+
+    for name in [
+        "dot_eu",
+        "full_month",
+        "rfc2822",
+        "ctime",
+        "oracle_style",
+        "datetime_no_seconds",
+        "compact_iso",
+    ] {
+        assert_eq!(
+            column(cols, name)["ideal_type"],
+            "NaiveDate / DateTime",
+            "column {name} should resolve to a date/datetime type"
+        );
+    }
+
+    // "01/15/24" - a genuinely 2-digit year must resolve to the %y form,
+    // not be silently swallowed by %m/%d/%Y treating "24" as year 24 AD
+    // (a real chrono characteristic - %Y accepts variable-width numeric
+    // input while parsing). See matching_date_format_two_digit_year_takes_
+    // priority_over_four_digit_for_short_years in lib.rs for the direct,
+    // format-string-level proof; this is the full-pipeline confirmation.
+    let two_digit = column(cols, "two_digit_year");
+    assert_eq!(two_digit["ideal_type"], "NaiveDate / DateTime");
+    assert!(
+        two_digit["notes"].as_str().unwrap().contains("%m/%d/%y"),
+        "expected the two-digit-year format to win, got: {:?}",
+        two_digit["notes"]
+    );
+}
+
+#[test]
 fn csv_recognizes_hex_literals_and_mac_addresses() {
     let doc = run_json("type_detection.csv", &[]);
     let cols = table(&doc, "type_detection");
