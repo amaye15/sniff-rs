@@ -1029,6 +1029,15 @@ fn csv_recognizes_wkt_geometry() {
 }
 
 #[test]
+fn csv_recognizes_cron_expression() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let schedule = column(cols, "schedule");
+    assert_eq!(schedule["ideal_type"], "Cron Expression");
+}
+
+#[test]
 fn csv_recognizes_iban_and_credit_card_numbers_via_checksum() {
     let doc = run_json("type_detection.csv", &[]);
     let cols = table(&doc, "type_detection");
@@ -1118,6 +1127,7 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(props["subnet"], serde_json::json!({"type": "string"}));
     assert_eq!(props["request_id"], serde_json::json!({"type": "string"}));
     assert_eq!(props["geom"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["schedule"], serde_json::json!({"type": "string"}));
 }
 
 // --- Adversarial / robustness tests ----------------------------------
@@ -1177,6 +1187,7 @@ fn adversarial_csv_never_false_positives_on_any_near_miss_column() {
     assert_ne!(column(cols, "near_cidr")["ideal_type"], "CIDR");
     assert_ne!(column(cols, "near_ulid")["ideal_type"], "ULID");
     assert_ne!(column(cols, "near_wkt")["ideal_type"], "WKT Geometry");
+    assert_ne!(column(cols, "near_cron")["ideal_type"], "Cron Expression");
 
     // A column that's 3 real UUIDs and 1 clearly-not-a-UUID value must not
     // be classified as UUID - one bad value vetoes the whole column.

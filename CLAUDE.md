@@ -694,6 +694,20 @@ entirely:
   test. Checked well ahead of the weaker `is_lat_lon_pair` check, since the
   OGC keyword is a much stronger, more specific signal.
 
+- **Cron expressions** (`"0 0 * * *"`, `"*/15 * * * *"`) - a standard
+  5-field schedule (minute/hour/day-of-month/month/day-of-week), each
+  field a `*`, a number, a comma-separated list, a range `N-M`, or a step
+  `*/N`/`N-M/N`, each checked against its field's real valid range (minute
+  0-59, hour 0-23, day-of-month 1-31, month 1-12, day-of-week 0-7 where
+  both 0 and 7 mean Sunday). Deliberately does not support named months/
+  weekdays (`JAN`, `MON`, ...) - kept to the numeric grammar most cron
+  implementations share, rather than a larger, harder-to-verify keyword
+  table (a false negative just falls back to `String`). Checked at the
+  same tier as `is_lat_lon_pair`, and carries the same kind of disclosed,
+  irreducible ambiguity: five arbitrary small integers in range
+  (`"1 2 3 4 5"`) are indistinguishable from a real cron schedule - no
+  checksum or prefix rules out coincidence here either.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that

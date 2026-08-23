@@ -700,6 +700,66 @@ fn is_lat_lon_pair(s: &str) -> bool {
     (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
 }
 
+/// One comma-separated cron field part: '*', a bare number, a range
+/// "N-M", or a step on either of those ("*/N" or "N-M/N"). A step's base
+/// must be '*' or a range - cron itself doesn't define what "5/3" would
+/// even mean for a bare number, so that's rejected rather than guessed at.
+fn is_cron_field_part(part: &str, min: u32, max: u32) -> bool {
+    let (base, step) = match part.split_once('/') {
+        Some((b, s)) => {
+            let Ok(step_n) = s.parse::<u32>() else {
+                return false;
+            };
+            if step_n == 0 {
+                return false;
+            }
+            (b, Some(step_n))
+        }
+        None => (part, None),
+    };
+    let range_ok = if base == "*" {
+        true
+    } else if let Some((lo, hi)) = base.split_once('-') {
+        let (Ok(lo), Ok(hi)) = (lo.parse::<u32>(), hi.parse::<u32>()) else {
+            return false;
+        };
+        lo <= hi && lo >= min && hi <= max
+    } else if let Ok(n) = base.parse::<u32>() {
+        (min..=max).contains(&n)
+    } else {
+        false
+    };
+    range_ok && (step.is_none() || base == "*" || base.contains('-'))
+}
+
+fn is_cron_field(field: &str, min: u32, max: u32) -> bool {
+    field
+        .split(',')
+        .all(|part| is_cron_field_part(part, min, max))
+}
+
+/// A standard 5-field cron expression: minute(0-59) hour(0-23)
+/// day-of-month(1-31) month(1-12) day-of-week(0-7, both 0 and 7 mean
+/// Sunday). Each field may be '*', a number, a comma-separated list, a
+/// range "N-M", or a step "*/N"/"N-M/N". Deliberately does not support
+/// named months/weekdays (JAN, MON, ...) - kept to the numeric grammar
+/// most cron implementations share, rather than a larger, harder-to-verify
+/// keyword table. Carries a real, disclosed ambiguity like
+/// is_lat_lon_pair/is_semver do: five arbitrary small integers in range
+/// ("1 2 3 4 5") are indistinguishable from a real cron schedule - there's
+/// no checksum or prefix here either.
+fn is_cron_expression(s: &str) -> bool {
+    let fields: Vec<&str> = s.split_whitespace().collect();
+    if fields.len() != 5 {
+        return false;
+    }
+    const RANGES: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
+    fields
+        .iter()
+        .zip(RANGES)
+        .all(|(f, (min, max))| is_cron_field(f, min, max))
+}
+
 /// Classifies a value by hex-digest length alone (MD5=32, SHA-1=40,
 /// SHA-256=64 hex characters). Deliberately NOT promoted to its own
 /// ideal_type the way UUID/IMEI/etc. are - there's no checksum or prefix
@@ -961,6 +1021,16 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "Geographic Coordinates".to_string(),
             "matches \"lat,lon\" within valid ranges (±90/±180)".to_string(),
+        );
+    }
+
+    // Same tier as is_lat_lon_pair, same reason: no checksum or prefix, so
+    // this carries the same kind of disclosed, irreducible ambiguity - see
+    // is_cron_expression's own doc comment.
+    if values.iter().all(|v| is_cron_expression(v)) {
+        return (
+            "Cron Expression".to_string(),
+            "matches 5-field cron format (minute hour day-of-month month day-of-week)".to_string(),
         );
     }
 
@@ -3931,7 +4001,8 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "VIN"
         | "CIDR"
         | "ULID"
-        | "WKT Geometry" => Some(("string", None)),
+        | "WKT Geometry"
+        | "Cron Expression" => Some(("string", None)),
         _ => None,
     }
 }
@@ -4737,6 +4808,26 @@ mod tests {
     }
 
     #[test]
+    fn is_cron_expression_accepts_standard_forms_and_rejects_out_of_range_fields() {
+        assert!(is_cron_expression("0 0 * * *")); // daily at midnight
+        assert!(is_cron_expression("*/15 * * * *")); // every 15 minutes
+        assert!(is_cron_expression("0 9-17 * * 1-5")); // hourly, 9-5, weekdays
+        assert!(is_cron_expression("0,30 * * * *")); // list: every 0 and 30 min
+        assert!(!is_cron_expression("0 0 * *")); // only 4 fields
+        assert!(!is_cron_expression("60 0 * * *")); // minute 60 - max is 59
+        assert!(!is_cron_expression("0 0 * * 8")); // day-of-week 8 - max is 7
+        assert!(!is_cron_expression("0 0 32 * *")); // day-of-month 32 - max is 31
+        assert!(!is_cron_expression("a b c d e")); // not numeric or '*' at all
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_cron_expression() {
+        let (ideal, note) = suggest_ideal_type(&["0 0 * * *", "*/15 * * * *"], "String");
+        assert_eq!(ideal, "Cron Expression");
+        assert!(note.contains("cron"));
+    }
+
+    #[test]
     fn hash_digest_kind_classifies_by_exact_length_and_rejects_non_hex_or_mixed_lengths() {
         let md5 = "d41d8cd98f00b204e9800998ecf8427e"; // 32 hex chars
         let sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709"; // 40 hex chars
@@ -4929,6 +5020,7 @@ mod tests {
             let _ = base64url_decode(s);
             let _ = is_wkt_geometry(s);
             let _ = is_lat_lon_pair(s);
+            let _ = is_cron_expression(s);
             let _ = hash_digest_kind(s);
             let _ = parse_prefixed_int(s);
             let _ = is_missing_sentinel(s);
@@ -4965,6 +5057,7 @@ mod tests {
             let _ = base64url_decode(s);
             let _ = is_wkt_geometry(s);
             let _ = is_lat_lon_pair(s);
+            let _ = is_cron_expression(s);
             let _ = hash_digest_kind(s);
             let _ = normalize_numeric_str(s);
             let _ = suggest_ideal_type(&[s], "String");
@@ -5043,6 +5136,8 @@ mod tests {
         assert!(!is_ulid("81ARZ3NDEKTSV4RRFFQ69G5FAV")); // first char overflows timestamp bits
         assert!(!is_wkt_geometry("CIRCLE(30 10, 5)")); // not a real WKT keyword
         assert!(!is_wkt_geometry("POINT(30 10")); // unbalanced parens
+        assert!(!is_cron_expression("60 0 * * *")); // minute out of range
+        assert!(!is_cron_expression("0 0 * *")); // only 4 fields
     }
 
     #[test]
