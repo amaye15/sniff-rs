@@ -1032,6 +1032,31 @@ entirely:
   explicitly against `headers.len()` in this project's own code - stating
   the actual invariant ("every row matches the header") directly instead
   of depending on which record happened to seed an internal tracker first.
+  A follow-up, more exhaustive real-world pass (running the *entire*
+  crawled-CSV survey rather than a sample, after an initial pass had
+  mistakenly only sampled part of a related pollution corpus - see "Real-
+  world corpus validation" below) went back to those same three files that
+  had just been turned into a clean error by the fix above, and asked
+  whether that error was actually correct or just the best this project
+  could do at the time. It wasn't: all three are a genuine, common,
+  parseable shape - a scientific/numeric export where line 1 is a row
+  count, not a header (`"868\n0,0.0\n0.0025,0.0992676486197\n..."`), not
+  corrupted data. Signal A above can't catch this - the line is a real,
+  non-empty value, not padding, so it never qualifies as a candidate under
+  that signal's rules. A second, independent signal (also gated behind
+  `MAX_PREAMBLE_SCAN`) instead trusts a field-count mismatch between the
+  leading row and a *stable* run of what immediately follows - every one
+  of the next several rows sharing one consistent field count, not just
+  the very next row, specifically so a single coincidentally-matching
+  neighbor in an otherwise-genuinely-ragged file can't trigger it (a
+  dedicated test locks this in: a body that agrees for two rows and then
+  diverges on the third must not fire). Requiring at least 3 corroborating
+  body rows before trusting the mismatch is the same "don't act on weak
+  corroboration" discipline used elsewhere in this list (compare the
+  hash-digest-length note, which never promotes to a real type on shape
+  alone). With both signals in place, every one of the 3,712 real files in
+  Pollock's own crawled survey now resolves successfully - zero errors,
+  zero panics.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
@@ -1271,27 +1296,59 @@ and not this project's to redistribute - the fixtures the findings produced
 portals as part of their own published study of 245,000+ files' RFC-4180
 violations) and the public, 35,000-row "Ask A Manager" salary survey (real
 human-entered free text - job titles, locations, currencies, salaries with
-thousands separators). Result: 3,709 of the 3,712 Pollock files parsed
-correctly and the remaining 3 failed with a clean, actionable ragged-row
-error (genuinely malformed files) - zero panics, zero silent misparses,
-both before and after the preamble-detection work below. Pollock's own 21
-synthetic structural-pollution variants (delimiter swapped to `;`/tab/
-space, quote character changed, escape character changed, multi-row
-headers, a preamble, a multi-table file, no header, an empty file, CRLF/CR/
-LF-only line endings, no trailing newline) also produced zero crashes -
-delimiter/quote/escape mismatches correctly surface as a clean ragged-row
-error rather than a silent misparse, exactly as documented above (this
-tool doesn't auto-sniff CSV dialect; `--delimiter` is the escape hatch).
-This pass is what found both real bugs described in the preamble-detection
-entry above (the previously-undetected header-swallowed-by-banner-row
-behavior, and the seek-poisoning ragged-row panic introduced while fixing
-it) - real-world testing here served the same role adversarial fixture
-testing already serves elsewhere in this file: surfacing failures no one
-would have thought to write a synthetic test for in advance.
-`tests/fixtures/preamble.csv` and its four integration tests distill the
-finding into a small, permanent, committed regression test, so the
-external corpora themselves don't need to be present for `cargo test` to
-keep proving the fix holds.
+thousands separators).
+
+The first pass through Pollock only sampled part of its second corpus -
+`polluted_files/csv`, 2,290 synthetic structural-pollution files - testing
+just the 21 unique whole-*file*-level pollution variants (delimiter/quote/
+escape character changed, multi-row headers, a preamble, a multi-table
+file, no header, an empty file, CRLF/CR/LF-only line endings, no trailing
+newline) plus the unmodified `source.csv`, on the mistaken assumption that
+the remaining 2,268 files were near-duplicate variants of one already-
+covered shape. They weren't: that remainder is actually three more
+pollution families entirely (`row_more_sep_row*`/`row_less_sep_row*`/
+`row_field_delimiter_*`, each injecting a ragged row at every possible
+row/column position in the base file), never sampled or even enumerated in
+the first pass. A corrected, genuinely exhaustive run covers all 2,290
+files: zero panics, 260 parse successfully, and 2,030 fail with a clean,
+actionable `found record with N fields, but the header has M fields`
+error. That high error rate is the *correct* outcome, not a gap - these
+three families are Pollock's own adversarial fuzzing, deliberately
+injecting a single ragged row at a random position in an otherwise-clean
+84-row file specifically to test whether a system correctly *rejects*
+genuinely inconsistent data. Silently tolerating them would mean guessing
+which of two shapes is right with no structural basis for the guess -
+exactly what this project refuses to do everywhere else in this file.
+
+The `survey/csv` corpus (all 3,712 files, run exhaustively both times) is a
+better test of legitimate real-world messiness rather than deliberate
+fuzzing: every one of the 3,712 now resolves successfully - zero errors,
+zero panics. That wasn't true on the first pass (3,709 succeeded, 3 failed
+with a clean ragged-row error) - going back and asking whether that
+error was actually the right answer, rather than treating "clean error,
+no panic" as good enough, is what led to the second preamble-detection
+signal documented above. Pollock's 21 unique whole-file pollution variants
+also produced zero crashes on every pass - delimiter/quote/escape
+mismatches correctly surface as a clean ragged-row error rather than a
+silent misparse, exactly as documented above (this tool doesn't auto-sniff
+CSV dialect; `--delimiter` is the escape hatch).
+
+This pass is what found all three real bugs described in the preamble-
+detection entries above (the previously-undetected header-swallowed-by-
+banner-row behavior, the seek-poisoning ragged-row panic introduced while
+fixing it, and the row-count-line-misread-as-ragged-data gap found by
+going back and re-examining what "clean error" was actually hiding) - real-
+world testing here served the same role adversarial fixture testing
+already serves elsewhere in this file: surfacing failures no one would
+have thought to write a synthetic test for in advance, and - just as
+importantly - surfacing the gap in the *validation methodology itself*
+(an unverified assumption about which files a large external corpus
+contains) the same way this file's adversarial-testing discipline exists
+to surface gaps in the *product*. `tests/fixtures/preamble.csv`,
+`tests/fixtures/row_count_preamble.csv`, and their five integration tests
+distill both findings into small, permanent, committed regression tests,
+so the external corpora themselves don't need to be present for `cargo
+test` to keep proving the fixes hold.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
@@ -1516,12 +1573,16 @@ to generate every other test fixture here) doesn't support writing
   separate concern (transport encoding, not data format) that was out of
   scope for what this feature was asked to solve.
 - **Preamble-row auto-detection (`detect_preamble_rows`) is capped at
-  `MAX_PREAMBLE_SCAN` (5) leading rows**, and only ever fires on the
-  specific fill-pattern described in the design philosophy section above
-  (a leading run of at-most-one-field-populated rows immediately followed
-  by a fully-populated row). A banner that spans more than 5 rows, or a
+  `MAX_PREAMBLE_SCAN` (5) leading rows for both of its signals**, and only
+  ever fires on the two specific structural patterns described in the
+  design philosophy section above: a padded, mostly-empty banner row (a
+  leading run of at-most-one-field-populated rows immediately followed by
+  a fully-populated row), or a metadata/row-count line ahead of a *stable*
+  multi-row data body (requiring at least 3 corroborating body rows that
+  all agree on one field count). A banner that spans more than 5 rows, a
   header that legitimately has an empty/unlabeled column right after the
-  banner, both fall back to `skip_rows = 0` - the same old behavior,
-  disclosed nowhere further since nothing auto-fired - rather than a wrong
-  guess. `--skip-rows N` is the explicit, always-correct escape hatch for
-  either case.
+  banner, or a metadata line ahead of a body with fewer than 3 rows or
+  that isn't internally consistent all fall back to `skip_rows = 0` - the
+  same old behavior, disclosed nowhere further since nothing auto-fired -
+  rather than a wrong guess. `--skip-rows N` is the explicit,
+  always-correct escape hatch for any of these.

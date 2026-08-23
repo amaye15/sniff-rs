@@ -1401,6 +1401,24 @@ fn clean_csv_has_no_preamble_detected() {
     );
 }
 
+// Found via a real-world sweep against the HPI Pollock benchmark's own
+// crawled-CSV survey: three real files are a scientific/numeric export
+// where line 1 is a row count, not a header, followed by consistently
+// 2-column data - row_count_preamble.csv reproduces that exact shape at
+// fixture scale. Before this signal existed, all three real files failed
+// with a hard "found record with 2 fields, but the header has 1 fields"
+// error instead of resolving - a genuinely parseable file, not a corrupt
+// one.
+#[test]
+fn row_count_preamble_line_is_auto_detected_and_skipped() {
+    let doc = run_json("row_count_preamble.csv", &[]);
+    let cols = table(&doc, "row_count_preamble");
+    assert_eq!(cols.len(), 2);
+    for c in cols {
+        assert_eq!(c["ideal_type"], "f64");
+    }
+}
+
 #[test]
 fn whitespace_only_csv_treats_the_blank_value_as_missing_not_a_crash() {
     let doc = run_json("malformed_whitespace_only.csv", &[]);

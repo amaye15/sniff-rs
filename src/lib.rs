@@ -1365,23 +1365,38 @@ fn columns_from_csv(
     Ok(columns)
 }
 
-// A leading title/instructions row above the real header is a real,
-// observed pattern in human-authored spreadsheets exported to CSV (found
-// via real-world testing against the Ask A Manager salary survey and the
-// HPI Pollock benchmark's own file_preamble.csv fixture, both independently
-// showing the same shape). Detecting it only ever fires on a structural
-// fill-pattern, never on cell content or column-name guessing, the same
-// bar every other heuristic in this file holds to: a leading row counts as
-// "preamble" only if it has at least two fields and at most one of them is
-// non-empty (a real header virtually always names every column; a real
-// single-column data row is the one thing this rules out on purpose, by
-// requiring >= 2 fields), and the run of such rows must be immediately
-// followed by a row where *every* field is non-empty (the strongest
-// available signal that this is the real header, not just another sparse
-// row). Capped at MAX_PREAMBLE_SCAN so a genuinely sparse dataset can never
-// have an unbounded chunk silently skipped. Either condition failing to
-// hold leaves skip_rows at 0 - the safe, old-behavior direction - rather
-// than guessing.
+// A leading row above the real header is a real, observed pattern with (at
+// least) two distinct real-world shapes, both found via real-world testing
+// rather than reasoned about in advance, and both handled by independent
+// signals below - either firing leaves skip_rows at that row count, never
+// guessing on cell content or column-name meaning, the same bar every
+// other heuristic in this file holds to:
+//
+//   1. A title/instructions banner row (Ask A Manager's public salary
+//      survey, and independently the HPI Pollock benchmark's own
+//      file_preamble.csv fixture, both showing the same shape): padded
+//      with trailing commas to the same field count as the real header,
+//      but almost entirely empty. Signal A below: a leading row counts as
+//      a candidate only if it has at least two fields and at most one of
+//      them is non-empty (requiring >= 2 fields specifically rules out
+//      misreading a genuine single-column dataset, whose every row is
+//      trivially "1 of 1 fields populated"), and the run of such rows
+//      must be immediately followed by a row where *every* field is
+//      non-empty - the strongest available signal that row is the real
+//      header, not just another sparse one.
+//   2. A metadata/row-count line (found in three real files in the HPI
+//      Pollock benchmark's own crawled-CSV survey: "868\n0,0.0\n0.0025,
+//      ...\n..." - "868" is a row count for a scientific/numeric export,
+//      not a header). Signal A can't catch this - the line is a real,
+//      non-empty value, not padding. Signal B below instead trusts a
+//      field-count mismatch between the leading row and a *stable* run of
+//      what immediately follows (every one of the next several rows
+//      sharing one consistent field count, not just the very next row, so
+//      a single coincidentally-matching neighbor in an otherwise-ragged
+//      file can't trigger it).
+//
+// Both signals are capped at MAX_PREAMBLE_SCAN so a genuinely sparse or
+// oddly-shaped dataset can never have an unbounded chunk silently skipped.
 const MAX_PREAMBLE_SCAN: usize = 5;
 
 fn detect_preamble_rows(path: &Path, delimiter: u8) -> usize {
@@ -1414,15 +1429,38 @@ fn detect_preamble_rows(path: &Path, delimiter: u8) -> usize {
             break;
         }
     }
-    if skip == 0 || skip >= records.len() {
-        return 0;
+    if skip > 0 && skip < records.len() {
+        let (non_empty, total) = fill(&records[skip]);
+        if total >= 2 && non_empty == total {
+            return skip;
+        }
     }
-    let (non_empty, total) = fill(&records[skip]);
-    if total >= 2 && non_empty == total {
-        skip
-    } else {
-        0
+
+    // Second, independent signal - found via real-world testing (three
+    // files in the HPI Pollock benchmark's own crawled-CSV survey), not
+    // reasoned about in advance: a single metadata/row-count line ahead of
+    // otherwise-uniform tabular data (a real, common shape scientific/
+    // numeric export tools produce, e.g. "868\n0,0.0\n0.0025,...\n..." -
+    // "868" is a row count, not a header). Signal A above can't catch
+    // this: the leading row here is non-empty (it's a real value, not
+    // padding), so it never even qualifies as a candidate. What's
+    // confident here instead is that its field count doesn't match a
+    // *stable* run of what immediately follows - stable meaning every one
+    // of the next several rows shares one consistent field count, not
+    // just the very next row, so one coincidentally-matching neighbor in
+    // an otherwise-ragged file can't trigger this. Requires at least 3
+    // corroborating body rows (records.len() >= 4) before trusting it -
+    // weaker corroboration than that isn't worth acting on.
+    if records.len() >= 4 {
+        let (_, leading_total) = fill(&records[0]);
+        let (_, body_total) = fill(&records[1]);
+        let body_is_stable = records[1..].iter().all(|r| fill(r).1 == body_total);
+        if body_total >= 2 && leading_total != body_total && body_is_stable {
+            return 1;
+        }
     }
+
+    0
 }
 
 /// Explicit --skip-rows always wins; otherwise falls back to
@@ -6301,6 +6339,48 @@ mod tests {
         }
         csv.push_str("id,name,age\n1,Alice,30\n");
         assert_eq!(preamble_rows(&csv), 0);
+    }
+
+    // --- Signal B: metadata/row-count line ahead of a stable data body --
+    // Found in three real files during a real-world sweep against the HPI
+    // Pollock benchmark's own crawled-CSV survey - a scientific/numeric
+    // export where line 1 is a row count, not a header (real shape:
+    // "868\n0,0.0\n0.0025,0.0992676486197\n..."). Signal A above can't
+    // catch this: "868" is a real, non-empty value, not padding.
+
+    #[test]
+    fn detect_preamble_rows_finds_a_row_count_line_before_stable_data() {
+        let csv = "868\n0,0.0\n0.0025,0.099\n0.005,0.197\n0.0075,0.293\n0.01,0.387\n";
+        assert_eq!(preamble_rows(csv), 1);
+    }
+
+    #[test]
+    fn detect_preamble_rows_does_not_misfire_when_the_body_is_not_stable() {
+        // Only the first two body rows share a field count; the third
+        // diverges (a genuinely ragged file, not a metadata-line pattern) -
+        // this must not be mistaken for signal B, since "stable" requires
+        // every scanned body row to agree, not just the first neighbor.
+        let csv = "868\n0,0.0\n0.0025,0.099\n0.005,0.197,extra\n0.0075,0.293\n";
+        assert_eq!(preamble_rows(csv), 0);
+    }
+
+    #[test]
+    fn detect_preamble_rows_does_not_misfire_on_a_genuinely_single_column_file() {
+        // Every row here (including the first) has exactly 1 field - a
+        // real single-column dataset, not a metadata line ahead of a
+        // wider body. leading_total == body_total, so signal B must not
+        // fire (there's no mismatch to detect in the first place).
+        let csv = "868\n1\n2\n3\n4\n";
+        assert_eq!(preamble_rows(csv), 0);
+    }
+
+    #[test]
+    fn detect_preamble_rows_requires_at_least_three_corroborating_body_rows() {
+        // Only 2 rows total (1 candidate + 1 body row) - not enough
+        // corroboration to trust a field-count mismatch as signal B,
+        // regardless of how consistent that single body row looks.
+        let csv = "868\n0,0.0\n";
+        assert_eq!(preamble_rows(csv), 0);
     }
 
     #[test]
