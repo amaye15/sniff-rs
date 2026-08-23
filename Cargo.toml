@@ -55,3 +55,26 @@ syslog = ["dep:regex"]
 dbase = ["dep:dbase"]
 stata = ["dep:dta"]
 sas7bdat = ["dep:sas7bdat"]
+
+[dev-dependencies]
+# Dev-only - never affects the shipped binary or a consumer's build, unlike
+# every other dependency decision in this file. See CLAUDE.md's benchmarking
+# section for why this is the one place this project reaches for a big,
+# full-featured crate instead of hand-rolling something leaner.
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+# harness = false on every target below: Criterion supplies its own `main`,
+# replacing the default libtest harness (which doesn't understand
+# Criterion's `criterion_group!`/`criterion_main!` macros).
+[[bench]]
+name = "heuristic_engine"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "format_comparison"
+harness = false
+required-features = ["parquet", "sqlite", "xlsx"]

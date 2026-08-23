@@ -909,14 +909,67 @@ the same as the malformed-input family: none of it needed a code fix, all
 of it was already handled correctly and simply lacked a test locking the
 behavior in.
 
-The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
-binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
-black-box integration tests there's also a `#[cfg(test)] mod tests` at the
-bottom of `lib.rs` unit-testing the heuristic functions directly
-(`suggest_ideal_type`, `has_leading_zero`, `matching_date_format`,
-`describe_kinds`) — they're the part most likely to grow subtle bugs under
-a small direct test, and being private functions in the same file, they
-don't need any `pub` just to be reachable from `#[cfg(test)]`.
+The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
+just calls `sniff_rs::run()`), so besides the black-box integration tests
+there's also a `#[cfg(test)] mod tests` at the bottom of `lib.rs`
+unit-testing the heuristic functions directly (`suggest_ideal_type`,
+`has_leading_zero`, `matching_date_format`, `describe_kinds`) — they're
+the part most likely to grow subtle bugs under a small direct test. Most
+of these stay private, reachable from `#[cfg(test)]` without needing
+`pub`; `suggest_ideal_type` itself is the one exception, made `pub` for
+`benches/heuristic_engine.rs` to call directly - see "Benchmarking" below.
+`run()` remains the crate's only *supported* entry point; the rest of the
+public surface (currently just that one function) exists for benchmarking
+access, not as a general-purpose library API for other crates to build on.
+
+## Benchmarking
+
+```bash
+cargo bench                                    # heuristic_engine + end_to_end (no features needed)
+cargo bench --features parquet,sqlite,xlsx     # + format_comparison
+cargo bench --bench heuristic_engine           # just one target
+open target/criterion/report/index.html        # HTML report, after any run
+```
+
+Three targets, each answering a different question, all via
+[Criterion](https://docs.rs/criterion) (`[dev-dependencies]` only - never
+touches the shipped binary or a consumer's build, the one place in this
+project that reaches for a big, full-featured crate instead of hand-
+rolling something leaner, since statistical rigor - variance, outlier
+detection, regression comparison across runs - is exactly what a
+benchmark needs and a `std::time::Instant` harness can't easily give it):
+
+- **`benches/heuristic_engine.rs`** — "how fast is the type-detection
+  logic itself?" Calls `suggest_ideal_type` directly, in-process, across a
+  few realistic column shapes (UUIDs, integers, emails, and a high-
+  cardinality free-text column - the actual worst case, since it has to
+  fail *every* precise-grammar check before falling back to `String`) at
+  10/1,000/100,000 values each. This is the one target that needed a
+  public-API change (`suggest_ideal_type` is `pub` specifically for this,
+  see above) - the alternative would be measuring it only through a full
+  subprocess run, which buries the actual heuristic cost under process-
+  spawn and file-I/O noise.
+- **`benches/end_to_end.rs`** — "how does the CLI actually perform for a
+  user?" Black-box, via `Command` against the compiled binary - the same
+  approach `tests/integration.rs` already uses, and for the same reason
+  (no assert_cmd dependency; keeping bench tooling as lean as the test
+  tooling). CSV and JSON only, generated synthetically at 100/10,000/
+  200,000 rows (written to a `tempfile::tempdir()`, never committed) -
+  these two need no optional feature, so this target always runs.
+- **`benches/format_comparison.rs`** — "which format does this tool read
+  fastest, for the *same* data?" Not just the same row count -
+  `benches/fixtures/generate.py` writes one pandas DataFrame to five
+  formats at once (CSV/JSON/Parquet/SQLite/Excel), so the values are
+  byte-identical across formats, not just similarly shaped. Gated behind
+  `required-features = ["parquet", "sqlite", "xlsx"]` in `Cargo.toml`, so
+  a plain `cargo bench` skips it rather than failing to build. A real
+  run's own numbers on this repo's dev machine (10,000 rows, illustrative
+  only - always reproduce locally before trusting a specific figure):
+  SQLite and CSV read fastest (~14-15ms), Parquet close behind (~15ms),
+  JSON slower (~22ms, the recursive per-record flattening path has more
+  overhead than the flat-columnar readers), Excel slowest by a clear
+  margin (~29ms, zip decompression plus XML parsing on top of everything
+  else).
 
 ## Known limitations / roadmap
 

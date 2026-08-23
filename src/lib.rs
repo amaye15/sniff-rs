@@ -868,7 +868,14 @@ fn is_vin(s: &str) -> bool {
     b[8] == expected
 }
 
-fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
+/// The core type-detection heuristic: given a column's raw string values
+/// and its declared "current" type, returns an `(ideal_type, notes)` pair.
+/// Public specifically so `benches/heuristic_engine.rs` can call it
+/// directly (in-process, no subprocess/I/O noise) - this is the one
+/// function in the crate's otherwise-private internals exposed for that
+/// reason alone, not as a general-purpose library API (`run()` remains the
+/// only supported entry point for actual use).
+pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
     // (leading-zero, in particular) firing on a substring pattern instead.
