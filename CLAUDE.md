@@ -35,7 +35,7 @@ every format. See "Testing" below.
 | Format | Extensions | Needs | Notes |
 |---|---|---|---|
 | CSV / TSV | `.csv`, `.tsv` | *(default)* | `--delimiter` overrides the separator; `--skip-rows` skips N leading rows before the header (auto-detected when not given - see below) |
-| JSON | `.json` | *(default)* | array-of-objects or JSON Lines, auto-detected by content |
+| JSON | `.json` | *(default)* | array-of-objects, a single (optionally pretty-printed) object, or JSON Lines, auto-detected by content; a top-level array/stream of non-object values profiles as one `value` column |
 | JSON Lines / NDJSON | `.jsonl`, `.ndjson` | *(default)* | same reader as JSON |
 | Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List/Map |
 | Arrow IPC / Feather | `.arrow`, `.feather` | `--features parquet` | shares Parquet's Arrow infrastructure |
@@ -1058,6 +1058,65 @@ entirely:
   Pollock's own crawled survey now resolves successfully - zero errors,
   zero panics.
 
+- **The JSON reader used to reject the majority of valid JSON documents it
+  could have profiled - a top-level array of scalars, or a hand-authored/
+  pretty-printed single object spanning multiple lines - with "expected an
+  array of objects"/"expected one JSON object per line".** Found via a
+  real-world sweep against `nst/JSONTestSuite`, a JSON parser conformance
+  corpus (played the same role for the JSON reader this pass that the HPI
+  Pollock benchmark played for CSV): only 13 of its 95 valid-JSON test
+  files were accepted before this fix. Two distinct, additive gaps, both
+  closed without weakening what the reader already correctly rejects
+  (`serde_json` itself still does 100% of actual JSON *syntax* validation
+  - nothing here second-guesses that):
+    1. **Top-level array/stream of non-object values** (`[1, 2, 3]`, or
+       one bare ID per line) has no field names to extract as columns, but
+       is still a genuine single column of data - the same "no natural
+       row-record shape, so treat what's there as one column" choice a
+       headerless CSV (`file_no_header.csv`, see above) and NumPy's plain
+       1D array (`columns_from_npy`) already make elsewhere in this file.
+       `columns_from_json` now checks whether every top-level value is an
+       object; if not, the whole set is profiled as a single `"value"`
+       column through `profile_json_path` - the exact same recursive
+       engine an already-nested array-of-scalars sub-column goes through,
+       so a mixed scalar/object array gets the same documented "no partial
+       credit" and object-fields-still-recursed treatment at the top level
+       that it already got when nested. One real gotcha caught before it
+       shipped: `profile_json_path` expects its caller to have already
+       filtered nulls out of the `values` it's handed (its own existing
+       recursive call site does this) - `unwrap_arrays` only drops nulls
+       it finds *inside* a nested array, not from a flat top-level list -
+       so the new top-level call site filters nulls itself; skipping that
+       would have been a real, reproducible panic on `[1, null, 3]`, not
+       a hypothetical, caught by reasoning through the existing contract
+       before trusting it rather than after.
+    2. **A single JSON document that doesn't start with `[`** (almost
+       always an object) was unconditionally treated as JSON Lines mode
+       and split by newline - fine for a *compact* single-line object,
+       but a pretty-printed one (`{\n  "a": "b"\n}`, the overwhelmingly
+       common shape for a hand-authored config or a response saved to
+       disk by any JSON-pretty-printing tool) then fails line-by-line,
+       since `"{"` alone isn't valid JSON. `read_json_values` now tries
+       parsing the *whole* content as one JSON value first - the same
+       "whole document = one record" choice TOML and YAML's single-
+       mapping mode already make for their own single-document shapes -
+       and only falls through to per-line parsing if that fails. This is
+       provably a pure fallback, not a competing interpretation: a
+       genuine multi-record JSON Lines stream *must* fail the whole-
+       content parse, since `serde_json::from_str` rejects trailing
+       content after a complete value ("trailing characters" - confirmed
+       directly against the crate before relying on it, not assumed).
+  With both fixes, `JSONTestSuite`'s valid-JSON files go to 95/95 accepted
+  (its invalid-JSON and implementation-defined-edge-case files are
+  unaffected - still 186/188 correctly rejected, and 35/35 survive without
+  a panic, exactly as before), and a separate real-world sweep against 43
+  genuinely nested JSON/JSONL datasets from the RealNest benchmark
+  (real-world GitHub Archive events, AWS public blockchain and genomics
+  data, OpenStreetMap, cord-19 research-paper parses - up to 14,703
+  flattened columns on the deepest one) completed with zero failures and
+  zero panics, confirming the recursive flattening engine holds up on
+  real production-scale nested payloads, not just synthetic fixtures.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1349,6 +1408,32 @@ to surface gaps in the *product*. `tests/fixtures/preamble.csv`,
 distill both findings into small, permanent, committed regression tests,
 so the external corpora themselves don't need to be present for `cargo
 test` to keep proving the fixes hold.
+
+The same exercise was repeated for the JSON reader, against two more
+external corpora, neither committed for the same redistribution reason as
+above: `nst/JSONTestSuite` (318 files - 95 valid-JSON files that a
+compliant parser must accept, 188 invalid-JSON files it must reject, 35
+implementation-defined edge cases where either outcome is acceptable but a
+crash never is) and 43 real nested JSON/JSONL tables from the RealNest
+benchmark's 1024-row sample data (GitHub Archive events, AWS public
+blockchain and genomics data, OpenStreetMap, cord-19 research-paper
+parses). Before the two fixes described in the design philosophy section
+above, only 13/95 valid files were accepted; after, 95/95, with the
+invalid/edge-case buckets unaffected (186/188 rejected, 35/35 survive) and
+zero panics throughout. The RealNest sweep found zero failures on any of
+the 43 real tables, up to 14,703 flattened columns on the deepest one
+(`cord-19-document_parses`), confirming the recursive flattening engine
+holds up on real production-scale nested payloads rather than just
+synthetic fixtures - spot-checking one output by hand
+(`gharchive-PushEvent`) also showed the semantic-type heuristics firing
+correctly on genuine production API data for the first time in testing
+(`commits.sha` correctly flagged as matching SHA-1 hex-digest length,
+`commits.url` resolved to `URL`). `tests/fixtures/
+edge_pretty_printed_single_object.json`,
+`tests/fixtures/edge_top_level_scalar_array.json`, and their own
+integration tests (plus five `#[cfg(test)]` unit tests directly on
+`read_json_values`/`columns_from_json`) lock both JSON fixes in
+permanently, the same pattern as the CSV findings above.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests

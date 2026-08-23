@@ -2061,6 +2061,38 @@ fn json_all_null_field_is_100_percent_missing_not_a_crash() {
     assert!(a["notes"].as_str().unwrap().contains("empty/all null"));
 }
 
+// Found via a real-world sweep against nst/JSONTestSuite - a JSON parser
+// conformance corpus, played the same role for the JSON reader that the
+// HPI Pollock benchmark played for CSV. Before these two fixes, only 13 of
+// its 95 valid-JSON test files were accepted by sniff-rs; the other 82
+// were rejected with "expected an array of objects" even though every one
+// is a real, unambiguous JSON document. After: 95/95, and separately
+// verified against 43 real nested-JSON datasets from the RealNest
+// benchmark (GitHub Archive events, AWS public blockchain/genomics data,
+// OpenStreetMap, cord-19) with zero failures.
+
+#[test]
+fn json_accepts_a_pretty_printed_single_object() {
+    // Previously misdetected as JSON Lines mode (content doesn't start
+    // with '[') and failed line-by-line, since "{" alone on its own line
+    // isn't valid JSON - a real, common shape for a hand-authored or
+    // tool-saved config/response file.
+    let doc = run_json("edge_pretty_printed_single_object.json", &[]);
+    let cols = table(&doc, "edge_pretty_printed_single_object");
+    assert_eq!(column(cols, "user_id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "email")["ideal_type"], "Email");
+}
+
+#[test]
+fn json_top_level_array_of_scalars_becomes_one_value_column() {
+    let doc = run_json("edge_top_level_scalar_array.json", &[]);
+    let cols = table(&doc, "edge_top_level_scalar_array");
+    assert_eq!(cols.len(), 1);
+    let value = column(cols, "value");
+    assert_eq!(value["ideal_type"], "UUID");
+    assert_eq!(value["missing_pct"].as_f64().unwrap(), 33.3);
+}
+
 #[cfg(feature = "parquet")]
 #[test]
 fn parquet_zero_rows_still_reports_the_schema_not_a_crash() {

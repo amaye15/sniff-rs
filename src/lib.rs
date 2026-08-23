@@ -2304,36 +2304,48 @@ fn unwrap_arrays<'a>(values: &[&'a JsonValue]) -> (Vec<&'a JsonValue>, bool) {
     (pool, saw_array)
 }
 
-/// Reads either a top-level JSON array of objects, or JSON Lines (one object
-/// per non-empty line) - detected by whether the trimmed content starts with '['.
-fn read_json_records(path: &Path) -> Result<Vec<serde_json::Map<String, JsonValue>>> {
+/// Reads either a top-level JSON array, a single JSON document (object or
+/// scalar, possibly pretty-printed across multiple lines), or JSON Lines
+/// (one value per non-empty line) - detected by whether the trimmed
+/// content starts with '[', then by whether the *whole* content parses as
+/// one value. Every element/line must itself be valid JSON, but is *not*
+/// required to be an object here - a top-level array or JSON Lines stream
+/// of bare scalars (`[1, 2, 3]`, or one ID per line) is a real, common
+/// shape with no natural field names but still a genuine single column,
+/// same as a headerless CSV or NumPy's plain 1D array elsewhere in this
+/// file - columns_from_json decides what to do with the result.
+fn read_json_values(path: &Path) -> Result<Vec<JsonValue>> {
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
     let trimmed = content.trim_start();
 
     if trimmed.starts_with('[') {
-        let values: Vec<JsonValue> = serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse {path:?} as a JSON array"))?;
-        values
-            .into_iter()
-            .map(|v| match v {
-                JsonValue::Object(m) => Ok(m),
-                _ => bail!("expected an array of objects in {path:?}"),
-            })
-            .collect()
-    } else {
-        trimmed
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|line| {
-                let v: JsonValue = serde_json::from_str(line)
-                    .with_context(|| format!("failed to parse a line of {path:?} as JSON"))?;
-                match v {
-                    JsonValue::Object(m) => Ok(m),
-                    _ => bail!("expected one JSON object per line in {path:?}"),
-                }
-            })
-            .collect()
+        return serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse {path:?} as a JSON array"));
     }
+
+    // A single JSON document - most commonly a pretty-printed object, the
+    // overwhelmingly common shape for a hand-authored or tool-saved
+    // config/response file - parses as exactly one value with nothing
+    // left over. Try that first, the same "whole document = one record"
+    // choice TOML and YAML's single-mapping mode already make for their
+    // own single-document shapes. A genuine multi-record JSON Lines
+    // stream fails this: serde_json::from_str rejects trailing content
+    // after a complete value ("trailing characters", confirmed directly
+    // rather than assumed), so it falls through to per-line parsing below
+    // exactly as before - this is a pure additive fallback, not a
+    // replacement for JSON Lines detection.
+    if let Ok(v) = serde_json::from_str::<JsonValue>(&content) {
+        return Ok(vec![v]);
+    }
+
+    trimmed
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .with_context(|| format!("failed to parse a line of {path:?} as JSON"))
+        })
+        .collect()
 }
 
 /// Profiles one JSON "path". `total` is how many parent slots could have held
@@ -2535,11 +2547,38 @@ fn columns_from_json(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    let mut records = read_json_records(path)?;
+    let mut values = read_json_values(path)?;
     if let Some(n) = nrows {
-        records.truncate(n);
+        values.truncate(n);
     }
-    Ok(profile_json_records(&records, n_samples))
+
+    if values.iter().all(JsonValue::is_object) {
+        let records: Vec<serde_json::Map<String, JsonValue>> = values
+            .into_iter()
+            .map(|v| match v {
+                JsonValue::Object(m) => m,
+                _ => unreachable!("just checked every value is an object"),
+            })
+            .collect();
+        Ok(profile_json_records(&records, n_samples))
+    } else {
+        // Not every top-level value/line is an object, so there's no
+        // field-name-per-column shape to extract - but the values
+        // themselves (scalars, or a scalar/object mix) are still a real
+        // single column, profiled by the same recursive engine a nested
+        // array-of-scalars sub-column already goes through. profile_json_path
+        // expects nulls pre-filtered from `values` (its own recursive call
+        // site does the same) - unwrap_arrays only drops nulls it finds
+        // *inside* a nested array, not from this top-level list itself.
+        let total = values.len();
+        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+        Ok(profile_json_path(
+            "value".to_string(),
+            total,
+            refs,
+            n_samples,
+        ))
+    }
 }
 
 // --- Parquet + Arrow IPC/Feather readers (opt-in via --features parquet) ---
@@ -5051,6 +5090,80 @@ mod tests {
     // json_flattens_nested_object_and_array_of_objects and
     // nested_arrays_and_objects_are_recursively_typed_at_every_leaf in
     // tests/integration.rs).
+
+    // --- read_json_values: what shapes of top-level JSON does the reader
+    // accept, beyond "array of objects" / "JSON Lines of objects"? ---
+    // Found via a real-world sweep against nst/JSONTestSuite (a JSON
+    // parser conformance corpus, analogous to what the Pollock benchmark
+    // is for CSV): before these two fixes, only 13 of 95 valid-JSON test
+    // files were accepted - everything else (bare top-level scalars,
+    // arrays of scalars, a pretty-printed single object) was rejected
+    // with "expected an array of objects"/"expected one JSON object per
+    // line", even though every one of them is a real, valid JSON document
+    // with no ambiguity about what it contains. After both fixes: 95/95.
+
+    fn read_values(json_text: &str) -> Vec<JsonValue> {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, json_text.as_bytes()).unwrap();
+        read_json_values(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn read_json_values_accepts_a_pretty_printed_single_object() {
+        // Previously misdetected as JSON Lines mode (content doesn't
+        // start with '[') and then failed line-by-line, since "{" alone
+        // isn't valid JSON on its own line.
+        let values = read_values("{\n  \"a\": \"b\"\n}");
+        assert_eq!(values, vec![serde_json::json!({"a": "b"})]);
+    }
+
+    #[test]
+    fn read_json_values_still_splits_a_genuine_multi_record_jsonl_stream() {
+        // The single-document fallback must not swallow real JSON Lines
+        // data - serde_json rejects trailing content after a complete
+        // value, so this correctly falls through to per-line parsing.
+        let values = read_values("{\"a\":1}\n{\"a\":2}\n");
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"a": 1}), serde_json::json!({"a": 2})]
+        );
+    }
+
+    #[test]
+    fn read_json_values_accepts_a_top_level_array_of_scalars() {
+        let values = read_values("[1, 2, 3]");
+        assert_eq!(
+            values,
+            vec![
+                serde_json::json!(1),
+                serde_json::json!(2),
+                serde_json::json!(3)
+            ]
+        );
+    }
+
+    #[test]
+    fn read_json_values_on_an_empty_file_falls_through_to_zero_records() {
+        // Neither the array branch (doesn't start with '[') nor the
+        // single-document parse (empty string isn't valid JSON) can
+        // claim this - it must still land on the existing, tested "empty
+        // file -> zero records" contract rather than erroring.
+        assert_eq!(read_values(""), Vec::<JsonValue>::new());
+    }
+
+    #[test]
+    fn columns_from_json_top_level_scalar_array_becomes_one_value_column() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"[1, null, 3]").unwrap();
+        let cols = columns_from_json(tmp.path(), None, 3).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "value");
+        assert_eq!(cols[0].ideal_type, "i64");
+        // total=3, non-null=2 -> 33.3% missing; proves the null wasn't
+        // silently dropped from the missing-% accounting the way it would
+        // be if `values` weren't filtered before reaching profile_json_path.
+        assert!((cols[0].missing_pct - 33.3).abs() < 0.01);
+    }
 
     #[test]
     fn profile_json_path_types_a_plain_array_of_scalars_precisely() {
