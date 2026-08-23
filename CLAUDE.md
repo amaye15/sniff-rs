@@ -412,8 +412,12 @@ bridged into `serde_json::Value` and handed to the exact same recursive
 flattener**, rather than reimplementing recursion per format:
 
 - Avro decodes each record to `serde_json::Value` (`avro_value_to_json`)
-  and calls `profile_json_records` — identical code path to a `.json` file.
-  Unlike every other bridge in this list, it also takes the record's
+  and calls `profile_json_records` — identical code path to a `.json` file
+  — or, if not every decoded value is an object (a real, valid shape: an
+  Avro RPC response file, for instance, decodes to a bare scalar), the
+  same top-level-scalar fallback the JSON/YAML readers use, profiling
+  the whole set as one `value` column instead. Unlike every other bridge
+  in this list, it also takes the record's
   `Schema` alongside the value and co-recurses over both together, because
   one Avro logical type - `decimal` - genuinely can't be rendered correctly
   from the value alone: Avro stores only the unscaled two's-complement
@@ -1222,6 +1226,47 @@ entirely:
   own decoding limits, not this project's, and zero panics were produced
   by any of them either way.
 
+- **Two more real gaps, found the same way, this time for Avro**: a
+  real-world sweep combining the Apache Avro project's own interop test
+  data with the widely-used "userdata" sample Avro dataset (real-shaped
+  synthetic user records - names, emails, IPs, credit card numbers,
+  registration timestamps). Before any fix, 10 of 19 files read
+  successfully, zero panics.
+    1. **Every file compressed with Snappy - Avro's most common
+       production codec, especially in Kafka/Hadoop pipelines - failed
+       outright** (`"Codec 'snappy' is not supported/enabled"`), including
+       all 5 real userdata files and the Apache Avro project's own
+       `weather-snappy.avro`/`weather-zstd.avro` interop fixtures (zstd
+       failed the same way). `apache-avro`'s `snappy` and `zstandard`
+       features weren't enabled. Checked the cost before assuming it was
+       expensive, the same discipline the Parquet `chrono-tz` fix above
+       used: `zstd` dedupes for free (this project already depends on the
+       exact same version, `0.13.3`, for its own top-level `--features
+       zstd`), and enabling both together adds exactly two more crates
+       (`crc32fast`, `snap`) - cheap enough to simply turn both on.
+    2. **A non-record top-level Avro schema was rejected outright** - the
+       same "must decode to an object" gap the JSON and YAML readers had,
+       found in the exact same corpus: the Apache Avro project's own
+       "hello world" RPC interop fixture decodes to the bare string
+       `"Hello World"`, not an object, and `columns_from_avro` bailed with
+       `"expected each Avro record to decode to an object"` rather than
+       accepting it. Fixed with the identical fallback already used for
+       JSON/YAML: collect every decoded value first, and if not all of
+       them are objects, profile the whole set as one `value` column
+       instead of rejecting a real, valid Avro file.
+  With both fixes, all 19 files in the combined corpus succeed. Spot-
+  checking the real userdata output by hand also confirmed something
+  worth recording as a *non*-finding: its `email` column stays plain
+  `String` rather than resolving to `Email`, which looked at first like a
+  possible gap - checked directly (`is_email` correctly accepts every
+  real domain shape in the dataset, including ones with digits and
+  hyphens like `163.com`/`t-online.de`/`51.la`) before concluding the
+  real cause is a handful of genuinely empty-string email values mixed
+  into the column, which correctly veto the whole column under this
+  project's existing "no partial credit" rule (see `is_email`'s entry in
+  the list above) - the heuristic was already doing exactly the right
+  thing, not a bug to fix.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1593,6 +1638,23 @@ vendoring a third-party file even though `parquet-testing` is Apache-2.0
 licensed and permits it) and its integration test lock the map-key fix
 in permanently.
 
+A fifth pass, for Avro: the Apache Avro project's own interop test data
+(`share/test/` in the `apache/avro` repo - weather data in several
+compression codecs, RPC request/response fixtures) combined with the
+`userdata1-5.avro` files from Teradata/kylo's sample-data collection - a
+widely-reused, real-shaped synthetic dataset (names, emails, IPs, credit
+cards, timestamps) rather than something built for this project. Before
+any fix: 10/19 files read successfully, zero panics. After the two fixes
+described in the design philosophy section above (Snappy/zstd codec
+support, non-record top-level schemas): 19/19, and the same real-userdata
+sweep is also what surfaced the `is_email` non-finding documented there -
+checking a heuristic's output against real data and confirming it's
+already correct is as much a part of this validation pass as finding
+things that are actually broken. `tests/fixtures/edge_avro_snappy_codec.avro`
+and `tests/fixtures/edge_avro_scalar_records.avro` (both generated with
+`fastavro`, matching this project's fixture-generation convention) plus
+two integration tests lock both fixes in.
+
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
 there's also a `#[cfg(test)] mod tests` at the bottom of `lib.rs`
@@ -1714,7 +1776,13 @@ design philosophy section above). Separately, a Parquet/Arrow Map column
 with non-string keys (`Map<Int32, T>`, a real, legal shape for a numeric-
 code lookup table) used to fail the whole file's read, not just that one
 column - fixed by isolating each nested column's own JSON conversion
-rather than converting a batch's nested columns as one atomic unit.
+rather than converting a batch's nested columns as one atomic unit. Any
+Avro file compressed with Snappy - the default/most common codec for
+Kafka- and Hadoop-pipeline-produced Avro specifically - failed outright
+with every single one of this project's own real-world Snappy-compressed
+test files (`apache-avro`'s `snappy` feature wasn't enabled); zstd-
+compressed Avro had the identical gap. Both are now enabled - see the
+design philosophy section above for the exact dependency-cost check.
 
 **Not covered, and out of scope for this pass:** Avro's `Duration` logical
 type (months/days/milliseconds, a compound value with no single natural

@@ -3066,19 +3066,42 @@ fn columns_from_avro(
     // alone) that only the schema carries.
     let schema = reader.writer_schema().clone();
 
-    let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+    let mut values: Vec<JsonValue> = Vec::new();
     for (i, value_result) in reader.enumerate() {
         if nrows.is_some_and(|limit| i >= limit) {
             break;
         }
         let value =
             value_result.with_context(|| format!("failed decoding a record from {path:?}"))?;
-        match avro_value_to_json(&value, Some(&schema)) {
-            JsonValue::Object(m) => records.push(m),
-            _ => bail!("expected each Avro record to decode to an object in {path:?}"),
-        }
+        values.push(avro_value_to_json(&value, Some(&schema)));
     }
-    Ok(profile_json_records(&records, n_samples))
+
+    // Not every Avro file holds record-typed rows - an Avro RPC response
+    // file, for instance, decodes to a bare scalar (found via a real-world
+    // sweep against the Apache Avro project's own interop test data: a
+    // "hello world" RPC response is just the string "Hello, world!", not
+    // an object). The same fallback the JSON/YAML readers already use for
+    // their own analogous case applies here too: profile the whole set as
+    // one "value" column rather than rejecting a real, valid Avro file.
+    if values.iter().all(JsonValue::is_object) {
+        let records: Vec<serde_json::Map<String, JsonValue>> = values
+            .into_iter()
+            .map(|v| match v {
+                JsonValue::Object(m) => m,
+                _ => unreachable!("just checked every value is an object"),
+            })
+            .collect();
+        Ok(profile_json_records(&records, n_samples))
+    } else {
+        let total = values.len();
+        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+        Ok(profile_json_path(
+            "value".to_string(),
+            total,
+            refs,
+            n_samples,
+        ))
+    }
 }
 
 #[cfg(not(feature = "avro"))]

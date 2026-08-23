@@ -1727,6 +1727,43 @@ fn avro_resolves_logical_types_instead_of_leaving_them_as_raw_numbers_or_debug_o
     assert_eq!(price_list["ideal_type"], "Vec<f64>");
 }
 
+// Both found via a real-world sweep combining the Apache Avro project's
+// own interop test data with real-shaped sample data (the widely-used
+// "userdata" Avro dataset) - not a synthetic corpus built for this project.
+
+#[cfg(feature = "avro")]
+#[test]
+fn avro_reads_snappy_and_zstandard_compressed_files() {
+    // Snappy is Avro's most common production codec (Kafka/Hadoop
+    // ecosystems especially) - it and zstd were both silently rejected
+    // ("Codec 'snappy' is not supported/enabled") until this project's
+    // apache-avro dependency enabled the matching optional features. Every
+    // real .avro file using either codec failed outright before this,
+    // including the Apache Avro project's own interop test data.
+    let doc = run_json("edge_avro_snappy_codec.avro", &[]);
+    let cols = table(&doc, "edge_avro_snappy_codec");
+    assert_eq!(column(cols, "sensor_id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "value")["ideal_type"], "f64");
+}
+
+#[cfg(feature = "avro")]
+#[test]
+fn avro_top_level_scalar_records_become_one_value_column() {
+    // An Avro RPC response file (or any Avro stream whose schema is a bare
+    // scalar rather than a record - a real, valid shape, confirmed against
+    // the Apache Avro project's own "hello world" RPC interop fixture,
+    // which decodes to the plain string "Hello World", not an object) used
+    // to be rejected with "expected each Avro record to decode to an
+    // object" - the same class of gap the JSON/YAML readers had for their
+    // own top-level-scalar cases.
+    let doc = run_json("edge_avro_scalar_records.avro", &[]);
+    let cols = table(&doc, "edge_avro_scalar_records");
+    assert_eq!(cols.len(), 1);
+    let value = column(cols, "value");
+    assert_eq!(value["current_type"], "String");
+    assert_eq!(value["missing_pct"].as_f64().unwrap(), 0.0);
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_recognizes_uuid_email_ipv4_and_date_columns() {
