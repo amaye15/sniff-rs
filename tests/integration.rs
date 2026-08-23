@@ -818,6 +818,21 @@ fn yaml_reads_a_multi_document_stream_as_one_record_per_document() {
     assert!((active["missing_pct"].as_f64().unwrap() - 66.7).abs() < 0.01);
 }
 
+// Found via a real-world sweep against yaml/yaml-test-suite (the YAML spec
+// compliance corpus): a top-level sequence of scalars (no field names to
+// extract) used to be rejected with "expected each YAML document/record
+// to be a mapping", even though it's real, valid, unambiguous YAML - the
+// same class of gap the JSON reader had for a top-level array of scalars.
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_top_level_sequence_of_scalars_becomes_one_value_column() {
+    let doc = run_json("edge_yaml_scalar_sequence.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_scalar_sequence");
+    assert_eq!(cols.len(), 1);
+    let value = column(cols, "value");
+    assert_eq!(value["ideal_type"], "i64");
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_writer_silently_mangling_a_zip_code_gets_caught() {

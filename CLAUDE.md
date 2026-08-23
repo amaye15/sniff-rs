@@ -44,7 +44,7 @@ every format. See "Testing" below.
 | SQLite | `.db`, `.sqlite`, `.sqlite3` | `--features sqlite` | one section per table (see below) |
 | MessagePack | `.msgpack`, `.mp` | `--features msgpack` | stream of concatenated records, or a single top-level array |
 | TOML | `.toml` | `--features toml` | whole document = one row; array-of-tables flattens like a nested JSON array |
-| YAML | `.yaml`, `.yml` | `--features yaml` | single mapping = one row, single sequence = array-of-records, `---`-multi-doc = one row per document |
+| YAML | `.yaml`, `.yml` | `--features yaml` | single mapping = one row, single sequence = array-of-records, `---`-multi-doc = one row per document; a non-mapping document/sequence-of-scalars profiles as one `value` column |
 | CBOR | `.cbor` | `--features cbor` | same convention as MessagePack: concatenated records, or a single top-level array |
 | INI | `.ini` | `--features ini` | one section per table, like SQLite (see below); a repeated key pools into an array |
 | XML | `.xml` | `--features xml` | homogeneous same-tag children of the root = records; otherwise the root = one row; attributes become `@name` columns |
@@ -453,7 +453,11 @@ flattener**, rather than reimplementing recursion per format:
   array of records (JSON's `[...]` mode); a single top-level mapping is one
   record (TOML's whole-document-as-one-row choice); a `---`-separated
   multi-document stream is one record per document (YAML's own equivalent
-  of JSON Lines, but self-delimiting rather than newline-delimited).
+  of JSON Lines, but self-delimiting rather than newline-delimited). Not
+  every document/sequence-element has to be a mapping either - the same
+  "no field names, but still a genuine single column" fallback the JSON
+  reader uses for a top-level array of scalars applies here too (see the
+  design philosophy section below).
 - CBOR does exactly what MessagePack does (`cbor_value_to_json`, via the
   `ciborium` crate): a stream of concatenated self-delimiting top-level
   values, or a single top-level array's elements. Same convention, same
@@ -1117,6 +1121,46 @@ entirely:
   zero panics, confirming the recursive flattening engine holds up on
   real production-scale nested payloads, not just synthetic fixtures.
 
+- **The YAML reader had the exact same "must be a mapping" gap the JSON
+  reader had, found the same way** - a real-world sweep, this time against
+  `yaml/yaml-test-suite` (the YAML spec compliance corpus, playing the
+  same role for YAML this pass that JSONTestSuite played for JSON): a
+  top-level sequence of scalars, or a bare top-level scalar document, was
+  rejected with "expected each YAML document/record to be a mapping" even
+  though both are real, valid, unambiguous YAML. Before the fix, only
+  137/312 of the suite's valid-YAML cases were accepted; `columns_from_yaml`
+  now applies the identical fallback the JSON reader already uses - bridge
+  every document/sequence-element to `serde_json::Value` first via the
+  existing `yaml_value_to_json`, then check whether *all* of them are
+  objects; if not, profile the whole set as one `"value"` column through
+  `profile_json_path`, same as a top-level JSON array of scalars. After:
+  231/312 accepted (94 more, exactly the count of mapping-shape
+  rejections found), zero panics throughout, and the invalid-YAML bucket
+  essentially unaffected in spirit - still 72/94 correctly rejected by
+  the underlying parser itself. `yaml_document_to_record`, the helper that
+  used to enforce the mapping-only rule, is gone entirely rather than kept
+  around unused - the mapping check it did is now just one path through
+  the shared JSON-shaped dispatch, not a separate gate.
+
+  The remaining gap is real but out of scope: 81 of the suite's valid-YAML
+  cases still fail, and a further 22 of its invalid-YAML cases are
+  incorrectly accepted - both are the underlying `serde_norway` crate's
+  own YAML-1.2-spec-compliance limits (complex mapping keys, certain
+  directive/tag combinations, lenient handling of missing whitespace
+  before comments, tabs in block context, and similar corners), not a gap
+  in this project's own code. Every remaining failure was checked
+  individually (error text like `"did not find expected ..."`, `"found
+  unknown directive"` - genuine parser-level rejections, not something
+  downstream of a successful parse) to confirm this before accepting it
+  as a boundary rather than chasing it - the same "delegate real parsing
+  to the crate, don't reimplement it" principle behind not writing a CSV
+  dialect sniffer or a second JSON validator anywhere else in this file.
+  Separately verified against 128 real Kubernetes manifests from the
+  ContainerSolutions/kubernetes-examples collection (ConfigMaps, Services,
+  NetworkPolicies, Istio resources, and more) - zero failures, zero
+  panics, confirming the fix holds on genuine production YAML and not
+  just synthetic spec-compliance fixtures.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1434,6 +1478,42 @@ edge_pretty_printed_single_object.json`,
 integration tests (plus five `#[cfg(test)]` unit tests directly on
 `read_json_values`/`columns_from_json`) lock both JSON fixes in
 permanently, the same pattern as the CSV findings above.
+
+The same exercise, a third time, for the YAML reader: `yaml/yaml-test-suite`
+(406 test cases extracted from its own meta-YAML format via a small
+one-off Python script, not committed - see the design philosophy section
+above for the exact before/after numbers) played the role JSONTestSuite
+played for JSON, and found the identical class of gap. Separately, 128
+real Kubernetes manifests from the `ContainerSolutions/kubernetes-examples`
+collection - zero failures, zero panics. One genuinely interesting
+methodology wrinkle surfaced along the way, worth recording since it's a
+trap any future real-world-corpus pass could fall into again: a plain
+sweep script built around `while IFS= read -r f; do ...; done < file_list`
+(or the equivalent with a bash array populated via process substitution)
+intermittently hung indefinitely partway through the k8s manifest sweep in
+this environment, with zero panics, zero errors, and zero progress output
+- not a sniff-rs bug (confirmed by then re-running the same 128 files
+through a small Python `subprocess.run(..., timeout=10)` wrapper instead,
+which completed cleanly with zero failures - the per-call timeout alone
+is proof no individual invocation ever actually hung). The likely cause
+was an interaction between this session's shell-command hook tooling and
+a long-running loop construct, not anything YAML- or sniff-rs-specific,
+but the lesson generalizes: prefer a subprocess-based sweep script with an
+explicit per-file timeout over a raw shell loop for any future exhaustive
+corpus pass, since it's both more reliable *and* gives a genuine hang a
+way to be caught and reported instead of silently stalling the whole
+sweep. Fixing the YAML gap also surfaced a stale test assumption, not a
+product bug: `tests/fixtures/malformed_garbage.yaml` (a hand-written
+sentence of plain prose, meant to simulate "readable text, no real
+structure") was quietly valid YAML all along - any single unquoted line
+is a legal YAML plain scalar - so it only ever passed
+`malformed_yaml_fails_cleanly` as a side effect of the mapping-only gate
+this pass removed. Replaced with genuinely invalid YAML (an unterminated
+quoted scalar), verified directly against `serde_norway` before trusting
+it, rather than loosening the test's own intent.
+`tests/fixtures/edge_yaml_scalar_sequence.yaml` and its own integration
+test, plus three `#[cfg(test)]` unit tests on `columns_from_yaml`, lock
+the YAML fix in the same way.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests

@@ -1,1 +1,2 @@
-this is not a valid file for its claimed format - garbage bytes for adversarial robustness testing, deliberately not matching any real file signature or magic bytes whatsoever, 1234567890
+key: "unterminated string
+value

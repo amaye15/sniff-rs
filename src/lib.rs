@@ -3241,17 +3241,6 @@ fn yaml_value_to_json(v: &serde_norway::Value) -> JsonValue {
 }
 
 #[cfg(feature = "yaml")]
-fn yaml_document_to_record(
-    v: serde_norway::Value,
-    path: &Path,
-) -> Result<serde_json::Map<String, JsonValue>> {
-    match yaml_value_to_json(&v) {
-        JsonValue::Object(m) => Ok(m),
-        _ => bail!("expected each YAML document/record to be a mapping in {path:?}"),
-    }
-}
-
-#[cfg(feature = "yaml")]
 fn columns_from_yaml(
     path: &Path,
     nrows: Option<usize>,
@@ -3270,27 +3259,53 @@ fn columns_from_yaml(
         }
     }
 
-    let mut records = Vec::new();
+    // Same dual-mode dispatch as before: a single top-level sequence is
+    // an array of records (JSON's `[...]` mode); anything else - one
+    // mapping, one bare scalar, or a `---`-separated multi-document
+    // stream - is one record per document/element (TOML's own "whole
+    // document = one row" choice for its single-document shape).
+    let mut values: Vec<JsonValue> = Vec::new();
     match documents.len() {
         1 => match documents.into_iter().next().unwrap() {
             serde_norway::Value::Sequence(items) => {
-                for item in items {
-                    records.push(yaml_document_to_record(item, path)?);
-                }
+                values.extend(items.iter().map(yaml_value_to_json));
             }
-            other => records.push(yaml_document_to_record(other, path)?),
+            other => values.push(yaml_value_to_json(&other)),
         },
-        _ => {
-            for doc in documents {
-                records.push(yaml_document_to_record(doc, path)?);
-            }
-        }
+        _ => values.extend(documents.iter().map(yaml_value_to_json)),
     }
 
     if let Some(n) = nrows {
-        records.truncate(n);
+        values.truncate(n);
     }
-    Ok(profile_json_records(&records, n_samples))
+
+    // Not every document/element is a mapping - a real, valid shape
+    // (a top-level sequence of scalars, a bare scalar document, or a
+    // multi-doc stream mixing shapes - all found via a real-world sweep
+    // against yaml-test-suite, the spec compliance corpus), not something
+    // to reject. Same fallback the JSON reader already uses for its own
+    // analogous case: profile the whole set as a single "value" column
+    // through the same recursive engine a nested array-of-scalars
+    // sub-column goes through, rather than a "must be a mapping" error.
+    if values.iter().all(JsonValue::is_object) {
+        let records: Vec<serde_json::Map<String, JsonValue>> = values
+            .into_iter()
+            .map(|v| match v {
+                JsonValue::Object(m) => m,
+                _ => unreachable!("just checked every value is an object"),
+            })
+            .collect();
+        Ok(profile_json_records(&records, n_samples))
+    } else {
+        let total = values.len();
+        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+        Ok(profile_json_path(
+            "value".to_string(),
+            total,
+            refs,
+            n_samples,
+        ))
+    }
 }
 
 #[cfg(not(feature = "yaml"))]
@@ -5315,6 +5330,55 @@ mod tests {
             "-0.05"
         );
         assert_eq!(avro_decimal_to_string(avro_decimal_from_i64(0), 2), "0.00");
+    }
+
+    // --- YAML: what shapes of top-level document does the reader accept,
+    // beyond "single mapping" / "sequence of mappings" / "multi-doc stream
+    // of mappings"? --- Found via a real-world sweep against
+    // yaml/yaml-test-suite (the YAML spec compliance corpus): before this
+    // fix, sniff-rs rejected any document/element that wasn't itself a
+    // mapping with "expected each YAML document/record to be a mapping",
+    // even for a top-level sequence of scalars or a bare scalar document -
+    // both real, valid YAML with no ambiguity about what they contain, the
+    // exact same class of gap the JSON reader had (see the JSON tests
+    // above and the design philosophy section in CLAUDE.md).
+
+    #[cfg(feature = "yaml")]
+    fn columns_from_yaml_text(yaml_text: &str) -> Vec<ColumnProfile> {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, yaml_text.as_bytes()).unwrap();
+        columns_from_yaml(tmp.path(), None, 3).unwrap()
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn columns_from_yaml_accepts_a_top_level_sequence_of_scalars() {
+        let cols = columns_from_yaml_text("- 1\n- 2\n- 3\n");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "value");
+        assert_eq!(cols[0].ideal_type, "i64");
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn columns_from_yaml_accepts_a_bare_scalar_document() {
+        let cols = columns_from_yaml_text("just a plain scalar string\n");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "value");
+        assert_eq!(cols[0].current_type, "String");
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn columns_from_yaml_still_reads_a_single_mapping_as_one_record() {
+        // Must not regress the far more common shape - a single mapping
+        // document still profiles as named columns, not a "value" column.
+        // Column order isn't asserted here (serde_norway's Mapping doesn't
+        // preserve YAML source order, a pre-existing, unrelated detail).
+        let cols = columns_from_yaml_text("name: Alice\nage: 30\n");
+        let mut names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["age", "name"]);
     }
 
     #[test]
