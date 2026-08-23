@@ -570,6 +570,33 @@ fn is_jwt(s: &str) -> bool {
     base64url_decode(parts[2]).is_some()
 }
 
+/// A "lat,lon" single-cell coordinate pair. Deliberately the most
+/// conservative check in this file: unlike a checksum or a fixed-prefix
+/// grammar, there's no unambiguous signal distinguishing a real coordinate
+/// from any other pair of small decimals - "1.5,2.5" is structurally
+/// identical to a genuine coordinate. Requiring a decimal point in *both*
+/// components (real coordinate data essentially always carries fractional
+/// precision) plus the standard ±90/±180 range rules out plain integer
+/// pairs and out-of-range values, but doesn't eliminate the ambiguity -
+/// see the design-philosophy note below for why this tradeoff was made
+/// anyway, with the residual risk documented rather than hidden.
+fn is_lat_lon_pair(s: &str) -> bool {
+    let Some((lat_str, lon_str)) = s.split_once(',') else {
+        return false;
+    };
+    let (lat_str, lon_str) = (lat_str.trim(), lon_str.trim());
+    if !lat_str.contains('.') || !lon_str.contains('.') {
+        return false;
+    }
+    let Ok(lat) = lat_str.parse::<f64>() else {
+        return false;
+    };
+    let Ok(lon) = lon_str.parse::<f64>() else {
+        return false;
+    };
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
+}
+
 /// '#' followed by exactly 3 (RGB), 4 (RGBA), 6 (RRGGBB), or 8 (RRGGBBAA)
 /// hex digits - the '#' prefix is the unambiguous signal, the same role
 /// "0x" plays for parse_prefixed_int.
@@ -698,6 +725,16 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "String".to_string(),
             "cell holds embedded JSON (object/array) - consider parsing it separately".to_string(),
+        );
+    }
+
+    // Checked last among the "precise grammar" checks, deliberately: unlike
+    // everything above it, this has no checksum or fixed prefix to rule out
+    // coincidence - see is_lat_lon_pair's own doc comment.
+    if values.iter().all(|v| is_lat_lon_pair(v)) {
+        return (
+            "Geographic Coordinates".to_string(),
+            "matches \"lat,lon\" within valid ranges (±90/±180)".to_string(),
         );
     }
 
@@ -3643,9 +3680,14 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "MAC Address" => Some(("string", None)),
         "IBAN" => Some(("string", None)),
         "Credit Card Number" => Some(("string", None)),
-        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" | "SemVer" | "Hex Color" | "IMEI" | "JWT" => {
-            Some(("string", None))
-        }
+        "ISBN-10"
+        | "ISBN-13"
+        | "EAN-13 / UPC-A"
+        | "SemVer"
+        | "Hex Color"
+        | "IMEI"
+        | "JWT"
+        | "Geographic Coordinates" => Some(("string", None)),
         _ => None,
     }
 }
@@ -4351,6 +4393,24 @@ mod tests {
     }
 
     #[test]
+    fn is_lat_lon_pair_requires_decimals_and_valid_ranges() {
+        assert!(is_lat_lon_pair("40.7128,-74.0060")); // New York
+        assert!(is_lat_lon_pair("-33.8688, 151.2093")); // Sydney, with a space
+        assert!(!is_lat_lon_pair("1,2")); // no decimal point at all - too weak a signal
+        assert!(!is_lat_lon_pair("91.0,0.0")); // latitude out of range
+        assert!(!is_lat_lon_pair("0.0,181.0")); // longitude out of range
+        assert!(!is_lat_lon_pair("40.7128")); // no comma at all
+        assert!(!is_lat_lon_pair("40.7128,-74.0060,10.5")); // 3 components, not a pair
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_geographic_coordinates() {
+        let (ideal, note) = suggest_ideal_type(&["40.7128,-74.0060", "51.5074,-0.1278"], "String");
+        assert_eq!(ideal, "Geographic Coordinates");
+        assert!(note.contains("lat,lon"));
+    }
+
+    #[test]
     fn suggest_ideal_type_recognizes_uuid_email_ipv4_ipv6_and_url() {
         let (ideal, note) = suggest_ideal_type(
             &[
@@ -4493,6 +4553,7 @@ mod tests {
             let _ = is_imei(s);
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
+            let _ = is_lat_lon_pair(s);
             let _ = parse_prefixed_int(s);
             let _ = is_missing_sentinel(s);
             let _ = has_leading_zero(s);
@@ -4523,6 +4584,7 @@ mod tests {
             let _ = is_imei(s);
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
+            let _ = is_lat_lon_pair(s);
             let _ = normalize_numeric_str(s);
             let _ = suggest_ideal_type(&[s], "String");
         }
@@ -4591,6 +4653,8 @@ mod tests {
         // JSON - three dots alone must not be enough to claim JWT.
         assert!(!is_jwt("hello.world.foo"));
         assert!(!is_jwt("aGVsbG8.d29ybGQ.Zm9v")); // valid base64url, but decodes to plain text, not JSON
+        assert!(!is_lat_lon_pair("999.0,999.0")); // both components out of range
+        assert!(!is_lat_lon_pair("45,90")); // plain integers, no decimal signal
     }
 
     #[test]

@@ -601,6 +601,20 @@ entirely:
   base64url charset, never decoded as JSON - it's arbitrary bytes by
   design (an HMAC or signature), not structured data. Verified against
   jwt.io's own canonical example token.
+- **Geographic coordinate pairs** (`"40.7128,-74.0060"`) - deliberately the
+  most conservative check in the file, and checked *last* among the
+  "precise grammar" tier for exactly that reason. Unlike everything else
+  above it, there's no checksum or fixed prefix ruling out coincidence: a
+  plain pair of small decimals is structurally identical to a real
+  coordinate. Requiring a decimal point in *both* components (real
+  coordinate data essentially always carries fractional precision) plus
+  the standard ±90/±180 range rules out plain integer pairs and
+  out-of-range values, but doesn't eliminate the ambiguity - "1.5,2.5"
+  still passes. This tradeoff was made deliberately and with the user's
+  explicit awareness (flagged as the most ambiguous of a batch of four
+  candidates before it was picked), the same spirit as the IPv4-vs-
+  version-string and SemVer ambiguities already documented above:
+  disclosed and accepted, not hidden.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
