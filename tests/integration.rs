@@ -1287,3 +1287,135 @@ fn deeply_nested_json_fails_cleanly_instead_of_a_stack_overflow() {
         "expected a recursion-limit error, got: {stderr}"
     );
 }
+
+// --- Per-format malformed-input tests ---------------------------------
+// CSV/JSON already have their own dedicated malformed-file tests above.
+// Every other format gets one here: a `malformed_garbage.<ext>` fixture -
+// plain readable text with the right extension but none of the real
+// format's structure (no Parquet footer, no SQLite header, no valid TOML
+// syntax past the first token, etc.) - proving each reader fails with a
+// clean, actionable error rather than a panic. This was verified
+// empirically against every format before being written up as a test, not
+// assumed: every one of them already propagates the underlying crate's own
+// error through `?`/`with_context` rather than unwrapping, so none of this
+// required a code fix - it only needed the coverage locking it in.
+
+// Only called from #[cfg(feature = "...")]-gated tests below, so the
+// default (no --features) build sees it as unused - allow(dead_code)
+// rather than a long any(feature = ...) list naming every gate.
+#[allow(dead_code)]
+fn assert_fails_without_panicking(fixture_name: &str) {
+    let output = Command::new(bin())
+        .args([fixture(fixture_name).to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        !output.status.success(),
+        "{fixture_name}: expected a non-zero exit for malformed input"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.is_empty(),
+        "{fixture_name}: expected a non-empty, actionable error message"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("RUST_BACKTRACE"),
+        "{fixture_name}: expected a clean handled error, got what looks like a panic: {stderr}"
+    );
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn malformed_parquet_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.parquet");
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn malformed_arrow_ipc_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.arrow");
+}
+
+#[cfg(feature = "avro")]
+#[test]
+fn malformed_avro_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.avro");
+}
+
+#[cfg(feature = "msgpack")]
+#[test]
+fn malformed_msgpack_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.msgpack");
+}
+
+#[cfg(feature = "cbor")]
+#[test]
+fn malformed_cbor_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.cbor");
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn malformed_xml_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.xml");
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn malformed_npy_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.npy");
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn malformed_npz_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.npz");
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn malformed_xlsx_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.xlsx");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn malformed_sqlite_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.sqlite");
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn malformed_toml_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.toml");
+}
+
+#[cfg(feature = "yaml")]
+#[test]
+fn malformed_yaml_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.yaml");
+}
+
+#[cfg(feature = "ini")]
+#[test]
+fn malformed_ini_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.ini");
+}
+
+#[cfg(feature = "dbase")]
+#[test]
+fn malformed_dbase_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.dbf");
+}
+
+#[cfg(feature = "stata")]
+#[test]
+fn malformed_stata_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.dta");
+}
+
+#[cfg(feature = "sas7bdat")]
+#[test]
+fn malformed_sas7bdat_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.sas7bdat");
+}

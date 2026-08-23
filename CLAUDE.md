@@ -847,6 +847,25 @@ for the deeply-nested JSON case specifically, never a stack overflow
 `profile_json_path`'s own recursive flattening here, confirmed rather
 than assumed).
 
+Every other format also has its own malformed-input test now (CSV/JSON's
+own dedicated fixtures above predate this and are more varied; every other
+format gets one `tests/fixtures/malformed_garbage.<ext>` fixture -
+readable text with the right extension but none of the real format's
+structure - and one `#[cfg(feature = "...")]`-gated test asserting a
+clean, actionable error rather than a panic, via the shared
+`assert_fails_without_panicking` helper). This was verified empirically
+against every format *before* being written up as a test, not assumed:
+feeding each reader random garbage, and separately a truncated-halfway
+copy of a real fixture, confirmed every one of them already propagates
+the underlying crate's own error through `?`/`with_context` rather than
+unwrapping - so none of this needed a code fix, only the coverage locking
+it in. One genuinely interesting, non-obvious finding from that
+verification: TOML/YAML/INI can *fail to error at all* on a truncated
+file if the cut happens to land at a syntactically valid boundary (e.g.
+right after a complete `key = value` line) - not a bug, just how lenient
+plain-text formats degrade, the same way a CSV truncated after a complete
+row also "just works" with fewer rows.
+
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
 black-box integration tests there's also a `#[cfg(test)] mod tests` at the
