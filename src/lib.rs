@@ -3088,6 +3088,76 @@ fn xml_element_to_json(el: &xmltree::Element) -> JsonValue {
     }
 }
 
+// Every other nested format here (JSON, TOML, YAML, MessagePack, CBOR) is
+// protected against a stack-overflow crash on a deeply-nested adversarial
+// document by an explicit recursion/depth limit in its own parsing crate
+// (serde_json's built-in limit, toml_edit's `#![recursion_limit = "256"]`,
+// serde_norway's, rmpv's, ciborium's - each verified directly, not
+// assumed, the same discipline as everywhere else in this file). `xmltree`
+// has no such guard at all - `Element::parse`'s own tree-building recurses
+// once per nesting level with nothing capping it, so a document nested
+// tens of thousands of levels deep reliably aborts the whole process with
+// a real stack overflow, not a catchable error (confirmed empirically: a
+// 50,000-level `<a><a><a>...` document crashes the compiled binary).
+// Since the crash happens *inside* `Element::parse` itself, a depth check
+// added after that call would be too late - `xml_nesting_too_deep` scans
+// the raw text first and refuses to hand xmltree anything more deeply
+// nested than `MAX_XML_DEPTH`, the same "clean, actionable error instead
+// of a crash" contract every other format already has.
+#[cfg(feature = "xml")]
+const MAX_XML_DEPTH: usize = 512;
+
+/// A conservative pre-parse scan for excessive tag-nesting depth - not a
+/// full XML tokenizer, just enough state to walk past comments/CDATA/
+/// processing instructions/DOCTYPE (whose content must never affect the
+/// depth count) and tell an opening tag from a closing or self-closing
+/// one. Deliberately errs toward over-counting depth rather than under-
+/// counting it: the one known gap is a literal, unescaped '>' inside an
+/// attribute value (legal but very rare in practice - virtually every
+/// real XML writer escapes it as `&gt;` even though the spec doesn't
+/// strictly require it outside the literal sequence "]]>"), which could
+/// end a tag scan early. In that specific, narrow case this scan can
+/// still miss a genuinely deep document - a false negative that only
+/// returns this project to its pre-fix behavior for that one exotic
+/// shape, never worse than before.
+#[cfg(feature = "xml")]
+fn xml_nesting_too_deep(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &content[i..];
+        if rest.starts_with("<!--") {
+            i = rest.find("-->").map_or(bytes.len(), |p| i + p + 3);
+        } else if rest.starts_with("<![CDATA[") {
+            i = rest.find("]]>").map_or(bytes.len(), |p| i + p + 3);
+        } else if rest.starts_with("<?") {
+            i = rest.find("?>").map_or(bytes.len(), |p| i + p + 2);
+        } else if rest.starts_with("<!") {
+            // DOCTYPE or another markup declaration - skip to its closing '>'.
+            i = rest.find('>').map_or(bytes.len(), |p| i + p + 1);
+        } else if rest.as_bytes().get(1) == Some(&b'/') {
+            depth = depth.saturating_sub(1);
+            i = rest.find('>').map_or(bytes.len(), |p| i + p + 1);
+        } else {
+            let end = rest.find('>').map_or(bytes.len(), |p| i + p + 1);
+            let self_closing = end >= 2 && bytes.get(end - 2) == Some(&b'/');
+            if !self_closing {
+                depth += 1;
+                if depth > MAX_XML_DEPTH {
+                    return true;
+                }
+            }
+            i = end;
+        }
+    }
+    false
+}
+
 /// If the root element's children all share one tag name (the common
 /// `<root><item>...</item><item>...</item></root>` shape), each becomes a
 /// record - mirroring the JSON reader's `[...]` array-of-objects mode.
@@ -3099,12 +3169,15 @@ fn columns_from_xml(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use std::fs::File;
-    use std::io::BufReader;
     use xmltree::XMLNode;
 
-    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let root = xmltree::Element::parse(BufReader::new(file))
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    if xml_nesting_too_deep(&content) {
+        bail!(
+            "{path:?} has more than {MAX_XML_DEPTH} levels of nested XML elements - refusing to parse it (this would otherwise risk a stack overflow, since xmltree has no recursion limit of its own)"
+        );
+    }
+    let root = xmltree::Element::parse(content.as_bytes())
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("failed to parse {path:?} as XML"))?;
 
@@ -4643,6 +4716,46 @@ mod tests {
         assert_eq!(x.ideal_type, "i64");
     }
 
+    // xml_nesting_too_deep is the pre-parse guard added after discovering
+    // xmltree has no recursion limit of its own (unlike every other nested
+    // format's crate here) - a genuinely deep document reliably stack-
+    // overflowed the compiled binary before this existed, confirmed
+    // empirically at 50,000 levels of nesting, not assumed. These test the
+    // scanner directly; deeply_nested_xml_fails_cleanly_instead_of_a_stack_overflow
+    // in tests/integration.rs proves the fix holds through the full binary.
+
+    #[cfg(feature = "xml")]
+    #[test]
+    fn xml_nesting_too_deep_rejects_a_document_past_the_limit() {
+        let deep = format!("<root>{}1{}</root>", "<a>".repeat(600), "</a>".repeat(600));
+        assert!(xml_nesting_too_deep(&deep));
+    }
+
+    #[cfg(feature = "xml")]
+    #[test]
+    fn xml_nesting_too_deep_accepts_a_document_comfortably_under_the_limit() {
+        let shallow = format!("<root>{}1{}</root>", "<a>".repeat(50), "</a>".repeat(50));
+        assert!(!xml_nesting_too_deep(&shallow));
+    }
+
+    #[cfg(feature = "xml")]
+    #[test]
+    fn xml_nesting_too_deep_ignores_angle_brackets_inside_comments_and_cdata() {
+        let noisy = format!(
+            "<root><!-- {} --><item><![CDATA[{}]]></item></root>",
+            "<a>".repeat(600),
+            "<a>".repeat(600)
+        );
+        assert!(!xml_nesting_too_deep(&noisy));
+    }
+
+    #[cfg(feature = "xml")]
+    #[test]
+    fn xml_nesting_too_deep_does_not_count_self_closing_tags_as_adding_depth() {
+        let wide = format!("<root>{}</root>", "<item/>".repeat(5000));
+        assert!(!xml_nesting_too_deep(&wide));
+    }
+
     #[test]
     fn suggest_ideal_type_flags_leading_zeros_already_lost_by_numeric_parse() {
         let (ideal, note) = suggest_ideal_type(&["02134", "90210"], "i64");
@@ -5553,6 +5666,40 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&["9223372036854775808"], "String"); // i64::MAX + 1
         assert_eq!(ideal, "f64");
         assert!(note.contains("exceed i64"));
+    }
+
+    #[test]
+    fn suggest_ideal_type_category_threshold_boundary_on_unique_count() {
+        // CLAUDE.md documents the category threshold as "<=50 unique
+        // values AND a uniqueness ratio under 5%" but neither edge had a
+        // test locking in the exact boundary until now. Ratio is held
+        // comfortably under 5% for both cases (2.5%/2.55%) - only the
+        // *unique value count* crosses the documented <=50 cutoff.
+        let at_50: Vec<String> = (0..2000).map(|i| format!("v{}", i % 50)).collect();
+        let refs: Vec<&str> = at_50.iter().map(String::as_str).collect();
+        let (ideal, _) = suggest_ideal_type(&refs, "String");
+        assert_eq!(ideal, "enum / category"); // exactly 50 unique - still within the limit
+
+        let at_51: Vec<String> = (0..2000).map(|i| format!("v{}", i % 51)).collect();
+        let refs: Vec<&str> = at_51.iter().map(String::as_str).collect();
+        let (ideal, _) = suggest_ideal_type(&refs, "String");
+        assert_eq!(ideal, "String"); // one past the limit, even though the ratio is still tiny
+    }
+
+    #[test]
+    fn suggest_ideal_type_category_threshold_boundary_on_ratio() {
+        // Unique count held constant at 10 (well under the 50-value cap) -
+        // only the uniqueness *ratio* crosses the documented "<5%" cutoff.
+        // The check is a strict `<`, so exactly 5.0% must NOT count.
+        let at_5_pct: Vec<String> = (0..200).map(|i| format!("v{}", i % 10)).collect(); // 10/200 = 5.0% exactly
+        let refs: Vec<&str> = at_5_pct.iter().map(String::as_str).collect();
+        let (ideal, _) = suggest_ideal_type(&refs, "String");
+        assert_eq!(ideal, "String"); // exactly 5% - not under it, so this must not count
+
+        let just_under_5_pct: Vec<String> = (0..201).map(|i| format!("v{}", i % 10)).collect(); // 10/201 ~= 4.975%
+        let refs: Vec<&str> = just_under_5_pct.iter().map(String::as_str).collect();
+        let (ideal, _) = suggest_ideal_type(&refs, "String");
+        assert_eq!(ideal, "enum / category"); // just under 5% - now it counts
     }
 
     // --- Content-sniffing tests ---------------------------------------

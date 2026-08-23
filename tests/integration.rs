@@ -1338,6 +1338,93 @@ fn deeply_nested_json_fails_cleanly_instead_of_a_stack_overflow() {
     );
 }
 
+#[cfg(feature = "xml")]
+#[test]
+fn deeply_nested_xml_fails_cleanly_instead_of_a_stack_overflow() {
+    // Unlike JSON/TOML/YAML/MessagePack/CBOR, xmltree has no recursion
+    // guard of its own - confirmed by this exact adversarial shape
+    // genuinely stack-overflowing the compiled binary (SIGABRT, not a
+    // clean error) before xml_nesting_too_deep's pre-parse scan was added.
+    // This locks in the fix.
+    let output = Command::new(bin())
+        .args([fixture("malformed_deeply_nested.xml").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert!(
+        output.status.code().is_some(),
+        "expected a clean exit, not a signal (e.g. a stack-overflow abort): {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("RUST_BACKTRACE"),
+        "expected a clean handled error, got what looks like a crash: {stderr}"
+    );
+    assert!(
+        stderr.contains("levels of nested XML elements"),
+        "expected a nesting-depth error, got: {stderr}"
+    );
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn xml_with_comments_cdata_and_self_closing_tags_is_not_miscounted_as_too_deep() {
+    // The depth pre-scan has to walk past comment/CDATA content (which can
+    // contain literal '<'/'>' characters that must not count as real tags)
+    // and recognize self-closing tags (which must not add net depth) -
+    // otherwise a legitimate, shallow document could be wrongly rejected.
+    let path = fixture("_scratch_xml_comments_cdata.xml");
+    std::fs::write(
+        &path,
+        r#"<root>
+  <!-- a comment with < and > and <<<many>>> angle brackets -->
+  <item><![CDATA[some <fake> <<<tags>>> here]]></item>
+  <nested><deep><deeper><deepest>value</deepest></deeper></deep></nested>
+  <self_closing_a/><self_closing_a/><self_closing_a/>
+</root>
+"#,
+    )
+    .unwrap();
+    let doc = run_json("_scratch_xml_comments_cdata.xml", &[]);
+    std::fs::remove_file(&path).ok();
+    let cols = table(&doc, "_scratch_xml_comments_cdata");
+
+    // The CDATA content came through as a plain value, not parsed as markup.
+    let item = column(cols, "item");
+    assert_eq!(item["sample_values"][0], "some <fake> <<<tags>>> here");
+
+    let deepest = column(cols, "nested.deep.deeper.deepest");
+    assert_eq!(deepest["sample_values"][0], "value");
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn xml_many_shallow_self_closing_siblings_is_not_miscounted_as_too_deep() {
+    // 2,000 self-closing siblings at depth 1 - a legitimate, wide-but-
+    // shallow document that must not trip the nesting-depth guard, which
+    // only cares about depth, not element count. Doesn't inspect the
+    // resulting columns (an empty self-closing tag with no attributes or
+    // content is its own, unrelated "#text": null fallback shape) - the
+    // only thing this proves is that width alone never triggers the
+    // depth-guard error.
+    let path = fixture("_scratch_xml_wide_self_closing.xml");
+    let mut content = String::from("<root>");
+    content.push_str(&"<item/>".repeat(2000));
+    content.push_str("</root>");
+    std::fs::write(&path, content).unwrap();
+    let output = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .expect("failed to run binary");
+    std::fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "a wide-but-shallow document should never trip the depth guard: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // --- Semantic type detection through every format's own reader --------
 // suggest_ideal_type is format-agnostic (it only ever sees raw strings),
 // and CSV/JSON already exercise it exhaustively (type_detection.csv,

@@ -451,7 +451,22 @@ flattener**, rather than reimplementing recursion per format:
   detection then mirrors the other formats' own dual-mode choices: if the
   root's children are all the same tag (`<root><item/><item/></root>`),
   each is a record; otherwise the whole document is one record, TOML's and
-  an INI section's choice for their own single-document shapes.
+  an INI section's choice for their own single-document shapes. XML is also
+  the one nested format whose crate has no recursion guard of its own -
+  `xmltree`'s own tree-building recurses once per nesting level with
+  nothing capping it, confirmed to genuinely stack-overflow the compiled
+  binary on a 50,000-level-deep adversarial document (a real SIGABRT, not
+  a catchable error) before `xml_nesting_too_deep` was added. That function
+  runs a conservative pre-parse scan of the raw text - not a full
+  tokenizer, just enough state to walk past comments/CDATA/processing
+  instructions/DOCTYPE (whose content must never affect the depth count)
+  and tell an opening tag from a closing or self-closing one - and refuses
+  to hand `xmltree` anything nested past `MAX_XML_DEPTH` (512), the same
+  clean-error-instead-of-a-crash contract every other nested format already
+  gets from its own parsing crate (serde_json's built-in limit,
+  toml_edit's `#![recursion_limit = "256"]`, serde_norway's, rmpv's,
+  ciborium's - each verified directly against that crate's own source, not
+  assumed, before trusting it as already-safe).
 - Parquet/Arrow IPC's Struct/List/Map columns get bridged through Arrow's
   own JSON writer (`arrow::json::writer::ArrayWriter`) into the same
   `serde_json::Map` shape, then call `profile_json_path` directly (a Map
@@ -710,6 +725,26 @@ entirely:
   whole column's classification on a single non-conforming value (a
   "mostly UUIDs" column is not a trustworthy UUID column) rather than
   taking a majority vote.
+- **A deeply-nested XML document could crash the whole process with a real
+  stack overflow, not a handled error** - a third bug this project's
+  adversarial-testing practice found directly, the same way the infinity/
+  NaN and i64-precision-loss bugs below were found: not reasoned about in
+  advance, but discovered by deliberately trying to break the tool.
+  `malformed_deeply_nested.json` already proved JSON survives unbounded
+  nesting depth cleanly, so the natural adversarial question was whether
+  every *other* nested format (TOML, YAML, MessagePack, CBOR, XML) had the
+  same protection - each format's own parsing crate was checked directly
+  rather than assumed safe by analogy, and every one of them does have an
+  explicit recursion/depth guard **except** `xmltree`, confirmed by
+  actually constructing a 50,000-level-deep adversarial XML document and
+  watching the compiled binary abort with a genuine stack overflow.
+  `xml_nesting_too_deep` (see the Architecture section's XML paragraph)
+  closes this with a pre-parse scan that refuses anything nested past a
+  fixed depth, restoring the same "clean error, never a crash" contract
+  every other format already had - verified not to false-positive on
+  legitimate complex XML either (comments/CDATA containing literal
+  `<`/`>` characters, self-closing tags, thousands of wide-but-shallow
+  siblings).
 - **Hex colors and IMEI** - two more precise, low-risk checks. `is_hex_color`
   is the `parse_prefixed_int` pattern again: a `#` prefix
   plus exactly 3/4/6/8 hex digits (RGB/RGBA/RRGGBB/RRGGBBAA) is essentially
@@ -858,10 +893,15 @@ entirely:
   same verification discipline), `is_lat_lon_pair` at exactly ±90/±180,
   every cron field at its real minimum and maximum simultaneously
   (`"0 0 1 1 0"` and `"59 23 31 12 7"` - note day-of-week 7 meaning Sunday,
-  the same as 0, is exercised specifically), and the actual decision
-  boundary behind the i64-overflow precision-loss note: `i64::MAX` itself
-  gets no note (it fits exactly), `i64::MAX + 1` does - not an arbitrary
-  digit-count threshold, the literal boundary the code checks.
+  the same as 0, is exercised specifically), the actual decision
+  boundary behind the i64-overflow precision-loss note (`i64::MAX` itself
+  gets no note since it fits exactly, `i64::MAX + 1` does - not an
+  arbitrary digit-count threshold, the literal boundary the code checks),
+  and the category-detection threshold's two independent edges (unique
+  value count crossing exactly 50 with the ratio held fixed and tiny; the
+  uniqueness ratio crossing exactly 5% with the unique count held fixed at
+  10 - the check is a strict `<`, so precisely 5.0% is confirmed to *not*
+  count).
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
@@ -1036,7 +1076,11 @@ clean, actionable error naming the actual problem - never a panic, and
 for the deeply-nested JSON case specifically, never a stack overflow
 (serde_json's own built-in recursion limit is what actually protects
 `profile_json_path`'s own recursive flattening here, confirmed rather
-than assumed).
+than assumed). A matching `malformed_deeply_nested.xml` fixture covers the
+same adversarial shape for XML - the one nested format that needed an
+actual code fix (`xml_nesting_too_deep`) rather than just a test locking in
+already-correct behavior, since `xmltree` has no recursion guard of its own
+(see the design philosophy section above for how this was found).
 
 Every other format also has its own malformed-input test now (CSV/JSON's
 own dedicated fixtures above predate this and are more varied; every other
