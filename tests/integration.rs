@@ -1419,3 +1419,172 @@ fn malformed_stata_fails_cleanly() {
 fn malformed_sas7bdat_fails_cleanly() {
     assert_fails_without_panicking("malformed_garbage.sas7bdat");
 }
+
+// --- Format-level edge-case tests --------------------------------------
+// Degenerate but structurally *valid* inputs - zero rows, empty documents,
+// unicode content - as opposed to the malformed/garbage-input tests above.
+// Every one of these was verified empirically before being written up:
+// none of them needed a code fix, they were already handled sanely, this
+// just locks the behavior in.
+
+#[test]
+fn json_empty_array_and_empty_object_produce_an_empty_table_not_a_crash() {
+    for fixture_name in ["edge_empty_array.json", "edge_empty_object.json"] {
+        let doc = run_json(fixture_name, &[]);
+        let cols = table(&doc, fixture_name.strip_suffix(".json").unwrap());
+        assert!(cols.is_empty(), "{fixture_name}: expected an empty table");
+    }
+}
+
+#[test]
+fn json_all_null_field_is_100_percent_missing_not_a_crash() {
+    let doc = run_json("edge_all_null_field.json", &[]);
+    let cols = table(&doc, "edge_all_null_field");
+    let a = column(cols, "a");
+    assert_eq!(a["missing_pct"].as_f64().unwrap(), 100.0);
+    assert!(a["notes"].as_str().unwrap().contains("empty/all null"));
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn parquet_zero_rows_still_reports_the_schema_not_a_crash() {
+    let doc = run_json("edge_zero_rows.parquet", &[]);
+    let cols = table(&doc, "edge_zero_rows");
+    assert_eq!(cols.len(), 2);
+    for c in cols {
+        assert_eq!(c["missing_pct"].as_f64().unwrap(), 0.0);
+        assert!(c["notes"].as_str().unwrap().contains("empty/all null"));
+    }
+}
+
+#[cfg(feature = "avro")]
+#[test]
+fn avro_zero_records_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("edge_zero_records.avro", &[]);
+    let cols = table(&doc, "edge_zero_records");
+    assert!(cols.is_empty());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_table_with_zero_rows_still_reports_its_columns_not_a_crash() {
+    let doc = run_json("edge_zero_rows.sqlite", &[]);
+    let cols = table(&doc, "items");
+    assert_eq!(cols.len(), 2);
+    for c in cols {
+        assert!(c["notes"].as_str().unwrap().contains("empty/all null"));
+    }
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn excel_header_only_sheet_and_unicode_content_both_work() {
+    let doc = run_json("edge_zero_rows_and_unicode.xlsx", &[]);
+
+    let header_only = table(&doc, "HeaderOnly");
+    assert_eq!(header_only.len(), 2);
+    for c in header_only {
+        assert!(c["notes"].as_str().unwrap().contains("empty/all null"));
+    }
+
+    let unicode = table(&doc, "Unicode");
+    let name = column(unicode, "name");
+    let samples: Vec<&str> = name["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(samples.contains(&"café"));
+    assert!(samples.contains(&"日本語"));
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn xml_empty_root_element_is_an_actionable_error_not_a_crash() {
+    let output = Command::new(bin())
+        .args([fixture("edge_empty_root.xml").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("root"),
+        "expected an error naming the empty root element: {stderr}"
+    );
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn xml_unicode_text_content_round_trips_exactly() {
+    let doc = run_json("edge_unicode.xml", &[]);
+    let cols = table(&doc, "edge_unicode");
+    let text = column(cols, "#text");
+    let samples: Vec<&str> = text["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(samples.contains(&"café"));
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn npy_zero_length_array_is_an_empty_column_not_a_crash() {
+    let doc = run_json("edge_empty_array.npy", &[]);
+    let cols = table(&doc, "edge_empty_array");
+    assert_eq!(cols.len(), 1);
+    assert!(
+        cols[0]["notes"]
+            .as_str()
+            .unwrap()
+            .contains("empty/all null")
+    );
+}
+
+#[cfg(feature = "msgpack")]
+#[test]
+fn msgpack_zero_byte_file_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("edge_empty.msgpack", &[]);
+    assert!(table(&doc, "edge_empty").is_empty());
+}
+
+#[cfg(feature = "cbor")]
+#[test]
+fn cbor_zero_byte_file_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("edge_empty.cbor", &[]);
+    assert!(table(&doc, "edge_empty").is_empty());
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn toml_zero_byte_file_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("edge_empty_doc.toml", &[]);
+    assert!(table(&doc, "edge_empty_doc").is_empty());
+}
+
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_zero_byte_file_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("edge_empty_doc.yaml", &[]);
+    assert!(table(&doc, "edge_empty_doc").is_empty());
+}
+
+#[cfg(feature = "ini")]
+#[test]
+fn ini_zero_byte_file_is_an_actionable_error_not_a_crash() {
+    // Unlike TOML/YAML (a genuinely empty document is valid there), INI's
+    // own reader treats zero sections as an error - different from the
+    // other two, but still a clean, actionable one rather than a panic.
+    let output = Command::new(bin())
+        .args([fixture("edge_empty_doc.ini").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("section"),
+        "expected an error naming the missing sections: {stderr}"
+    );
+}

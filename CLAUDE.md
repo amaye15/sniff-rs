@@ -866,6 +866,23 @@ right after a complete `key = value` line) - not a bug, just how lenient
 plain-text formats degrade, the same way a CSV truncated after a complete
 row also "just works" with fewer rows.
 
+A third `tests/fixtures/edge_*` family covers structurally *valid* but
+degenerate input, as opposed to malformed/garbage: a zero-row Parquet
+file (schema present, no data), a zero-record Avro file, a SQLite table
+with no rows, an Excel workbook with a header-only sheet plus a separate
+sheet with unicode content (café/日本語) in the same file, an XML document
+whose root element has no children (a clean "nothing to profile" error,
+not a crash) alongside a separate unicode-content XML document that does
+work, a zero-length NumPy array, a JSON `[]`/`{}` top-level value, a JSON
+field that's `null` in every record, and a genuinely zero-byte file for
+every format lenient enough to treat that as "zero records" (MessagePack/
+CBOR/TOML/YAML) versus INI, whose own reader treats zero sections as an
+error instead - a real, documented difference between formats' own
+conventions, not an inconsistency in this tool. Every case here was
+verified empirically first, the same as the malformed-input family: none
+of it needed a code fix, all of it was already handled correctly and
+simply lacked a test locking the behavior in.
+
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the
 black-box integration tests there's also a `#[cfg(test)] mod tests` at the
