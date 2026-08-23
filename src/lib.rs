@@ -636,6 +636,75 @@ fn is_imei(s: &str) -> bool {
     s.len() == 15 && digits_of(s).is_some_and(|d| luhn_checksum_valid(&d))
 }
 
+/// NHTSA's VIN letter-to-digit transliteration table (ISO 3779-derived,
+/// used for the North American check-digit calculation). I/O/Q are never
+/// valid VIN characters at all (excluded from the standard to avoid
+/// confusion with 1/0), so they correctly fall through to None here rather
+/// than needing special-casing.
+fn vin_char_value(c: u8) -> Option<u32> {
+    Some(match c {
+        b'0'..=b'9' => u32::from(c - b'0'),
+        b'A' => 1,
+        b'B' => 2,
+        b'C' => 3,
+        b'D' => 4,
+        b'E' => 5,
+        b'F' => 6,
+        b'G' => 7,
+        b'H' => 8,
+        b'J' => 1,
+        b'K' => 2,
+        b'L' => 3,
+        b'M' => 4,
+        b'N' => 5,
+        b'P' => 7,
+        b'R' => 9,
+        b'S' => 2,
+        b'T' => 3,
+        b'U' => 4,
+        b'V' => 5,
+        b'W' => 6,
+        b'X' => 7,
+        b'Y' => 8,
+        b'Z' => 9,
+        _ => return None,
+    })
+}
+
+const VIN_WEIGHTS: [u32; 17] = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2];
+
+/// The North American VIN check-digit scheme: each of the 17 characters'
+/// transliterated value times its position weight, summed and reduced
+/// mod 11 - the result must equal position 9's own character (as a digit,
+/// or 'X' for a remainder of 10; position 9 IS the check digit, which is
+/// why its own weight is 0 - it contributes nothing to the sum it's being
+/// checked against). Verified by hand (recomputed independently, not just
+/// trusted from this function's own output) against the canonical
+/// reference VIN "1HGCM82633A004352" used throughout VIN-checksum
+/// documentation, plus a tampered counterpart - see CLAUDE.md for why this
+/// gets a smaller verification set than IBAN/ISBN's multiple independent
+/// real numbers.
+fn is_vin(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 17 {
+        return false;
+    }
+    let mut sum = 0u32;
+    for (i, &c) in b.iter().enumerate() {
+        let Some(v) = vin_char_value(c) else {
+            return false;
+        };
+        sum += v * VIN_WEIGHTS[i];
+    }
+    let remainder = sum % 11;
+    let expected = if remainder == 10 {
+        b'X'
+    } else {
+        b'0' + remainder as u8
+    };
+    b[8] == expected
+}
+
 fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // Precise, unambiguous grammars are checked first - each one fully
     // explains the whole string, so there's no risk of a cruder check
@@ -658,14 +727,16 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
             "matches IBAN format (mod-97 checksum valid)".to_string(),
         );
     }
-    // ISBN/EAN/UPC/IMEI are all checked ahead of the broader-range credit
-    // card check below: they only match an exact 10, 12, 13, or 15-digit
-    // length, so the more narrowly-scoped match should win a tie (a
-    // 13-digit number can in principle satisfy both a card issuer's Luhn
-    // check and EAN-13's own mod-10 check by coincidence - genuinely
+    // ISBN/EAN/UPC/IMEI/VIN are all checked ahead of the broader-range
+    // credit card check below: they only match an exact 10, 12, 13, 15, or
+    // 17-character length, so the more narrowly-scoped match should win a
+    // tie (a 13-digit number can in principle satisfy both a card issuer's
+    // Luhn check and EAN-13's own mod-10 check by coincidence - genuinely
     // undecidable from the digits alone without domain context, the same
     // kind of irreducible ambiguity as a dotted-quad value being valid as
-    // both IPv4 and a version string).
+    // both IPv4 and a version string; a VIN containing only digits, which
+    // the standard doesn't strictly forbid though real ones never do this,
+    // is the same story at 17 characters).
     if values.iter().all(|v| is_isbn10(v)) {
         return (
             "ISBN-10".to_string(),
@@ -688,6 +759,12 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "IMEI".to_string(),
             "matches IMEI format (15 digits, Luhn checksum valid)".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_vin(v)) {
+        return (
+            "VIN".to_string(),
+            "matches Vehicle Identification Number format (mod-11 checksum valid)".to_string(),
         );
     }
     if values.iter().all(|v| is_credit_card_number(v)) {
@@ -3721,7 +3798,8 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "Hex Color"
         | "IMEI"
         | "JWT"
-        | "Geographic Coordinates" => Some(("string", None)),
+        | "Geographic Coordinates"
+        | "VIN" => Some(("string", None)),
         _ => None,
     }
 }
@@ -4391,6 +4469,41 @@ mod tests {
         assert_eq!(ideal, "IMEI");
     }
 
+    // The canonical reference VIN used throughout VIN-checksum
+    // documentation, hand-recomputed independently (not just trusted from
+    // is_vin's own output) before being relied on:
+    //   positions:  1=1 2=H 3=G 4=C 5=M 6=8 7=2 8=6 9=3 10=3 11=A 12=0 13=0 14=4 15=3 16=5 17=2
+    //   values:     1  8  7  3  4  8  2  6  -  3  1  0  0  4  3  5  2   (position 9 excluded, weight 0)
+    //   weights:    8  7  6  5  4  3  2 10  0  9  8  7  6  5  4  3  2
+    //   products:   8 56 42 15 16 24 4 60  0 27  8  0  0 20 12 15  4
+    //   sum = 311, 311 % 11 = 3 -> expected check digit '3', matches position 9's '3'.
+    const REFERENCE_VIN: &str = "1HGCM82633A004352";
+
+    #[test]
+    fn is_vin_validates_the_canonical_reference_vin_and_rejects_a_tampered_one() {
+        assert!(is_vin(REFERENCE_VIN));
+        assert!(!is_vin("1HGCM82633A004353")); // check digit off by one
+        assert!(!is_vin("1HGCM82633A00435")); // 16 chars, too short
+        assert!(!is_vin("1HGCM82633A0043522")); // 18 chars, too long
+        assert!(!is_vin("1HGCM8263IA004352")); // contains 'I' - not a valid VIN character
+    }
+
+    #[test]
+    fn vin_char_value_excludes_i_o_and_q() {
+        assert_eq!(vin_char_value(b'I'), None);
+        assert_eq!(vin_char_value(b'O'), None);
+        assert_eq!(vin_char_value(b'Q'), None);
+        assert_eq!(vin_char_value(b'A'), Some(1));
+        assert_eq!(vin_char_value(b'9'), Some(9));
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_vin() {
+        let (ideal, note) = suggest_ideal_type(&[REFERENCE_VIN], "String");
+        assert_eq!(ideal, "VIN");
+        assert!(note.contains("Vehicle Identification Number"));
+    }
+
     // jwt.io's own canonical example token - the header decodes to
     // {"alg":"HS256","typ":"JWT"}, the payload to a claims object.
     const REFERENCE_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
@@ -4612,6 +4725,7 @@ mod tests {
             let _ = is_embedded_json(s);
             let _ = is_hex_color(s);
             let _ = is_imei(s);
+            let _ = is_vin(s);
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
             let _ = is_lat_lon_pair(s);
@@ -4644,6 +4758,7 @@ mod tests {
             let _ = is_embedded_json(s);
             let _ = is_hex_color(s);
             let _ = is_imei(s);
+            let _ = is_vin(s);
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
             let _ = is_lat_lon_pair(s);
@@ -4693,6 +4808,7 @@ mod tests {
         assert!(!is_isbn13("9780306406156")); // last digit off by one
         assert!(!is_ean_or_upc("4006381333930")); // last digit off by one
         assert!(!is_imei("490154203237519")); // last digit off by one
+        assert!(!is_vin("1HGCM82633A004353")); // check digit off by one
     }
 
     #[test]

@@ -630,6 +630,26 @@ entirely:
   *same* digest length, not just "some hex-shaped length" - a column
   mixing a 32-char and a 40-char value doesn't get the note either,
   confirmed by a dedicated adversarial fixture column.
+- **VIN (Vehicle Identification Number)** - the most algorithmically
+  complex check in this file: 17 characters, transliterated through
+  NHTSA's own letter-to-digit table (I/O/Q are never valid VIN characters
+  at all, excluded from the standard itself to avoid confusion with
+  1/0/0), each multiplied by a fixed per-position weight, summed and
+  reduced mod 11 - the result must equal the check digit at position 9
+  (itself weighted 0, since it's what's being checked against, not part of
+  the sum). Given the complexity, this got extra-careful verification: the
+  canonical reference VIN used throughout VIN-checksum documentation
+  (`"1HGCM82633A004352"`) was recomputed *by hand*, digit by digit, not
+  just trusted from `is_vin`'s own output - the full working is preserved
+  as a comment directly above the test that encodes it
+  (`is_vin_validates_the_canonical_reference_vin_and_rejects_a_tampered_one`).
+  This is honestly a smaller verification set than IBAN/ISBN got (which
+  were checked against 3+ independent real numbers) - a second recalled
+  VIN failed validation during development and was discarded rather than
+  investigated, specifically *because* it couldn't be confirmed as a real,
+  correctly-issued VIN (recalled from memory, not sourced), so it wasn't
+  trustworthy evidence either way. Checked ahead of the credit card number
+  range for the same narrower-match-wins-a-tie reason as ISBN/EAN/IMEI.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and

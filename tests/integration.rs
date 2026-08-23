@@ -993,6 +993,15 @@ fn csv_flags_hash_digest_length_as_a_note_not_a_type_promotion() {
 }
 
 #[test]
+fn csv_recognizes_vin() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let vin = column(cols, "vin");
+    assert_eq!(vin["ideal_type"], "VIN");
+}
+
+#[test]
 fn csv_recognizes_iban_and_credit_card_numbers_via_checksum() {
     let doc = run_json("type_detection.csv", &[]);
     let cols = table(&doc, "type_detection");
@@ -1078,6 +1087,7 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(props["imei"], serde_json::json!({"type": "string"}));
     assert_eq!(props["auth_token"], serde_json::json!({"type": "string"}));
     assert_eq!(props["location"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["vin"], serde_json::json!({"type": "string"}));
 }
 
 // --- Adversarial / robustness tests ----------------------------------
@@ -1133,6 +1143,7 @@ fn adversarial_csv_never_false_positives_on_any_near_miss_column() {
     // Mixed digest "kinds" (a 32-char then a 40-char value) within one
     // column must not trigger the hash-digest note either.
     assert_eq!(column(cols, "near_hash")["notes"], "");
+    assert_ne!(column(cols, "near_vin")["ideal_type"], "VIN");
 
     // A column that's 3 real UUIDs and 1 clearly-not-a-UUID value must not
     // be classified as UUID - one bad value vetoes the whole column.
