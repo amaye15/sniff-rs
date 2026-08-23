@@ -1641,3 +1641,160 @@ fn empty_syslog_file_still_reports_the_fixed_column_set_not_a_crash() {
         assert!(c["notes"].as_str().unwrap().contains("empty/all null"));
     }
 }
+
+// --- Content-based format auto-detection -------------------------------
+// detect_format tries the extension first, exactly as before - these prove
+// its fallback (sniff_format, in lib.rs) carries a real extensionless or
+// wrongly-named file through the *full* pipeline: correct detection *and*
+// a correct reader dispatch and profile, not just that the classification
+// function itself returns the right enum variant (that narrower claim has
+// its own direct unit tests in lib.rs's #[cfg(test)] module, including the
+// near-miss/boundary cases that would be awkward to prove through a whole
+// subprocess run here).
+
+/// Copies `fixture_name`'s bytes into a fresh tempdir under `dest_name`
+/// (typically an extensionless name, or an unrelated one) so detect_format
+/// sees a real file its extension-based arm can't classify.
+fn copy_fixture_as(fixture_name: &str, dest_name: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("failed to create tempdir");
+    let dest = dir.path().join(dest_name);
+    std::fs::copy(fixture(fixture_name), &dest)
+        .unwrap_or_else(|e| panic!("failed to copy {fixture_name} to {dest:?}: {e}"));
+    (dir, dest)
+}
+
+/// Runs the binary against an arbitrary path (no --format override) and
+/// returns the parsed JSON document - run_json's counterpart for a path
+/// that isn't itself a committed fixture.
+fn run_json_at(dest: &std::path::Path) -> serde_json::Value {
+    let output = Command::new(bin())
+        .args([dest.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "expected content-sniffing to succeed for {dest:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout was not valid JSON ({e}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+#[test]
+fn extensionless_jsonl_is_auto_detected_from_content() {
+    let (_dir, dest) = copy_fixture_as("nested.jsonl", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "json");
+    let cols = table(&doc, "mystery_data");
+    assert!(cols.iter().any(|c| c["name"] == "metadata.risk_score"));
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn extensionless_xml_is_auto_detected_from_content() {
+    let (_dir, dest) = copy_fixture_as("sample.xml", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "xml");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn misnamed_sqlite_file_is_auto_detected_from_content() {
+    // A wrong-but-plausible extension, not just a missing one - proves the
+    // fallback fires for any extension detect_format doesn't itself claim,
+    // not only a literally absent one.
+    let (_dir, dest) = copy_fixture_as("sample.sqlite", "backup.dat");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "sqlite");
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn extensionless_parquet_is_auto_detected_from_content() {
+    let (_dir, dest) = copy_fixture_as("sample.parquet", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "parquet");
+}
+
+#[cfg(feature = "avro")]
+#[test]
+fn extensionless_avro_is_auto_detected_from_content() {
+    let (_dir, dest) = copy_fixture_as("sample.avro", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "avro");
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn extensionless_npy_is_auto_detected_from_content() {
+    let (_dir, dest) = copy_fixture_as("sample_matrix.npy", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "npy");
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn extensionless_xlsx_is_auto_detected_and_disambiguated_from_npz() {
+    let (_dir, dest) = copy_fixture_as("sample.xlsx", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "xlsx");
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn extensionless_npz_is_auto_detected_and_disambiguated_from_xlsx() {
+    let (_dir, dest) = copy_fixture_as("sample.npz", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "npz");
+}
+
+#[cfg(feature = "dbase")]
+#[test]
+fn extensionless_dbase_is_auto_detected_from_content() {
+    let (_dir, dest) = copy_fixture_as("sample.dbf", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "dbase");
+}
+
+#[cfg(feature = "stata")]
+#[test]
+fn extensionless_stata_is_auto_detected_from_content() {
+    let (_dir, dest) = copy_fixture_as("sample.dta", "mystery_data");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "stata");
+}
+
+#[test]
+fn extension_still_wins_and_is_never_second_guessed_by_content() {
+    // sample.csv's content is genuinely plain CSV text, so this isn't a
+    // mismatch case - what it proves is that a recognized extension routes
+    // straight through the original extension-based arm and never reaches
+    // sniff_format at all, so this fallback existing doesn't change
+    // anything about the tool's existing, already-tested behavior.
+    let doc = run_json("sample.csv", &[]);
+    assert_eq!(doc["format"], "csv");
+}
+
+#[test]
+fn an_extensionless_file_with_no_sniffable_signal_still_gets_an_actionable_error() {
+    // Plain delimited text (TSV) has no magic number or other structural
+    // signal sniff_format looks for (see its doc comment - this is the
+    // same disclosed, deliberate gap CSV/TSV/TOML/YAML/INI all share), so
+    // this must still fail with the same actionable "pass --format"
+    // error it always has, not a wrong guess.
+    let (_dir, dest) = copy_fixture_as("sample.tsv", "mystery_data");
+    let output = Command::new(bin())
+        .args([dest.to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format"),
+        "expected an error pointing at --format: {stderr}"
+    );
+}

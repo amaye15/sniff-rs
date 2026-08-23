@@ -66,7 +66,9 @@ extension-based detection when a file is misnamed or ambiguous — fixed-width
 text and all four log formats (web access + syslog) have no extension
 convention reliable enough to infer from at all (logs are commonly
 `.log`/`.txt`/no extension), so all five are reachable only via `--format`,
-never auto-detected.
+never auto-detected. A missing or unrecognized extension on any *other*
+format first falls back to content-based sniffing before giving up and
+asking for `--format` — see "Content-based format auto-detection" below.
 
 Every optional format has a matching Cargo feature that gates both the
 dependency (`dep:x` in `[features]`) and the reader function itself
@@ -97,6 +99,115 @@ features, which pulls in `bzip2` and a second, older copy of `zstd`
 alongside this project's own. That's a handful of small, fast-compiling
 extra crates — nothing like the DuckDB situation below — so it was judged
 worth it for `.npz` support rather than treated as a reason to skip it.
+
+## Content-based format auto-detection
+
+`detect_format` tries the file extension first, exactly as described above.
+When that fails — no extension, or one this tool doesn't recognize — it
+falls back to `sniff_format`, which reads a small prefix of the file's own
+bytes (and, for Parquet, its last 4 bytes too) looking for a magic number or
+other structural signature, before giving up and asking for `--format`. This
+is the same "declared type is a hint, not the truth" principle the rest of
+this file already applies to every column, turned on the file format itself
+— a misnamed file, or one with no extension at all (a downloaded artifact, a
+piped temp file, a database backup someone renamed `.bak`), doesn't have to
+be guessed at by a human if its content carries a real signal. A *recognized*
+extension is never second-guessed by content — `data.csv` always reads as
+CSV regardless of what sniffing might think, so this is a strict superset of
+the previous behavior: nothing that used to work changed, and cases that
+used to hard-error now succeed automatically.
+
+Deliberately conservative, the same way every heuristic in this file is —
+only formats with a fixed magic number, or a multi-field structural check
+strong enough to be confident rather than a guess, are attempted:
+
+- **SQLite, Avro, Arrow IPC, NumPy (`.npy`)** — each has a short, fixed,
+  unambiguous byte prefix (`"SQLite format 3\0"`, `"Obj\x01"`, `"ARROW1"`,
+  `"\x93NUMPY"` respectively). Checked directly against each reader crate's
+  own source rather than assumed from memory.
+- **SAS7BDAT** — a fixed 32-byte magic (`SAS7BDAT_MAGIC`), copied verbatim
+  from the `sas7bdat` crate's own `probe.rs` (`SAS7BDAT_MAGIC_NUMBER`) — the
+  same "verified against the source" discipline as the rest of this list,
+  notable here specifically because this format has no committed test
+  fixture to cross-check against (see Known limitations), so the crate's own
+  source was the only verification path available.
+- **Parquet** — `"PAR1"` at both the very start of the file *and* the last 4
+  bytes (`"PARE"` for an encrypted footer is also accepted) — checking only
+  the header would let a truncated or unrelated file that happens to open
+  with those 4 bytes false-positive; requiring the footer too closes that
+  gap.
+- **Old-style `.xls`** (pre-2007, OLE2/Compound File Binary) — its container
+  magic (`D0 CF 11 E0 A1 B1 1A E1`) is shared with old `.doc`/`.ppt`, but
+  this tool reads no other format that magic could mean, so there's no
+  practical ambiguity.
+- **Stata `.dta`** — the modern XML-like container (release 117+) opens with
+  a literal `<stata_dta>` tag. The older binary format (102–116) has no
+  fixed string at all, just a numeric release byte — so this combines it
+  with the byte-order byte that always immediately follows (only 0, 1, or 2
+  are real) into one two-field check, confident enough on its own that
+  neither field alone would be.
+- **dBase `.dbf`** — no fixed magic string either, just a version byte that
+  on its own is nowhere near unique (roughly a dozen accepted values out of
+  256 possible). Paired with three more of the header's fixed-offset fields
+  — a valid month/day in the "last updated" date, and a header length and
+  record length that are internally consistent with a real dBase file — the
+  combined false-positive rate is negligible. Verified against the `dbase`
+  crate's own header layout (`header.rs`'s `Header::read_from` and
+  `Version::from`), the same "stack independent weak signals into one
+  confident check" approach Stata's binary format needed for the same
+  underlying reason (no single fixed string available).
+- **Zip-based formats** (`.xlsx`/`.xlsb`/`.ods`, `.npz`) all share the same
+  outer `PK\x03\x04` magic, so telling them apart needs a peek at what's
+  actually packed inside. A zip's local file header stores each entry's
+  filename as plain, uncompressed ASCII, so a substring search over the same
+  head buffer — no real zip/central-directory parsing needed — reliably
+  tells them apart: an OOXML spreadsheet always carries an `xl/`-prefixed
+  entry (verified empirically against this project's own committed `.xlsx`
+  fixtures — `xl/workbook.xml`, `xl/worksheets/sheet1.xml`, etc.), an ODF
+  spreadsheet's first entry is a literal `mimetype` file whose content names
+  its type (`application/vnd.oasis.opendocument.spreadsheet`), and an
+  `.npz` archive's entries are always named `<array-name>.npy`.
+- **JSON and XML** — the only two plain-text formats sniffed, because
+  they're the only two with an unambiguous leading character: `{`/`[` (after
+  skipping leading whitespace) is JSON's own grammar, not a guess, and
+  covers JSON Lines too (each line still opens with `{`). XML requires the
+  character right after `<` to be a valid tag-name start (an ASCII letter,
+  `_`, or the `?` of an XML declaration) specifically so it can't collide
+  with an RFC 3164 syslog line, which also opens with `<` but is always
+  followed by a PRI digit (`"<34>Oct 11 ..."`) — a digit is never a legal
+  XML tag-name start.
+
+**CSV, TSV, TOML, YAML, and INI are deliberately left un-sniffed.** Plain
+delimited or key-value text carries no fixed magic number or unambiguous
+leading character, so guessing between them would mean guessing at intent —
+exactly what this project's heuristics never do (see "Design philosophy"
+below). This is the same category of disclosed, irreducible ambiguity as a
+dotted-quad value being valid as both IPv4 and a version string. Fixed-width
+text and the four log formats aren't attempted either, for the reason
+already stated above: no delimiter or magic number distinguishes them from
+generic text at all, which is exactly why they're `--format`-only in the
+first place, not a gap specific to sniffing.
+
+One further, explicitly out-of-scope case: an extensionless file that's
+*also* gzip- or zstd-compressed. `compression_from_extension` (feeding
+`decompress_if_needed`) is still purely extension-based (`.gz`/`.gzip`/
+`.zst`/`.zstd`) and runs *before* format detection, so a compressed file
+with no extension at all skips decompression entirely and `sniff_format`
+sees raw compressed bytes it has no signature for — a clear `--format`-
+demanding error, not a silent misdetection, but not an automatic pass
+either. Extending sniffing to compression itself was considered and set
+aside as a separate concern from identifying the *inner* data format, the
+thing this feature was actually asked to solve.
+
+Tested at two levels, the same split this project uses for every other
+heuristic: `sniff_format` itself has direct unit tests in `lib.rs`'s
+`#[cfg(test)]` module (one file per format via synthetic byte buffers,
+including near-miss cases — a bad month byte for dBase, an out-of-range
+release byte for Stata, a truncated Parquet footer, a syslog line's PRI
+digit rejected by the XML check), and `tests/integration.rs` proves the
+*full* pipeline end-to-end (extension missing or wrong → sniff → correct
+reader dispatch → correct profile) by copying real fixtures to
+extensionless/misnamed paths and running the compiled binary against them.
 
 ## Output formats
 
@@ -1059,3 +1170,10 @@ benchmark needs and a `std::time::Instant` harness can't easily give it):
   silently misparse a numeric ID as a date; a fixed list either matches
   every value in a column or reports nothing, which is a safer failure
   mode. Extend the list if a reasonable format is missing one.
+- **Content-based format sniffing doesn't cover CSV, TSV, TOML, YAML, or
+  INI**, and doesn't extend to detecting gzip/zstd compression on an
+  extensionless file - see "Content-based format auto-detection" above for
+  why both are deliberate, not oversights. The first is the same
+  irreducible-ambiguity tradeoff as IPv4-vs-version-string; the second is a
+  separate concern (transport encoding, not data format) that was out of
+  scope for what this feature was asked to solve.

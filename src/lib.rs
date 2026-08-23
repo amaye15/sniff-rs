@@ -24,8 +24,12 @@ use serde_json::json;
 /// table per sheet), INI files (one table per section), and .npz archives
 /// (one table per named array) can produce multiple tables; every other
 /// format always produces exactly one implicit table - all of it renders
-/// through the same path. Format is inferred from the file extension
-/// unless --format is given. A .gz or .zst extension is transparently decompressed
+/// through the same path. Format is inferred from the file extension; if
+/// there isn't one, or it's not one this tool recognizes, the file's own
+/// bytes are sniffed instead (a magic number or other structural signature -
+/// see sniff_format), so a misnamed or extensionless file for any format
+/// with such a signature still doesn't need --format. --format always wins
+/// when given. A .gz or .zst extension is transparently decompressed
 /// first, so e.g. data.csv.gz reads exactly like data.csv (gzip always
 /// available; zstd needs --features zstd). Every optional format needs its
 /// own --features flag (see the Supported formats table in CLAUDE.md), or
@@ -3796,7 +3800,202 @@ impl InputFormat {
     }
 }
 
-fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputFormat> {
+// --- Content-based format sniffing (the fallback detect_format reaches for
+// when the extension is missing or unrecognized) ---
+
+/// SAS7BDAT's own fixed 32-byte header magic, copied verbatim from the
+/// `sas7bdat` crate's `probe.rs` (`SAS7BDAT_MAGIC_NUMBER`) rather than
+/// reconstructed from memory - the same "verified against the source, not
+/// assumed" discipline the rest of this file's heuristics already follow.
+const SAS7BDAT_MAGIC: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC2, 0xEA, 0x81, 0x60,
+    0xB3, 0x14, 0x11, 0xCF, 0xBD, 0x92, 0x08, 0x00, 0x09, 0xC7, 0x31, 0x8C, 0x18, 0x1F, 0x10, 0x11,
+];
+
+/// How much of a file's head `sniff_format` reads looking for a magic
+/// number or structural signature: enough to cover every fixed-offset
+/// check below (SAS7BDAT's 32-byte magic is the longest single one) with
+/// headroom for the zip-based substring search, which needs to see past a
+/// spreadsheet's early metadata entries to reach a distinguishing path
+/// like "xl/workbook.xml".
+const SNIFF_HEAD_BYTES: u64 = 64 * 1024;
+
+fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Content-based format detection: the fallback `detect_format` reaches for
+/// once the extension is missing or isn't one this tool recognizes. The
+/// file extension is itself just a hint - the same "declared type is a
+/// hint, not the truth" principle this tool already applies to every
+/// column (see CLAUDE.md's design philosophy) - so a file with no
+/// extension, or a generic one (`.dat`, `.bin`, a download with none at
+/// all), doesn't have to fall back to a `--format`-demanding error if its
+/// own bytes carry a real signal.
+///
+/// Deliberately conservative: only formats with a fixed magic number, or a
+/// multi-field structural check strong enough to be confident rather than a
+/// guess, are attempted here. CSV/TSV/TOML/YAML/INI have no such signal -
+/// plain delimited or key-value text is genuinely ambiguous between them at
+/// the byte level (the same kind of irreducible ambiguity this tool already
+/// discloses rather than guesses at elsewhere, e.g. a dotted-quad value
+/// valid as both IPv4 and a version string) - so those still need an
+/// extension or `--format`. Fixed-width text and the four log formats are
+/// skipped for the same reason they're already `--format`-only: no
+/// delimiter or magic number distinguishes them from generic text either.
+fn sniff_format(path: &Path) -> Option<InputFormat> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut head = Vec::new();
+    file.by_ref()
+        .take(SNIFF_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    if head.is_empty() {
+        return None;
+    }
+
+    // --- Fixed magic numbers - each verified against the reader crate's
+    // own source rather than assumed.
+    if head.starts_with(b"SQLite format 3\0") {
+        return Some(InputFormat::Sqlite);
+    }
+    if head.starts_with(b"Obj\x01") {
+        return Some(InputFormat::Avro);
+    }
+    if head.starts_with(b"ARROW1") {
+        return Some(InputFormat::ArrowIpc);
+    }
+    if head.starts_with(b"\x93NUMPY") {
+        return Some(InputFormat::Npy);
+    }
+    if head.len() >= 32 && head[..32] == SAS7BDAT_MAGIC[..] {
+        return Some(InputFormat::Sas7bdat);
+    }
+    if head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
+        // OLE2/Compound File Binary magic - the pre-2007 .xls container
+        // (also .doc/.ppt, but this tool reads no other format that magic
+        // could mean, so there's no ambiguity in practice).
+        return Some(InputFormat::Xlsx);
+    }
+    if head.starts_with(b"PAR1") && file_len >= 8 {
+        let mut tail = [0u8; 4];
+        if file.seek(SeekFrom::End(-4)).is_ok() && file.read_exact(&mut tail).is_ok() {
+            // "PAR1" is Parquet's normal footer magic, "PARE" marks an
+            // encrypted footer - both are real, valid Parquet files per the
+            // `parquet` crate's own writer (PARQUET_MAGIC /
+            // PARQUET_MAGIC_ENCR_FOOTER in file/mod.rs).
+            if &tail == b"PAR1" || &tail == b"PARE" {
+                return Some(InputFormat::Parquet);
+            }
+        }
+    }
+
+    // --- Stata .dta: the modern XML-like container (release 117+) opens
+    // with a literal ASCII tag. The older binary format (102-116) has no
+    // fixed string at all, just a numeric release byte - so this combines
+    // it with the byte-order byte that always follows (0, 1, or 2) into one
+    // confident two-field check, the same "stack independent weak signals"
+    // approach dBase's check below needs for the same reason.
+    if head.starts_with(b"<stata_dta>") {
+        return Some(InputFormat::Stata);
+    }
+    if head.len() >= 2 && (102..=116).contains(&head[0]) && head[1] <= 2 {
+        return Some(InputFormat::Stata);
+    }
+
+    // --- dBase: also no fixed magic string, just a version byte - on its
+    // own, nowhere near unique (roughly a dozen values out of 256). Paired
+    // with the header's other fixed-offset fields (a valid month/day in the
+    // "last updated" date, and a header/record length that are internally
+    // consistent with a real dBase file) the combined false-positive rate
+    // is negligible - verified against the `dbase` crate's own header
+    // layout (`header.rs`'s `Header::read_from` and `Version::from`) rather
+    // than assumed.
+    if let Some(h) = head.get(0..12) {
+        let version_known = matches!(
+            h[0],
+            0x02 | 0x03 | 0x83 | 0x30..=0x32 | 0x8b | 0xcb | 0x43 | 0x63 | 0xfb | 0xf5
+        );
+        let month = h[2];
+        let day = h[3];
+        let header_len = u16::from_le_bytes([h[8], h[9]]);
+        let record_len = u16::from_le_bytes([h[10], h[11]]);
+        if version_known
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day)
+            && header_len >= 32
+            && record_len >= 1
+        {
+            return Some(InputFormat::Dbase);
+        }
+    }
+
+    // --- Zip-based formats (xlsx/xlsb/ods, npz) share the same outer
+    // magic, so telling them apart needs a peek at what's actually packed
+    // inside. A zip's local file header stores each entry's filename as
+    // plain, uncompressed ASCII, so a substring search over the same head
+    // buffer - no real zip/central-directory parsing needed - reliably
+    // tells them apart: OOXML spreadsheets always carry an "xl/" entry
+    // (verified against this project's own committed .xlsx fixtures), an
+    // ODF spreadsheet's first entry is a literal "mimetype" file naming its
+    // content type, and every entry in an .npz archive is named
+    // "<array-name>.npy".
+    if head.starts_with(b"PK\x03\x04") {
+        if slice_contains(&head, b"application/vnd.oasis.opendocument.spreadsheet") {
+            return Some(InputFormat::Xlsx);
+        }
+        if slice_contains(&head, b"xl/") {
+            return Some(InputFormat::Xlsx);
+        }
+        if slice_contains(&head, b".npy") {
+            return Some(InputFormat::Npz);
+        }
+    }
+
+    // --- Text formats: only the two with an unambiguous leading character
+    // are attempted. CSV/TSV/TOML/YAML/INI are left alone (see the doc
+    // comment above) - a leading '{'/'[' is JSON's own grammar, not a
+    // guess (a YAML flow-style document could in principle also open this
+    // way, but that's vanishingly rare as an entire real-world file rather
+    // than a value inside one - the same disclosed-not-hidden tradeoff as
+    // the geographic-coordinate check). XML requires the character right
+    // after '<' to be a valid tag-name start (an ASCII letter, '_', or the
+    // '?' of an XML declaration) specifically so this can't collide with
+    // an RFC 3164 syslog line, which also opens with '<' but is followed
+    // by a PRI digit ("<34>Oct 11 ...") - a digit is never a legal XML
+    // tag-name start.
+    let mut idx = 0;
+    while idx < head.len() && head[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if let Some(&first) = head.get(idx) {
+        if first == b'{' || first == b'[' {
+            return Some(InputFormat::Json);
+        }
+        if first == b'<'
+            && let Some(&next) = head.get(idx + 1)
+            && (next.is_ascii_alphabetic() || next == b'_' || next == b'?')
+        {
+            return Some(InputFormat::Xml);
+        }
+    }
+
+    None
+}
+
+/// `logical_path` drives extension-based detection (as before) and its
+/// error messages; `read_path` is the file's real, already-decompressed
+/// bytes (see `decompress_if_needed` - for a plain, uncompressed input the
+/// two are the same path) that `sniff_format` reads from when the
+/// extension alone isn't enough.
+fn detect_format(
+    read_path: &Path,
+    logical_path: &Path,
+    override_fmt: &Option<String>,
+) -> Result<InputFormat> {
     if let Some(f) = override_fmt {
         return match f.to_lowercase().as_str() {
             "csv" => Ok(InputFormat::Csv),
@@ -3830,7 +4029,7 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
             }
         };
     }
-    let ext = path
+    let ext = logical_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -3855,12 +4054,20 @@ fn detect_format(path: &Path, override_fmt: &Option<String>) -> Result<InputForm
         "dbf" => Ok(InputFormat::Dbase),
         "dta" => Ok(InputFormat::Stata),
         "sas7bdat" => Ok(InputFormat::Sas7bdat),
-        // No extension convention reliably means fixed-width or a log
-        // format (.txt/.log/no extension are all ambiguous), so all of
-        // these are --format-only, never inferred.
-        other => bail!(
-            "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat explicitly"
-        ),
+        // The extension alone doesn't tell us - either there isn't one, or
+        // it's not one of the above. Before giving up, try the file's own
+        // bytes: fixed-width text and the four log formats have no magic
+        // number or delimiter to sniff either (that's exactly why they're
+        // --format-only above too), so a real hit here can only be one of
+        // sniff_format's magic-backed formats.
+        other => {
+            if let Some(format) = sniff_format(read_path) {
+                return Ok(format);
+            }
+            bail!(
+                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat explicitly"
+            )
+        }
     }
 }
 
@@ -4185,7 +4392,7 @@ pub fn run() -> Result<()> {
     // output naming, and _decompressed_tmp just needs to outlive the reads.
     let (read_path, logical_path, _decompressed_tmp) = decompress_if_needed(&args.input_path)?;
 
-    let format = detect_format(&logical_path, &args.format)?;
+    let format = detect_format(&read_path, &logical_path, &args.format)?;
     let file_name = args
         .input_path
         .file_name()
@@ -5265,5 +5472,141 @@ mod tests {
         let (ideal, note) = suggest_ideal_type(&["9223372036854775808"], "String"); // i64::MAX + 1
         assert_eq!(ideal, "f64");
         assert!(note.contains("exceed i64"));
+    }
+
+    // --- Content-sniffing tests ---------------------------------------
+    // sniff_format only ever runs when the extension already failed to
+    // name a format, so these test it directly against synthetic byte
+    // buffers rather than through detect_format/run - real end-to-end
+    // proof that a specific extensionless *file* round-trips through the
+    // full reader pipeline lives in tests/integration.rs instead. Every
+    // magic number below was checked against its reader crate's own
+    // source (see the doc comments on sniff_format/SAS7BDAT_MAGIC), not
+    // assumed - the same discipline this file's other heuristics follow.
+
+    fn sniff_bytes(bytes: &[u8]) -> Option<InputFormat> {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, bytes).unwrap();
+        sniff_format(tmp.path())
+    }
+
+    fn sniff_matches(bytes: &[u8], expected: &str) {
+        let got = sniff_bytes(bytes).unwrap_or_else(|| panic!("expected a match for {expected}"));
+        assert_eq!(got.as_str(), expected);
+    }
+
+    #[test]
+    fn sniff_format_recognizes_every_fixed_magic_number() {
+        sniff_matches(b"SQLite format 3\x00rest of the file...", "sqlite");
+        sniff_matches(b"Obj\x01\x04\x14avro.codec...", "avro");
+        sniff_matches(b"ARROW1\x00\x00rest...", "arrow_ipc");
+        sniff_matches(b"\x93NUMPY\x01\x00rest...", "npy");
+        sniff_matches(
+            &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0],
+            "xlsx",
+        );
+
+        let mut sas = SAS7BDAT_MAGIC.to_vec();
+        sas.extend_from_slice(b"...rest of a real header");
+        sniff_matches(&sas, "sas7bdat");
+    }
+
+    #[test]
+    fn sniff_format_recognizes_parquet_only_with_a_matching_header_and_footer() {
+        let mut valid = b"PAR1".to_vec();
+        valid.extend_from_slice(b"...fake row groups and footer metadata here...");
+        valid.extend_from_slice(b"PAR1");
+        sniff_matches(&valid, "parquet");
+
+        // Header matches but the footer doesn't - not a real Parquet file
+        // (a truncated download, or something else that happens to open
+        // with "PAR1"), so this must not match.
+        let mut truncated = b"PAR1".to_vec();
+        truncated.extend_from_slice(b"...cut off mid-file, no footer magic");
+        assert!(sniff_bytes(&truncated).is_none());
+    }
+
+    #[test]
+    fn sniff_format_recognizes_both_stata_container_shapes() {
+        sniff_matches(b"<stata_dta><header>...", "stata");
+
+        // Binary format: release byte (102-116) + byte-order byte (0-2).
+        sniff_matches(&[114, 1, 0, 0, 0, 0, 0, 0], "stata");
+
+        // A release byte outside the binary range (117+ is XML-only, so a
+        // bare byte 117 here is neither a real binary release nor the
+        // literal "<stata_dta>" tag) must not match.
+        assert!(sniff_bytes(&[117, 1, 0, 0, 0, 0, 0, 0]).is_none());
+        // Byte-order byte out of range (only 0/1/2 are real).
+        assert!(sniff_bytes(&[114, 5, 0, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn sniff_format_recognizes_dbase_only_with_every_field_consistent() {
+        // version=0x03 (dBase III), date=2026-08-20, num_records=3,
+        // header_len=193, record_len=33 - a real, internally consistent
+        // dBase header (the same shape as tests/fixtures/sample.dbf).
+        let valid: [u8; 12] = [0x03, 126, 8, 20, 3, 0, 0, 0, 193, 0, 33, 0];
+        sniff_matches(&valid, "dbase");
+
+        // Same bytes but an impossible month (13) - a coincidental match
+        // on the version byte alone must not be enough.
+        let mut bad_month = valid;
+        bad_month[2] = 13;
+        assert!(sniff_bytes(&bad_month).is_none());
+
+        // Same bytes but an unrecognized version byte.
+        let mut bad_version = valid;
+        bad_version[0] = 0x99;
+        assert!(sniff_bytes(&bad_version).is_none());
+
+        // Same bytes but a header length too short to be real (< 32).
+        let mut bad_header_len = valid;
+        bad_header_len[8] = 10;
+        bad_header_len[9] = 0;
+        assert!(sniff_bytes(&bad_header_len).is_none());
+    }
+
+    #[test]
+    fn sniff_format_disambiguates_zip_based_formats_by_their_entry_names() {
+        let mut xlsx = b"PK\x03\x04".to_vec();
+        xlsx.extend_from_slice(b"...junk...xl/workbook.xml...more junk...");
+        sniff_matches(&xlsx, "xlsx");
+
+        let mut ods = b"PK\x03\x04".to_vec();
+        ods.extend_from_slice(b"mimetypeapplication/vnd.oasis.opendocument.spreadsheet");
+        sniff_matches(&ods, "xlsx");
+
+        let mut npz = b"PK\x03\x04".to_vec();
+        npz.extend_from_slice(b"...junk...scores.npy...more junk...");
+        sniff_matches(&npz, "npz");
+
+        // A real zip with none of the three signals - a generic zip file,
+        // not any format this tool reads - must not match anything.
+        let mut plain_zip = b"PK\x03\x04".to_vec();
+        plain_zip.extend_from_slice(b"...just some unrelated archived file...");
+        assert!(sniff_bytes(&plain_zip).is_none());
+    }
+
+    #[test]
+    fn sniff_format_recognizes_json_and_xml_leading_characters() {
+        sniff_matches(br#"{"a": 1}"#, "json");
+        sniff_matches(b"[1, 2, 3]", "json");
+        sniff_matches(b"  \n  {\"a\": 1}", "json"); // leading whitespace tolerated
+        sniff_matches(b"<?xml version=\"1.0\"?><root/>", "xml");
+        sniff_matches(b"<root><child/></root>", "xml");
+
+        // An RFC 3164 syslog line also opens with '<', but followed by a
+        // PRI digit, never a legal XML tag-name start - must not match.
+        assert!(sniff_bytes(b"<34>Oct 11 22:14:15 mymachine su: some message").is_none());
+    }
+
+    #[test]
+    fn sniff_format_returns_none_for_plain_text_and_empty_files() {
+        assert!(sniff_bytes(b"").is_none());
+        assert!(sniff_bytes(b"just,some,csv,like,text\n1,2,3,4,5").is_none());
+        // TOML-shaped, deliberately not sniffed - see sniff_format's doc comment.
+        assert!(sniff_bytes(b"key = value\nother_key = 1").is_none());
+        assert!(sniff_bytes(b"random garbage that is not any format").is_none());
     }
 }
