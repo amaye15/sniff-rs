@@ -173,6 +173,30 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// Crockford's Base32 alphabet (RFC-independent, but the de facto standard
+/// it's named after): 0-9 and A-Z minus I/L/O/U, chosen specifically to
+/// avoid visual confusion with 1/1/0/V. Decoding is case-insensitive, so
+/// lowercase input is normalized before comparing.
+const CROCKFORD_BASE32: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A ULID (Universally Unique Lexicographically Sortable Identifier): 26
+/// Crockford-base32 characters encoding 128 bits (48-bit timestamp + 80
+/// bits of randomness). 26 * 5 = 130 bits, 2 more than the 128 actually
+/// used - those 2 extra bits live at the top of the first character, so a
+/// real, non-overflowing ULID's first character can only be '0'-'7' (the
+/// first 8 symbols of the alphabet), never '8' or higher. This detail is
+/// widely documented in the ULID spec itself (the canonical example -
+/// "01ARZ3NDEKTSV4RRFFQ69G5FAV" - starts with '0'), and a false negative
+/// on it just falls back to String, the safer failure mode if this detail
+/// were ever misremembered.
+fn is_ulid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 26
+        && b.iter()
+            .all(|c| CROCKFORD_BASE32.contains(&c.to_ascii_uppercase()))
+        && matches!(b[0].to_ascii_uppercase(), b'0'..=b'7')
+}
+
 /// A deliberately conservative email check - not RFC 5322-complete, just
 /// precise enough to avoid false positives: exactly one '@', a non-empty
 /// local part, no whitespace anywhere, and a domain ending in an
@@ -795,6 +819,16 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     }
     if values.iter().all(|v| is_uuid(v)) {
         return ("UUID".to_string(), "matches UUID format".to_string());
+    }
+    // Checked ahead of parse_prefixed_int further down: a ULID beginning
+    // "0X..." (a real, valid Crockford digit sequence) would otherwise get
+    // intercepted by the "0x" hex-literal prefix check first, since that
+    // needs only a 2-character match versus this check's full 26.
+    if values.iter().all(|v| is_ulid(v)) {
+        return (
+            "ULID".to_string(),
+            "matches ULID format (Crockford base32, valid timestamp bits)".to_string(),
+        );
     }
     if values.iter().all(|v| is_email(v)) {
         return (
@@ -3826,7 +3860,8 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "JWT"
         | "Geographic Coordinates"
         | "VIN"
-        | "CIDR" => Some(("string", None)),
+        | "CIDR"
+        | "ULID" => Some(("string", None)),
         _ => None,
     }
 }
@@ -4632,6 +4667,24 @@ mod tests {
     }
 
     #[test]
+    fn is_ulid_validates_the_canonical_example_and_rejects_near_misses() {
+        // The canonical example from the ULID spec itself.
+        assert!(is_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(is_ulid("01arz3ndektsv4rrffq69g5fav")); // lowercase - decoding is case-insensitive
+        assert!(!is_ulid("01ARZ3NDEKTSV4RRFFQ69G5FA")); // 25 chars, too short
+        assert!(!is_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAVX")); // 27 chars, too long
+        assert!(!is_ulid("01ARZ3NDEKTSVILRFFQ69G5FAV")); // contains 'I' - not in Crockford's alphabet
+        assert!(!is_ulid("81ARZ3NDEKTSV4RRFFQ69G5FAV")); // first char '8' - overflows the 48-bit timestamp
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_ulid() {
+        let (ideal, note) = suggest_ideal_type(&["01ARZ3NDEKTSV4RRFFQ69G5FAV"], "String");
+        assert_eq!(ideal, "ULID");
+        assert!(note.contains("ULID"));
+    }
+
+    #[test]
     fn suggest_ideal_type_recognizes_uuid_email_ipv4_ipv6_and_url() {
         let (ideal, note) = suggest_ideal_type(
             &[
@@ -4758,6 +4811,7 @@ mod tests {
     fn every_validator_survives_adversarial_input_without_panicking() {
         for s in ADVERSARIAL_STRINGS {
             let _ = is_uuid(s);
+            let _ = is_ulid(s);
             let _ = is_email(s);
             let _ = is_url(s);
             let _ = is_ipv4(s);
@@ -4796,6 +4850,7 @@ mod tests {
         let long_unicode = "é".repeat(50_000);
         for s in [long_ascii.as_str(), long_unicode.as_str()] {
             let _ = is_uuid(s);
+            let _ = is_ulid(s);
             let _ = is_email(s);
             let _ = is_cidr(s);
             let _ = is_iban(s);
@@ -4885,6 +4940,8 @@ mod tests {
         assert!(!is_lat_lon_pair("45,90")); // plain integers, no decimal signal
         assert!(!is_cidr("192.168.1.0/33")); // prefix out of range for IPv4
         assert!(!is_cidr("192.168.1.0")); // no prefix at all
+        assert!(!is_ulid("01ARZ3NDEKTSV4RRFFQ69G5FA")); // 25 chars, too short
+        assert!(!is_ulid("81ARZ3NDEKTSV4RRFFQ69G5FAV")); // first char overflows timestamp bits
     }
 
     #[test]

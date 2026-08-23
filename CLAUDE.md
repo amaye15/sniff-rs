@@ -657,6 +657,23 @@ entirely:
   itself defines (0-32 for IPv4, 0-128 for IPv6). No new parsing logic, no
   new ambiguity beyond what IPv4/IPv6 already carry.
 
+- **ULID** - 26 Crockford-base32 characters encoding a 128-bit value (48-bit
+  timestamp + 80 bits of randomness), a growing alternative to UUID.
+  `26 * 5 = 130` bits, 2 more than the 128 actually used - those 2 extra
+  bits live at the top of the first character, so a real, non-overflowing
+  ULID's first character can only be `'0'`-`'7'`, never `'8'` or higher.
+  This detail is checked (not just the alphabet and length), and is
+  flagged honestly as a smaller-confidence detail than most of this file:
+  it's widely documented in the ULID spec itself and the canonical example
+  starts with `'0'`, but if it were ever misremembered the failure mode is
+  a false negative (falls back to `String`), the safe direction. Checked
+  *ahead of* `parse_prefixed_int` further down: a ULID beginning `"0X..."`
+  (a real, valid Crockford digit sequence) would otherwise get intercepted
+  by the `"0x"` hex-literal prefix check first, since that only needs a
+  2-character match versus this check's full 26 - a concrete instance of
+  the same "more specific match wins" principle applied throughout this
+  file.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
