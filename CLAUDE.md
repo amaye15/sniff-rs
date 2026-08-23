@@ -972,6 +972,42 @@ one `NaN` alongside otherwise-integer data), SAS7BDAT being wired up
 (see Known limitations for why it has no dedicated fixture), and that
 Markdown output never has a trailing blank line.
 
+**Every format also has at least one test proving a precise-grammar
+semantic type (UUID/Email/IPv4/date, not just a bare scalar shape) survives
+that format's own reader.** `suggest_ideal_type` itself only needs proving
+once (CSV's `type_detection.csv`/`adversarial.csv` and JSON's
+`nested_typed.jsonl` already do this exhaustively, since the function is
+format-agnostic - it only ever sees raw strings), so the risk this layer
+actually covers is narrower and more concrete: does *this specific format's
+reader* hand a value to that engine unmangled? That's a real, format-
+specific failure mode this project has hit before (Excel silently turning
+a leading-zero zip code into a number is exactly this class of bug, for a
+different heuristic) - and before this layer existed, roughly half the
+format readers (Parquet, Arrow IPC, Avro, SQLite, MessagePack, TOML, INI,
+CBOR, NumPy, dBase, Stata, fixed-width text, and the log formats) had never
+had a single assertion checking anything beyond `current_type`/column shape.
+`tests/fixtures/type_detection.<ext>` (one per format, generated with
+pandas/pyarrow/fastavro/openpyxl/dbf/etc. and each verified by hand against
+the compiled binary before being trusted) carries the same five columns -
+`id`/`user_uuid`/`contact_email`/`ip_address`/`signup_date` - so expectations
+line up across formats; dBase's copy alone renames the three longest to fit
+its own 10-character field-name limit. Common/Combined Log's `host` and
+`referer` columns needed no new fixture at all - the existing sample logs
+already carry real IPv4/URL data, just previously unasserted. This layer
+also caught a genuine, previously-unverified interaction between two
+already-documented design decisions: RFC 5424 permits either a literal `Z`
+suffix or an explicit numeric offset on its timestamp, and `DATE_FORMATS`
+requires one single candidate format to match every value in a column - so
+`sample_rfc5424.log`'s existing fixture (which mixes both forms across its
+3 lines, per the RFC's own canonical example) correctly leaves `timestamp`
+as a plain `String` rather than forcing a guess, verified directly against
+chrono rather than assumed; a second, uniformly-`Z`-formatted fixture
+(`edge_rfc5424_uniform_timestamps.log`) proves the positive case still
+resolves correctly when a real sender's format is actually consistent.
+Arrow IPC/Feather additionally went from zero real read coverage (only
+feature-wiring was checked, since Parquet already proved the shared
+`profile_arrow_batches` path) to a genuine `.arrow` fixture.
+
 The `#[cfg(test)] mod tests` block in `lib.rs` additionally has an
 adversarial/robustness section (see the design-philosophy note above) that
 every validator must survive without panicking - hostile unicode, control

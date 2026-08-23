@@ -1338,6 +1338,294 @@ fn deeply_nested_json_fails_cleanly_instead_of_a_stack_overflow() {
     );
 }
 
+// --- Semantic type detection through every format's own reader --------
+// suggest_ideal_type is format-agnostic (it only ever sees raw strings),
+// and CSV/JSON already exercise it exhaustively (type_detection.csv,
+// adversarial.csv, nested_typed.jsonl) - so the risk this section actually
+// covers isn't "does UUID detection work," it's "does *this format's own
+// reader* hand suggest_ideal_type the raw value unmangled." That's a real,
+// format-specific failure mode this project has hit before (see CLAUDE.md's
+// design philosophy: Excel's writer silently turning a leading-zero zip
+// code into a number is exactly this class of bug, just for a different
+// heuristic). Before this section, most formats below had never had a
+// single assertion proving a precise-grammar type (UUID/Email/IPv4/date)
+// resolves correctly through their own reader - only current_type/shape
+// were checked. Every fixture here (`type_detection.<ext>`) carries the
+// same five columns (id/user_uuid/contact_email/ip_address/signup_date)
+// so the columns and expected values line up across formats; each was
+// generated with pandas/pyarrow/fastavro/openpyxl/dbf/etc. and its output
+// verified by hand against the compiled binary before being trusted,
+// per this project's usual practice.
+
+#[cfg(feature = "parquet")]
+#[test]
+fn parquet_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.parquet", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn arrow_ipc_recognizes_uuid_email_ipv4_and_date_columns() {
+    // The first real Arrow IPC/Feather fixture in this suite - previously
+    // only feature-wiring was checked (feather_reads_via_the_shared_arrow_batch_profiler
+    // above), never an actual read, since Parquet and Arrow IPC share
+    // profile_arrow_batches and a Parquet fixture already existed. This
+    // fixture closes that gap with a real .arrow file, auto-detected from
+    // its extension the same way a user would actually invoke this (no
+    // --format needed).
+    let doc = run_json("type_detection.arrow", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "avro")]
+#[test]
+fn avro_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.avro", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn excel_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.xlsx", &[]);
+    let cols = table(&doc, "Sheet1"); // openpyxl's default sheet name
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.sqlite", &[]);
+    let cols = table(&doc, "data");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "msgpack")]
+#[test]
+fn msgpack_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.msgpack", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "cbor")]
+#[test]
+fn cbor_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.cbor", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn toml_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.toml", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "ini")]
+#[test]
+fn ini_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.ini", &[]);
+    let cols = table(&doc, "data"); // the [data] section name
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn npy_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.npy", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn npz_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.npz", &[]);
+    let cols = table(&doc, "people"); // the array's name inside the archive
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_recognizes_uuid_email_ipv4_and_date_columns() {
+    // Field names are shortened to fit dBase's own 10-character field-name
+    // limit (email/ip_addr/sign_dt instead of contact_email/ip_address/
+    // signup_date) - a real format constraint, not this tool's choice.
+    // Character fields are declared wide enough (C(36)/C(32)) that a UUID
+    // or email isn't silently truncated before it ever reaches the
+    // heuristic engine.
+    let doc = run_json("type_detection.dbf", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "USER_UUID")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "EMAIL")["ideal_type"], "Email");
+    assert_eq!(column(cols, "IP_ADDR")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "SIGN_DT")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "stata")]
+#[test]
+fn stata_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.dta", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[test]
+fn fixed_width_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_with_format(
+        "type_detection.fwf",
+        "json",
+        &["--format", "fixed-width", "--widths", "3,38,22,13,12"],
+    );
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "weblog")]
+#[test]
+fn common_and_combined_log_recognize_ipv4_hosts_and_a_url_referer() {
+    // sample_common.log/sample_combined.log's host column is already real
+    // IPv4 data (127.0.0.1, 192.168.1.5, ...) and combined's referer is
+    // already a real URL - no new fixture needed, just assertions that
+    // were never written proving the log-line regex hands those fields to
+    // suggest_ideal_type unmangled.
+    let common = run_with_format("sample_common.log", "json", &["--format", "common-log"]);
+    let common_cols = table(&common, "sample_common");
+    assert_eq!(column(common_cols, "host")["ideal_type"], "IPv4");
+
+    let combined = run_with_format("sample_combined.log", "json", &["--format", "combined-log"]);
+    let combined_cols = table(&combined, "sample_combined");
+    assert_eq!(column(combined_cols, "host")["ideal_type"], "IPv4");
+    assert_eq!(column(combined_cols, "referer")["ideal_type"], "URL");
+}
+
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_rfc5424_recognizes_a_uniformly_formatted_rfc3339_timestamp() {
+    // A syslog5424-only fixture with every timestamp in the same "Z"
+    // representation - the common real-world case of one sender emitting
+    // a consistent format throughout its own log stream.
+    let doc = run_with_format(
+        "edge_rfc5424_uniform_timestamps.log",
+        "json",
+        &["--format", "syslog5424"],
+    );
+    let cols = table(&doc, "edge_rfc5424_uniform_timestamps");
+    assert_eq!(
+        column(cols, "timestamp")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_rfc5424_does_not_force_a_mixed_z_and_offset_timestamp_column_into_one_type() {
+    // sample_rfc5424.log deliberately mixes RFC 5424's two equally-valid
+    // timestamp representations across its 3 lines - a literal "Z" suffix
+    // (line 1/3) and an explicit numeric offset (line 2), both legal RFC
+    // 3339. DATE_FORMATS requires one *single* candidate format to match
+    // every value in the column (see CLAUDE.md's "fixed candidate list,
+    // not a fuzzy parser" design note) - "%.fZ" and "%.f%z" are two
+    // different candidates, and neither matches all 3 lines at once
+    // (verified directly against chrono: the "%z" specifier does not
+    // accept a literal "Z"). So this column honestly stays a String
+    // rather than silently picking one representation and mis-parsing
+    // the other - the same safe-failure-mode tradeoff already documented
+    // for RFC 3164's yearless timestamp, just discovered from a different
+    // angle (value heterogeneity instead of a missing field).
+    let doc = run_with_format("sample_rfc5424.log", "json", &["--format", "syslog5424"]);
+    let cols = table(&doc, "sample_rfc5424");
+    assert_eq!(column(cols, "timestamp")["ideal_type"], "String");
+}
+
 // --- Per-format malformed-input tests ---------------------------------
 // CSV/JSON already have their own dedicated malformed-file tests above.
 // Every other format gets one here: a `malformed_garbage.<ext>` fixture -

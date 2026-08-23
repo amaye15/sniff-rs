@@ -1,0 +1,3 @@
+<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 [exampleSDID@32473 iut="3"] 'su root' failed for lonvick
+<165>1 2003-08-24T05:14:15.000003Z myproc.example.com myproc 8710 - - %% It's time to make the do-nuts.
+<13>1 2003-10-11T22:14:16.010Z mymachine.example.com su - - - just a plain message

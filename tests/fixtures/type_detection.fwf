@@ -1,0 +1,4 @@
+id user_uuid                             contact_email         ip_address   signup_date
+1  550e8400-e29b-41d4-a716-446655440000  alice@example.com     192.168.1.1  2024-01-15
+2  6fa459ea-ee8a-3ca4-894e-db77e160355e  bob@example.org       10.0.0.5     2024-02-20
+3  16fd2706-8baf-433b-82eb-8c7fada847da  carol@example.net     203.0.113.9  2024-03-11
