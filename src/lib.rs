@@ -614,6 +614,65 @@ fn is_jwt(s: &str) -> bool {
     base64url_decode(parts[2]).is_some()
 }
 
+// GEOMETRYCOLLECTION is deliberately excluded: unlike the other six, its
+// parenthesized body legitimately nests *other* geometry keywords
+// ("GEOMETRYCOLLECTION(POINT(4 6))"), not just coordinate characters - this
+// was found empirically (a real fixture value with GEOMETRYCOLLECTION
+// caused the whole test column to fail the coordinate-only character check
+// below). Properly supporting it needs actual recursive parsing, a
+// meaningfully bigger scope than "keyword + balanced coordinate body" - so
+// rather than either overclaim support that silently breaks on nesting, or
+// loosen the character check for everyone (raising false-positive risk for
+// the other six), it's just left out. A GEOMETRYCOLLECTION value falls back
+// to String, the safe direction.
+const WKT_KEYWORDS: &[&str] = &[
+    "POINT",
+    "LINESTRING",
+    "POLYGON",
+    "MULTIPOINT",
+    "MULTILINESTRING",
+    "MULTIPOLYGON",
+];
+
+/// A Well-Known Text geometry: one of the standard OGC keywords, followed
+/// by a parenthesized, balanced coordinate group. Deliberately structural
+/// rather than a full WKT parser - it doesn't validate that the coordinate
+/// content actually forms a well-formed ring/point-count for its geometry
+/// type, just that the keyword is real and the parenthesized body is
+/// balanced and contains only characters a coordinate list could contain
+/// (digits, '.', '-', ',', space, nested parens for POLYGON's rings). Not
+/// standards-complete in the same spirit as is_email/is_url elsewhere in
+/// this file - a false negative just falls back to String.
+fn is_wkt_geometry(s: &str) -> bool {
+    let trimmed = s.trim();
+    let keyword_end = trimmed
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(trimmed.len());
+    let keyword = &trimmed[..keyword_end];
+    if !WKT_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(keyword)) {
+        return false;
+    }
+    let rest = trimmed[keyword_end..].trim_start();
+    if !rest.starts_with('(') || !rest.ends_with(')') {
+        return false;
+    }
+    let mut depth = 0i32;
+    for c in rest.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            '0'..='9' | '.' | '-' | ',' | ' ' => {}
+            _ => return false,
+        }
+    }
+    depth == 0
+}
+
 /// A "lat,lon" single-cell coordinate pair. Deliberately the most
 /// conservative check in this file: unlike a checksum or a fixed-prefix
 /// grammar, there's no unambiguous signal distinguishing a real coordinate
@@ -882,6 +941,16 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "String".to_string(),
             "cell holds embedded JSON (object/array) - consider parsing it separately".to_string(),
+        );
+    }
+
+    // Checked well ahead of the weaker lat/lon check below - the OGC
+    // keyword makes this a much stronger, more specific signal, the same
+    // "more specific match wins" principle as everywhere else in this file.
+    if values.iter().all(|v| is_wkt_geometry(v)) {
+        return (
+            "WKT Geometry".to_string(),
+            "matches Well-Known Text geometry format".to_string(),
         );
     }
 
@@ -3861,7 +3930,8 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "Geographic Coordinates"
         | "VIN"
         | "CIDR"
-        | "ULID" => Some(("string", None)),
+        | "ULID"
+        | "WKT Geometry" => Some(("string", None)),
         _ => None,
     }
 }
@@ -4640,6 +4710,33 @@ mod tests {
     }
 
     #[test]
+    fn is_wkt_geometry_accepts_standard_keywords_and_rejects_near_misses() {
+        assert!(is_wkt_geometry("POINT(30 10)"));
+        assert!(is_wkt_geometry("LINESTRING(30 10, 10 30, 40 40)"));
+        assert!(is_wkt_geometry(
+            "POLYGON((30 10, 40 40, 20 40, 10 20, 30 10))"
+        ));
+        assert!(is_wkt_geometry("point(30 10)")); // case-insensitive keyword
+        assert!(!is_wkt_geometry("CIRCLE(30 10, 5)")); // not a real WKT keyword
+        assert!(!is_wkt_geometry("POINT30 10")); // missing parens entirely
+        assert!(!is_wkt_geometry("POINT(30 10")); // unterminated - missing ')'
+        assert!(!is_wkt_geometry("POINT(30 abc)")); // letters aren't valid coordinate content
+        // Deliberately out of scope: GEOMETRYCOLLECTION nests other
+        // geometry keywords, which this structural (non-recursive) check
+        // can't validate - found empirically, not just reasoned about (see
+        // WKT_KEYWORDS's own comment).
+        assert!(!is_wkt_geometry("GEOMETRYCOLLECTION(POINT(4 6))"));
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_wkt_geometry() {
+        let (ideal, note) =
+            suggest_ideal_type(&["POINT(30 10)", "LINESTRING(30 10, 10 30)"], "String");
+        assert_eq!(ideal, "WKT Geometry");
+        assert!(note.contains("Well-Known Text"));
+    }
+
+    #[test]
     fn hash_digest_kind_classifies_by_exact_length_and_rejects_non_hex_or_mixed_lengths() {
         let md5 = "d41d8cd98f00b204e9800998ecf8427e"; // 32 hex chars
         let sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709"; // 40 hex chars
@@ -4830,6 +4927,7 @@ mod tests {
             let _ = is_vin(s);
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
+            let _ = is_wkt_geometry(s);
             let _ = is_lat_lon_pair(s);
             let _ = hash_digest_kind(s);
             let _ = parse_prefixed_int(s);
@@ -4865,6 +4963,7 @@ mod tests {
             let _ = is_vin(s);
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
+            let _ = is_wkt_geometry(s);
             let _ = is_lat_lon_pair(s);
             let _ = hash_digest_kind(s);
             let _ = normalize_numeric_str(s);
@@ -4942,6 +5041,8 @@ mod tests {
         assert!(!is_cidr("192.168.1.0")); // no prefix at all
         assert!(!is_ulid("01ARZ3NDEKTSV4RRFFQ69G5FA")); // 25 chars, too short
         assert!(!is_ulid("81ARZ3NDEKTSV4RRFFQ69G5FAV")); // first char overflows timestamp bits
+        assert!(!is_wkt_geometry("CIRCLE(30 10, 5)")); // not a real WKT keyword
+        assert!(!is_wkt_geometry("POINT(30 10")); // unbalanced parens
     }
 
     #[test]

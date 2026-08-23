@@ -674,6 +674,26 @@ entirely:
   the same "more specific match wins" principle applied throughout this
   file.
 
+- **WKT (Well-Known Text) geometry** (`"POINT(30 10)"`,
+  `"LINESTRING(30 10, 10 30, 40 40)"`) - a real OGC keyword followed by a
+  balanced, parenthesized body containing only coordinate-safe characters.
+  Deliberately structural, not a full WKT parser - it doesn't validate a
+  well-formed ring/point-count, just that the keyword is real and the body
+  is balanced. **`GEOMETRYCOLLECTION` is deliberately excluded from the
+  keyword list**, and this was found empirically, not just reasoned about
+  in advance: unlike the other six WKT types, its body legitimately nests
+  *other* geometry keywords (`"GEOMETRYCOLLECTION(POINT(4 6))"`), which
+  isn't just coordinate characters - a real fixture value with it caused
+  the whole test column to fail the coordinate-only character check the
+  first time this was tried. Properly supporting it needs actual recursive
+  parsing, a meaningfully bigger scope than "keyword + balanced coordinate
+  body." Rather than either overclaim support that silently breaks on
+  nesting, or loosen the character check for every keyword (raising
+  false-positive risk for the other six), it's just left out - a
+  `GEOMETRYCOLLECTION` value falls back to `String`, confirmed by its own
+  test. Checked well ahead of the weaker `is_lat_lon_pair` check, since the
+  OGC keyword is a much stronger, more specific signal.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
