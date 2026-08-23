@@ -931,6 +931,14 @@ cargo bench --bench heuristic_engine           # just one target
 open target/criterion/report/index.html        # HTML report, after any run
 ```
 
+`BENCHMARKS.md` (repo root) is a manually-updated log of past runs - no CI
+runner behind this project, deliberately (see its own header for why: cross-
+machine numbers aren't comparable anyway, and a committed, human-curated
+log was judged more valuable here than automating something whose output
+still needs a human to interpret). Append a new entry there after a
+performance-relevant change, so it can be checked against a prior snapshot
+on the same machine instead of relying on memory.
+
 Three targets, each answering a different question, all via
 [Criterion](https://docs.rs/criterion) (`[dev-dependencies]` only - never
 touches the shipped binary or a consumer's build, the one place in this
