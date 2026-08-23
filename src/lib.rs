@@ -597,6 +597,26 @@ fn is_lat_lon_pair(s: &str) -> bool {
     (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
 }
 
+/// Classifies a value by hex-digest length alone (MD5=32, SHA-1=40,
+/// SHA-256=64 hex characters). Deliberately NOT promoted to its own
+/// ideal_type the way UUID/IMEI/etc. are - there's no checksum or prefix
+/// to verify against, so a bare hex string of one of these lengths is
+/// exactly as likely to be an unrelated hex-encoded ID as a real digest
+/// (in fact a bare, undashed UUID is exactly 32 hex characters too). Only
+/// ever surfaced as a note on an otherwise-plain String column - see where
+/// it's used in suggest_ideal_type for why.
+fn hash_digest_kind(s: &str) -> Option<&'static str> {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match s.len() {
+        32 => Some("MD5"),
+        40 => Some("SHA-1"),
+        64 => Some("SHA-256"),
+        _ => None,
+    }
+}
+
 /// '#' followed by exactly 3 (RGB), 4 (RGBA), 6 (RRGGBB), or 8 (RRGGBBAA)
 /// hex digits - the '#' prefix is the unambiguous signal, the same role
 /// "0x" plays for parse_prefixed_int.
@@ -735,6 +755,20 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "Geographic Coordinates".to_string(),
             "matches \"lat,lon\" within valid ranges (±90/±180)".to_string(),
+        );
+    }
+
+    // Note-only, never a type change: see hash_digest_kind's doc comment
+    // for why this is deliberately the weakest-confidence check here.
+    if let Some(kind) = values.first().and_then(|first| hash_digest_kind(first))
+        && values.iter().all(|v| hash_digest_kind(v) == Some(kind))
+    {
+        return (
+            "String".to_string(),
+            format!(
+                "matches {kind} hex-digest length ({} hex chars) - shape only, not a validated hash",
+                values[0].len()
+            ),
         );
     }
 
@@ -4411,6 +4445,33 @@ mod tests {
     }
 
     #[test]
+    fn hash_digest_kind_classifies_by_exact_length_and_rejects_non_hex_or_mixed_lengths() {
+        let md5 = "d41d8cd98f00b204e9800998ecf8427e"; // 32 hex chars
+        let sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709"; // 40 hex chars
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // 64 hex chars
+        assert_eq!(hash_digest_kind(md5), Some("MD5"));
+        assert_eq!(hash_digest_kind(sha1), Some("SHA-1"));
+        assert_eq!(hash_digest_kind(sha256), Some("SHA-256"));
+        assert_eq!(hash_digest_kind("not hex at all, wrong length"), None);
+        assert_eq!(hash_digest_kind("d41d8cd98f00b204e9800998ecf842"), None); // 30 hex chars, no match
+    }
+
+    #[test]
+    fn suggest_ideal_type_flags_a_hash_digest_length_as_a_note_not_a_type_change() {
+        let md5s = [
+            "d41d8cd98f00b204e9800998ecf8427e",
+            "5d41402abc4b2a76b9719d911017c592",
+        ];
+        let (ideal, note) = suggest_ideal_type(&md5s, "String");
+        // Deliberately stays String - there's no checksum backing this, so
+        // it must never be promoted to its own confident type the way
+        // UUID/IMEI/etc. are.
+        assert_eq!(ideal, "String");
+        assert!(note.contains("MD5"));
+        assert!(note.contains("shape only"));
+    }
+
+    #[test]
     fn suggest_ideal_type_recognizes_uuid_email_ipv4_ipv6_and_url() {
         let (ideal, note) = suggest_ideal_type(
             &[
@@ -4554,6 +4615,7 @@ mod tests {
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
             let _ = is_lat_lon_pair(s);
+            let _ = hash_digest_kind(s);
             let _ = parse_prefixed_int(s);
             let _ = is_missing_sentinel(s);
             let _ = has_leading_zero(s);
@@ -4585,6 +4647,7 @@ mod tests {
             let _ = is_jwt(s);
             let _ = base64url_decode(s);
             let _ = is_lat_lon_pair(s);
+            let _ = hash_digest_kind(s);
             let _ = normalize_numeric_str(s);
             let _ = suggest_ideal_type(&[s], "String");
         }

@@ -980,6 +980,19 @@ fn csv_recognizes_geographic_coordinate_pairs() {
 }
 
 #[test]
+fn csv_flags_hash_digest_length_as_a_note_not_a_type_promotion() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let hash = column(cols, "content_hash");
+    // Deliberately stays String - no checksum backs this, so it must never
+    // be promoted to its own confident type the way UUID/IMEI/etc. are.
+    assert_eq!(hash["ideal_type"], "String");
+    assert!(hash["notes"].as_str().unwrap().contains("MD5"));
+    assert!(hash["notes"].as_str().unwrap().contains("shape only"));
+}
+
+#[test]
 fn csv_recognizes_iban_and_credit_card_numbers_via_checksum() {
     let doc = run_json("type_detection.csv", &[]);
     let cols = table(&doc, "type_detection");
@@ -1117,6 +1130,9 @@ fn adversarial_csv_never_false_positives_on_any_near_miss_column() {
         column(cols, "near_coordinates")["ideal_type"],
         "Geographic Coordinates"
     );
+    // Mixed digest "kinds" (a 32-char then a 40-char value) within one
+    // column must not trigger the hash-digest note either.
+    assert_eq!(column(cols, "near_hash")["notes"], "");
 
     // A column that's 3 real UUIDs and 1 clearly-not-a-UUID value must not
     // be classified as UUID - one bad value vetoes the whole column.

@@ -615,6 +615,21 @@ entirely:
   candidates before it was picked), the same spirit as the IPv4-vs-
   version-string and SemVer ambiguities already documented above:
   disclosed and accepted, not hidden.
+- **Hash-digest length is a note, deliberately never a type promotion.**
+  `hash_digest_kind` classifies a value by exact hex-digest length alone
+  (MD5=32, SHA-1=40, SHA-256=64 hex chars) - checked *after* geographic
+  coordinates, i.e. dead last, because there's even less signal here than
+  anywhere else in the file: no checksum, no prefix, not even a range
+  constraint, just "this many hex characters." A bare, undashed UUID is
+  itself exactly 32 hex characters, so this would misfire constantly if
+  promoted to a confident type the way UUID/IMEI/IBAN are. Instead it only
+  ever adds a note to an otherwise-plain `String` column
+  (`"matches MD5 hex-digest length (32 hex chars) - shape only, not a
+  validated hash"`) - informative without asserting something the tool
+  can't actually verify. Requires every value in the column to share the
+  *same* digest length, not just "some hex-shaped length" - a column
+  mixing a 32-char and a 40-char value doesn't get the note either,
+  confirmed by a dedicated adversarial fixture column.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
