@@ -588,6 +588,19 @@ entirely:
   valid/near-miss columns as part of the same change, not added later -
   every new type in this project now gets its near-miss coverage
   immediately, per the adversarial-testing section above.
+- **JWT (JSON Web Tokens)** - three dot-separated base64url segments where
+  the header and payload segments must each decode to a valid JSON
+  *object* (RFC 7519 defines both as always objects). This is a much
+  stronger signal than "three base64-ish segments separated by dots" -
+  proven directly by a test where all three segments are individually
+  valid base64url but decode to plain text, not JSON (`is_jwt` correctly
+  rejects it). `base64url_decode` is hand-rolled (RFC 4648 §5) rather than
+  adding the `base64` crate as an unconditional dependency of the default
+  build - the same UUID/email/URL/hex-color tradeoff made throughout this
+  file. The signature segment is intentionally only checked for a valid
+  base64url charset, never decoded as JSON - it's arbitrary bytes by
+  design (an HMAC or signature), not structured data. Verified against
+  jwt.io's own canonical example token.
 
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and

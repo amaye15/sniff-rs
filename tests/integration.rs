@@ -962,6 +962,15 @@ fn csv_recognizes_hex_colors_and_imei() {
 }
 
 #[test]
+fn csv_recognizes_jwt() {
+    let doc = run_json("type_detection.csv", &[]);
+    let cols = table(&doc, "type_detection");
+
+    let token = column(cols, "auth_token");
+    assert_eq!(token["ideal_type"], "JWT");
+}
+
+#[test]
 fn csv_recognizes_iban_and_credit_card_numbers_via_checksum() {
     let doc = run_json("type_detection.csv", &[]);
     let cols = table(&doc, "type_detection");
@@ -1045,6 +1054,7 @@ fn json_schema_maps_semantic_types_to_standard_format_keywords() {
     assert_eq!(props["app_version"], serde_json::json!({"type": "string"}));
     assert_eq!(props["hex_color"], serde_json::json!({"type": "string"}));
     assert_eq!(props["imei"], serde_json::json!({"type": "string"}));
+    assert_eq!(props["auth_token"], serde_json::json!({"type": "string"}));
 }
 
 // --- Adversarial / robustness tests ----------------------------------
@@ -1092,6 +1102,7 @@ fn adversarial_csv_never_false_positives_on_any_near_miss_column() {
     assert_ne!(column(cols, "near_mac")["ideal_type"], "MAC Address");
     assert_ne!(column(cols, "near_hex_color")["ideal_type"], "Hex Color");
     assert_ne!(column(cols, "near_imei")["ideal_type"], "IMEI");
+    assert_ne!(column(cols, "near_jwt")["ideal_type"], "JWT");
 
     // A column that's 3 real UUIDs and 1 clearly-not-a-UUID value must not
     // be classified as UUID - one bad value vetoes the whole column.

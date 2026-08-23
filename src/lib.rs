@@ -506,6 +506,70 @@ fn is_embedded_json(s: &str) -> bool {
     )
 }
 
+/// Decodes unpadded base64url (RFC 4648 §5: '-'/'_' instead of '+'/'/', no
+/// '=' padding required, though tolerated by simply stripping it first).
+/// Hand-rolled rather than adding the `base64` crate as an unconditional
+/// dependency of the default build - the same tradeoff already made for
+/// UUID/email/URL detection elsewhere in this file.
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn sextet(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let stripped: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    if stripped.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(stripped.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for b in stripped {
+        buf = (buf << 6) | u32::from(sextet(b)?);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// A JSON Web Token: three dot-separated base64url segments where the
+/// header and payload segments must each decode to a valid JSON *object*
+/// (both are defined by RFC 7519 to always be objects - the header at
+/// minimum carries "alg", the payload carries the claims) - a much
+/// stronger signal than just "three base64-ish segments", since it
+/// requires the decoded bytes to actually be valid UTF-8 JSON, not merely
+/// valid base64url. The third (signature) segment is arbitrary bytes by
+/// design, so it's only checked for a valid base64url charset, not decoded
+/// content. Verified against jwt.io's own canonical example token before
+/// being relied on.
+fn is_jwt(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return false;
+    }
+    for part in &parts[..2] {
+        let Some(bytes) = base64url_decode(part) else {
+            return false;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        match serde_json::from_str::<JsonValue>(text) {
+            Ok(JsonValue::Object(_)) => {}
+            _ => return false,
+        }
+    }
+    base64url_decode(parts[2]).is_some()
+}
+
 /// '#' followed by exactly 3 (RGB), 4 (RGBA), 6 (RRGGBB), or 8 (RRGGBBAA)
 /// hex digits - the '#' prefix is the unambiguous signal, the same role
 /// "0x" plays for parse_prefixed_int.
@@ -620,6 +684,13 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "i64".to_string(),
             "base-prefixed literal (0x/0b/0o), decoded from its declared base".to_string(),
+        );
+    }
+
+    if values.iter().all(|v| is_jwt(v)) {
+        return (
+            "JWT".to_string(),
+            "matches JSON Web Token format (header/payload decode as JSON objects)".to_string(),
         );
     }
 
@@ -3572,7 +3643,7 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         "MAC Address" => Some(("string", None)),
         "IBAN" => Some(("string", None)),
         "Credit Card Number" => Some(("string", None)),
-        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" | "SemVer" | "Hex Color" | "IMEI" => {
+        "ISBN-10" | "ISBN-13" | "EAN-13 / UPC-A" | "SemVer" | "Hex Color" | "IMEI" | "JWT" => {
             Some(("string", None))
         }
         _ => None,
@@ -4244,6 +4315,41 @@ mod tests {
         assert_eq!(ideal, "IMEI");
     }
 
+    // jwt.io's own canonical example token - the header decodes to
+    // {"alg":"HS256","typ":"JWT"}, the payload to a claims object.
+    const REFERENCE_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+    #[test]
+    fn base64url_decode_matches_a_known_jwt_header_and_rejects_padding_free_edge_cases() {
+        let decoded = base64url_decode("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9").unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            r#"{"alg":"HS256","typ":"JWT"}"#
+        );
+        assert!(base64url_decode("").is_none());
+        assert!(base64url_decode("not valid base64url!!").is_none());
+    }
+
+    #[test]
+    fn is_jwt_validates_a_real_token_and_rejects_near_misses() {
+        assert!(is_jwt(REFERENCE_JWT));
+        assert!(!is_jwt("not.a.jwt")); // segments don't decode to JSON objects
+        assert!(!is_jwt("only.two")); // only 2 segments
+        assert!(!is_jwt("a.b.c.d")); // 4 segments
+        assert!(!is_jwt("..")); // empty segments
+        // header decodes to a JSON array, not an object - RFC 7519 requires
+        // both header and payload to be objects.
+        let array_header = "WyJhIiwiYiJd"; // base64url("[\"a\",\"b\"]")
+        assert!(!is_jwt(&format!("{array_header}.{array_header}.sig")));
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_jwt() {
+        let (ideal, note) = suggest_ideal_type(&[REFERENCE_JWT], "String");
+        assert_eq!(ideal, "JWT");
+        assert!(note.contains("JSON Web Token"));
+    }
+
     #[test]
     fn suggest_ideal_type_recognizes_uuid_email_ipv4_ipv6_and_url() {
         let (ideal, note) = suggest_ideal_type(
@@ -4385,6 +4491,8 @@ mod tests {
             let _ = is_embedded_json(s);
             let _ = is_hex_color(s);
             let _ = is_imei(s);
+            let _ = is_jwt(s);
+            let _ = base64url_decode(s);
             let _ = parse_prefixed_int(s);
             let _ = is_missing_sentinel(s);
             let _ = has_leading_zero(s);
@@ -4413,6 +4521,8 @@ mod tests {
             let _ = is_embedded_json(s);
             let _ = is_hex_color(s);
             let _ = is_imei(s);
+            let _ = is_jwt(s);
+            let _ = base64url_decode(s);
             let _ = normalize_numeric_str(s);
             let _ = suggest_ideal_type(&[s], "String");
         }
@@ -4477,6 +4587,10 @@ mod tests {
         assert!(!is_mac_address("GG:1A:2B:3C:4D:5E")); // non-hex group
         assert!(!is_hex_color("#12345")); // 5 digits - not a valid length
         assert!(!is_hex_color("123456")); // missing '#'
+        // Dot-separated, JWT-shaped, but the segments aren't real base64url
+        // JSON - three dots alone must not be enough to claim JWT.
+        assert!(!is_jwt("hello.world.foo"));
+        assert!(!is_jwt("aGVsbG8.d29ybGQ.Zm9v")); // valid base64url, but decodes to plain text, not JSON
     }
 
     #[test]
