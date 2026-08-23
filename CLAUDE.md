@@ -501,6 +501,16 @@ flattener**, rather than reimplementing recursion per format:
   aren't nested at all — `arrow_type_label` resolves them to their
   underlying value type recursively, so a dictionary-encoded string column
   reports as `String`, not as the encoding wrapping it.
+  `arrow_batch_to_json_rows` tries the whole batch through `ArrayWriter` in
+  one call first (the fast, common path), but falls back to converting
+  each nested column separately if that fails - a real, encountered case
+  being a Map column with non-UTF8 keys (`Map<Int32, T>` is legal Parquet/
+  Arrow, e.g. a numeric-code lookup table), which the JSON writer refuses
+  outright for the whole batch regardless of what every other column looks
+  like. A column that still fails even in isolation gets a disclosed
+  "nested content could not be converted for typing" note rather than
+  silently losing the column or failing the whole file over one
+  unsupported column - see the design philosophy section below.
 
 Parquet and Arrow IPC additionally share one function,
 `profile_arrow_batches`, since they both decode to the same `RecordBatch`
@@ -1161,6 +1171,57 @@ entirely:
   panics, confirming the fix holds on genuine production YAML and not
   just synthetic spec-compliance fixtures.
 
+- **A Parquet/Arrow file with one Map column whose keys aren't strings
+  used to fail to read entirely, losing every other column in the file
+  along with it - even columns with nothing wrong with them.** Found via a
+  real-world sweep against the official `apache/parquet-testing` corpus
+  (its `data/` directory: 79 files that should all read cleanly). Root
+  cause: `Map<Int32, T>` (or any non-UTF8 key type) is legal Parquet and
+  Arrow, but `arrow::json::writer::ArrayWriter` - the crate's own JSON
+  writer this project bridges nested columns through - refuses to
+  serialize it at all ("Only UTF8 keys supported by JSON MapArray
+  Writer"), and the old code ran that writer once over the *entire batch*
+  (every nested column together), so one unsupported column's error
+  aborted the whole read. `arrow_batch_to_json_rows` now tries that fast,
+  whole-batch path first (the common case, unaffected), but on failure
+  falls back to converting each nested column through its own isolated
+  single-column `ArrayWriter` call - a column that still can't be
+  converted gets a clean, disclosed note
+  (`"nested content could not be converted for typing: ..."`) on just
+  that column, while every other column in the file profiles normally.
+  This is the same principle behind every other partial-failure case in
+  this file (a "mostly UUID" column still isn't silently promoted, a
+  mixed scalar/object array still types its object portion) applied to a
+  new axis: one column's *format-level* unsupportability shouldn't cost
+  the rest of an otherwise perfectly readable file.
+
+  The same sweep also found a related but separately-caused failure:
+  `nested_structs.rust.parquet` failed with `"Invalid timezone \"UTC\":
+  only offset based timezones supported without chrono-tz feature"` -
+  Arrow's JSON writer needs the IANA timezone database to resolve a
+  *named* timezone (as opposed to a raw numeric offset like `+00:00`) on
+  a Timestamp column, and this project's `arrow` dependency didn't enable
+  that optional feature. Checked before assuming it was expensive
+  (`cargo tree` before/after): enabling `chrono-tz` on the `arrow`
+  dependency adds exactly three crates (`chrono-tz`, `phf`, `phf_shared`)
+  - nothing like the DuckDB or SPSS dependency-weight tradeoffs elsewhere
+  in this file - so it was simply turned on rather than worked around.
+
+  The remaining 4 of the 79 `data/` files still fail (`alp_extended.zstd`
+  - an experimental encoding this version of the `parquet` crate doesn't
+  yet decode; `dict-page-offset-zero` and `large_string_map.brotli` -
+  page/buffer-decoding errors; `nation.dict-malformed` - an `EOF: Invalid
+  page header`, consistent with its name), and 7 of the 22 intentionally
+  adversarial files in `bad_data/` (named after real `apache/arrow-rs`
+  GitHub issues - corrupted dictionary sizes, out-of-range offsets,
+  oversized primitives) are still accepted rather than rejected. Every
+  one of these was confirmed to fail (or succeed) *before* this project's
+  own bridging/typing code ever runs - inside the `parquet`/`arrow`
+  crate's own metadata parsing or batch decoding - so, same as the
+  YAML-1.2-spec-compliance gap above, these are the underlying crate's
+  own decoding limits, not this project's, and zero panics were produced
+  by any of them either way.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1515,6 +1576,23 @@ it, rather than loosening the test's own intent.
 test, plus three `#[cfg(test)]` unit tests on `columns_from_yaml`, lock
 the YAML fix in the same way.
 
+A fourth pass, for Parquet/Arrow: the official `apache/parquet-testing`
+corpus (79 files in `data/` that should all read cleanly, 22 deliberately
+adversarial files in `bad_data/` named after real `apache/arrow-rs`
+GitHub issues). Before any fix: 72/79 good files read successfully, zero
+panics on either directory. After the two fixes described in the design
+philosophy section above (per-column JSON-conversion isolation, and
+enabling `chrono-tz`): 75/79, with the remaining 4 (plus 7 of the 22
+adversarial files still being accepted rather than rejected) confirmed to
+be limits of the underlying `parquet`/`arrow` crate's own metadata/batch
+decoding, not this project's code - the same "delegate real parsing to
+the crate" boundary the YAML pass drew. `tests/fixtures/
+edge_map_non_string_key.parquet` (generated with `pyarrow`, matching this
+project's own established fixture-generation convention rather than
+vendoring a third-party file even though `parquet-testing` is Apache-2.0
+licensed and permits it) and its integration test lock the map-key fix
+in permanently.
+
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
 there's also a `#[cfg(test)] mod tests` at the bottom of `lib.rs`
@@ -1593,9 +1671,9 @@ narrower and more concrete: once a file produced by an AWS/Azure/GCP-native
 data service has been downloaded locally, does it read the same as any
 other file of that format? A deliberate pass was made checking exactly
 that, empirically rather than by inspection - some things already worked
-and just needed confirming, one format needed a real fix (see the design
-philosophy section above for the Avro logical-type and `\N`-sentinel
-entries).
+and just needed confirming, some formats needed a real fix (see the
+design philosophy section above for the Avro logical-type, `\N`-sentinel,
+and Parquet `chrono-tz`/Map-key entries).
 
 **Already correct, verified rather than assumed:**
 
@@ -1626,7 +1704,17 @@ counterparts were being silently reduced to opaque epoch integers, and
 both real risks for cloud-streaming Avro producers (Kinesis Firehose,
 Event Hubs Capture, Pub/Sub) that lean on exactly these logical types.
 `\N`, the literal NULL marker MySQL/Hive/Redshift `UNLOAD` all write in
-text exports, is now recognized as a missing-value sentinel.
+text exports, is now recognized as a missing-value sentinel. A Parquet
+Timestamp column carrying a *named* timezone (`"UTC"`, as opposed to a
+raw numeric offset) - exactly what Spark/Hive writers commonly attach -
+used to fail outright ("only offset based timezones supported without
+chrono-tz feature"); the `arrow` dependency now enables `chrono-tz`
+(three extra crates, checked before assuming it was expensive - see the
+design philosophy section above). Separately, a Parquet/Arrow Map column
+with non-string keys (`Map<Int32, T>`, a real, legal shape for a numeric-
+code lookup table) used to fail the whole file's read, not just that one
+column - fixed by isolating each nested column's own JSON conversion
+rather than converting a batch's nested columns as one atomic unit.
 
 **Not covered, and out of scope for this pass:** Avro's `Duration` logical
 type (months/days/milliseconds, a compound value with no single natural

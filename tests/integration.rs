@@ -391,6 +391,34 @@ fn parquet_map_and_dictionary_columns_are_handled() {
     assert_eq!(color["current_type"], "String");
 }
 
+// Found via a real-world sweep against the official apache/parquet-testing
+// corpus: a Map column with non-UTF8 keys (Map<Int32, T> is legal Parquet/
+// Arrow, e.g. a numeric-code-to-description lookup) used to fail Arrow's
+// own JSON writer for the *whole batch*, taking every other column in the
+// file down with it - a single unsupported column shouldn't cost the rest
+// of a file that's otherwise perfectly readable.
+#[cfg(feature = "parquet")]
+#[test]
+fn parquet_map_with_non_string_keys_does_not_sink_the_rest_of_the_file() {
+    let doc = run_json("edge_map_non_string_key.parquet", &[]);
+    let cols = table(&doc, "edge_map_non_string_key");
+
+    let map_col = column(cols, "code_lookup");
+    assert_eq!(map_col["current_type"], "Map");
+    assert!(
+        map_col["notes"]
+            .as_str()
+            .unwrap()
+            .contains("could not be converted")
+    );
+
+    // The plain scalar column alongside it must still be profiled
+    // normally - this is the whole point of the isolation.
+    let plain = column(cols, "plain_id");
+    assert_eq!(plain["ideal_type"], "i64");
+    assert_eq!(plain["missing_pct"].as_f64().unwrap(), 0.0);
+}
+
 #[cfg(feature = "parquet")]
 #[test]
 fn feather_reads_via_the_shared_arrow_batch_profiler() {

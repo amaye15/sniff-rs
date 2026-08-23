@@ -2637,6 +2637,68 @@ fn is_nested_arrow_type(dt: &arrow::datatypes::DataType) -> bool {
 /// and handed to the same recursive flattener used for JSON/Avro files, so
 /// nesting gets identical treatment regardless of source format.
 #[cfg(feature = "parquet")]
+/// Converts one batch's nested columns to per-row JSON via Arrow's own
+/// JSON writer. Tries the whole batch in one call first (the common, fast
+/// path); if that fails - a real, encountered case being a Map column
+/// with non-UTF8 keys, which the writer refuses outright regardless of
+/// what every other column in the file looks like - falls back to
+/// converting each nested column separately, so one column's conversion
+/// failure doesn't lose every other (perfectly convertible) column in the
+/// same file. A column that still fails even in isolation gets its error
+/// recorded in `col_errors` rather than silently losing the column or
+/// failing the whole read.
+fn arrow_batch_to_json_rows(
+    batch: &arrow::record_batch::RecordBatch,
+    schema: &arrow::datatypes::Schema,
+    nested: &[bool],
+    path: &Path,
+    col_errors: &mut [Option<String>],
+) -> Result<Vec<serde_json::Map<String, JsonValue>>> {
+    let mut writer = arrow::json::writer::ArrayWriter::new(Vec::new());
+    if writer.write(batch).and_then(|()| writer.finish()).is_ok() {
+        let buf = writer.into_inner();
+        return serde_json::from_slice(&buf)
+            .with_context(|| format!("failed parsing converted JSON for a batch in {path:?}"));
+    }
+
+    let mut rows: Vec<serde_json::Map<String, JsonValue>> =
+        vec![serde_json::Map::new(); batch.num_rows()];
+    for (col_idx, &is_nested) in nested.iter().enumerate() {
+        if !is_nested {
+            continue;
+        }
+        let field = schema.field(col_idx);
+        let single_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![field.clone()]));
+        let single_batch = arrow::record_batch::RecordBatch::try_new(
+            single_schema,
+            vec![batch.column(col_idx).clone()],
+        )
+        .with_context(|| format!("failed projecting column {col_idx} in {path:?}"))?;
+
+        let mut col_writer = arrow::json::writer::ArrayWriter::new(Vec::new());
+        match col_writer
+            .write(&single_batch)
+            .and_then(|()| col_writer.finish())
+        {
+            Ok(()) => {
+                let buf = col_writer.into_inner();
+                let col_rows: Vec<serde_json::Map<String, JsonValue>> =
+                    serde_json::from_slice(&buf).with_context(|| {
+                        format!("failed parsing converted JSON for a column in {path:?}")
+                    })?;
+                for (row, m) in rows.iter_mut().zip(col_rows) {
+                    if let Some(v) = m.get(field.name()) {
+                        row.insert(field.name().clone(), v.clone());
+                    }
+                }
+            }
+            Err(e) => col_errors[col_idx] = Some(e.to_string()),
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "parquet")]
 fn profile_arrow_batches(
     path: &Path,
     schema: &arrow::datatypes::Schema,
@@ -2663,6 +2725,7 @@ fn profile_arrow_batches(
 
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
     let mut nested_values: Vec<Vec<JsonValue>> = vec![Vec::new(); names.len()];
+    let mut col_errors: Vec<Option<String>> = vec![None; names.len()];
     let mut rows_read = 0usize;
 
     'batches: for batch_result in reader {
@@ -2670,16 +2733,7 @@ fn profile_arrow_batches(
             batch_result.with_context(|| format!("failed reading a batch from {path:?}"))?;
 
         let json_rows: Vec<serde_json::Map<String, JsonValue>> = if any_nested {
-            let mut writer = arrow::json::writer::ArrayWriter::new(Vec::new());
-            writer
-                .write(&batch)
-                .with_context(|| format!("failed converting a batch to JSON in {path:?}"))?;
-            writer
-                .finish()
-                .with_context(|| format!("failed finishing JSON conversion in {path:?}"))?;
-            let buf = writer.into_inner();
-            serde_json::from_slice(&buf)
-                .with_context(|| format!("failed parsing converted JSON for a batch in {path:?}"))?
+            arrow_batch_to_json_rows(&batch, schema, &nested, path, &mut col_errors)?
         } else {
             Vec::new()
         };
@@ -2713,8 +2767,25 @@ fn profile_arrow_batches(
     let mut out = Vec::new();
     for (i, name) in names.into_iter().enumerate() {
         if nested[i] {
-            let values: Vec<&JsonValue> = nested_values[i].iter().collect();
-            out.extend(profile_json_path(name, rows_read, values, n_samples));
+            if let Some(err) = &col_errors[i] {
+                // This column's nested content couldn't be converted to
+                // JSON even in isolation (e.g. a Map column with non-UTF8
+                // keys - a real Arrow JSON writer limitation, not
+                // something this project's own code decides) - disclosed
+                // rather than silently dropped or failing the whole file.
+                out.push(ColumnProfile {
+                    name,
+                    current_type: type_labels[i].clone(),
+                    ideal_type: "String".to_string(),
+                    description: String::new(),
+                    missing_pct: 0.0,
+                    sample_values: Vec::new(),
+                    notes: format!("nested content could not be converted for typing: {err}"),
+                });
+            } else {
+                let values: Vec<&JsonValue> = nested_values[i].iter().collect();
+                out.extend(profile_json_path(name, rows_read, values, n_samples));
+            }
         } else {
             let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
             let col = ColumnInput {
