@@ -708,6 +708,24 @@ entirely:
   (`"1 2 3 4 5"`) are indistinguishable from a real cron schedule - no
   checksum or prefix rules out coincidence here either.
 
+- **Boundary-value tests are a distinct category from near-miss tests, and
+  both exist.** A near-miss test (already covered throughout this file)
+  proves a value just *past* a valid range is rejected; a boundary test
+  proves the *inclusive* edge of that same range is still accepted -
+  every range check in this file uses `..=`, and that's exactly where an
+  accidental `<` instead of `<=` would hide, silently. Covered: IPv4's
+  `0.0.0.0`/`255.255.255.255`, IPv6's all-zero/all-`f` forms, CIDR's `/0`
+  and `/32`/`/128`, a credit card at exactly 12 and exactly 19 digits
+  (both Luhn-valid, constructed and verified via a throwaway harness, not
+  assumed), an IBAN at exactly 15 and exactly 34 characters (mod-97-valid,
+  same verification discipline), `is_lat_lon_pair` at exactly ±90/±180,
+  every cron field at its real minimum and maximum simultaneously
+  (`"0 0 1 1 0"` and `"59 23 31 12 7"` - note day-of-week 7 meaning Sunday,
+  the same as 0, is exercised specifically), and the actual decision
+  boundary behind the i64-overflow precision-loss note: `i64::MAX` itself
+  gets no note (it fits exactly), `i64::MAX + 1` does - not an arbitrary
+  digit-count threshold, the literal boundary the code checks.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that

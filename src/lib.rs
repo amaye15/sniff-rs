@@ -5180,4 +5180,83 @@ mod tests {
             "expected a safe fallback type, got {ideal}"
         );
     }
+
+    // --- Boundary-value tests ----------------------------------------
+    // The near-miss tests above prove a value just past a valid range is
+    // rejected; these prove the *inclusive* edge of that same range is
+    // still accepted - the two are not the same claim, and every range
+    // check in this file uses an inclusive `..=`, which is exactly where
+    // an off-by-one (`<` vs `<=`) bug would hide. Every boundary value
+    // here was constructed and independently verified (by hand or via a
+    // throwaway harness) before being relied on, not assumed to be valid.
+
+    #[test]
+    fn is_ipv4_accepts_the_all_zero_and_all_max_addresses() {
+        assert!(is_ipv4("0.0.0.0"));
+        assert!(is_ipv4("255.255.255.255"));
+    }
+
+    #[test]
+    fn is_ipv6_accepts_the_all_zero_and_all_max_addresses() {
+        assert!(is_ipv6("::"));
+        assert!(is_ipv6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"));
+    }
+
+    #[test]
+    fn is_cidr_accepts_the_minimum_and_maximum_prefix_length() {
+        assert!(is_cidr("0.0.0.0/0"));
+        assert!(is_cidr("255.255.255.255/32"));
+        assert!(is_cidr("::/0"));
+        assert!(is_cidr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128"));
+    }
+
+    #[test]
+    fn is_credit_card_number_accepts_the_shortest_and_longest_valid_lengths() {
+        // Constructed and Luhn-verified via a throwaway harness: 12 and 19
+        // digits are the ISO/IEC 7812-1 range this tool accepts.
+        assert!(is_credit_card_number("444444444442")); // 12 digits, shortest valid
+        assert!(is_credit_card_number("4444444444444444442")); // 19 digits, longest valid
+        assert!(!is_credit_card_number("44444444442")); // 11 digits - one short of valid
+    }
+
+    #[test]
+    fn is_iban_accepts_the_shortest_and_longest_valid_lengths() {
+        // Constructed and mod-97-verified via a throwaway harness: 15 and
+        // 34 characters are the shortest and longest lengths this tool
+        // accepts, matching real IBANs' own length range (Norway's are 15
+        // characters, Malta's are 31, the longest issued today).
+        assert!(is_iban("GB1800000000000")); // 15 chars, shortest valid
+        assert!(is_iban("GB18000000000000000000000000000000")); // 34 chars, longest valid
+        assert!(!is_iban("GB180000000000")); // 14 chars - one short of valid
+    }
+
+    #[test]
+    fn is_lat_lon_pair_accepts_the_exact_range_boundary() {
+        assert!(is_lat_lon_pair("90.0,180.0"));
+        assert!(is_lat_lon_pair("-90.0,-180.0"));
+        assert!(!is_lat_lon_pair("90.1,0.0")); // just past the latitude boundary
+        assert!(!is_lat_lon_pair("0.0,180.1")); // just past the longitude boundary
+    }
+
+    #[test]
+    fn is_cron_expression_accepts_every_fields_exact_min_and_max() {
+        assert!(is_cron_expression("0 0 1 1 0")); // every field at its minimum
+        assert!(is_cron_expression("59 23 31 12 7")); // every field at its maximum (dow 7 = Sunday, same as 0)
+        assert!(!is_cron_expression("0 0 1 1 8")); // one past day-of-week's maximum
+    }
+
+    #[test]
+    fn suggest_ideal_type_precision_loss_note_boundary_is_exactly_i64_max() {
+        // i64::MAX itself fits exactly - no precision-loss note. One past
+        // it overflows i64 and triggers the note. This is the actual
+        // decision boundary is_plain_integer_literal cares about, not an
+        // arbitrary digit count.
+        let (ideal, note) = suggest_ideal_type(&["9223372036854775807"], "String"); // i64::MAX
+        assert_eq!(ideal, "i64");
+        assert!(!note.contains("exceed i64"));
+
+        let (ideal, note) = suggest_ideal_type(&["9223372036854775808"], "String"); // i64::MAX + 1
+        assert_eq!(ideal, "f64");
+        assert!(note.contains("exceed i64"));
+    }
 }
