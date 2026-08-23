@@ -878,10 +878,18 @@ field that's `null` in every record, and a genuinely zero-byte file for
 every format lenient enough to treat that as "zero records" (MessagePack/
 CBOR/TOML/YAML) versus INI, whose own reader treats zero sections as an
 error instead - a real, documented difference between formats' own
-conventions, not an inconsistency in this tool. Every case here was
-verified empirically first, the same as the malformed-input family: none
-of it needed a code fix, all of it was already handled correctly and
-simply lacked a test locking the behavior in.
+conventions, not an inconsistency in this tool. Rounding out the same
+family: a zero-byte fixed-width file (a hard, correct error - there's no
+header to derive column meaning from even with `--widths` given, unlike
+every other empty-file case here which at least has a schema or fixed
+column set to fall back on), a gzip file whose *decompressed* content is
+itself zero bytes (transparent decompression still applies before the
+empty-CSV case is reached), and empty Common Log/syslog files (both fall
+back to their own fixed, format-defined column set, same shape as the
+header-only-CSV case). Every case here was verified empirically first,
+the same as the malformed-input family: none of it needed a code fix, all
+of it was already handled correctly and simply lacked a test locking the
+behavior in.
 
 The crate is a lib (`src/lib.rs`, exposing `pub fn run()`) plus a thin
 binary (`src/main.rs` that just calls `sniff_rs::run()`), so besides the

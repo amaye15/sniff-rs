@@ -1588,3 +1588,56 @@ fn ini_zero_byte_file_is_an_actionable_error_not_a_crash() {
         "expected an error naming the missing sections: {stderr}"
     );
 }
+
+#[test]
+fn fixed_width_empty_file_is_an_actionable_error_not_a_crash() {
+    // Unlike the other empty-file cases, fixed-width text has no way to
+    // derive column meaning from zero bytes at all (no header to slice
+    // even with --widths given), so this is correctly a hard error, not
+    // an empty table.
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_empty.fwf").to_str().unwrap(),
+            "-",
+            "--format",
+            "fixed-width",
+            "--widths",
+            "5,5",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected an error naming the empty file: {stderr}"
+    );
+}
+
+#[test]
+fn gzip_wrapping_a_zero_byte_inner_file_produces_an_empty_table_not_a_crash() {
+    let doc = run_json("edge_empty_inner.csv.gz", &[]);
+    assert!(table(&doc, "edge_empty_inner").is_empty());
+}
+
+#[cfg(feature = "weblog")]
+#[test]
+fn empty_common_log_file_still_reports_the_fixed_column_set_not_a_crash() {
+    let doc = run_with_format("edge_empty_common.log", "json", &["--format", "common-log"]);
+    let cols = table(&doc, "edge_empty_common");
+    assert_eq!(cols.len(), 9); // host/ident/authuser/timestamp/method/path/protocol/status/bytes
+    for c in cols {
+        assert!(c["notes"].as_str().unwrap().contains("empty/all null"));
+    }
+}
+
+#[cfg(feature = "syslog")]
+#[test]
+fn empty_syslog_file_still_reports_the_fixed_column_set_not_a_crash() {
+    let doc = run_with_format("edge_empty_syslog.log", "json", &["--format", "syslog"]);
+    let cols = table(&doc, "edge_empty_syslog");
+    assert_eq!(cols.len(), 7); // facility/severity/timestamp/hostname/tag/pid/message
+    for c in cols {
+        assert!(c["notes"].as_str().unwrap().contains("empty/all null"));
+    }
+}
