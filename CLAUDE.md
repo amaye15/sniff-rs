@@ -651,6 +651,12 @@ entirely:
   trustworthy evidence either way. Checked ahead of the credit card number
   range for the same narrower-match-wins-a-tie reason as ISBN/EAN/IMEI.
 
+- **CIDR notation** (`"192.168.1.0/24"`, `"2001:db8::/32"`) - the cheapest
+  addition in this file: `is_cidr` reuses `is_ipv4`/`is_ipv6` directly for
+  the address part, and just adds the prefix-length range CIDR notation
+  itself defines (0-32 for IPv4, 0-128 for IPv6). No new parsing logic, no
+  new ambiguity beyond what IPv4/IPv6 already carry.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that

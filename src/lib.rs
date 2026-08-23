@@ -217,6 +217,26 @@ fn is_ipv6(s: &str) -> bool {
     s.contains(':') && s.parse::<Ipv6Addr>().is_ok()
 }
 
+/// "<IPv4 or IPv6 address>/<prefix length>" - reuses is_ipv4/is_ipv6
+/// directly rather than a second address parser, and just adds the
+/// prefix-length range check (0-32 for IPv4, 0-128 for IPv6) CIDR notation
+/// itself defines.
+fn is_cidr(s: &str) -> bool {
+    let Some((addr, prefix_str)) = s.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u8>() else {
+        return false;
+    };
+    if is_ipv4(addr) {
+        prefix <= 32
+    } else if is_ipv6(addr) {
+        prefix <= 128
+    } else {
+        false
+    }
+}
+
 /// Normalizes a numeric-looking string by stripping formatting noise a raw
 /// parse would otherwise choke on: surrounding whitespace, thousands-
 /// separator commas, currency symbols ($/€/£/¥), parenthesized negatives
@@ -792,6 +812,12 @@ fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return (
             "IPv6".to_string(),
             "matches IPv6 address format".to_string(),
+        );
+    }
+    if values.iter().all(|v| is_cidr(v)) {
+        return (
+            "CIDR".to_string(),
+            "matches CIDR notation (address/prefix-length, valid range)".to_string(),
         );
     }
     if values.iter().all(|v| is_semver(v)) {
@@ -3799,7 +3825,8 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "IMEI"
         | "JWT"
         | "Geographic Coordinates"
-        | "VIN" => Some(("string", None)),
+        | "VIN"
+        | "CIDR" => Some(("string", None)),
         _ => None,
     }
 }
@@ -4504,6 +4531,26 @@ mod tests {
         assert!(note.contains("Vehicle Identification Number"));
     }
 
+    #[test]
+    fn is_cidr_validates_address_and_prefix_range_for_v4_and_v6() {
+        assert!(is_cidr("192.168.1.0/24"));
+        assert!(is_cidr("10.0.0.0/8"));
+        assert!(is_cidr("2001:db8::/32"));
+        assert!(is_cidr("::/0"));
+        assert!(!is_cidr("192.168.1.0/33")); // IPv4 prefix max is 32
+        assert!(!is_cidr("2001:db8::/129")); // IPv6 prefix max is 128
+        assert!(!is_cidr("192.168.1.0")); // no prefix at all
+        assert!(!is_cidr("not-an-address/24"));
+        assert!(!is_cidr("192.168.1.256/24")); // invalid octet
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_cidr() {
+        let (ideal, note) = suggest_ideal_type(&["192.168.1.0/24", "10.0.0.0/8"], "String");
+        assert_eq!(ideal, "CIDR");
+        assert!(note.contains("CIDR"));
+    }
+
     // jwt.io's own canonical example token - the header decodes to
     // {"alg":"HS256","typ":"JWT"}, the payload to a claims object.
     const REFERENCE_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
@@ -4715,6 +4762,7 @@ mod tests {
             let _ = is_url(s);
             let _ = is_ipv4(s);
             let _ = is_ipv6(s);
+            let _ = is_cidr(s);
             let _ = is_mac_address(s);
             let _ = is_iban(s);
             let _ = is_credit_card_number(s);
@@ -4749,6 +4797,7 @@ mod tests {
         for s in [long_ascii.as_str(), long_unicode.as_str()] {
             let _ = is_uuid(s);
             let _ = is_email(s);
+            let _ = is_cidr(s);
             let _ = is_iban(s);
             let _ = is_credit_card_number(s);
             let _ = is_isbn10(s);
@@ -4834,6 +4883,8 @@ mod tests {
         assert!(!is_jwt("aGVsbG8.d29ybGQ.Zm9v")); // valid base64url, but decodes to plain text, not JSON
         assert!(!is_lat_lon_pair("999.0,999.0")); // both components out of range
         assert!(!is_lat_lon_pair("45,90")); // plain integers, no decimal signal
+        assert!(!is_cidr("192.168.1.0/33")); // prefix out of range for IPv4
+        assert!(!is_cidr("192.168.1.0")); // no prefix at all
     }
 
     #[test]
