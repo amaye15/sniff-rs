@@ -1676,6 +1676,39 @@ turns the Avro pass's `is_email` non-finding from a claim in this document
 into something a future change to that function would actually have to
 break a test to get wrong.
 
+A sixth pass covered two more formats with clean results. **SQLite**:
+two well-known real sample databases, Chinook (a ~1MB digital-media-store
+schema, 11 tables) and a SQLite port of Northwind (~25MB, 13 tables).
+Both read correctly on the first try - real email/date/URL columns
+resolved to their semantic types, a genuine SQLite type-affinity mix
+(Northwind's `Order Details.UnitPrice` storing both integer and float
+values interchangeably) was correctly reported as `mixed(...)`, and a
+real table name containing a space (`"Order Details"`) round-tripped
+without incident. The one thing worth locking in rather than just
+confirming by hand: Northwind ships 18 real SQL Server-style VIEWs
+(several also space-named) alongside its 13 real tables, and none of
+them leaked into the output - `columns_from_sqlite`'s own
+`WHERE type='table'` query already excludes them structurally, but
+nothing had ever tested that a real database with real views actually
+exercises this correctly. `tests/fixtures/edge_sqlite_view_excluded.sqlite`
+(a table plus a view built from it, both space-named) and
+`sqlite_excludes_views_and_handles_table_names_with_spaces` now do.
+
+**TOML**: the official `toml-lang/toml-test` conformance suite (268
+files that must be accepted, 509 that must be rejected) plus 41 real
+`Cargo.toml` files pulled from this machine's own crates.io registry
+cache (including this project's own). Result: 268/268 valid files
+accepted, 41/41 real files accepted, zero panics anywhere. 500 of the
+509 invalid files were correctly rejected; the remaining 9 (a datetime
+missing seconds, a trailing comma in an inline table, an invalid `\x`
+string escape) were checked individually and confirmed to be the
+underlying `toml`/`toml_edit` crate's own parsing leniency - the exact
+same "delegate real parsing to the crate, don't second-guess it" boundary
+already drawn for YAML above, not a gap in this project's code. No fix
+was needed for TOML at all - the cleanest result of any format pass in
+this document, and worth recording as such rather than only writing up
+passes that found something broken.
+
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
 there's also a `#[cfg(test)] mod tests` at the bottom of `lib.rs`

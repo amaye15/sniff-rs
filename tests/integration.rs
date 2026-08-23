@@ -971,6 +971,29 @@ fn sqlite_reports_multiple_tables_and_catches_a_type_affinity_violation() {
     );
 }
 
+// Found via a real-world sweep against two well-known sample databases
+// (Chinook, and Northwind's SQLite port) - confirmed correct rather than a
+// gap, but previously untested: Northwind alone ships 18 real VIEWs
+// (several with spaces in their names, like the table this fixture
+// mirrors) alongside its 13 real tables, and none of them leaked into
+// sniff-rs's output - `columns_from_sqlite`'s own `WHERE type='table'`
+// query already excludes them structurally. This fixture locks that
+// behavior in permanently, and doubles as coverage for a table name
+// containing a space (also a real shape in both sample databases).
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_excludes_views_and_handles_table_names_with_spaces() {
+    let doc = run_json("edge_sqlite_view_excluded.sqlite", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(
+        tables.keys().collect::<Vec<_>>(),
+        vec!["Order Details"],
+        "the 'Order Summary' VIEW must not appear alongside the real table"
+    );
+    let cols = table(&doc, "Order Details");
+    assert_eq!(column(cols, "qty")["ideal_type"], "i64");
+}
+
 #[test]
 fn csv_treats_missing_value_sentinels_as_null_not_literal_strings() {
     let doc = run_json("type_detection.csv", &[]);
