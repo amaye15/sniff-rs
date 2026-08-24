@@ -2529,22 +2529,143 @@ this project could just implement directly rather than depend on:
   now parse-and-re-stringify numeric values the same way calamine does,
   not just the one that happened to surface it first.
 
-**What's deliberately not being hand-rolled yet**: the two formats
-`--features xlsx` still covers that are genuinely their own binary
-specifications - legacy `.xls` (a compound binary container format
-wrapping binary BIFF records - arguably the single largest remaining
-piece of this whole effort) and `.xlsb` (a different binary record
-format again, inside a ZIP container this project's own `ZipArchive`
-could already open, but with its own distinct record schema to
-implement) - remain on calamine for now. `serde`/`serde_json` remain
-the other dependency left that's more central than any of the others in
-this list: `serde_json::Value` is the literal bridge type seven
-different format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR,
-XML) recurse through via `profile_json_path` - replacing it means
+- **`.xls` (legacy BIFF8/OLE2) - the largest piece of this whole effort,
+  in two genuinely separate layers.** Unlike `.xlsx`/`.ods` (one archive
+  format, ZIP, wrapping one document format, XML), a `.xls` file is a
+  binary *container* format (OLE2/Compound File Binary, [MS-CFB] - a
+  small filesystem-in-a-file, unrelated to ZIP) holding a binary
+  *content* format inside it (BIFF8 records, [MS-XLS]) - each needed its
+  own from-scratch reader, verified independently before being wired
+  together.
+
+  Getting a genuine test fixture came first and needed real, explicit
+  user authorization: no tool already available in this environment can
+  write a real `.xlsb`, and (it turned out, after investigation) none can
+  write a real `.xls` either - `openpyxl`/`xlsxwriter` (used for every
+  `.xlsx` fixture so far) only write the modern OOXML format. The user
+  chose to install LibreOffice specifically to solve this
+  (`brew install --cask libreoffice`, a real ~1GB+ application install,
+  confirmed with the user first given its size and system-modifying
+  nature), whose own "MS Excel 97" export filter genuinely does write
+  BIFF8/OLE2 - every `.xls` fixture in this project, including the ones
+  reused below, is a real LibreOffice-produced conversion of this
+  project's own existing, already-trusted `.xlsx` fixtures, not a
+  synthetic byte-level construction.
+
+  **The container layer** (`CfbFile`, right after the ZIP/XML
+  infrastructure): [MS-CFB]'s 512-byte header, a FAT (File Allocation
+  Table - sector-chain pointers, assembled from a 109-entry table
+  embedded in the header plus any number of overflow DIFAT sectors for
+  larger files), a directory stream (128-byte entries: UTF-16LE name,
+  object type, start sector, size), and - the genuinely tricky part - a
+  *mini*-FAT/mini-stream subsystem for any stream under 4096 bytes
+  (stored 64 bytes at a time inside the root directory entry's own
+  regular stream, with its own separate mini-FAT). Confirmed directly,
+  not assumed, that this isn't a rare corner case: even a small,
+  realistic spreadsheet's own "Workbook" stream lands in the mini-stream
+  path. Verified byte-exact against a real file - header, FAT, mini-FAT,
+  directory entries, and the first 20 bytes of the extracted "Workbook"
+  stream (a BOF record, the mandatory first record of any BIFF8 stream)
+  all independently re-derived in Python and diffed against the Rust
+  reader's own output. That verification caught a real lesson worth
+  recording: an early version of the test itself failed on what looked
+  like an off-by-one in the reader, and turned out instead to be a manual
+  hex-transcription error in the *test's own* expected-bytes literal, not
+  the reader - re-deriving the expected bytes fresh a second time (rather
+  than trusting the first hand-transcription) is what caught it. `.xls`
+  detection in the `columns_from_xlsx` dispatcher checks for a real
+  "Workbook" (or the older name, "Book") stream inside a valid OLE2
+  container, the same content-over-extension principle `sniff_format`
+  and the `.xlsx`/`.ods` dispatch already use.
+
+  **The content layer** (BIFF8 records) was researched the same way
+  every hand-rolled format in this project is - reading calamine's own
+  `xls.rs`/`cfb.rs`/`formats.rs` source field-by-field before writing a
+  line of Rust, not recalled from memory. A BIFF record is simple framing
+  (2-byte type + 2-byte length + that many bytes), but any record can be
+  followed by CONTINUE records carrying its overflow past an ~8KB
+  per-record cap - and, confirmed directly against calamine's own
+  dispatch code rather than assumed, only the shared string table (SST)
+  actually reads a value that spans a CONTINUE boundary; a LABEL cell's
+  inline string and a FORMAT record's custom format code are each read
+  from a single non-continuing buffer (truncating cleanly if the record
+  runs short, mirroring `XlsEncoding::decode_to`'s own behavior) exactly
+  because calamine's own `parse_label`/`parse_format` do the same - this
+  reader matches that boundary rather than exceeding it in an untested
+  way. RK's compact 4-byte numeric encoding (the 4 bytes become an IEEE
+  double's high 32 bits, with the low 2 bits of the first byte
+  repurposed as "divide by 100"/"this is a shifted 30-bit integer" flags)
+  and date detection (an XF record's format index resolved through
+  either a FORMAT record's custom format-code text or a fixed
+  built-in-ID range) both reuse machinery already built and verified for
+  `.xlsx` - `xlsx_is_date_format_code` directly, and the same
+  `xlsx_serial_to_ymd`/`xlsx_format_serial` epoch-conversion functions,
+  since `.xls` uses the identical 1900 date-serial system. A FORMULA
+  cell's cached result value is read (row/col plus an 8-byte tagged
+  field: a plain double, or - signalled by a trailing `0xFFFF` - a
+  bool/error/blank/"string follows in the next STRING record" marker);
+  like the `.xlsx` reader, this project deliberately reads only that
+  cached value, not the formula's own token stream, into a formula
+  string.
+
+  Two scope boundaries were chosen deliberately, both disclosed rather
+  than silently assumed: this reader targets BIFF8 only (Excel 97-2003 -
+  the version every writer anyone would actually feed this tool today
+  produces, LibreOffice's own filter included; an older BIFF2-5 stream is
+  a clear, actionable error rather than guessed-at, since there's no
+  fixture to verify that path against - the same "no fixture, no trust"
+  boundary SAS7BDAT already draws). And "compressed" (1-byte-per-char)
+  string content decodes as Latin-1 rather than through a real
+  per-codepage charset table the way calamine's own `XlsEncoding` does -
+  the same "not standards-complete, correct for the overwhelming common
+  case" tradeoff already made for `is_email`/`is_url` elsewhere in this
+  project; it only differs from true Windows-1252 in the rare 0x80-0x9F
+  control range, and "uncompressed" (real UTF-16LE) content - what any
+  modern writer uses for non-ASCII text - decodes exactly regardless of
+  codepage, confirmed directly against a real fixture carrying café/日本語
+  content converted through LibreOffice.
+
+  Verified against calamine's own output on six real fixtures - reusing
+  this project's own existing, already-trusted `.xlsx` fixtures
+  (converted through LibreOffice rather than authored from scratch, since
+  they were already known-good): the standard `type_detection` fixture
+  (UUID/Email/IPv4/date semantic types all surviving the BIFF8 path),
+  native date *and* datetime cells (the same high-impact "raw day-count
+  serial instead of a real date" bug class documented for `.xlsx` above,
+  proven fixed on the BIFF8 path on the first attempt), shared strings
+  (SST + LABELSST), formula and error cells (FORMULA/STRING/BOOLERR,
+  including a real `#DIV/0!` cached error value), a multi-sheet workbook,
+  and unicode content. Every one matched calamine's output exactly -
+  table names, column names, current/ideal types, missing percentages,
+  and sample values - before the dispatcher was wired to prefer this
+  reader over calamine for `.xls`.
+
+  **`.xlsb` was investigated and is being permanently left on calamine.**
+  LibreOffice, the only available tool that can write real legacy Excel
+  binary formats, turns out to have no working `.xlsb` export filter at
+  all - confirmed through genuine effort, not assumed from a first
+  failure: a plain `--convert-to xlsb` reports no export filter found,
+  and explicitly naming the filter (`xlsb:Calc MS Excel 2007 Binary`) is
+  accepted but fails at the actual file-write step
+  (`SfxBaseModel::impl_store failed`). With no tool anywhere in this
+  environment able to produce a genuine `.xlsb` fixture, hand-rolling its
+  own distinct binary record schema would mean shipping unverified
+  parsing code - exactly the situation SAS7BDAT's own "no fixture, no
+  trust" precedent already exists to avoid, so `.xlsb` gets the same
+  treatment: a real, disclosed, permanent gap rather than a guess.
+
+**What's deliberately not being hand-rolled**: `.xlsb` (see immediately
+above - no tool in this environment can produce a genuine fixture to
+verify a hand-rolled reader against, and LibreOffice's own `.xlsb` export
+filter turns out not to actually work) remains on calamine. `serde`/
+`serde_json` remain the other dependency left that's more central than
+any of the others in this list: `serde_json::Value` is the literal bridge
+type seven different format readers (JSON, YAML, TOML, Avro, MessagePack,
+CBOR, XML) recurse through via `profile_json_path` - replacing it means
 writing and re-verifying a whole JSON value type, parser, and
 serializer, not swapping one call site at a time or hand-rolling a
-narrower, self-contained parser the way `csv`, `chrono`, `.xlsx`, and
-now `.ods` all still were, however real their own risk. That's
+narrower, self-contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`,
+and now `.xls` all still were, however real their own risk. That's
 still a real, non-mechanical rewrite - the risk itself is why it's still
 deliberately a dependency, the same reasoning that applied to every
 other entry in this list right up until it didn't.

@@ -5138,21 +5138,26 @@ fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
     cell.to_string()
 }
 
-/// Dispatches to the hand-rolled OOXML reader for `.xlsx` specifically
-/// (see `xlsx_support` above and CLAUDE.md's Dependency footprint
-/// section - verified to match calamine's own output exactly across
-/// every real fixture before this dispatch was wired in), and to
-/// calamine for the two formats this feature also covers that aren't
-/// hand-rolled yet (.xls/.xlsb).
+/// Dispatches to the hand-rolled OOXML/ODF/BIFF8 readers for `.xlsx`/
+/// `.ods`/`.xls` respectively (see `xlsx_support` above and CLAUDE.md's
+/// Dependency footprint section - each verified to match calamine's own
+/// output exactly across every real fixture before its dispatch was
+/// wired in), and to calamine for the one format this feature also
+/// covers that isn't hand-rolled (`.xlsb` - see CLAUDE.md's Known
+/// limitations for why: LibreOffice, the only tool available to produce
+/// a genuine test fixture, turns out to have no working `.xlsb` export
+/// filter at all).
 ///
-/// Dispatches on the archive's own *content*, not the file extension -
-/// the same "declared type is a hint, not the truth" principle this
-/// project already applies to `sniff_format`'s own content-based
-/// detection, not a new one invented here. `xl/workbook.xml` is xlsx's
-/// own signature entry (xlsb's equivalent part is a binary
-/// `xl/workbook.bin`, so this never misfires on it); `content.xml` +
-/// `mimetype` is ODF's. Anything else - not a ZIP at all, or a ZIP
-/// without either signature - falls through to calamine, the same
+/// Dispatches on the file's own *content*, not its extension - the same
+/// "declared type is a hint, not the truth" principle this project
+/// already applies to `sniff_format`'s own content-based detection, not
+/// a new one invented here. `xl/workbook.xml` is xlsx's own signature
+/// ZIP entry (xlsb's equivalent part is a binary `xl/workbook.bin`, so
+/// this never misfires on it); `content.xml` + `mimetype` is ODF's;
+/// a "Workbook"/"Book" OLE2 stream is `.xls`'s. Anything else - not a
+/// ZIP or OLE2 file at all, or one without any of these signatures
+/// (including a genuine `.xlsb`, whose OOXML-flavored ZIP entries never
+/// match the first two checks) - falls through to calamine, the same
 /// fallback a truly unrecognized case already got before this dispatch
 /// existed.
 #[cfg(feature = "xlsx")]
@@ -5169,6 +5174,11 @@ fn columns_from_xlsx(
         if names.contains(&"content.xml") && names.contains(&"mimetype") {
             return xlsx_support::columns_from_ods(path, nrows, n_samples);
         }
+    }
+    if let Ok(cfb) = xlsx_support::CfbFile::open(path)
+        && (cfb.has_stream("Workbook") || cfb.has_stream("Book"))
+    {
+        return xlsx_support::columns_from_xls(path, nrows, n_samples);
     }
     columns_from_xlsx_calamine(path, nrows, n_samples)
 }
@@ -7431,6 +7441,1033 @@ mod xlsx_support {
         }
         Ok(out)
     }
+
+    // --- Hand-rolled OLE2 / Compound File Binary Format reader ---
+    // Legacy `.xls` isn't ZIP-based at all - it's Microsoft's own
+    // "structured storage" container ([MS-CFB], a mini filesystem inside
+    // one file, with a FAT-like allocation table and a directory tree of
+    // named streams), holding a stream named "Workbook" (or "Book" in
+    // very old Excel 95 files) that itself contains a BIFF8 record
+    // stream - the actual spreadsheet data. Every field and offset below
+    // was checked directly against a genuine file (produced by LibreOffice,
+    // installed specifically to get one, since no library available in
+    // this environment can write real .xls) byte-by-byte before being
+    // trusted, the same discipline this project applies everywhere else -
+    // notably confirming that even a small, realistic file's "Workbook"
+    // stream (a few KB) lands in the *mini* stream (sub-4096-byte streams
+    // are stored 64 bytes at a time inside the root entry's own stream,
+    // with their own separate mini-FAT allocation table) rather than the
+    // regular 512-byte sector chain, so that path isn't a rare corner
+    // case skippable for "big files only" - it's the common case for a
+    // realistically-sized spreadsheet.
+
+    const CFB_FREESECT: u32 = 0xFFFF_FFFF;
+    const CFB_ENDOFCHAIN: u32 = 0xFFFF_FFFE;
+
+    pub(crate) struct CfbFile {
+        data: Vec<u8>,
+        sector_size: usize,
+        mini_sector_size: usize,
+        fat: Vec<u32>,
+        mini_fat: Vec<u32>,
+        mini_stream: Vec<u8>,
+        mini_stream_cutoff: u32,
+        directory: Vec<CfbDirEntry>,
+    }
+
+    struct CfbDirEntry {
+        name: String,
+        object_type: u8, // 0 = unused, 1 = storage, 2 = stream, 5 = root storage
+        start_sector: u32,
+        stream_size: u64,
+    }
+
+    impl CfbFile {
+        fn read_u16(data: &[u8], pos: usize) -> Result<u16> {
+            let b = data
+                .get(pos..pos + 2)
+                .context("unexpected end of CFB data")?;
+            Ok(u16::from_le_bytes([b[0], b[1]]))
+        }
+
+        fn read_u32(data: &[u8], pos: usize) -> Result<u32> {
+            let b = data
+                .get(pos..pos + 4)
+                .context("unexpected end of CFB data")?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }
+
+        fn sector_offset(&self, sector: u32) -> usize {
+            512 + sector as usize * self.sector_size
+        }
+
+        /// Follows a regular sector chain (via the main FAT) starting at
+        /// `start`, concatenating every sector's raw bytes.
+        fn read_chain(&self, start: u32) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut sector = start;
+            let mut guard = 0usize;
+            while sector != CFB_ENDOFCHAIN {
+                let offset = self.sector_offset(sector);
+                let chunk = self
+                    .data
+                    .get(offset..offset + self.sector_size)
+                    .context("truncated CFB sector chain")?;
+                out.extend_from_slice(chunk);
+                sector = *self
+                    .fat
+                    .get(sector as usize)
+                    .context("CFB sector chain references an out-of-range sector")?;
+                guard += 1;
+                if guard > self.fat.len() + 1 {
+                    bail!("CFB sector chain does not terminate (likely corrupt file)");
+                }
+            }
+            Ok(out)
+        }
+
+        /// Follows a mini-sector chain (via the mini FAT) starting at
+        /// `start`, extracting 64-byte mini-sectors from the already-read
+        /// mini stream (itself the root directory entry's regular stream).
+        fn read_mini_chain(&self, start: u32) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut sector = start;
+            let mut guard = 0usize;
+            while sector != CFB_ENDOFCHAIN {
+                let offset = sector as usize * self.mini_sector_size;
+                let chunk = self
+                    .mini_stream
+                    .get(offset..offset + self.mini_sector_size)
+                    .context("truncated CFB mini-sector chain")?;
+                out.extend_from_slice(chunk);
+                sector = *self
+                    .mini_fat
+                    .get(sector as usize)
+                    .context("CFB mini-sector chain references an out-of-range sector")?;
+                guard += 1;
+                if guard > self.mini_fat.len() + 1 {
+                    bail!("CFB mini-sector chain does not terminate (likely corrupt file)");
+                }
+            }
+            Ok(out)
+        }
+
+        pub(crate) fn open(path: &Path) -> Result<Self> {
+            let data = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+            if data.len() < 512 || data[0..8] != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+                bail!("not a valid OLE2/Compound File Binary file (bad signature)");
+            }
+            let sector_shift = Self::read_u16(&data, 30)?;
+            let mini_sector_shift = Self::read_u16(&data, 32)?;
+            let num_fat_sectors = Self::read_u32(&data, 44)?;
+            let first_dir_sector = Self::read_u32(&data, 48)?;
+            let mini_stream_cutoff = Self::read_u32(&data, 56)?;
+            let first_minifat_sector = Self::read_u32(&data, 60)?;
+            let num_minifat_sectors = Self::read_u32(&data, 64)?;
+            let first_difat_sector = Self::read_u32(&data, 68)?;
+            let num_difat_sectors = Self::read_u32(&data, 72)?;
+            if !(6..=20).contains(&sector_shift) || !(2..=20).contains(&mini_sector_shift) {
+                bail!("unsupported OLE2 sector size");
+            }
+            let sector_size = 1usize << sector_shift;
+            let mini_sector_size = 1usize << mini_sector_shift;
+
+            // The DIFAT: 109 entries embedded in the header, followed by
+            // any number of dedicated DIFAT sectors (each holding
+            // sector_size/4 - 1 more entries, plus a trailing pointer to
+            // the next DIFAT sector).
+            let mut fat_sector_locations = Vec::new();
+            for i in 0..109 {
+                let entry = Self::read_u32(&data, 76 + i * 4)?;
+                if entry != CFB_FREESECT {
+                    fat_sector_locations.push(entry);
+                }
+            }
+            if num_difat_sectors > 0 {
+                let mut sector = first_difat_sector;
+                let entries_per_sector = sector_size / 4 - 1;
+                for _ in 0..num_difat_sectors {
+                    let offset = 512 + sector as usize * sector_size;
+                    let chunk = data
+                        .get(offset..offset + sector_size)
+                        .context("truncated CFB DIFAT sector")?;
+                    for i in 0..entries_per_sector {
+                        let entry = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+                        if entry != CFB_FREESECT {
+                            fat_sector_locations.push(entry);
+                        }
+                    }
+                    sector = u32::from_le_bytes(
+                        chunk[entries_per_sector * 4..entries_per_sector * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    if sector == CFB_ENDOFCHAIN {
+                        break;
+                    }
+                }
+            }
+
+            // The FAT itself: each listed sector holds sector_size/4
+            // u32 entries.
+            let mut fat = Vec::new();
+            for &sector in &fat_sector_locations {
+                let offset = 512 + sector as usize * sector_size;
+                let chunk = data
+                    .get(offset..offset + sector_size)
+                    .context("truncated CFB FAT sector")?;
+                for i in 0..sector_size / 4 {
+                    fat.push(u32::from_le_bytes(
+                        chunk[i * 4..i * 4 + 4].try_into().unwrap(),
+                    ));
+                }
+            }
+            let _ = num_fat_sectors; // informational only; fat_sector_locations is authoritative
+
+            let mut cfb = CfbFile {
+                data,
+                sector_size,
+                mini_sector_size,
+                fat,
+                mini_fat: Vec::new(),
+                mini_stream: Vec::new(),
+                mini_stream_cutoff,
+                directory: Vec::new(),
+            };
+
+            // Directory entries: a chain of sector_size-byte sectors, each
+            // holding sector_size/128 fixed 128-byte entries.
+            let dir_bytes = cfb.read_chain(first_dir_sector)?;
+            let mut directory = Vec::new();
+            for entry in dir_bytes.chunks(128) {
+                if entry.len() < 128 {
+                    break;
+                }
+                let name_len = u16::from_le_bytes([entry[64], entry[65]]) as usize;
+                if name_len < 2 {
+                    continue; // unused entry
+                }
+                // name_len includes the trailing UTF-16 null terminator.
+                let name_utf16: Vec<u16> = entry[0..name_len - 2]
+                    .chunks(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                let name = String::from_utf16_lossy(&name_utf16);
+                let object_type = entry[66];
+                let start_sector = u32::from_le_bytes(entry[116..120].try_into().unwrap());
+                let stream_size = u64::from_le_bytes(entry[120..128].try_into().unwrap());
+                directory.push(CfbDirEntry {
+                    name,
+                    object_type,
+                    start_sector,
+                    stream_size,
+                });
+            }
+            cfb.directory = directory;
+
+            // The root entry's own stream *is* the mini stream every small
+            // stream's data actually lives inside.
+            if let Some(root) = cfb.directory.iter().find(|e| e.object_type == 5)
+                && root.start_sector != CFB_ENDOFCHAIN
+            {
+                cfb.mini_stream = cfb.read_chain(root.start_sector)?;
+                cfb.mini_stream.truncate(root.stream_size as usize);
+            }
+            if num_minifat_sectors > 0 {
+                let minifat_bytes = cfb.read_chain(first_minifat_sector)?;
+                cfb.mini_fat = minifat_bytes
+                    .chunks(4)
+                    .filter(|c| c.len() == 4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+            }
+
+            Ok(cfb)
+        }
+
+        pub(crate) fn read_stream(&self, name: &str) -> Result<Vec<u8>> {
+            let entry = self
+                .directory
+                .iter()
+                .find(|e| e.object_type == 2 && e.name == name)
+                .ok_or_else(|| anyhow!("no '{name}' stream in this OLE2 file"))?;
+            let mut bytes = if entry.stream_size < u64::from(self.mini_stream_cutoff) {
+                self.read_mini_chain(entry.start_sector)?
+            } else {
+                self.read_chain(entry.start_sector)?
+            };
+            bytes.truncate(entry.stream_size as usize);
+            Ok(bytes)
+        }
+
+        /// Cheap existence check used only for content-based format
+        /// dispatch (`columns_from_xlsx`) - avoids reading and copying a
+        /// stream's full bytes just to decide whether this OLE2 file looks
+        /// like a `.xls` workbook at all.
+        pub(crate) fn has_stream(&self, name: &str) -> bool {
+            self.directory
+                .iter()
+                .any(|e| e.object_type == 2 && e.name == name)
+        }
+    }
+
+    // --- Hand-rolled BIFF8 (.xls) reader ---
+    // Sits on top of the OLE2/CFBF reader above (the container format) - a
+    // `.xls` file's actual spreadsheet content lives in one CFB stream
+    // named "Workbook" (or, rarely, the older name "Book"), itself a
+    // stream of BIFF8 records: 2-byte type + 2-byte length + that many
+    // bytes of data ([MS-XLS] 2.3). Every field layout, record-type
+    // number, and encoding rule below was ported directly from calamine's
+    // own `xls.rs`/`cfb.rs`/`formats.rs` (checked against the actual
+    // installed crate source, not recalled from memory - the same
+    // discipline every other hand-rolled reader in this project follows),
+    // then verified end-to-end against calamine's own output on a real,
+    // LibreOffice-exported `.xls` fixture before being trusted.
+    //
+    // Deliberately scoped to BIFF8 only - the version every writer anyone
+    // would actually feed this tool today produces (Excel 97-2003 itself,
+    // and LibreOffice's own "MS Excel 97" export filter, confirmed
+    // directly rather than assumed while building the test fixture for
+    // this reader). An older BIFF2-5 stream is a clear, disclosed error
+    // instead of guessed-at - there's no fixture to verify that path
+    // against, the same "no fixture, no trust" boundary this project
+    // already draws for SAS7BDAT and (see below) `.xlsb`.
+    //
+    // Two more deliberate scope boundaries, both chosen because calamine's
+    // own reference implementation draws them in the same place, so
+    // matching them keeps this reader's output provably identical rather
+    // than accidentally more (or less) capable in an untested way:
+    //   - Only the SST (shared string table) reads a string that spans a
+    //     CONTINUE record (`xls_read_dbcs`/`xls_read_rich_extended_string`,
+    //     mirroring calamine's `read_dbcs`/`read_rich_extended_string`,
+    //     called through `Record`'s own `continue_record()`). A LABEL
+    //     cell's inline string and a FORMAT record's custom format code
+    //     are read through a single non-continuing decode
+    //     (`xls_decode_plain`, mirroring `XlsEncoding::decode_to`'s own
+    //     `min(stream.len(), len)` truncate-don't-error behavior) exactly
+    //     because calamine's `parse_label`/`parse_format` do the same -
+    //     confirmed directly against their source rather than assumed.
+    //   - "Compressed" (1-byte-per-character) string content is decoded as
+    //     Latin-1 (each byte maps directly to the same Unicode code point)
+    //     rather than through a real per-codepage charset table the way
+    //     calamine's `XlsEncoding` (via the `codepage`/`encoding_rs`
+    //     crates) does. This is the same "not standards-complete, correct
+    //     for the overwhelming common case" tradeoff already made for
+    //     `is_email`/`is_url` elsewhere in this project - it only differs
+    //     from a true Windows-1252 decode in the rare 0x80-0x9F control
+    //     range, and "uncompressed" (real UTF-16LE) content, used for
+    //     anything outside plain ASCII by any modern writer, is decoded
+    //     exactly regardless of codepage.
+
+    fn xls_read_u16(data: &[u8], pos: usize) -> Result<u16> {
+        let b = data
+            .get(pos..pos + 2)
+            .context("unexpected end of BIFF record data")?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn xls_read_u32(data: &[u8], pos: usize) -> Result<u32> {
+        let b = data
+            .get(pos..pos + 4)
+            .context("unexpected end of BIFF record data")?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn xls_read_i32(data: &[u8], pos: usize) -> Result<i32> {
+        Ok(xls_read_u32(data, pos)? as i32)
+    }
+
+    fn xls_read_f64(data: &[u8], pos: usize) -> Result<f64> {
+        let b = data
+            .get(pos..pos + 8)
+            .context("unexpected end of BIFF record data")?;
+        Ok(f64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    fn xls_builtin_format_is_date(ifmt: u16) -> bool {
+        matches!(ifmt, 14..=22 | 45 | 46 | 47)
+    }
+
+    /// A BIFF record's data, plus any CONTINUE records ([MS-XLS 2.4.54])
+    /// immediately following it - a record whose content exceeds the
+    /// ~8KB per-record limit is split across a base record and one or
+    /// more CONTINUE records, and only a handful of field types (notably
+    /// SST strings) are ever read across that boundary. Mirrors
+    /// calamine's own `Record`/`RecordIter` exactly, including
+    /// `continue_record()`'s "advance to the next stored continuation, or
+    /// report none left" contract.
+    struct XlsRecord<'a> {
+        typ: u16,
+        data: &'a [u8],
+        cont: Vec<&'a [u8]>,
+    }
+
+    impl<'a> XlsRecord<'a> {
+        fn continue_record(&mut self) -> bool {
+            if self.cont.is_empty() {
+                false
+            } else {
+                self.data = self.cont.remove(0);
+                true
+            }
+        }
+
+        fn skip(&mut self, mut len: usize) -> Result<()> {
+            while len > 0 {
+                if self.data.is_empty() && !self.continue_record() {
+                    bail!("BIFF CONTINUE record ended before an expected field could be skipped");
+                }
+                let l = len.min(self.data.len());
+                self.data = &self.data[l..];
+                len -= l;
+            }
+            Ok(())
+        }
+    }
+
+    struct XlsRecordIter<'a> {
+        stream: &'a [u8],
+    }
+
+    impl<'a> Iterator for XlsRecordIter<'a> {
+        type Item = Result<XlsRecord<'a>>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.stream.len() < 4 {
+                return if self.stream.is_empty() {
+                    None
+                } else {
+                    Some(Err(anyhow!("truncated BIFF record header")))
+                };
+            }
+            let typ = match xls_read_u16(self.stream, 0) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let len = match xls_read_u16(self.stream, 2) {
+                Ok(v) => v as usize,
+                Err(e) => return Some(Err(e)),
+            };
+            if self.stream.len() < len + 4 {
+                return Some(Err(anyhow!("truncated BIFF record body")));
+            }
+            let (record_bytes, rest) = self.stream.split_at(len + 4);
+            self.stream = rest;
+            let data = &record_bytes[4..];
+
+            // Splice in every immediately-following CONTINUE record
+            // (type 0x003C) - these aren't independent records, just this
+            // one's overflow content.
+            let mut cont = Vec::new();
+            loop {
+                if self.stream.len() < 4 {
+                    break;
+                }
+                let next_typ = match xls_read_u16(self.stream, 0) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                if next_typ != 0x003C {
+                    break;
+                }
+                let cont_len = match xls_read_u16(self.stream, 2) {
+                    Ok(v) => v as usize,
+                    Err(e) => return Some(Err(e)),
+                };
+                if self.stream.len() < cont_len + 4 {
+                    return Some(Err(anyhow!("truncated BIFF CONTINUE record")));
+                }
+                let (chunk, rest) = self.stream.split_at(cont_len + 4);
+                cont.push(&chunk[4..]);
+                self.stream = rest;
+            }
+
+            Some(Ok(XlsRecord { typ, data, cont }))
+        }
+    }
+
+    /// Decodes `len` characters from a single, non-continuing buffer -
+    /// used for the two field types calamine itself never reads across a
+    /// CONTINUE boundary (a LABEL cell's inline string, a FORMAT record's
+    /// custom format code). Truncates cleanly if `data` runs short rather
+    /// than erroring, mirroring `XlsEncoding::decode_to`'s own
+    /// `min(stream.len(), len)` behavior exactly (verified directly
+    /// against calamine's `cfb.rs` source) - a malformed/truncated file
+    /// degrades to a shorter string, not a hard failure, the same
+    /// leniency this project's other plain-text-ish formats (TOML/YAML/
+    /// INI truncated mid-file) already show.
+    fn xls_decode_plain(data: &[u8], len: usize, high_byte: bool) -> String {
+        if high_byte {
+            let l = (data.len() / 2).min(len);
+            let units: Vec<u16> = data[..2 * l]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            char::decode_utf16(units)
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .collect()
+        } else {
+            let l = data.len().min(len);
+            data[..l].iter().map(|&b| b as char).collect()
+        }
+    }
+
+    /// `XLUnicodeString` [MS-XLS 2.5.294], BIFF8 form only: a 2-byte
+    /// `cch`, a 1-byte flags byte (bit 0 = uncompressed/UTF-16 vs
+    /// compressed/1-byte), then the character data itself.
+    fn xls_parse_unicode_string(data: &[u8]) -> Result<String> {
+        if data.len() < 3 {
+            if data.len() == 2 && xls_read_u16(data, 0)? == 0 {
+                return Ok(String::new());
+            }
+            bail!("truncated BIFF unicode string");
+        }
+        let cch = xls_read_u16(data, 0)? as usize;
+        let high_byte = data[2] & 0x1 != 0;
+        Ok(xls_decode_plain(&data[3..], cch, high_byte))
+    }
+
+    /// `ShortXLUnicodeString` [MS-XLS 2.5.240], BIFF8 form: a 1-byte
+    /// `cch`, a 1-byte flags byte, then the character data itself - used
+    /// for a BOUNDSHEET8 record's sheet name.
+    fn xls_parse_short_string(data: &[u8]) -> Result<String> {
+        if data.len() < 2 {
+            bail!("truncated BIFF short string");
+        }
+        let cch = data[0] as usize;
+        let high_byte = data[1] & 0x1 != 0;
+        Ok(xls_decode_plain(&data[2..], cch, high_byte))
+    }
+
+    /// CONTINUE-aware character decode, used only by SST string reading
+    /// (`xls_read_rich_extended_string`) - mirrors calamine's `read_dbcs`
+    /// exactly, including erroring (rather than silently truncating) if
+    /// the CONTINUE chain runs out mid-string, and re-reading a fresh
+    /// compressed/uncompressed flag byte from the start of each
+    /// continuation, per [MS-XLS 2.5.293].
+    fn xls_read_dbcs(r: &mut XlsRecord, mut len: usize, mut high_byte: bool) -> Result<String> {
+        let mut units: Vec<u16> = Vec::with_capacity(len);
+        while len > 0 {
+            if r.data.is_empty() {
+                if !r.continue_record() {
+                    bail!("BIFF SST string ran past the end of its CONTINUE chain");
+                }
+                if r.data.is_empty() {
+                    bail!("empty BIFF CONTINUE record mid-string");
+                }
+                high_byte = r.data[0] & 0x1 != 0;
+                r.data = &r.data[1..];
+                continue;
+            }
+            if high_byte {
+                if r.data.len() < 2 {
+                    bail!(
+                        "a double-byte SST character was split across a CONTINUE record \
+                         boundary (not expected in a well-formed BIFF8 file)"
+                    );
+                }
+                units.push(u16::from_le_bytes([r.data[0], r.data[1]]));
+                r.data = &r.data[2..];
+            } else {
+                units.push(r.data[0] as u16);
+                r.data = &r.data[1..];
+            }
+            len -= 1;
+        }
+        Ok(char::decode_utf16(units)
+            .map(|r| r.unwrap_or('\u{FFFD}'))
+            .collect())
+    }
+
+    /// `XLUnicodeRichExtendedString` [MS-XLS 2.5.293] - one SST entry.
+    /// Beyond the plain unicode string, it can carry a formatting-run
+    /// block (`rgRun`, skipped - this project only ever wants a cell's
+    /// plain text) and an "ExtRst" phonetic-text block (also skipped);
+    /// both are just byte-counted and stepped over via `XlsRecord::skip`,
+    /// which itself is CONTINUE-aware.
+    fn xls_read_rich_extended_string(r: &mut XlsRecord) -> Result<String> {
+        if r.data.is_empty() {
+            return Ok(String::new());
+        }
+        if r.data.len() < 3 {
+            bail!("truncated BIFF rich string header");
+        }
+        let cch = xls_read_u16(r.data, 0)? as usize;
+        let flags = r.data[2];
+        r.data = &r.data[3..];
+        let high_byte = flags & 0x1 != 0;
+
+        let mut c_run = 0usize;
+        let mut cb_ext_rst = 0usize;
+        if flags & 0x8 != 0 {
+            if r.data.len() < 2 {
+                bail!("truncated BIFF rich string cRun field");
+            }
+            c_run = xls_read_u16(r.data, 0)? as usize;
+            r.data = &r.data[2..];
+        }
+        if flags & 0x4 != 0 {
+            if r.data.len() < 4 {
+                bail!("truncated BIFF rich string cbExtRst field");
+            }
+            cb_ext_rst = xls_read_i32(r.data, 0)? as usize;
+            r.data = &r.data[4..];
+        }
+
+        let s = xls_read_dbcs(r, cch, high_byte)?;
+        r.skip(c_run * 4)?;
+        r.skip(cb_ext_rst)?;
+        Ok(s)
+    }
+
+    /// SST (Shared String Table) [MS-XLS 2.4.265]: an 8-byte header
+    /// (`cstTotal`/`cstUnique`, both unused here - the string count is
+    /// just "however many rich extended strings are packed into the
+    /// record and its CONTINUE chain") followed by that many entries.
+    fn xls_parse_sst(r: &mut XlsRecord) -> Result<Vec<String>> {
+        if r.data.len() < 8 {
+            bail!("truncated SST record");
+        }
+        r.data = &r.data[8..];
+        let mut sst = Vec::new();
+        while !r.data.is_empty() || r.continue_record() {
+            sst.push(xls_read_rich_extended_string(r)?);
+        }
+        Ok(sst)
+    }
+
+    /// RK's compact 4-byte numeric encoding [MS-XLS 2.5.122]: the 4 bytes
+    /// become the *high* 32 bits of an IEEE-754 double (low 32 implicit
+    /// zero), except the low 2 bits of the first byte are repurposed as
+    /// flags rather than being part of the value - bit 0 (`fX100`) means
+    /// "divide the final value by 100", bit 1 (`fInt`) means "this is a
+    /// 30-bit integer, left-shifted by 2, rather than a truncated
+    /// double". Ported field-for-field from calamine's own `rk_num`.
+    fn xls_rk_decode(val: [u8; 4]) -> Result<f64> {
+        let d100 = val[0] & 1 != 0;
+        let is_int = val[0] & 2 != 0;
+        let mut v = [0u8; 8];
+        v[4..8].copy_from_slice(&val);
+        v[4] &= 0xFC;
+        let raw = if is_int {
+            (i32::from_le_bytes(v[4..8].try_into().unwrap()) >> 2) as f64
+        } else {
+            f64::from_le_bytes(v)
+        };
+        Ok(if d100 { raw / 100.0 } else { raw })
+    }
+
+    fn xls_numeric_cell_text(value: f64, is_date: bool) -> String {
+        if is_date {
+            xlsx_format_serial(value)
+        } else {
+            value.to_string()
+        }
+    }
+
+    /// NUMBER [MS-XLS 2.4.190]: row/col/XF-index + a plain 8-byte double.
+    fn xls_parse_number(data: &[u8], is_date_by_xf: &[bool]) -> Result<(u32, u32, String)> {
+        let d = data.get(0..14).context("truncated NUMBER record")?;
+        let row = xls_read_u16(d, 0)? as u32;
+        let col = xls_read_u16(d, 2)? as u32;
+        let ifmt = xls_read_u16(d, 4)? as usize;
+        let v = xls_read_f64(d, 6)?;
+        let is_date = is_date_by_xf.get(ifmt).copied().unwrap_or(false);
+        Ok((row, col, xls_numeric_cell_text(v, is_date)))
+    }
+
+    /// RK [MS-XLS 2.5.122 cell record form]: row/col/XF-index + the
+    /// 4-byte RK-encoded value.
+    fn xls_parse_rk(data: &[u8], is_date_by_xf: &[bool]) -> Result<(u32, u32, String)> {
+        let d = data.get(0..10).context("truncated RK record")?;
+        let row = xls_read_u16(d, 0)? as u32;
+        let col = xls_read_u16(d, 2)? as u32;
+        let ifmt = xls_read_u16(d, 4)? as usize;
+        let val: [u8; 4] = d[6..10].try_into().unwrap();
+        let v = xls_rk_decode(val)?;
+        let is_date = is_date_by_xf.get(ifmt).copied().unwrap_or(false);
+        Ok((row, col, xls_numeric_cell_text(v, is_date)))
+    }
+
+    /// MULRK [MS-XLS 2.4.176]: several RK cells across one row packed
+    /// into a single record - row, first column, `(ifmt, value)` per
+    /// column, then the last column index.
+    fn xls_parse_mul_rk(data: &[u8], is_date_by_xf: &[bool]) -> Result<Vec<(u32, u32, String)>> {
+        if data.len() < 6 {
+            bail!("truncated MULRK record");
+        }
+        let row = xls_read_u16(data, 0)? as u32;
+        let col_first = xls_read_u16(data, 2)? as u32;
+        let col_last = xls_read_u16(data, data.len() - 2)? as u32;
+        let expected = 6 + 6 * (col_last.saturating_sub(col_first) as usize + 1);
+        if data.len() != expected {
+            bail!("MULRK record length does not match its own column range");
+        }
+        let body = &data[4..data.len() - 2];
+        let mut out = Vec::new();
+        for (i, chunk) in body.chunks_exact(6).enumerate() {
+            let ifmt = xls_read_u16(chunk, 0)? as usize;
+            let val: [u8; 4] = chunk[2..6].try_into().unwrap();
+            let v = xls_rk_decode(val)?;
+            let is_date = is_date_by_xf.get(ifmt).copied().unwrap_or(false);
+            out.push((row, col_first + i as u32, xls_numeric_cell_text(v, is_date)));
+        }
+        Ok(out)
+    }
+
+    /// LABEL [MS-XLS 2.4.148] (and the near-identical RString, 0x00D6):
+    /// row/col/XF-index (unused - a label's own value is never a date)
+    /// + an `XLUnicodeString`.
+    fn xls_parse_label(data: &[u8]) -> Result<(u32, u32, String)> {
+        if data.len() < 6 {
+            bail!("truncated LABEL record");
+        }
+        let row = xls_read_u16(data, 0)? as u32;
+        let col = xls_read_u16(data, 2)? as u32;
+        let s = xls_parse_unicode_string(&data[6..])?;
+        Ok((row, col, s))
+    }
+
+    /// LABELSST [MS-XLS 2.4.149]: row/col/XF-index + a 4-byte index into
+    /// the SST. A file with a LABELSST whose index is somehow out of
+    /// range (shouldn't happen in a well-formed file) is skipped rather
+    /// than fabricating a value, the same "no fixture, no trust" caution
+    /// this project applies elsewhere.
+    fn xls_parse_label_sst(data: &[u8], sst: &[String]) -> Result<Option<(u32, u32, String)>> {
+        if data.len() < 10 {
+            bail!("truncated LABELSST record");
+        }
+        let row = xls_read_u16(data, 0)? as u32;
+        let col = xls_read_u16(data, 2)? as u32;
+        let idx = xls_read_u32(data, 6)? as usize;
+        Ok(sst.get(idx).map(|s| (row, col, s.clone())))
+    }
+
+    fn xls_error_code_to_string(code: u8) -> Result<String> {
+        Ok(match code {
+            0x00 => "#NULL!",
+            0x07 => "#DIV/0!",
+            0x0F => "#VALUE!",
+            0x17 => "#REF!",
+            0x1D => "#NAME?",
+            0x24 => "#NUM!",
+            0x2A => "#N/A",
+            0x2B => "#GETTING_DATA",
+            e => bail!("unrecognized BIFF error code {e:#04x}"),
+        }
+        .to_string())
+    }
+
+    /// BoolErr [MS-XLS 2.4.21 / 2.5.16]: row/col/XF-index, then either a
+    /// boolean byte or an error-code byte, selected by a trailing flag
+    /// byte.
+    fn xls_parse_bool_err(data: &[u8]) -> Result<(u32, u32, String)> {
+        if data.len() < 8 {
+            bail!("truncated BoolErr record");
+        }
+        let row = xls_read_u16(data, 0)? as u32;
+        let col = xls_read_u16(data, 2)? as u32;
+        let s = match data[7] {
+            0x00 => (data[6] != 0).to_string(),
+            0x01 => xls_error_code_to_string(data[6])?,
+            e => bail!("unrecognized BIFF BoolErr fError byte {e:#04x}"),
+        };
+        Ok((row, col, s))
+    }
+
+    /// A FORMULA record's cached result value [MS-XLS 2.5.198.2] - an
+    /// 8-byte field that's either a plain double, or (signalled by its
+    /// last 2 bytes both being 0xFF) a tagged bool/error/blank/"string
+    /// follows in the next STRING record" marker. Ported directly from
+    /// calamine's `parse_formula_value`; this project deliberately reads
+    /// only this cached value; it doesn't parse the formula's own token
+    /// stream (`rgce`) into a formula string, mirroring how the OOXML
+    /// reader already only surfaces a formula cell's cached `<v>` value.
+    fn xls_parse_formula_value(data: &[u8], is_date: bool) -> Result<Option<String>> {
+        let d = data.get(0..8).context("truncated FORMULA cached value")?;
+        if d[6] == 0xFF && d[7] == 0xFF {
+            return Ok(match d[0] {
+                0x00 => None, // string result: the next STRING (0x0207) record carries it
+                0x01 => Some((d[2] != 0).to_string()),
+                0x02 => Some(xls_error_code_to_string(d[2])?),
+                0x03 => Some(String::new()),
+                e => bail!("unrecognized BIFF formula cached-value type {e:#04x}"),
+            });
+        }
+        let v = xls_read_f64(d, 0)?;
+        Ok(Some(xls_numeric_cell_text(v, is_date)))
+    }
+
+    /// BoundSheet8 [MS-XLS 2.4.28]: a 4-byte absolute stream offset to
+    /// this sheet's own BOF, a visibility byte and a sheet-type byte
+    /// (neither needed here - see the module doc comment above for why
+    /// this project doesn't filter by sheet type), then the sheet's name
+    /// as a `ShortXLUnicodeString`.
+    fn xls_parse_boundsheet(data: &[u8]) -> Result<(usize, String)> {
+        if data.len() < 6 {
+            bail!("truncated BOUNDSHEET8 record");
+        }
+        let pos = xls_read_u32(data, 0)? as usize;
+        let mut name = xls_parse_short_string(&data[6..])?;
+        name.retain(|c| c != '\0');
+        Ok((pos, name))
+    }
+
+    /// Parses the workbook-globals substream - the BIFF record stream
+    /// from the very start of the "Workbook" stream up to its first EOF
+    /// record - collecting everything needed to read the per-sheet
+    /// substreams that follow: each sheet's name and absolute byte
+    /// offset (BOUNDSHEET8), the shared string table (SST), and a
+    /// per-cell-format ("XF") table resolved down to a simple `is this
+    /// format a date/time?` bool (from FORMAT's custom format-code text,
+    /// or the fixed built-in-format-ID ranges when no FORMAT record
+    /// overrides it) - mirroring OOXML's own `numFmtId`-indexed
+    /// `is_date_format` table in spirit, just built from BIFF8's own
+    /// record types instead of `styles.xml`.
+    struct XlsWorkbookGlobals {
+        sheet_positions: Vec<(usize, String)>,
+        sst: Vec<String>,
+        is_date_by_xf: Vec<bool>,
+    }
+
+    fn xls_parse_workbook_globals(stream: &[u8]) -> Result<XlsWorkbookGlobals> {
+        let mut biff_checked = false;
+        let mut custom_date_formats: HashMap<u16, bool> = HashMap::new();
+        let mut xfs: Vec<u16> = Vec::new();
+        let mut sheet_positions: Vec<(usize, String)> = Vec::new();
+        let mut sst: Vec<String> = Vec::new();
+
+        for record in (XlsRecordIter { stream }) {
+            let mut r = record?;
+            match r.typ {
+                0x0809 => {
+                    // BOF [MS-XLS 2.4.21] - only the very first one (this
+                    // substream's own) is checked; per-sheet substreams
+                    // are parsed separately by `xls_parse_sheet`.
+                    if !biff_checked {
+                        let biff_version = xls_read_u16(r.data, 0)?;
+                        if biff_version != 0x0600 {
+                            bail!(
+                                "this .xls file uses an older BIFF version (0x{biff_version:04X}) \
+                                 - only BIFF8 (Excel 97-2003) is supported; re-save from a newer \
+                                 Excel/LibreOffice, or convert to .xlsx"
+                            );
+                        }
+                        biff_checked = true;
+                    }
+                }
+                0x041E => {
+                    // Format [MS-XLS 2.4.126] - only a fixed set of custom
+                    // format IDs is valid; anything else is skipped
+                    // exactly as calamine's own `parse_format` does
+                    // (logging and moving on, not failing the file).
+                    if r.data.len() >= 2 {
+                        let ifmt = xls_read_u16(r.data, 0)?;
+                        if matches!(ifmt, 5..=8 | 23..=26 | 41..=44 | 63..=66 | 164..=382) {
+                            let code = xls_parse_unicode_string(&r.data[2..])?;
+                            custom_date_formats.insert(ifmt, xlsx_is_date_format_code(&code));
+                        }
+                    }
+                }
+                0x00E0 => {
+                    // XF [MS-XLS 2.4.353] - only the format index (ifmt,
+                    // at byte offset 2) is needed here.
+                    if r.data.len() >= 4 {
+                        xfs.push(xls_read_u16(r.data, 2)?);
+                    }
+                }
+                0x0085 => {
+                    sheet_positions.push(xls_parse_boundsheet(r.data)?);
+                }
+                0x00FC => {
+                    sst = xls_parse_sst(&mut r)?;
+                }
+                0x000A => break, // EOF of the workbook-globals substream
+                _ => {}
+            }
+        }
+
+        if !biff_checked {
+            bail!("no BOF record found - not a valid BIFF workbook stream");
+        }
+
+        let is_date_by_xf: Vec<bool> = xfs
+            .iter()
+            .map(|&ifmt| {
+                custom_date_formats
+                    .get(&ifmt)
+                    .copied()
+                    .unwrap_or_else(|| xls_builtin_format_is_date(ifmt))
+            })
+            .collect();
+
+        Ok(XlsWorkbookGlobals {
+            sheet_positions,
+            sst,
+            is_date_by_xf,
+        })
+    }
+
+    /// Parses one worksheet's own BIFF substream (starting at the byte
+    /// offset its BOUNDSHEET8 record gave) into a dense `row x column`
+    /// grid, the same shape `xlsx_parse_sheet`/`ods_parse_sheet` already
+    /// produce. A FORMULA cell's cached value is used directly; if that
+    /// cache says "the real value is a string", the STRING record
+    /// immediately following supplies it (`fmla_pos` tracks which cell
+    /// that belongs to, since STRING carries no row/col of its own).
+    fn xls_parse_sheet(
+        stream: &[u8],
+        sst: &[String],
+        is_date_by_xf: &[bool],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        let mut sparse: Vec<(u32, u32, String)> = Vec::new();
+        let mut max_row: i64 = -1;
+        let mut max_col: i64 = -1;
+        let mut fmla_pos: (u32, u32) = (0, 0);
+
+        macro_rules! record_cell {
+            ($row:expr, $col:expr, $val:expr) => {{
+                let row = $row;
+                let col = $col;
+                max_row = max_row.max(row as i64);
+                max_col = max_col.max(col as i64);
+                sparse.push((row, col, $val));
+            }};
+        }
+
+        for record in (XlsRecordIter { stream }) {
+            let r = record?;
+            match r.typ {
+                0x0203 => {
+                    let (row, col, val) = xls_parse_number(r.data, is_date_by_xf)?;
+                    record_cell!(row, col, val);
+                }
+                0x027E => {
+                    let (row, col, val) = xls_parse_rk(r.data, is_date_by_xf)?;
+                    record_cell!(row, col, val);
+                }
+                0x00BD => {
+                    for (row, col, val) in xls_parse_mul_rk(r.data, is_date_by_xf)? {
+                        record_cell!(row, col, val);
+                    }
+                }
+                0x0204 | 0x00D6 => {
+                    let (row, col, val) = xls_parse_label(r.data)?;
+                    record_cell!(row, col, val);
+                }
+                0x00FD => {
+                    if let Some((row, col, val)) = xls_parse_label_sst(r.data, sst)? {
+                        record_cell!(row, col, val);
+                    }
+                }
+                0x0205 => {
+                    let (row, col, val) = xls_parse_bool_err(r.data)?;
+                    record_cell!(row, col, val);
+                }
+                0x0006 => {
+                    let d = r.data.get(0..14).context("truncated FORMULA record")?;
+                    let row = xls_read_u16(d, 0)? as u32;
+                    let col = xls_read_u16(d, 2)? as u32;
+                    fmla_pos = (row, col);
+                    let ifmt = xls_read_u16(d, 4)? as usize;
+                    let is_date = is_date_by_xf.get(ifmt).copied().unwrap_or(false);
+                    if let Some(val) = xls_parse_formula_value(&d[6..14], is_date)? {
+                        record_cell!(row, col, val);
+                    }
+                }
+                0x0207 => {
+                    let val = xls_parse_unicode_string(r.data)?;
+                    record_cell!(fmla_pos.0, fmla_pos.1, val);
+                }
+                0x000A => break, // EOF of this worksheet's substream
+                _ => {}
+            }
+        }
+
+        if max_row < 0 || max_col < 0 {
+            return Ok(Vec::new());
+        }
+        let mut grid: Vec<Vec<Option<String>>> =
+            vec![vec![None; (max_col + 1) as usize]; (max_row + 1) as usize];
+        for (row, col, val) in sparse {
+            grid[row as usize][col as usize] = Some(val);
+        }
+        Ok(grid)
+    }
+
+    pub(crate) fn columns_from_xls(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let cfb = CfbFile::open(path)?;
+        let stream = cfb
+            .read_stream("Workbook")
+            .or_else(|_| cfb.read_stream("Book"))
+            .context("no 'Workbook'/'Book' stream in this OLE2 file - not a valid .xls")?;
+
+        let XlsWorkbookGlobals {
+            sheet_positions,
+            sst,
+            is_date_by_xf,
+        } = xls_parse_workbook_globals(&stream)?;
+        if sheet_positions.is_empty() {
+            bail!("no sheets found in {path:?}");
+        }
+
+        let mut out = Vec::new();
+        for (pos, sheet_name) in sheet_positions {
+            let sheet_stream = stream
+                .get(pos..)
+                .context("BOUNDSHEET8 position past the end of the Workbook stream")?;
+            let grid = xls_parse_sheet(sheet_stream, &sst, &is_date_by_xf)?;
+
+            let mut rows = grid.into_iter();
+            let Some(header_row) = rows.next() else {
+                continue; // empty sheet (or a non-tabular one, e.g. a chart) - contributes no table
+            };
+            let headers: Vec<String> = header_row
+                .iter()
+                .map(|c| c.clone().unwrap_or_default())
+                .collect();
+
+            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
+            for (i, row) in rows.enumerate() {
+                if nrows.is_some_and(|limit| i >= limit) {
+                    break;
+                }
+                for (col_idx, col) in raw.iter_mut().enumerate() {
+                    col.push(row.get(col_idx).cloned().flatten());
+                }
+            }
+
+            let mut profiles = Vec::new();
+            for (i, name) in headers.into_iter().enumerate() {
+                let total = raw[i].len();
+                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let current_type = if non_null.is_empty() {
+                    "String".to_string()
+                } else {
+                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                    naive_current_type(&refs).to_string()
+                };
+                let col = ColumnInput {
+                    name,
+                    current_type,
+                    raw_values: non_null,
+                    total,
+                    skip_heuristics: false,
+                };
+                profiles.push(profile_column(col, n_samples));
+            }
+            out.push((sheet_name, profiles));
+        }
+
+        if out.is_empty() {
+            bail!("no non-empty sheets found in {path:?}");
+        }
+        Ok(out)
+    }
 } // mod xlsx_support
 
 // --- Transparent gzip/zstd decompression ---
@@ -8111,6 +9148,57 @@ mod tests {
 
     #[cfg(feature = "xlsx")]
     #[test]
+    fn xls_reader_matches_calamine_output_exactly() {
+        for f in [
+            "tests/fixtures/type_detection_lo.xls",
+            "tests/fixtures/edge_xls_native_date_cells.xls",
+            "tests/fixtures/edge_xls_shared_strings.xls",
+            "tests/fixtures/edge_xls_formula_and_error.xls",
+            "tests/fixtures/multi_sheet_lo.xls",
+            "tests/fixtures/edge_zero_rows_and_unicode_lo.xls",
+        ] {
+            let path = Path::new(f);
+            let expected = columns_from_xlsx_calamine(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} calamine: {e:?}"));
+            let got = xlsx_support::columns_from_xls(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} xls: {e:?}"));
+            assert_eq!(got.len(), expected.len(), "{f}: sheet count");
+            for ((got_name, got_cols), (exp_name, exp_cols)) in got.iter().zip(expected.iter()) {
+                assert_eq!(got_name, exp_name, "{f}: sheet name");
+                assert_eq!(
+                    got_cols.len(),
+                    exp_cols.len(),
+                    "{f} sheet '{exp_name}': column count"
+                );
+                for (gc, ec) in got_cols.iter().zip(exp_cols.iter()) {
+                    assert_eq!(gc.name, ec.name, "{f} sheet '{exp_name}': column name");
+                    assert_eq!(
+                        gc.current_type, ec.current_type,
+                        "{f} sheet '{exp_name}' col '{}': current_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.ideal_type, ec.ideal_type,
+                        "{f} sheet '{exp_name}' col '{}': ideal_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.missing_pct, ec.missing_pct,
+                        "{f} sheet '{exp_name}' col '{}': missing_pct",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.sample_values, ec.sample_values,
+                        "{f} sheet '{exp_name}' col '{}': sample_values",
+                        ec.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
     fn ods_reader_matches_calamine_output_exactly() {
         for f in ["tests/fixtures/sample.ods"] {
             let path = Path::new(f);
@@ -8179,6 +9267,29 @@ mod tests {
         let name_col = cols.iter().find(|c| c.name == "name").unwrap();
         assert_eq!(name_col.missing_pct, 50.0);
         assert_eq!(name_col.sample_values, vec!["bob"]);
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn cfb_reader_extracts_the_real_workbook_stream() {
+        let cfb =
+            xlsx_support::CfbFile::open(Path::new("tests/fixtures/type_detection_lo.xls")).unwrap();
+        let workbook = cfb.read_stream("Workbook").unwrap();
+        assert_eq!(workbook.len(), 2268);
+        // The exact first 20 bytes, independently extracted in Python
+        // from this same file (header/FAT/directory/mini-FAT/mini-stream
+        // all walked manually, cross-checked twice after an initial
+        // manual hex-transcription error in this test itself - not the
+        // reader - was caught and fixed) before this reader was trusted -
+        // starts with a BOF record (type 0x0809, len 16), the mandatory
+        // first record of any valid BIFF8 stream.
+        assert_eq!(
+            &workbook[0..20],
+            &[
+                0x09, 0x08, 0x10, 0x00, 0x00, 0x06, 0x05, 0x00, 0xbb, 0x0d, 0xcc, 0x07, 0x00, 0x00,
+                0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     // A real, sizable (3,000-row) gzip file, generated with the system

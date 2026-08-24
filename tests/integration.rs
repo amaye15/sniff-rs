@@ -1090,6 +1090,83 @@ fn ods_handles_a_real_scale_repeated_empty_row_block_without_hanging() {
     assert_eq!(name["missing_pct"].as_f64().unwrap(), 50.0);
 }
 
+// .xls (Excel 97-2003, BIFF8) reads through the same InputFormat::Xlsx path
+// as .xlsx/.ods - dispatched internally to a hand-rolled OLE2/CFBF +
+// BIFF8 record reader rather than calamine, see CLAUDE.md's Dependency
+// footprint section. Unlike .ods, .xls's own dates ARE Excel-style
+// epoch-day serials (the same 1900 system .xlsx uses), resolved through
+// the exact same `xlsx_serial_to_ymd`/`xlsx_format_serial` machinery.
+#[cfg(feature = "xlsx")]
+#[test]
+fn xls_recognizes_types_and_resolves_native_date_serials() {
+    let doc = run_json("type_detection_lo.xls", &[]);
+    assert_eq!(doc["format"], "xlsx");
+    let cols = table(&doc, "Sheet1");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn xls_is_auto_detected_from_content_when_extensionless() {
+    let (_dir, dest) = copy_fixture_as("type_detection_lo.xls", "mystery_spreadsheet");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "xlsx");
+    let cols = table(&doc, "Sheet1");
+    assert!(cols.iter().any(|c| c["name"] == "id"));
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn xls_resolves_native_date_and_datetime_serials_not_raw_day_counts() {
+    // The exact same bug class documented in CLAUDE.md for .xlsx (a
+    // native date cell silently rendering as Excel's meaningless raw
+    // day-count serial, e.g. "45306") - this fixture was generated with
+    // real openpyxl datetime.date/datetime.datetime values, then
+    // exported through LibreOffice's own "MS Excel 97" filter, so a
+    // regression here would mean the BIFF8 NUMBER + XF-format date
+    // detection path (as opposed to .xlsx's styles.xml-based one) had
+    // silently broken.
+    let doc = run_json("edge_xls_native_date_cells.xls", &[]);
+    let cols = table(&doc, "Sheet");
+    let date = column(cols, "event_date");
+    assert_eq!(date["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(date["sample_values"][0], "2024-01-15");
+    let datetime = column(cols, "event_datetime");
+    assert_eq!(datetime["sample_values"][0], "2024-01-15T10:30:00");
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn xls_reports_one_table_per_sheet_and_extracts_formula_and_error_cells() {
+    let doc = run_json("multi_sheet_lo.xls", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(
+        tables.len(),
+        2,
+        "fixture has two sheets (customers, products), expected one table each"
+    );
+    let customers = table(&doc, "customers");
+    assert!(customers.iter().any(|c| c["name"] == "customer_id"));
+    let products = table(&doc, "products");
+    assert!(products.iter().any(|c| c["name"] == "sku"));
+
+    let formula_doc = run_json("edge_xls_formula_and_error.xls", &[]);
+    let formula_cols = table(&formula_doc, "Sheet");
+    let result = column(formula_cols, "formula_result");
+    assert!(
+        result["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "#DIV/0!"),
+        "expected a formula-cached #DIV/0! error value: {:?}",
+        result["sample_values"]
+    );
+}
+
 #[cfg(feature = "ini")]
 #[test]
 fn ini_reports_one_table_per_section_and_pools_duplicate_keys() {
