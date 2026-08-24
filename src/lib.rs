@@ -1775,7 +1775,20 @@ fn syslog_regex(rfc5424: bool) -> regex::Regex {
     let pattern = if rfc5424 {
         r#"^<(\d{1,3})>(\d+) (\S+) (\S+) (\S+) (\S+) (\S+) (-|\[[^\]]*\]) ?(.*)$"#
     } else {
-        r"^<(\d{1,3})>([A-Za-z]{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}) (\S+) ([^:\[\s]+)(?:\[(\d+)\])?: ?(.*)$"
+        // The `<PRI>` prefix is optional here, unlike RFC 5424 above -
+        // found via real-world testing (loghub's own real Linux_2k.log,
+        // sourced from an actual production system's /var/log/messages):
+        // PRI is primarily a wire-protocol artifact, and virtually every
+        // real on-disk RFC 3164 file (/var/log/syslog, /var/log/messages,
+        // /var/log/auth.log on any real Linux box) is written by the
+        // local syslog daemon *without* it - RFC 3164 itself documents
+        // PRI as commonly stripped by relays, but this project's original
+        // regex required it unconditionally, rejecting the single most
+        // common real-world shape this format actually appears in.
+        // Capture group numbering is unaffected: wrapping the whole `<PRI>`
+        // segment in a non-capturing optional group doesn't renumber the
+        // groups after it, so every other field's index is unchanged.
+        r"^(?:<(\d{1,3})>)?([A-Za-z]{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}) (\S+) ([^:\[]+?)(?:\[(\d+)\])?: ?(.*)$"
     };
     regex::Regex::new(pattern).expect("hardcoded syslog regex is always valid")
 }
@@ -1835,11 +1848,17 @@ fn columns_from_syslog(
                 line_no + 1
             )
         })?;
-        let pri: u32 = caps[1]
-            .parse()
-            .with_context(|| format!("line {}: PRI '{}' isn't a number", line_no + 1, &caps[1]))?;
+        // Group 1 (PRI) is mandatory for RFC 5424 but optional for RFC 3164
+        // (see syslog_regex's doc comment) - `caps.get(1)` handles both via
+        // `None` rather than the panicking `caps[1]` index form.
+        let pri: Option<u32> = caps
+            .get(1)
+            .map(|m| m.as_str().parse::<u32>())
+            .transpose()
+            .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
 
         let values: Vec<Option<String>> = if rfc5424 {
+            let pri = pri.expect("RFC 5424's regex always captures PRI");
             vec![
                 Some(syslog_facility_name(pri)),
                 Some(syslog_severity_name(pri)),
@@ -1854,8 +1873,8 @@ fn columns_from_syslog(
             ]
         } else {
             vec![
-                Some(syslog_facility_name(pri)),
-                Some(syslog_severity_name(pri)),
+                pri.map(syslog_facility_name),
+                pri.map(syslog_severity_name),
                 Some(caps[2].to_string()),
                 Some(caps[3].to_string()),
                 Some(caps[4].to_string()),

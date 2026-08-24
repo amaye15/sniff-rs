@@ -1360,6 +1360,65 @@ entirely:
   mirroring MNIST's own shape at fixture scale) and its integration test
   lock this in.
 
+- **RFC 3164 syslog required a `<PRI>` prefix that virtually no real
+  on-disk syslog file actually has, and its `tag` grammar rejected any
+  program name containing a space.** Found via a real-world sweep against
+  `loghub`'s `Linux_2k.log` - a genuine excerpt of an actual production
+  `/var/log/messages`-style file, not synthetic data. Two distinct gaps
+  in the same 1,999-line file:
+    1. **PRI.** RFC 3164 nominally includes `<PRI>` as part of every
+       message, but PRI is fundamentally a wire-protocol artifact - it's
+       how a receiving syslog daemon knows the sender's facility/severity
+       over the network. The *local* syslog daemon writing its own file
+       to disk (the overwhelming majority of real syslog data anyone
+       would actually want to profile) has no reason to include it, and
+       doesn't. The original regex made `<PRI>` mandatory, so it rejected
+       essentially the single most common real-world shape this format
+       appears in - confirmed directly against the real file, not
+       theorized. `syslog_regex` now wraps `<PRI>` in a non-capturing
+       optional group; when it's absent, `facility`/`severity` correctly
+       come out as missing rather than a guessed value - the same
+       "disclose the gap, don't guess" rule applied everywhere else in
+       this file, just triggered by an absent field instead of an
+       ambiguous one.
+    2. **The tag grammar.** The same real file has a recurring line
+       (7 times in fewer than 2,000 lines - not a one-off, since it's
+       `sysklogd`'s own hardcoded restart announcement, which fires on
+       every daemon restart): `"syslogd 1.4.1: restart."`. RFC 3164's
+       `TAG` field is conventionally a single no-whitespace program name,
+       and the old regex enforced exactly that - but here the "tag" is a
+       program name *and version* separated by a space. Changed the tag
+       capture from a whitespace-excluding character class to a
+       non-greedy one that only excludes `:`/`[` (letting it span
+       whitespace, matched non-greedily so it still stops at the
+       earliest valid `tag[pid]:`/`tag:` boundary rather than swallowing
+       message content). This is a real precision/coverage trade-off,
+       disclosed rather than hidden: a genuinely malformed line with no
+       colon anywhere still correctly fails to match at all (verified
+       against the existing `syslog_line_that_does_not_match_the_grammar_
+       is_an_actionable_error` test, unchanged), but a line with *some*
+       colon somewhere now has a wider space of tag interpretations than
+       before. Checked empirically before trusting it, the same
+       discipline as everywhere else in this file: ran the *entire* real
+       2,000-line file through the loosened grammar and read every
+       resulting `tag` value by hand, not just confirmed it didn't error
+       - 29 of 30 sampled values were unambiguously correct real program
+         names (`sshd(pam_unix)`, `logrotate`, `syslogd 1.4.1`, `kernel`,
+       `irqbalance`, ...); the one exception (a line with a genuinely
+       missing tag field in the *source* log itself - a double space
+       where a real program identifier should have been) reflects
+       already-ambiguous source data, not a parsing defect introduced by
+       the looser grammar.
+  Separately, the same pass ran a real, unrelated 10,000-line Apache
+  access log (Elastic's own published example dataset) through
+  `--format combined-log` and found zero gaps in the *existing* reader -
+  every field (IP, timestamp, method, status, referer as `URL`) resolved
+  correctly, and the one line that failed to parse turned out to be
+  genuine data corruption in the source file itself (a literal missing
+  closing quote mid-line, confirmed by reading the raw bytes) - exactly
+  the "hard error naming the line" contract this project already
+  guarantees, working as intended on a real corrupted line, not a gap.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1846,6 +1905,24 @@ the design philosophy section above. MNIST's own two label arrays
 archive's other two arrays are 3-D images" to profiling normally
 alongside a clear, disclosed explanation for the two that still
 correctly can't be.
+
+A tenth pass covered the log formats: `loghub`'s real `Linux_2k.log` (a
+genuine excerpt of an actual production `/var/log/messages`) for
+`--format syslog`, and a real 10,000-line Apache access log (Elastic's
+own published example dataset) for `--format combined-log`. The access
+log needed no fix at all - every field resolved correctly, and its one
+parse failure was confirmed to be genuine corruption already present in
+the source file. The syslog file found two real gaps; see the `<PRI>`-
+optional and tag-grammar entries in the design philosophy section above
+for the full writeup, including the empirical check (reading every
+resulting `tag` value from the *entire* real file by hand, not just
+confirming it didn't error) behind trusting the loosened grammar.
+`tests/fixtures/sample_rfc3164_no_pri.log` (three lines lifted directly
+from the real file's own shapes: a PRI-less line with `[pid]`, the
+recurring `"syslogd 1.4.1: restart."` space-containing-tag line, and a
+kernel-style message with embedded brackets/colons that must not be
+mistaken for tag/pid structure of its own) and its integration test lock
+both fixes in together.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests

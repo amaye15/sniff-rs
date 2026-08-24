@@ -741,6 +741,58 @@ fn syslog_rfc3164_decodes_pri_and_extracts_pid() {
     );
 }
 
+// Found via a real-world sweep against loghub's Linux_2k.log - a real
+// sample from an actual production /var/log/messages-style file. RFC 3164
+// technically includes a <PRI> prefix, but PRI is primarily a wire-
+// protocol artifact: the local syslog daemon on virtually every real
+// Linux box writes its own on-disk log files *without* it. The original
+// regex required PRI unconditionally, rejecting the single most common
+// real-world shape this format actually appears in. The same real file
+// also has a recurring line - sysklogd's own hardcoded restart
+// announcement, "syslogd 1.4.1: restart." - whose "tag" is a
+// space-containing "program version" rather than RFC 3164's usual
+// single-token program name, which the old strict no-whitespace tag
+// grammar also rejected outright.
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_rfc3164_pri_is_optional_and_tag_may_contain_a_space() {
+    let doc = run_with_format("sample_rfc3164_no_pri.log", "json", &["--format", "syslog"]);
+    let cols = table(&doc, "sample_rfc3164_no_pri");
+
+    // No <PRI> anywhere in this fixture - facility/severity can't be
+    // derived, so they're missing, not defaulted to a wrong guess.
+    let facility = column(cols, "facility");
+    assert_eq!(facility["missing_pct"].as_f64().unwrap(), 100.0);
+    let severity = column(cols, "severity");
+    assert_eq!(severity["missing_pct"].as_f64().unwrap(), 100.0);
+
+    // The rest of the line still parses normally without PRI.
+    let tag = column(cols, "tag");
+    let tag_samples: Vec<&str> = tag["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(tag_samples.contains(&"sshd(pam_unix)"));
+    // The space-containing "program version" tag shape.
+    assert!(tag_samples.contains(&"syslogd 1.4.1"));
+
+    let pid = column(cols, "pid");
+    assert_eq!(pid["current_type"], "i64");
+
+    // A bracketed, colon-containing kernel-style message body must not be
+    // mistaken for [pid]/tag structure of its own.
+    let message = column(cols, "message");
+    assert!(
+        message["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "[12345.678] eth0: link up")
+    );
+}
+
 #[cfg(feature = "syslog")]
 #[test]
 fn syslog_rfc5424_treats_nilvalue_dash_as_missing() {
