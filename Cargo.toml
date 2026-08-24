@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 csv = "1"
 chrono = "0.4"
-anyhow = "1"
 serde_json = "1.0.151"
 arrow = { version = "59.2.0", features = ["ipc", "ipc_compression", "chrono-tz"], optional = true }
 parquet = { version = "59.2.0", features = ["arrow"], optional = true }

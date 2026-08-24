@@ -2218,11 +2218,13 @@ this project could just implement directly rather than depend on:
   `--flag=value` forms, with the numeric/char/comma-list parsing each
   option already needed anyway. The one deliberate behavior change: clap
   prints its own error and exits with its own reserved code before this
-  project's `main` ever runs; the hand-rolled version returns
-  `anyhow::Result<Args>` instead, so a bad flag flows through the exact
-  same `Error: ...`-and-exit-1 path every other error in this tool already
-  uses - one less special case, not a regression, and nothing currently
-  depends on clap's specific exit code.
+  project's `main` ever runs; the hand-rolled version returns this
+  crate's own `Result<Args>` instead (at the time this was written, still
+  backed by `anyhow` - see that dependency's own entry further below for
+  why it was removed too, afterward), so a bad flag flows through the
+  exact same `Error: ...`-and-exit-1 path every other error in this tool
+  already uses - one less special case, not a regression, and nothing
+  currently depends on clap's specific exit code.
 - **`serde`'s `derive` feature dropped.** The only two places this project
   ever used `#[derive(Serialize)]` were `ColumnProfile` and a small local
   `DataDictionary` wrapper in `render_json` - both replaced with a direct,
@@ -2278,26 +2280,69 @@ this project could just implement directly rather than depend on:
   committed regression coverage (`src/lib.rs`'s own `#[cfg(test)]`
   block plus two new `tests/integration.rs` cases), rather than relying
   on the throwaway scratch files the fuller manual verification pass used.
+- **`anyhow` → a hand-rolled `Error`/`Context`/`Result`/`bail!`.** Done
+  last, and done anyway despite `anyhow` itself having *zero* transitive
+  dependencies of its own (confirmed via `cargo tree` before starting -
+  the rewrite was always going to net exactly one crate removed, a poor
+  ratio purely by dependency count), because the actual rewrite turned
+  out to be low-risk and mechanical rather than something to weigh
+  against that ratio: `Error` (message + optional boxed `source`, the
+  same shape anyhow's own context chain has), a `Context` trait
+  implemented once for any `Result<T, E: Into<Error>>` *and* for
+  `Option<T>`, and `bail!`/`anyhow!` as local `macro_rules!` wrapping
+  `format!` - about 100 lines total, replacing `use anyhow::{Context,
+  Result, bail};` at the top of `src/lib.rs`. The one piece worth calling
+  out: `impl<E: std::error::Error> From<E> for Error` is a *single*
+  blanket impl, and it's what makes `?` keep working unchanged at every
+  one of this project's ~150 explicit `.context()`/`.with_context()`/
+  `bail!`/`anyhow!` call sites (plus every bare `?` on a lower-level
+  error) across every reader - `io::Error`, `serde_json::Error`,
+  `csv::Error`, `chrono::ParseError`, `rusqlite::Error`,
+  `apache_avro::Error`, `parquet`/`arrow`'s errors, `calamine`'s,
+  `toml_edit`'s, `serde_norway`'s, `dbase`'s, `dta`'s, `sas7bdat`'s, and
+  more all already implement the standard `std::error::Error` trait (a
+  very standard convention almost every published crate follows), so one
+  impl bridges all of them at once - no per-crate special-casing needed,
+  confirmed by both the default and `--features full` builds compiling
+  clean *on the first attempt* after the swap, with all 122+60 (default)
+  and 131+156 (full) tests still passing unchanged. `Error` deliberately
+  does *not* implement `std::error::Error` itself - the same choice
+  anyhow's own `Error` type makes, and for the same reason: it would
+  conflict with core's reflexive `impl<T> From<T> for T` once `Error:
+  Into<Error>` is also relied on by the `Context` impl covering the
+  "wrap a `Result<T, Error>` this project's own code already returned"
+  case. `Error`/`Result` are `pub` (a small, deliberate extension of this
+  crate's otherwise-minimal public surface - see the "only supported
+  entry point" note elsewhere in this file) purely because `main.rs`
+  needs to name `run()`'s return type, the same reason `anyhow::Result`
+  used to appear there. Manually spot-verified across several real,
+  multi-level error chains before trusting the mechanical pass alone
+  (a missing file, a truncated gzip header nested three levels deep
+  through `decompress`/`read gzip header`/the underlying io error, a
+  corrupted Parquet footer, a wrong Avro magic number, a broken xlsx
+  zip archive, and a TOML parse error whose multi-line pointer-diagram
+  `Display` output survives the `.to_string()` bridge intact) - nothing
+  byte-identical to anyhow's own `Debug` formatting was required, since
+  no test in this project ever asserted on that exact chain layout, only
+  on specific substrings appearing somewhere in stderr.
 
 **What's deliberately not being hand-rolled**, and why the cost/benefit
-flips hard past this point: `anyhow` itself has *zero* transitive
-dependencies (confirmed via `cargo tree`), so replacing its ~185 call
-sites (`Result<T>`, `.with_context`, `bail!`, `anyhow!`) across this file
-would trade a large, mechanical rewrite for exactly one crate removed -
-a poor ratio even though the rewrite itself would be low-risk. `chrono`
-and `csv` are both far higher-value dependency-count targets on paper
-(chrono pulls `iana-time-zone`/`core-foundation-sys`/`num-traits`; csv
-pulls `csv-core`/`memchr`/`itoa`/`ryu`) but hand-rolling either one means
-re-deriving, by hand, the exact parsing correctness this project has
-spent this entire file's "Design philosophy" and "Real-world corpus
-validation" sections earning - 40+ verified date formats and their chrono
--specific parsing quirks, or the ragged-row/preamble/quoting edge cases
-found via the Pollock and JSONTestSuite corpora. `serde`/`serde_json` are
-even more central: `serde_json::Value` is the literal bridge type seven
-different format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML)
-recurse through via `profile_json_path` - replacing it means writing and
-re-verifying a whole JSON value type, parser, and serializer, not
-swapping one call site at a time.
+stays genuinely unfavorable here even after `anyhow` turned out to be
+worth doing anyway: `chrono` and `csv` are both real dependency-count
+targets on paper (chrono pulls `iana-time-zone`/`core-foundation-sys`/
+`num-traits`; csv pulls `csv-core`/`memchr`/`itoa`/`ryu`) but hand-rolling
+either one means re-deriving, by hand, the exact parsing correctness this
+project has spent this entire file's "Design philosophy" and "Real-world
+corpus validation" sections earning - 40+ verified date formats and their
+chrono-specific parsing quirks, or the ragged-row/preamble/quoting edge
+cases found via the Pollock and JSONTestSuite corpora. `serde`/
+`serde_json` are even more central: `serde_json::Value` is the literal
+bridge type seven different format readers (JSON, YAML, TOML, Avro,
+MessagePack, CBOR, XML) recurse through via `profile_json_path` -
+replacing it means writing and re-verifying a whole JSON value type,
+parser, and serializer, not swapping one call site at a time. Unlike
+`anyhow`, none of these three would be a mechanical, low-risk rewrite -
+the risk itself is the reason they're still deliberately dependencies.
 
 ## Known limitations / roadmap
 

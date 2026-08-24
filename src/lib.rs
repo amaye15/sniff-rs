@@ -3,10 +3,132 @@ use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use serde_json::Value as JsonValue;
 use serde_json::json;
+
+// --- Hand-rolled stand-in for `anyhow` (see CLAUDE.md's Dependency
+// footprint section) ---
+// `anyhow::Error` itself is zero-transitive-dependency and this project's
+// error handling is nothing fancier than "a message, plus optionally the
+// lower-level error that caused it, chained arbitrarily deep" - exactly
+// what `Error`/`Context` below provide, in about 40 lines total. `pub`
+// only because `main.rs` needs to name `run()`'s return type, the same
+// reason `anyhow::Result` used to appear there.
+
+/// An error with a human-readable message and, optionally, the
+/// lower-level error that caused it - chained arbitrarily deep, the same
+/// shape `anyhow::Error`'s own context chain has.
+pub struct Error {
+    message: String,
+    source: Option<Box<Error>>,
+}
+
+impl Error {
+    fn msg(message: impl Into<String>) -> Self {
+        Error {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    fn wrap(message: impl Into<String>, source: Error) -> Self {
+        Error {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+// Bridges any lower-level error (io::Error, serde_json::Error,
+// csv::Error, chrono::ParseError, rusqlite::Error, ...) into this
+// project's own Error type, which is what lets `?` convert automatically
+// inside any function returning this crate's `Result<T>` - the same role
+// anyhow's own blanket `From<E: StdError + Send + Sync + 'static>` impl
+// plays. Deliberately *not* implementing `std::error::Error` for `Error`
+// itself, the same choice anyhow's own `Error` type makes, and for the
+// same reason: it would conflict with core's reflexive `impl<T> From<T>
+// for T` once `Error: Into<Error>` is also relied on below.
+impl<E: std::error::Error> From<E> for Error {
+    fn from(e: E) -> Self {
+        Error::msg(e.to_string())
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+// Prints the full context chain, the same information anyhow::Error's own
+// Debug impl carries (just not byte-identical formatting - nothing in
+// this project's tests depend on that exact layout, only on specific
+// substrings appearing somewhere in stderr).
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        let mut cur = self.source.as_deref();
+        let mut idx = 0;
+        if cur.is_some() {
+            write!(f, "\n\nCaused by:")?;
+        }
+        while let Some(e) = cur {
+            write!(f, "\n    {idx}: {}", e.message)?;
+            idx += 1;
+            cur = e.source.as_deref();
+        }
+        Ok(())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Stand-in for `anyhow::Context`: attaches a message to any error
+/// (including this project's own `Error`, via the reflexive `Into`) or to
+/// an `Option`'s `None` case, producing this project's `Error` type
+/// either way.
+trait Context<T> {
+    fn context(self, msg: impl Into<String>) -> Result<T>;
+    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T>;
+}
+
+impl<T, E: Into<Error>> Context<T> for std::result::Result<T, E> {
+    fn context(self, msg: impl Into<String>) -> Result<T> {
+        self.map_err(|e| Error::wrap(msg.into(), e.into()))
+    }
+
+    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T> {
+        self.map_err(|e| Error::wrap(f(), e.into()))
+    }
+}
+
+impl<T> Context<T> for Option<T> {
+    fn context(self, msg: impl Into<String>) -> Result<T> {
+        self.ok_or_else(|| Error::msg(msg.into()))
+    }
+
+    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T> {
+        self.ok_or_else(|| Error::msg(f()))
+    }
+}
+
+/// Stand-in for `anyhow::bail!` - constructs an `Error` from a format
+/// string and returns it immediately.
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return std::result::Result::Err($crate::Error::msg(format!($($arg)*)))
+    };
+}
+
+/// Stand-in for `anyhow::anyhow!` - constructs an `Error` from a format
+/// string as a value, for the `.ok_or_else(|| anyhow!(...))` style call
+/// sites that need an `Error` rather than an immediate `return`.
+macro_rules! anyhow {
+    ($($arg:tt)*) => {
+        $crate::Error::msg(format!($($arg)*))
+    };
+}
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
@@ -152,7 +274,7 @@ impl Args {
                     *i += 1;
                     raw.get(*i)
                         .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("--{name} requires a value"))
+                        .ok_or_else(|| anyhow!("--{name} requires a value"))
                 };
                 match name.as_str() {
                     "samples" => {
@@ -173,7 +295,7 @@ impl Args {
                         let v = value(&mut i)?;
                         let mut chars = v.chars();
                         let c = chars.next().ok_or_else(|| {
-                            anyhow::anyhow!("--delimiter: expected a single character, got \"\"")
+                            anyhow!("--delimiter: expected a single character, got \"\"")
                         })?;
                         if chars.next().is_some() {
                             bail!("--delimiter: expected a single character, got {v:?}");
@@ -217,7 +339,7 @@ impl Args {
         let input_path = positionals
             .next()
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("missing required argument: input_path"))?;
+            .ok_or_else(|| anyhow!("missing required argument: input_path"))?;
         let output_path = positionals.next().map(PathBuf::from);
         if let Some(extra) = positionals.next() {
             bail!("unexpected extra argument: {extra}");
@@ -1719,9 +1841,7 @@ fn columns_from_fixed_width(
 ) -> Result<Vec<ColumnInput>> {
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
     let mut lines = content.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("{path:?} is empty"))?;
+    let header_line = lines.next().ok_or_else(|| anyhow!("{path:?} is empty"))?;
     let headers = slice_fixed_width(header_line, widths);
 
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); widths.len()];
@@ -1828,7 +1948,7 @@ fn columns_from_weblog(
             "Common Log"
         };
         let caps = re.captures(line).ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow!(
                 "line {} doesn't match {format_name} Format: {line:?}",
                 line_no + 1
             )
@@ -2034,7 +2154,7 @@ fn columns_from_syslog(
         }
         let format_name = if rfc5424 { "RFC 5424" } else { "RFC 3164" };
         let caps = re.captures(line).ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow!(
                 "line {} doesn't match syslog {format_name}: {line:?}",
                 line_no + 1
             )
@@ -2398,7 +2518,7 @@ fn columns_from_sas7bdat(
     use std::ops::ControlFlow;
 
     let ds = sas7bdat::Dataset::open(path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("failed to open {path:?}"))?;
 
     let names: Vec<String> = ds.columns().iter().map(|c| c.name.clone()).collect();
@@ -2422,7 +2542,7 @@ fn columns_from_sas7bdat(
                 Ok(ControlFlow::Continue(()))
             }
         })
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("failed reading records from {path:?}"))?;
 
     let mut columns = Vec::new();
@@ -3725,7 +3845,7 @@ fn columns_from_cbor(
         .is_empty()
     {
         let v: ciborium::Value = ciborium::from_reader(&mut reader)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow!("{e}"))
             .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
         top_values.push(v);
     }
@@ -3794,7 +3914,7 @@ fn columns_from_cbor(
 #[cfg(feature = "ini")]
 fn columns_from_ini(path: &Path, n_samples: usize) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
     let conf = ini::Ini::load_from_file(path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("failed to parse {path:?} as INI"))?;
 
     let mut out = Vec::new();
@@ -3984,7 +4104,7 @@ fn columns_from_xml(
         );
     }
     let root = xmltree::Element::parse(content.as_bytes())
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("failed to parse {path:?} as XML"))?;
 
     let child_elements: Vec<&xmltree::Element> = root
@@ -4396,9 +4516,7 @@ fn columns_from_npz(
             .by_name(&name)
             .with_context(|| format!("failed reading array '{name}' from {path:?}"))
             .and_then(|npy| {
-                npy.ok_or_else(|| {
-                    anyhow::anyhow!("array '{name}' disappeared while reading {path:?}")
-                })
+                npy.ok_or_else(|| anyhow!("array '{name}' disappeared while reading {path:?}"))
             })
             .and_then(|npy| columns_from_npy_reader(npy, nrows, n_samples));
 
@@ -5493,7 +5611,7 @@ fn dynamic_tables<R: std::io::Read>(
             0..=15 => lengths.push(sym as u8),
             16 => {
                 let prev = *lengths.last().ok_or_else(|| {
-                    anyhow::anyhow!(
+                    anyhow!(
                         "invalid DEFLATE stream: repeat-previous code length with no previous value"
                     )
                 })?;
@@ -5900,7 +6018,7 @@ pub fn run() -> Result<()> {
             InputFormat::Xml => columns_from_xml(&read_path, args.nrows, args.samples)?,
             InputFormat::FixedWidth => {
                 let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
-                    anyhow::anyhow!(
+                    anyhow!(
                         "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
                     )
                 })?;

@@ -1,3 +1,3 @@
-fn main() -> anyhow::Result<()> {
+fn main() -> sniff_rs::Result<()> {
     sniff_rs::run()
 }
