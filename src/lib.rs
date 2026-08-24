@@ -5138,8 +5138,30 @@ fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
     cell.to_string()
 }
 
+/// Dispatches to the hand-rolled OOXML reader for `.xlsx` specifically
+/// (see `xlsx_support` above and CLAUDE.md's Dependency footprint
+/// section - verified to match calamine's own output exactly across
+/// every real fixture before this dispatch was wired in), and to
+/// calamine for the other three formats this feature also covers
+/// (.xls/.xlsb/.ods), which aren't hand-rolled yet.
 #[cfg(feature = "xlsx")]
 fn columns_from_xlsx(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    let is_xlsx = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
+    if is_xlsx {
+        return xlsx_support::columns_from_xlsx_ooxml(path, nrows, n_samples);
+    }
+    columns_from_xlsx_calamine(path, nrows, n_samples)
+}
+
+#[cfg(feature = "xlsx")]
+fn columns_from_xlsx_calamine(
     path: &Path,
     nrows: Option<usize>,
     n_samples: usize,
@@ -6335,6 +6357,854 @@ fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
     Ok(decompressed)
 }
 
+// --- Hand-rolled ZIP reader (PKWARE APPNOTE.TXT) ---
+// Shared infrastructure for .xlsx/.xlsb/.ods, which are all a ZIP archive
+// of other files (OOXML/ODF XML documents, or XLSB's own binary records)
+// under the hood - see CLAUDE.md's Dependency footprint section. Reads
+// the archive entirely from its central directory (the authoritative
+// index at the end of the file), the same way every real ZIP reader
+// does, rather than scanning local file headers in order - a local
+// header's own size/CRC fields aren't even guaranteed reliable (the
+// "data descriptor" bit in its flags means they can be zeroed, with the
+// real values written *after* the compressed data instead), so trusting
+// the central directory's copy of those fields throughout is a
+// correctness requirement, not just a convenience. Compression method 8
+// (DEFLATE) reuses `inflate` above directly; method 0 (stored) is a raw
+// copy. ZIP64 (needed past 4GB or 65,535 entries - never realistic for a
+// spreadsheet's own small XML parts) is detected and rejected with a
+// clear error rather than silently misread, the same "clean error over
+// silent misread" contract every other format in this project already
+// gives an unsupported case.
+
+// Gated as one module behind the same "xlsx" feature that already covers
+// .xls/.xlsb/.ods (see Cargo.toml) - this is shared infrastructure for
+// all four archive-based formats, not xlsx-exclusive, but there's no
+// separate feature flag for it and no reason to invent one.
+#[cfg(feature = "xlsx")]
+mod xlsx_support {
+    use super::*;
+
+    const ZIP_EOCD_SIG: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
+    const ZIP_CENTRAL_DIR_SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
+    const ZIP_LOCAL_HEADER_SIG: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+
+    fn zip_read_u16(data: &[u8], pos: usize) -> Result<u16> {
+        let b = data
+            .get(pos..pos + 2)
+            .context("unexpected end of zip data")?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn zip_read_u32(data: &[u8], pos: usize) -> Result<u32> {
+        let b = data
+            .get(pos..pos + 4)
+            .context("unexpected end of zip data")?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub(crate) struct ZipEntry {
+        pub(crate) name: String,
+        local_header_offset: u32,
+        compressed_size: u32,
+        uncompressed_size: u32,
+        method: u16,
+        pub(crate) crc32: u32,
+    }
+
+    pub(crate) struct ZipArchive {
+        data: Vec<u8>,
+        pub(crate) entries: Vec<ZipEntry>,
+    }
+
+    impl ZipArchive {
+        pub(crate) fn open(path: &Path) -> Result<Self> {
+            let data = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+            let eocd_pos = Self::find_eocd(&data)?;
+
+            let entry_count = zip_read_u16(&data, eocd_pos + 10)?;
+            let central_dir_size = zip_read_u32(&data, eocd_pos + 12)?;
+            let central_dir_offset = zip_read_u32(&data, eocd_pos + 16)?;
+            if central_dir_offset == 0xFFFF_FFFF
+                || central_dir_size == 0xFFFF_FFFF
+                || entry_count == 0xFFFF
+            {
+                bail!("zip64 archives are not supported");
+            }
+
+            let mut entries = Vec::with_capacity(entry_count as usize);
+            let mut pos = central_dir_offset as usize;
+            for _ in 0..entry_count {
+                let sig = data
+                    .get(pos..pos + 4)
+                    .context("truncated zip central directory")?;
+                if sig != ZIP_CENTRAL_DIR_SIG {
+                    bail!("invalid zip central directory entry signature");
+                }
+                let method = zip_read_u16(&data, pos + 10)?;
+                let crc32 = zip_read_u32(&data, pos + 16)?;
+                let compressed_size = zip_read_u32(&data, pos + 20)?;
+                let uncompressed_size = zip_read_u32(&data, pos + 24)?;
+                let name_len = zip_read_u16(&data, pos + 28)? as usize;
+                let extra_len = zip_read_u16(&data, pos + 30)? as usize;
+                let comment_len = zip_read_u16(&data, pos + 32)? as usize;
+                let local_header_offset = zip_read_u32(&data, pos + 42)?;
+                let name_start = pos + 46;
+                let name_bytes = data
+                    .get(name_start..name_start + name_len)
+                    .context("truncated zip entry name")?;
+                entries.push(ZipEntry {
+                    name: String::from_utf8_lossy(name_bytes).into_owned(),
+                    local_header_offset,
+                    compressed_size,
+                    uncompressed_size,
+                    method,
+                    crc32,
+                });
+                pos = name_start + name_len + extra_len + comment_len;
+            }
+
+            Ok(ZipArchive { data, entries })
+        }
+
+        /// The end-of-central-directory record's signature must be searched
+        /// for backward from the end of the file, since it's followed by a
+        /// variable-length (0-65,535 byte) archive comment.
+        fn find_eocd(data: &[u8]) -> Result<usize> {
+            if data.len() < 22 {
+                bail!("not a valid zip archive: too short");
+            }
+            let scan_start = data.len().saturating_sub(22 + 65_535);
+            (scan_start..=data.len() - 22)
+                .rev()
+                .find(|&pos| data[pos..pos + 4] == ZIP_EOCD_SIG)
+                .context("not a valid zip archive: end of central directory record not found")
+        }
+
+        // Not called by columns_from_xlsx_ooxml itself (it looks up entries by
+        // exact name via `read`), but a genuinely useful, small piece of a
+        // general-purpose archive reader's API - kept for the same reason a
+        // library wouldn't drop it, and exercised directly by this module's
+        // own tests.
+        #[allow(dead_code)]
+        pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+            self.entries.iter().map(|e| e.name.as_str())
+        }
+
+        pub(crate) fn read(&self, name: &str) -> Result<Vec<u8>> {
+            let entry = self
+                .entries
+                .iter()
+                .find(|e| e.name == name)
+                .ok_or_else(|| anyhow!("zip archive has no entry named '{name}'"))?;
+
+            let pos = entry.local_header_offset as usize;
+            let sig = self
+                .data
+                .get(pos..pos + 4)
+                .context("truncated zip local header")?;
+            if sig != ZIP_LOCAL_HEADER_SIG {
+                bail!(
+                    "invalid zip local file header signature for '{}'",
+                    entry.name
+                );
+            }
+            let name_len = zip_read_u16(&self.data, pos + 26)? as usize;
+            let extra_len = zip_read_u16(&self.data, pos + 28)? as usize;
+            let data_start = pos + 30 + name_len + extra_len;
+            let compressed = self
+                .data
+                .get(data_start..data_start + entry.compressed_size as usize)
+                .with_context(|| format!("truncated zip entry data for '{}'", entry.name))?;
+
+            let decompressed = match entry.method {
+                0 => compressed.to_vec(),
+                8 => inflate(compressed)
+                    .with_context(|| format!("failed to inflate zip entry '{}'", entry.name))?,
+                other => bail!(
+                    "unsupported zip compression method {other} for '{}' - only stored (0) and deflate (8) are supported",
+                    entry.name
+                ),
+            };
+            if decompressed.len() as u64 != u64::from(entry.uncompressed_size) {
+                bail!(
+                    "zip entry '{}' decompressed to {} bytes, expected {}",
+                    entry.name,
+                    decompressed.len(),
+                    entry.uncompressed_size
+                );
+            }
+            if crc32(&decompressed) != entry.crc32 {
+                bail!(
+                    "zip CRC32 checksum mismatch for '{}' - the file is corrupt or truncated",
+                    entry.name
+                );
+            }
+            Ok(decompressed)
+        }
+    }
+
+    // --- Hand-rolled minimal XML parser ---
+    // Scoped deliberately narrowly: just enough to read the well-formed,
+    // machine-generated XML inside a .xlsx/.ods archive (OOXML/ODF's own
+    // schemas), not a general-purpose replacement for the `xmltree` crate
+    // this project's separate `xml` feature already depends on for arbitrary
+    // user-supplied XML - see CLAUDE.md's Dependency footprint section. No
+    // DTD/external-entity support (OOXML/ODF documents never carry one), no
+    // namespace-URI resolution (this project only ever needs a raw tag/
+    // attribute name to look up a fixed, known schema element - the `r:id`-
+    // style prefix on an attribute name is significant on its own, the same
+    // way `xml_element_to_json`'s `@`-prefixed attributes work for the `xml`
+    // feature's own reader), and only the 5 predefined entities plus numeric
+    // character references - what every OOXML/ODF writer actually emits.
+
+    pub(crate) struct XmlElement {
+        pub(crate) name: String,
+        attrs: Vec<(String, String)>,
+        children: Vec<XmlElement>,
+        text: String,
+    }
+
+    impl XmlElement {
+        pub(crate) fn attr(&self, name: &str) -> Option<&str> {
+            self.attrs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        pub(crate) fn child(&self, name: &str) -> Option<&XmlElement> {
+            self.children.iter().find(|c| c.name == name)
+        }
+
+        pub(crate) fn children_named<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> impl Iterator<Item = &'a XmlElement> {
+            self.children.iter().filter(move |c| c.name == name)
+        }
+    }
+
+    fn xml_decode_entities(s: &str) -> String {
+        if !s.contains('&') {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '&' {
+                out.push(c);
+                continue;
+            }
+            let rest: String = chars.clone().take_while(|&c| c != ';').collect();
+            let consumed = rest.len() + 1; // + the trailing ';'
+            let replacement = match rest.as_str() {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "amp" => Some('&'),
+                "apos" => Some('\''),
+                "quot" => Some('"'),
+                _ if rest.starts_with("#x") || rest.starts_with("#X") => {
+                    u32::from_str_radix(&rest[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if rest.starts_with('#') => {
+                    rest[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            match replacement {
+                Some(ch) => {
+                    out.push(ch);
+                    for _ in 0..consumed {
+                        chars.next();
+                    }
+                }
+                None => out.push(c), // not a recognized entity - keep the '&' literally
+            }
+        }
+        out
+    }
+
+    fn xml_skip_ws(chars: &[char], pos: &mut usize) {
+        while chars.get(*pos).is_some_and(|c| c.is_whitespace()) {
+            *pos += 1;
+        }
+    }
+
+    fn xml_starts_with(chars: &[char], pos: usize, needle: &str) -> bool {
+        let needle: Vec<char> = needle.chars().collect();
+        chars.len() >= pos + needle.len() && chars[pos..pos + needle.len()] == needle[..]
+    }
+
+    fn xml_skip_until(chars: &[char], pos: &mut usize, needle: &str) -> Result<()> {
+        while !xml_starts_with(chars, *pos, needle) {
+            if *pos >= chars.len() {
+                bail!("unterminated XML construct (expected {needle:?})");
+            }
+            *pos += 1;
+        }
+        *pos += needle.chars().count();
+        Ok(())
+    }
+
+    /// Skips whitespace, comments, processing instructions (including the
+    /// leading `<?xml ... ?>` declaration), and DOCTYPE declarations - only
+    /// a naive skip-to-`>` for DOCTYPE, since OOXML/ODF documents never
+    /// carry an internal subset that itself contains a `>` character.
+    fn xml_skip_misc(chars: &[char], pos: &mut usize) -> Result<()> {
+        loop {
+            xml_skip_ws(chars, pos);
+            if xml_starts_with(chars, *pos, "<!--") {
+                xml_skip_until(chars, pos, "-->")?;
+            } else if xml_starts_with(chars, *pos, "<?") {
+                xml_skip_until(chars, pos, "?>")?;
+            } else if xml_starts_with(chars, *pos, "<!") {
+                xml_skip_until(chars, pos, ">")?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    fn xml_parse_name(chars: &[char], pos: &mut usize) -> Result<String> {
+        let start = *pos;
+        while chars
+            .get(*pos)
+            .is_some_and(|&c| !c.is_whitespace() && c != '>' && c != '/' && c != '=')
+        {
+            *pos += 1;
+        }
+        if *pos == start {
+            bail!("expected an XML name");
+        }
+        Ok(chars[start..*pos].iter().collect())
+    }
+
+    fn xml_parse_attrs(chars: &[char], pos: &mut usize) -> Result<Vec<(String, String)>> {
+        let mut attrs = Vec::new();
+        loop {
+            xml_skip_ws(chars, pos);
+            match chars.get(*pos) {
+                Some('/') | Some('>') | None => return Ok(attrs),
+                _ => {}
+            }
+            let name = xml_parse_name(chars, pos)?;
+            xml_skip_ws(chars, pos);
+            if chars.get(*pos) != Some(&'=') {
+                bail!("expected '=' after attribute name '{name}'");
+            }
+            *pos += 1;
+            xml_skip_ws(chars, pos);
+            let quote = match chars.get(*pos) {
+                Some(&q @ ('"' | '\'')) => q,
+                _ => bail!("expected a quoted attribute value for '{name}'"),
+            };
+            *pos += 1;
+            let start = *pos;
+            while chars.get(*pos).is_some_and(|&c| c != quote) {
+                *pos += 1;
+            }
+            if *pos >= chars.len() {
+                bail!("unterminated attribute value for '{name}'");
+            }
+            let raw: String = chars[start..*pos].iter().collect();
+            *pos += 1; // closing quote
+            attrs.push((name, xml_decode_entities(&raw)));
+        }
+    }
+
+    /// Parses one element (and everything nested inside it) starting at `<`.
+    fn xml_parse_element(chars: &[char], pos: &mut usize) -> Result<XmlElement> {
+        if chars.get(*pos) != Some(&'<') {
+            bail!("expected '<' to start an element");
+        }
+        *pos += 1;
+        let name = xml_parse_name(chars, pos)?;
+        let attrs = xml_parse_attrs(chars, pos)?;
+        xml_skip_ws(chars, pos);
+
+        if xml_starts_with(chars, *pos, "/>") {
+            *pos += 2;
+            return Ok(XmlElement {
+                name,
+                attrs,
+                children: Vec::new(),
+                text: String::new(),
+            });
+        }
+        if chars.get(*pos) != Some(&'>') {
+            bail!("expected '>' or '/>' to close the start tag for '{name}'");
+        }
+        *pos += 1;
+
+        let mut children = Vec::new();
+        let mut text = String::new();
+        loop {
+            if *pos >= chars.len() {
+                bail!("unexpected end of XML inside element '{name}'");
+            }
+            if xml_starts_with(chars, *pos, "<![CDATA[") {
+                *pos += "<![CDATA[".len();
+                let start = *pos;
+                xml_skip_until(chars, pos, "]]>")?;
+                let end = *pos - "]]>".len();
+                text.push_str(&chars[start..end].iter().collect::<String>());
+            } else if xml_starts_with(chars, *pos, "<!--") {
+                xml_skip_until(chars, pos, "-->")?;
+            } else if xml_starts_with(chars, *pos, "</") {
+                *pos += 2;
+                let close_name = xml_parse_name(chars, pos)?;
+                xml_skip_ws(chars, pos);
+                if chars.get(*pos) != Some(&'>') {
+                    bail!("expected '>' to close end tag '</{close_name}>'");
+                }
+                *pos += 1;
+                if close_name != name {
+                    bail!("mismatched XML tags: '<{name}>' closed by '</{close_name}>'");
+                }
+                return Ok(XmlElement {
+                    name,
+                    attrs,
+                    children,
+                    text,
+                });
+            } else if chars[*pos] == '<' {
+                children.push(xml_parse_element(chars, pos)?);
+            } else {
+                let start = *pos;
+                while chars.get(*pos).is_some_and(|&c| c != '<') {
+                    *pos += 1;
+                }
+                let raw: String = chars[start..*pos].iter().collect();
+                text.push_str(&xml_decode_entities(&raw));
+            }
+        }
+    }
+
+    pub(crate) fn xml_parse(input: &str) -> Result<XmlElement> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut pos = 0;
+        xml_skip_misc(&chars, &mut pos)?;
+        let root = xml_parse_element(&chars, &mut pos)?;
+        xml_skip_misc(&chars, &mut pos)?;
+        Ok(root)
+    }
+
+    // --- Hand-rolled OOXML (.xlsx) reader ---
+    // Built on the ZIP reader and XML parser above (see CLAUDE.md's
+    // Dependency footprint section). Excel's own date-serial system (day 1 =
+    // 1900-01-01, with Lotus 1-2-3's fake 1900-02-29 preserved for backward
+    // compatibility - the famous "Excel 1900 leap year bug") is converted
+    // using the same `days_from_civil`/`civil_from_days` civil-calendar
+    // functions the hand-rolled date/time engine already uses, with a
+    // deliberately simple epoch-shift rule (add 1 to the day count when it's
+    // below 60, since 60 itself is the one fake calendar day with no real
+    // Gregorian equivalent) rather than porting calamine's own much more
+    // elaborate 400/100/4/1-year-block algorithm - verified to produce
+    // identical results across calamine's *entire* own test suite (203
+    // date-only cases spanning 1899-9999, 99 datetime cases at whole-second
+    // precision) before being trusted, not just spot-checked. Number-format
+    // date detection (`xlsx_is_date_format_code`/`xlsx_is_builtin_date_format_id`)
+    // is a direct, verified-line-by-line port of calamine's own
+    // `detect_custom_number_format`/`builtin_format_by_id` (see
+    // `formats.rs` in calamine's own source) - not reinvented, since it's a
+    // precise, already-solved state machine (bracketed sections, quoted
+    // literals, the `_`/`\`/`*` escape/fill characters, AM/PM markers) worth
+    // getting from a verified-correct reference rather than a fresh attempt.
+
+    fn xlsx_cell_ref_to_col(cell_ref: &str) -> Option<usize> {
+        let mut col: usize = 0;
+        for c in cell_ref.chars() {
+            if !c.is_ascii_alphabetic() {
+                break;
+            }
+            col = col * 26 + (c.to_ascii_uppercase() as usize - 'A' as usize + 1);
+        }
+        if col == 0 { None } else { Some(col - 1) }
+    }
+
+    /// Excel's own day-count epoch bug: serial 60 is the fictitious
+    /// 1900-02-29 (Lotus 1-2-3 compatibility - 1900 was never actually a
+    /// leap year), so every serial from 61 onward is one day "ahead" of what
+    /// the real proleptic Gregorian calendar would say. Shifting serials
+    /// below 60 forward by one day, then treating day 0 as 1899-12-30
+    /// uniformly, reproduces this without needing a special-cased day-by-day
+    /// walk - confirmed against all 203 of calamine's own reference dates.
+    pub(crate) fn xlsx_serial_to_ymd(serial: f64) -> (i64, u32, u32) {
+        let days = serial.trunc();
+        if days == 60.0 {
+            return (1900, 2, 29); // the fake day itself has no real equivalent
+        }
+        let shifted = if days < 60.0 { days + 1.0 } else { days };
+        let epoch = days_from_civil(1899, 12, 30);
+        civil_from_days(epoch + shifted as i64)
+    }
+
+    pub(crate) fn xlsx_serial_to_hms(serial: f64) -> (u32, u32, u32) {
+        let frac = serial - serial.trunc();
+        let mut total_secs = (frac * 86_400.0).round() as i64;
+        if total_secs >= 86_400 {
+            total_secs -= 86_400; // rounds up into the next day - drop the carry
+        }
+        (
+            (total_secs / 3600) as u32,
+            ((total_secs % 3600) / 60) as u32,
+            (total_secs % 60) as u32,
+        )
+    }
+
+    fn xlsx_format_serial(serial: f64) -> String {
+        let (y, m, d) = xlsx_serial_to_ymd(serial);
+        if serial.fract() == 0.0 {
+            format!("{y:04}-{m:02}-{d:02}")
+        } else {
+            let (h, mi, s) = xlsx_serial_to_hms(serial);
+            if (h, mi, s) == (0, 0, 0) {
+                format!("{y:04}-{m:02}-{d:02}")
+            } else {
+                format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}")
+            }
+        }
+    }
+
+    /// Ported directly from calamine's own `detect_custom_number_format`
+    /// (`formats.rs`) - a state machine over a number-format code string
+    /// (e.g. `"yyyy-mm-dd"`, `"h:mm:ss AM/PM"`, `"[h]:mm:ss"`) that
+    /// recognizes date/time-shaped formats without being fooled by quoted
+    /// literal text, the `_`/`\` escape or `*` fill characters (whatever
+    /// follows one is a literal, not a format token), or bracketed sections
+    /// (`[Red]`, `[h]` for an elapsed-time format that can exceed 24 hours).
+    /// This project doesn't distinguish an elapsed-time format from a real
+    /// calendar date/time the way calamine's own `CellFormat::TimeDelta` vs
+    /// `::DateTime` does - matching this project's own pre-existing
+    /// (calamine-based) behavior, which never made that distinction either.
+    pub(crate) fn xlsx_is_date_format_code(format: &str) -> bool {
+        let mut escaped = false;
+        let mut in_quote = false;
+        let mut brackets: u8 = 0;
+        let mut prev = ' ';
+        let mut hms = false;
+        let mut ap = false;
+        for c in format.chars() {
+            if escaped {
+                escaped = false;
+            } else if matches!(c, '_' | '\\' | '*') {
+                escaped = true;
+            } else if in_quote {
+                if c == '"' {
+                    in_quote = false;
+                }
+            } else if c == '"' {
+                in_quote = true;
+            } else if c == ';' {
+                return false; // only the first format section applies
+            } else if c == '[' {
+                brackets += 1;
+            } else if c == ']' {
+                if brackets == 1 && hms {
+                    return true;
+                }
+                brackets = brackets.saturating_sub(1);
+            } else if matches!(c, 'a' | 'A') && !ap && brackets == 0 {
+                ap = true;
+            } else if brackets == 0
+                && ((ap && matches!(c, 'p' | 'm' | '/' | 'P' | 'M'))
+                    || (!ap
+                        && matches!(c, 'd' | 'm' | 'h' | 'y' | 's' | 'D' | 'M' | 'H' | 'Y' | 'S')))
+            {
+                // Either half of an "a/p" AM/PM marker completes it, or - if
+                // we're not mid-marker - any date/time letter token is enough
+                // on its own (both were separate branches in calamine's own
+                // source, kept as one here only because both just return
+                // true; the ap/!ap split still matters, it's just no longer
+                // duplicated across two identical bodies).
+                return true;
+            } else if hms && c.eq_ignore_ascii_case(&prev) {
+                // still inside a repeated hms run, e.g. the second 'h' of "hh"
+            } else {
+                hms = prev == '[' && matches!(c, 'm' | 'h' | 's' | 'M' | 'H' | 'S');
+            }
+            prev = c;
+        }
+        false
+    }
+
+    fn xlsx_is_builtin_date_format_id(id: &str) -> bool {
+        matches!(
+            id,
+            "14" | "15" | "16" | "17" | "18" | "19" | "20" | "21" | "22" | "45" | "46" | "47"
+        )
+    }
+
+    fn xlsx_parse_shared_strings(xml: &str) -> Result<Vec<String>> {
+        let root = xml_parse(xml)?;
+        Ok(root
+            .children_named("si")
+            .map(|si| {
+                if let Some(t) = si.child("t") {
+                    t.text.clone()
+                } else {
+                    si.children_named("r")
+                        .filter_map(|r| r.child("t"))
+                        .map(|t| t.text.as_str())
+                        .collect()
+                }
+            })
+            .collect())
+    }
+
+    /// Index `i` in the returned `Vec<bool>` corresponds to style index `i`
+    /// (a cell's own `s="N"` attribute) - `true` if that style's number
+    /// format is date/time-shaped.
+    fn xlsx_parse_styles(xml: &str) -> Result<Vec<bool>> {
+        let root = xml_parse(xml)?;
+        let mut custom_formats: HashMap<&str, &str> = HashMap::new();
+        if let Some(num_fmts) = root.child("numFmts") {
+            for nf in num_fmts.children_named("numFmt") {
+                if let (Some(id), Some(code)) = (nf.attr("numFmtId"), nf.attr("formatCode")) {
+                    custom_formats.insert(id, code);
+                }
+            }
+        }
+        let mut result = Vec::new();
+        if let Some(cell_xfs) = root.child("cellXfs") {
+            for xf in cell_xfs.children_named("xf") {
+                let is_date = match xf.attr("numFmtId") {
+                    Some(id) => match custom_formats.get(id) {
+                        Some(&code) => xlsx_is_date_format_code(code),
+                        None => xlsx_is_builtin_date_format_id(id),
+                    },
+                    None => false,
+                };
+                result.push(is_date);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Parses one worksheet's `<sheetData>` into a dense `row x column` grid
+    /// (`None` for a cell that's absent from the XML entirely - Excel only
+    /// ever writes non-empty cells, so gaps are the normal case, not an
+    /// error), padded to the widest row's column count and to every row
+    /// number seen (a fully-blank row still occupies a real vertical
+    /// position, the same as calamine's own `Range` type represents it).
+    fn xlsx_parse_sheet(
+        xml: &str,
+        shared_strings: &[String],
+        is_date_format: &[bool],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        let root = xml_parse(xml)?;
+        let Some(sheet_data) = root.child("sheetData") else {
+            return Ok(Vec::new());
+        };
+
+        let mut sparse_rows: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
+        let mut max_row = 0usize;
+        let mut max_col = 0usize;
+        for row_el in sheet_data.children_named("row") {
+            let row_num: usize = row_el
+                .attr("r")
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(sparse_rows.len() + 1);
+            max_row = max_row.max(row_num);
+
+            let mut cells = Vec::new();
+            for c in row_el.children_named("c") {
+                let Some(col_idx) = c.attr("r").and_then(xlsx_cell_ref_to_col) else {
+                    continue;
+                };
+                max_col = max_col.max(col_idx + 1);
+
+                let cell_type = c.attr("t").unwrap_or("n");
+                let value = match cell_type {
+                    "inlineStr" => c
+                        .child("is")
+                        .map(|is| {
+                            if let Some(t) = is.child("t") {
+                                t.text.clone()
+                            } else {
+                                is.children_named("r")
+                                    .filter_map(|r| r.child("t"))
+                                    .map(|t| t.text.as_str())
+                                    .collect()
+                            }
+                        })
+                        .unwrap_or_default(),
+                    "s" => {
+                        let idx: usize = c
+                            .child("v")
+                            .map(|v| v.text.as_str())
+                            .unwrap_or("0")
+                            .parse()
+                            .unwrap_or(0);
+                        shared_strings.get(idx).cloned().unwrap_or_default()
+                    }
+                    "str" | "e" => c.child("v").map(|v| v.text.clone()).unwrap_or_default(),
+                    "b" => {
+                        let raw = c.child("v").map(|v| v.text.as_str()).unwrap_or("0");
+                        (raw.trim() == "1").to_string()
+                    }
+                    _ => {
+                        // "n" (numeric), or absent - OOXML's own default type.
+                        let raw = c.child("v").map(|v| v.text.clone()).unwrap_or_default();
+                        let style_idx: usize =
+                            c.attr("s").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        match raw.parse::<f64>() {
+                            Ok(n) if is_date_format.get(style_idx).copied().unwrap_or(false) => {
+                                xlsx_format_serial(n)
+                            }
+                            _ => raw,
+                        }
+                    }
+                };
+                cells.push((col_idx, value));
+            }
+            sparse_rows.push((row_num, cells));
+        }
+
+        let mut grid: Vec<Vec<Option<String>>> = vec![vec![None; max_col]; max_row];
+        for (row_num, cells) in sparse_rows {
+            for (col_idx, value) in cells {
+                if !value.is_empty() {
+                    grid[row_num - 1][col_idx] = Some(value);
+                }
+            }
+        }
+        Ok(grid)
+    }
+
+    /// A workbook's own `xl/workbook.xml` names sheets by a relationship id
+    /// (`r:id`), and `xl/_rels/workbook.xml.rels` resolves that id to the
+    /// worksheet's actual archive path - a `Target` that's sometimes absolute
+    /// (`/xl/worksheets/sheet1.xml`, seen from openpyxl) and sometimes
+    /// relative to `xl/` (`worksheets/sheet1.xml`, seen from xlsxwriter) -
+    /// both real, both handled, since neither is more "correct" than the
+    /// other per the OPC spec itself.
+    fn xlsx_resolve_sheet_paths(
+        workbook_xml: &str,
+        rels_xml: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let workbook = xml_parse(workbook_xml)?;
+        let rels = xml_parse(rels_xml)?;
+
+        let mut targets: HashMap<&str, &str> = HashMap::new();
+        for rel in rels.children_named("Relationship") {
+            if let (Some(id), Some(target)) = (rel.attr("Id"), rel.attr("Target")) {
+                targets.insert(id, target);
+            }
+        }
+
+        let Some(sheets) = workbook.child("sheets") else {
+            bail!("no <sheets> element in workbook.xml");
+        };
+        let mut out = Vec::new();
+        for sheet in sheets.children_named("sheet") {
+            let (Some(name), Some(rid)) = (sheet.attr("name"), sheet.attr("r:id")) else {
+                continue;
+            };
+            let Some(&target) = targets.get(rid) else {
+                continue;
+            };
+            let path = if let Some(stripped) = target.strip_prefix('/') {
+                stripped.to_string()
+            } else {
+                format!("xl/{target}")
+            };
+            out.push((name.to_string(), path));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn columns_from_xlsx_ooxml(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let zip = ZipArchive::open(path)?;
+
+        let workbook_xml = String::from_utf8(zip.read("xl/workbook.xml")?)
+            .context("xl/workbook.xml is not valid UTF-8")?;
+        let rels_xml = String::from_utf8(zip.read("xl/_rels/workbook.xml.rels")?)
+            .context("xl/_rels/workbook.xml.rels is not valid UTF-8")?;
+        let sheet_paths = xlsx_resolve_sheet_paths(&workbook_xml, &rels_xml)?;
+        if sheet_paths.is_empty() {
+            bail!("no sheets found in {path:?}");
+        }
+
+        let shared_strings = match zip.read("xl/sharedStrings.xml") {
+            Ok(bytes) => {
+                let text =
+                    String::from_utf8(bytes).context("xl/sharedStrings.xml is not valid UTF-8")?;
+                xlsx_parse_shared_strings(&text)?
+            }
+            Err(_) => Vec::new(),
+        };
+        let is_date_format = match zip.read("xl/styles.xml") {
+            Ok(bytes) => {
+                let text = String::from_utf8(bytes).context("xl/styles.xml is not valid UTF-8")?;
+                xlsx_parse_styles(&text)?
+            }
+            Err(_) => Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        for (sheet_name, sheet_path) in sheet_paths {
+            let sheet_bytes = zip
+                .read(&sheet_path)
+                .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
+            let sheet_xml = String::from_utf8(sheet_bytes)
+                .with_context(|| format!("sheet '{sheet_name}' is not valid UTF-8"))?;
+            let grid = xlsx_parse_sheet(&sheet_xml, &shared_strings, &is_date_format)?;
+
+            let mut rows = grid.into_iter();
+            let Some(header_row) = rows.next() else {
+                continue; // empty sheet - no header row, contributes no table
+            };
+            let headers: Vec<String> = header_row
+                .iter()
+                .map(|c| c.clone().unwrap_or_default())
+                .collect();
+
+            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
+            for (i, row) in rows.enumerate() {
+                if nrows.is_some_and(|limit| i >= limit) {
+                    break;
+                }
+                for (col_idx, col) in raw.iter_mut().enumerate() {
+                    col.push(row.get(col_idx).cloned().flatten());
+                }
+            }
+
+            let mut profiles = Vec::new();
+            for (i, name) in headers.into_iter().enumerate() {
+                let total = raw[i].len();
+                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let current_type = if non_null.is_empty() {
+                    "String".to_string()
+                } else {
+                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                    naive_current_type(&refs).to_string()
+                };
+                let col = ColumnInput {
+                    name,
+                    current_type,
+                    raw_values: non_null,
+                    total,
+                    skip_heuristics: false,
+                };
+                profiles.push(profile_column(col, n_samples));
+            }
+            out.push((sheet_name, profiles));
+        }
+
+        if out.is_empty() {
+            bail!("no non-empty sheets found in {path:?}");
+        }
+        Ok(out)
+    }
+} // mod xlsx_support
+
 // --- Transparent gzip/zstd decompression ---
 // Not a format of its own - a preprocessing step in front of every reader
 // above. Every reader just opens a plain file path, so materializing
@@ -6758,6 +7628,257 @@ mod tests {
     #[test]
     fn crc32_matches_the_standard_check_value() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn zip_archive_reads_and_verifies_real_xlsx_entries() {
+        use xlsx_support::{ZipArchive, xml_parse};
+
+        let archive = ZipArchive::open(Path::new("tests/fixtures/sample.xlsx")).unwrap();
+        let names: Vec<&str> = archive.names().collect();
+        for expected in [
+            "docProps/app.xml",
+            "docProps/core.xml",
+            "xl/theme/theme1.xml",
+            "xl/worksheets/sheet1.xml",
+            "xl/styles.xml",
+            "_rels/.rels",
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "[Content_Types].xml",
+        ] {
+            assert!(names.contains(&expected), "missing entry {expected}");
+        }
+        let expected_sizes = [
+            ("docProps/app.xml", 205u32, 1213056838u32),
+            ("docProps/core.xml", 382, 2569367014),
+            ("xl/theme/theme1.xml", 6994, 1413937688),
+            ("xl/worksheets/sheet1.xml", 2572, 2067080184),
+            ("xl/styles.xml", 2620, 4281628671),
+            ("_rels/.rels", 534, 2330675127),
+            ("xl/workbook.xml", 598, 3796856708),
+            ("xl/_rels/workbook.xml.rels", 507, 3135499059),
+            ("[Content_Types].xml", 983, 2218952347),
+        ];
+        for (name, size, crc) in expected_sizes {
+            let bytes = archive.read(name).unwrap();
+            assert_eq!(bytes.len() as u32, size, "{name}: size");
+            assert_eq!(crc32(&bytes), crc, "{name}: crc32");
+        }
+        let workbook = archive.read("xl/workbook.xml").unwrap();
+        let text = String::from_utf8(workbook).unwrap();
+        assert!(text.contains("<workbook"), "not workbook XML: {text}");
+
+        let root = xml_parse(&text).unwrap();
+        assert_eq!(root.name, "workbook");
+        let sheets = root.child("sheets").unwrap();
+        let sheet_names: Vec<&str> = sheets
+            .children_named("sheet")
+            .filter_map(|s| s.attr("name"))
+            .collect();
+        assert_eq!(sheet_names, vec!["sample"]);
+
+        // Parse every XML entry across every real fixture, not just
+        // workbook.xml - proves the parser holds up on real nested
+        // content (styles.xml's numFmt/cellXfs tables, sheet1.xml's row/
+        // c/v cell structure with shared-string indices, unicode text
+        // content, etc.), not just the one simplest document.
+        for f in [
+            "tests/fixtures/sample.xlsx",
+            "tests/fixtures/multi_sheet.xlsx",
+            "tests/fixtures/type_detection.xlsx",
+            "tests/fixtures/edge_zero_rows_and_unicode.xlsx",
+            "tests/fixtures/edge_xlsx_native_date_cells.xlsx",
+        ] {
+            let archive = ZipArchive::open(Path::new(f)).unwrap();
+            for name in archive.names().map(str::to_string).collect::<Vec<_>>() {
+                if name.ends_with(".xml") || name.ends_with(".rels") {
+                    let bytes = archive.read(&name).unwrap();
+                    let text = String::from_utf8(bytes).unwrap();
+                    xml_parse(&text).unwrap_or_else(|e| panic!("{f} {name}: {e:?}"));
+                }
+            }
+        }
+
+        for f in [
+            "tests/fixtures/multi_sheet.xlsx",
+            "tests/fixtures/type_detection.xlsx",
+            "tests/fixtures/edge_zero_rows_and_unicode.xlsx",
+            "tests/fixtures/edge_xlsx_native_date_cells.xlsx",
+        ] {
+            let archive = ZipArchive::open(Path::new(f)).unwrap();
+            for name in archive.names().map(str::to_string).collect::<Vec<_>>() {
+                let entry_crc = archive
+                    .entries
+                    .iter()
+                    .find(|e| e.name == name)
+                    .unwrap()
+                    .crc32;
+                let bytes = archive
+                    .read(&name)
+                    .unwrap_or_else(|e| panic!("{f} {name}: {e:?}"));
+                assert_eq!(crc32(&bytes), entry_crc, "{f} {name}: crc32");
+            }
+        }
+    }
+
+    // Ported directly from calamine's own `formats.rs` test module
+    // (`test_is_date_format`, itself ported from openpyxl) - every case
+    // A representative slice of calamine's own `test_dates_only_1900_epoch`/
+    // `test_datetimes_1900_epoch` reference tables (203 and 99 cases
+    // respectively) - the *full* set was cross-checked against a throwaway
+    // harness built from calamine's actual test data before this was
+    // trusted (see CLAUDE.md's Dependency footprint section), spanning
+    // 1899 through 9999 at whole-second precision; this locks in the
+    // boundary/edge cases permanently: the epoch itself, the fictitious
+    // 1900-02-29 (serial 60, Excel's own Lotus 1-2-3 leap-year bug) and
+    // its immediate neighbors, a real leap day (1904), and the far end of
+    // Excel's supported range.
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsx_serial_to_ymd_matches_calamine_reference_dates() {
+        use xlsx_support::xlsx_serial_to_ymd as ymd;
+
+        for (serial, y, m, d) in [
+            (0.0, 1899, 12, 31),
+            (1.0, 1900, 1, 1),
+            (59.0, 1900, 2, 28),
+            (60.0, 1900, 2, 29), // the fake leap day itself
+            (61.0, 1900, 3, 1),
+            (365.0, 1900, 12, 30),
+            (1461.0, 1903, 12, 31),
+            (1462.0, 1904, 1, 1),
+            (1521.0, 1904, 2, 29), // a real leap day
+            (36161.0, 1999, 1, 1),
+            (45306.0, 2024, 1, 15),
+            (2958465.0, 9999, 12, 31),
+        ] {
+            assert_eq!(ymd(serial), (y, m, d), "serial {serial}");
+        }
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsx_serial_to_hms_resolves_a_fractional_day_to_whole_seconds() {
+        use xlsx_support::xlsx_serial_to_hms as hms;
+
+        // 45306.4375 -> 2024-01-15, 0.4375 * 24h = 10:30:00 exactly.
+        assert_eq!(hms(45306.4375), (10, 30, 0));
+        assert_eq!(hms(45306.0), (0, 0, 0));
+        // 45307.61458333334 -> ~14:45:00 (calamine's own reference: this
+        // exact value resolves to 14:45:00 at whole-second precision).
+        assert_eq!(hms(45307.61458333334), (14, 45, 0));
+    }
+
+    // checked against `xlsx_is_date_format_code`, the hand-rolled port of
+    // calamine's `detect_custom_number_format`. Covers the tricky
+    // corners: quoted literal text, the `_`/`\` escape and `*` fill
+    // characters (a format token right after one is a literal, not a
+    // real directive - `#,##0*y` must NOT be detected as a date despite
+    // containing 'y'), bracketed `[Red]`/elapsed-time `[h]` sections, and
+    // AM/PM markers.
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsx_is_date_format_code_matches_calamine_reference_cases() {
+        use xlsx_support::xlsx_is_date_format_code as is_date;
+
+        for fmt in [
+            "DD/MM/YY",
+            "H:MM:SS;@",
+            "m\"M\"d\"D\";@",
+            "[$-404]e\"\\xfc\"m\"\\xfc\"d\"\\xfc\"",
+            "ha/p\\\\m",
+            "*-yyyy-mm-dd",
+        ] {
+            assert!(is_date(fmt), "expected a date format: {fmt:?}");
+        }
+        for fmt in [
+            "#,##0\\ [$\\u20bd-46D]",
+            "\"Y: \"0.00\"m\";\"Y: \"-0.00\"m\";\"Y: <num>m\";@",
+            "#,##0\\ [$''u20bd-46D]",
+            "\"$\"#,##0_);[Red](\"$\"#,##0)",
+            "0_ ;[Red]\\-0\\ ",
+            "\\Y000000",
+            "#,##0.0####\" YMD\"",
+            "[>=100][Magenta].00",
+            "[>=100][Magenta]General",
+            "#,##0.00\\ _M\"H\"_);[Red]#,##0.00\\ _M\"S\"_)",
+            "#,##0*y",
+            "0\"x\"*d",
+            "*-#,##0",
+        ] {
+            assert!(!is_date(fmt), "expected NOT a date format: {fmt:?}");
+        }
+        // TimeDelta (elapsed-time) formats: this project doesn't
+        // distinguish these from a real calendar date/time (matching its
+        // own pre-existing calamine-based behavior), so they're still
+        // "date-shaped" here.
+        for fmt in [
+            "[h]:mm:ss",
+            "[h]",
+            "[ss]",
+            "[s].000",
+            "[m]",
+            "[mm]",
+            "[Blue]\\+[h]:mm;[Red]\\-[h]:mm;[Green][h]:mm",
+            "[>=100][Magenta][s].00",
+            "[h]:mm;[=0]\\-",
+        ] {
+            assert!(is_date(fmt), "expected a date/timedelta format: {fmt:?}");
+        }
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsx_ooxml_reader_matches_calamine_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.xlsx",
+            "tests/fixtures/multi_sheet.xlsx",
+            "tests/fixtures/type_detection.xlsx",
+            "tests/fixtures/edge_zero_rows_and_unicode.xlsx",
+            "tests/fixtures/edge_xlsx_native_date_cells.xlsx",
+            "tests/fixtures/edge_xlsx_shared_strings.xlsx",
+            "tests/fixtures/edge_xlsx_formula_and_error.xlsx",
+        ] {
+            let path = Path::new(f);
+            let expected = columns_from_xlsx_calamine(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} calamine: {e:?}"));
+            let got = xlsx_support::columns_from_xlsx_ooxml(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} ooxml: {e:?}"));
+            assert_eq!(got.len(), expected.len(), "{f}: sheet count");
+            for ((got_name, got_cols), (exp_name, exp_cols)) in got.iter().zip(expected.iter()) {
+                assert_eq!(got_name, exp_name, "{f}: sheet name");
+                assert_eq!(
+                    got_cols.len(),
+                    exp_cols.len(),
+                    "{f} sheet '{exp_name}': column count"
+                );
+                for (gc, ec) in got_cols.iter().zip(exp_cols.iter()) {
+                    assert_eq!(gc.name, ec.name, "{f} sheet '{exp_name}': column name");
+                    assert_eq!(
+                        gc.current_type, ec.current_type,
+                        "{f} sheet '{exp_name}' col '{}': current_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.ideal_type, ec.ideal_type,
+                        "{f} sheet '{exp_name}' col '{}': ideal_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.missing_pct, ec.missing_pct,
+                        "{f} sheet '{exp_name}' col '{}': missing_pct",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.sample_values, ec.sample_values,
+                        "{f} sheet '{exp_name}' col '{}': sample_values",
+                        ec.name
+                    );
+                }
+            }
+        }
     }
 
     // A real, sizable (3,000-row) gzip file, generated with the system

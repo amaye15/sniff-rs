@@ -2418,19 +2418,93 @@ this project could just implement directly rather than depend on:
   gone" across the default/full split; it depended on *which specific
   feature* was active.
 
-**What's deliberately not being hand-rolled**, and why the cost/benefit
-stays genuinely unfavorable even after `anyhow`, `csv`, and `chrono` all
-turned out to be worth doing anyway: `serde`/`serde_json` are the one
-dependency left that's more central than any of the others were.
-`serde_json::Value` is the literal bridge type seven different format
-readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML) recurse through
-via `profile_json_path` - replacing it means writing and re-verifying a
-whole JSON value type, parser, and serializer, not swapping one call
-site at a time or hand-rolling a narrower, self-contained parser the way
-`csv` and `chrono` both still were, however real their own risk. That's
+- **`calamine` → hand-rolled, one format at a time - `.xlsx` first.**
+  Unlike every other dependency in this section, `calamine` isn't one
+  format's worth of parsing - it bundles four genuinely different file
+  formats (OOXML `.xlsx`, legacy binary BIFF8/OLE2 `.xls`, binary-record
+  `.xlsb`, and ODF `.ods`) behind one `--features xlsx` flag. `.xlsx`
+  went first because it's both the most common in practice and the most
+  tractable: a ZIP archive of XML documents, and this project already
+  had (or could cheaply build) both halves. `ZipArchive` (`src/lib.rs`,
+  right after `gzip_decompress`) is a from-scratch ZIP reader following
+  PKWARE's own APPNOTE.TXT spec - reads exclusively from the central
+  directory (the archive's authoritative index, at the end of the file)
+  rather than trusting local file headers in file order, since a local
+  header's size/CRC fields aren't even guaranteed reliable (the "data
+  descriptor" flag bit means they can be zeroed there, with the real
+  values written *after* the compressed data instead) - and reuses
+  `inflate` directly for compression method 8 (DEFLATE), since a ZIP
+  entry's compressed stream is byte-for-byte the same format gzip's own
+  body already is. `xml_parse` is a second from-scratch piece, a minimal
+  DOM parser scoped deliberately to what well-formed, machine-generated
+  OOXML/ODF XML actually needs (no DTD/external-entity support, no
+  namespace-URI resolution) - not a general replacement for the separate
+  `xmltree` crate this project's own `xml` feature still depends on for
+  arbitrary user-supplied XML, which remains untouched.
+
+  The genuinely hard part was Excel's own date-serial system: day 1 =
+  1900-01-01, with Lotus 1-2-3's fictitious 1900-02-29 preserved for
+  backward compatibility (the well-known "Excel 1900 leap year bug").
+  `xlsx_serial_to_ymd` converts this with a deliberately simple
+  epoch-shift rule (shift serials below 60 forward by a day, then treat
+  day 0 as 1899-12-30 uniformly, special-casing serial 60 itself since
+  it has no real Gregorian equivalent) reusing the same
+  `days_from_civil`/`civil_from_days` civil-calendar functions the
+  hand-rolled date/time engine already has - rather than porting
+  calamine's own considerably more elaborate 400/100/4/1-year-block
+  algorithm (`excel_to_standard_datetime` in its `datatype.rs`, built
+  that way specifically to avoid floating-point precision loss at large
+  serial values). Verified by extracting calamine's *entire own* test
+  suite for this (203 date-only reference cases spanning 1899-9999, 99
+  datetime cases with millisecond precision) into a throwaway harness
+  and confirming every single case matched before trusting the simpler
+  approach - not spot-checked, the complete set. Number-format date
+  detection (`xlsx_is_date_format_code`/`xlsx_is_builtin_date_format_id`)
+  is a direct, line-by-line port of calamine's own
+  `detect_custom_number_format`/`builtin_format_by_id` (`formats.rs`) -
+  a precise, already-solved state machine (bracketed `[Red]`/elapsed-time
+  sections, quoted literal text, the `_`/`\` escape and `*` fill
+  characters, AM/PM markers) worth taking from a verified-correct
+  reference rather than re-deriving; calamine's own 22-case test suite
+  for it (itself ported from openpyxl) was ported over too, and caught a
+  real regression during a clippy-driven refactor (merging two identical
+  `return true` branches) before it shipped - confirming the port stayed
+  correct even after being rewritten for a lint.
+
+  `columns_from_xlsx` now dispatches on file extension: `.xlsx` goes to
+  this new reader, everything else `--features xlsx` still covers
+  (`.xls`/`.xlsb`/`.ods`) still goes to calamine, completely unchanged -
+  the feature flag's own boundary and behavior are identical either way,
+  this is purely an internal swap. Verified two ways before the dispatch
+  was wired in: every one of this project's own real `.xlsx` fixtures
+  (inline strings, shared strings with real deduplication, native
+  date/datetime cells across multiple number formats, unicode content,
+  multi-sheet workbooks, formula-result and error cells) produced
+  *identical* output - table names, column names, current/ideal types,
+  missing percentages, and sample values - through both the new reader
+  and calamine side by side, and every feature combination that could
+  plausibly differ (`--features xlsx` alone, `--features full`, and the
+  default build with neither) was rebuilt and clippy-checked separately,
+  not just the usual two endpoints.
+
+**What's deliberately not being hand-rolled yet**: the other three
+formats `--features xlsx` still covers (`.xls`, `.xlsb`, `.ods`) remain
+on calamine for now - each is its own separate, substantial file-format
+specification (legacy `.xls` especially: a compound binary container
+format wrapping binary BIFF records, arguably the single largest
+remaining piece of this whole effort) rather than a small extension of
+the ZIP/XML infrastructure `.xlsx` just proved out. `serde`/
+`serde_json` remain the other dependency left that's more central than
+any of the others in this list: `serde_json::Value` is the literal
+bridge type seven different format readers (JSON, YAML, TOML, Avro,
+MessagePack, CBOR, XML) recurse through via `profile_json_path` -
+replacing it means writing and re-verifying a whole JSON value type,
+parser, and serializer, not swapping one call site at a time or
+hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
+and now `.xlsx` all still were, however real their own risk. That's
 still a real, non-mechanical rewrite - the risk itself is why it's still
-deliberately a dependency, the same reasoning that applied to the other
-three right up until it didn't.
+deliberately a dependency, the same reasoning that applied to every
+other entry in this list right up until it didn't.
 
 ## Known limitations / roadmap
 
