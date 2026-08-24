@@ -1033,6 +1033,13 @@ fn ini_reports_one_table_per_section_and_pools_duplicate_keys() {
     let tag = column(database, "tag");
     assert_eq!(tag["current_type"], "Vec<String>");
     assert_eq!(tag["sample_values"].as_array().unwrap().len(), 2);
+
+    // "On"/"Off" is a real, common INI boolean convention (php.ini's own
+    // directive style, also Apache/Windows-style configs) - found via a
+    // real-world sweep against php.ini-production, which resolves every
+    // On/Off directive as an untyped enum/category without this.
+    let ssl_enabled = column(database, "ssl_enabled");
+    assert_eq!(ssl_enabled["ideal_type"], "bool");
 }
 
 #[cfg(feature = "sqlite")]

@@ -230,7 +230,7 @@ fn is_missing_sentinel(s: &str) -> bool {
 fn is_bool_word(s: &str) -> bool {
     matches!(
         s.to_ascii_lowercase().as_str(),
-        "true" | "false" | "yes" | "no" | "y" | "n"
+        "true" | "false" | "yes" | "no" | "y" | "n" | "on" | "off"
     )
 }
 
@@ -1169,7 +1169,7 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     if values.iter().all(|v| is_bool_word(v)) {
         return (
             "bool".to_string(),
-            "values are yes/no/true/false".to_string(),
+            "values are yes/no/true/false/on/off".to_string(),
         );
     }
 
@@ -5579,6 +5579,20 @@ mod tests {
     fn suggest_ideal_type_recognizes_bool_words() {
         let (ideal, _) = suggest_ideal_type(&["yes", "no", "Y"], "String");
         assert_eq!(ideal, "bool");
+    }
+
+    #[test]
+    fn suggest_ideal_type_recognizes_on_off_as_boolean() {
+        // Found via a real-world sweep against php.ini-production (the
+        // actual file shipped and deployed as-is on countless real PHP
+        // servers): "On"/"Off" is PHP's own boolean directive convention
+        // (also common in Apache and Windows .ini-style configs), but
+        // wasn't in the original yes/no/true/false set at all, so real
+        // directives like `engine = On` stayed an untyped enum/category
+        // instead of resolving to bool.
+        let (ideal, note) = suggest_ideal_type(&["On", "Off", "On"], "String");
+        assert_eq!(ideal, "bool");
+        assert!(note.contains("on/off"));
     }
 
     #[test]

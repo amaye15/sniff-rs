@@ -1419,6 +1419,20 @@ entirely:
   the "hard error naming the line" contract this project already
   guarantees, working as intended on a real corrupted line, not a gap.
 
+- **`"On"`/`"Off"` - a common real INI/config boolean convention (PHP's
+  own directive style in `php.ini`, also seen in Apache and
+  Windows-style configs) - wasn't recognized as boolean at all.** Found
+  via a real-world sweep against `php.ini-production`, the actual file
+  shipped and deployed as-is on countless real PHP servers: every
+  `On`/`Off` directive (`engine = On`, `display_errors = Off`, dozens
+  more) resolved to a plain untyped `enum / category` instead of `bool`,
+  since `is_bool_word` only recognized `true`/`false`/`yes`/`no`/`y`/`n`.
+  Added `on`/`off` to the same set - zero new ambiguity risk, since
+  nothing else in this file's type-detection order would ever claim
+  those two words for something else. A real, unrelated Samba
+  `smb.conf` swept in the same pass needed no fix - its own boolean
+  convention (`yes`/`no`) already worked.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1923,6 +1937,22 @@ recurring `"syslogd 1.4.1: restart."` space-containing-tag line, and a
 kernel-style message with embedded brackets/colons that must not be
 mistaken for tag/pid structure of its own) and its integration test lock
 both fixes in together.
+
+An eleventh pass covered three more formats. **Stata**: three real,
+official Stata-press example datasets (`auto.dta`, the canonical
+teaching dataset; `census.dta`, real US state-level demographic data;
+`nlswork.dta`, a genuinely large ~28,000-row longitudinal survey with
+missing-value rates up to 32.6% on some columns) - all three read
+correctly with zero panics and zero fixes needed. **dBase**: a real US
+Census Bureau TIGER/Line shapefile's `.dbf` component (56 US states/
+territories, extracted from the actual ZIP the Census Bureau publishes)
+- also zero panics, zero fixes needed; FIPS codes correctly flagged for
+leading zeros, land/water area columns correctly showing the
+declared-`f64`-but-really-`i64` gap this project's dBase reader is
+specifically built to surface. **INI**: `php.ini-production` (the real,
+1,878-line file PHP ships and countless servers deploy verbatim) and a
+real Samba `smb.conf` - one real gap found; see the `on`/`off` boolean
+entry in the design philosophy section above.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
