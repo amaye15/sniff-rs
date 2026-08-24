@@ -1267,6 +1267,46 @@ entirely:
   the list above) - the heuristic was already doing exactly the right
   thing, not a bug to fix.
 
+- **MessagePack and CBOR had the exact same "must decode to a map" gap
+  JSON, YAML, and Avro all had** - both bridge into the same
+  `serde_json::Value` shape those three do, so once the bug class was
+  known, checking the other two bridge formats directly (rather than
+  assuming it was JSON/YAML/Avro-specific) was the obvious next step, and
+  it was there in both. Found with genuine, real-shaped data: a bare
+  top-level array of five sensor-reading floats
+  (`[23.5, 24.1, 23.8, 22.9, 24.4]`, modeling the IoT/telemetry payloads
+  both formats are commonly chosen for specifically because they're
+  compact binary encodings) failed outright on both readers with
+  `"expected each MessagePack/CBOR record to decode to a map"`, even
+  though the identical shape had already been fixed for JSON and YAML.
+  Fixed with the same fallback: collect every decoded top-level value
+  first, and if not all of them are objects, profile the whole set as one
+  `"value"` column via `profile_json_path` (with top-level nulls filtered
+  out first, the same precondition every other caller of that function
+  already satisfies) instead of rejecting a real, valid file.
+
+  This pass also surfaced a genuine format-specific quirk in the existing
+  adversarial coverage, not a new bug: `malformed_garbage.msgpack` (the
+  "readable text, wrong structure" convention every other format's
+  `malformed_garbage.<ext>` fixture relies on) turns out not to be invalid
+  MessagePack at all. MessagePack's positive-fixint encoding defines the
+  single-byte range `0x00`-`0x7f` as meaning the integer of that same
+  value - byte-for-byte identical to the 7-bit ASCII range, so any plain
+  ASCII text is, by construction, already a legal MessagePack value
+  stream (a sequence of small non-negative integers: `'t'` = 116, `'h'` =
+  104, `'i'` = 105, ...). The fixture's test only ever passed by accident,
+  via the unrelated "must decode to a map" bail this fix removes - not
+  because the bytes were genuinely malformed. `malformed_msgpack_fails_cleanly`
+  now points at a new `malformed_truncated.msgpack` fixture (a `str8`
+  header declaring a 200-byte string with only 3 bytes actually supplied -
+  a real, verified-to-error truncation) instead, and the original
+  fixture's surprising-but-correct decode is its own locked-in test rather
+  than an accidental pass. CBOR's own `malformed_garbage.cbor` needed no
+  equivalent fix - confirmed, not assumed, that it still fails cleanly
+  after this change: CBOR's major-type encoding (the top 3 bits of each
+  byte select the type) doesn't share MessagePack's coincidental overlap
+  with printable ASCII.
+
 - **RFC 2822 dates with a literal named zone (`"GMT"`) instead of a
   numeric offset were left as plain `String`.** Found via a real-world
   sweep of live RSS feeds: BBC News's `<pubDate>` field uses
@@ -1953,6 +1993,56 @@ specifically built to surface. **INI**: `php.ini-production` (the real,
 1,878-line file PHP ships and countless servers deploy verbatim) and a
 real Samba `smb.conf` - one real gap found; see the `on`/`off` boolean
 entry in the design philosophy section above.
+
+A twelfth pass covered MessagePack and CBOR, found via the same reasoning
+that motivated every other bridge-format check in this project: both
+formats decode into a `serde_json::Value`-shaped tree the same way JSON,
+YAML, and Avro do, so a structural bug found in one of those readers'
+"must decode to an object" dispatch logic was worth checking for in the
+other two directly, rather than assuming it was JSON/YAML/Avro-specific.
+It was there. Confirmed with genuine, real-shaped data rather than a
+synthetic edge case: a bare top-level array of five sensor-reading floats
+(`[23.5, 24.1, 23.8, 22.9, 24.4]`, generated with Python's `msgpack` and
+`cbor2` libraries, modeling the IoT/telemetry payloads both formats are
+commonly chosen for specifically because they're compact binary
+encodings) failed outright on both readers with `"expected each
+MessagePack/CBOR record to decode to a map"`, even though the exact same
+shape - a top-level array of scalars - had already been fixed for JSON
+and YAML. Both `columns_from_msgpack` and `columns_from_cbor` now apply
+the identical fallback: if every top-level value is a JSON object, profile
+as records as before; otherwise profile the whole set as a single
+`"value"` column via `profile_json_path`, with top-level nulls filtered
+out first (the same precondition `profile_json_path` already requires of
+every other caller). Locked in with `tests/fixtures/
+edge_msgpack_scalar_array.msgpack` / `edge_cbor_scalar_array.cbor`
+(the same five-float sensor-reading data used to find the bug, generated
+directly into the fixtures directory rather than left as a scratch file).
+
+This pass also surfaced a genuine, format-specific quirk in the existing
+adversarial coverage, not a new bug: `malformed_garbage.msgpack` (the
+same "readable text, wrong structure" convention every other format's
+`malformed_garbage.<ext>` fixture uses) turns out to *not* be invalid
+MessagePack at all. MessagePack's positive-fixint encoding defines the
+single-byte range `0x00`-`0x7f` as meaning the integer of that same
+value - which is byte-for-byte identical to the 7-bit ASCII range, so any
+plain ASCII text is, by construction, already a legal MessagePack value
+stream: a sequence of small non-negative integers (`'t'` = 116, `'h'` =
+104, `'i'` = 105, ...). Before this pass's fix, the fixture's test only
+passed by accident, via the unrelated "must decode to a map" bail this
+pass just removed - not because the bytes were actually malformed. Now
+that a non-map top-level stream correctly falls back to a `"value"`
+column instead of erroring, the fixture decodes successfully and
+correctly, so `malformed_msgpack_fails_cleanly` was repointed at a new
+`tests/fixtures/malformed_truncated.msgpack` (a `str8` header declaring a
+200-byte string with only 3 bytes actually supplied - a genuine,
+verified-to-error truncation), and the previous fixture's real, surprising
+behavior is now its own locked-in test,
+`msgpack_ascii_garbage_text_decodes_as_a_stream_of_small_integers`, rather
+than an accidental pass. CBOR's own `malformed_garbage.cbor` needed no
+equivalent fix - CBOR's major-type encoding (top 3 bits of each byte) does
+not have the same overlap with printable ASCII, confirmed by checking that
+fixture still fails cleanly after this pass's fix, not assumed from the
+MessagePack finding.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests

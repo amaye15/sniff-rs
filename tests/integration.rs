@@ -2006,6 +2006,39 @@ fn cbor_recognizes_uuid_email_ipv4_and_date_columns() {
     );
 }
 
+#[cfg(feature = "msgpack")]
+#[test]
+fn msgpack_top_level_array_of_scalars_becomes_one_value_column() {
+    // A MessagePack stream of bare scalars (e.g. IoT/telemetry sensor
+    // readings - a real, common shape for this format specifically because
+    // it's a compact binary encoding aimed at exactly that use case) has no
+    // field names to extract as a record, but is still a genuine single
+    // column. Used to be rejected outright with "expected each MessagePack
+    // record to decode to a map" - the same class of gap the JSON/YAML/Avro
+    // readers had for their own top-level-scalar cases, confirmed by
+    // generating this exact shape (five float sensor readings) with
+    // Python's `msgpack` library and running it through the compiled
+    // binary before the fix existed.
+    let doc = run_json("edge_msgpack_scalar_array.msgpack", &[]);
+    let cols = table(&doc, "edge_msgpack_scalar_array");
+    assert_eq!(cols.len(), 1);
+    let value = column(cols, "value");
+    assert_eq!(value["ideal_type"], "f64");
+    assert_eq!(value["missing_pct"].as_f64().unwrap(), 0.0);
+}
+
+#[cfg(feature = "cbor")]
+#[test]
+fn cbor_top_level_array_of_scalars_becomes_one_value_column() {
+    // Same fix, same fixture shape, as MessagePack's equivalent test above.
+    let doc = run_json("edge_cbor_scalar_array.cbor", &[]);
+    let cols = table(&doc, "edge_cbor_scalar_array");
+    assert_eq!(cols.len(), 1);
+    let value = column(cols, "value");
+    assert_eq!(value["ideal_type"], "f64");
+    assert_eq!(value["missing_pct"].as_f64().unwrap(), 0.0);
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_recognizes_uuid_email_ipv4_and_date_columns() {
@@ -2227,7 +2260,37 @@ fn malformed_avro_fails_cleanly() {
 #[cfg(feature = "msgpack")]
 #[test]
 fn malformed_msgpack_fails_cleanly() {
-    assert_fails_without_panicking("malformed_garbage.msgpack");
+    // Plain readable-text garbage (malformed_garbage.msgpack, the sibling-
+    // format convention) doesn't actually work here - see
+    // msgpack_ascii_garbage_text_decodes_as_a_stream_of_small_integers
+    // below for why. A genuinely truncated multi-byte value (a str8 header
+    // claiming 200 bytes with only 3 supplied) is what a real decode
+    // failure looks like for this format.
+    assert_fails_without_panicking("malformed_truncated.msgpack");
+}
+
+#[cfg(feature = "msgpack")]
+#[test]
+fn msgpack_ascii_garbage_text_decodes_as_a_stream_of_small_integers() {
+    // A genuine, surprising discovery, not a tool bug: MessagePack's
+    // positive-fixint encoding is defined as the single byte range
+    // 0x00-0x7f standing for the integer of the same value - which is
+    // byte-for-byte identical to the 7-bit ASCII range. So any plain
+    // readable ASCII text (the "garbage" convention every other format's
+    // malformed_garbage.<ext> fixture relies on to be structurally
+    // invalid) is, byte for byte, already a legal MessagePack value
+    // stream: a sequence of small non-negative integers. It used to
+    // "fail cleanly" only by accident, via the unrelated pre-fix bug that
+    // bailed on anything that wasn't a map - now that top-level non-map
+    // streams correctly fall back to a single "value" column instead of
+    // erroring, this fixture decodes successfully, and correctly so.
+    let doc = run_json("malformed_garbage.msgpack", &[]);
+    let cols = table(&doc, "malformed_garbage");
+    assert_eq!(cols.len(), 1);
+    let value = column(cols, "value");
+    assert_eq!(value["ideal_type"], "i64");
+    // First three bytes of the fixture are 't','h','i' -> 116, 104, 105.
+    assert_eq!(value["sample_values"][0], "116");
 }
 
 #[cfg(feature = "cbor")]

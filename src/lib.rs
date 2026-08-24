@@ -3235,17 +3235,36 @@ fn columns_from_msgpack(
         top_values
     };
 
-    let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
-    for v in values {
-        match msgpack_value_to_json(&v) {
-            JsonValue::Object(m) => records.push(m),
-            _ => bail!("expected each MessagePack record to decode to a map in {path:?}"),
-        }
-    }
+    let mut values: Vec<JsonValue> = values.iter().map(msgpack_value_to_json).collect();
     if let Some(n) = nrows {
-        records.truncate(n);
+        values.truncate(n);
     }
-    Ok(profile_json_records(&records, n_samples))
+
+    // Not every MessagePack stream holds map-typed records - a stream of
+    // bare scalars (e.g. IoT/telemetry readings, a real, common shape for
+    // this format specifically because it's compact binary encoding) has
+    // no field names to extract, but is still a genuine single column.
+    // Same fallback the JSON/YAML/Avro readers already use for their own
+    // analogous case, found the same way: real-world testing.
+    if values.iter().all(JsonValue::is_object) {
+        let records: Vec<serde_json::Map<String, JsonValue>> = values
+            .into_iter()
+            .map(|v| match v {
+                JsonValue::Object(m) => m,
+                _ => unreachable!("just checked every value is an object"),
+            })
+            .collect();
+        Ok(profile_json_records(&records, n_samples))
+    } else {
+        let total = values.len();
+        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+        Ok(profile_json_path(
+            "value".to_string(),
+            total,
+            refs,
+            n_samples,
+        ))
+    }
 }
 
 #[cfg(not(feature = "msgpack"))]
@@ -3529,17 +3548,35 @@ fn columns_from_cbor(
         top_values
     };
 
-    let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
-    for v in values {
-        match cbor_value_to_json(&v) {
-            JsonValue::Object(m) => records.push(m),
-            _ => bail!("expected each CBOR record to decode to a map in {path:?}"),
-        }
-    }
+    let mut values: Vec<JsonValue> = values.iter().map(cbor_value_to_json).collect();
     if let Some(n) = nrows {
-        records.truncate(n);
+        values.truncate(n);
     }
-    Ok(profile_json_records(&records, n_samples))
+
+    // Same fallback as MessagePack's reader (and JSON/YAML/Avro before it):
+    // a stream of bare CBOR scalars (e.g. IoT/telemetry readings - CBOR is
+    // the format RFC 7049 was written for, and constrained-device telemetry
+    // is exactly this shape in practice) has no field names to extract, but
+    // is still a genuine single column, not an error.
+    if values.iter().all(JsonValue::is_object) {
+        let records: Vec<serde_json::Map<String, JsonValue>> = values
+            .into_iter()
+            .map(|v| match v {
+                JsonValue::Object(m) => m,
+                _ => unreachable!("just checked every value is an object"),
+            })
+            .collect();
+        Ok(profile_json_records(&records, n_samples))
+    } else {
+        let total = values.len();
+        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+        Ok(profile_json_path(
+            "value".to_string(),
+            total,
+            refs,
+            n_samples,
+        ))
+    }
 }
 
 #[cfg(not(feature = "cbor"))]
