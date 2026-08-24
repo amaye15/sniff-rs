@@ -4164,6 +4164,38 @@ fn columns_from_npz(
 // Empty sheets are skipped rather than erroring, the same way SQLite skips
 // its own internal `sqlite_%` tables.
 
+/// A cell Excel itself displays as a date/time (its own `Data::DateTime`
+/// variant, backed by a raw numeric day-count serial - Excel's internal
+/// storage for every date since 1900) used to be stringified as that raw
+/// serial number (`"44652"`) rather than a date, because `calamine::Data`'s
+/// own `Display` impl for that variant renders the *unresolved* serial,
+/// not a calendar date - confirmed directly against the crate's own source
+/// (`ExcelDateTime`'s `Display` is `write!(f, "{}", self.value)`), not
+/// assumed. `.as_datetime()` (needs calamine's own `chrono` feature, now
+/// enabled) resolves it correctly; only reached for cells calamine itself
+/// already flags as a date/time (`is_datetime`/`is_datetime_iso`) rather
+/// than every numeric cell, so a plain integer column is never
+/// reinterpreted as a date. Time-of-day is dropped from the rendered
+/// string only when it's exactly midnight - the same ambiguity a
+/// date-only Excel format (`"d-mmm"`, no time component at all) and a
+/// genuine midnight timestamp share, with no way to tell them apart from
+/// the resolved value alone; the resulting ISO string still lands on the
+/// exact same `DATE_FORMATS` entries any other date-shaped string would.
+#[cfg(feature = "xlsx")]
+fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
+    use calamine::DataType as _;
+    if (cell.is_datetime() || cell.is_datetime_iso())
+        && let Some(dt) = cell.as_datetime()
+    {
+        return if dt.time() == chrono::NaiveTime::MIN {
+            dt.date().format("%Y-%m-%d").to_string()
+        } else {
+            dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+        };
+    }
+    cell.to_string()
+}
+
 #[cfg(feature = "xlsx")]
 fn columns_from_xlsx(
     path: &Path,
@@ -4198,7 +4230,7 @@ fn columns_from_xlsx(
             }
             for (col_idx, col) in raw.iter_mut().enumerate() {
                 let value = match row.get(col_idx) {
-                    Some(cell) if !cell.is_empty() => Some(cell.to_string()),
+                    Some(cell) if !cell.is_empty() => Some(xlsx_cell_to_string(cell)),
                     _ => None,
                 };
                 col.push(value);

@@ -1844,6 +1844,37 @@ fn excel_recognizes_uuid_email_ipv4_and_date_columns() {
     );
 }
 
+// Found via a real-world sweep against three genuinely real .xlsx files
+// (a cyclone-tracking dataset, Microsoft's own "Financial Sample" demo
+// workbook, and a public "messy data" teaching dataset) - all three had
+// at least one date column that came through as a meaningless raw
+// integer (Excel's internal day-count serial, e.g. 44652) instead of a
+// date. type_detection.xlsx's own "signup_date" column above never
+// caught this because it was written as a plain date-shaped *string*,
+// not a genuine native Excel date cell - this fixture is written with
+// real datetime.date/datetime.datetime values via openpyxl specifically
+// to exercise the code path the string-based fixture couldn't reach.
+// Verified this fixture actually catches a regression, not just
+// exercises already-correct code: temporarily reverting to the old
+// `cell.to_string()` behavior reproduced the exact original bug (raw
+// serials "45306"/"45306.4375") before the fix was restored.
+#[cfg(feature = "xlsx")]
+#[test]
+fn excel_resolves_native_date_and_datetime_cells_not_raw_serial_numbers() {
+    let doc = run_json("edge_xlsx_native_date_cells.xlsx", &[]);
+    let cols = table(&doc, "Sheet");
+
+    let event_date = column(cols, "event_date");
+    assert_eq!(event_date["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(event_date["sample_values"][0], "2024-01-15");
+
+    // A cell with a real time-of-day component keeps it, rather than
+    // collapsing everything to a bare date.
+    let event_datetime = column(cols, "event_datetime");
+    assert_eq!(event_datetime["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(event_datetime["sample_values"][0], "2024-01-15T10:30:00");
+}
+
 #[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_recognizes_uuid_email_ipv4_and_date_columns() {

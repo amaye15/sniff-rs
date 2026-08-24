@@ -1291,6 +1291,49 @@ entirely:
   source in question is backed by the actual HTTP spec, not treated as
   too narrow a sample to act on.
 
+- **A native Excel date/datetime cell was silently rendered as a
+  meaningless raw integer (Excel's own internal day-count serial, e.g.
+  `44652`) instead of a date - the single most impactful bug this whole
+  real-world-testing effort found, because date columns are close to
+  ubiquitous in real spreadsheets.** Found via a real-world sweep against
+  three genuinely real `.xlsx` files (a cyclone-tracking dataset,
+  Microsoft's own "Financial Sample" demo workbook, Kaggle's
+  `MessyData.xlsx`) - every single one of them had at least one date
+  column affected. `type_detection.xlsx`'s own `signup_date` column never
+  caught this, because it was authored as a plain date-*shaped string*
+  rather than a genuine native Excel date cell - a real gap between what
+  the committed fixture tested and what the format actually produces in
+  practice, not just a missing assertion. Root cause, confirmed directly
+  against `calamine`'s own source rather than assumed: a date-formatted
+  cell decodes to `calamine::Data::DateTime(ExcelDateTime)`, but that
+  type's own `Display` impl is `write!(f, "{}", self.value)` - `self.value`
+  being the *unresolved* numeric serial, not a calendar date - and this
+  project's Excel reader was stringifying every cell via that same
+  generic `Display` path (`cell.to_string()`), scalar and date-typed
+  alike. `calamine` itself already carries the fix - `.as_datetime()`
+  correctly resolves the serial to a real `chrono::NaiveDateTime` - but
+  it's gated behind `calamine`'s own optional `chrono` Cargo feature,
+  which this project hadn't enabled (checked the cost first, the same
+  discipline as the Parquet `chrono-tz` and Avro codec dependency
+  decisions above: exactly 2 more lines in `cargo tree`, since this
+  project's own `chrono` dependency already satisfies calamine's version
+  requirement and dedupes for free). `xlsx_cell_to_string` now checks
+  whether calamine itself already flagged the cell as a date/time
+  (`is_datetime`/`is_datetime_iso`) before resolving it - deliberately
+  never applied to every numeric cell, so a plain integer column (a
+  serial number, an ID) is never reinterpreted as a date just because its
+  magnitude happens to look like one. Time-of-day is dropped from the
+  rendered string only when it's exactly midnight, the closest available
+  signal to "this cell's own format had no time component" that
+  `calamine`'s resolved value actually exposes. Verified this was a real,
+  regression-catchable fix rather than assumed: temporarily reverting to
+  the old `cell.to_string()` call reproduced the exact original bug
+  (raw serials `"45306"`/`"45306.4375"`) against the new
+  `edge_xlsx_native_date_cells.xlsx` fixture (written with real
+  `datetime.date`/`datetime.datetime` values via `openpyxl`, specifically
+  because a string-based fixture can't exercise this code path at all)
+  before the fix was restored.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1747,6 +1790,23 @@ fallback), and genuine multi-dot attribute names (Maven's own
 One real, valuable gap this pass did find: see
 `matching_date_format_recognizes_rfc2822_with_literal_gmt_zone` in the
 design philosophy section below.
+
+An eighth pass, for Excel: three genuinely real `.xlsx` files (a
+cyclone-tracking dataset, Microsoft's own "Financial Sample" demo
+workbook, and Kaggle's `MessyData.xlsx`). All three read successfully
+with zero panics - but every single one of them exposed the same real,
+high-impact bug: a native Excel date/datetime column silently rendered
+as a meaningless raw day-count serial (`44652`) instead of a date. See
+the `xlsx_cell_to_string`/`ExcelDateTime` entry in the design philosophy
+section above for the full root-cause and fix writeup - it's flagged
+there as the single most impactful finding of this entire real-world
+validation effort, since date columns are close to ubiquitous in real
+spreadsheets and every one of them was affected before the fix.
+`tests/fixtures/edge_xlsx_native_date_cells.xlsx` (written with real
+Python `datetime` values via `openpyxl`, deliberately not the
+date-shaped-string approach `type_detection.xlsx`'s existing
+`signup_date` column already used, which is exactly why that fixture
+never caught this) and its integration test lock the fix in.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
