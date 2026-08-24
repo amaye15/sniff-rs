@@ -2486,22 +2486,65 @@ this project could just implement directly rather than depend on:
   plausibly differ (`--features xlsx` alone, `--features full`, and the
   default build with neither) was rebuilt and clippy-checked separately,
   not just the usual two endpoints.
+- **`.ods` next, reusing the same ZIP/XML infrastructure.** ODF's own
+  spreadsheet schema turned out considerably simpler than OOXML's for
+  this project's purposes: a cell states its own value type directly
+  (`office:value-type="date"`) and a date's value is already a clean ISO
+  8601 string (`office:date-value="2024-01-15"`) - no epoch-serial
+  arithmetic at all, unlike Excel's own system. The one genuinely tricky
+  real-world convention is cell/row compression:
+  `table:number-columns-repeated`/`table:number-rows-repeated` let a
+  writer represent a long run of identical (almost always empty) cells
+  or rows without spelling each one out, and real LibreOffice-authored
+  files routinely pad a sheet out to ODF's own actual maximum dimensions
+  this way (1,048,576 rows x 16,384 columns) - naively expanding every
+  repeat into a real, materialized cell would be a genuine memory-blowup
+  risk, not a hypothetical one; `ods_parse_sheet` tracks logical row/
+  column position as repeats are walked but only ever records a sparse
+  entry for a cell that actually has content, so an empty repeat, however
+  large, never allocates anything. Verified directly against this exact
+  pathological shape, not just reasoned about: a hand-built fixture with
+  a `table:number-rows-repeated="1048573"` trailing block (over 17
+  billion logical empty cells) plus a repeated *empty* cell sitting in
+  the middle of a real data row (to prove the gap doesn't misalign the
+  columns after it) both resolve correctly and complete essentially
+  instantly. `ods_cell_text`'s attribute-priority order and
+  `columns_from_ods`'s overall shape were checked directly against
+  calamine's own `ods.rs` (`read_row`/`get_datatype`) before being
+  trusted, the same "verify against the source" discipline as `.xlsx`.
 
-**What's deliberately not being hand-rolled yet**: the other three
-formats `--features xlsx` still covers (`.xls`, `.xlsb`, `.ods`) remain
-on calamine for now - each is its own separate, substantial file-format
-specification (legacy `.xls` especially: a compound binary container
-format wrapping binary BIFF records, arguably the single largest
-remaining piece of this whole effort) rather than a small extension of
-the ZIP/XML infrastructure `.xlsx` just proved out. `serde`/
-`serde_json` remain the other dependency left that's more central than
-any of the others in this list: `serde_json::Value` is the literal
-bridge type seven different format readers (JSON, YAML, TOML, Avro,
-MessagePack, CBOR, XML) recurse through via `profile_json_path` -
-replacing it means writing and re-verifying a whole JSON value type,
-parser, and serializer, not swapping one call site at a time or
-hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
-and now `.xlsx` all still were, however real their own risk. That's
+  This pass also caught a real, pre-existing latent bug in the `.xlsx`
+  reader itself, found via the exact same calamine-comparison test that
+  had already passed cleanly for every `.xlsx` fixture: calamine parses
+  a numeric cell's raw value through `fast_float2::parse` and
+  re-stringifies the resulting `f64` (confirmed directly against both
+  its `xlsx.rs` and `ods.rs` source) rather than passing the original
+  XML text through verbatim, which silently normalizes away a written
+  trailing `.0` on a whole number (`"30.0"` in the XML becomes the
+  displayed value `"30"`). Every `.xlsx` fixture tested so far happened
+  to be written by a tool (openpyxl, xlsxwriter) that never emits an
+  unnecessary trailing `.0` for a whole-number cell, so this gap was
+  invisible until the `.ods` fixture's own writer (odfpy) did emit one
+  and the comparison test caught the mismatch immediately - both readers
+  now parse-and-re-stringify numeric values the same way calamine does,
+  not just the one that happened to surface it first.
+
+**What's deliberately not being hand-rolled yet**: the two formats
+`--features xlsx` still covers that are genuinely their own binary
+specifications - legacy `.xls` (a compound binary container format
+wrapping binary BIFF records - arguably the single largest remaining
+piece of this whole effort) and `.xlsb` (a different binary record
+format again, inside a ZIP container this project's own `ZipArchive`
+could already open, but with its own distinct record schema to
+implement) - remain on calamine for now. `serde`/`serde_json` remain
+the other dependency left that's more central than any of the others in
+this list: `serde_json::Value` is the literal bridge type seven
+different format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR,
+XML) recurse through via `profile_json_path` - replacing it means
+writing and re-verifying a whole JSON value type, parser, and
+serializer, not swapping one call site at a time or hand-rolling a
+narrower, self-contained parser the way `csv`, `chrono`, `.xlsx`, and
+now `.ods` all still were, however real their own risk. That's
 still a real, non-mechanical rewrite - the risk itself is why it's still
 deliberately a dependency, the same reasoning that applied to every
 other entry in this list right up until it didn't.

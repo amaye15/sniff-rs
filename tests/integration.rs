@@ -1037,6 +1037,59 @@ fn excel_reports_one_table_per_sheet() {
     assert_eq!(in_stock["ideal_type"], "bool");
 }
 
+// .ods reads through the same InputFormat::Xlsx path as .xlsx (calamine's
+// own open_workbook_auto covers all four formats under one --features
+// xlsx flag) - dispatched internally to a hand-rolled ODF reader rather
+// than calamine, see CLAUDE.md's Dependency footprint section. Its own
+// date-value attribute is already a clean ISO string (no Excel-style
+// epoch-serial resolution needed the way .xlsx's native dates require).
+#[cfg(feature = "xlsx")]
+#[test]
+fn ods_recognizes_types_and_resolves_dates_already_in_iso_form() {
+    let doc = run_json("sample.ods", &[]);
+    assert_eq!(doc["format"], "xlsx");
+    let cols = table(&doc, "Sheet1");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "amount")["ideal_type"], "f64");
+    let date = column(cols, "signup_date");
+    assert_eq!(date["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(date["sample_values"][0], "2024-01-15");
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn ods_is_auto_detected_from_content_when_extensionless() {
+    let (_dir, dest) = copy_fixture_as("sample.ods", "mystery_spreadsheet");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "xlsx");
+    let cols = table(&doc, "Sheet1");
+    assert!(cols.iter().any(|c| c["name"] == "id"));
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn ods_handles_a_real_scale_repeated_empty_row_block_without_hanging() {
+    // table:number-rows-repeated at ODF's own max dimensions
+    // (1,048,573 rows x 16,384 columns) - a real LibreOffice padding
+    // convention, not a synthetic stress test - plus a repeated *empty*
+    // cell in the middle of a real data row. Finishing at all quickly is
+    // the correctness proof; see this fixture's own generation notes in
+    // this project's history for why a naive eager expansion would be a
+    // genuine memory-blowup risk here, not just a performance concern.
+    let doc = run_json("edge_ods_repeated_cells.ods", &[]);
+    let cols = table(&doc, "Sheet1");
+    assert_eq!(
+        column(cols, "id")["sample_values"],
+        serde_json::json!(["1", "2"])
+    );
+    assert_eq!(
+        column(cols, "note")["sample_values"],
+        serde_json::json!(["first", "second"])
+    );
+    let name = column(cols, "name");
+    assert_eq!(name["missing_pct"].as_f64().unwrap(), 50.0);
+}
+
 #[cfg(feature = "ini")]
 #[test]
 fn ini_reports_one_table_per_section_and_pools_duplicate_keys() {

@@ -5142,20 +5142,33 @@ fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
 /// (see `xlsx_support` above and CLAUDE.md's Dependency footprint
 /// section - verified to match calamine's own output exactly across
 /// every real fixture before this dispatch was wired in), and to
-/// calamine for the other three formats this feature also covers
-/// (.xls/.xlsb/.ods), which aren't hand-rolled yet.
+/// calamine for the two formats this feature also covers that aren't
+/// hand-rolled yet (.xls/.xlsb).
+///
+/// Dispatches on the archive's own *content*, not the file extension -
+/// the same "declared type is a hint, not the truth" principle this
+/// project already applies to `sniff_format`'s own content-based
+/// detection, not a new one invented here. `xl/workbook.xml` is xlsx's
+/// own signature entry (xlsb's equivalent part is a binary
+/// `xl/workbook.bin`, so this never misfires on it); `content.xml` +
+/// `mimetype` is ODF's. Anything else - not a ZIP at all, or a ZIP
+/// without either signature - falls through to calamine, the same
+/// fallback a truly unrecognized case already got before this dispatch
+/// existed.
 #[cfg(feature = "xlsx")]
 fn columns_from_xlsx(
     path: &Path,
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-    let is_xlsx = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
-    if is_xlsx {
-        return xlsx_support::columns_from_xlsx_ooxml(path, nrows, n_samples);
+    if let Ok(zip) = xlsx_support::ZipArchive::open(path) {
+        let names: Vec<&str> = zip.names().collect();
+        if names.contains(&"xl/workbook.xml") {
+            return xlsx_support::columns_from_xlsx_ooxml(path, nrows, n_samples);
+        }
+        if names.contains(&"content.xml") && names.contains(&"mimetype") {
+            return xlsx_support::columns_from_ods(path, nrows, n_samples);
+        }
     }
     columns_from_xlsx_calamine(path, nrows, n_samples)
 }
@@ -7046,7 +7059,19 @@ mod xlsx_support {
                         (raw.trim() == "1").to_string()
                     }
                     _ => {
-                        // "n" (numeric), or absent - OOXML's own default type.
+                        // "n" (numeric), or absent - OOXML's own default
+                        // type. Parsed and re-stringified through f64
+                        // rather than passed through as the raw XML text
+                        // verbatim - matching calamine's own
+                        // fast_float2::parse-then-Display round trip
+                        // (confirmed directly against its xlsx.rs source),
+                        // which silently normalizes away a written
+                        // trailing ".0" on a whole number (e.g. "30.0" in
+                        // the XML becomes the displayed value "30") -
+                        // found via exactly this mismatch surfacing in
+                        // the ODS reader's own calamine-comparison test,
+                        // then confirmed to be a real, pre-existing xlsx
+                        // behavior too, not ODS-specific.
                         let raw = c.child("v").map(|v| v.text.clone()).unwrap_or_default();
                         let style_idx: usize =
                             c.attr("s").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -7054,7 +7079,8 @@ mod xlsx_support {
                             Ok(n) if is_date_format.get(style_idx).copied().unwrap_or(false) => {
                                 xlsx_format_serial(n)
                             }
-                            _ => raw,
+                            Ok(n) => n.to_string(),
+                            Err(_) => raw,
                         }
                     }
                 };
@@ -7160,6 +7186,208 @@ mod xlsx_support {
             let mut rows = grid.into_iter();
             let Some(header_row) = rows.next() else {
                 continue; // empty sheet - no header row, contributes no table
+            };
+            let headers: Vec<String> = header_row
+                .iter()
+                .map(|c| c.clone().unwrap_or_default())
+                .collect();
+
+            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
+            for (i, row) in rows.enumerate() {
+                if nrows.is_some_and(|limit| i >= limit) {
+                    break;
+                }
+                for (col_idx, col) in raw.iter_mut().enumerate() {
+                    col.push(row.get(col_idx).cloned().flatten());
+                }
+            }
+
+            let mut profiles = Vec::new();
+            for (i, name) in headers.into_iter().enumerate() {
+                let total = raw[i].len();
+                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let current_type = if non_null.is_empty() {
+                    "String".to_string()
+                } else {
+                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                    naive_current_type(&refs).to_string()
+                };
+                let col = ColumnInput {
+                    name,
+                    current_type,
+                    raw_values: non_null,
+                    total,
+                    skip_heuristics: false,
+                };
+                profiles.push(profile_column(col, n_samples));
+            }
+            out.push((sheet_name, profiles));
+        }
+
+        if out.is_empty() {
+            bail!("no non-empty sheets found in {path:?}");
+        }
+        Ok(out)
+    }
+
+    // --- Hand-rolled ODF (.ods) reader ---
+    // Built on the same ZIP reader and XML parser .xlsx uses. ODF's own
+    // spreadsheet schema is considerably simpler than OOXML's for this
+    // project's purposes: a cell states its own value type directly
+    // (`office:value-type="date"`) and, for a date, its value is already
+    // a clean ISO 8601 string (`office:date-value="2024-01-15"`) - no
+    // epoch-serial arithmetic needed at all, unlike Excel's own system.
+    //
+    // The one genuinely tricky real-world convention is cell/row
+    // compression: `table:number-columns-repeated`/`table:number-rows-
+    // repeated` let a writer represent a long run of identical
+    // (typically empty) cells or rows without spelling each one out -
+    // real LibreOffice-authored files routinely pad a sheet out to its
+    // full max dimension this way (up to 1,048,576 rows / 16,384 columns
+    // per the ODF spec's own limits), so naively expanding every repeat
+    // into a real, materialized cell would be a genuine memory-blowup
+    // risk, not a hypothetical one. `ods_parse_sheet` tracks logical row/
+    // column *position* as repeats are walked, but only ever pushes a
+    // sparse entry for a cell that actually has content - an empty
+    // repeat, however large, never allocates anything - confirmed
+    // against calamine's own `ods.rs` (`read_row`/`get_datatype`) for the
+    // attribute names and priority order, not assumed.
+
+    const ODS_MAX_ROWS: usize = 1_048_576;
+    const ODS_MAX_COLUMNS: usize = 16_384;
+
+    fn ods_repeat_count(el: &XmlElement, attr: &str, max: usize) -> usize {
+        el.attr(attr)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, max)
+    }
+
+    /// Extracts a cell's value as a display string, in the same priority
+    /// order as ODF itself defines (a numeric `office:value` wins over a
+    /// string, etc. - see `get_datatype` in calamine's `ods.rs`, verified
+    /// directly rather than assumed). `office:time-value` (an ISO 8601
+    /// duration like `"PT14H30M00S"`, not a plain time-of-day) is
+    /// deliberately left as its raw duration string rather than guessed
+    /// at - the same disclosed-gap treatment Avro's own `Duration`
+    /// logical type already gets elsewhere in this project, for the same
+    /// reason: a compound value with no single natural string form.
+    fn ods_cell_text(cell: &XmlElement) -> Option<String> {
+        if let Some(v) = cell.attr("office:value") {
+            // Parsed and re-stringified through f64 rather than passed
+            // through verbatim - matching calamine's own
+            // fast_float2::parse-then-Display round trip (confirmed
+            // directly against its ods.rs source), which silently
+            // normalizes away a written trailing ".0" on a whole number.
+            // Found via a real mismatch against calamine's own output
+            // for this exact fixture before being trusted.
+            return Some(match v.parse::<f64>() {
+                Ok(n) => n.to_string(),
+                Err(_) => v.to_string(),
+            });
+        }
+        if let Some(v) = cell.attr("office:date-value") {
+            return Some(v.to_string());
+        }
+        if let Some(v) = cell.attr("office:time-value") {
+            return Some(v.to_string());
+        }
+        if let Some(v) = cell.attr("office:boolean-value") {
+            return Some((v.eq_ignore_ascii_case("true")).to_string());
+        }
+        if let Some(v) = cell.attr("office:string-value") {
+            return Some(v.to_string());
+        }
+        if cell.attr("office:value-type") == Some("string") {
+            let text: String = cell
+                .children_named("text:p")
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    fn ods_parse_sheet(table: &XmlElement) -> Vec<Vec<Option<String>>> {
+        let mut sparse: Vec<(usize, usize, String)> = Vec::new();
+        let mut max_row = 0usize;
+        let mut max_col = 0usize;
+        let mut row_pos = 0usize;
+
+        for row_el in table.children_named("table:table-row") {
+            let row_repeat = ods_repeat_count(
+                row_el,
+                "table:number-rows-repeated",
+                ODS_MAX_ROWS.saturating_sub(row_pos),
+            );
+
+            let mut col_pos = 0usize;
+            let mut row_cells: Vec<(usize, String)> = Vec::new();
+            for cell_el in row_el
+                .children_named("table:table-cell")
+                .chain(row_el.children_named("table:covered-table-cell"))
+            {
+                let col_repeat = ods_repeat_count(
+                    cell_el,
+                    "table:number-columns-repeated",
+                    ODS_MAX_COLUMNS.saturating_sub(col_pos),
+                );
+                if let Some(value) = ods_cell_text(cell_el) {
+                    for i in 0..col_repeat {
+                        row_cells.push((col_pos + i, value.clone()));
+                    }
+                    max_col = max_col.max(col_pos + col_repeat - 1);
+                }
+                col_pos += col_repeat;
+            }
+
+            if !row_cells.is_empty() {
+                for r in 0..row_repeat {
+                    for &(col, ref val) in &row_cells {
+                        sparse.push((row_pos + r, col, val.clone()));
+                    }
+                }
+                max_row = max_row.max(row_pos + row_repeat - 1);
+            }
+            row_pos += row_repeat;
+        }
+
+        let mut grid: Vec<Vec<Option<String>>> = vec![vec![None; max_col + 1]; max_row + 1];
+        for (r, c, v) in sparse {
+            grid[r][c] = Some(v);
+        }
+        grid
+    }
+
+    pub(crate) fn columns_from_ods(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let zip = ZipArchive::open(path)?;
+        let content_bytes = zip
+            .read("content.xml")
+            .context("no content.xml in ODF archive")?;
+        let content_xml =
+            String::from_utf8(content_bytes).context("content.xml is not valid UTF-8")?;
+        let root = xml_parse(&content_xml)?;
+
+        let spreadsheet = root
+            .child("office:body")
+            .and_then(|b| b.child("office:spreadsheet"))
+            .ok_or_else(|| anyhow!("no <office:spreadsheet> element in {path:?}"))?;
+
+        let mut out = Vec::new();
+        for table in spreadsheet.children_named("table:table") {
+            let sheet_name = table.attr("table:name").unwrap_or("Sheet1").to_string();
+            let grid = ods_parse_sheet(table);
+
+            let mut rows = grid.into_iter();
+            let Some(header_row) = rows.next() else {
+                continue;
             };
             let headers: Vec<String> = header_row
                 .iter()
@@ -7879,6 +8107,78 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn ods_reader_matches_calamine_output_exactly() {
+        for f in ["tests/fixtures/sample.ods"] {
+            let path = Path::new(f);
+            let expected = columns_from_xlsx_calamine(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} calamine: {e:?}"));
+            let got = xlsx_support::columns_from_ods(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} ods: {e:?}"));
+            assert_eq!(got.len(), expected.len(), "{f}: sheet count");
+            for ((got_name, got_cols), (exp_name, exp_cols)) in got.iter().zip(expected.iter()) {
+                assert_eq!(got_name, exp_name, "{f}: sheet name");
+                assert_eq!(
+                    got_cols.len(),
+                    exp_cols.len(),
+                    "{f} sheet '{exp_name}': column count"
+                );
+                for (gc, ec) in got_cols.iter().zip(exp_cols.iter()) {
+                    assert_eq!(gc.name, ec.name, "{f} sheet '{exp_name}': column name");
+                    assert_eq!(
+                        gc.current_type, ec.current_type,
+                        "{f} sheet '{exp_name}' col '{}': current_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.ideal_type, ec.ideal_type,
+                        "{f} sheet '{exp_name}' col '{}': ideal_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.sample_values, ec.sample_values,
+                        "{f} sheet '{exp_name}' col '{}': sample_values",
+                        ec.name
+                    );
+                }
+            }
+        }
+    }
+
+    // A real-scale pathological case: a trailing empty-row block using
+    // ODF's own row/column repeat compression at the format's actual
+    // maximum dimensions (1,048,573 repeated rows x 16,384 repeated
+    // columns - over 17 billion logical empty cells), the same shape a
+    // real LibreOffice-authored file routinely produces when padding a
+    // sheet out to its full size. Also covers a repeated *empty* cell
+    // sitting in the *middle* of a row with real data on both sides
+    // (verifying the gap doesn't misalign the columns after it).
+    // Finishing quickly at all is itself the correctness proof for the
+    // deferred/sparse handling - a naive eager expansion would either
+    // hang or exhaust memory well before this test's own timeout would
+    // even matter.
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn ods_reader_handles_a_real_scale_trailing_empty_row_block_without_blowing_up() {
+        let path = Path::new("tests/fixtures/edge_ods_repeated_cells.ods");
+        let table = xlsx_support::columns_from_ods(path, None, 3).unwrap();
+        assert_eq!(table.len(), 1);
+        let (name, cols) = &table[0];
+        assert_eq!(name, "Sheet1");
+        let id_col = cols.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id_col.sample_values, vec!["1", "2"]);
+        assert_eq!(id_col.missing_pct, 0.0);
+        let note_col = cols.iter().find(|c| c.name == "note").unwrap();
+        assert_eq!(note_col.sample_values, vec!["first", "second"]);
+        // The repeated empty cell between id and note lands on "name",
+        // correctly missing for row 1 and correctly NOT misaligning "bob"
+        // in row 2 onto the wrong column.
+        let name_col = cols.iter().find(|c| c.name == "name").unwrap();
+        assert_eq!(name_col.missing_pct, 50.0);
+        assert_eq!(name_col.sample_values, vec!["bob"]);
     }
 
     // A real, sizable (3,000-row) gzip file, generated with the system
