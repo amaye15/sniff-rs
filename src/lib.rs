@@ -5138,28 +5138,29 @@ fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
     cell.to_string()
 }
 
-/// Dispatches to the hand-rolled OOXML/ODF/BIFF8 readers for `.xlsx`/
-/// `.ods`/`.xls` respectively (see `xlsx_support` above and CLAUDE.md's
-/// Dependency footprint section - each verified to match calamine's own
-/// output exactly across every real fixture before its dispatch was
-/// wired in), and to calamine for the one format this feature also
-/// covers that isn't hand-rolled (`.xlsb` - see CLAUDE.md's Known
-/// limitations for why: LibreOffice, the only tool available to produce
-/// a genuine test fixture, turns out to have no working `.xlsb` export
-/// filter at all).
+/// Dispatches to the hand-rolled OOXML/ODF/BIFF8/BIFF12 readers for
+/// `.xlsx`/`.ods`/`.xls`/`.xlsb` respectively (see `xlsx_support` above
+/// and CLAUDE.md's Dependency footprint section - each verified to match
+/// calamine's own output exactly across every real fixture before its
+/// dispatch was wired in; `.xlsb` additionally against a real file
+/// calamine itself can't read at all, see `xlsb_parse_bundle_sh`'s own
+/// doc comment). Nothing this feature covers is left on calamine
+/// anymore - it's kept only as this project's own cross-verification
+/// oracle during development, still built and tested against on every
+/// change.
 ///
 /// Dispatches on the file's own *content*, not its extension - the same
 /// "declared type is a hint, not the truth" principle this project
 /// already applies to `sniff_format`'s own content-based detection, not
 /// a new one invented here. `xl/workbook.xml` is xlsx's own signature
-/// ZIP entry (xlsb's equivalent part is a binary `xl/workbook.bin`, so
-/// this never misfires on it); `content.xml` + `mimetype` is ODF's;
-/// a "Workbook"/"Book" OLE2 stream is `.xls`'s. Anything else - not a
-/// ZIP or OLE2 file at all, or one without any of these signatures
-/// (including a genuine `.xlsb`, whose OOXML-flavored ZIP entries never
-/// match the first two checks) - falls through to calamine, the same
-/// fallback a truly unrecognized case already got before this dispatch
-/// existed.
+/// ZIP entry; `xl/workbook.bin` is xlsb's (the same OPC container, with
+/// binary BIFF12 parts instead of XML - checked *after* the `.xlsx`
+/// check specifically so it can never misfire on a real `.xlsx`, which
+/// has no `.bin` parts at all); `content.xml` + `mimetype` is ODF's; a
+/// "Workbook"/"Book" OLE2 stream is `.xls`'s. Anything else - not a ZIP
+/// or OLE2 file at all, or one without any of these signatures - falls
+/// through to calamine, the same fallback a truly unrecognized case
+/// already got before this dispatch existed.
 #[cfg(feature = "xlsx")]
 fn columns_from_xlsx(
     path: &Path,
@@ -5170,6 +5171,9 @@ fn columns_from_xlsx(
         let names: Vec<&str> = zip.names().collect();
         if names.contains(&"xl/workbook.xml") {
             return xlsx_support::columns_from_xlsx_ooxml(path, nrows, n_samples);
+        }
+        if names.contains(&"xl/workbook.bin") {
+            return xlsx_support::columns_from_xlsb(path, nrows, n_samples);
         }
         if names.contains(&"content.xml") && names.contains(&"mimetype") {
             return xlsx_support::columns_from_ods(path, nrows, n_samples);
@@ -8468,6 +8472,508 @@ mod xlsx_support {
         }
         Ok(out)
     }
+
+    // --- Hand-rolled BIFF12 (.xlsb) reader ---
+    // `.xlsb` shares its outer container with `.xlsx` - the exact same
+    // OPC ZIP-of-parts layout (`xl/workbook.bin`, `xl/worksheets/*.bin`,
+    // `xl/sharedStrings.bin`, `xl/styles.bin`, and - still plain XML even
+    // here - `xl/_rels/*.rels`) - so this reuses `ZipArchive` and
+    // `xml_parse` directly. What's different is every part's own
+    // content: BIFF12 binary records instead of XML elements. BIFF12's
+    // own record framing is considerably simpler than BIFF8's: a 1- or
+    // 2-byte variable-length record *type* (high bit of the first byte
+    // signals a second byte) followed by a 1-to-4-byte base-128 varint
+    // *length* - no fixed 16-bit length cap, so (unlike BIFF8) there's no
+    // CONTINUE-record concept to handle at all. Every field layout below
+    // was read from calamine's own `xlsb/mod.rs`/`xlsb/cells_reader.rs`
+    // source first, the same discipline as every other hand-rolled
+    // reader in this project - RK's compact numeric encoding turned out
+    // to be byte-for-byte identical to BIFF8's own, so `xls_rk_decode`
+    // is reused directly rather than reimplemented.
+    //
+    // Verification here needed one more step than usual, because
+    // calamine itself turned out not to be a fully reliable oracle for
+    // this format - see `xlsb_parse_bundle_sh`'s own doc comment for a
+    // real bug this uncovered (independently reproduced in a second,
+    // unrelated implementation - Python's `pyxlsb` - not just calamine),
+    // and CLAUDE.md's Dependency footprint section for the full writeup.
+
+    struct XlsbSheetEntry {
+        name: String,
+        part_path: String,
+    }
+
+    struct Biff12RecordIter<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Biff12RecordIter<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Biff12RecordIter { data, pos: 0 }
+        }
+
+        fn read_u8(&mut self) -> Result<u8> {
+            let b = *self
+                .data
+                .get(self.pos)
+                .context("unexpected end of BIFF12 record stream")?;
+            self.pos += 1;
+            Ok(b)
+        }
+
+        fn read_type(&mut self) -> Result<u16> {
+            let b = self.read_u8()?;
+            Ok(if b & 0x80 != 0 {
+                let b2 = self.read_u8()?;
+                (b & 0x7F) as u16 | (((b2 & 0x7F) as u16) << 7)
+            } else {
+                b as u16
+            })
+        }
+
+        fn read_len(&mut self) -> Result<usize> {
+            let mut b = self.read_u8()?;
+            let mut len = (b & 0x7F) as usize;
+            let mut shift = 7;
+            for _ in 1..4 {
+                if b & 0x80 == 0 {
+                    break;
+                }
+                b = self.read_u8()?;
+                len += ((b & 0x7F) as usize) << shift;
+                shift += 7;
+            }
+            Ok(len)
+        }
+    }
+
+    impl<'a> Iterator for Biff12RecordIter<'a> {
+        type Item = Result<(u16, &'a [u8])>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.pos >= self.data.len() {
+                return None;
+            }
+            let typ = match self.read_type() {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            let len = match self.read_len() {
+                Ok(l) => l,
+                Err(e) => return Some(Err(e)),
+            };
+            let body = match self.data.get(self.pos..self.pos + len) {
+                Some(b) => b,
+                None => return Some(Err(anyhow!("truncated BIFF12 record body"))),
+            };
+            self.pos += len;
+            Some(Ok((typ, body)))
+        }
+    }
+
+    /// A BIFF12 `XLWideString`: a 4-byte character count followed by
+    /// that many UTF-16LE code units - always UTF-16, never BIFF8's
+    /// compressed/uncompressed split, and never spanning a CONTINUE
+    /// record (BIFF12 has none), so this is considerably simpler than
+    /// the `.xls` reader's own string decoding.
+    fn xlsb_wide_str(data: &[u8]) -> Result<String> {
+        let cch = xls_read_u32(data, 0)? as usize;
+        let bytes = data
+            .get(4..4 + cch * 2)
+            .context("truncated BIFF12 wide string")?;
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Ok(char::decode_utf16(units)
+            .map(|r| r.unwrap_or('\u{FFFD}'))
+            .collect())
+    }
+
+    fn xlsb_parse_relationships(rels_xml: &str) -> Result<HashMap<String, String>> {
+        let root = xml_parse(rels_xml)?;
+        let mut out = HashMap::new();
+        for rel in root.children_named("Relationship") {
+            if let (Some(id), Some(target)) = (rel.attr("Id"), rel.attr("Target")) {
+                out.insert(id.to_string(), target.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// `BrtBundleSh` [MS-XLSB 2.4.316]: a fixed `hsState`/`itabID` header,
+    /// then a length-prefixed relationship-ID string (the length itself
+    /// prefixed by a 4-byte `cch`, or the sentinel `0xFFFFFFFF` for "no
+    /// relationship"), then a length-prefixed sheet name.
+    ///
+    /// Microsoft's own published spec example shows that fixed header as
+    /// exactly 8 bytes (`hsState` then `itabID`, 4 bytes each), and most
+    /// real files - confirmed directly against this project's own
+    /// `sample.xlsb` fixture - do use exactly that. But a second, equally
+    /// real fixture (Apache POI's own `Simple.xlsb`, from POI's own
+    /// `test-data` corpus) has 4 extra reserved bytes there instead (12
+    /// bytes total) - confirmed by hand, byte-for-byte, against that
+    /// file's actual `xl/_rels/workbook.bin.rels` contents, not assumed.
+    /// That discrepancy isn't hypothetical: it's *exactly* what makes
+    /// both calamine and Python's independent `pyxlsb` library fail on
+    /// this exact file - both hardcode the 8-byte offset, so both slice
+    /// out a garbled 1-character "relationship ID" that can't be found
+    /// in the real relationships map (calamine panics with "no entry
+    /// found for key", pyxlsb raises `KeyError`) - a genuine bug shared
+    /// by two independent, unrelated implementations, not a quirk of one
+    /// library's own code.
+    ///
+    /// Rather than hardcode either offset, this tries the documented
+    /// 8-byte header first and only falls back to 12 if that produces a
+    /// relationship ID that isn't actually present in the relationships
+    /// map already parsed from `xl/_rels/workbook.bin.rels` - a real
+    /// structural corroboration check against already-known-good data,
+    /// not a guess, the same "verify before trusting a fixed offset"
+    /// discipline this project applies everywhere else (compare the
+    /// preamble-detection and dBase/Stata version-sniffing heuristics).
+    fn xlsb_parse_bundle_sh(
+        body: &[u8],
+        relationships: &HashMap<String, String>,
+    ) -> Result<Option<XlsbSheetEntry>> {
+        for header_len in [8usize, 12usize] {
+            if body.len() < header_len + 4 {
+                continue;
+            }
+            let rel_char_count = xls_read_u32(body, header_len)?;
+            if rel_char_count == 0xFFFF_FFFF {
+                return Ok(None); // no relationship for this bundle entry
+            }
+            let rel_bytes_end = header_len + 4 + rel_char_count as usize * 2;
+            if rel_bytes_end > body.len() {
+                continue;
+            }
+            let rel_id = xlsb_wide_str(&body[header_len..])?;
+            if let Some(target) = relationships.get(&rel_id) {
+                let name = xlsb_wide_str(&body[rel_bytes_end..])?;
+                return Ok(Some(XlsbSheetEntry {
+                    name,
+                    part_path: format!("xl/{target}"),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Parses `xl/workbook.bin`'s `BrtBundleSh` records into an ordered
+    /// sheet list. `BrtWbProp`'s 1904-date-system flag is deliberately
+    /// not tracked here - the `.xlsx`/`.xls` readers don't handle that
+    /// date system either (see CLAUDE.md's Known limitations), and this
+    /// reader stays consistent with that existing, disclosed gap rather
+    /// than fixing it for just one of the three formats.
+    fn xlsb_parse_workbook(
+        data: &[u8],
+        relationships: &HashMap<String, String>,
+    ) -> Result<Vec<XlsbSheetEntry>> {
+        let mut sheets = Vec::new();
+        for record in Biff12RecordIter::new(data) {
+            let (typ, body) = record?;
+            if typ == 0x009C {
+                // BrtBundleSh
+                if let Some(entry) = xlsb_parse_bundle_sh(body, relationships)? {
+                    sheets.push(entry);
+                }
+            }
+        }
+        Ok(sheets)
+    }
+
+    /// `xl/styles.bin`: `BrtFmt` [MS-XLSB 2.4.148] custom format
+    /// definitions (format id as `u16`, then the format code as a wide
+    /// string), followed later by *two* separate XF tables that share
+    /// the exact same per-entry record type (`BrtXF`, [MS-XLSB 2.4.826]):
+    /// `cellStyleXfs` (named style definitions like "Normal"/"Percent",
+    /// never referenced by a cell directly) and `cellXfs` (the real
+    /// per-cell format table a cell's own style reference indexes into).
+    /// A flat scan collecting every `BrtXF` record regardless of which
+    /// section it's in was tried first and is wrong - confirmed by a
+    /// real mismatch against calamine on `poi_various.xlsb` (a genuine
+    /// date cell rendered as its raw, unresolved serial number instead
+    /// of a date), traced to `cellStyleXfs`'s own entries shifting every
+    /// later cell's style-ref index by however many style-only entries
+    /// preceded the real `cellXfs` table. Fixed by mirroring calamine's
+    /// own two-phase read exactly: only `BrtFmt` records immediately
+    /// following `BrtBeginFmts` (up to its own declared count) populate
+    /// the custom-format table, and only `BrtXF` records immediately
+    /// following `BrtBeginCellXFs` (0x0269, likewise count-bounded) ever
+    /// get pushed into the returned table - anything in between,
+    /// including a `cellStyleXfs` section's own `BrtXF` entries, is
+    /// walked past and ignored, the same way calamine's own top-level
+    /// dispatch loop only reacts to those two specific begin-markers.
+    fn xlsb_parse_styles(data: &[u8]) -> Result<Vec<bool>> {
+        let mut custom_date_formats: HashMap<u16, bool> = HashMap::new();
+        let mut is_date_by_xf: Vec<bool> = Vec::new();
+        let mut iter = Biff12RecordIter::new(data);
+        while let Some(record) = iter.next() {
+            let (typ, body) = record?;
+            match typ {
+                0x0267 => {
+                    // BrtBeginFmts - a u32 count, then exactly that many
+                    // BrtFmt records follow (skipping anything else).
+                    if body.len() < 4 {
+                        continue;
+                    }
+                    let count = xls_read_u32(body, 0)?;
+                    let mut seen = 0u32;
+                    while seen < count {
+                        let Some(next) = iter.next() else { break };
+                        let (t, b) = next?;
+                        if t == 0x002C && b.len() >= 2 {
+                            let fmt_code = xls_read_u16(b, 0)?;
+                            let fmt_str = xlsb_wide_str(&b[2..])?;
+                            custom_date_formats
+                                .insert(fmt_code, xlsx_is_date_format_code(&fmt_str));
+                            seen += 1;
+                        }
+                    }
+                }
+                0x0269 => {
+                    // BrtBeginCellXFs - the *real* cell format table,
+                    // same count-then-entries shape as BrtBeginFmts.
+                    if body.len() < 4 {
+                        continue;
+                    }
+                    let count = xls_read_u32(body, 0)?;
+                    let mut seen = 0u32;
+                    while seen < count {
+                        let Some(next) = iter.next() else { break };
+                        let (t, b) = next?;
+                        if t == 0x002F && b.len() >= 4 {
+                            let fmt_code = xls_read_u16(b, 2)?;
+                            let is_date = custom_date_formats
+                                .get(&fmt_code)
+                                .copied()
+                                .unwrap_or_else(|| xls_builtin_format_is_date(fmt_code));
+                            is_date_by_xf.push(is_date);
+                            seen += 1;
+                        }
+                    }
+                    break; // cellXfs is always the last table this reader needs
+                }
+                _ => {}
+            }
+        }
+        Ok(is_date_by_xf)
+    }
+
+    /// `xl/sharedStrings.bin`: every `BrtSSTItem` [MS-XLSB 2.4.822] is a
+    /// 1-byte (unused here) rich-text flag byte followed by a plain wide
+    /// string - collected in file order, matching the index a
+    /// `BrtCellIsst` cell record refers to.
+    fn xlsb_parse_shared_strings(data: &[u8]) -> Result<Vec<String>> {
+        let mut sst = Vec::new();
+        for record in Biff12RecordIter::new(data) {
+            let (typ, body) = record?;
+            if typ == 0x0013 && !body.is_empty() {
+                sst.push(xlsb_wide_str(&body[1..])?);
+            }
+        }
+        Ok(sst)
+    }
+
+    /// A cell record's shared header [MS-XLSB 2.5.9]: `col` as a `u32`
+    /// at offset 0, then a 24-bit style/XF reference at offset 4 (byte 7
+    /// is unused padding) - the value-specific payload starts at offset
+    /// 8 for every cell record type.
+    fn xlsb_cell_style_ref(buf: &[u8]) -> usize {
+        u32::from_le_bytes([buf[4], buf[5], buf[6], 0]) as usize
+    }
+
+    /// Parses one worksheet part (`xl/worksheets/sheetN.bin`) into the
+    /// same dense `row x column` grid shape every other reader in this
+    /// project produces. `BrtRowHdr` carries the current row for every
+    /// cell record that follows until the next one (cell records
+    /// themselves carry only a column); a formula cell's cached result
+    /// (`BrtFmlaNum`/`BrtFmlaBool`/`BrtFmlaString`/`BrtFmlaError`) is
+    /// read the exact same way as its non-formula counterpart - this
+    /// reader deliberately never parses the formula token stream itself,
+    /// matching the `.xls`/`.xlsx` readers' own "cached value only"
+    /// scope. `BrtCellBlank` (an explicitly-blank cell) is silently
+    /// skipped, the same "absent = missing" convention every other
+    /// reader in this project already uses.
+    fn xlsb_parse_sheet(
+        data: &[u8],
+        sst: &[String],
+        is_date_by_xf: &[bool],
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        let mut sparse: Vec<(u32, u32, String)> = Vec::new();
+        let mut max_row: i64 = -1;
+        let mut max_col: i64 = -1;
+        let mut row: u32 = 0;
+
+        macro_rules! record_cell {
+            ($col:expr, $val:expr) => {{
+                let col = $col;
+                max_row = max_row.max(row as i64);
+                max_col = max_col.max(col as i64);
+                sparse.push((row, col, $val));
+            }};
+        }
+
+        for record in Biff12RecordIter::new(data) {
+            let (typ, body) = record?;
+            match typ {
+                0x0000 => {
+                    // BrtRowHdr
+                    if body.len() >= 4 {
+                        row = xls_read_u32(body, 0)?;
+                    }
+                }
+                0x0092 => break, // BrtEndSheetData
+                0x0002 => {
+                    // BrtCellRk
+                    let d = body.get(0..12).context("truncated BrtCellRk record")?;
+                    let col = xls_read_u32(d, 0)?;
+                    let style_ref = xlsb_cell_style_ref(d);
+                    let val: [u8; 4] = d[8..12].try_into().unwrap();
+                    let v = xls_rk_decode(val)?;
+                    let is_date = is_date_by_xf.get(style_ref).copied().unwrap_or(false);
+                    record_cell!(col, xls_numeric_cell_text(v, is_date));
+                }
+                0x0003 | 0x000B => {
+                    // BrtCellError | BrtFmlaError
+                    let d = body
+                        .get(0..9)
+                        .context("truncated BIFF12 error cell record")?;
+                    let col = xls_read_u32(d, 0)?;
+                    record_cell!(col, xls_error_code_to_string(d[8])?);
+                }
+                0x0004 | 0x000A => {
+                    // BrtCellBool | BrtFmlaBool
+                    let d = body
+                        .get(0..9)
+                        .context("truncated BIFF12 bool cell record")?;
+                    let col = xls_read_u32(d, 0)?;
+                    record_cell!(col, (d[8] != 0).to_string());
+                }
+                0x0005 | 0x0009 => {
+                    // BrtCellReal | BrtFmlaNum
+                    let d = body
+                        .get(0..16)
+                        .context("truncated BIFF12 numeric cell record")?;
+                    let col = xls_read_u32(d, 0)?;
+                    let style_ref = xlsb_cell_style_ref(d);
+                    let v = xls_read_f64(d, 8)?;
+                    let is_date = is_date_by_xf.get(style_ref).copied().unwrap_or(false);
+                    record_cell!(col, xls_numeric_cell_text(v, is_date));
+                }
+                0x0006 | 0x0008 => {
+                    // BrtCellSt | BrtFmlaString
+                    let col = xls_read_u32(body, 0)?;
+                    let s = xlsb_wide_str(
+                        body.get(8..)
+                            .context("truncated BIFF12 string cell record")?,
+                    )?;
+                    record_cell!(col, s);
+                }
+                0x0007 => {
+                    // BrtCellIsst
+                    let d = body.get(0..12).context("truncated BrtCellIsst record")?;
+                    let col = xls_read_u32(d, 0)?;
+                    let idx = xls_read_u32(d, 8)? as usize;
+                    if let Some(s) = sst.get(idx) {
+                        record_cell!(col, s.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if max_row < 0 || max_col < 0 {
+            return Ok(Vec::new());
+        }
+        let mut grid: Vec<Vec<Option<String>>> =
+            vec![vec![None; (max_col + 1) as usize]; (max_row + 1) as usize];
+        for (r, c, v) in sparse {
+            grid[r as usize][c as usize] = Some(v);
+        }
+        Ok(grid)
+    }
+
+    pub(crate) fn columns_from_xlsb(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let zip = ZipArchive::open(path)?;
+
+        let rels_xml = String::from_utf8(zip.read("xl/_rels/workbook.bin.rels")?)
+            .context("xl/_rels/workbook.bin.rels is not valid UTF-8")?;
+        let relationships = xlsb_parse_relationships(&rels_xml)?;
+
+        let workbook_bin = zip.read("xl/workbook.bin")?;
+        let sheet_entries = xlsb_parse_workbook(&workbook_bin, &relationships)?;
+        if sheet_entries.is_empty() {
+            bail!("no sheets found in {path:?}");
+        }
+
+        let sst = match zip.read("xl/sharedStrings.bin") {
+            Ok(bytes) => xlsb_parse_shared_strings(&bytes)?,
+            Err(_) => Vec::new(),
+        };
+        let is_date_by_xf = match zip.read("xl/styles.bin") {
+            Ok(bytes) => xlsb_parse_styles(&bytes)?,
+            Err(_) => Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        for entry in sheet_entries {
+            let sheet_bytes = zip
+                .read(&entry.part_path)
+                .with_context(|| format!("failed to read sheet '{}' in {path:?}", entry.name))?;
+            let grid = xlsb_parse_sheet(&sheet_bytes, &sst, &is_date_by_xf)?;
+
+            let mut rows = grid.into_iter();
+            let Some(header_row) = rows.next() else {
+                continue; // empty sheet (or a non-tabular one, e.g. a chart) - contributes no table
+            };
+            let headers: Vec<String> = header_row
+                .iter()
+                .map(|c| c.clone().unwrap_or_default())
+                .collect();
+
+            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
+            for (i, row) in rows.enumerate() {
+                if nrows.is_some_and(|limit| i >= limit) {
+                    break;
+                }
+                for (col_idx, col) in raw.iter_mut().enumerate() {
+                    col.push(row.get(col_idx).cloned().flatten());
+                }
+            }
+
+            let mut profiles = Vec::new();
+            for (i, name) in headers.into_iter().enumerate() {
+                let total = raw[i].len();
+                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let current_type = if non_null.is_empty() {
+                    "String".to_string()
+                } else {
+                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                    naive_current_type(&refs).to_string()
+                };
+                let col = ColumnInput {
+                    name,
+                    current_type,
+                    raw_values: non_null,
+                    total,
+                    skip_heuristics: false,
+                };
+                profiles.push(profile_column(col, n_samples));
+            }
+            out.push((entry.name, profiles));
+        }
+
+        if out.is_empty() {
+            bail!("no non-empty sheets found in {path:?}");
+        }
+        Ok(out)
+    }
 } // mod xlsx_support
 
 // --- Transparent gzip/zstd decompression ---
@@ -9195,6 +9701,146 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsb_reader_matches_calamine_output_exactly() {
+        // Real files from Apache POI's own test-data (see
+        // tests/fixtures/poi_xlsb_PROVENANCE.md). Only poi_sample.xlsb is
+        // compared here - poi_simple.xlsb, poi_date.xlsb, and
+        // poi_various.xlsb each trip a real, independently-confirmed bug
+        // in calamine 0.36.1 itself, so comparing this reader's output
+        // against calamine's on those three would be comparing against a
+        // known-wrong oracle. Each has its own dedicated test instead,
+        // asserting this reader's own independently-verified correct
+        // behavior directly - see
+        // xlsb_reader_succeeds_on_a_real_file_that_breaks_calamine_and_pyxlsb,
+        // xlsb_reader_resolves_a_date_calamine_fails_to_because_of_its_own_stream_desync_bug,
+        // and xlsb_reader_captures_a_formula_error_cell_calamine_silently_drops below.
+        for f in ["tests/fixtures/poi_sample.xlsb"] {
+            let path = Path::new(f);
+            let expected = columns_from_xlsx_calamine(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} calamine: {e:?}"));
+            let got = xlsx_support::columns_from_xlsb(path, None, 3)
+                .unwrap_or_else(|e| panic!("{f} xlsb: {e:?}"));
+            assert_eq!(got.len(), expected.len(), "{f}: sheet count");
+            for ((got_name, got_cols), (exp_name, exp_cols)) in got.iter().zip(expected.iter()) {
+                assert_eq!(got_name, exp_name, "{f}: sheet name");
+                assert_eq!(
+                    got_cols.len(),
+                    exp_cols.len(),
+                    "{f} sheet '{exp_name}': column count"
+                );
+                for (gc, ec) in got_cols.iter().zip(exp_cols.iter()) {
+                    assert_eq!(gc.name, ec.name, "{f} sheet '{exp_name}': column name");
+                    assert_eq!(
+                        gc.current_type, ec.current_type,
+                        "{f} sheet '{exp_name}' col '{}': current_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.ideal_type, ec.ideal_type,
+                        "{f} sheet '{exp_name}' col '{}': ideal_type",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.missing_pct, ec.missing_pct,
+                        "{f} sheet '{exp_name}' col '{}': missing_pct",
+                        ec.name
+                    );
+                    assert_eq!(
+                        gc.sample_values, ec.sample_values,
+                        "{f} sheet '{exp_name}' col '{}': sample_values",
+                        ec.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// `poi_simple.xlsb` is a real file that both calamine 0.36.1 and
+    /// Python's independent `pyxlsb` fail on entirely (confirmed
+    /// separately against both before writing this test) - its
+    /// `BrtBundleSh` records use a 12-byte fixed header instead of the
+    /// 8-byte one both libraries hardcode. Verified independently of
+    /// both (a from-scratch manual byte-level scan of the file's own
+    /// worksheet parts, not just "the code didn't crash") to confirm the
+    /// resolved content is genuinely correct: sheet1 has exactly one
+    /// real cell (a shared-string header at row 0, col 0), and sheet2/
+    /// sheet3 are legitimately empty (no cell records at all before
+    /// their own BrtEndSheetData) - so only one table is expected here,
+    /// not a reader bug silently dropping two sheets.
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsb_reader_succeeds_on_a_real_file_that_breaks_calamine_and_pyxlsb() {
+        let path = Path::new("tests/fixtures/poi_simple.xlsb");
+        let tables = xlsx_support::columns_from_xlsb(path, None, 3).unwrap();
+        assert_eq!(tables.len(), 1, "sheet2/sheet3 are genuinely empty");
+        let (name, cols) = &tables[0];
+        assert_eq!(name, "Sheet1");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(
+            cols[0].name,
+            "This is an example spreadsheet created with Microsoft Excel 2007 Beta 2."
+        );
+    }
+
+    /// `poi_date.xlsb`'s `xl/styles.bin` has several records of other
+    /// types (fonts, fills, etc., none zero-length) before its
+    /// `BrtBeginCellXFs` record - and calamine's own `read_styles`
+    /// (`xlsb/mod.rs`) has a real bug on exactly this shape: its
+    /// top-level dispatch loop calls `iter.read_type()` for every
+    /// record, but only calls `fill_buffer()` (which is what actually
+    /// advances the reader past that record's body) inside the
+    /// `0x0267`/`0x0269` match arms - every *other* record type's body
+    /// is silently never consumed. The very first non-zero-length,
+    /// non-matching record permanently desyncs the rest of the stream,
+    /// so calamine's search for the real `BrtBeginCellXFs` record either
+    /// never finds it or finds one at the wrong offset - confirmed
+    /// directly against calamine's source, not just inferred from its
+    /// output. The practical symptom: this file's one real cell (a date,
+    /// styled with the builtin date format id 14) renders as calamine's
+    /// own CLI-facing output shows it - the raw, unresolved serial
+    /// `"41286"` - instead of a real date. This reader's own
+    /// `Biff12RecordIter` never has this bug (every record's length is
+    /// consumed unconditionally in one place, regardless of type), so it
+    /// resolves the date correctly.
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsb_reader_resolves_a_date_calamine_fails_to_because_of_its_own_stream_desync_bug() {
+        let path = Path::new("tests/fixtures/poi_date.xlsb");
+        let tables = xlsx_support::columns_from_xlsb(path, None, 3).unwrap();
+        assert_eq!(tables.len(), 1);
+        let (_, cols) = &tables[0];
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "2013-01-12");
+    }
+
+    /// `poi_various.xlsb` has a formula cell whose cached result is an
+    /// error (`#NAME?`, BIFF12 record type `BrtFmlaError`/`0x000B`).
+    /// calamine's own `next_cell` (used by `worksheet_range()`, the API
+    /// this project's calamine-backed reader calls) handles a *literal*
+    /// error cell (`BrtCellError`/`0x0003`) but has no match arm at all
+    /// for `BrtFmlaError` - it falls into that function's catch-all
+    /// `_ => continue`, so the cell is silently dropped from calamine's
+    /// output entirely rather than surfacing as `"#NAME?"`. Confirmed
+    /// directly against `xlsb/cells_reader.rs`'s source, not assumed.
+    /// This reader treats `BrtFmlaError` the same as `BrtCellError` (see
+    /// `xlsb_parse_sheet`), matching the `.xls`/`.xlsx` readers' own
+    /// existing formula-error handling instead of reproducing this gap.
+    #[cfg(feature = "xlsx")]
+    #[test]
+    fn xlsb_reader_captures_a_formula_error_cell_calamine_silently_drops() {
+        let path = Path::new("tests/fixtures/poi_various.xlsb");
+        let tables = xlsx_support::columns_from_xlsb(path, None, 100).unwrap();
+        let (_, cols) = &tables[0];
+        let col = cols.iter().find(|c| c.name == "This is a string").unwrap();
+        assert!(
+            col.sample_values.iter().any(|v| v == "#NAME?"),
+            "expected a captured #NAME? formula-error value: {:?}",
+            col.sample_values
+        );
     }
 
     #[cfg(feature = "xlsx")]

@@ -1167,6 +1167,36 @@ fn xls_reports_one_table_per_sheet_and_extracts_formula_and_error_cells() {
     );
 }
 
+// .xlsb (Excel Binary Workbook) reads through the same InputFormat::Xlsx
+// path as .xlsx/.xls/.ods - dispatched internally to a hand-rolled
+// BIFF12 reader rather than calamine, see CLAUDE.md's Dependency
+// footprint section. Fixtures here are real files vendored from Apache
+// POI's own test-data (see tests/fixtures/poi_xlsb_PROVENANCE.md) -
+// this project can't generate its own .xlsb fixtures at all (no tool in
+// this environment can write one).
+#[cfg(feature = "xlsx")]
+#[test]
+fn xlsb_reports_one_table_per_sheet() {
+    let doc = run_json("poi_sample.xlsb", &[]);
+    assert_eq!(doc["format"], "xlsx");
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(tables.len(), 2, "fixture has two sheets");
+    let sheet1 = table(&doc, "Sheet1");
+    assert!(sheet1.iter().any(|c| c["name"] == "Lorem"));
+    let rich = table(&doc, "rich test");
+    assert!(!rich.is_empty());
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn xlsb_is_auto_detected_from_content_when_extensionless() {
+    let (_dir, dest) = copy_fixture_as("poi_sample.xlsb", "mystery_spreadsheet");
+    let doc = run_json_at(&dest);
+    assert_eq!(doc["format"], "xlsx");
+    let cols = table(&doc, "Sheet1");
+    assert!(cols.iter().any(|c| c["name"] == "Lorem"));
+}
+
 #[cfg(feature = "ini")]
 #[test]
 fn ini_reports_one_table_per_section_and_pools_duplicate_keys() {

@@ -2640,35 +2640,156 @@ this project could just implement directly rather than depend on:
   and sample values - before the dispatcher was wired to prefer this
   reader over calamine for `.xls`.
 
-  **`.xlsb` was investigated and is being permanently left on calamine.**
-  LibreOffice, the only available tool that can write real legacy Excel
-  binary formats, turns out to have no working `.xlsb` export filter at
-  all - confirmed through genuine effort, not assumed from a first
-  failure: a plain `--convert-to xlsb` reports no export filter found,
-  and explicitly naming the filter (`xlsb:Calc MS Excel 2007 Binary`) is
-  accepted but fails at the actual file-write step
-  (`SfxBaseModel::impl_store failed`). With no tool anywhere in this
-  environment able to produce a genuine `.xlsb` fixture, hand-rolling its
-  own distinct binary record schema would mean shipping unverified
-  parsing code - exactly the situation SAS7BDAT's own "no fixture, no
-  trust" precedent already exists to avoid, so `.xlsb` gets the same
-  treatment: a real, disclosed, permanent gap rather than a guess.
+- **`.xlsb` (Excel Binary Workbook, BIFF12) - initially declined, then
+  revisited once a real verification fixture turned out to be reachable
+  after all.** This was first written up as a permanent gap: LibreOffice
+  (the only tool available in this environment that can write legacy
+  Excel binary formats at all) has no working `.xlsb` export filter -
+  confirmed through genuine effort, not assumed from one failure (a plain
+  `--convert-to xlsb` reports no export filter found; explicitly naming
+  the filter, `xlsb:Calc MS Excel 2007 Binary`, is accepted but fails at
+  the actual file-write step, `SfxBaseModel::impl_store failed`). But
+  "no tool here can *write* one" and "no genuine `.xlsb` file is
+  reachable at all" turned out to be two different claims - the second
+  one was never actually checked before the gap was declared permanent.
+  It doesn't hold: Apache POI's own `test-data/spreadsheet/` directory
+  (Apache-2.0 licensed, the same license family already trusted for
+  `parquet-testing` elsewhere in this file) ships several real,
+  genuinely-Excel-produced `.xlsb` files as part of POI's own test suite.
+  Four were vendored into this project's own `tests/fixtures/`
+  (`poi_simple.xlsb`, `poi_date.xlsb`, `poi_sample.xlsb`,
+  `poi_various.xlsb` - see `tests/fixtures/poi_xlsb_PROVENANCE.md` for
+  the exact source and license) specifically because no tool anywhere in
+  this environment can generate a synthetic one - the same "vendor a
+  real file when self-generation is genuinely impossible" call already
+  made for the OLE2/CFBF layer of `.xls` verification, just one level
+  further since even *conversion* wasn't available here.
 
-**What's deliberately not being hand-rolled**: `.xlsb` (see immediately
-above - no tool in this environment can produce a genuine fixture to
-verify a hand-rolled reader against, and LibreOffice's own `.xlsb` export
-filter turns out not to actually work) remains on calamine. `serde`/
-`serde_json` remain the other dependency left that's more central than
-any of the others in this list: `serde_json::Value` is the literal bridge
-type seven different format readers (JSON, YAML, TOML, Avro, MessagePack,
-CBOR, XML) recurse through via `profile_json_path` - replacing it means
-writing and re-verifying a whole JSON value type, parser, and
-serializer, not swapping one call site at a time or hand-rolling a
-narrower, self-contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`,
-and now `.xls` all still were, however real their own risk. That's
-still a real, non-mechanical rewrite - the risk itself is why it's still
+  **The container layer needed nothing new.** `.xlsb` uses the exact
+  same OPC ZIP-of-parts layout `.xlsx` already does (`xl/workbook.bin`,
+  `xl/worksheets/*.bin`, `xl/sharedStrings.bin`, `xl/styles.bin`, and -
+  still plain XML even here - `xl/_rels/*.rels`), so this reuses
+  `ZipArchive` and `xml_parse` directly; only each part's own *content*
+  differs (binary BIFF12 records instead of XML elements). BIFF12's own
+  record framing turned out simpler than BIFF8's: a 1- or 2-byte
+  variable-length record type (the first byte's high bit signals a
+  second byte) followed by a 1-to-4-byte base-128 varint length - no
+  fixed 16-bit length cap the way BIFF8 has, so there's no CONTINUE-
+  record concept to handle at all. RK's compact numeric encoding turned
+  out byte-for-byte identical to BIFF8's own, so `xls_rk_decode` is
+  reused directly rather than reimplemented - confirmed field-by-field
+  against calamine's `cells_reader.rs`, not assumed from the similar name.
+
+  **This pass surfaced three real, independently-confirmed bugs - two in
+  calamine 0.36.1's own `.xlsb` reader, and one in this project's own
+  first draft, caught the same way this project catches everything else:
+  by testing against real files and treating any mismatch as worth
+  understanding, not dismissing.**
+    1. A `BrtBundleSh` [MS-XLSB 2.4.316] record's relationship-ID string
+       is prefixed by a fixed header whose documented size (Microsoft's
+       own published spec example) is 8 bytes (`hsState` + `itabID`, 4
+       bytes each). `poi_sample.xlsb` genuinely uses that 8-byte form -
+       but `poi_simple.xlsb`, an equally real file, has 4 extra reserved
+       bytes there instead (12 bytes total), confirmed by hand-decoding
+       its raw bytes against its own `xl/_rels/workbook.bin.rels`
+       contents until the relationship ID and sheet name both came out
+       clean. calamine hardcodes the 8-byte offset and panics on this
+       file (`"no entry found for key"`, indexing straight into a
+       `HashMap` with `[]` rather than `.get()`) - and, checked
+       specifically because a second, independent implementation is
+       better evidence than one library's own bug, Python's `pyxlsb`
+       hardcodes the identical assumption and fails the identical way
+       (`KeyError`). `xlsb_parse_bundle_sh` tries the documented 8-byte
+       header first and only falls back to 12 if the resulting
+       relationship ID isn't actually present in the already-parsed
+       relationships map - a real structural corroboration check against
+       known-good data, not a guess, matching this project's usual
+       "verify before trusting a fixed offset" discipline (compare the
+       preamble-detection and dBase/Stata version-sniffing heuristics).
+       `xlsb_reader_succeeds_on_a_real_file_that_breaks_calamine_and_pyxlsb`
+       locks this in, independently re-verified by hand (a from-scratch
+       byte-level scan of `poi_simple.xlsb`'s own worksheet parts, not
+       just "the code didn't crash") to confirm the resolved content -
+       one real header cell, two genuinely empty sheets - is actually
+       correct, not merely non-panicking.
+    2. This project's own first draft of the styles-table reader
+       collected every `BrtXF` [MS-XLSB 2.4.826] record in the file into
+       one flat list. That's wrong: `styles.bin` has *two* separate XF
+       tables sharing that same per-entry record type - `cellStyleXfs`
+       (named style definitions like "Normal", never referenced by a
+       cell directly) and `cellXfs` (the real per-cell format table a
+       cell's own style reference indexes into) - and a flat scan lets
+       `cellStyleXfs`'s own entries shift every later cell's index by
+       however many style-only entries came first. Found via a genuine
+       mismatch against calamine on `poi_various.xlsb`: a real date cell
+       rendered as its raw, unresolved serial number instead of a date.
+       Fixed by mirroring calamine's own two-phase read exactly -
+       `BrtBeginFmts`/`BrtBeginCellXFs` each declare their own entry
+       count up front, and only entries immediately following the
+       *right* marker, up to that count, are ever collected.
+    3. Having fixed its own bug, this project's reader then disagreed
+       with calamine on the very same file (`poi_various.xlsb`) a second
+       time, on a *different* column - and this time the mismatch traced
+       back to calamine itself, not this project's code. calamine's
+       `next_cell` (the function `worksheet_range()` actually uses) has
+       a match arm for `BrtCellError` (a literal error value) but none
+       at all for `BrtFmlaError` (a *formula* cell whose cached result is
+       an error) - it falls into that function's own catch-all
+       `_ => continue`, silently dropping the cell instead of surfacing
+       `"#NAME?"`. Confirmed directly against `xlsb/cells_reader.rs`'s
+       source. This reader treats `BrtFmlaError` the same as
+       `BrtCellError`, matching the `.xls`/`.xlsx` readers' own existing
+       formula-error handling rather than reproducing calamine's gap.
+    4. A fourth, separate calamine bug surfaced independently while
+       chasing the *first* attempted fix for bug 2 above: `poi_date.xlsb`
+       still failed to resolve its one real cell's date even after this
+       project's own styles-table fix, so the file's `xl/styles.bin` was
+       checked directly against calamine's `read_styles` source rather
+       than assumed correct. That function's top-level dispatch loop
+       calls `iter.read_type()` for every record, but only calls
+       `fill_buffer()` - the call that actually advances the reader past
+       a record's *body* - inside its `0x0267`/`0x0269` match arms; every
+       other record type's body is silently never consumed. The first
+       non-zero-length, non-matching record in the file (and
+       `poi_date.xlsb`'s `styles.bin` has several - fonts, fills, and
+       more - before its real `BrtBeginCellXFs`) permanently desyncs the
+       rest of the stream, so calamine's own CLI-facing output for this
+       file shows the cell's raw, unresolved serial (`"41286"`) instead
+       of a date. This reader's own `Biff12RecordIter` has no equivalent
+       bug - every record's length is consumed unconditionally in one
+       place, `next()` itself, regardless of what type it is - so it
+       resolves the date correctly.
+       `xlsb_reader_resolves_a_date_calamine_fails_to_because_of_its_own_stream_desync_bug`
+       and `xlsb_reader_captures_a_formula_error_cell_calamine_silently_drops`
+       lock bugs 3 and 4 in as permanent regression tests, each with the
+       full diagnosis in its own doc comment - and
+       `xlsb_reader_matches_calamine_output_exactly` was narrowed to just
+       `poi_sample.xlsb`, the one fixture with no known calamine bug
+       affecting it, rather than comparing against a now-known-wrong
+       oracle on the other three.
+
+**What's deliberately not being hand-rolled**: `serde`/`serde_json` are
+the one dependency left that's more central than any of the others in
+this list: `serde_json::Value` is the literal bridge type seven different
+format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML) recurse
+through via `profile_json_path` - replacing it means writing and
+re-verifying a whole JSON value type, parser, and serializer, not
+swapping one call site at a time or hand-rolling a narrower, self-
+contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`, `.xls`, and
+now `.xlsb` all still were, however real their own risk. That's still a
+real, non-mechanical rewrite - the risk itself is why it's still
 deliberately a dependency, the same reasoning that applied to every
-other entry in this list right up until it didn't.
+other entry in this list right up until it didn't. With `.xlsb` done,
+every format `--features xlsx` is documented to cover (`.xlsx`/`.ods`/
+`.xls`/`.xlsb`) now has its own hand-rolled reader and is dispatched to
+it by content, not extension - `columns_from_xlsx_calamine` remains
+wired in only as `columns_from_xlsx`'s last-resort fallback for a file
+that matches none of the four content signatures (a genuinely malformed
+file, or some other real-world OOXML/OLE2-flavored format this project
+doesn't otherwise recognize), and as this project's own ongoing cross-
+verification oracle during development (see every
+`*_matches_calamine_output_exactly` test above) - not because any of the
+four documented formats still relies on it to be read correctly.
 
 ## Known limitations / roadmap
 
