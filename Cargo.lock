@@ -2082,7 +2082,6 @@ dependencies = [
  "csv",
  "dbase",
  "dta",
- "flate2",
  "npyz",
  "num-bigint 0.4.8",
  "parquet",

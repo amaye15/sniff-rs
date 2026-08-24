@@ -5242,14 +5242,437 @@ fn render_json_schema(
     serde_json::to_string_pretty(&doc).context("failed to serialize JSON Schema output")
 }
 
+// --- Hand-rolled DEFLATE (RFC 1951) + gzip (RFC 1952) decoder ---
+// gzip is the one compression format this project reads unconditionally
+// (no --features gate - see below), so it's the one place hand-rolling
+// pays off without touching an optional feature's own dependency budget.
+// Decode-only (this tool never writes gzip, only reads it), and closely
+// follows the structure of `puff.c` - Mark Adler's own minimal reference
+// inflate implementation - rather than inventing an approach from first
+// principles; DEFLATE's bit-packing (data elements LSB-first, but Huffman
+// codes themselves packed MSB-first) is exactly the kind of detail worth
+// getting from a known-correct reference rather than reasoning out fresh.
+// Verified against real gzip files: the system `gzip` command and
+// Python's `gzip`/`zlib` modules both reach for dynamic Huffman blocks
+// (BTYPE 10) for anything non-trivial, not just the simpler stored/fixed
+// cases (BTYPE 00/01) a partial implementation might stop at.
+
+const MAX_BITS: usize = 15;
+
+/// Reads DEFLATE's bitstream: multi-bit data elements (lengths, extra
+/// bits, HLIT/HDIST/HCLEN) are packed LSB-first, filled lazily one whole
+/// byte at a time so the underlying reader never advances further than
+/// the bits actually consumed - which is what lets `gzip_decompress`
+/// safely read the CRC32/ISIZE footer immediately after `inflate`
+/// returns, with no explicit re-sync step.
+struct BitReader<R> {
+    inner: R,
+    buf: u32,
+    nbits: u32,
+}
+
+impl<R: std::io::Read> BitReader<R> {
+    fn new(inner: R) -> Self {
+        BitReader {
+            inner,
+            buf: 0,
+            nbits: 0,
+        }
+    }
+
+    fn bits(&mut self, need: u32) -> Result<u32> {
+        while self.nbits < need {
+            let mut byte = [0u8; 1];
+            self.inner
+                .read_exact(&mut byte)
+                .context("unexpected end of DEFLATE stream")?;
+            self.buf |= (byte[0] as u32) << self.nbits;
+            self.nbits += 8;
+        }
+        let val = self.buf & ((1u32 << need) - 1);
+        self.buf >>= need;
+        self.nbits -= need;
+        Ok(val)
+    }
+
+    /// Discards whatever's left of the byte currently buffered - needed
+    /// before a stored block's LEN/NLEN fields, which always start at a
+    /// real byte boundary regardless of where the preceding 3-bit block
+    /// header left the bitstream.
+    fn align_to_byte(&mut self) {
+        self.buf = 0;
+        self.nbits = 0;
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        Ok(self.bits(8)? as u8)
+    }
+
+    fn read_u16_le(&mut self) -> Result<u16> {
+        let lo = self.read_u8()? as u16;
+        let hi = self.read_u8()? as u16;
+        Ok(lo | (hi << 8))
+    }
+}
+
+/// A canonical Huffman decode table (RFC 1951 3.2.2): `counts[len]` is how
+/// many symbols have that code length, `symbols` holds every coded symbol
+/// ordered first by length then by symbol index within that length - the
+/// same layout `puff.c`'s `construct()` builds, which is what makes
+/// `decode` below able to find a symbol without ever materializing an
+/// actual code->symbol map.
+struct HuffmanTable {
+    counts: [u16; MAX_BITS + 1],
+    symbols: Vec<u16>,
+}
+
+impl HuffmanTable {
+    fn build(lengths: &[u8]) -> Result<Self> {
+        let mut counts = [0u16; MAX_BITS + 1];
+        for &len in lengths {
+            counts[len as usize] += 1;
+        }
+        counts[0] = 0;
+
+        // Reject an over-subscribed code (more codes at some length than
+        // fit) - the only case genuinely invalid at construction time. A
+        // few too few codes ("incomplete") is left alone: RFC 1951
+        // permits exactly one real case of it (a distance table with only
+        // one distance value ever used), and any other incomplete table
+        // simply never gets asked to decode its missing code, since a
+        // valid encoder never emits one.
+        let mut left: i32 = 1;
+        for &count in counts.iter().skip(1) {
+            left <<= 1;
+            left -= count as i32;
+            if left < 0 {
+                bail!("invalid DEFLATE stream: over-subscribed Huffman code");
+            }
+        }
+
+        let mut offsets = [0u16; MAX_BITS + 2];
+        for len in 1..MAX_BITS {
+            offsets[len + 1] = offsets[len] + counts[len];
+        }
+        let mut next = offsets;
+        let mut symbols = vec![0u16; lengths.len()];
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len != 0 {
+                symbols[next[len as usize] as usize] = sym as u16;
+                next[len as usize] += 1;
+            }
+        }
+
+        Ok(HuffmanTable { counts, symbols })
+    }
+
+    fn decode<R: std::io::Read>(&self, bits: &mut BitReader<R>) -> Result<u16> {
+        let mut code: i32 = 0;
+        let mut first: i32 = 0;
+        let mut index: i32 = 0;
+        for len in 1..=MAX_BITS {
+            code |= bits.bits(1)? as i32;
+            let count = self.counts[len] as i32;
+            if code - first < count {
+                return Ok(self.symbols[(index + (code - first)) as usize]);
+            }
+            index += count;
+            first += count;
+            first <<= 1;
+            code <<= 1;
+        }
+        bail!("invalid DEFLATE stream: Huffman code not found in table")
+    }
+}
+
+// RFC 1951 3.2.5's length/distance base values and their extra-bit counts.
+const LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+const LENGTH_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+const DIST_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+const DIST_EXTRA: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+// RFC 1951 3.2.7's fixed, spec-mandated order the HCLEN code-length code
+// lengths themselves arrive in - not related to any of the tables above.
+const CLEN_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+/// Decodes one compressed block's symbol stream (shared by fixed and
+/// dynamic Huffman blocks - they differ only in which tables they hand
+/// in) directly into `out`, stopping at the end-of-block symbol (256).
+/// Back-references index straight into `out` itself rather than a
+/// bounded sliding window, matching every other reader in this project
+/// (CSV/JSON/YAML/... all read their whole input into memory too - see
+/// CLAUDE.md's Dependency footprint section).
+fn inflate_block<R: std::io::Read>(
+    bits: &mut BitReader<R>,
+    out: &mut Vec<u8>,
+    lencode: &HuffmanTable,
+    distcode: &HuffmanTable,
+) -> Result<()> {
+    loop {
+        let symbol = lencode.decode(bits)?;
+        if symbol < 256 {
+            out.push(symbol as u8);
+        } else if symbol == 256 {
+            return Ok(());
+        } else {
+            let idx = (symbol - 257) as usize;
+            if idx >= LENGTH_BASE.len() {
+                bail!("invalid DEFLATE stream: bad length code {symbol}");
+            }
+            let length = LENGTH_BASE[idx] as usize + bits.bits(LENGTH_EXTRA[idx] as u32)? as usize;
+            let dsym = distcode.decode(bits)? as usize;
+            if dsym >= DIST_BASE.len() {
+                bail!("invalid DEFLATE stream: bad distance code {dsym}");
+            }
+            let dist = DIST_BASE[dsym] as usize + bits.bits(DIST_EXTRA[dsym] as u32)? as usize;
+            if dist > out.len() {
+                bail!(
+                    "invalid DEFLATE stream: distance {dist} goes further back than any output produced so far"
+                );
+            }
+            let start = out.len() - dist;
+            out.reserve(length);
+            for i in 0..length {
+                out.push(out[start + i]);
+            }
+        }
+    }
+}
+
+/// RFC 1951 3.2.6's fixed Huffman code lengths - used verbatim, not
+/// derived, since the spec defines these as literal constants.
+fn fixed_tables() -> (HuffmanTable, HuffmanTable) {
+    let mut lengths = [0u8; 288];
+    lengths[0..144].fill(8);
+    lengths[144..256].fill(9);
+    lengths[256..280].fill(7);
+    lengths[280..288].fill(8);
+    let lencode =
+        HuffmanTable::build(&lengths).expect("the fixed literal/length table is always valid");
+
+    let dlengths = [5u8; 30];
+    let distcode =
+        HuffmanTable::build(&dlengths).expect("the fixed distance table is always valid");
+
+    (lencode, distcode)
+}
+
+/// RFC 1951 3.2.7's dynamic Huffman header: HLIT/HDIST/HCLEN counts, the
+/// HCLEN "code length code" itself, then that code used to decode the
+/// real literal/length and distance table's code lengths (with repeat
+/// codes 16/17/18 for runs, since a table can have hundreds of entries).
+fn dynamic_tables<R: std::io::Read>(
+    bits: &mut BitReader<R>,
+) -> Result<(HuffmanTable, HuffmanTable)> {
+    let hlit = bits.bits(5)? as usize + 257;
+    let hdist = bits.bits(5)? as usize + 1;
+    let hclen = bits.bits(4)? as usize + 4;
+
+    let mut clen_lengths = [0u8; 19];
+    for i in 0..hclen {
+        clen_lengths[CLEN_ORDER[i]] = bits.bits(3)? as u8;
+    }
+    let clen_table = HuffmanTable::build(&clen_lengths)?;
+
+    let mut lengths: Vec<u8> = Vec::with_capacity(hlit + hdist);
+    while lengths.len() < hlit + hdist {
+        let sym = clen_table.decode(bits)?;
+        match sym {
+            0..=15 => lengths.push(sym as u8),
+            16 => {
+                let prev = *lengths.last().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid DEFLATE stream: repeat-previous code length with no previous value"
+                    )
+                })?;
+                let rep = 3 + bits.bits(2)?;
+                lengths.resize(lengths.len() + rep as usize, prev);
+            }
+            17 => {
+                let rep = 3 + bits.bits(3)?;
+                lengths.resize(lengths.len() + rep as usize, 0);
+            }
+            18 => {
+                let rep = 11 + bits.bits(7)?;
+                lengths.resize(lengths.len() + rep as usize, 0);
+            }
+            _ => bail!("invalid DEFLATE stream: bad code-length symbol {sym}"),
+        }
+    }
+    if lengths.len() != hlit + hdist {
+        bail!("invalid DEFLATE stream: code-length repeat overran the table");
+    }
+    let lencode = HuffmanTable::build(&lengths[..hlit])?;
+    let distcode = HuffmanTable::build(&lengths[hlit..])?;
+    Ok((lencode, distcode))
+}
+
+/// Decodes a raw DEFLATE stream (no gzip/zlib wrapper) to its full
+/// uncompressed bytes.
+fn inflate<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
+    let mut bits = BitReader::new(input);
+    let mut out = Vec::new();
+    loop {
+        let bfinal = bits.bits(1)?;
+        let btype = bits.bits(2)?;
+        match btype {
+            0 => {
+                bits.align_to_byte();
+                let len = bits.read_u16_le()?;
+                let nlen = bits.read_u16_le()?;
+                if len != !nlen {
+                    bail!("invalid DEFLATE stream: stored block length check failed");
+                }
+                out.reserve(len as usize);
+                for _ in 0..len {
+                    out.push(bits.read_u8()?);
+                }
+            }
+            1 => {
+                let (lencode, distcode) = fixed_tables();
+                inflate_block(&mut bits, &mut out, &lencode, &distcode)?;
+            }
+            2 => {
+                let (lencode, distcode) = dynamic_tables(&mut bits)?;
+                inflate_block(&mut bits, &mut out, &lencode, &distcode)?;
+            }
+            _ => bail!("invalid DEFLATE stream: reserved block type 3"),
+        }
+        if bfinal == 1 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// CRC-32 (IEEE 802.3, the same polynomial gzip's own footer uses),
+/// table-based and built once per process via `OnceLock` rather than a
+/// `lazy_static`-style dependency - std alone is enough for this.
+fn crc32(data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = [0u32; 256];
+        for (i, entry) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *entry = c;
+        }
+        table
+    });
+
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn read_null_terminated<R: std::io::Read>(input: &mut R) -> Result<()> {
+    let mut byte = [0u8; 1];
+    loop {
+        input.read_exact(&mut byte)?;
+        if byte[0] == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Parses a gzip container (RFC 1952) around the raw DEFLATE stream:
+/// header (with its optional FEXTRA/FNAME/FCOMMENT/FHCRC fields, each
+/// gated by its own flag bit and skipped rather than interpreted, since
+/// none of them affect the decompressed bytes), the compressed data
+/// itself, then a footer whose CRC32 and ISIZE are checked against what
+/// was actually decompressed - catching real data corruption a purely
+/// structural decode wouldn't (a bit-flipped byte deep in a compressed
+/// block can still often decode to *some* well-formed-looking output).
+fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut input = std::io::BufReader::new(input);
+
+    let mut header = [0u8; 10];
+    input
+        .read_exact(&mut header)
+        .context("failed to read gzip header")?;
+    if header[0] != 0x1f || header[1] != 0x8b {
+        bail!("not a valid gzip file (bad magic bytes)");
+    }
+    if header[2] != 8 {
+        bail!("unsupported gzip compression method (only DEFLATE is supported)");
+    }
+    let flags = header[3];
+
+    if flags & 0x04 != 0 {
+        // FEXTRA
+        let mut len_buf = [0u8; 2];
+        input
+            .read_exact(&mut len_buf)
+            .context("failed to read gzip FEXTRA length")?;
+        let mut skip = vec![0u8; u16::from_le_bytes(len_buf) as usize];
+        input
+            .read_exact(&mut skip)
+            .context("failed to read gzip FEXTRA data")?;
+    }
+    if flags & 0x08 != 0 {
+        read_null_terminated(&mut input).context("failed to read gzip FNAME")?;
+    }
+    if flags & 0x10 != 0 {
+        read_null_terminated(&mut input).context("failed to read gzip FCOMMENT")?;
+    }
+    if flags & 0x02 != 0 {
+        // FHCRC - a checksum of the header only, not verified (the
+        // footer's CRC32 of the actual decompressed data below is the
+        // check that matters for catching real corruption).
+        let mut crc16 = [0u8; 2];
+        input
+            .read_exact(&mut crc16)
+            .context("failed to read gzip FHCRC")?;
+    }
+
+    let decompressed = inflate(&mut input)?;
+
+    let mut footer = [0u8; 8];
+    input
+        .read_exact(&mut footer)
+        .context("failed to read gzip footer")?;
+    let expected_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+    let expected_isize = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+
+    if crc32(&decompressed) != expected_crc {
+        bail!("gzip CRC32 checksum mismatch - the file is corrupt or truncated");
+    }
+    if (decompressed.len() as u64 & 0xFFFF_FFFF) as u32 != expected_isize {
+        bail!("gzip size checksum mismatch - the file is corrupt or truncated");
+    }
+
+    Ok(decompressed)
+}
+
 // --- Transparent gzip/zstd decompression ---
 // Not a format of its own - a preprocessing step in front of every reader
 // above. Every reader just opens a plain file path, so materializing
 // compressed input to a real temporary file (rather than trying to hand
 // each reader a generic Read stream) means compressed input needs zero
 // per-format changes, including formats that need actual random file
-// access rather than a stream (Parquet, SQLite, Excel). gzip (via flate2,
-// pure Rust, no C toolchain) is always available; zstd needs
+// access rather than a stream (Parquet, SQLite, Excel). gzip (hand-rolled
+// above, pure std, no dependency at all) is always available; zstd needs
 // --features zstd since the zstd crate compiles a small vendored C library.
 
 enum Compression {
@@ -5365,6 +5788,7 @@ impl Drop for TempFile {
 /// Non-compressed input passes through unchanged with no guard.
 fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFile>)> {
     use std::fs::File;
+    use std::io::Write;
 
     let Some(compression) = compression_from_extension(path) else {
         return Ok((path.to_path_buf(), path.to_path_buf(), None));
@@ -5374,9 +5798,11 @@ fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFil
     let mut tmp = TempFile::new()?;
     match compression {
         Compression::Gzip => {
-            let mut decoder = flate2::read::GzDecoder::new(input);
-            std::io::copy(&mut decoder, tmp.as_file_mut())
-                .with_context(|| format!("failed to decompress {path:?}"))?;
+            let bytes =
+                gzip_decompress(input).with_context(|| format!("failed to decompress {path:?}"))?;
+            tmp.as_file_mut()
+                .write_all(&bytes)
+                .with_context(|| format!("failed to write decompressed data for {path:?}"))?;
         }
         Compression::Zstd => decompress_zstd(input, tmp.as_file_mut(), path)?,
     }
@@ -5554,6 +5980,69 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // crc32's standard published check value (RFC 1952's own reference,
+    // shared by every CRC-32/ISO-HDLC implementation) - the cheapest
+    // possible proof the table/polynomial are right, before trusting it
+    // against anything gzip-shaped.
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    // A real, sizable (3,000-row) gzip file, generated with the system
+    // `gzip` command specifically because that forces zlib's own encoder
+    // to reach for dynamic Huffman blocks (BTYPE 10) across multiple
+    // blocks and long length/distance matches, not just the trivial
+    // single-block case a smaller fixture would produce - see this
+    // format's own real-world-corpus-validation write-up in CLAUDE.md for
+    // the fuller verification this received (byte-exact diffed against
+    // Python's independent zlib/gzip modules across several more real
+    // files, including a 28MB/300,000-row one, before this was trusted).
+    #[test]
+    fn gzip_decompress_handles_a_real_multi_block_dynamic_huffman_file() {
+        let bytes = include_bytes!("../tests/fixtures/edge_gzip_dynamic_huffman.csv.gz");
+        let decompressed = gzip_decompress(&bytes[..]).unwrap();
+        let text = String::from_utf8(decompressed).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3001); // header + 3,000 data rows
+        assert_eq!(lines[0], "id,name,email,amount,active");
+        assert_eq!(lines[1], "0,alice_0,alice0@example.com,0.00,True");
+        assert_eq!(
+            lines[3000],
+            "2999,erin_2999,erin2999@example.com,5248.25,False"
+        );
+    }
+
+    // FHCRC, FEXTRA, FNAME, and FCOMMENT all set at once - hand-built with
+    // Python's zlib/struct (see the fixture's own generation script in
+    // this project's history) rather than relying on the system `gzip`
+    // command, which never sets FEXTRA/FCOMMENT/FHCRC in practice. Proves
+    // every flag-gated skip branch in gzip_decompress, not just FNAME
+    // (which the dynamic-Huffman fixture above already exercises, since
+    // `gzip -k` always embeds the original filename by default).
+    #[test]
+    fn gzip_decompress_skips_every_optional_header_field() {
+        let bytes = include_bytes!("../tests/fixtures/edge_gzip_all_optional_header_fields.csv.gz");
+        let decompressed = gzip_decompress(&bytes[..]).unwrap();
+        assert_eq!(
+            decompressed,
+            b"id,name,amount\n1,alice,10.50\n2,bob,20.25\n3,carol,30.75\n"
+        );
+    }
+
+    // A single byte flipped inside sample.csv.gz's CRC32 footer field -
+    // real, structurally-valid gzip that decodes cleanly at the DEFLATE
+    // level, so only the checksum verification catches the corruption.
+    #[test]
+    fn gzip_decompress_rejects_a_corrupted_checksum() {
+        let bytes = include_bytes!("../tests/fixtures/malformed_gzip_checksum.csv.gz");
+        let err = gzip_decompress(&bytes[..]).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("CRC32"),
+            "expected a CRC32 mismatch error, got: {err:?}"
+        );
+    }
 
     #[test]
     fn leading_zero_requires_a_second_digit() {

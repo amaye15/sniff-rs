@@ -82,16 +82,17 @@ slicing), so it's always compiled in, gated by nothing but the required
 gzip/zstd decompression (`decompress_if_needed`) isn't a format of its own —
 it's a preprocessing step in front of every reader above, not a new
 `InputFormat` variant. A `.gz`/`.zst` input gets decompressed into a real
-temporary file (via `tempfile::NamedTempFile`, cleaned up on drop) *before*
-format detection ever runs, so every reader keeps opening a plain file path
-exactly as before, with zero per-format changes — including formats that
-need actual random file access rather than a stream (Parquet, SQLite,
-Excel). Detection and default output naming use the compression-stripped
-logical name (`data.csv.gz` behaves like `data.csv`); the JSON/Markdown
-`file` field still reports the real, original filename for traceability.
-gzip is via `flate2` (pure Rust, no C toolchain, so always available); zstd
-needs `--features zstd` since the `zstd` crate compiles a small vendored C
-library.
+temporary file (via the hand-rolled `TempFile` guard - see the Dependency
+footprint section below), cleaned up on drop) *before* format detection
+ever runs, so every reader keeps opening a plain file path exactly as
+before, with zero per-format changes — including formats that need actual
+random file access rather than a stream (Parquet, SQLite, Excel).
+Detection and default output naming use the compression-stripped logical
+name (`data.csv.gz` behaves like `data.csv`); the JSON/Markdown `file`
+field still reports the real, original filename for traceability. gzip is
+via a hand-rolled DEFLATE/gzip decoder (pure `std`, no dependency at all -
+see the Dependency footprint section); zstd needs `--features zstd` since
+the `zstd` crate compiles a small vendored C library.
 
 NumPy's `npyz` crate is worth a dependency note: its `npz` feature (for
 `.npz` archives) depends on the `zip` crate without trimming its default
@@ -2244,6 +2245,39 @@ this project could just implement directly rather than depend on:
   same discipline this file's design-philosophy section applies
   everywhere else, here applied to a build-system change rather than a
   heuristic.
+- **`flate2` → a hand-rolled DEFLATE/gzip decoder.** gzip is the one
+  compression format this project reads unconditionally (no feature
+  gate), so it's the one place hand-rolling pays off without touching an
+  optional feature's own dependency budget. `inflate`/`gzip_decompress`
+  (in `src/lib.rs`, right above the "Transparent gzip/zstd decompression"
+  section) implement RFC 1951 (DEFLATE: stored/fixed/dynamic Huffman
+  blocks) and RFC 1952 (the gzip container: header, optional FEXTRA/
+  FNAME/FCOMMENT/FHCRC fields, and a CRC32+ISIZE footer actually verified
+  against what was decompressed, not just parsed) - decode-only, since
+  this tool never writes gzip, closely following the structure of
+  `puff.c` (Mark Adler's own minimal reference inflate implementation)
+  rather than inventing an approach from first principles. Real DEFLATE
+  decoders are notoriously easy to get subtly wrong, so this got
+  correspondingly heavier verification before being trusted: byte-exact
+  diffed against Python's independent `zlib`/`gzip` modules across eight
+  real files generated with the system `gzip` command at multiple
+  compression levels (empty, a 2-byte file, highly repetitive content,
+  random/incompressible content forcing stored blocks, and a 28MB/
+  300,000-row CSV to check performance isn't pathological - all correct,
+  0.54s end-to-end), plus a hand-built file exercising all four optional
+  gzip header fields at once (FHCRC/FEXTRA/FNAME/FCOMMENT - none of which
+  the system `gzip` command ever sets on its own) and two deliberately
+  checksum-corrupted files to confirm the CRC32/ISIZE verification
+  actually catches real corruption rather than just being present in the
+  code. `tests/fixtures/edge_gzip_dynamic_huffman.csv.gz` (3,000 rows,
+  large/repetitive enough that zlib's encoder reaches for multiple
+  dynamic Huffman blocks, not just the trivial single-block case
+  `sample.csv.gz` already covers), `edge_gzip_all_optional_header_fields
+  .csv.gz`, and `malformed_gzip_checksum.csv.gz` carry the smaller,
+  representative slice of that verification forward as permanent,
+  committed regression coverage (`src/lib.rs`'s own `#[cfg(test)]`
+  block plus two new `tests/integration.rs` cases), rather than relying
+  on the throwaway scratch files the fuller manual verification pass used.
 
 **What's deliberately not being hand-rolled**, and why the cost/benefit
 flips hard past this point: `anyhow` itself has *zero* transitive
@@ -2263,12 +2297,7 @@ even more central: `serde_json::Value` is the literal bridge type seven
 different format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML)
 recurse through via `profile_json_path` - replacing it means writing and
 re-verifying a whole JSON value type, parser, and serializer, not
-swapping one call site at a time. `flate2` (gzip) is the one remaining
-candidate with a genuinely reasonable payoff (`crc32fast`/`miniz_oxide`/
-`adler2`/`simd-adler32`, 5 more crates) for a bounded, well-specified
-algorithm (DEFLATE decoding only, no compression needed) - real
-algorithmic work, not simply mechanical, so it's the natural next
-candidate if this effort continues rather than something to do reflexively.
+swapping one call site at a time.
 
 ## Known limitations / roadmap
 

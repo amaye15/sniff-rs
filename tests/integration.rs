@@ -313,6 +313,35 @@ fn gzip_input_reads_transparently_as_its_inner_format() {
     assert!(zip["notes"].as_str().unwrap().contains("already lost"));
 }
 
+// A real, 3,000-row gzip file through the full pipeline (not just the
+// direct gzip_decompress unit tests in lib.rs) - large/repetitive enough
+// that the system `gzip` command reaches for multiple dynamic Huffman
+// blocks rather than the single trivial block sample.csv.gz produces.
+#[test]
+fn gzip_with_dynamic_huffman_blocks_reads_correctly_end_to_end() {
+    let doc = run_json("edge_gzip_dynamic_huffman.csv.gz", &[]);
+    let cols = table(&doc, "edge_gzip_dynamic_huffman");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "amount")["ideal_type"], "f64");
+}
+
+#[test]
+fn gzip_with_a_corrupted_checksum_gives_an_actionable_error_not_a_panic() {
+    let output = Command::new(bin())
+        .args([
+            fixture("malformed_gzip_checksum.csv.gz").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CRC32"),
+        "error should mention the CRC32 mismatch, not panic: {stderr}"
+    );
+}
+
 #[test]
 fn gzip_with_an_invalid_header_gives_an_actionable_error_not_a_panic() {
     let bad_gz = fixture("_scratch_not_actually_gzip.csv.gz");
