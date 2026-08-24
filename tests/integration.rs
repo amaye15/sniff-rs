@@ -1100,6 +1100,7 @@ fn csv_recognizes_international_rfc2822_ctime_and_oracle_style_dates() {
         "dot_eu",
         "full_month",
         "rfc2822",
+        "rfc2822_gmt",
         "ctime",
         "oracle_style",
         "datetime_no_seconds",
@@ -1111,6 +1112,19 @@ fn csv_recognizes_international_rfc2822_ctime_and_oracle_style_dates() {
             "column {name} should resolve to a date/datetime type"
         );
     }
+
+    // Found via a real-world sweep of RSS feeds (BBC News's <pubDate>) -
+    // RFC 2822 with the literal named zone "GMT" instead of a numeric
+    // offset, the same shape RFC 7231's HTTP Date-header grammar itself
+    // mandates. Asserted separately from the loop above to also confirm
+    // it resolved via its *own* format string, not by coincidentally
+    // matching the numeric-offset rfc2822 entry.
+    let rfc2822_gmt = column(cols, "rfc2822_gmt");
+    assert!(
+        rfc2822_gmt["notes"].as_str().unwrap().contains("GMT"),
+        "expected the literal-GMT format to win, got: {:?}",
+        rfc2822_gmt["notes"]
+    );
 
     // "01/15/24" - a genuinely 2-digit year must resolve to the %y form,
     // not be silently swallowed by %m/%d/%Y treating "24" as year 24 AD

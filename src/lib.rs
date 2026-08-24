@@ -134,6 +134,16 @@ const DATE_FORMATS: &[&str] = &[
     // %a against the parsed date (a value claiming the wrong weekday for
     // its actual date is correctly rejected, not just shape-matched).
     "%a, %d %b %Y %H:%M:%S %z", // e.g. "Mon, 15 Jan 2024 10:00:00 +0000"
+    // The same RFC 2822 shape, but with the literal named zone "GMT"
+    // instead of a numeric offset - found via a real-world sweep of RSS
+    // feeds (BBC News uses this; RFC 7231's own HTTP `Date`-header
+    // "IMF-fixdate" grammar mandates literal "GMT" specifically, not a
+    // numeric offset, so this is a spec-standard shape, not an outlier).
+    // `%z` doesn't accept "GMT" (confirmed directly: "input contains
+    // invalid characters"), but a literal "GMT" in the format string
+    // matches it as plain text, which is exactly correct here since
+    // GMT's offset is always zero - nothing is lost treating it as naive.
+    "%a, %d %b %Y %H:%M:%S GMT", // e.g. "Mon, 15 Jan 2024 10:00:00 GMT"
     // Unix `date`/`ctime()`'s own default textual format (also git log's
     // default), e.g. "Mon Jan 15 10:00:00 2024" - a real, distinct field
     // order from RFC 2822 above (weekday/month/day before year, no comma,
@@ -5585,6 +5595,33 @@ mod tests {
         assert_eq!(
             matching_date_format(&["Mon Jan 15 10:00:00 2024", "Tue Feb 20 11:30:00 2024"]),
             Some("%a %b %d %H:%M:%S %Y")
+        );
+    }
+
+    #[test]
+    fn matching_date_format_recognizes_rfc2822_with_literal_gmt_zone() {
+        // Found via a real-world sweep of RSS feeds: BBC News's <pubDate>
+        // uses a literal "GMT" zone rather than a numeric offset - the
+        // same shape RFC 7231's HTTP Date-header grammar itself mandates.
+        // %z rejects "GMT" outright (it's not a numeric offset), so this
+        // needs its own format entry with "GMT" as literal text, distinct
+        // from the numeric-offset RFC 2822 entry above.
+        assert_eq!(
+            matching_date_format(&[
+                "Sun, 23 Aug 2026 21:22:17 GMT",
+                "Sun, 23 Aug 2026 21:05:43 GMT"
+            ]),
+            Some("%a, %d %b %Y %H:%M:%S GMT")
+        );
+        // A column mixing the numeric-offset and literal-GMT shapes must
+        // not silently match either format alone - "no partial credit"
+        // applies to date-format detection the same as everywhere else.
+        assert_eq!(
+            matching_date_format(&[
+                "Sun, 23 Aug 2026 21:22:17 GMT",
+                "Sun, 23 Aug 2026 21:05:43 +0000"
+            ]),
+            None
         );
     }
 

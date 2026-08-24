@@ -1267,6 +1267,30 @@ entirely:
   the list above) - the heuristic was already doing exactly the right
   thing, not a bug to fix.
 
+- **RFC 2822 dates with a literal named zone (`"GMT"`) instead of a
+  numeric offset were left as plain `String`.** Found via a real-world
+  sweep of live RSS feeds: BBC News's `<pubDate>` field uses
+  `"Mon, 15 Jan 2024 10:00:00 GMT"`, not the `+0000` form the existing
+  RFC 2822 entry already handled - and this isn't an outlier convention,
+  it's what RFC 7231's own HTTP `Date`-header "IMF-fixdate" grammar
+  mandates. Confirmed directly before assuming it: chrono's `%z` rejects
+  `"GMT"` outright ("input contains invalid characters" - it's a named
+  zone, not a numeric offset, and `%Z` is display-only in chrono, not
+  reliable for parsing), but a literal `"GMT"` written directly into the
+  format string matches it as plain text, which is exactly correct here
+  since GMT's offset is always zero - nothing is lost treating the result
+  as naive. A new `DATE_FORMATS` entry
+  (`"%a, %d %b %Y %H:%M:%S GMT"`) handles it, kept as a separate entry
+  from the numeric-offset RFC 2822 form rather than trying to make one
+  format string cover both (a column mixing the two shapes correctly
+  matches neither, the same "no partial credit" rule the rest of this
+  file already applies everywhere else - confirmed by a dedicated test).
+  Two of the three real feeds swept (NASA, Hacker News) already used the
+  numeric-offset form and needed no fix; only BBC's did - a reminder that
+  "found in one real source out of three" is still worth fixing when the
+  source in question is backed by the actual HTTP spec, not treated as
+  too narrow a sample to act on.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1708,6 +1732,21 @@ already drawn for YAML above, not a gap in this project's code. No fix
 was needed for TOML at all - the cleanest result of any format pass in
 this document, and worth recording as such rather than only writing up
 passes that found something broken.
+
+A seventh pass, for XML: six genuinely real files rather than a
+synthetic or crawled corpus - live RSS feeds from BBC News, NASA, and
+Hacker News, a real, large Maven `pom.xml` (Apache Maven's own, 244
+flattened columns, nesting seven levels deep through real plugin
+configuration), a real sitemap.xml, and a real SVG icon. All six read
+correctly with zero panics - deeply nested real configuration, mixed
+scalar/object arrays (BBC's RSS mixes a plain-text `<link>` with an
+Atom-namespaced `<link href="..."/>` under the same flattened name,
+correctly triggering the documented "no partial credit" mixed-array
+fallback), and genuine multi-dot attribute names (Maven's own
+`combine.children` inheritance directive) all handled without incident.
+One real, valuable gap this pass did find: see
+`matching_date_format_recognizes_rfc2822_with_literal_gmt_zone` in the
+design philosophy section below.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
