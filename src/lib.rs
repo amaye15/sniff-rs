@@ -3,7 +3,6 @@ use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
@@ -359,6 +358,488 @@ impl Args {
     }
 }
 
+// --- Hand-rolled stand-in for chrono's date/time parsing and civil-
+// calendar arithmetic (see CLAUDE.md's Dependency footprint section) ---
+// Only covers what this project actually needs: matching a value against
+// one of the fixed strftime-style formats in DATE_FORMATS/TIME_FORMATS
+// below (used by the default CSV/JSON build), and converting a stored
+// epoch offset (days/seconds/millis/... since 1970-01-01) to a formatted
+// string (used by the Avro and SAS7BDAT readers). `chrono` itself is now
+// an *optional* dependency, needed only by the `xlsx` feature - calamine's
+// own `as_datetime()` API returns a real `chrono::NaiveDateTime`
+// regardless of what this project's own code does, so that one call site
+// can't avoid the real crate no matter what.
+//
+// The civil-calendar conversion (days_from_civil/civil_from_days) is
+// Howard Hinnant's well-known algorithm
+// (http://howardhinnant.github.io/date_algorithms.html) rather than
+// something derived from scratch - verified against Python's `datetime`
+// module across leap-year, century-boundary, and proleptic-range cases
+// (year 1, year 9999, 1600/1900/2000/2100/2400) before being trusted, the
+// same "verify against a known-correct source" discipline this project
+// already applies to `sniff_format`'s magic-byte checks. Every directive
+// this project's own DATE_FORMATS/TIME_FORMATS list actually uses was
+// checked directly against chrono's own `format/parse.rs`/`scan.rs`
+// source (not assumed from the strftime man page) - notably: `%Y` scans
+// 1-4 digits (not exactly 4 - this is *why* the %y-before-%Y ordering
+// trick above works at all), `%y`'s real pivot boundary is `< 70` (00-69
+// -> 2000s, 70-99 -> 1900s - confirmed directly against `parsed.rs`,
+// which turns out to be one year off from this file's own paraphrase
+// elsewhere of "00-68/69-99"), `%z` accepts any run of `:`/whitespace
+// between the hour and minute digits, and `%a` is cross-validated against
+// the actual computed weekday of the parsed date, not just shape-matched.
+
+/// Converts a proleptic-Gregorian (year, month, day) to days since
+/// 1970-01-01 (which is day 0; negative for earlier dates).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The inverse of `days_from_civil`.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// 0 = Sunday .. 6 = Saturday. 1970-01-01 (day 0) is a Thursday (index 4).
+fn weekday_index(days: i64) -> u32 {
+    (days.rem_euclid(7) + 4).rem_euclid(7) as u32
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Scans `min..=max` consecutive ASCII digits from the start of `s`
+/// (greedy, stopping at the first non-digit or after `max` digits),
+/// matching chrono's own `scan::number` exactly - confirmed directly
+/// against its source, since this is the detail the whole %y-before-%Y
+/// ordering trick depends on.
+fn scan_digits(s: &str, min: usize, max: usize) -> Option<(i64, &str)> {
+    let bytes = s.as_bytes();
+    let mut n: i64 = 0;
+    let mut count = 0;
+    for &b in bytes.iter().take(max) {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        n = n.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        count += 1;
+    }
+    if count < min {
+        return None;
+    }
+    Some((n, &s[count..]))
+}
+
+const MONTH_ABBR: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+// Suffix that extends the abbreviation into the full name, e.g. "jan" +
+// "uary" -> "january" - matching chrono's own `short_or_long_month0`.
+const MONTH_LONG_SUFFIX: [&str; 12] = [
+    "uary", "ruary", "ch", "il", "", "e", "y", "ust", "tember", "ober", "ember", "ember",
+];
+const WEEKDAY_ABBR: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+// `str::is_char_boundary(n)` doubles as the length check here (it
+// returns false when `n > v.len()`, per its own documented contract), and
+// - critically - also refuses to slice mid-character rather than
+// panicking: a byte offset that would otherwise land inside a multi-byte
+// UTF-8 character (found via adversarial testing with 💥/é-repeated
+// input, the same discipline CLAUDE.md's design-philosophy section
+// already applies to every other validator in this file) safely fails
+// the match instead, since an all-ASCII 3-letter name could never equal
+// a prefix that isn't even 3 whole characters long anyway.
+fn scan_month_short(v: &str) -> Option<(u32, &str)> {
+    if !v.is_char_boundary(3) {
+        return None;
+    }
+    let prefix = &v[..3];
+    MONTH_ABBR
+        .iter()
+        .position(|name| prefix.eq_ignore_ascii_case(name))
+        .map(|i| (i as u32 + 1, &v[3..]))
+}
+
+fn scan_month_long(v: &str) -> Option<(u32, &str)> {
+    let (month, rest) = scan_month_short(v)?;
+    let suffix = MONTH_LONG_SUFFIX[(month - 1) as usize];
+    if !suffix.is_empty()
+        && rest.is_char_boundary(suffix.len())
+        && rest[..suffix.len()].eq_ignore_ascii_case(suffix)
+    {
+        Some((month, &rest[suffix.len()..]))
+    } else {
+        Some((month, rest))
+    }
+}
+
+fn scan_weekday_short(v: &str) -> Option<(u32, &str)> {
+    if !v.is_char_boundary(3) {
+        return None;
+    }
+    let prefix = &v[..3];
+    WEEKDAY_ABBR
+        .iter()
+        .position(|name| prefix.eq_ignore_ascii_case(name))
+        .map(|i| (i as u32, &v[3..]))
+}
+
+/// `%z`: a sign, exactly 2 hour digits, any run of `:`/whitespace
+/// (possibly none), then exactly 2 minute digits - matching chrono's own
+/// `scan::timezone_offset` with its default `colon_or_space` separator.
+/// The offset value itself is never used downstream (matching_date_format
+/// only checks whether the value matches at all), so this only validates
+/// shape and returns the remaining unconsumed slice.
+fn scan_tz_offset(v: &str) -> Option<&str> {
+    let mut chars = v.chars();
+    match chars.next() {
+        Some('+') | Some('-') => {}
+        _ => return None,
+    }
+    let rest = chars.as_str();
+    let (_hours, rest) = scan_digits(rest, 2, 2)?;
+    let rest = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+    let (_minutes, rest) = scan_digits(rest, 2, 2)?;
+    Some(rest)
+}
+
+#[derive(Default)]
+struct DateFields {
+    year: Option<i32>,
+    month: Option<u32>,
+    day: Option<u32>,
+    hour: Option<u32>,
+    hour12: Option<u32>,
+    is_pm: Option<bool>,
+    minute: Option<u32>,
+    second: Option<u32>,
+    weekday: Option<u32>,
+}
+
+/// Walks `fmt` (a small strftime-style subset - only the directives
+/// DATE_FORMATS/TIME_FORMATS actually use) and `value` in lockstep,
+/// extracting whichever fields the format names. Returns `None` on any
+/// mismatch, including leftover unconsumed input at the end (the same
+/// "the whole value must match the whole format" contract
+/// `NaiveDate::parse_from_str`/`NaiveDateTime::parse_from_str` both
+/// enforce) - callers that only care about a strict date, a strict time,
+/// or a datetime all just call this once and look at whichever fields
+/// they need, rather than needing chrono's own separate
+/// NaiveDate-vs-NaiveDateTime entry points.
+fn parse_date_fields(value: &str, fmt: &str) -> Option<DateFields> {
+    let mut f = DateFields::default();
+    let mut v = value;
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next()? {
+                'Y' => {
+                    let (n, rest) = scan_digits(v, 1, 4)?;
+                    f.year = Some(n as i32);
+                    v = rest;
+                }
+                'y' => {
+                    let (n, rest) = scan_digits(v, 2, 2)?;
+                    f.year = Some(if n < 70 {
+                        2000 + n as i32
+                    } else {
+                        1900 + n as i32
+                    });
+                    v = rest;
+                }
+                'm' => {
+                    let (n, rest) = scan_digits(v, 1, 2)?;
+                    f.month = Some(n as u32);
+                    v = rest;
+                }
+                'd' => {
+                    let (n, rest) = scan_digits(v, 1, 2)?;
+                    f.day = Some(n as u32);
+                    v = rest;
+                }
+                'H' => {
+                    let (n, rest) = scan_digits(v, 1, 2)?;
+                    f.hour = Some(n as u32);
+                    v = rest;
+                }
+                'I' => {
+                    let (n, rest) = scan_digits(v, 1, 2)?;
+                    f.hour12 = Some(n as u32);
+                    v = rest;
+                }
+                'M' => {
+                    let (n, rest) = scan_digits(v, 1, 2)?;
+                    f.minute = Some(n as u32);
+                    v = rest;
+                }
+                'S' => {
+                    let (n, rest) = scan_digits(v, 1, 2)?;
+                    f.second = Some(n as u32);
+                    v = rest;
+                }
+                'p' => {
+                    if !v.is_char_boundary(2) {
+                        return None;
+                    }
+                    let two = &v[..2];
+                    if two.eq_ignore_ascii_case("am") {
+                        f.is_pm = Some(false);
+                    } else if two.eq_ignore_ascii_case("pm") {
+                        f.is_pm = Some(true);
+                    } else {
+                        return None;
+                    }
+                    v = &v[2..];
+                }
+                'b' => {
+                    let (m, rest) = scan_month_short(v)?;
+                    f.month = Some(m);
+                    v = rest;
+                }
+                'B' => {
+                    let (m, rest) = scan_month_long(v)?;
+                    f.month = Some(m);
+                    v = rest;
+                }
+                'a' => {
+                    let (wd, rest) = scan_weekday_short(v)?;
+                    f.weekday = Some(wd);
+                    v = rest;
+                }
+                '.' => {
+                    if chars.next() != Some('f') {
+                        return None; // only the "%.f" directive is supported
+                    }
+                    // Tolerates a value with no fractional seconds at all -
+                    // only consumes it if a '.' is actually present.
+                    if let Some(rest) = v.strip_prefix('.') {
+                        let (_frac, rest) = scan_digits(rest, 1, 9)?;
+                        v = rest;
+                    }
+                }
+                'z' => {
+                    v = scan_tz_offset(v)?;
+                }
+                '%' => {
+                    v = v.strip_prefix('%')?;
+                }
+                _ => return None,
+            }
+        } else {
+            let mut vc = v.chars();
+            if vc.next() != Some(c) {
+                return None;
+            }
+            v = vc.as_str();
+        }
+    }
+    if !v.is_empty() {
+        return None; // trailing input the format didn't account for
+    }
+
+    if let (Some(month), Some(day)) = (f.month, f.day) {
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        let max_day = match f.year {
+            Some(year) => days_in_month(i64::from(year), month),
+            None => 31,
+        };
+        if day < 1 || day > max_day {
+            return None;
+        }
+    }
+    if let Some(h) = f.hour
+        && h > 23
+    {
+        return None;
+    }
+    if let Some(h12) = f.hour12
+        && !(1..=12).contains(&h12)
+    {
+        return None;
+    }
+    if let Some(m) = f.minute
+        && m > 59
+    {
+        return None;
+    }
+    if let Some(s) = f.second
+        && s > 59
+    {
+        return None;
+    }
+    if let (Some(year), Some(month), Some(day), Some(wd)) = (f.year, f.month, f.day, f.weekday) {
+        let actual = weekday_index(days_from_civil(i64::from(year), month, day));
+        if actual != wd {
+            return None; // %a must match the date it's attached to
+        }
+    }
+
+    Some(f)
+}
+
+fn matches_date_format(value: &str, fmt: &str) -> bool {
+    parse_date_fields(value, fmt).is_some()
+}
+
+// A minimal date/time/datetime value type covering exactly what the Avro
+// and SAS7BDAT readers need: turning a stored epoch offset (days/seconds/
+// millis/micros/nanos since 1970-01-01) into one of a handful of fixed
+// output strings, via the same civil-calendar conversion above. Not a
+// general calendar library - no arithmetic, comparison, or parsing, just
+// epoch-in / formatted-string-out.
+#[allow(dead_code)]
+struct EpochDate {
+    year: i32,
+    month: u32,
+    day: u32,
+}
+
+#[allow(dead_code)]
+impl EpochDate {
+    fn from_days(days: i64) -> Option<Self> {
+        let (y, m, d) = civil_from_days(days);
+        Some(EpochDate {
+            year: i32::try_from(y).ok()?,
+            month: m,
+            day: d,
+        })
+    }
+
+    fn format_ymd(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+}
+
+#[allow(dead_code)]
+struct EpochTime {
+    hour: u32,
+    minute: u32,
+    second: u32,
+    nanosecond: u32,
+}
+
+#[allow(dead_code)]
+impl EpochTime {
+    fn from_seconds_since_midnight(total_secs: u32, nanosecond: u32) -> Option<Self> {
+        if total_secs >= 86_400 || nanosecond >= 1_000_000_000 {
+            return None;
+        }
+        Some(EpochTime {
+            hour: total_secs / 3600,
+            minute: (total_secs % 3600) / 60,
+            second: total_secs % 60,
+            nanosecond,
+        })
+    }
+
+    fn format_hms(&self) -> String {
+        format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
+    }
+
+    /// Fixed-width fractional seconds (always exactly `digits` digits,
+    /// zero-padded) - a different, simpler contract than `%.f`'s
+    /// tolerant/variable-width parsing above, matching what Avro's own
+    /// millis/micros/nanos logical types need for output.
+    fn format_hms_frac(&self, digits: u32) -> String {
+        let scale = 10u32.pow(9 - digits);
+        let frac = self.nanosecond / scale;
+        format!(
+            "{}.{:0width$}",
+            self.format_hms(),
+            frac,
+            width = digits as usize
+        )
+    }
+}
+
+#[allow(dead_code)]
+struct EpochDateTime {
+    date: EpochDate,
+    time: EpochTime,
+}
+
+#[allow(dead_code)]
+impl EpochDateTime {
+    fn from_days_and_seconds(days: i64, secs_in_day: u32, nanosecond: u32) -> Option<Self> {
+        Some(EpochDateTime {
+            date: EpochDate::from_days(days)?,
+            time: EpochTime::from_seconds_since_midnight(secs_in_day, nanosecond)?,
+        })
+    }
+
+    fn from_unix_seconds(total_secs: i64, nanosecond: u32) -> Option<Self> {
+        Self::from_days_and_seconds(
+            total_secs.div_euclid(86_400),
+            total_secs.rem_euclid(86_400) as u32,
+            nanosecond,
+        )
+    }
+
+    fn from_unix_millis(total_millis: i64) -> Option<Self> {
+        let ms_in_day = total_millis.rem_euclid(86_400_000) as u32;
+        Self::from_days_and_seconds(
+            total_millis.div_euclid(86_400_000),
+            ms_in_day / 1000,
+            (ms_in_day % 1000) * 1_000_000,
+        )
+    }
+
+    fn from_unix_micros(total_micros: i64) -> Option<Self> {
+        let us_in_day = total_micros.rem_euclid(86_400_000_000) as u64;
+        Self::from_days_and_seconds(
+            total_micros.div_euclid(86_400_000_000),
+            (us_in_day / 1_000_000) as u32,
+            ((us_in_day % 1_000_000) * 1000) as u32,
+        )
+    }
+
+    fn format_space(&self) -> String {
+        format!("{} {}", self.date.format_ymd(), self.time.format_hms())
+    }
+
+    fn format_t_frac(&self, digits: u32) -> String {
+        format!(
+            "{}T{}",
+            self.date.format_ymd(),
+            self.time.format_hms_frac(digits)
+        )
+    }
+}
+
 // chrono's `%Y` accepts variable-width numeric input while parsing (it only
 // zero-pads to 4 digits on *output*), so it will happily parse a genuinely
 // 2-digit year like "24" as the literal year 24 AD rather than rejecting
@@ -376,12 +857,17 @@ impl Args {
 const DATE_FORMATS: &[&str] = &[
     // Two-digit-year variants, deliberately ordered before their %Y
     // counterparts just below (see the module-level comment above) -
-    // common in older exports and some spreadsheet defaults. chrono's `%y`
-    // follows the standard strptime pivot (00-68 -> 2000-2068, 69-99 ->
-    // 1969-1999), the same convention every other tool assumes; this is a
-    // real, disclosed ambiguity for genuinely 100+-year-old dates, not
-    // something this project can resolve any more precisely than the
-    // format itself allows.
+    // common in older exports and some spreadsheet defaults. The pivot
+    // (00-69 -> 2000-2069, 70-99 -> 1970-1999) is the same convention
+    // every other tool assumes; this is a real, disclosed ambiguity for
+    // genuinely 100+-year-old dates, not something this project can
+    // resolve any more precisely than the format itself allows. This
+    // exact boundary was worth re-confirming directly against chrono's
+    // own source (`format/parsed.rs`'s `resolve_year`, `r < 70`) while
+    // hand-rolling a replacement parser (see the Dependency footprint
+    // section) - it turned out to be one year off from an earlier
+    // paraphrase here ("00-68/69-99"), a genuine, if narrow, discrepancy
+    // between what this comment used to claim and chrono's real behavior.
     "%m/%d/%y", // e.g. "01/15/24"
     "%d/%m/%y", // e.g. "15/01/24"
     "%Y-%m-%d",
@@ -457,11 +943,10 @@ const DATE_FORMATS: &[&str] = &[
 const TIME_FORMATS: &[&str] = &["%H:%M:%S%.f", "%H:%M", "%I:%M:%S %p", "%I:%M %p"];
 
 fn matching_time_format(values: &[&str]) -> Option<&'static str> {
-    TIME_FORMATS.iter().copied().find(|fmt| {
-        values
-            .iter()
-            .all(|v| NaiveTime::parse_from_str(v, fmt).is_ok())
-    })
+    TIME_FORMATS
+        .iter()
+        .copied()
+        .find(|fmt| values.iter().all(|v| matches_date_format(v, fmt)))
 }
 
 // --- Shared intermediate representation, produced by each format's reader ---
@@ -548,12 +1033,10 @@ fn is_bool_word(s: &str) -> bool {
 }
 
 fn matching_date_format(values: &[&str]) -> Option<&'static str> {
-    DATE_FORMATS.iter().copied().find(|fmt| {
-        values.iter().all(|v| {
-            NaiveDate::parse_from_str(v, fmt).is_ok()
-                || NaiveDateTime::parse_from_str(v, fmt).is_ok()
-        })
-    })
+    DATE_FORMATS
+        .iter()
+        .copied()
+        .find(|fmt| values.iter().all(|v| matches_date_format(v, fmt)))
 }
 
 /// Recognizes RFC 4122 UUID string form (8-4-4-4-12 hex digits, dashes at
@@ -2574,17 +3057,17 @@ fn sas_cell_to_string(v: &sas7bdat::CellValue) -> Option<String> {
             }
         }
         CellValue::Bytes(b) => Some(b.iter().map(|byte| format!("{byte:02x}")).collect()),
-        CellValue::Date(d) => chrono::DateTime::UNIX_EPOCH
-            .checked_add_signed(chrono::Duration::days(i64::from(d.unix_days())))
-            .map(|dt| dt.format("%Y-%m-%d").to_string()),
-        CellValue::DateTime(dt) => chrono::DateTime::UNIX_EPOCH
-            .checked_add_signed(chrono::Duration::seconds(dt.unix_seconds()))
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-        CellValue::Time(t) => chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+        CellValue::Date(d) => {
+            EpochDate::from_days(i64::from(d.unix_days())).map(|date| date.format_ymd())
+        }
+        CellValue::DateTime(dt) => {
+            EpochDateTime::from_unix_seconds(dt.unix_seconds(), 0).map(|dt| dt.format_space())
+        }
+        CellValue::Time(t) => EpochTime::from_seconds_since_midnight(
             u32::try_from(t.seconds_since_midnight).unwrap_or(0),
             0,
         )
-        .map(|nt| nt.format("%H:%M:%S").to_string()),
+        .map(|nt| nt.format_hms()),
     }
 }
 
@@ -3315,45 +3798,38 @@ fn avro_decimal_to_string(decimal: apache_avro::Decimal, scale: usize) -> String
 
 #[cfg(feature = "avro")]
 fn avro_millis_to_string(millis: i64) -> JsonValue {
-    chrono::DateTime::from_timestamp_millis(millis).map_or(JsonValue::Null, |dt| {
-        JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string())
-    })
+    EpochDateTime::from_unix_millis(millis)
+        .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(3)))
 }
 
 #[cfg(feature = "avro")]
 fn avro_micros_to_string(micros: i64) -> JsonValue {
-    chrono::DateTime::from_timestamp_micros(micros).map_or(JsonValue::Null, |dt| {
-        JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
-    })
+    EpochDateTime::from_unix_micros(micros)
+        .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(6)))
 }
 
 #[cfg(feature = "avro")]
 fn avro_nanos_to_string(nanos: i64) -> JsonValue {
     let secs = nanos.div_euclid(1_000_000_000);
     let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, subsec_nanos).map_or(JsonValue::Null, |dt| {
-        JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.9f").to_string())
-    })
+    EpochDateTime::from_unix_seconds(secs, subsec_nanos)
+        .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(9)))
 }
 
 #[cfg(feature = "avro")]
 fn avro_time_millis_to_string(millis: i32) -> JsonValue {
     let secs = (millis.div_euclid(1000)).rem_euclid(86_400) as u32;
     let nanos = millis.rem_euclid(1000) as u32 * 1_000_000;
-    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
-        .map_or(JsonValue::Null, |t| {
-            JsonValue::String(t.format("%H:%M:%S%.3f").to_string())
-        })
+    EpochTime::from_seconds_since_midnight(secs, nanos)
+        .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(3)))
 }
 
 #[cfg(feature = "avro")]
 fn avro_time_micros_to_string(micros: i64) -> JsonValue {
     let secs = (micros.div_euclid(1_000_000)).rem_euclid(86_400) as u32;
     let nanos = micros.rem_euclid(1_000_000) as u32 * 1000;
-    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
-        .map_or(JsonValue::Null, |t| {
-            JsonValue::String(t.format("%H:%M:%S%.6f").to_string())
-        })
+    EpochTime::from_seconds_since_midnight(secs, nanos)
+        .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(6)))
 }
 
 /// `schema` co-recurses alongside `v` so logical types whose meaning isn't
@@ -3435,11 +3911,8 @@ fn avro_value_to_json(
                     .collect(),
             )
         }
-        AvroValue::Date(days) => chrono::DateTime::UNIX_EPOCH
-            .checked_add_signed(chrono::Duration::days(i64::from(*days)))
-            .map_or(JsonValue::Null, |d| {
-                JsonValue::String(d.format("%Y-%m-%d").to_string())
-            }),
+        AvroValue::Date(days) => EpochDate::from_days(i64::from(*days))
+            .map_or(JsonValue::Null, |d| JsonValue::String(d.format_ymd())),
         AvroValue::Uuid(u) => JsonValue::String(u.to_string()),
         AvroValue::TimestampMillis(ms) | AvroValue::LocalTimestampMillis(ms) => {
             avro_millis_to_string(*ms)
@@ -6237,6 +6710,45 @@ mod tests {
             records,
             vec![vec!["id", "note"], vec!["1", "never closed\n2,plain\n"]]
         );
+    }
+
+    // days_from_civil/civil_from_days (Howard Hinnant's civil-calendar
+    // algorithm) and weekday_index, cross-checked against Python's
+    // datetime module across leap-year and century-boundary cases before
+    // being trusted - the same values used to verify this by hand before
+    // it was ever wired into the rest of this file, now locked in
+    // permanently. Weekday is Python's `date.weekday()` (Mon=0) converted
+    // to this file's own Sun=0 convention (`(mon0 + 1) % 7`).
+    #[test]
+    fn days_from_civil_matches_python_datetime_across_leap_and_century_boundaries() {
+        let cases: &[(i64, u32, u32, i64, u32)] = &[
+            (1970, 1, 1, 0, 4),
+            (1970, 1, 2, 1, 5),
+            (1969, 12, 31, -1, 3),
+            (2000, 2, 29, 11016, 2),
+            (2024, 1, 15, 19737, 1),
+            (1900, 1, 1, -25567, 1),
+            (2100, 3, 1, 47541, 1),
+            (1600, 2, 29, -135081, 2),
+            (2400, 2, 29, 157113, 2),
+            (1, 1, 1, -719162, 1),
+            (9999, 12, 31, 2932896, 5),
+            (2024, 2, 29, 19782, 4),
+            (2023, 2, 28, 19416, 2),
+            (1899, 12, 31, -25568, 0),
+            (2069, 12, 31, 36524, 2),
+            (1970, 12, 31, 364, 4),
+        ];
+        for &(y, m, d, expected_days, expected_weekday) in cases {
+            let days = days_from_civil(y, m, d);
+            assert_eq!(days, expected_days, "{y}-{m}-{d}: days");
+            assert_eq!(
+                weekday_index(days),
+                expected_weekday,
+                "{y}-{m}-{d}: weekday"
+            );
+            assert_eq!(civil_from_days(days), (y, m, d), "{y}-{m}-{d}: round-trip");
+        }
     }
 
     // crc32's standard published check value (RFC 1952's own reference,

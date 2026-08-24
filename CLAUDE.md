@@ -2363,25 +2363,74 @@ this project could just implement directly rather than depend on:
   as one field rather than hang or panic) - were checked by hand and
   turned into permanent unit tests on `parse_csv` directly rather than
   left as one-off manual checks.
+- **`chrono` → a hand-rolled civil-calendar and date/time parser -
+  everywhere except `xlsx`.** The most research-heavy hand-roll of this
+  whole effort, precisely because it looked the *most* dangerous going
+  in: 40+ independently-verified date formats, RFC 2822's weekday
+  cross-validation, and the already-documented %y/%Y quirks this file's
+  own comments rely on getting right. Done by reading chrono's own
+  source (`format/parse.rs`, `format/scan.rs`, `format/parsed.rs`)
+  directive-by-directive rather than assuming strptime conventions carry
+  over exactly - several details only surfaced this way: `%Y` scans 1-4
+  digits, not exactly 4 (the literal reason the %y-before-%Y ordering
+  trick elsewhere in this file works at all); `%y`'s real pivot is
+  `< 70` (00-69 -> 2000s, 70-99 -> 1900s), which turned out to be one
+  year off from this file's own older paraphrase of the same rule -
+  fixed in place once found; `%z` accepts any run of `:`/whitespace
+  between hour and minute digits, not just a single optional colon; and
+  `%a` is genuinely cross-validated against the parsed date's *computed*
+  weekday, not just shape-matched. The civil-calendar conversion itself
+  (`days_from_civil`/`civil_from_days`, backing both the format parser's
+  weekday check and the Avro/SAS7BDAT epoch-to-date paths) is Howard
+  Hinnant's well-known algorithm, not derived from scratch - verified
+  against Python's `datetime` module across leap-year and century-
+  boundary cases (year 1, year 9999, 1600/1900/2000/2100/2400) before
+  anything else was built on top of it. `EpochDate`/`EpochTime`/
+  `EpochDateTime` (near `matches_date_format`) cover the separate,
+  simpler need the Avro/SAS7BDAT readers have: turning a stored epoch
+  offset into one of a handful of fixed output strings, not general
+  parsing. One real bug the adversarial test suite caught immediately:
+  the first attempt at the month/weekday-name scanner (`&v[..3]`)
+  panicked on multi-byte UTF-8 input (💥, repeated é) with "byte index 3
+  is not a char boundary" - fixed by checking `str::is_char_boundary`
+  first (which doubles as the length check, per its own documented
+  contract, and correctly fails the match rather than panicking when a
+  3-byte prefix would land mid-character - an all-ASCII month/weekday
+  name could never match there anyway). All 11 of this file's own
+  existing `matching_date_format`/`matching_time_format` tests -
+  covering RFC 3339 with `Z`/numeric offset, international and
+  full-month variants, RFC 2822 and Unix `ctime()` forms, RFC 2822 with
+  a literal `GMT` zone, the weekday-mismatch rejection, the two-digit-
+  year ordering trick, Oracle-style and compact-ISO forms, and 12h/24h
+  time - passed unchanged the moment the parser was wired in, before the
+  UTF-8 fix was even found (the adversarial-input tests are what caught
+  it, not these). `chrono` didn't disappear entirely, though: it's now
+  an *optional* dependency, gated behind `xlsx` only, because calamine's
+  own `as_datetime()` API returns a real `chrono::NaiveDateTime`
+  regardless of what this project's own code does - `xlsx_cell_to_string`
+  was already fully-qualifying `chrono::NaiveTime::MIN` and needed no
+  changes at all, it just lost its unconditional top-level `use`.
+  Verified across every affected feature combination individually, not
+  just the two usual endpoints - `--features avro` alone, `--features
+  sas7bdat` alone, and `--features xlsx` alone all needed their own
+  clean-build and clippy check, since (unlike every earlier dependency
+  removed in this section) chrono's removal wasn't simply "gone or not
+  gone" across the default/full split; it depended on *which specific
+  feature* was active.
 
 **What's deliberately not being hand-rolled**, and why the cost/benefit
-stays genuinely unfavorable even after both `anyhow` and `csv` turned out
-to be worth doing anyway: `chrono` is a real dependency-count target on
-paper (`iana-time-zone`/`core-foundation-sys`/`num-traits`) but hand-
-rolling it means re-deriving, by hand, 40+ verified date formats and
-their chrono-specific parsing quirks - correctness this project has
-spent this entire file's "Design philosophy" section earning, in a way
-`csv`'s RFC-4180-plus-a-few-real-world-extensions grammar (bounded,
-mostly delimiter/quote-state-machine shaped) doesn't really compare to:
-a date format is closer to 40+ *independent* small grammars than one
-grammar with edge cases. `serde`/`serde_json` are even more central:
+stays genuinely unfavorable even after `anyhow`, `csv`, and `chrono` all
+turned out to be worth doing anyway: `serde`/`serde_json` are the one
+dependency left that's more central than any of the others were.
 `serde_json::Value` is the literal bridge type seven different format
 readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML) recurse through
 via `profile_json_path` - replacing it means writing and re-verifying a
 whole JSON value type, parser, and serializer, not swapping one call
-site at a time. Both would still be real, non-mechanical rewrites - the
-risk itself is why they're still deliberately dependencies, the same
-reasoning that applied to `csv` right up until it didn't.
+site at a time or hand-rolling a narrower, self-contained parser the way
+`csv` and `chrono` both still were, however real their own risk. That's
+still a real, non-mechanical rewrite - the risk itself is why it's still
+deliberately a dependency, the same reasoning that applied to the other
+three right up until it didn't.
 
 ## Known limitations / roadmap
 
