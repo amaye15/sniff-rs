@@ -597,6 +597,36 @@ fn npz_reports_one_table_per_named_array() {
     assert!(users.iter().any(|c| c["name"] == "user_id"));
 }
 
+// Found via a real-world sweep against TensorFlow's own MNIST .npz
+// (x_train/x_test are genuine 3-D image arrays, (60000, 28, 28) and
+// (10000, 28, 28) - a real, documented boundary this tool correctly
+// refuses to guess a flattening for - but y_train/y_test in the exact
+// same archive are perfectly ordinary 1-D label arrays). One array's
+// shape not being representable used to abort the *entire* archive read,
+// costing every other array in the file its own profile too - the same
+// "one bad part shouldn't sink everything else" principle already
+// applied to a single unconvertible nested Parquet/Arrow column.
+#[cfg(feature = "npy")]
+#[test]
+fn npz_one_unreadable_array_does_not_sink_the_rest_of_the_archive() {
+    let doc = run_json("edge_npz_mixed_readable_and_unreadable.npz", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(tables.len(), 2, "both arrays must still appear as tables");
+
+    let images = table(&doc, "images");
+    assert!(
+        column(images, "value")["notes"]
+            .as_str()
+            .unwrap()
+            .contains("could not be profiled"),
+        "the 3-D array's own table should disclose why, not silently vanish"
+    );
+
+    // The unrelated, perfectly ordinary array must still profile normally.
+    let labels = table(&doc, "labels");
+    assert_eq!(column(labels, "value")["ideal_type"], "i64");
+}
+
 #[cfg(feature = "weblog")]
 #[test]
 fn combined_log_splits_request_and_treats_dash_as_missing() {

@@ -4134,14 +4134,39 @@ fn columns_from_npz(
         bail!("no arrays found in {path:?}");
     }
 
+    // Found via real-world testing (MNIST's own .npz - x_train/x_test are
+    // genuine 3-D image arrays with no natural row/column reading, a real,
+    // documented boundary, not a bug - but y_train/y_test in the *same
+    // file* are perfectly ordinary 1-D label arrays): one array's shape or
+    // dtype not being representable shouldn't cost every other array in
+    // the same archive its own profile. Each array's read is caught
+    // independently and disclosed on just that array's own "table" rather
+    // than aborting the whole archive, the same principle already applied
+    // to a single unconvertible nested column in Parquet/Arrow.
     let mut out = Vec::new();
     for name in names {
-        let npy = archive
+        let read_result = archive
             .by_name(&name)
-            .with_context(|| format!("failed reading array '{name}' from {path:?}"))?
-            .ok_or_else(|| anyhow::anyhow!("array '{name}' disappeared while reading {path:?}"))?;
-        let profiles = columns_from_npy_reader(npy, nrows, n_samples)
-            .with_context(|| format!("failed reading array '{name}' from {path:?}"))?;
+            .with_context(|| format!("failed reading array '{name}' from {path:?}"))
+            .and_then(|npy| {
+                npy.ok_or_else(|| {
+                    anyhow::anyhow!("array '{name}' disappeared while reading {path:?}")
+                })
+            })
+            .and_then(|npy| columns_from_npy_reader(npy, nrows, n_samples));
+
+        let profiles = match read_result {
+            Ok(profiles) => profiles,
+            Err(e) => vec![ColumnProfile {
+                name: "value".to_string(),
+                current_type: "unknown".to_string(),
+                ideal_type: "String".to_string(),
+                description: String::new(),
+                missing_pct: 0.0,
+                sample_values: Vec::new(),
+                notes: format!("array '{name}' could not be profiled: {e}"),
+            }],
+        };
         out.push((name, profiles));
     }
     Ok(out)

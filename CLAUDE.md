@@ -1334,6 +1334,32 @@ entirely:
   because a string-based fixture can't exercise this code path at all)
   before the fix was restored.
 
+- **A single `.npz` array with an unsupported shape used to abort every
+  other array in the same archive, not just its own.** Found via a
+  real-world sweep against TensorFlow's own MNIST dataset (the actual
+  `mnist.npz` its own `tf.keras.datasets.mnist` API downloads): `x_train`/
+  `x_test` are genuine 3-D image arrays (`(60000, 28, 28)`/
+  `(10000, 28, 28)`) - correctly and deliberately rejected, per this
+  file's own already-documented "anything higher-dimensional is a clear
+  error rather than a guessed flattening" boundary, not a new bug - but
+  `y_train`/`y_test` in that *exact same file* are perfectly ordinary 1-D
+  label arrays that should read cleanly. Before this fix, hitting the
+  first unreadable array (`columns_from_npz`'s loop propagated its error
+  immediately via `?`) meant the whole archive read failed, so the two
+  perfectly good label arrays never got profiled either - a real user
+  pointing this tool at a real, extremely common ML dataset shape would
+  have gotten nothing at all, not a partial, honest answer. Each array's
+  read is now caught independently; one that fails gets a single
+  disclosed placeholder column on its own table
+  (`"array 'x_train' could not be profiled: ..."`) instead of taking
+  every other array down with it - the same "one bad part shouldn't sink
+  everything else" principle already applied to a single unconvertible
+  nested Parquet/Arrow column above. `tests/fixtures/
+  edge_npz_mixed_readable_and_unreadable.npz` (a genuinely 3-D array
+  alongside an ordinary 1-D one, generated directly with `numpy` -
+  mirroring MNIST's own shape at fixture scale) and its integration test
+  lock this in.
+
 If you're adding a heuristic, ask "does this catch a real, reproducible
 loss-of-information event, or am I guessing at intent?" The leading-zero and
 type-affinity checks are the former. There's deliberately no heuristic that
@@ -1807,6 +1833,19 @@ Python `datetime` values via `openpyxl`, deliberately not the
 date-shaped-string approach `type_detection.xlsx`'s existing
 `signup_date` column already used, which is exactly why that fixture
 never caught this) and its integration test lock the fix in.
+
+A ninth pass, for NumPy: TensorFlow's own real MNIST `.npz` (the exact
+file `tf.keras.datasets.mnist.load_data()` downloads) alongside four
+more real files generated directly from scikit-learn's bundled real-
+world datasets (Iris as a structured/record-dtype `.npy`, Diabetes as a
+plain 2-D `.npy`, Wine as an `.npz`, California Housing as a larger
+~20,000-row `.npy`). All five reads succeed with zero panics - and one
+real gap this pass found: see the `.npz`-per-array-isolation entry in
+the design philosophy section above. MNIST's own two label arrays
+(`y_train`/`y_test`) went from "never profiled at all, because the
+archive's other two arrays are 3-D images" to profiling normally
+alongside a clear, disclosed explanation for the two that still
+correctly can't be.
 
 The crate is a lib (`src/lib.rs`) plus a thin binary (`src/main.rs` that
 just calls `sniff_rs::run()`), so besides the black-box integration tests
