@@ -2641,11 +2641,53 @@ fn empty_syslog_file_still_reports_the_fixed_column_set_not_a_crash() {
 // near-miss/boundary cases that would be awkward to prove through a whole
 // subprocess run here).
 
+/// Minimal hand-rolled stand-in for `tempfile::TempDir`, used only here -
+/// a fresh, uniquely-named directory under the OS temp dir, recursively
+/// removed on drop. See `TempFile` in `src/lib.rs` for the same tradeoff
+/// applied to a single scratch file rather than a directory.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("sniff-rs-test-{pid}-{nanos}-{n}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return TempDir { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("failed to create tempdir: {e}"),
+            }
+        }
+        panic!("failed to create a tempdir after several attempts");
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Copies `fixture_name`'s bytes into a fresh tempdir under `dest_name`
 /// (typically an extensionless name, or an unrelated one) so detect_format
 /// sees a real file its extension-based arm can't classify.
-fn copy_fixture_as(fixture_name: &str, dest_name: &str) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("failed to create tempdir");
+fn copy_fixture_as(fixture_name: &str, dest_name: &str) -> (TempDir, PathBuf) {
+    let dir = TempDir::new();
     let dest = dir.path().join(dest_name);
     std::fs::copy(fixture(fixture_name), &dest)
         .unwrap_or_else(|e| panic!("failed to copy {fixture_name} to {dest:?}: {e}"));

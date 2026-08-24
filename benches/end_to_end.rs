@@ -71,8 +71,50 @@ fn run_binary(path: &Path) {
     );
 }
 
+/// Minimal hand-rolled stand-in for `tempfile::TempDir`, mirroring the
+/// identical helper in `tests/integration.rs` - see its doc comment for
+/// the rationale (this project deliberately hand-rolls its own scratch-
+/// directory guard rather than depending on `tempfile`).
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("sniff-rs-bench-{pid}-{nanos}-{n}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return TempDir { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("failed to create bench scratch dir: {e}"),
+            }
+        }
+        panic!("failed to create a bench scratch dir after several attempts");
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn benchmarks(c: &mut Criterion) {
-    let dir = tempfile::tempdir().expect("failed to create bench scratch dir");
+    let dir = TempDir::new();
 
     let mut csv_group = c.benchmark_group("end_to_end/csv");
     for &rows in ROW_COUNTS {

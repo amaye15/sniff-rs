@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use clap::Parser;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
@@ -34,8 +33,6 @@ use serde_json::json;
 /// available; zstd needs --features zstd). Every optional format needs its
 /// own --features flag (see the Supported formats table in CLAUDE.md), or
 /// use --features full for everything.
-#[derive(Parser)]
-#[command(name = "sniff-rs")]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
@@ -46,33 +43,198 @@ struct Args {
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     output_path: Option<PathBuf>,
     /// Number of sample values to show per column
-    #[arg(long, default_value_t = 3)]
     samples: usize,
     /// Only read the first N rows/records (for large files)
-    #[arg(long)]
     nrows: Option<usize>,
     /// Override format detection: csv, tsv, json (covers json/jsonl/ndjson), parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, or sas7bdat
-    #[arg(long)]
     format: Option<String>,
     /// Override the field delimiter for csv/tsv (single character)
-    #[arg(long)]
     delimiter: Option<char>,
     /// Skip N leading rows before the header (csv/tsv only) - for a
     /// title/instructions banner row some spreadsheet exports carry above
     /// the real header. If not given, a small run of leading rows is
     /// auto-skipped when it shows a strong structural signal of being a
     /// preamble rather than the header - see detect_preamble_rows.
-    #[arg(long)]
     skip_rows: Option<usize>,
     /// Column widths for --format fixed-width, as comma-separated character
     /// counts (e.g. --widths 10,5,20) - there's no delimiter to split on, so
     /// this format only runs when widths are given explicitly
-    #[arg(long, value_delimiter = ',')]
     widths: Option<Vec<usize>>,
     /// Output format: md (markdown tables), json (this tool's own rich shape), or
     /// json-schema (json-schema.org vocabulary, for schema-consuming tools)
-    #[arg(long, default_value = "md")]
     output_format: String,
+}
+
+const HELP_TEXT: &str = r#"sniff-rs - profile a data file and produce a data dictionary
+
+Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
+Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
+INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
+Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
+(.dta), or SAS7BDAT: one row per column, with a current type, a
+heuristic "ideal" type suggestion, missing %, sample values, and a
+blank Description field to fill in by hand.
+
+USAGE:
+    sniff-rs <INPUT_PATH> [OUTPUT_PATH] [OPTIONS]
+
+ARGS:
+    <INPUT_PATH>
+            Path to the input file. Format is inferred from the extension;
+            if there isn't one, or it's not recognized, the file's own
+            bytes are sniffed instead. A .gz or .zst extension is
+            transparently decompressed first.
+    [OUTPUT_PATH]
+            Output path (default: <input>.dictionary.md or .json).
+            Pass "-" to write to stdout.
+
+OPTIONS:
+        --samples <N>          Number of sample values to show per column [default: 3]
+        --nrows <N>             Only read the first N rows/records
+        --format <FORMAT>       Override format detection (csv, tsv, json, parquet, arrow,
+                                avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml,
+                                fixed-width, npy, npz, common-log, combined-log, syslog,
+                                syslog5424, dbase, stata, sas7bdat)
+        --delimiter <CHAR>      Override the field delimiter for csv/tsv (single character)
+        --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
+        --widths <N,N,...>      Column widths for --format fixed-width, comma-separated
+        --output-format <FMT>   md (default), json, or json-schema
+    -h, --help                  Print this help
+    -V, --version                Print version
+"#;
+
+/// A minimal hand-rolled stand-in for `clap`'s derive-based parser: this
+/// CLI only ever has long (`--flag`) options plus two positionals, so a
+/// small manual loop over `std::env::args()` covers the whole surface
+/// without pulling in a derive-macro crate and its terminal-formatting
+/// dependencies. `--flag value` and `--flag=value` are both accepted;
+/// errors flow through the same `anyhow`-based `Result` chain every other
+/// error in this project already uses, rather than clap's own separate
+/// exit-code convention - `--help`/`--version` are the one place this
+/// still exits the process directly, matching what a user actually expects
+/// from either flag.
+impl Args {
+    fn parse() -> Result<Self> {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        Self::parse_from(&raw)
+    }
+
+    fn parse_from(raw: &[String]) -> Result<Self> {
+        let mut samples: usize = 3;
+        let mut nrows: Option<usize> = None;
+        let mut format: Option<String> = None;
+        let mut delimiter: Option<char> = None;
+        let mut skip_rows: Option<usize> = None;
+        let mut widths: Option<Vec<usize>> = None;
+        let mut output_format = "md".to_string();
+        let mut positionals: Vec<String> = Vec::new();
+
+        let mut i = 0;
+        while i < raw.len() {
+            let arg = raw[i].as_str();
+            if arg == "-h" || arg == "--help" {
+                print!("{HELP_TEXT}");
+                std::process::exit(0);
+            }
+            if arg == "-V" || arg == "--version" {
+                println!("sniff-rs {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            if let Some(rest) = arg.strip_prefix("--") {
+                let (name, inline_value) = match rest.split_once('=') {
+                    Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                    None => (rest.to_string(), None),
+                };
+                let value = |i: &mut usize| -> Result<String> {
+                    if let Some(v) = inline_value.clone() {
+                        return Ok(v);
+                    }
+                    *i += 1;
+                    raw.get(*i)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--{name} requires a value"))
+                };
+                match name.as_str() {
+                    "samples" => {
+                        let v = value(&mut i)?;
+                        samples = v
+                            .parse()
+                            .with_context(|| format!("--samples: invalid number {v:?}"))?;
+                    }
+                    "nrows" => {
+                        let v = value(&mut i)?;
+                        nrows = Some(
+                            v.parse()
+                                .with_context(|| format!("--nrows: invalid number {v:?}"))?,
+                        );
+                    }
+                    "format" => format = Some(value(&mut i)?),
+                    "delimiter" => {
+                        let v = value(&mut i)?;
+                        let mut chars = v.chars();
+                        let c = chars.next().ok_or_else(|| {
+                            anyhow::anyhow!("--delimiter: expected a single character, got \"\"")
+                        })?;
+                        if chars.next().is_some() {
+                            bail!("--delimiter: expected a single character, got {v:?}");
+                        }
+                        delimiter = Some(c);
+                    }
+                    "skip-rows" => {
+                        let v = value(&mut i)?;
+                        skip_rows = Some(
+                            v.parse()
+                                .with_context(|| format!("--skip-rows: invalid number {v:?}"))?,
+                        );
+                    }
+                    "widths" => {
+                        let v = value(&mut i)?;
+                        let parsed: Result<Vec<usize>> = v
+                            .split(',')
+                            .map(|s| {
+                                s.trim()
+                                    .parse::<usize>()
+                                    .with_context(|| format!("--widths: invalid number {s:?}"))
+                            })
+                            .collect();
+                        widths = Some(parsed?);
+                    }
+                    "output-format" => output_format = value(&mut i)?,
+                    other => bail!("unrecognized flag --{other}"),
+                }
+            } else if let Some(short) = arg.strip_prefix('-')
+                && !short.is_empty()
+                && short != "-"
+            {
+                bail!("unrecognized flag {arg}");
+            } else {
+                positionals.push(arg.to_string());
+            }
+            i += 1;
+        }
+
+        let mut positionals = positionals.into_iter();
+        let input_path = positionals
+            .next()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("missing required argument: input_path"))?;
+        let output_path = positionals.next().map(PathBuf::from);
+        if let Some(extra) = positionals.next() {
+            bail!("unexpected extra argument: {extra}");
+        }
+
+        Ok(Args {
+            input_path,
+            output_path,
+            samples,
+            nrows,
+            format,
+            delimiter,
+            skip_rows,
+            widths,
+            output_format,
+        })
+    }
 }
 
 // chrono's `%Y` accepts variable-width numeric input while parsing (it only
@@ -190,7 +352,6 @@ struct ColumnInput {
     skip_heuristics: bool,   // true for nested JSON (array/object) columns
 }
 
-#[derive(serde::Serialize)]
 struct ColumnProfile {
     name: String,
     current_type: String,
@@ -199,6 +360,36 @@ struct ColumnProfile {
     missing_pct: f64,
     sample_values: Vec<String>,
     notes: String,
+}
+
+// Hand-rolled stand-in for `#[derive(serde::Serialize)]` - this project's
+// own `serde` dependency skips the `derive` feature entirely (see
+// Cargo.toml). Deliberately a manual `SerializeStruct` impl rather than
+// building a `serde_json::Value`/`Map` by hand: `serde_json::Map` is
+// backed by a plain `BTreeMap` unless the `preserve_order` feature is
+// enabled (which would pull in `indexmap`, the wrong direction for this
+// exercise), so any Value/`json!`-based construction silently re-sorts
+// fields alphabetically - confirmed by hitting exactly that regression
+// (name/current_type/... coming out as current_type/description/...)
+// before switching to this approach. `serialize_struct` writes fields
+// directly to the output in the order given here, matching the documented
+// JSON shape in CLAUDE.md exactly, with no intermediate unordered map.
+impl serde::Serialize for ColumnProfile {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ColumnProfile", 7)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("current_type", &self.current_type)?;
+        state.serialize_field("ideal_type", &self.ideal_type)?;
+        state.serialize_field("description", &self.description)?;
+        state.serialize_field("missing_pct", &self.missing_pct)?;
+        state.serialize_field("sample_values", &self.sample_values)?;
+        state.serialize_field("notes", &self.notes)?;
+        state.end()
+    }
 }
 
 // --- Shared heuristic engine (format-agnostic, works on stringified values) ---
@@ -4903,11 +5094,29 @@ fn render_json(
     format: &InputFormat,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
 ) -> Result<String> {
-    #[derive(serde::Serialize)]
+    // A plain struct (not a derive target - see ColumnProfile's own
+    // Serialize impl above for why) so `file`/`format`/`tables` come out
+    // in this declared order rather than an unordered map's sorted keys.
+    // `tables` itself serializes fine through serde's blanket BTreeMap
+    // impl once ColumnProfile: Serialize - a table-name-sorted JSON object
+    // is exactly the shape already documented in CLAUDE.md.
     struct DataDictionary<'a> {
         file: &'a str,
         format: &'a str,
         tables: &'a BTreeMap<String, Vec<ColumnProfile>>,
+    }
+    impl serde::Serialize for DataDictionary<'_> {
+        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeStruct;
+            let mut state = serializer.serialize_struct("DataDictionary", 3)?;
+            state.serialize_field("file", &self.file)?;
+            state.serialize_field("format", &self.format)?;
+            state.serialize_field("tables", &self.tables)?;
+            state.end()
+        }
     }
     let doc = DataDictionary {
         file: file_name,
@@ -5077,14 +5286,84 @@ fn decompress_zstd(_reader: std::fs::File, _out: &mut std::fs::File, path: &Path
     )
 }
 
+/// A minimal hand-rolled stand-in for `tempfile::NamedTempFile`, just
+/// large enough for what this project actually needs: a real on-disk file
+/// (several readers here need genuine random file access, not just a
+/// stream - Parquet, SQLite, Excel) that's cleaned up automatically when
+/// dropped. Uses `create_new` - fails if the path already exists rather
+/// than silently truncating or following it - for the same collision/
+/// symlink-race safety `tempfile` provides internally; a small bounded
+/// retry loop stands in for the RNG-backed retry `tempfile` itself uses,
+/// since a pid + nanosecond-timestamp + call-counter name is already
+/// unique for all practical purposes in a single-process CLI like this.
+struct TempFile {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl TempFile {
+    fn new() -> Result<Self> {
+        use std::fs::OpenOptions;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        for _ in 0..8 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("sniff-rs-{pid}-{nanos}-{n}.tmp"));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(TempFile { path, file }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).context("failed to create a temporary file for decompression");
+                }
+            }
+        }
+        bail!("failed to create a temporary file for decompression after several attempts")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn as_file_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+}
+
+impl std::io::Write for TempFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// If `path` ends in `.gz`/`.gzip` or `.zst`/`.zstd`, decompresses it into a
 /// real temporary file and returns (the path to actually read bytes from,
 /// the compression-stripped logical path used for format detection and
 /// default output naming, a guard that deletes the temp file on drop).
 /// Non-compressed input passes through unchanged with no guard.
-fn decompress_if_needed(
-    path: &Path,
-) -> Result<(PathBuf, PathBuf, Option<tempfile::NamedTempFile>)> {
+fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFile>)> {
     use std::fs::File;
 
     let Some(compression) = compression_from_extension(path) else {
@@ -5092,8 +5371,7 @@ fn decompress_if_needed(
     };
 
     let input = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let mut tmp = tempfile::NamedTempFile::new()
-        .context("failed to create a temporary file for decompression")?;
+    let mut tmp = TempFile::new()?;
     match compression {
         Compression::Gzip => {
             let mut decoder = flate2::read::GzDecoder::new(input);
@@ -5127,7 +5405,7 @@ impl OutputFormat {
 }
 
 pub fn run() -> Result<()> {
-    let args = Args::parse();
+    let args = Args::parse()?;
 
     let output_format = OutputFormat::parse(&args.output_format)?;
 
@@ -5335,7 +5613,7 @@ mod tests {
     // with no ambiguity about what it contains. After both fixes: 95/95.
 
     fn read_values(json_text: &str) -> Vec<JsonValue> {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, json_text.as_bytes()).unwrap();
         read_json_values(tmp.path()).unwrap()
     }
@@ -5385,7 +5663,7 @@ mod tests {
 
     #[test]
     fn columns_from_json_top_level_scalar_array_becomes_one_value_column() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, b"[1, null, 3]").unwrap();
         let cols = columns_from_json(tmp.path(), None, 3).unwrap();
         assert_eq!(cols.len(), 1);
@@ -5562,7 +5840,7 @@ mod tests {
 
     #[cfg(feature = "yaml")]
     fn columns_from_yaml_text(yaml_text: &str) -> Vec<ColumnProfile> {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, yaml_text.as_bytes()).unwrap();
         columns_from_yaml(tmp.path(), None, 3).unwrap()
     }
@@ -6739,7 +7017,7 @@ mod tests {
     // detect_preamble_rows's doc comment for the exact structural signal.
 
     fn preamble_rows(csv_text: &str) -> usize {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, csv_text.as_bytes()).unwrap();
         detect_preamble_rows(tmp.path(), b',')
     }
@@ -6845,7 +7123,7 @@ mod tests {
     #[test]
     fn columns_from_csv_skip_rows_matches_manual_preamble_removal() {
         let with_preamble = "Banner,,,,\nid,name,age\n1,Alice,30\n2,Bob,40\n";
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, with_preamble.as_bytes()).unwrap();
 
         let cols = columns_from_csv(tmp.path(), None, b',', 1).unwrap();
@@ -6857,7 +7135,7 @@ mod tests {
     #[test]
     fn columns_from_csv_skip_rows_past_everything_yields_an_empty_table_not_an_error() {
         let tiny = "id,name\n1,Alice\n";
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, tiny.as_bytes()).unwrap();
 
         let cols = columns_from_csv(tmp.path(), None, b',', 100).unwrap();
@@ -6875,7 +7153,7 @@ mod tests {
     // assumed - the same discipline this file's other heuristics follow.
 
     fn sniff_bytes(bytes: &[u8]) -> Option<InputFormat> {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, bytes).unwrap();
         sniff_format(tmp.path())
     }

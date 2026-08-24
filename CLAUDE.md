@@ -2186,6 +2186,90 @@ confidence than the rest of this section, since `fastavro` (the tool used
 to generate every other test fixture here) doesn't support writing
 `big-decimal` test data the way it does for `decimal`.
 
+## Dependency footprint
+
+This project already declines whole formats over dependency weight (see
+DuckDB/SPSS below) - the same instinct applies one level down, to
+individual crates within formats that *are* supported. A handful of
+dependencies were hand-rolled away entirely once actually looked at,
+because what they provided was a small, bounded piece of functionality
+this project could just implement directly rather than depend on:
+
+- **`tempfile` → `TempFile`/`TempDir`.** The only thing `decompress_if_needed`
+  actually needs is a real on-disk scratch file (several readers need
+  genuine random file access, not a stream - Parquet, SQLite, Excel) that's
+  cleaned up on drop. `TempFile` (in `src/lib.rs`, right above
+  `decompress_if_needed`) does this in about 40 lines: `create_new` (fails
+  if the path already exists, rather than silently truncating or
+  following it) for the same collision/symlink-race safety `tempfile`
+  provides internally, with a pid + nanosecond-timestamp + call-counter
+  name standing in for `tempfile`'s RNG-backed uniqueness - overkill for a
+  single-process CLI, but the safety property (atomic create-or-fail, not
+  a check-then-create race) is the part actually worth keeping.
+  `tests/integration.rs` and `benches/end_to_end.rs` each carry their own
+  near-identical `TempDir` (a whole scratch *directory*, recursively
+  removed on drop) for the same reason, duplicated rather than shared
+  since tests/benches/the lib are three separate compilation units here.
+- **`clap` → a hand-written arg loop.** This CLI has no subcommands and no
+  short flags besides the automatic `-h`/`-V`, just nine long options plus
+  two positionals - `Args::parse_from` (above the `Args` struct) is a
+  single `while` loop over `std::env::args()` handling `--flag value` and
+  `--flag=value` forms, with the numeric/char/comma-list parsing each
+  option already needed anyway. The one deliberate behavior change: clap
+  prints its own error and exits with its own reserved code before this
+  project's `main` ever runs; the hand-rolled version returns
+  `anyhow::Result<Args>` instead, so a bad flag flows through the exact
+  same `Error: ...`-and-exit-1 path every other error in this tool already
+  uses - one less special case, not a regression, and nothing currently
+  depends on clap's specific exit code.
+- **`serde`'s `derive` feature dropped.** The only two places this project
+  ever used `#[derive(Serialize)]` were `ColumnProfile` and a small local
+  `DataDictionary` wrapper in `render_json` - both replaced with a direct,
+  hand-written `impl serde::Serialize` using `serialize_struct`. This
+  surfaced a real, easy-to-miss trap worth recording: the first attempt at
+  this used `serde_json::Value`/the `json!` macro instead (building the
+  output as a `Map` rather than implementing `Serialize` by hand), and
+  `serde_json::Map` is backed by a plain `BTreeMap` unless the
+  `preserve_order` feature is enabled (which pulls in `indexmap` - the
+  wrong direction for this exercise entirely) - so it silently re-sorted
+  every field alphabetically (`current_type, description, ideal_type,
+  missing_pct, name, notes, sample_values` instead of the documented
+  `name, current_type, ideal_type, ...` order shown earlier in this file).
+  None of the existing tests caught this - they parse JSON output and
+  look values up by key, which is correct behavior for JSON's own
+  semantics (object key order isn't meaningful) but meant a real,
+  visible regression against this project's own documented output shape
+  went unnoticed by `cargo test`. Only caught by actually running the
+  binary and reading the output by hand before trusting the change - the
+  same discipline this file's design-philosophy section applies
+  everywhere else, here applied to a build-system change rather than a
+  heuristic.
+
+**What's deliberately not being hand-rolled**, and why the cost/benefit
+flips hard past this point: `anyhow` itself has *zero* transitive
+dependencies (confirmed via `cargo tree`), so replacing its ~185 call
+sites (`Result<T>`, `.with_context`, `bail!`, `anyhow!`) across this file
+would trade a large, mechanical rewrite for exactly one crate removed -
+a poor ratio even though the rewrite itself would be low-risk. `chrono`
+and `csv` are both far higher-value dependency-count targets on paper
+(chrono pulls `iana-time-zone`/`core-foundation-sys`/`num-traits`; csv
+pulls `csv-core`/`memchr`/`itoa`/`ryu`) but hand-rolling either one means
+re-deriving, by hand, the exact parsing correctness this project has
+spent this entire file's "Design philosophy" and "Real-world corpus
+validation" sections earning - 40+ verified date formats and their chrono
+-specific parsing quirks, or the ragged-row/preamble/quoting edge cases
+found via the Pollock and JSONTestSuite corpora. `serde`/`serde_json` are
+even more central: `serde_json::Value` is the literal bridge type seven
+different format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML)
+recurse through via `profile_json_path` - replacing it means writing and
+re-verifying a whole JSON value type, parser, and serializer, not
+swapping one call site at a time. `flate2` (gzip) is the one remaining
+candidate with a genuinely reasonable payoff (`crc32fast`/`miniz_oxide`/
+`adler2`/`simd-adler32`, 5 more crates) for a bounded, well-specified
+algorithm (DEFLATE decoding only, no compression needed) - real
+algorithmic work, not simply mechanical, so it's the natural next
+candidate if this effort continues rather than something to do reflexively.
+
 ## Known limitations / roadmap
 
 - **No ORC.** Deliberately skipped — Rust ecosystem support is weak enough
