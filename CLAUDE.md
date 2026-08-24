@@ -2325,24 +2325,63 @@ this project could just implement directly rather than depend on:
   byte-identical to anyhow's own `Debug` formatting was required, since
   no test in this project ever asserted on that exact chain layout, only
   on specific substrings appearing somewhere in stderr.
+- **`csv` → a hand-rolled `parse_csv`.** The riskiest hand-roll in this
+  list, precisely because - unlike `anyhow` - this one *is* real,
+  correctness-sensitive parsing logic, of exactly the kind this section
+  elsewhere argues against touching. Done anyway, but only after
+  confirming the actual behavior needed (not a naive delimiter-split)
+  directly against `csv-core`'s own `reader.rs` state machine
+  (`transition_nfa`) rather than assumed from RFC 4180 alone - real CSV
+  in the wild, and several of this project's own committed fixtures,
+  lean on behavior RFC 4180 doesn't even specify: CRLF/bare-LF/bare-CR
+  all independently ending a record, a genuinely blank line producing no
+  record at all (not a one-empty-field row), content immediately after a
+  quoted field's closing quote appending to the same field rather than
+  erroring, and a leading UTF-8 BOM stripped only at the very start of
+  the file. `parse_csv` (`src/lib.rs`, right above `columns_from_csv`) is
+  a straightforward character-by-character state machine matching that
+  behavior exactly, operating on `char`s rather than raw bytes so
+  multi-byte UTF-8 content already read into memory via `fs::
+  read_to_string` (which also gets UTF-8 validation, and gzip-file-style
+  BOM handling, for free) is never split mid-character. Reading the
+  whole file up front rather than streaming also let `columns_from_csv`
+  drop the two-pass seek-and-resume dance the old `csv`-crate-based
+  version needed to skip preamble rows without losing the header - see
+  that function's own git history for the seek-poisoning bug that
+  approach caused - since "skip N rows, then strictly length-check the
+  rest against the header" is now just slicing an already-parsed
+  `Vec<Vec<String>>`. Verified two ways before being trusted: the
+  existing test suite's *own* adversarial CSV coverage (near-miss
+  checksums for IBAN/credit-card/ISBN/EAN/VIN/IMEI, WKT geometry and
+  coordinate pairs with embedded commas inside quotes, embedded JSON with
+  escaped quotes, BOM handling, ragged rows, both preamble-detection
+  signals) passed unchanged with zero code changes needed beyond the
+  parser swap itself, and five shapes that suite's fixtures don't happen
+  to stress - a newline embedded in a quoted field, content after a
+  closing quote, mixed CRLF/LF/CR in one file, consecutive blank lines,
+  and an unterminated quote (confirmed to consume the rest of the file
+  as one field rather than hang or panic) - were checked by hand and
+  turned into permanent unit tests on `parse_csv` directly rather than
+  left as one-off manual checks.
 
 **What's deliberately not being hand-rolled**, and why the cost/benefit
-stays genuinely unfavorable here even after `anyhow` turned out to be
-worth doing anyway: `chrono` and `csv` are both real dependency-count
-targets on paper (chrono pulls `iana-time-zone`/`core-foundation-sys`/
-`num-traits`; csv pulls `csv-core`/`memchr`/`itoa`/`ryu`) but hand-rolling
-either one means re-deriving, by hand, the exact parsing correctness this
-project has spent this entire file's "Design philosophy" and "Real-world
-corpus validation" sections earning - 40+ verified date formats and their
-chrono-specific parsing quirks, or the ragged-row/preamble/quoting edge
-cases found via the Pollock and JSONTestSuite corpora. `serde`/
-`serde_json` are even more central: `serde_json::Value` is the literal
-bridge type seven different format readers (JSON, YAML, TOML, Avro,
-MessagePack, CBOR, XML) recurse through via `profile_json_path` -
-replacing it means writing and re-verifying a whole JSON value type,
-parser, and serializer, not swapping one call site at a time. Unlike
-`anyhow`, none of these three would be a mechanical, low-risk rewrite -
-the risk itself is the reason they're still deliberately dependencies.
+stays genuinely unfavorable even after both `anyhow` and `csv` turned out
+to be worth doing anyway: `chrono` is a real dependency-count target on
+paper (`iana-time-zone`/`core-foundation-sys`/`num-traits`) but hand-
+rolling it means re-deriving, by hand, 40+ verified date formats and
+their chrono-specific parsing quirks - correctness this project has
+spent this entire file's "Design philosophy" section earning, in a way
+`csv`'s RFC-4180-plus-a-few-real-world-extensions grammar (bounded,
+mostly delimiter/quote-state-machine shaped) doesn't really compare to:
+a date format is closer to 40+ *independent* small grammars than one
+grammar with edge cases. `serde`/`serde_json` are even more central:
+`serde_json::Value` is the literal bridge type seven different format
+readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML) recurse through
+via `profile_json_path` - replacing it means writing and re-verifying a
+whole JSON value type, parser, and serializer, not swapping one call
+site at a time. Both would still be real, non-mechanical rewrites - the
+risk itself is why they're still deliberately dependencies, the same
+reasoning that applied to `csv` right up until it didn't.
 
 ## Known limitations / roadmap
 

@@ -41,7 +41,7 @@ impl Error {
 }
 
 // Bridges any lower-level error (io::Error, serde_json::Error,
-// csv::Error, chrono::ParseError, rusqlite::Error, ...) into this
+// chrono::ParseError, rusqlite::Error, ...) into this
 // project's own Error type, which is what lets `?` convert automatically
 // inside any function returning this crate's `Result<T>` - the same role
 // anyhow's own blanket `From<E: StdError + Send + Sync + 'static>` impl
@@ -1578,77 +1578,162 @@ fn naive_current_type(values: &[&str]) -> &'static str {
     }
 }
 
+/// A minimal hand-rolled stand-in for the `csv` crate (see CLAUDE.md's
+/// Dependency footprint section), replicating its actual documented
+/// default behavior exactly rather than a naive delimiter-split - each
+/// point below confirmed directly against `csv-core`'s own reader.rs
+/// state machine (`transition_nfa`) before being relied on, the same
+/// "verify against the source, don't assume" discipline this project
+/// already applies to `sniff_format`'s magic-byte checks elsewhere:
+///   - CRLF, bare LF, and bare CR are each independently a record
+///     terminator, and any *run* of them (including a genuinely blank
+///     line) is fully skipped rather than producing an empty record.
+///   - A field starting with `"` is quoted: the delimiter or a line
+///     ending inside it is just data, and `""` is an escaped literal
+///     `"`. Quoting is only special at the very start of a field - a
+///     `"` appearing mid-*unquoted*-field is copied literally.
+///   - Content immediately following a quoted field's closing quote,
+///     before the next delimiter/terminator, is appended to the same
+///     field rather than erroring (`csv-core`'s own permissive
+///     `InDoubleEscapedQuote` -> `InField` transition).
+///   - A leading UTF-8 BOM is stripped, but only at the very start of
+///     the file, not anywhere else a BOM codepoint might appear.
+///
+/// Operates on `char`s (not raw bytes) so multi-byte UTF-8 content is
+/// never split mid-character - the delimiter itself is always ASCII in
+/// practice (the CLI's own `--delimiter` flag already only accepts a
+/// single `char`, cast down to `u8` before reaching here, matching what
+/// the `csv` crate's own `u8`-typed `.delimiter()` builder method already
+/// required).
+fn parse_csv(content: &str, delimiter: u8) -> Vec<Vec<String>> {
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+    let delimiter = delimiter as char;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        StartRecord,
+        StartField,
+        InField,
+        InQuotedField,
+        InDoubleEscapedQuote,
+    }
+
+    fn is_term(c: char) -> bool {
+        c == '\r' || c == '\n'
+    }
+
+    let chars: Vec<char> = content.chars().collect();
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut state = State::StartRecord;
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match state {
+            State::StartRecord => {
+                if is_term(c) {
+                    i += 1;
+                } else {
+                    state = State::StartField;
+                }
+            }
+            State::StartField => {
+                if c == '"' {
+                    state = State::InQuotedField;
+                    i += 1;
+                } else if c == delimiter {
+                    record.push(std::mem::take(&mut field));
+                    i += 1;
+                } else if is_term(c) {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                    state = State::StartRecord;
+                    i += 1;
+                } else {
+                    field.push(c);
+                    state = State::InField;
+                    i += 1;
+                }
+            }
+            State::InField => {
+                if c == delimiter {
+                    record.push(std::mem::take(&mut field));
+                    state = State::StartField;
+                    i += 1;
+                } else if is_term(c) {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                    state = State::StartRecord;
+                    i += 1;
+                } else {
+                    field.push(c);
+                    i += 1;
+                }
+            }
+            State::InQuotedField => {
+                if c == '"' {
+                    state = State::InDoubleEscapedQuote;
+                } else {
+                    field.push(c);
+                }
+                i += 1;
+            }
+            State::InDoubleEscapedQuote => {
+                if c == '"' {
+                    field.push('"');
+                    state = State::InQuotedField;
+                    i += 1;
+                } else if c == delimiter {
+                    record.push(std::mem::take(&mut field));
+                    state = State::StartField;
+                    i += 1;
+                } else if is_term(c) {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                    state = State::StartRecord;
+                    i += 1;
+                } else {
+                    field.push(c);
+                    state = State::InField;
+                    i += 1;
+                }
+            }
+        }
+    }
+    // Flush a final, unterminated record (no trailing newline) - anything
+    // other than a pristine StartRecord means real content is pending.
+    if state != State::StartRecord {
+        record.push(field);
+        records.push(record);
+    }
+
+    records
+}
+
 fn columns_from_csv(
     path: &Path,
     nrows: Option<usize>,
     delimiter: u8,
     skip_rows: usize,
 ) -> Result<Vec<ColumnInput>> {
-    // Two passes, because a skipped preamble row often doesn't share the
-    // real header's field count (a banner line with no commas at all,
-    // above a 9-column header, is a real shape - see
-    // detect_preamble_rows), which the strict reader below would otherwise
-    // reject as ragged before ever getting to decide it's not a data row.
-    // Pass one is flexible specifically to tolerate that while walking
-    // past skip_rows rows to the header; pass two seeks a strict
-    // (non-flexible) reader to resume exactly where pass one left off, so
-    // a genuinely ragged *data* row is still the same hard, actionable
-    // csv-crate error it always has been - flexible(true) for the whole
-    // read would have silently swallowed that instead.
-    let mut header_reader = csv::ReaderBuilder::new()
-        .delimiter(delimiter)
-        .has_headers(false)
-        .flexible(true)
-        .from_path(path)
-        .with_context(|| format!("failed to open {path:?}"))?;
-    let mut rec = csv::StringRecord::new();
-    let mut headers: Vec<String> = Vec::new();
-    for i in 0..=skip_rows {
-        if !header_reader.read_record(&mut rec)? {
-            break;
-        }
-        if i == skip_rows {
-            headers = rec.iter().map(|s| s.to_string()).collect();
-        }
-    }
-    let resume_at = header_reader.position().clone();
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let records = parse_csv(&content, delimiter);
 
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(delimiter)
-        .has_headers(false)
-        .flexible(true)
-        .from_path(path)
-        .with_context(|| format!("failed to open {path:?}"))?;
-    // seek() internally calls byte_headers(), which - if headers haven't
-    // been read yet - reads a record from the *start* of the file (the
-    // skipped preamble, not the header) purely to populate its own cache,
-    // before the actual seek happens. Pre-seeding a dummy header
-    // short-circuits that internal read (byte_headers only reads when
-    // `state.headers` is still `None`), so seek() performs a pure position
-    // jump with no wasted side-read.
-    reader.set_headers(csv::StringRecord::new());
-    reader.seek(resume_at)?;
+    // If the file has fewer than skip_rows+1 rows, there's no header to
+    // read at all - headers stays empty and the loop below produces zero
+    // columns, the same silent-empty-result behavior this function has
+    // always had for that case (never an error - skip_rows past the end
+    // of a short file isn't itself a malformed-input signal).
+    let headers: Vec<String> = records.get(skip_rows).cloned().unwrap_or_default();
+    let data_rows: &[Vec<String>] = records.get(skip_rows + 1..).unwrap_or(&[]);
 
-    // Deliberately flexible(true) plus a manual length check here, rather
-    // than leaning on the csv crate's own strict-mode ragged-row
-    // detection: that detection anchors itself to whichever record it
-    // happens to read *first* on a given Reader (tracked internally,
-    // starting from None), and after a seek there's no way to seed it
-    // with the header's field count directly - confirmed directly against
-    // the csv crate's own source (`ReaderState::add_record`), not
-    // assumed, after an earlier version of this function silently passed
-    // through a real ragged header/data mismatch instead of erroring
-    // because of exactly this gap. Checking every record's length against
-    // `headers.len()` explicitly sidesteps that internal state machine
-    // entirely and states the actual invariant this tool cares about -
-    // every row matches the header - rather than "every row matches
-    // whatever the first one happened to be."
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-    for (i, result) in reader.records().enumerate() {
+    for (i, record) in data_rows.iter().enumerate() {
         if nrows.is_some_and(|limit| i >= limit) {
             break;
         }
-        let record = result?;
         if record.len() != headers.len() {
             bail!(
                 "CSV error: found record with {} fields, but the header has {} fields",
@@ -1661,7 +1746,7 @@ fn columns_from_csv(
             let value = if trimmed.is_empty() || is_missing_sentinel(trimmed) {
                 None
             } else {
-                Some(field.to_string())
+                Some(field.clone())
             };
             raw[col_idx].push(value);
         }
@@ -1723,21 +1808,15 @@ fn columns_from_csv(
 const MAX_PREAMBLE_SCAN: usize = 5;
 
 fn detect_preamble_rows(path: &Path, delimiter: u8) -> usize {
-    let Ok(reader) = csv::ReaderBuilder::new()
-        .delimiter(delimiter)
-        .has_headers(false)
-        .flexible(true)
-        .from_path(path)
-    else {
+    let Ok(content) = fs::read_to_string(path) else {
         return 0;
     };
-    let records: Vec<csv::StringRecord> = reader
-        .into_records()
+    let records: Vec<Vec<String>> = parse_csv(&content, delimiter)
+        .into_iter()
         .take(MAX_PREAMBLE_SCAN + 1)
-        .filter_map(|r| r.ok())
         .collect();
 
-    fn fill(record: &csv::StringRecord) -> (usize, usize) {
+    fn fill(record: &[String]) -> (usize, usize) {
         let total = record.len();
         let non_empty = record.iter().filter(|f| !f.trim().is_empty()).count();
         (non_empty, total)
@@ -6098,6 +6177,67 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // parse_csv's own edge cases, verified directly against csv-core's
+    // source (transition_nfa) before being trusted, and covering shapes
+    // the committed CSV fixtures don't specifically stress (they're all
+    // single-line records) - the manual verification this project's own
+    // discipline (see CLAUDE.md's design-philosophy section) always turns
+    // into a permanent test rather than a one-off check.
+    #[test]
+    fn parse_csv_preserves_a_newline_embedded_in_a_quoted_field() {
+        let records = parse_csv("id,note\n1,\"line one\nline two\",10\n", b',');
+        assert_eq!(
+            records,
+            vec![vec!["id", "note"], vec!["1", "line one\nline two", "10"],]
+        );
+    }
+
+    #[test]
+    fn parse_csv_appends_content_after_a_closing_quote_to_the_same_field() {
+        // csv-core's own permissive InDoubleEscapedQuote -> InField
+        // transition: "abc"def is one field, "abcdef", not an error.
+        let records = parse_csv("id,note\n1,\"abc\"def\n", b',');
+        assert_eq!(records, vec![vec!["id", "note"], vec!["1", "abcdef"]]);
+    }
+
+    #[test]
+    fn parse_csv_treats_crlf_bare_lf_and_bare_cr_as_equivalent_terminators() {
+        let records = parse_csv("id,note\r\n1,crlf\n2,lf\r3,cr\r\n", b',');
+        assert_eq!(
+            records,
+            vec![
+                vec!["id", "note"],
+                vec!["1", "crlf"],
+                vec!["2", "lf"],
+                vec!["3", "cr"],
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_csv_skips_genuinely_blank_lines_without_producing_empty_records() {
+        let records = parse_csv("a,b\n\n\nc,d\n", b',');
+        assert_eq!(records, vec![vec!["a", "b"], vec!["c", "d"]]);
+    }
+
+    #[test]
+    fn parse_csv_strips_a_leading_bom_but_not_one_appearing_elsewhere() {
+        let records = parse_csv("\u{FEFF}name,value\nfirst,\u{FEFF}1\n", b',');
+        assert_eq!(
+            records,
+            vec![vec!["name", "value"], vec!["first", "\u{FEFF}1"],]
+        );
+    }
+
+    #[test]
+    fn parse_csv_handles_an_unterminated_quote_without_hanging_or_panicking() {
+        let records = parse_csv("id,note\n1,\"never closed\n2,plain\n", b',');
+        assert_eq!(
+            records,
+            vec![vec!["id", "note"], vec!["1", "never closed\n2,plain\n"]]
+        );
+    }
 
     // crc32's standard published check value (RFC 1952's own reference,
     // shared by every CRC-32/ISO-HDLC implementation) - the cheapest

@@ -2072,7 +2072,6 @@ dependencies = [
  "chrono",
  "ciborium",
  "criterion",
- "csv",
  "dbase",
  "dta",
  "npyz",
