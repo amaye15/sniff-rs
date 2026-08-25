@@ -4,17 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Optional, gated behind xlsx only - see CLAUDE.md's Dependency footprint
-# section. Every other date/time need in this project (the default CSV/
-# JSON build's own format matching, plus Avro and SAS7BDAT) is hand-rolled
-# instead; calamine's own `as_datetime()` API returns a real
-# `chrono::NaiveDateTime` regardless of what this project's own code does,
-# so xlsx can't avoid the real crate no matter what.
-chrono = { version = "0.4", optional = true }
 serde_json = "1.0.151"
 arrow = { version = "59.2.0", features = ["ipc", "ipc_compression", "chrono-tz"], optional = true }
 parquet = { version = "59.2.0", features = ["arrow"], optional = true }
-calamine = { version = "0.36.1", features = ["chrono"], optional = true }
 apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"], optional = true }
 # Already a transitive dependency of apache-avro itself (its Decimal value
 # type wraps a num_bigint::BigInt internally) - depending on it directly
@@ -46,7 +38,7 @@ default = []
 # parquet also covers Arrow IPC/Feather (.arrow/.feather) - both are Arrow-ecosystem
 # formats sharing the same `arrow` crate, so there's no separate compile cost to split them.
 parquet = ["dep:arrow", "dep:parquet"]
-xlsx = ["dep:calamine", "dep:chrono"]
+xlsx = []
 avro = ["dep:apache-avro", "dep:num-bigint"]
 full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat"]
 sqlite = ["dep:rusqlite"]
@@ -73,6 +65,17 @@ sas7bdat = ["dep:sas7bdat"]
 # section for why this is the one place this project reaches for a big,
 # full-featured crate instead of hand-rolling something leaner.
 criterion = { version = "0.8.2", features = ["html_reports"] }
+# calamine (and chrono, needed only by calamine's own `as_datetime()` API)
+# used to be a real, optional runtime dependency of the `xlsx` feature -
+# every format it covers (.xlsx/.ods/.xls/.xlsb) now has its own
+# hand-rolled reader instead (see CLAUDE.md's Dependency footprint
+# section), so both moved here: kept only as this project's own
+# cross-verification oracle in the `*_matches_calamine_output_exactly`
+# tests (`#[cfg(all(test, feature = "xlsx"))]` in src/lib.rs), the same
+# "dev-only, never touches the shipped binary" treatment criterion above
+# already gets.
+calamine = { version = "0.36.1", features = ["chrono"] }
+chrono = "0.4"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

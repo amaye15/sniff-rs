@@ -5123,7 +5123,13 @@ fn columns_from_npz(
 /// genuine midnight timestamp share, with no way to tell them apart from
 /// the resolved value alone; the resulting ISO string still lands on the
 /// exact same `DATE_FORMATS` entries any other date-shaped string would.
-#[cfg(feature = "xlsx")]
+///
+/// Test-only: calamine/chrono are dev-dependencies now (see Cargo.toml
+/// and CLAUDE.md's Dependency footprint section) - every format they
+/// used to read at runtime has its own hand-rolled reader, so this
+/// function's only remaining job is producing the "expected" side of the
+/// `*_matches_calamine_output_exactly` cross-verification tests.
+#[cfg(all(test, feature = "xlsx"))]
 fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
     use calamine::DataType as _;
     if (cell.is_datetime() || cell.is_datetime_iso())
@@ -5144,10 +5150,9 @@ fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
 /// calamine's own output exactly across every real fixture before its
 /// dispatch was wired in; `.xlsb` additionally against a real file
 /// calamine itself can't read at all, see `xlsb_parse_bundle_sh`'s own
-/// doc comment). Nothing this feature covers is left on calamine
-/// anymore - it's kept only as this project's own cross-verification
-/// oracle during development, still built and tested against on every
-/// change.
+/// doc comment). Nothing this feature reads at runtime touches calamine
+/// anymore - it's a dev-dependency now, kept only as this project's own
+/// cross-verification oracle in tests (see Cargo.toml).
 ///
 /// Dispatches on the file's own *content*, not its extension - the same
 /// "declared type is a hint, not the truth" principle this project
@@ -5158,9 +5163,13 @@ fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
 /// check specifically so it can never misfire on a real `.xlsx`, which
 /// has no `.bin` parts at all); `content.xml` + `mimetype` is ODF's; a
 /// "Workbook"/"Book" OLE2 stream is `.xls`'s. Anything else - not a ZIP
-/// or OLE2 file at all, or one without any of these signatures - falls
-/// through to calamine, the same fallback a truly unrecognized case
-/// already got before this dispatch existed.
+/// or OLE2 file at all, or one without any of these four signatures - is
+/// a clear, disclosed error rather than a guess: by the time this
+/// function runs, the file was already routed here as `InputFormat::Xlsx`
+/// (by extension or `sniff_format`'s own OLE2-magic sniffing), so
+/// reaching this point with none of the four signatures matching means
+/// either a corrupted file or a genuinely different, unsupported
+/// structure - not something worth silently misreading.
 #[cfg(feature = "xlsx")]
 fn columns_from_xlsx(
     path: &Path,
@@ -5184,10 +5193,15 @@ fn columns_from_xlsx(
     {
         return xlsx_support::columns_from_xls(path, nrows, n_samples);
     }
-    columns_from_xlsx_calamine(path, nrows, n_samples)
+    bail!(
+        "{path:?} doesn't match a recognized .xlsx/.xlsb/.ods ZIP structure or .xls OLE2 \
+         structure - if this is genuinely one of those formats, its internal layout doesn't \
+         match what this reader expects (a corrupted file, or an .xlsb written by an unusual \
+         tool, are the most likely causes)"
+    )
 }
 
-#[cfg(feature = "xlsx")]
+#[cfg(all(test, feature = "xlsx"))]
 fn columns_from_xlsx_calamine(
     path: &Path,
     nrows: Option<usize>,

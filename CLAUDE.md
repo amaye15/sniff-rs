@@ -2768,28 +2768,50 @@ this project could just implement directly rather than depend on:
        affecting it, rather than comparing against a now-known-wrong
        oracle on the other three.
 
+- **`calamine`/`chrono` demoted from real dependencies to dev-only ones,
+  once `.xlsb` closed the last format still reading through them.** With
+  every format `--features xlsx` documents (`.xlsx`/`.ods`/`.xls`/
+  `.xlsb`) now dispatched by content to its own hand-rolled reader,
+  `columns_from_xlsx_calamine`/`xlsx_cell_to_string` had exactly one job
+  left: producing the "expected" side of the
+  `*_matches_calamine_output_exactly` cross-verification tests. Rather
+  than delete that verification capability outright, both moved to
+  `[dev-dependencies]` in `Cargo.toml` and both functions became
+  `#[cfg(all(test, feature = "xlsx"))]` - the exact same "dev-only, never
+  touches the shipped binary" treatment this project's own benchmarking
+  section already gives `criterion` (see "Benchmarking" below), applied
+  here for the first time to a crate that used to be load-bearing at
+  runtime. Confirmed with `cargo tree --features xlsx -e normal` (no
+  `calamine`/`chrono` anywhere in the shipped build's dependency graph)
+  versus `cargo tree --features xlsx -e normal,dev` (both present) -
+  the distinction is real, not just a `Cargo.toml` comment, and
+  `cargo build --features xlsx`/`--features full` compile with zero
+  trace of either crate. All four `*_matches_calamine_output_exactly`
+  tests, and the three tests documenting real calamine bugs found while
+  building `.xlsb`, keep working completely unchanged - `cargo test`
+  still links calamine for test binaries, exactly the way `cargo bench`
+  already links criterion. The one real behavior change: `columns_from_xlsx`'s
+  previous last-resort fallback (hand a file matching none of the four
+  known content signatures to calamine, in case it's some other
+  OOXML/OLE2-flavored format this project doesn't otherwise recognize)
+  is now a direct, disclosed error instead - since the file was already
+  routed here as `InputFormat::Xlsx` by extension or OLE2-magic
+  sniffing, reaching this point with no signature matching means a
+  corrupted file or a genuinely unsupported structure, not a case worth
+  silently deferring to a crate no longer in the build at all.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
-the one dependency left that's more central than any of the others in
-this list: `serde_json::Value` is the literal bridge type seven different
-format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML) recurse
-through via `profile_json_path` - replacing it means writing and
-re-verifying a whole JSON value type, parser, and serializer, not
-swapping one call site at a time or hand-rolling a narrower, self-
-contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`, `.xls`, and
-now `.xlsb` all still were, however real their own risk. That's still a
-real, non-mechanical rewrite - the risk itself is why it's still
-deliberately a dependency, the same reasoning that applied to every
-other entry in this list right up until it didn't. With `.xlsb` done,
-every format `--features xlsx` is documented to cover (`.xlsx`/`.ods`/
-`.xls`/`.xlsb`) now has its own hand-rolled reader and is dispatched to
-it by content, not extension - `columns_from_xlsx_calamine` remains
-wired in only as `columns_from_xlsx`'s last-resort fallback for a file
-that matches none of the four content signatures (a genuinely malformed
-file, or some other real-world OOXML/OLE2-flavored format this project
-doesn't otherwise recognize), and as this project's own ongoing cross-
-verification oracle during development (see every
-`*_matches_calamine_output_exactly` test above) - not because any of the
-four documented formats still relies on it to be read correctly.
+the last real dependency left, and the one that's always been more
+central than any of the others in this list: `serde_json::Value` is the
+literal bridge type seven different format readers (JSON, YAML, TOML,
+Avro, MessagePack, CBOR, XML) recurse through via `profile_json_path` -
+replacing it means writing and re-verifying a whole JSON value type,
+parser, and serializer, not swapping one call site at a time or
+hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
+`.xlsx`, `.ods`, `.xls`, and `.xlsb` all still were, however real their
+own risk. That's still a real, non-mechanical rewrite - the risk itself
+is why it's still deliberately a dependency, the same reasoning that
+applied to every other entry in this list right up until it didn't.
 
 ## Known limitations / roadmap
 
