@@ -4189,8 +4189,10 @@ fn columns_from_toml(_path: &Path, _n_samples: usize) -> Result<Vec<ColumnProfil
     )
 }
 
-// --- YAML reader (opt-in via --features yaml, via the serde_norway crate -
-// a maintained fork of the archived serde_yaml, same API shape) ---
+// --- YAML reader (opt-in via --features yaml, hand-rolled - see
+// `yaml_support` below and CLAUDE.md's Dependency footprint section for
+// the full writeup, including the real, disclosed scope boundaries this
+// parser draws) ---
 // YAML has three shapes a data file commonly takes, so the record list is
 // built differently depending on what's actually in the file rather than
 // assuming one: a single top-level sequence is an array of records (like
@@ -4199,49 +4201,994 @@ fn columns_from_toml(_path: &Path, _n_samples: usize) -> Result<Vec<ColumnProfil
 // single-document format); a `---`-separated multi-document stream is one
 // record per document (YAML's own equivalent of JSON Lines).
 
+/// A from-scratch YAML 1.1/1.2-flavored parser producing `serde_json::Value`
+/// directly (no intermediate YAML-specific value type - unlike every other
+/// nested-format bridge in this file, there's no ready-made dynamic Value
+/// type to reuse here since the dependency being replaced *was* that type).
+///
+/// Deliberately scoped to the block/flow structural surface real-world YAML
+/// data files overwhelmingly use, the same "confident common case, disclosed
+/// gap on the rest" discipline as every other hand-rolled reader in this
+/// project - this project's own former `serde_norway`-based reader already
+/// only passed ~74% of the `yaml-test-suite` spec-compliance corpus (see
+/// CLAUDE.md's real-world-corpus-validation writeup), so 100% spec fidelity
+/// was never the bar being matched. Supported: block and flow mappings/
+/// sequences at arbitrary nesting depth, an inline value/nested structure
+/// immediately after `- `/`key: ` (`- key: value`, `- - a`, `key: [1, 2]`,
+/// ...), plain/single-quoted/double-quoted scalars (with double-quote's
+/// full backslash-escape grammar, including `\xNN`/`\uNNNN`/`\UNNNNNNNN`),
+/// a folded multi-line plain scalar, literal (`|`) and folded (`>`) block
+/// scalars with `-`/`+` chomping and an explicit indentation indicator,
+/// `#` comments (respecting quote state), multi-document `---`/`...`
+/// streams, leading `%`-directives (skipped), and YAML 1.2's core-schema
+/// null/bool/int/float resolution for plain scalars (deliberately *not*
+/// YAML 1.1's `yes`/`no`/`on`/`off` boolean words - matching this crate's
+/// own predecessor, `serde_yaml`, whose maintained fork is literally named
+/// `serde_norway` after the classic "Norway problem" of `NO` silently
+/// resolving to `false`; not regressing that fix was a real, checked
+/// design constraint here, not an incidental choice).
+///
+/// An anchor's own value (`key: &name ...`) is read completely normally,
+/// with the tag itself just stripped (`strip_anchor_prefix`) since it
+/// carries no information this project's type-detection heuristics need,
+/// but *dereferencing* it elsewhere via an alias (`*name`) or a merge
+/// key (`<<: *name`) is deliberately out of scope, and produces a clear,
+/// disclosed error rather than a silent guess (see
+/// `resolve_plain_scalar`'s own check) - the alternative, found via real-
+/// world validation before this split was made, was silent data loss:
+/// the anchor's *own* content was misread as a literal string, and the
+/// block it should have introduced was orphaned entirely. Also
+/// deliberately out of scope, on the same "disclosed gap, not a guess"
+/// footing: explicit complex mapping keys (`? key\n: value`), and any
+/// custom YAML tag beyond a best-effort strip-and-parse-the-rest (the
+/// five `!!core` tags - `str`/`int`/`float`/`bool`/`null` - *are*
+/// honored, forcing that exact interpretation rather than guessing). A
+/// document boundary (`---`/`...`) is detected via a single flat
+/// pre-pass before structural parsing begins, so a block scalar whose
+/// own literal content happens to contain a line that's exactly `---`
+/// would be mis-split - a narrow, accepted edge case rather than
+/// something worth a fully-integrated single-pass state machine to
+/// close.
 #[cfg(feature = "yaml")]
-fn yaml_key_to_string(k: &serde_norway::Value) -> String {
-    match k {
-        serde_norway::Value::String(s) => s.clone(),
-        other => match yaml_value_to_json(other) {
+mod yaml_support {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct YLine<'a> {
+        indent: usize,
+        raw: &'a str,
+        num: usize,
+    }
+
+    fn split_lines(text: &str) -> Result<Vec<YLine<'_>>> {
+        let mut out = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let trimmed = line.trim_start_matches(' ');
+            if line.starts_with('\t') && !line.trim().is_empty() {
+                bail!("YAML doesn't allow tabs for indentation (line {})", i + 1);
+            }
+            let indent = line.len() - trimmed.len();
+            out.push(YLine {
+                indent,
+                raw: trimmed,
+                num: i + 1,
+            });
+        }
+        Ok(out)
+    }
+
+    fn is_blank_or_comment(raw: &str) -> bool {
+        raw.is_empty() || raw.starts_with('#')
+    }
+
+    /// Strips a trailing `# comment` from a single structural line,
+    /// honoring quote state (a `#` inside a quoted scalar is never a
+    /// comment) - never applied to a block scalar's own verbatim body,
+    /// where `#` is always literal content.
+    fn strip_comment(s: &str) -> &str {
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut prev_is_space = true;
+        let mut chars = s.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if in_double {
+                if c == '\\' {
+                    chars.next();
+                } else if c == '"' {
+                    in_double = false;
+                }
+                prev_is_space = false;
+                continue;
+            }
+            if in_single {
+                if c == '\'' {
+                    if chars.peek().map(|&(_, c2)| c2) == Some('\'') {
+                        chars.next();
+                        prev_is_space = false;
+                        continue;
+                    }
+                    in_single = false;
+                }
+                prev_is_space = false;
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_double = true;
+                    prev_is_space = false;
+                }
+                '\'' => {
+                    in_single = true;
+                    prev_is_space = false;
+                }
+                '#' if prev_is_space => return s[..i].trim_end(),
+                ' ' | '\t' => prev_is_space = true,
+                _ => prev_is_space = false,
+            }
+        }
+        s.trim_end()
+    }
+
+    fn is_sequence_item_line(s: &str) -> bool {
+        s == "-" || s.starts_with("- ")
+    }
+
+    /// Is `l` the start of a nested block value for a key/dash whose own
+    /// indentation is `parent_indent`? Ordinarily this just means
+    /// "more indented than the parent" - but YAML block sequences are a
+    /// real, explicit exception: `key:\n- item` (the sequence at the
+    /// *same* indentation as its own key, not more) is legal and, in
+    /// practice, a common real-world style (found via a real Kubernetes
+    /// manifest during validation - `containers:` followed by `- name:
+    /// ...` at identical indentation). A same-indent *mapping* key is
+    /// not given this exception (that would be genuinely ambiguous), so
+    /// this only fires for a same-indent line that's itself a sequence
+    /// item.
+    fn is_nested_value_line(l: &YLine, parent_indent: usize) -> bool {
+        if l.indent > parent_indent {
+            return true;
+        }
+        l.indent == parent_indent && is_sequence_item_line(strip_comment(l.raw).trim_end())
+    }
+
+    /// Strips a leading `&anchor` token, if present, from the start of a
+    /// value. Anchors (`&name`) and aliases (`*name`) are, as a pair, out
+    /// of this parser's declared scope (see the module's own doc
+    /// comment) - but *defining* an anchor and *dereferencing* it later
+    /// are different-sized problems: the anchor token itself carries no
+    /// information this project's own type-detection heuristics need
+    /// (it's metadata *about* the value, not part of the value), so
+    /// simply discarding it and reading the value it's attached to
+    /// normally is correct and free - no anchor-table bookkeeping
+    /// required. An `*alias` reference is the genuinely unsupported
+    /// half (see `resolve_plain_scalar`'s own check) - a real, checked
+    /// finding: an early version of this parser stripped nothing, so
+    /// `key: &anchor` silently became the literal string `"&anchor"`
+    /// (and, worse, orphaned every line of the block it should have
+    /// introduced) rather than reading the anchored value at all -
+    /// confirmed against a real anchors-and-merge-keys fixture before
+    /// this fix, not assumed. Returns the remaining text and how many
+    /// characters were consumed (name plus trailing whitespace), so a
+    /// caller computing a column offset can adjust for it.
+    fn strip_anchor_prefix(s: &str) -> (&str, usize) {
+        let Some(rest) = s.strip_prefix('&') else {
+            return (s, 0);
+        };
+        let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let after_name = &rest[name_end..];
+        let trimmed = after_name.trim_start();
+        (trimmed, s.len() - trimmed.len())
+    }
+
+    /// Finds the byte offset of the `:` that separates a block mapping
+    /// key from its value: the first colon, outside any quote and outside
+    /// any flow (`{}`/`[]`) nesting, immediately followed by whitespace or
+    /// end-of-string - the same rule that keeps `http://example.com` or
+    /// `time: 12:30`'s embedded colons from being misread as key
+    /// separators.
+    fn find_mapping_colon(s: &str) -> Option<usize> {
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut flow_depth = 0i32;
+        let mut chars = s.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if in_double {
+                if c == '\\' {
+                    chars.next();
+                } else if c == '"' {
+                    in_double = false;
+                }
+                continue;
+            }
+            if in_single {
+                if c == '\'' {
+                    if chars.peek().map(|&(_, c2)| c2) == Some('\'') {
+                        chars.next();
+                        continue;
+                    }
+                    in_single = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '{' | '[' => flow_depth += 1,
+                '}' | ']' => flow_depth -= 1,
+                ':' if flow_depth == 0 => {
+                    let next = chars.peek().map(|&(_, c2)| c2);
+                    if next.is_none() || next == Some(' ') || next == Some('\t') {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn skip_blank_and_comment_lines(lines: &[YLine], pos: &mut usize) {
+        while let Some(l) = lines.get(*pos) {
+            if is_blank_or_comment(strip_comment(l.raw)) {
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Splits raw YAML text into top-level documents (`---`-separated,
+    /// with an optional `...` end marker and optional leading
+    /// `%`-directives), then parses each into a `JsonValue`.
+    pub(crate) fn parse_yaml_documents(text: &str) -> Result<Vec<JsonValue>> {
+        let lines = split_lines(text)?;
+        let mut docs = Vec::new();
+        let mut i = 0usize;
+        while i < lines.len() && lines[i].raw.starts_with('%') {
+            i += 1;
+        }
+        loop {
+            while i < lines.len() && is_blank_or_comment(strip_comment(lines[i].raw)) {
+                i += 1;
+            }
+            if i >= lines.len() {
+                break;
+            }
+            let mut doc_lines: Vec<YLine> = Vec::new();
+            if lines[i].raw == "---" || lines[i].raw.starts_with("--- ") {
+                let inline = lines[i].raw.strip_prefix("---").unwrap().trim_start();
+                if !inline.is_empty() {
+                    doc_lines.push(YLine {
+                        indent: 0,
+                        raw: inline,
+                        num: lines[i].num,
+                    });
+                }
+                i += 1;
+            }
+            while i < lines.len() {
+                let l = lines[i];
+                if l.indent == 0 && (l.raw == "---" || l.raw.starts_with("--- ") || l.raw == "...")
+                {
+                    break;
+                }
+                doc_lines.push(l);
+                i += 1;
+            }
+            if lines.get(i).map(|l| l.raw == "...").unwrap_or(false) {
+                i += 1;
+            }
+            let mut pos = 0usize;
+            let value = parse_document(&doc_lines, &mut pos)?;
+            docs.push(value);
+        }
+        Ok(docs)
+    }
+
+    fn parse_document(lines: &[YLine], pos: &mut usize) -> Result<JsonValue> {
+        skip_blank_and_comment_lines(lines, pos);
+        if *pos >= lines.len() {
+            return Ok(JsonValue::Null);
+        }
+        let indent = lines[*pos].indent;
+        parse_block_node(lines, pos, indent, indent)
+    }
+
+    /// `indent` is the structural gate - what a sibling key/item at this
+    /// level must match. `parent_indent` is what a *scalar*'s own
+    /// continuation lines (a folded plain scalar, or a block scalar's
+    /// body) are measured against instead - these normally coincide, but
+    /// diverge for a value inline right after `- `/`key: `, where
+    /// `indent` becomes that inline value's own re-anchored column (so a
+    /// nested mapping/sequence's *later* keys/items align to it) while
+    /// `parent_indent` stays the enclosing key/dash's real indentation
+    /// (what YAML's own multi-line-scalar rules actually measure against
+    /// - see `parse_inline_value`, where the two are first split apart).
+    fn parse_block_node(
+        lines: &[YLine],
+        pos: &mut usize,
+        indent: usize,
+        parent_indent: usize,
+    ) -> Result<JsonValue> {
+        skip_blank_and_comment_lines(lines, pos);
+        let Some(line) = lines.get(*pos) else {
+            return Ok(JsonValue::Null);
+        };
+        if line.indent < indent {
+            return Ok(JsonValue::Null);
+        }
+        if line.indent > indent {
+            bail!(
+                "unexpected indentation at line {} (expected {} leading spaces, found {})",
+                line.num,
+                indent,
+                line.indent
+            );
+        }
+        let content = strip_comment(line.raw).trim_end();
+        if content.is_empty() {
+            *pos += 1;
+            return Ok(JsonValue::Null);
+        }
+        if is_sequence_item_line(content) {
+            parse_block_sequence(lines, pos, indent)
+        } else if find_mapping_colon(content).is_some() {
+            parse_block_mapping(lines, pos, indent)
+        } else {
+            parse_scalar_or_flow(lines, pos, parent_indent)
+        }
+    }
+
+    /// Re-anchors an inline value (the text right after `- ` or `key: `)
+    /// as a synthetic line at the column it actually starts on, then
+    /// delegates to `parse_block_node` - this uniformly handles a plain/
+    /// quoted scalar, a flow collection, or an inline nested mapping/
+    /// sequence whose later keys/items are indented to match that same
+    /// column, without duplicating any of `parse_block_node`'s own logic.
+    /// `parent_indent` is the enclosing key/dash's *own* real
+    /// indentation (passed straight through to `parse_block_node`,
+    /// unlike the synthetic `value_col` used as the structural `indent` -
+    /// see `parse_block_node`'s own doc comment for why the two must
+    /// stay separate). Returns the parsed value and how many *real*
+    /// lines (starting at `at`) were consumed.
+    fn parse_inline_value<'a>(
+        lines: &[YLine<'a>],
+        at: usize,
+        inline: &'a str,
+        value_col: usize,
+        parent_indent: usize,
+    ) -> Result<(JsonValue, usize)> {
+        let synthetic = YLine {
+            indent: value_col,
+            raw: inline,
+            num: lines[at].num,
+        };
+        let mut sub_lines: Vec<YLine<'a>> = Vec::with_capacity(1 + lines.len() - at - 1);
+        sub_lines.push(synthetic);
+        sub_lines.extend_from_slice(&lines[at + 1..]);
+        let mut sub_pos = 0usize;
+        let value = parse_block_node(&sub_lines, &mut sub_pos, value_col, parent_indent)?;
+        Ok((value, sub_pos.max(1)))
+    }
+
+    fn parse_block_sequence(lines: &[YLine], pos: &mut usize, indent: usize) -> Result<JsonValue> {
+        let mut items = Vec::new();
+        loop {
+            skip_blank_and_comment_lines(lines, pos);
+            let Some(line) = lines.get(*pos) else { break };
+            if line.indent != indent {
+                break;
+            }
+            let content = strip_comment(line.raw).trim_end();
+            if !is_sequence_item_line(content) {
+                break;
+            }
+            let after_dash_raw = &content[1..];
+            let trimmed_len = after_dash_raw.len() - after_dash_raw.trim_start().len();
+            let (after_dash, anchor_consumed) = strip_anchor_prefix(after_dash_raw.trim_start());
+            let value_col = line.indent + 1 + trimmed_len + anchor_consumed;
+            if after_dash.is_empty() {
+                *pos += 1;
+                skip_blank_and_comment_lines(lines, pos);
+                match lines.get(*pos) {
+                    Some(l) if is_nested_value_line(l, indent) => {
+                        let child_indent = l.indent;
+                        items.push(parse_block_node(lines, pos, child_indent, child_indent)?);
+                    }
+                    _ => items.push(JsonValue::Null),
+                }
+            } else {
+                let (value, consumed) =
+                    parse_inline_value(lines, *pos, after_dash, value_col, line.indent)?;
+                items.push(value);
+                *pos += consumed;
+            }
+        }
+        Ok(JsonValue::Array(items))
+    }
+
+    fn parse_block_mapping(lines: &[YLine], pos: &mut usize, indent: usize) -> Result<JsonValue> {
+        let mut map = serde_json::Map::new();
+        loop {
+            skip_blank_and_comment_lines(lines, pos);
+            let Some(line) = lines.get(*pos) else { break };
+            if line.indent != indent {
+                break;
+            }
+            let content = strip_comment(line.raw).trim_end();
+            let Some(colon) = find_mapping_colon(content) else {
+                break;
+            };
+            let key = resolve_scalar_key(content[..colon].trim())?;
+            let after_colon_raw = &content[colon + 1..];
+            let trimmed_len = after_colon_raw.len() - after_colon_raw.trim_start().len();
+            let (after_colon, anchor_consumed) = strip_anchor_prefix(after_colon_raw.trim_start());
+            let value_col = line.indent + colon + 1 + trimmed_len + anchor_consumed;
+            if after_colon.is_empty() {
+                *pos += 1;
+                skip_blank_and_comment_lines(lines, pos);
+                match lines.get(*pos) {
+                    Some(l) if is_nested_value_line(l, indent) => {
+                        let child_indent = l.indent;
+                        let value = parse_block_node(lines, pos, child_indent, child_indent)?;
+                        map.insert(key, value);
+                    }
+                    _ => {
+                        map.insert(key, JsonValue::Null);
+                    }
+                }
+            } else {
+                let (value, consumed) =
+                    parse_inline_value(lines, *pos, after_colon, value_col, line.indent)?;
+                map.insert(key, value);
+                *pos += consumed;
+            }
+        }
+        Ok(JsonValue::Object(map))
+    }
+
+    fn parse_scalar_or_flow(
+        lines: &[YLine],
+        pos: &mut usize,
+        parent_indent: usize,
+    ) -> Result<JsonValue> {
+        let line = lines[*pos];
+        let content = strip_comment(line.raw).trim_end();
+        if let Some(rest) = content
+            .strip_prefix('|')
+            .or_else(|| content.strip_prefix('>'))
+        {
+            let style = content.chars().next().unwrap();
+            return parse_block_scalar(lines, pos, parent_indent, style, rest);
+        }
+        if content.starts_with('{') || content.starts_with('[') {
+            return parse_flow_from_lines(lines, pos);
+        }
+        if content.starts_with('"') || content.starts_with('\'') {
+            *pos += 1;
+            return resolve_scalar_value(content);
+        }
+        // A plain (unquoted) scalar can fold across subsequent
+        // more-indented lines (YAML's multi-line plain scalar rule).
+        // Once folded, the combined text is always a String - a real,
+        // multi-word plain scalar can never validly resolve to
+        // null/bool/int/float anyway.
+        let mut parts = vec![content.to_string()];
+        *pos += 1;
+        while let Some(l) = lines.get(*pos) {
+            if l.raw.is_empty() {
+                *pos += 1;
+                continue;
+            }
+            if l.indent <= parent_indent {
+                break;
+            }
+            let c = strip_comment(l.raw).trim_end();
+            if c.is_empty() {
+                *pos += 1;
+                continue;
+            }
+            if is_sequence_item_line(c) || find_mapping_colon(c).is_some() {
+                break;
+            }
+            parts.push(c.to_string());
+            *pos += 1;
+        }
+        if parts.len() == 1 {
+            resolve_scalar_value(&parts[0])
+        } else {
+            Ok(JsonValue::String(parts.join(" ")))
+        }
+    }
+
+    /// A literal (`|`) or folded (`>`) block scalar. `header_rest` is
+    /// whatever followed the style character on the header line - a
+    /// chomping indicator (`-` strip, `+` keep, default clip: exactly one
+    /// trailing newline) and/or an explicit indentation-level digit, in
+    /// either order, per [YAML 1.2 §8.1.1]. "Keep" chomping is
+    /// approximated as clip (a disclosed simplification - preserving
+    /// every last trailing blank line exactly is the rarest of the three
+    /// modes in real-world use).
+    fn parse_block_scalar(
+        lines: &[YLine],
+        pos: &mut usize,
+        parent_indent: usize,
+        style: char,
+        header_rest: &str,
+    ) -> Result<JsonValue> {
+        let mut chomp = '=';
+        let mut explicit_indent: Option<usize> = None;
+        for c in header_rest.trim().chars() {
+            match c {
+                '-' => chomp = '-',
+                '+' => chomp = '+',
+                '0'..='9' => explicit_indent = Some(c as usize - '0' as usize),
+                _ => {}
+            }
+        }
+        *pos += 1;
+        let mut body: Vec<(usize, &str)> = Vec::new();
+        while let Some(l) = lines.get(*pos) {
+            if l.raw.is_empty() {
+                body.push((usize::MAX, ""));
+                *pos += 1;
+                continue;
+            }
+            if l.indent <= parent_indent {
+                break;
+            }
+            body.push((l.indent, l.raw));
+            *pos += 1;
+        }
+        while matches!(body.last(), Some(&(usize::MAX, _))) {
+            body.pop();
+        }
+        let base_indent = explicit_indent
+            .map(|n| parent_indent + n)
+            .or_else(|| {
+                body.iter()
+                    .find(|&&(i, _)| i != usize::MAX)
+                    .map(|&(i, _)| i)
+            })
+            .unwrap_or(parent_indent + 1);
+        let mut out_lines: Vec<String> = Vec::with_capacity(body.len());
+        for (indent, raw) in &body {
+            if *indent == usize::MAX {
+                out_lines.push(String::new());
+            } else {
+                let pad = indent.saturating_sub(base_indent);
+                out_lines.push(format!("{}{}", " ".repeat(pad), raw));
+            }
+        }
+        let mut text = if style == '|' {
+            out_lines.join("\n")
+        } else {
+            fold_block_scalar(&out_lines)
+        };
+        if !body.is_empty() && chomp != '-' {
+            text.push('\n');
+        }
+        Ok(JsonValue::String(text))
+    }
+
+    /// YAML folding: consecutive non-blank lines join with a single
+    /// space; a blank line becomes a literal newline. Doesn't special-
+    /// case a more-indented line staying literal (a real but rarer
+    /// folding nuance) - a disclosed simplification.
+    fn fold_block_scalar(lines: &[String]) -> String {
+        let mut out = String::new();
+        let mut prev_blank = true;
+        for l in lines {
+            if l.is_empty() {
+                out.push('\n');
+                prev_blank = true;
+            } else {
+                if !prev_blank {
+                    out.push(' ');
+                }
+                out.push_str(l);
+                prev_blank = false;
+            }
+        }
+        out
+    }
+
+    /// Joins every remaining line in this document (raw, unstripped -
+    /// the flow parser below understands `#` comments itself) starting
+    /// at `*pos`, parses one flow value from the front of it, then
+    /// figures out how many whole lines that consumed by counting
+    /// newlines in the consumed prefix - flow collections aren't
+    /// indentation-sensitive, so they're free to span physical lines.
+    fn parse_flow_from_lines(lines: &[YLine], pos: &mut usize) -> Result<JsonValue> {
+        let start = *pos;
+        let mut joined = String::new();
+        for l in &lines[start..] {
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            joined.push_str(l.raw);
+        }
+        let mut cursor = 0usize;
+        let value = parse_flow_value(&joined, &mut cursor)?;
+        let consumed_lines = joined[..cursor].matches('\n').count();
+        *pos = start + consumed_lines + 1;
+        Ok(value)
+    }
+
+    fn skip_flow_ws(s: &str, cursor: &mut usize) {
+        loop {
+            let rest = &s[*cursor..];
+            match rest.chars().next() {
+                Some(c) if c.is_whitespace() => *cursor += c.len_utf8(),
+                Some('#') => {
+                    *cursor += rest.find('\n').unwrap_or(rest.len());
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn parse_flow_value(s: &str, cursor: &mut usize) -> Result<JsonValue> {
+        skip_flow_ws(s, cursor);
+        match s[*cursor..].chars().next() {
+            Some('{') => parse_flow_mapping(s, cursor),
+            Some('[') => parse_flow_sequence(s, cursor),
+            Some('"') => Ok(JsonValue::String(parse_double_quoted(s, cursor)?)),
+            Some('\'') => Ok(JsonValue::String(parse_single_quoted(s, cursor)?)),
+            Some(_) => {
+                let raw = read_flow_plain_scalar(s, cursor);
+                resolve_scalar_value(raw.trim())
+            }
+            None => bail!("unexpected end of input while parsing a YAML flow value"),
+        }
+    }
+
+    fn read_flow_plain_scalar<'a>(s: &'a str, cursor: &mut usize) -> &'a str {
+        let start = *cursor;
+        let mut prev_space = false;
+        loop {
+            let rest = &s[*cursor..];
+            let Some(c) = rest.chars().next() else { break };
+            match c {
+                ',' | '}' | ']' => break,
+                ':' => {
+                    let after = &rest[c.len_utf8()..];
+                    let next = after.chars().next();
+                    if matches!(next, None | Some(' ' | '\t' | ',' | '}' | ']' | '\n')) {
+                        break;
+                    }
+                    *cursor += c.len_utf8();
+                    prev_space = false;
+                }
+                '#' if prev_space => break,
+                _ => {
+                    prev_space = c == ' ' || c == '\t';
+                    *cursor += c.len_utf8();
+                }
+            }
+        }
+        s[start..*cursor].trim_end()
+    }
+
+    fn parse_flow_sequence(s: &str, cursor: &mut usize) -> Result<JsonValue> {
+        *cursor += 1;
+        let mut items = Vec::new();
+        loop {
+            skip_flow_ws(s, cursor);
+            match s[*cursor..].chars().next() {
+                Some(']') => {
+                    *cursor += 1;
+                    break;
+                }
+                None => bail!("unterminated YAML flow sequence"),
+                _ => {}
+            }
+            items.push(parse_flow_value(s, cursor)?);
+            skip_flow_ws(s, cursor);
+            match s[*cursor..].chars().next() {
+                Some(',') => *cursor += 1,
+                Some(']') => {
+                    *cursor += 1;
+                    break;
+                }
+                _ => bail!("expected ',' or ']' in YAML flow sequence"),
+            }
+        }
+        Ok(JsonValue::Array(items))
+    }
+
+    fn parse_flow_mapping(s: &str, cursor: &mut usize) -> Result<JsonValue> {
+        *cursor += 1;
+        let mut map = serde_json::Map::new();
+        loop {
+            skip_flow_ws(s, cursor);
+            match s[*cursor..].chars().next() {
+                Some('}') => {
+                    *cursor += 1;
+                    break;
+                }
+                None => bail!("unterminated YAML flow mapping"),
+                _ => {}
+            }
+            let key_val = parse_flow_value(s, cursor)?;
+            let key = match key_val {
+                JsonValue::String(s2) => s2,
+                other => other.to_string(),
+            };
+            skip_flow_ws(s, cursor);
+            let mut value = JsonValue::Null;
+            if s[*cursor..].starts_with(':') {
+                *cursor += 1;
+                value = parse_flow_value(s, cursor)?;
+            }
+            map.insert(key, value);
+            skip_flow_ws(s, cursor);
+            match s[*cursor..].chars().next() {
+                Some(',') => *cursor += 1,
+                Some('}') => {
+                    *cursor += 1;
+                    break;
+                }
+                _ => bail!("expected ',' or '}}' in YAML flow mapping"),
+            }
+        }
+        Ok(JsonValue::Object(map))
+    }
+
+    fn parse_double_quoted(s: &str, cursor: &mut usize) -> Result<String> {
+        *cursor += 1;
+        let mut out = String::new();
+        loop {
+            let rest = &s[*cursor..];
+            let Some(c) = rest.chars().next() else {
+                bail!("unterminated double-quoted YAML string");
+            };
+            *cursor += c.len_utf8();
+            match c {
+                '"' => return Ok(out),
+                '\\' => {
+                    let rest2 = &s[*cursor..];
+                    let Some(esc) = rest2.chars().next() else {
+                        bail!("unterminated escape sequence in double-quoted YAML string");
+                    };
+                    *cursor += esc.len_utf8();
+                    match esc {
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        '0' => out.push('\0'),
+                        'a' => out.push('\u{7}'),
+                        'b' => out.push('\u{8}'),
+                        'f' => out.push('\u{C}'),
+                        'v' => out.push('\u{B}'),
+                        'e' => out.push('\u{1B}'),
+                        ' ' => out.push(' '),
+                        'N' => out.push('\u{85}'),
+                        '_' => out.push('\u{A0}'),
+                        'L' => out.push('\u{2028}'),
+                        'P' => out.push('\u{2029}'),
+                        '\n' => {}
+                        'x' => out.push(read_hex_escape(s, cursor, 2)?),
+                        'u' => out.push(read_hex_escape(s, cursor, 4)?),
+                        'U' => out.push(read_hex_escape(s, cursor, 8)?),
+                        other => {
+                            bail!(
+                                "unrecognized escape sequence '\\{other}' in YAML double-quoted string"
+                            )
+                        }
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+
+    fn read_hex_escape(s: &str, cursor: &mut usize, digits: usize) -> Result<char> {
+        let rest = &s[*cursor..];
+        let hex: String = rest.chars().take(digits).collect();
+        if hex.chars().count() != digits {
+            bail!("truncated hex escape in YAML double-quoted string");
+        }
+        let code = u32::from_str_radix(&hex, 16)
+            .context("invalid hex escape in YAML double-quoted string")?;
+        *cursor += hex.len();
+        char::from_u32(code)
+            .ok_or_else(|| anyhow!("invalid unicode escape in YAML double-quoted string"))
+    }
+
+    fn parse_single_quoted(s: &str, cursor: &mut usize) -> Result<String> {
+        *cursor += 1;
+        let mut out = String::new();
+        loop {
+            let rest = &s[*cursor..];
+            let Some(c) = rest.chars().next() else {
+                bail!("unterminated single-quoted YAML string");
+            };
+            *cursor += c.len_utf8();
+            if c == '\'' {
+                if rest[1..].starts_with('\'') {
+                    out.push('\'');
+                    *cursor += 1;
+                    continue;
+                }
+                return Ok(out);
+            }
+            out.push(c);
+        }
+    }
+
+    fn resolve_scalar_key(raw: &str) -> Result<String> {
+        Ok(match resolve_scalar_value(raw)? {
             JsonValue::String(s) => s,
             other => other.to_string(),
-        },
+        })
     }
-}
 
-#[cfg(feature = "yaml")]
-fn yaml_value_to_json(v: &serde_norway::Value) -> JsonValue {
-    use serde_norway::Value as YamlValue;
-    match v {
-        YamlValue::Null => JsonValue::Null,
-        YamlValue::Bool(b) => JsonValue::Bool(*b),
-        YamlValue::Number(n) => n
-            .as_i64()
-            .map(JsonValue::from)
-            .or_else(|| n.as_u64().map(JsonValue::from))
-            .or_else(|| {
-                n.as_f64()
-                    .and_then(serde_json::Number::from_f64)
-                    .map(JsonValue::Number)
-            })
-            .unwrap_or(JsonValue::Null),
-        YamlValue::String(s) => JsonValue::String(s.clone()),
-        YamlValue::Sequence(items) => {
-            JsonValue::Array(items.iter().map(yaml_value_to_json).collect())
+    /// Strips and unescapes quotes if `s` is quoted, else returns it
+    /// unchanged - used by the `!!str`/`!!int`/`!!float`/`!!bool` tag
+    /// branches below, since a forced-type tag can legally apply to an
+    /// explicitly-quoted scalar too (e.g. `!!int "45"`), not just a
+    /// plain one.
+    fn unquote_if_quoted(s: &str) -> Result<String> {
+        if s.starts_with('"') {
+            let mut cursor = 0usize;
+            return parse_double_quoted(s, &mut cursor);
         }
-        YamlValue::Mapping(m) => JsonValue::Object(
-            m.iter()
-                .map(|(k, v)| (yaml_key_to_string(k), yaml_value_to_json(v)))
-                .collect(),
-        ),
-        // A tagged scalar/sequence/mapping (YAML's `!Tag value` syntax) -
-        // best-effort: keep the tag visible rather than silently dropping it.
-        YamlValue::Tagged(t) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert(t.tag.to_string(), yaml_value_to_json(&t.value));
-            JsonValue::Object(obj)
+        if s.starts_with('\'') {
+            let mut cursor = 0usize;
+            return parse_single_quoted(s, &mut cursor);
         }
+        Ok(s.to_string())
+    }
+
+    /// Resolves a single-line scalar (quoted or plain) to its
+    /// `JsonValue`. A quoted scalar is always a `String`, regardless of
+    /// what it looks like - the same "declared/explicit type wins"
+    /// principle this project already applies everywhere else, here
+    /// expressed by YAML's own quoting syntax rather than a schema.
+    fn resolve_scalar_value(raw: &str) -> Result<JsonValue> {
+        let trimmed = raw.trim();
+        // A no-op for block context (already stripped before this is
+        // reached, for column-tracking reasons - see
+        // `strip_anchor_prefix`'s own doc comment); needed here for flow
+        // context (`{a: &x 1}`), which has no equivalent earlier step.
+        let (trimmed, _) = strip_anchor_prefix(trimmed);
+        if trimmed.starts_with('"') {
+            let mut cursor = 0usize;
+            return Ok(JsonValue::String(parse_double_quoted(
+                trimmed,
+                &mut cursor,
+            )?));
+        }
+        if trimmed.starts_with('\'') {
+            let mut cursor = 0usize;
+            return Ok(JsonValue::String(parse_single_quoted(
+                trimmed,
+                &mut cursor,
+            )?));
+        }
+        if let Some(rest) = trimmed.strip_prefix("!!str ") {
+            return Ok(JsonValue::String(unquote_if_quoted(rest.trim())?));
+        }
+        if let Some(rest) = trimmed.strip_prefix("!!int ") {
+            let text = unquote_if_quoted(rest.trim())?;
+            return parse_plain_int(&text)
+                .ok_or_else(|| anyhow!("invalid !!int YAML scalar: {rest:?}"));
+        }
+        if let Some(rest) = trimmed.strip_prefix("!!float ") {
+            let text = unquote_if_quoted(rest.trim())?;
+            return text
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(JsonValue::Number)
+                .ok_or_else(|| anyhow!("invalid !!float YAML scalar: {rest:?}"));
+        }
+        if let Some(rest) = trimmed.strip_prefix("!!bool ") {
+            let text = unquote_if_quoted(rest.trim())?;
+            return parse_plain_bool(&text)
+                .map(JsonValue::Bool)
+                .ok_or_else(|| anyhow!("invalid !!bool YAML scalar: {rest:?}"));
+        }
+        if let Some(rest) = trimmed.strip_prefix('!') {
+            // Any other tag (custom, or a core tag like !!null already
+            // implied by a bare/empty value) - strip the tag token and
+            // resolve whatever follows normally, rather than guessing at
+            // tag semantics this project doesn't otherwise need.
+            return match rest.find(' ') {
+                Some(sp) => resolve_plain_scalar(rest[sp + 1..].trim()),
+                None => Ok(JsonValue::Null),
+            };
+        }
+        resolve_plain_scalar(trimmed)
+    }
+
+    fn resolve_plain_scalar(s: &str) -> Result<JsonValue> {
+        if s.is_empty() || s == "~" || s.eq_ignore_ascii_case("null") {
+            return Ok(JsonValue::Null);
+        }
+        // An anchor's own *value* is read normally (see
+        // `strip_anchor_prefix`), but dereferencing it elsewhere via an
+        // alias is genuinely out of scope - a clear, disclosed error
+        // here rather than silently misreading the reference as a
+        // literal `"*name"` string, this project's usual "no silent
+        // misreading" rule applied to a real YAML feature gap instead of
+        // a heuristic.
+        if s.starts_with('*') && s.len() > 1 {
+            bail!(
+                "YAML aliases (*name) aren't supported - the anchored value itself \
+                 (&name) is read normally, but referencing it elsewhere via '{s}' is not"
+            );
+        }
+        if let Some(b) = parse_plain_bool(s) {
+            return Ok(JsonValue::Bool(b));
+        }
+        if matches!(s, ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF") {
+            return Ok(JsonValue::Number(
+                serde_json::Number::from_f64(f64::INFINITY).unwrap(),
+            ));
+        }
+        if matches!(s, "-.inf" | "-.Inf" | "-.INF") {
+            return Ok(JsonValue::Number(
+                serde_json::Number::from_f64(f64::NEG_INFINITY).unwrap(),
+            ));
+        }
+        if matches!(s, ".nan" | ".NaN" | ".NAN") {
+            // serde_json::Number can't represent NaN at all - left as the
+            // literal string, the same "can't losslessly represent this"
+            // treatment this project already gives a handful of other
+            // edge values (compare Avro's Duration logical type).
+            return Ok(JsonValue::String(s.to_string()));
+        }
+        if let Some(n) = parse_plain_int(s) {
+            return Ok(n);
+        }
+        if let Ok(f) = s.parse::<f64>()
+            && let Some(num) = serde_json::Number::from_f64(f)
+        {
+            return Ok(JsonValue::Number(num));
+        }
+        Ok(JsonValue::String(s.to_string()))
+    }
+
+    fn parse_plain_bool(s: &str) -> Option<bool> {
+        match s {
+            "true" | "True" | "TRUE" => Some(true),
+            "false" | "False" | "FALSE" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn parse_plain_int(s: &str) -> Option<JsonValue> {
+        let (sign, digits) = match s.strip_prefix('-') {
+            Some(d) => (-1i64, d),
+            None => (1i64, s.strip_prefix('+').unwrap_or(s)),
+        };
+        if digits.is_empty() {
+            return None;
+        }
+        if let Some(hex) = digits.strip_prefix("0x") {
+            return i64::from_str_radix(hex, 16)
+                .ok()
+                .map(|v| JsonValue::from(sign * v));
+        }
+        if let Some(oct) = digits.strip_prefix("0o") {
+            return i64::from_str_radix(oct, 8)
+                .ok()
+                .map(|v| JsonValue::from(sign * v));
+        }
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits
+            .parse::<i64>()
+            .ok()
+            .map(|v| JsonValue::from(sign * v))
+            .or_else(|| digits.parse::<u64>().ok().map(JsonValue::from))
     }
 }
 
@@ -4251,18 +5198,11 @@ fn columns_from_yaml(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use serde::Deserialize;
-
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
 
-    let mut documents: Vec<serde_norway::Value> = Vec::new();
-    for doc in serde_norway::Deserializer::from_str(&content) {
-        let value = serde_norway::Value::deserialize(doc)
-            .with_context(|| format!("failed to parse a YAML document in {path:?}"))?;
-        if !value.is_null() {
-            documents.push(value);
-        }
-    }
+    let mut documents = yaml_support::parse_yaml_documents(&content)
+        .with_context(|| format!("failed to parse YAML in {path:?}"))?;
+    documents.retain(|v| !v.is_null());
 
     // Same dual-mode dispatch as before: a single top-level sequence is
     // an array of records (JSON's `[...]` mode); anything else - one
@@ -4272,12 +5212,10 @@ fn columns_from_yaml(
     let mut values: Vec<JsonValue> = Vec::new();
     match documents.len() {
         1 => match documents.into_iter().next().unwrap() {
-            serde_norway::Value::Sequence(items) => {
-                values.extend(items.iter().map(yaml_value_to_json));
-            }
-            other => values.push(yaml_value_to_json(&other)),
+            JsonValue::Array(items) => values.extend(items),
+            other => values.push(other),
         },
-        _ => values.extend(documents.iter().map(yaml_value_to_json)),
+        _ => values.extend(documents),
     }
 
     if let Some(n) = nrows {
@@ -10325,6 +11263,159 @@ mod tests {
         let mut names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["age", "name"]);
+    }
+
+    #[cfg(feature = "yaml")]
+    fn yaml_doc(text: &str) -> JsonValue {
+        yaml_support::parse_yaml_documents(text).unwrap().remove(0)
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_handles_nested_block_mappings_and_sequences() {
+        let v = yaml_doc("a:\n  b:\n    - 1\n    - 2\n  c: 3\n");
+        assert_eq!(v, serde_json::json!({"a": {"b": [1, 2], "c": 3}}));
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_handles_an_inline_nested_mapping_after_a_dash() {
+        let v = yaml_doc("- name: Alice\n  age: 30\n- name: Bob\n  age: 25\n");
+        assert_eq!(
+            v,
+            serde_json::json!([{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}])
+        );
+    }
+
+    /// A real bug this parser's own real-world validation found (see
+    /// CLAUDE.md's Dependency footprint section): a block sequence
+    /// indented at the *same* level as its own key, not more - a real,
+    /// common style (found in an actual Kubernetes deployment manifest's
+    /// `containers:` field) that YAML explicitly permits as an exception
+    /// to the usual "children more indented than parent" rule.
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_handles_a_block_sequence_indented_the_same_as_its_own_key() {
+        let v = yaml_doc("containers:\n- name: nginx\n  image: nginx:1.14.2\n");
+        assert_eq!(
+            v,
+            serde_json::json!({"containers": [{"name": "nginx", "image": "nginx:1.14.2"}]})
+        );
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_handles_flow_collections_including_multi_line() {
+        let v = yaml_doc("a: {b: 1, c: [1, 2, 3]}\n");
+        assert_eq!(v, serde_json::json!({"a": {"b": 1, "c": [1, 2, 3]}}));
+
+        let v = yaml_doc("a: [1, 2,\n    3, 4]\n");
+        assert_eq!(v, serde_json::json!({"a": [1, 2, 3, 4]}));
+    }
+
+    /// A real bug found the same way: the block scalar's own body
+    /// indentation was measured against the wrong reference column (the
+    /// synthetic column right after `key: `, rather than the key's own
+    /// real indentation), which not only produced an empty string but
+    /// also swallowed the *next* key entirely.
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_handles_literal_and_folded_block_scalars() {
+        let v = yaml_doc("a: |\n  line one\n  line two\nb: >\n  folded one\n  folded two\n");
+        assert_eq!(
+            v,
+            serde_json::json!({"a": "line one\nline two\n", "b": "folded one folded two\n"})
+        );
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_handles_double_quoted_escapes() {
+        let v = yaml_doc(r#"a: "hi\nthere\t\u00e9""#);
+        assert_eq!(v, serde_json::json!({"a": "hi\nthere\t\u{e9}"}));
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_strips_comments_outside_quotes() {
+        let v = yaml_doc("a: 1 # comment\nb: 2\n");
+        assert_eq!(v, serde_json::json!({"a": 1, "b": 2}));
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_folds_a_multi_line_plain_scalar_and_keeps_reading_later_keys() {
+        let v = yaml_doc("a: this is a very long\n  plain scalar continuing\nb: 2\n");
+        assert_eq!(
+            v,
+            serde_json::json!({"a": "this is a very long plain scalar continuing", "b": 2})
+        );
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_honors_core_tags_including_on_a_quoted_scalar() {
+        let v = yaml_doc("a: !!str 123\nb: !!int \"45\"\n");
+        assert_eq!(v, serde_json::json!({"a": "123", "b": 45}));
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_handles_arbitrary_nesting_depth() {
+        let v = yaml_doc("a:\n  b:\n    c:\n      d: 1\n      e: [1, {f: 2}]\n");
+        assert_eq!(
+            v,
+            serde_json::json!({"a": {"b": {"c": {"d": 1, "e": [1, {"f": 2}]}}}})
+        );
+    }
+
+    /// YAML 1.1's `yes`/`no`/`on`/`off` boolean words are deliberately
+    /// *not* coerced (matching this crate's own predecessor,
+    /// `serde_norway` - see that module's doc comment for why) - real,
+    /// checked evidence this matters: a real GitHub Actions workflow
+    /// file's top-level `on:` key, run through PyYAML's own default
+    /// `safe_load`, resolves to the boolean `True` rather than the
+    /// string `"on"` (the exact "Norway problem" this crate is named
+    /// after) - confirmed directly, not assumed, while validating this
+    /// parser against real files.
+    /// A real bug found via real-world validation: before
+    /// `strip_anchor_prefix` existed, `key: &anchor` (an anchor tag with
+    /// no other inline content, meaning "the real value is a nested
+    /// block on subsequent lines") was misread as the literal scalar
+    /// string `"&anchor"`, and - worse - the nested block it should have
+    /// introduced was silently orphaned (never consumed by anything, so
+    /// it just vanished from the output, taking the *next* sibling key
+    /// with it too). The anchored value itself is now read correctly;
+    /// only *dereferencing* it via `*anchor` elsewhere remains
+    /// unsupported (see the next test).
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_reads_an_anchored_values_own_content_correctly() {
+        let v = yaml_doc("defaults: &defaults\n  timeout: 30\nname: myapp\n");
+        assert_eq!(
+            v,
+            serde_json::json!({"defaults": {"timeout": 30}, "name": "myapp"})
+        );
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_gives_a_clear_error_on_an_alias_reference() {
+        let err = yaml_support::parse_yaml_documents(
+            "defaults: &defaults\n  timeout: 30\nprod:\n  <<: *defaults\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("alias"), "{err}");
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_does_not_coerce_on_off_yes_no_to_booleans() {
+        let v = yaml_doc("a: on\nb: off\nc: yes\nd: no\n");
+        assert_eq!(
+            v,
+            serde_json::json!({"a": "on", "b": "off", "c": "yes", "d": "no"})
+        );
     }
 
     #[test]

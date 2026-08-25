@@ -1001,6 +1001,25 @@ fn yaml_top_level_sequence_of_scalars_becomes_one_value_column() {
     assert_eq!(value["ideal_type"], "i64");
 }
 
+// Found while validating the hand-rolled YAML parser (replacing
+// serde_norway - see CLAUDE.md's Dependency footprint section) against a
+// real Kubernetes deployment manifest: a block sequence indented at the
+// *same* level as its own key (`containers:` followed by `- name: ...`
+// with no extra indentation), a real, common style YAML explicitly
+// permits as an exception to its usual "children more indented than
+// parent" rule. Locks in the fix at the full-pipeline level, not just the
+// parser's own unit tests.
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_handles_a_block_sequence_indented_the_same_as_its_own_key() {
+    let doc = run_json("edge_yaml_same_indent_sequence.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_same_indent_sequence");
+    let name = column(cols, "spec.template.spec.containers.name");
+    assert_eq!(name["sample_values"], serde_json::json!(["nginx"]));
+    let port = column(cols, "spec.template.spec.containers.ports.containerPort");
+    assert_eq!(port["ideal_type"], "i64");
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_writer_silently_mangling_a_zip_code_gets_caught() {

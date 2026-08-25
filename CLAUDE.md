@@ -2800,6 +2800,129 @@ this project could just implement directly rather than depend on:
   corrupted file or a genuinely unsupported structure, not a case worth
   silently deferring to a crate no longer in the build at all.
 
+- **`serde_norway` → a hand-rolled YAML parser, no intermediate value
+  type.** Every other nested-format bridge in this file leans on a
+  ready-made dynamic `Value` type from the crate being kept
+  (`toml::Value`, `rmpv::Value`, `ciborium::Value`) to convert into
+  `serde_json::Value` - this is the one exception, since the crate being
+  *removed* was that ready-made type itself. `yaml_support::parse_yaml_documents`
+  produces `serde_json::Value` directly: a line-based, indentation-aware
+  recursive-descent parser (`YLine` - indent + content + line number, the
+  same shape `xlsx_support`'s CFB/BIFF8 line-oriented parsing already
+  established the pattern for), with a character-stream sub-parser for
+  flow collections (`{}`/`[]`, not indentation-sensitive, so they're free
+  to span physical lines without any special handling - the consumed
+  span's own newline count tells the line-based parser how far to
+  advance). The trickiest structural piece: an inline value right after
+  `- `/`key: ` (`- key: value`, `key: [1, 2]`, a nested mapping whose
+  *later* keys align to a column with no dash/key prefix on their own
+  line) is handled uniformly by re-anchoring that text as a synthetic
+  `YLine` at the column it actually starts on and delegating straight
+  back into the normal recursive parser (`parse_inline_value`), rather
+  than duplicating block-mapping/sequence/scalar logic for the "already
+  mid-line" case.
+
+  Scoped deliberately, the same "confident common case, disclosed gap on
+  the rest" discipline as everywhere else in this file: this project's
+  own former `serde_norway`-based reader already only passed ~74% of the
+  `yaml-test-suite` spec-compliance corpus (see the real-world-corpus-
+  validation section above), so 100% fidelity was never the bar. Covered:
+  block and flow mappings/sequences at arbitrary depth, literal (`|`)
+  and folded (`>`) block scalars with chomping and an explicit indent
+  indicator, a folded multi-line plain scalar, single/double-quoted
+  scalars (full backslash-escape grammar), `#` comments respecting quote
+  state, `---`/`...` multi-document streams, leading `%`-directives, the
+  five `!!core` tags (forcing `str`/`int`/`float`/`bool`/`null`
+  interpretation - including on an explicitly-quoted scalar, e.g.
+  `!!int "45"`), and YAML 1.2's core-schema null/bool/int/float
+  resolution. Deliberately *not* YAML 1.1's `yes`/`no`/`on`/`off` boolean
+  words - checked directly, not assumed, that this matches the crate
+  being replaced: `serde_norway` is a maintained fork of the archived
+  `serde_yaml`, and its name is a direct nod to the classic "Norway
+  problem" (a bare `NO` silently resolving to `false`) that fork exists
+  to avoid, so *not* coercing those words is the correct continuation of
+  existing behavior, not a new limitation. An anchor's own value
+  (`key: &name ...`) is read completely normally; only *dereferencing*
+  it elsewhere via an alias (`*name`) or merge key (`<<: *name`) is out
+  of scope, producing a clear, disclosed error - see below for why that
+  split, rather than a flat "anchors unsupported," is what shipped.
+  Explicit complex mapping keys (`? key\n: value`) and any non-core tag
+  beyond a best-effort strip-and-parse-the-rest remain out of scope,
+  each a real, disclosed gap rather than a guess.
+
+  Verified two ways before being trusted, mirroring this project's own
+  established rigor for every hand-rolled reader: this project's *own*
+  existing YAML fixtures and unit tests (including the multi-document
+  `sample.yaml`, the top-level-scalar-sequence edge case, and the
+  malformed-input test) passed unchanged on the first attempt: and,
+  since no synthetic fixture set substitutes for genuinely messy
+  real-world YAML, three real files were pulled and cross-checked
+  against Python's independent `PyYAML` library - a real Docker Compose
+  file (`docker/awesome-compose`), a real Kubernetes Deployment manifest
+  (`kubernetes/website`'s own example), and a real GitHub Actions
+  workflow (`actions/starter-workflows`). This surfaced three real bugs,
+  each fixed and locked in as a permanent test before the parser was
+  trusted:
+    1. **Block scalars measured against the wrong reference indentation.**
+       `key: |` re-anchored the scalar's body-indentation check against
+       the *synthetic* column right after `key: ` (an artifact of the
+       inline-value delegation described above) rather than the key's
+       own real indentation - producing an empty string, and - worse -
+       silently orphaning the *next* key entirely, since the body lines
+       never satisfied that wrong reference and were left unconsumed for
+       the outer mapping loop to choke on. Fixed by threading a second,
+       separate `parent_indent` through the block-node/scalar functions
+       specifically for this purpose, distinct from the structural
+       `indent` the inline-delegation mechanism needs for its own,
+       different job (aligning a nested mapping/sequence's *later*
+       keys/items to a real column) - the two coincide everywhere except
+       through that one delegation path, which is exactly where the bug
+       was hiding.
+    2. **A block sequence indented the *same* as its own key** (`key:`
+       immediately followed by `- item` with no extra indentation, not
+       more) - found in the real Kubernetes manifest's own `containers:`
+       field, a real, common style YAML explicitly permits as an
+       exception to its usual "children more indented than parent" rule.
+       The mapping-value logic required strictly-greater indentation
+       before treating what followed as a nested value, so the sequence
+       was skipped entirely and its content misread as if it were a
+       sibling mapping key one level up. Fixed with `is_nested_value_line`,
+       which extends the exception specifically (and only) to a
+       same-indent line that's itself a sequence item - a same-indent
+       *mapping* key still isn't given this exception, since that would
+       be genuinely ambiguous.
+    3. **`on`/`off`/`yes`/`no` silently becoming booleans** - not a bug
+       in this project's own parser, but the *opposite* finding: cross-
+       checking the real GitHub Actions workflow against PyYAML's
+       default `safe_load` showed its own top-level `on:` key resolving
+       to the literal boolean `True`, exactly the "Norway problem" this
+       project's own design choice (above) was built to avoid. Confirmed
+       directly, not assumed, and recorded as positive evidence the
+       design choice was correct, not just theoretically justified.
+  A fourth issue was a real correctness gap rather than a cross-tool
+  mismatch, found by deliberately testing the declared-out-of-scope
+  anchor/alias case rather than just documenting it and moving on: an
+  anchor's own value (`defaults: &defaults` followed by a nested block)
+  was, before this fix, misread as the literal string `"&defaults"`,
+  and - the more serious half - the block it should have introduced was
+  silently dropped from the output entirely (never consumed by anything,
+  so it just vanished, taking the *next* sibling key down with it too).
+  That's a real violation of this project's own "never silently
+  misread" principle, not an acceptable shape for an out-of-scope
+  feature to fail in. `strip_anchor_prefix` closes the gap for the
+  anchor's own value (the tag carries no information the type-detection
+  heuristics need, so simply discarding it and reading the value
+  underneath normally is both correct and free), while a bare `*alias`
+  reference - genuinely unresolvable without anchor-table bookkeeping
+  this parser doesn't do - now produces a clear, actionable error
+  instead of either silently misreading it as a literal string or
+  losing data around it. `tests/fixtures/edge_yaml_same_indent_sequence.yaml`
+  and its own integration test lock in the Kubernetes-manifest finding
+  at the full-pipeline level; the block-scalar, anchor-value, and
+  alias-error findings are locked in as `#[cfg(test)]` unit tests
+  directly on `yaml_support::parse_yaml_documents`, alongside the
+  now-confirmed `on`/`off`/`yes`/`no` non-coercion behavior.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -2808,10 +2931,11 @@ Avro, MessagePack, CBOR, XML) recurse through via `profile_json_path` -
 replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
-`.xlsx`, `.ods`, `.xls`, and `.xlsb` all still were, however real their
-own risk. That's still a real, non-mechanical rewrite - the risk itself
-is why it's still deliberately a dependency, the same reasoning that
-applied to every other entry in this list right up until it didn't.
+`.xlsx`, `.ods`, `.xls`, `.xlsb`, and now `serde_norway` all still were,
+however real their own risk. That's still a real, non-mechanical
+rewrite - the risk itself is why it's still deliberately a dependency,
+the same reasoning that applied to every other entry in this list right
+up until it didn't.
 
 ## Known limitations / roadmap
 
