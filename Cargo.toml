@@ -21,7 +21,6 @@ serde = "1.0.229"
 rmpv = { version = "1.3.1", optional = true }
 toml = { version = "1.1.4", optional = true }
 ciborium = { version = "0.2.2", optional = true }
-rust-ini = { version = "0.21.3", optional = true }
 xmltree = { version = "0.12.0", features = ["attribute-order"], optional = true }
 zstd = { version = "0.13.3", optional = true }
 npyz = { version = "0.9.1", features = ["npz"], optional = true }
@@ -43,7 +42,7 @@ msgpack = ["dep:rmpv"]
 toml = ["dep:toml"]
 yaml = []
 cbor = ["dep:ciborium"]
-ini = ["dep:rust-ini"]
+ini = []
 xml = ["dep:xmltree"]
 zstd = ["dep:zstd"]
 npy = ["dep:npyz"]
@@ -70,6 +69,11 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 # already gets.
 calamine = { version = "0.36.1", features = ["chrono"] }
 chrono = "0.4"
+# Same dev-only treatment, same reason: the `ini` feature's own hand-rolled
+# reader (`ini_support` in src/lib.rs) replaced this at runtime; kept only
+# for the `ini_reader_matches_rust_ini_output_exactly` cross-verification
+# test.
+rust-ini = "0.21.3"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

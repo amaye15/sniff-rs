@@ -2923,6 +2923,67 @@ this project could just implement directly rather than depend on:
   directly on `yaml_support::parse_yaml_documents`, alongside the
   now-confirmed `on`/`off`/`yes`/`no` non-coercion behavior.
 
+- **`rust-ini` → a hand-rolled INI parser, the smallest and lowest-risk
+  hand-roll in this whole effort.** INI's own grammar is far smaller
+  than any nested format this project has replaced so far - no
+  indentation sensitivity, no nested collections, just sections and
+  flat `key=value`/`key:value` lines - so `ini_support::parse_ini`
+  (`src/lib.rs`) is a straightforward line-oriented parser: a line is a
+  comment (`;`/`#`), a `[section]` header, blank, or a key-value pair,
+  with a name-to-index map alongside an ordered `Vec` of sections so
+  that re-opening a `[section]` already seen earlier in the file appends
+  into that *same* section rather than creating a duplicate - matching
+  rust-ini's own `ListOrderedMultimap`-backed behavior, confirmed
+  directly against its source rather than assumed. Section (and,
+  within a section, key) order is real, observable output shape here,
+  the reason for the ordered `Vec` instead of a plain `HashMap`.
+
+  Value parsing mirrors rust-ini's own quoting/escaping rules, also
+  checked directly against its source: leading whitespace is skipped
+  once, then a value is built from zero or more `"..."`/`'...'` quoted
+  segments interleaved with unquoted trailing text - a real, if unusual,
+  rust-ini convention this replicates exactly (its own documented
+  example, `key='Single Quote' with extra value`, resolves to
+  `Single Quote with extra value`: the text right after a closing quote
+  is *not* re-trimmed of its own leading whitespace, only trailing, so
+  the space between the quoted segment and the trailing text survives
+  into the concatenated result). The backslash-escape grammar itself
+  (`\0 \a \b \t \r \n \xHHHH`, an escaped newline as a line-continuation
+  contributing nothing to the value, any other `\c` reducing to the
+  literal character `c`) is shared identically between quoted and
+  unquoted text, matching rust-ini's own single shared implementation
+  for both rather than two separate ones.
+
+  One deliberate divergence, made and disclosed rather than silently
+  matched: rust-ini requires a comment's `;`/`#` to be the *literal*
+  first character of the line (checked against its source: with the
+  `inline-comment` Cargo feature off, which is this project's own
+  configuration, a `;`/`#` preceded by even one space is a hard parse
+  error, not a recognized comment) - this parser is deliberately more
+  lenient, treating a comment as `;`/`#` after leading whitespace is
+  trimmed, the more standard and expected INI convention, since no real
+  file this project tested against ever exercised rust-ini's stricter
+  (and, on inspection, likely accidental) rule.
+
+  Verified two ways: a dedicated `ini_reader_matches_rust_ini_output_exactly`
+  test cross-checks this parser against `rust-ini` itself (kept as a
+  dev-only oracle, the same treatment calamine/chrono and rust-ini's own
+  YAML-era counterpart already get) on this project's existing fixtures
+  plus a new `tests/fixtures/edge_ini_quoting_and_escapes.ini` covering
+  every quoting/escaping rule above in one small, committed file; and,
+  transiently and not committed (matching this project's usual large-
+  external-corpus practice), against two real files already referenced
+  elsewhere in this document's own real-world-corpus-validation
+  write-up - a genuine `php.ini-production` (1,878 lines) and a real
+  Samba `smb.conf.default` (223 lines). Both matched `rust-ini`'s own
+  output exactly (after filtering empty sections on both sides, the same
+  filter `columns_from_ini` itself already applies - rust-ini eagerly
+  creates an empty `Properties` entry for every `[header]` line even
+  with no keys following, while this parser creates a section lazily on
+  its first key; a real, confirmed difference that never surfaces past
+  that existing filter) - zero hand-rolled-parser bugs found, the
+  cleanest result of any hand-roll in this whole effort.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -2931,10 +2992,11 @@ Avro, MessagePack, CBOR, XML) recurse through via `profile_json_path` -
 replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
-`.xlsx`, `.ods`, `.xls`, `.xlsb`, and now `serde_norway` all still were,
-however real their own risk. That's still a real, non-mechanical
-rewrite - the risk itself is why it's still deliberately a dependency,
-the same reasoning that applied to every other entry in this list right
+`.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, and now `rust-ini` all
+still were, however real their own risk. That's still a real,
+non-mechanical rewrite - the risk itself is why it's still deliberately
+a dependency, the same reasoning that applied to every other entry in
+this list right
 up until it didn't.
 
 ## Known limitations / roadmap

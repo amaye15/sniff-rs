@@ -5391,7 +5391,8 @@ fn columns_from_cbor(
     )
 }
 
-// --- INI reader (opt-in via --features ini) ---
+// --- INI reader (opt-in via --features ini, hand-rolled - see
+// `ini_support` below and CLAUDE.md's Dependency footprint section) ---
 // An INI file's sections are already "multiple named groups of key=value
 // pairs", so - like SQLite's tables and Excel's sheets - this returns one
 // profile list per section rather than assuming a single implicit table.
@@ -5401,31 +5402,207 @@ fn columns_from_cbor(
 // within one section (INI permits this) pools into one array value rather
 // than the second occurrence silently overwriting the first.
 
+/// A from-scratch INI parser, replacing `rust-ini` (kept as a dev-only
+/// cross-verification oracle - see Cargo.toml and CLAUDE.md's Dependency
+/// footprint section). Line-oriented rather than rust-ini's own
+/// character-stream state machine: a line is a comment (`;`/`#`, once
+/// leading whitespace is trimmed - deliberately more lenient than
+/// rust-ini's own stricter "must be the literal first character with no
+/// leading whitespace at all, else it's a parse error" rule, since no
+/// real file this project tested against ever exercised that corner and
+/// treating an indented comment as a comment is the far more standard,
+/// expected INI convention), a `[section]` header, a blank line, or a
+/// `key=value`/`key:value` pair - matching rust-ini's own choice to
+/// accept either delimiter. Re-opening a `[section]` already seen
+/// earlier in the file appends into that same section rather than
+/// creating a second one, matching rust-ini's own `ListOrderedMultimap`-
+/// backed behavior (confirmed against its source, not assumed) - the
+/// same reason this parser also uses an explicit ordered `Vec` plus a
+/// name-to-index map instead of a plain `HashMap`, since section (and,
+/// within a section, key) order is real, observable output shape here,
+/// not an implementation detail.
+///
+/// Value parsing mirrors rust-ini's own quoting/escaping rules exactly,
+/// checked directly against its source rather than assumed: leading
+/// whitespace is skipped once, then the value is built from zero or
+/// more `"..."`/`'...'` quoted segments (each with its own backslash-
+/// escape grammar applied) interleaved with unquoted trailing text - a
+/// real, if unusual, convention this enables (`key='Single Quote' with
+/// extra value` resolves to `Single Quote with extra value`, e.g.
+/// rust-ini's own doc example): the text right after a closing quote is
+/// *not* re-trimmed of its own leading whitespace, only trailing, so a
+/// space between a quoted segment and trailing text survives into the
+/// concatenated result. The escape grammar itself
+/// (`\0 \a \b \t \r \n \xHHHH`, an escaped literal newline as a line-
+/// continuation that contributes nothing to the value, and any other
+/// `\c` reducing to the literal character `c` - covering `\\`, `\"`,
+/// `\'`, `\;`, `\#`, `\=`, `\:`, and an escaped space to preserve
+/// otherwise-trimmed whitespace) is shared identically between quoted
+/// and unquoted text, matching rust-ini's own single shared
+/// `parse_str_until` implementation for both.
+#[cfg(feature = "ini")]
+mod ini_support {
+    use super::*;
+
+    /// One parsed INI document: an ordered list of sections (`None` for
+    /// the general section before any `[header]`), each an ordered list
+    /// of `(key, value)` pairs - order and duplicates both preserved, so
+    /// the caller can decide how to pool a repeated key.
+    pub(crate) type IniSections = Vec<(Option<String>, Vec<(String, String)>)>;
+
+    fn unescape_ini_run(s: &str, terminator: Option<char>) -> Result<(String, usize)> {
+        let mut out = String::new();
+        let mut chars = s.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if Some(c) == terminator {
+                return Ok((out, i + c.len_utf8()));
+            }
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                None => out.push('\\'),
+                Some((_, '0')) => out.push('\0'),
+                Some((_, 'a')) => out.push('\u{7}'),
+                Some((_, 'b')) => out.push('\u{8}'),
+                Some((_, 't')) => out.push('\t'),
+                Some((_, 'r')) => out.push('\r'),
+                Some((_, 'n')) => out.push('\n'),
+                Some((_, '\n')) => {} // escaped newline: line continuation, nothing emitted
+                Some((_, 'x')) => {
+                    let hex: String = (0..4)
+                        .filter_map(|_| chars.next().map(|(_, c)| c))
+                        .collect();
+                    if hex.chars().count() != 4 {
+                        bail!("truncated \\x escape in INI value");
+                    }
+                    let code =
+                        u32::from_str_radix(&hex, 16).context("invalid \\x escape in INI value")?;
+                    match char::from_u32(code) {
+                        Some(ch) => out.push(ch),
+                        None => bail!("invalid unicode escape in INI value: \\x{hex}"),
+                    }
+                }
+                Some((_, other)) => out.push(other),
+            }
+        }
+        if terminator.is_some() {
+            bail!("unterminated quoted INI value (missing closing quote)");
+        }
+        Ok((out, s.len()))
+    }
+
+    fn parse_ini_value(raw: &str) -> Result<String> {
+        let mut val = String::new();
+        let mut rest = raw.trim_start();
+        let mut first_part = true;
+        loop {
+            if let Some(after) = rest.strip_prefix('"') {
+                let (content, consumed) = unescape_ini_run(after, Some('"'))?;
+                val.push_str(&content);
+                rest = &after[consumed..];
+                first_part = false;
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix('\'') {
+                let (content, consumed) = unescape_ini_run(after, Some('\''))?;
+                val.push_str(&content);
+                rest = &after[consumed..];
+                first_part = false;
+                continue;
+            }
+            let (content, _) = unescape_ini_run(rest, None)?;
+            let trimmed = if first_part {
+                content.trim()
+            } else {
+                content.trim_end()
+            };
+            val.push_str(trimmed);
+            break;
+        }
+        Ok(val)
+    }
+
+    fn ini_section_index(
+        sections: &mut IniSections,
+        index: &mut HashMap<Option<String>, usize>,
+        key: Option<String>,
+    ) -> usize {
+        if let Some(&i) = index.get(&key) {
+            return i;
+        }
+        sections.push((key.clone(), Vec::new()));
+        let i = sections.len() - 1;
+        index.insert(key, i);
+        i
+    }
+
+    pub(crate) fn parse_ini(text: &str) -> Result<IniSections> {
+        let mut sections: IniSections = Vec::new();
+        let mut index: HashMap<Option<String>, usize> = HashMap::new();
+        let mut current: Option<String> = None;
+
+        for (line_no, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim_end_matches('\r');
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix('[') {
+                let Some(end) = rest.find(']') else {
+                    bail!(
+                        "line {}: section header missing closing ']': {trimmed:?}",
+                        line_no + 1
+                    );
+                };
+                current = Some(rest[..end].trim().to_string());
+                continue;
+            }
+            let Some(sep) = trimmed.find(['=', ':']) else {
+                bail!(
+                    "line {}: expected 'key=value' or 'key:value', found {trimmed:?}",
+                    line_no + 1
+                );
+            };
+            let key = trimmed[..sep].trim();
+            if key.is_empty() {
+                bail!("line {}: missing key before '{}'", line_no + 1, trimmed);
+            }
+            let value = parse_ini_value(&trimmed[sep + 1..])?;
+            let idx = ini_section_index(&mut sections, &mut index, current.clone());
+            sections[idx].1.push((key.to_string(), value));
+        }
+
+        Ok(sections)
+    }
+}
+
 #[cfg(feature = "ini")]
 fn columns_from_ini(path: &Path, n_samples: usize) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-    let conf = ini::Ini::load_from_file(path)
-        .map_err(|e| anyhow!("{e}"))
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let sections = ini_support::parse_ini(&content)
         .with_context(|| format!("failed to parse {path:?} as INI"))?;
 
     let mut out = Vec::new();
-    for (section_name, props) in conf.iter() {
+    for (section_name, props) in sections {
         if props.is_empty() {
             continue; // e.g. no general section before the first [header]
         }
         let mut record = serde_json::Map::new();
-        for (k, v) in props.iter() {
-            match record.get_mut(k) {
-                Some(JsonValue::Array(values)) => values.push(JsonValue::String(v.to_string())),
+        for (k, v) in props {
+            match record.get_mut(&k) {
+                Some(JsonValue::Array(values)) => values.push(JsonValue::String(v)),
                 Some(existing) => {
                     let first = existing.clone();
-                    *existing = JsonValue::Array(vec![first, JsonValue::String(v.to_string())]);
+                    *existing = JsonValue::Array(vec![first, JsonValue::String(v)]);
                 }
                 None => {
-                    record.insert(k.to_string(), JsonValue::String(v.to_string()));
+                    record.insert(k, JsonValue::String(v));
                 }
             }
         }
-        let name = section_name.unwrap_or("(default)").to_string();
+        let name = section_name.unwrap_or_else(|| "(default)".to_string());
         out.push((name, profile_json_records(&[record], n_samples)));
     }
 
@@ -10793,6 +10970,63 @@ mod tests {
             "expected a captured #NAME? formula-error value: {:?}",
             col.sample_values
         );
+    }
+
+    /// Cross-verifies the hand-rolled parser against `rust-ini` itself
+    /// (kept as a dev-only oracle - see Cargo.toml), on both this
+    /// project's own existing fixtures and a dedicated quoting/escaping
+    /// stress fixture covering rust-ini's own documented
+    /// `'Single Quote' with extra value` concatenation example, escaped
+    /// quotes, `\t`/`\n` escapes, the `:` delimiter, trailing-whitespace
+    /// trimming, and an empty value. Sections with no properties are
+    /// filtered from both sides before comparing - the same filter
+    /// `columns_from_ini` itself applies, so this compares what's
+    /// actually observable through the reader, not implementation-
+    /// internal section bookkeeping (rust-ini eagerly creates an empty
+    /// `Properties` entry for every `[header]` line even with no keys
+    /// following; this parser creates a section's entry lazily, on its
+    /// first key - a real, confirmed difference that never surfaces
+    /// past `columns_from_ini`'s own existing empty-section filter).
+    /// Also cross-checked, transiently and not committed (matching this
+    /// project's usual large-external-corpus practice), against a real
+    /// `php.ini-production` (1,878 lines) and a real Samba
+    /// `smb.conf.default` (223 lines) - both matched exactly, with zero
+    /// hand-rolled-parser bugs found; see CLAUDE.md's Dependency
+    /// footprint section for the full write-up.
+    #[cfg(feature = "ini")]
+    #[test]
+    fn ini_reader_matches_rust_ini_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.ini",
+            "tests/fixtures/type_detection.ini",
+            "tests/fixtures/edge_ini_quoting_and_escapes.ini",
+        ] {
+            let text = std::fs::read_to_string(f)
+                .unwrap_or_else(|e| panic!("{f}: failed to read fixture: {e}"));
+            let mine_raw = ini_support::parse_ini(&text)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled parser failed: {e:?}"));
+            let theirs_ini = ini::Ini::load_from_str(&text)
+                .unwrap_or_else(|e| panic!("{f}: rust-ini failed: {e:?}"));
+
+            let mine: ini_support::IniSections = mine_raw
+                .into_iter()
+                .filter(|(_, props)| !props.is_empty())
+                .collect();
+            let theirs: ini_support::IniSections = theirs_ini
+                .iter()
+                .filter(|(_, props)| !props.is_empty())
+                .map(|(name, props)| {
+                    (
+                        name.map(|s| s.to_string()),
+                        props
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            assert_eq!(mine, theirs, "{f}: hand-rolled parser vs rust-ini mismatch");
+        }
     }
 
     #[cfg(feature = "xlsx")]

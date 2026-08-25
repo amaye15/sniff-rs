@@ -1250,6 +1250,30 @@ fn ini_reports_one_table_per_section_and_pools_duplicate_keys() {
     assert_eq!(ssl_enabled["ideal_type"], "bool");
 }
 
+// Locks in the hand-rolled INI parser's quoting/escaping behavior (see
+// CLAUDE.md's Dependency footprint section) at the full-pipeline level -
+// the unit-level cross-check against rust-ini itself lives in src/lib.rs.
+#[cfg(feature = "ini")]
+#[test]
+fn ini_handles_quoted_values_and_backslash_escapes() {
+    let doc = run_json("edge_ini_quoting_and_escapes.ini", &[]);
+    let cols = table(&doc, "Section");
+    assert_eq!(column(cols, "Key1")["sample_values"][0], "Quoted value");
+    assert_eq!(
+        column(cols, "Key2")["sample_values"][0],
+        "Single Quote with extra value"
+    );
+    assert_eq!(
+        column(cols, "Key3")["sample_values"][0],
+        "plain \t tab and \n newline"
+    );
+    assert_eq!(
+        column(cols, "Key4")["sample_values"][0],
+        "escaped \"quote\" inside"
+    );
+    assert_eq!(column(cols, "Key5")["sample_values"][0], "colon delimiter");
+}
+
 #[cfg(feature = "sqlite")]
 #[test]
 fn sqlite_reports_multiple_tables_and_catches_a_type_affinity_violation() {
