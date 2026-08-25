@@ -1,0 +1,14 @@
+# TOML 1.1.0 features with zero prior coverage in this project's fixtures,
+# found while auditing the hand-rolled parser against toml-lang/toml-test.
+
+time_no_seconds = 13:37
+datetime_no_seconds = 1979-05-27 07:32Z
+
+inline_multiline = {
+	name = "multi-line inline table",
+	values = [1, 2, 3],
+}
+
+escapes = "tab:\tesc:\x1B hex:\x41"
+
+four_quotes = """"four quotes at the start""""

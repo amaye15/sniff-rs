@@ -3348,6 +3348,119 @@ this project could just implement directly rather than depend on:
   exactly - plus a 400-file bit-flip fuzz pass against the 500-record
   dataset, zero panics.
 
+- **`toml` → a hand-rolled TOML parser (`toml_support`).** The largest
+  hand-roll in this section by grammar surface, not by algorithmic
+  complexity - TOML's on-disk format is plain, well-specified text, but
+  correctly implementing its *redefinition* rules (which key/table paths
+  may be extended, and by which of dotted-keys vs. `[header]` vs.
+  `[[header]]`, and in which order) turned out to be considerably subtler
+  than the tokenizing itself, and got the rules wrong on a first read of
+  the spec's own prose - see below. Bridges straight to `serde_json::Value`
+  like `serde_norway`'s YAML replacement did (no intermediate `toml::Value`
+  stand-in, since there's no behavior of the old dependency worth
+  preserving beyond "produces the right JSON shape"), except for the
+  *document-structure* layer (`[header]`/`[[header]]`/dotted-key
+  resolution), which needs its own small tree type (`TomlNode`/
+  `TomlTable`) carrying two extra bits of state per table beyond its
+  entries.
+
+  **The redefinition rules needed toml-test's own fixtures to get right,
+  not just the spec text.** A first reading of the spec's prose
+  ("dotted keys create tables... the `[table]` form can be used to define
+  sub-tables within tables defined via dotted keys") led to implementing
+  a single `explicit: bool` per table, closing it to *both* further
+  dotted-key extension *and* `[header]` redefinition once set - which
+  is wrong, confirmed by toml-test's own `append-with-dotted-keys-*`
+  fixtures and, on a closer second read, by the spec's own worked example
+  immediately preceding that sentence (`[fruit]` / `apple.color = "red"` /
+  `apple.taste.sweet = true` / commented-out `# [fruit.apple]  # INVALID`)
+  - the commenting-out convention used throughout the spec for "do not do
+  this" examples was misread the first time as showing valid syntax. The
+  real rule needs *two* independent flags: `via_header` (set only by
+  `[header]`/`[[header]]`, closes the table to *dotted-key* traversal from
+  any later statement, but not to more header-based sub-tables nested
+  under it - the standard "supertable" pattern) and `dotted_owned` (set by
+  *any* dotted-key statement touching the table, closes it to a *later*
+  `[header]` redefinition, but never to more dotted-key extension - `a.b`
+  can always be extended by further `a.b.x = ...` statements, a real and
+  common pattern the spec's own worked example relies on). Both flags gate
+  the same header-redefinition check (`via_header || dotted_owned`); only
+  `via_header` gates the dotted-key-traversal check. Every
+  `append-with-dotted-keys-*`/`redefine-*`/`duplicate-key-*` fixture in
+  toml-test - the ones that actually exercise this interaction - passes
+  with this two-flag model; the single-flag version failed several of
+  them.
+
+  **Multi-line string closing needed the same "verify against the
+  corpus, not just the prose" treatment.** A run of quote characters at
+  the end of a multi-line string can include up to 2 *literal* quotes
+  immediately before the real 3-quote closing delimiter (`""""` closes as
+  "1 literal quote + delimiter", per the spec's own `str4`/`str5`
+  examples) - a first implementation generalized this as "however long
+  the run, the last 3 close and everything before is literal," which
+  wrongly *accepts* toml-test's own `multiline-quotes-01` invalid fixture
+  (a run of exactly 6 quotes, which the spec intends as unrepresentable:
+  the first 3 would already form a valid close, leaving 3 dangling quotes
+  with nothing to attach to). Fixed by capping the literal-quote
+  allowance at 2 (a run of 6+ is a hard error) - verified against
+  toml-test's own `string/multiline-quotes.toml` (the positive case, runs
+  of 4 and 5) and `multiline-quotes-01.toml` (the negative case, a run of
+  6) together, not just whichever one was checked first.
+
+  **Targets TOML 1.1.0** (matching the `toml = "1.1.4+spec-1.1.0"` crate
+  being replaced), which relaxes several 1.0.0 rules: optional seconds in
+  local time/datetime values (`13:37`, not just `13:37:00`), newlines and
+  a trailing comma inside inline tables (previously single-line-only with
+  no trailing comma), and two new string escapes (`\e` for ESC, `\xHH`
+  for the first 256 code points). Datetime values are parsed into a small
+  structured representation and *re-serialized* to match
+  `toml_datetime::Datetime`'s own `Display` impl exactly (checked
+  directly against its source, not assumed) rather than kept as the
+  original substring - the reference crate always normalizes the
+  date/time separator to `T` regardless of whether the source used a
+  space (RFC 3339 permits both), and right-trims trailing zeros from
+  fractional seconds, both of which a verbatim substring copy would get
+  wrong for the cross-verification oracle test to catch.
+
+  **Real-world/adversarial testing found the same class of stack-safety
+  gap this pass already knew to check for** (having just found it in
+  MessagePack's own decoder): TOML's array and inline-table grammar
+  recurses with no depth limit of its own, and a hand-built
+  `[[[...]]]`-nested array genuinely stack-overflowed a debug build
+  somewhere between 5,000 and 10,000 levels - deeper than MessagePack's
+  own danger zone (different recursion shape, lighter per-frame cost),
+  but real and reachable all the same, since `cargo test`/`cargo run`
+  both default to the debug profile that actually exhibits it. Capped at
+  512 (`MAX_TOML_DEPTH`), matching this project's own XML depth guard for
+  the same "comfortable margin, far deeper than any real document would
+  nest" reasoning.
+
+  Verified three ways: **(1)** the full `toml-lang/toml-test` conformance
+  suite, filtered to exactly the files that list applies to a 1.1.0
+  parser (`tests/files-toml-1.1.0`, itself part of the suite) rather than
+  the full valid/invalid directories, which mix in 1.0.0-only fixtures
+  this parser correctly disagrees with (e.g. the 1.0.0 suite marks
+  optional-seconds datetimes and inline-table trailing commas as
+  *invalid*, which 1.1.0 - and this parser - correctly accept) - 220/220
+  valid files accepted, 494/494 invalid files rejected, zero panics.
+  **(2)** `toml_reader_matches_the_toml_crate_output_exactly` cross-checks
+  this parser against the real `toml` crate (kept as a dev-only oracle,
+  the same treatment every other replaced crate in this section already
+  gets) on this project's own fixtures plus a new
+  `tests/fixtures/edge_toml_v1_1_features.toml` (the 1.1.0 features
+  above, all with zero prior coverage in this project's fixtures); and,
+  transiently and not committed (matching this project's usual real-
+  world-corpus practice), against 41 real `Cargo.toml` files pulled from
+  this machine's own crates.io registry cache plus this project's own -
+  all matched the `toml` crate's output exactly, zero panics. **(3)** a
+  400-file bit-flip fuzz pass against a real fixture, zero panics.
+  `tests/fixtures/malformed_deeply_nested.toml` (50,000 levels, matching
+  the scale of this project's other `malformed_deeply_nested.*`
+  fixtures) and `deeply_nested_toml_fails_cleanly_instead_of_a_stack_overflow`
+  lock the depth-guard fix in as a permanent regression test, run through
+  the compiled binary rather than in-process, matching how the original
+  crash was actually reproduced.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3357,7 +3470,8 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, and now `rmpv` all still were, however real their own risk.
+`zstd`, `npyz`, `rmpv`, and now `toml` all still were, however real their
+own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/

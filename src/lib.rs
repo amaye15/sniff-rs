@@ -4416,7 +4416,8 @@ fn columns_from_msgpack(
         "MessagePack support isn't compiled in - rebuild with `cargo build --release --features msgpack` (or --features full)"
     )
 }
-// --- TOML reader (opt-in via --features toml) ---
+// --- TOML reader (opt-in via --features toml, hand-rolled - see
+// `toml_support` below and CLAUDE.md's Dependency footprint section) ---
 // A TOML file is a single document, not inherently a table of many rows -
 // unlike every other reader in this file, there's no natural "row" to
 // repeat. Rather than invent a fake row count, the whole document is
@@ -4425,36 +4426,1299 @@ fn columns_from_msgpack(
 // that flattens exactly like any other JSON array of objects would.
 
 #[cfg(feature = "toml")]
-fn toml_value_to_json(v: &toml::Value) -> JsonValue {
-    match v {
-        toml::Value::String(s) => JsonValue::String(s.clone()),
-        toml::Value::Integer(i) => JsonValue::from(*i),
-        toml::Value::Float(f) => {
-            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        toml::Value::Boolean(b) => JsonValue::Bool(*b),
-        toml::Value::Datetime(dt) => JsonValue::String(dt.to_string()),
-        toml::Value::Array(items) => {
-            JsonValue::Array(items.iter().map(toml_value_to_json).collect())
-        }
-        toml::Value::Table(t) => JsonValue::Object(
-            t.iter()
-                .map(|(k, v)| (k.clone(), toml_value_to_json(v)))
-                .collect(),
-        ),
+mod toml_support {
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // Document tree with definedness tracking. The recursive *value*
+    // grammar (strings/numbers/arrays/inline tables) needs none of this -
+    // it bridges straight to `serde_json::Value`, same as every other
+    // hand-rolled nested-format reader in this project. Only the
+    // *document*-level structure built by `[header]`/`[[header]]`/bare
+    // `key = value` lines needs it, to enforce TOML's own redefinition
+    // rules (verified against the official spec text and, for the
+    // genuinely subtle cases prose alone left ambiguous, against
+    // `toml-lang/toml-test`'s own fixtures - see the worked examples in
+    // CLAUDE.md's Dependency footprint section).
+    // -----------------------------------------------------------------
+
+    #[derive(Clone)]
+    enum TomlNode {
+        /// A sealed leaf - a scalar, a fully-specified inline table, or a
+        /// static array literal. Once set, permanently closed: can never
+        /// be reassigned or navigated into from outside (matching TOML's
+        /// own "inline tables are fully self-contained" rule, and a
+        /// plain key/value pair's own "defining a key twice is invalid"
+        /// rule).
+        Value(JsonValue),
+        Table(TomlTable),
+        ArrayOfTables(Vec<TomlTable>),
     }
-}
+
+    #[derive(Clone, Default)]
+    struct TomlTable {
+        entries: Vec<(String, TomlNode)>,
+        /// `true` once this exact table was the direct target of a
+        /// `[header]` line (or is the freshest element of an
+        /// `[[header]]` array). Such a table stays open to *more*
+        /// `[header]`/`[[header]]` sub-table definitions nested under it
+        /// (the standard "supertable" pattern - see
+        /// `[fruit.apple.texture]` in the spec's own worked example, and
+        /// `[x]` legally defined *after* `[x.y.z.w]` already implied it)
+        /// but is permanently closed to *dotted-key* traversal reaching
+        /// into it from any later statement (a real, deliberate TOML
+        /// rule, not an oversight - confirmed against toml-test's own
+        /// `append-with-dotted-keys-*` fixtures and their commentary,
+        /// not just the spec's prose, since a first reading of the spec
+        /// text alone was misleading here - see this field's sibling
+        /// `dotted_owned` for the other half of the real rule).
+        via_header: bool,
+        /// `true` once this exact table has been the target (final
+        /// segment, or an intermediate ancestor) of *any* dotted-key
+        /// `a.b.c = value` statement. Unlike `via_header`, this does
+        /// *not* close the table to further dotted-key traversal (`a.b`
+        /// can be extended by any number of later `a.b.x = ...`/
+        /// `a.b.y.z = ...` statements - a real, common, valid pattern:
+        /// see the spec's own `apple.color`/`apple.taste.sweet` worked
+        /// example) - it only closes the table to being *later* named by
+        /// a `[header]`, which TOML forbids even though it would be
+        /// logically unambiguous (see the toml-lang GitHub issue linked
+        /// from toml-test's own `append-with-dotted-keys-01` fixture:
+        /// "it was decided this is not valid TOML as it's too confusing/
+        /// convoluted"). Both flags gate the *same* header-redefinition
+        /// check (`via_header || dotted_owned`); only `via_header` gates
+        /// the dotted-key-traversal check.
+        dotted_owned: bool,
+    }
+
+    impl TomlTable {
+        fn get_mut(&mut self, key: &str) -> Option<&mut TomlNode> {
+            self.entries
+                .iter_mut()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+        }
+        fn get(&self, key: &str) -> Option<&TomlNode> {
+            self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        }
+    }
+
+    fn table_to_json(t: &TomlTable) -> JsonValue {
+        JsonValue::Object(
+            t.entries
+                .iter()
+                .map(|(k, v)| (k.clone(), node_to_json(v)))
+                .collect(),
+        )
+    }
+
+    fn node_to_json(n: &TomlNode) -> JsonValue {
+        match n {
+            TomlNode::Value(v) => v.clone(),
+            TomlNode::Table(t) => table_to_json(t),
+            TomlNode::ArrayOfTables(elems) => {
+                JsonValue::Array(elems.iter().map(table_to_json).collect())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Datetime - a small structured representation, re-serialized to
+    // exactly match `toml_datetime::Datetime`'s own `Display` impl
+    // (checked directly against its source, not assumed): date-and-time
+    // always joined with a literal `T` regardless of whether the
+    // original text used a space (RFC 3339 permits both; the reference
+    // crate always normalizes to `T` on output), fractional seconds
+    // right-trimmed of trailing zeros (falling back to a single `0` if
+    // that trims everything), and a numeric offset always rendered
+    // `+HH:MM`/`-HH:MM` (`Z` only for literal UTC).
+    // -----------------------------------------------------------------
+
+    struct TomlDate {
+        year: u32,
+        month: u32,
+        day: u32,
+    }
+    struct TomlTime {
+        hour: u32,
+        minute: u32,
+        second: Option<u32>,
+        nanosecond: Option<u32>,
+    }
+    enum TomlOffset {
+        Z,
+        Minutes(i32),
+    }
+    struct TomlDatetime {
+        date: Option<TomlDate>,
+        time: Option<TomlTime>,
+        offset: Option<TomlOffset>,
+    }
+
+    impl std::fmt::Display for TomlDatetime {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if let Some(d) = &self.date {
+                write!(f, "{:04}-{:02}-{:02}", d.year, d.month, d.day)?;
+            }
+            if let Some(t) = &self.time {
+                if self.date.is_some() {
+                    write!(f, "T")?;
+                }
+                write!(f, "{:02}:{:02}", t.hour, t.minute)?;
+                let second = t.second.or(if t.nanosecond.is_some() {
+                    Some(0)
+                } else {
+                    None
+                });
+                if let Some(s) = second {
+                    write!(f, ":{s:02}")?;
+                }
+                if let Some(ns) = t.nanosecond {
+                    let s = format!("{ns:09}");
+                    let trimmed = s.trim_end_matches('0');
+                    write!(f, ".{}", if trimmed.is_empty() { "0" } else { trimmed })?;
+                }
+            }
+            if let Some(off) = &self.offset {
+                match off {
+                    TomlOffset::Z => write!(f, "Z")?,
+                    TomlOffset::Minutes(mins) => {
+                        let (sign, mins) = if *mins < 0 {
+                            ('-', -mins)
+                        } else {
+                            ('+', *mins)
+                        };
+                        write!(f, "{sign}{:02}:{:02}", mins / 60, mins % 60)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Character-cursor parser
+    // -----------------------------------------------------------------
+
+    /// A conservative recursion-depth cap for nested arrays/inline
+    /// tables, found necessary the same way every other nested-format
+    /// depth guard in this project was: real, adversarial testing (a
+    /// hand-built `[[[...]]]`-nested TOML array) genuinely stack-
+    /// overflowed a debug build somewhere between 5,000 and 10,000
+    /// levels (a release build survives considerably deeper, but debug
+    /// builds - what `cargo test`/`cargo run` both default to - are a
+    /// real, reachable environment, not a hypothetical one). 512 matches
+    /// this project's own XML depth guard (`MAX_XML_DEPTH`), chosen for
+    /// the same reason: comfortable margin under the empirically found
+    /// danger zone, far deeper than any real TOML document would
+    /// plausibly nest.
+    const MAX_TOML_DEPTH: u32 = 512;
+
+    struct P<'a> {
+        s: &'a str,
+        pos: usize,
+        depth: u32,
+    }
+
+    fn is_bare_key_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    }
+
+    impl<'a> P<'a> {
+        fn new(s: &'a str) -> Self {
+            P {
+                s,
+                pos: 0,
+                depth: 0,
+            }
+        }
+
+        fn peek(&self) -> Option<char> {
+            self.s[self.pos..].chars().next()
+        }
+        fn peek_at(&self, offset_chars: usize) -> Option<char> {
+            self.s[self.pos..].chars().nth(offset_chars)
+        }
+        fn bump(&mut self) -> Option<char> {
+            let c = self.peek()?;
+            self.pos += c.len_utf8();
+            Some(c)
+        }
+        fn starts_with(&self, s: &str) -> bool {
+            self.s[self.pos..].starts_with(s)
+        }
+        fn eof(&self) -> bool {
+            self.pos >= self.s.len()
+        }
+
+        fn skip_ws(&mut self) {
+            while matches!(self.peek(), Some(' ' | '\t')) {
+                self.bump();
+            }
+        }
+
+        /// Skips whitespace, comments, and blank lines - used between
+        /// top-level document items.
+        fn skip_ws_comments_newlines(&mut self) -> Result<()> {
+            loop {
+                match self.peek() {
+                    Some(' ' | '\t') => {
+                        self.bump();
+                    }
+                    Some('\r') if self.peek_at(1) == Some('\n') => {
+                        self.bump();
+                        self.bump();
+                    }
+                    Some('\n') => {
+                        self.bump();
+                    }
+                    Some('#') => {
+                        self.skip_comment()?;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(())
+        }
+
+        fn skip_comment(&mut self) -> Result<()> {
+            self.bump(); // '#'
+            loop {
+                match self.peek() {
+                    None | Some('\n') => break,
+                    Some('\r') if self.peek_at(1) == Some('\n') => break,
+                    Some(c) => {
+                        let cp = c as u32;
+                        if cp <= 0x08 || (0x0A..=0x1F).contains(&cp) || cp == 0x7F {
+                            bail!("malformed TOML: control character not permitted in a comment");
+                        }
+                        self.bump();
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn expect_newline_or_eof(&mut self) -> Result<()> {
+            self.skip_ws();
+            match self.peek() {
+                None => Ok(()),
+                Some('#') => self.skip_comment(),
+                Some('\n') => {
+                    self.bump();
+                    Ok(())
+                }
+                Some('\r') if self.peek_at(1) == Some('\n') => {
+                    self.bump();
+                    self.bump();
+                    Ok(())
+                }
+                Some(c) => bail!("malformed TOML: expected end of line, found '{c}'"),
+            }
+        }
+
+        // -- keys --
+
+        fn parse_key_segment(&mut self) -> Result<String> {
+            self.skip_ws();
+            // Keys may only be *single-line* basic/literal strings - the
+            // multi-line forms are explicitly not a valid key form (see
+            // toml-test's own `key/multiline-key-*` invalid fixtures).
+            if self.starts_with("\"\"\"") || self.starts_with("'''") {
+                bail!("malformed TOML: a multi-line string is not a valid key");
+            }
+            match self.peek() {
+                Some('"') => self.parse_basic_string(),
+                Some('\'') => self.parse_literal_string_raw(),
+                Some(c) if is_bare_key_char(c) => {
+                    let start = self.pos;
+                    while matches!(self.peek(), Some(c) if is_bare_key_char(c)) {
+                        self.bump();
+                    }
+                    Ok(self.s[start..self.pos].to_string())
+                }
+                _ => bail!("malformed TOML: expected a key"),
+            }
+        }
+
+        fn parse_dotted_key(&mut self) -> Result<Vec<String>> {
+            let mut parts = vec![self.parse_key_segment()?];
+            loop {
+                self.skip_ws();
+                if self.peek() == Some('.') {
+                    self.bump();
+                    parts.push(self.parse_key_segment()?);
+                } else {
+                    break;
+                }
+            }
+            Ok(parts)
+        }
+
+        // -- strings --
+
+        fn read_hex_n(&mut self, n: usize) -> Result<u32> {
+            let start = self.pos;
+            for _ in 0..n {
+                match self.peek() {
+                    Some(c) if c.is_ascii_hexdigit() => {
+                        self.bump();
+                    }
+                    _ => bail!("malformed TOML: invalid unicode escape"),
+                }
+            }
+            u32::from_str_radix(&self.s[start..self.pos], 16)
+                .ok()
+                .context("malformed TOML: invalid unicode escape")
+        }
+
+        fn basic_escape(&mut self) -> Result<Option<char>> {
+            match self.bump() {
+                Some('b') => Ok(Some('\u{8}')),
+                Some('t') => Ok(Some('\t')),
+                Some('n') => Ok(Some('\n')),
+                Some('f') => Ok(Some('\u{C}')),
+                Some('r') => Ok(Some('\r')),
+                Some('"') => Ok(Some('"')),
+                Some('\\') => Ok(Some('\\')),
+                Some('u') => {
+                    let cp = self.read_hex_n(4)?;
+                    char::from_u32(cp)
+                        .map(Some)
+                        .context("malformed TOML: invalid unicode scalar value")
+                }
+                Some('U') => {
+                    let cp = self.read_hex_n(8)?;
+                    char::from_u32(cp)
+                        .map(Some)
+                        .context("malformed TOML: invalid unicode scalar value")
+                }
+                // TOML 1.1.0 additions: `\e` for ESC (U+001B), and `\xHH`
+                // for the first 256 code points (verified against
+                // toml-test's own `string/escape-esc.toml` and
+                // `string/hex-escape.toml` fixtures).
+                Some('e') => Ok(Some('\u{1B}')),
+                Some('x') => {
+                    let cp = self.read_hex_n(2)?;
+                    char::from_u32(cp)
+                        .map(Some)
+                        .context("malformed TOML: invalid unicode scalar value")
+                }
+                Some(c) => bail!("malformed TOML: invalid escape sequence '\\{c}'"),
+                None => bail!("malformed TOML: unterminated escape sequence"),
+            }
+        }
+
+        fn forbidden_string_control_char(c: char, allow_tab_lf_cr: bool) -> bool {
+            let cp = c as u32;
+            if allow_tab_lf_cr && (c == '\t' || c == '\n' || c == '\r') {
+                return false;
+            }
+            cp <= 0x08
+                || cp == 0x0B
+                || cp == 0x0C
+                || (0x0E..=0x1F).contains(&cp)
+                || cp == 0x7F
+                || (cp <= 0x1F && !allow_tab_lf_cr && c != '\t')
+        }
+
+        fn parse_basic_string(&mut self) -> Result<String> {
+            if self.starts_with("\"\"\"") {
+                return self.parse_multiline_basic_string();
+            }
+            self.bump(); // opening quote
+            let mut out = String::new();
+            loop {
+                match self.peek() {
+                    None => bail!("malformed TOML: unterminated string"),
+                    Some('"') => {
+                        self.bump();
+                        break;
+                    }
+                    Some('\\') => {
+                        self.bump();
+                        if let Some(c) = self.basic_escape()? {
+                            out.push(c);
+                        }
+                    }
+                    Some('\n') => bail!("malformed TOML: newline in single-line string"),
+                    Some(c) => {
+                        if Self::forbidden_string_control_char(c, false) {
+                            bail!("malformed TOML: control character not permitted in a string");
+                        }
+                        self.bump();
+                        out.push(c);
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        fn parse_multiline_basic_string(&mut self) -> Result<String> {
+            self.pos += 3; // """
+            if self.peek() == Some('\r') && self.peek_at(1) == Some('\n') {
+                self.pos += 2;
+            } else if self.peek() == Some('\n') {
+                self.bump();
+            }
+            let mut out = String::new();
+            loop {
+                match self.peek() {
+                    None => bail!("malformed TOML: unterminated multi-line string"),
+                    Some('"') => {
+                        // Greedily count the *whole* consecutive run: up
+                        // to 2 quotes may appear literally anywhere,
+                        // including immediately before the closing
+                        // delimiter (verified against toml-test's own
+                        // `string/multiline-quotes.toml`: `""""` closes
+                        // as "1 literal quote + delimiter",
+                        // `"""""`/`""""""`... as "2 literal + delimiter" -
+                        // but 3+ leading extras, i.e. a run of 6 or more,
+                        // is invalid, per `multiline-quotes-01`'s own
+                        // negative fixture - the *first* 3 of a 6-run
+                        // would themselves already form a valid close,
+                        // leaving 3 dangling quotes with nothing to
+                        // attach to).
+                        let mut n = 0usize;
+                        let save = self.pos;
+                        while self.peek() == Some('"') {
+                            n += 1;
+                            self.bump();
+                        }
+                        if n < 3 {
+                            self.pos = save;
+                            for _ in 0..n {
+                                out.push('"');
+                                self.bump();
+                            }
+                            continue;
+                        }
+                        if n > 5 {
+                            bail!(
+                                "malformed TOML: too many consecutive quotes in a multi-line string"
+                            );
+                        }
+                        for _ in 0..(n - 3) {
+                            out.push('"');
+                        }
+                        break;
+                    }
+                    Some('\r') if self.peek_at(1) != Some('\n') => {
+                        bail!(
+                            "malformed TOML: a lone carriage return is not permitted in a string"
+                        );
+                    }
+                    Some('\\') => {
+                        self.bump();
+                        // line-ending backslash
+                        let save = self.pos;
+                        let mut only_ws = true;
+                        let mut p = self.pos;
+                        let bytes = self.s.as_bytes();
+                        while p < bytes.len() {
+                            let c = self.s[p..].chars().next().unwrap();
+                            if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+                                p += c.len_utf8();
+                            } else {
+                                break;
+                            }
+                        }
+                        // Only a genuine "line ending backslash" if a newline
+                        // actually appears before any non-whitespace.
+                        let ahead = &self.s[self.pos..p];
+                        if ahead.contains('\n') {
+                            self.pos = p;
+                        } else {
+                            only_ws = false;
+                        }
+                        if !only_ws {
+                            self.pos = save;
+                            if let Some(c) = self.basic_escape()? {
+                                out.push(c);
+                            }
+                        }
+                    }
+                    Some(c) => {
+                        if Self::forbidden_string_control_char(c, true) {
+                            bail!("malformed TOML: control character not permitted in a string");
+                        }
+                        self.bump();
+                        out.push(c);
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        fn parse_literal_string_raw(&mut self) -> Result<String> {
+            if self.starts_with("'''") {
+                return self.parse_multiline_literal_string();
+            }
+            self.bump();
+            let mut out = String::new();
+            loop {
+                match self.peek() {
+                    None => bail!("malformed TOML: unterminated string"),
+                    Some('\'') => {
+                        self.bump();
+                        break;
+                    }
+                    Some('\n') => bail!("malformed TOML: newline in single-line string"),
+                    Some(c) => {
+                        if Self::forbidden_string_control_char(c, false) {
+                            bail!("malformed TOML: control character not permitted in a string");
+                        }
+                        self.bump();
+                        out.push(c);
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        fn parse_multiline_literal_string(&mut self) -> Result<String> {
+            self.pos += 3;
+            if self.peek() == Some('\r') && self.peek_at(1) == Some('\n') {
+                self.pos += 2;
+            } else if self.peek() == Some('\n') {
+                self.bump();
+            }
+            let mut out = String::new();
+            loop {
+                match self.peek() {
+                    None => bail!("malformed TOML: unterminated multi-line string"),
+                    Some('\'') => {
+                        // See `parse_multiline_basic_string`'s identical
+                        // (and identically-verified) rule above: up to 2
+                        // extra literal quotes may precede the real
+                        // 3-quote close; a run of 6+ is invalid.
+                        let mut n = 0usize;
+                        let save = self.pos;
+                        while self.peek() == Some('\'') {
+                            n += 1;
+                            self.bump();
+                        }
+                        if n < 3 {
+                            self.pos = save;
+                            for _ in 0..n {
+                                out.push('\'');
+                                self.bump();
+                            }
+                            continue;
+                        }
+                        if n > 5 {
+                            bail!(
+                                "malformed TOML: too many consecutive quotes in a multi-line string"
+                            );
+                        }
+                        for _ in 0..(n - 3) {
+                            out.push('\'');
+                        }
+                        break;
+                    }
+                    Some('\r') if self.peek_at(1) != Some('\n') => {
+                        bail!(
+                            "malformed TOML: a lone carriage return is not permitted in a string"
+                        );
+                    }
+                    Some(c) => {
+                        if Self::forbidden_string_control_char(c, true) {
+                            bail!("malformed TOML: control character not permitted in a string");
+                        }
+                        self.bump();
+                        out.push(c);
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        // -- values --
+
+        fn parse_value(&mut self) -> Result<JsonValue> {
+            self.skip_ws();
+            match self.peek() {
+                Some('"') => self.parse_basic_string().map(JsonValue::String),
+                Some('\'') => self.parse_literal_string_raw().map(JsonValue::String),
+                Some('[') => self.parse_array(),
+                Some('{') => self.parse_inline_table(),
+                Some('t') if self.starts_with("true") => {
+                    self.pos += 4;
+                    Ok(JsonValue::Bool(true))
+                }
+                Some('f') if self.starts_with("false") => {
+                    self.pos += 5;
+                    Ok(JsonValue::Bool(false))
+                }
+                Some(_) => self.parse_number_or_datetime(),
+                None => bail!("malformed TOML: expected a value"),
+            }
+        }
+
+        fn parse_array(&mut self) -> Result<JsonValue> {
+            self.bump(); // [
+            self.depth += 1;
+            if self.depth > MAX_TOML_DEPTH {
+                bail!("malformed TOML: nested more than {MAX_TOML_DEPTH} levels deep");
+            }
+            let mut items = Vec::new();
+            loop {
+                self.skip_array_ws()?;
+                if self.peek() == Some(']') {
+                    self.bump();
+                    break;
+                }
+                items.push(self.parse_value()?);
+                self.skip_array_ws()?;
+                match self.peek() {
+                    Some(',') => {
+                        self.bump();
+                    }
+                    Some(']') => {
+                        self.bump();
+                        break;
+                    }
+                    _ => bail!("malformed TOML: expected ',' or ']' in array"),
+                }
+            }
+            self.depth -= 1;
+            Ok(JsonValue::Array(items))
+        }
+
+        fn skip_array_ws(&mut self) -> Result<()> {
+            loop {
+                match self.peek() {
+                    Some(' ' | '\t' | '\n') => {
+                        self.bump();
+                    }
+                    Some('\r') if self.peek_at(1) == Some('\n') => {
+                        self.bump();
+                        self.bump();
+                    }
+                    Some('#') => self.skip_comment()?,
+                    _ => break,
+                }
+            }
+            Ok(())
+        }
+
+        /// TOML 1.1.0 relaxes the original "single line only, no
+        /// trailing comma" inline-table restriction to allow both -
+        /// verified against toml-test's own `inline-table/newline*` and
+        /// `key/empty-05` valid fixtures, which exercise exactly this.
+        fn parse_inline_table(&mut self) -> Result<JsonValue> {
+            self.bump(); // {
+            self.depth += 1;
+            if self.depth > MAX_TOML_DEPTH {
+                bail!("malformed TOML: nested more than {MAX_TOML_DEPTH} levels deep");
+            }
+            let mut table = TomlTable::default();
+            self.skip_array_ws()?;
+            if self.peek() != Some('}') {
+                loop {
+                    self.skip_array_ws()?;
+                    let path = self.parse_dotted_key()?;
+                    self.skip_ws();
+                    if self.bump() != Some('=') {
+                        bail!("malformed TOML: expected '=' in inline table");
+                    }
+                    self.skip_ws();
+                    let value = self.parse_value()?;
+                    set_dotted(&mut table, &path, TomlNode::Value(value))?;
+                    self.skip_array_ws()?;
+                    match self.peek() {
+                        Some(',') => {
+                            self.bump();
+                            self.skip_array_ws()?;
+                            if self.peek() == Some('}') {
+                                break;
+                            }
+                        }
+                        Some('}') => break,
+                        _ => bail!("malformed TOML: expected ',' or '}}' in inline table"),
+                    }
+                }
+            }
+            self.bump(); // }
+            self.depth -= 1;
+            Ok(table_to_json(&table))
+        }
+
+        /// Grabs the maximal run of number/datetime-token characters,
+        /// including the one special case where a *local date* is
+        /// immediately followed by a single space and then a time (the
+        /// RFC 3339 space-instead-of-`T` allowance) - checked for
+        /// specifically rather than folding space into the generic
+        /// token charset, since a bare space is otherwise a genuine
+        /// value/array/inline-table separator.
+        fn read_value_token(&mut self) -> String {
+            let start = self.pos;
+            let is_tok =
+                |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | '_' | ':');
+            while matches!(self.peek(), Some(c) if is_tok(c)) {
+                self.bump();
+            }
+            let core = &self.s[start..self.pos];
+            if core.len() == 10
+                && core.as_bytes()[4] == b'-'
+                && core.as_bytes()[7] == b'-'
+                && core
+                    .bytes()
+                    .enumerate()
+                    .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+                && self.peek() == Some(' ')
+                && let Some(c2) = self.peek_at(1)
+                && c2.is_ascii_digit()
+            {
+                self.bump(); // the space
+                while matches!(self.peek(), Some(c) if is_tok(c)) {
+                    self.bump();
+                }
+            }
+            self.s[start..self.pos].to_string()
+        }
+
+        fn parse_number_or_datetime(&mut self) -> Result<JsonValue> {
+            if self.starts_with("+inf") || self.starts_with("-inf") {
+                let neg = self.peek() == Some('-');
+                self.pos += 4;
+                return Ok(f64_to_json(if neg {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }));
+            }
+            if self.starts_with("inf") {
+                self.pos += 3;
+                return Ok(f64_to_json(f64::INFINITY));
+            }
+            if self.starts_with("+nan") || self.starts_with("-nan") {
+                self.pos += 4;
+                return Ok(f64_to_json(f64::NAN));
+            }
+            if self.starts_with("nan") {
+                self.pos += 3;
+                return Ok(f64_to_json(f64::NAN));
+            }
+            if self.starts_with("0x") || self.starts_with("0o") || self.starts_with("0b") {
+                return self.parse_radix_int();
+            }
+
+            let token = self.read_value_token();
+            if token.is_empty() {
+                bail!("malformed TOML: expected a value");
+            }
+            classify_number_or_datetime(&token)
+        }
+
+        fn parse_radix_int(&mut self) -> Result<JsonValue> {
+            let radix = match self.peek_at(1) {
+                Some('x') => 16,
+                Some('o') => 8,
+                Some('b') => 2,
+                _ => unreachable!(),
+            };
+            self.pos += 2;
+            let start = self.pos;
+            while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit() || c == '_') {
+                self.bump();
+            }
+            let raw = &self.s[start..self.pos];
+            let digits: String = raw.chars().filter(|&c| c != '_').collect();
+            if digits.is_empty() || raw.starts_with('_') || raw.ends_with('_') || raw.contains("__")
+            {
+                bail!("malformed TOML: invalid integer literal");
+            }
+            let v = i64::from_str_radix(&digits, radix)
+                .or_else(|_| u64::from_str_radix(&digits, radix).map(|u| u as i64))
+                .context("malformed TOML: integer literal out of range")?;
+            Ok(JsonValue::from(v))
+        }
+    }
+
+    fn f64_to_json(f: f64) -> JsonValue {
+        serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+    }
+
+    fn valid_underscored_digits(s: &str, digit_ok: impl Fn(char) -> bool) -> Option<String> {
+        if s.is_empty() || s.starts_with('_') || s.ends_with('_') || s.contains("__") {
+            return None;
+        }
+        let mut out = String::new();
+        for c in s.chars() {
+            if c == '_' {
+                continue;
+            }
+            if !digit_ok(c) {
+                return None;
+            }
+            out.push(c);
+        }
+        if out.is_empty() { None } else { Some(out) }
+    }
+
+    /// Classifies an already-extracted value token as an integer, float,
+    /// or one of the four datetime shapes - verified against the spec's
+    /// own ABNF-described character positions (year/month/day/hour/
+    /// minute/second field widths, the fractional-seconds/offset
+    /// suffixes) rather than a general date-parsing library.
+    fn classify_number_or_datetime(token: &str) -> Result<JsonValue> {
+        let bytes = token.as_bytes();
+
+        // Local Date: exactly YYYY-MM-DD.
+        let looks_like_date = bytes.len() >= 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[0..4].iter().all(u8::is_ascii_digit)
+            && bytes[5..7].iter().all(u8::is_ascii_digit)
+            && bytes[8..10].iter().all(u8::is_ascii_digit);
+
+        if looks_like_date {
+            let year: u32 = token[0..4].parse().unwrap();
+            let month: u32 = token[5..7].parse().unwrap();
+            let day: u32 = token[8..10].parse().unwrap();
+            validate_date(year, month, day)?;
+            let date = TomlDate { year, month, day };
+            if token.len() == 10 {
+                return Ok(JsonValue::String(
+                    TomlDatetime {
+                        date: Some(date),
+                        time: None,
+                        offset: None,
+                    }
+                    .to_string(),
+                ));
+            }
+            // Date + time, joined by 'T'/'t'/' '.
+            let sep = token.as_bytes()[10];
+            if sep != b'T' && sep != b't' && sep != b' ' {
+                bail!("malformed TOML: invalid datetime '{token}'");
+            }
+            let (time, offset) = parse_time_and_offset(&token[11..])?;
+            return Ok(JsonValue::String(
+                TomlDatetime {
+                    date: Some(date),
+                    time: Some(time),
+                    offset,
+                }
+                .to_string(),
+            ));
+        }
+
+        // Local Time: HH:MM[:SS[.frac]] (no date, no offset) - seconds
+        // are optional since TOML 1.1.0.
+        let looks_like_time = bytes.len() >= 5
+            && bytes[2] == b':'
+            && bytes[0..2].iter().all(u8::is_ascii_digit)
+            && bytes[3..5].iter().all(u8::is_ascii_digit);
+        if looks_like_time {
+            let (time, offset) = parse_time_and_offset(token)?;
+            if offset.is_some() {
+                bail!("malformed TOML: a local time cannot have a timezone offset");
+            }
+            return Ok(JsonValue::String(
+                TomlDatetime {
+                    date: None,
+                    time: Some(time),
+                    offset: None,
+                }
+                .to_string(),
+            ));
+        }
+
+        // Otherwise: integer or float.
+        parse_int_or_float(token)
+    }
+
+    fn validate_date(year: u32, month: u32, day: u32) -> Result<()> {
+        if !(1..=12).contains(&month) {
+            bail!("malformed TOML: invalid month in date");
+        }
+        let max_day = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100))
+                    || year.is_multiple_of(400);
+                if leap { 29 } else { 28 }
+            }
+            _ => unreachable!(),
+        };
+        if day == 0 || day > max_day {
+            bail!("malformed TOML: invalid day in date");
+        }
+        Ok(())
+    }
+
+    fn parse_time_and_offset(s: &str) -> Result<(TomlTime, Option<TomlOffset>)> {
+        let bytes = s.as_bytes();
+        if bytes.len() < 5
+            || bytes[2] != b':'
+            || !bytes[0].is_ascii_digit()
+            || !bytes[1].is_ascii_digit()
+            || !bytes[3].is_ascii_digit()
+            || !bytes[4].is_ascii_digit()
+        {
+            bail!("malformed TOML: invalid time '{s}'");
+        }
+        let hour: u32 = s[0..2].parse().context("malformed TOML: invalid hour")?;
+        let minute: u32 = s[3..5].parse().context("malformed TOML: invalid minute")?;
+        if hour > 23 || minute > 59 {
+            bail!("malformed TOML: time field out of range");
+        }
+        let mut rest = &s[5..];
+        let mut second = None;
+        let mut nanosecond = None;
+        // Seconds are optional (TOML 1.1.0) - `HH:MM` alone is valid.
+        if let Some(after_colon) = rest.strip_prefix(':') {
+            let sbytes = after_colon.as_bytes();
+            if sbytes.len() < 2 || !sbytes[0].is_ascii_digit() || !sbytes[1].is_ascii_digit() {
+                bail!("malformed TOML: invalid second in '{s}'");
+            }
+            let sec: u32 = after_colon[0..2]
+                .parse()
+                .context("malformed TOML: invalid second")?;
+            if sec > 60 {
+                bail!("malformed TOML: time field out of range");
+            }
+            second = Some(sec);
+            rest = &after_colon[2..];
+            if let Some(frac) = rest.strip_prefix('.') {
+                let end = frac
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(frac.len());
+                let digits = &frac[..end];
+                if digits.is_empty() {
+                    bail!("malformed TOML: invalid fractional seconds");
+                }
+                let truncated = &digits[..digits.len().min(9)];
+                let padded = format!("{truncated:0<9}");
+                nanosecond = Some(
+                    padded
+                        .parse::<u32>()
+                        .context("malformed TOML: invalid fractional seconds")?,
+                );
+                rest = &frac[end..];
+            }
+        }
+        let time = TomlTime {
+            hour,
+            minute,
+            second,
+            nanosecond,
+        };
+
+        let offset = if rest.is_empty() {
+            None
+        } else if rest == "Z" || rest == "z" {
+            Some(TomlOffset::Z)
+        } else {
+            let rbytes = rest.as_bytes();
+            if rbytes.len() != 6 || (rbytes[0] != b'+' && rbytes[0] != b'-') || rbytes[3] != b':' {
+                bail!("malformed TOML: invalid timezone offset '{rest}'");
+            }
+            let sign = if rbytes[0] == b'-' { -1 } else { 1 };
+            let oh: i32 = rest[1..3]
+                .parse()
+                .context("malformed TOML: invalid offset hour")?;
+            let om: i32 = rest[4..6]
+                .parse()
+                .context("malformed TOML: invalid offset minute")?;
+            if oh > 23 || om > 59 {
+                bail!("malformed TOML: timezone offset out of range");
+            }
+            Some(TomlOffset::Minutes(sign * (oh * 60 + om)))
+        };
+        Ok((time, offset))
+    }
+
+    fn parse_int_or_float(token: &str) -> Result<JsonValue> {
+        let (sign, unsigned) = match token.strip_prefix('-') {
+            Some(rest) => ("-", rest),
+            None => match token.strip_prefix('+') {
+                Some(rest) => ("", rest),
+                None => ("", token),
+            },
+        };
+        let is_float = unsigned.contains('.') || unsigned.contains('e') || unsigned.contains('E');
+
+        if !is_float {
+            let digits = valid_underscored_digits(unsigned, |c| c.is_ascii_digit())
+                .with_context(|| format!("malformed TOML: invalid integer '{token}'"))?;
+            if digits.len() > 1 && digits.starts_with('0') {
+                bail!("malformed TOML: leading zeros are not allowed in integers ('{token}')");
+            }
+            let full = format!("{sign}{digits}");
+            let v: i64 = full
+                .parse()
+                .with_context(|| format!("malformed TOML: integer '{token}' out of range"))?;
+            return Ok(JsonValue::from(v));
+        }
+
+        // Float: intpart ['.' fracpart] [('e'|'E') exppart]
+        let (mantissa, exp) = match unsigned.split_once(['e', 'E']) {
+            Some((m, e)) => (m, Some(e)),
+            None => (unsigned, None),
+        };
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((i, f)) => (i, Some(f)),
+            None => (mantissa, None),
+        };
+        let int_digits = valid_underscored_digits(int_part, |c| c.is_ascii_digit())
+            .with_context(|| format!("malformed TOML: invalid float '{token}'"))?;
+        if int_digits.len() > 1 && int_digits.starts_with('0') {
+            bail!("malformed TOML: leading zeros are not allowed in floats ('{token}')");
+        }
+        let mut rebuilt = format!("{sign}{int_digits}");
+        if let Some(f) = frac_part {
+            let frac_digits = valid_underscored_digits(f, |c| c.is_ascii_digit())
+                .with_context(|| format!("malformed TOML: invalid float '{token}'"))?;
+            rebuilt.push('.');
+            rebuilt.push_str(&frac_digits);
+        }
+        if let Some(e) = exp {
+            let (esign, eu) = match e.strip_prefix('-') {
+                Some(r) => ("-", r),
+                None => match e.strip_prefix('+') {
+                    Some(r) => ("+", r),
+                    None => ("+", e),
+                },
+            };
+            let edigits = valid_underscored_digits(eu, |c| c.is_ascii_digit())
+                .with_context(|| format!("malformed TOML: invalid float exponent '{token}'"))?;
+            rebuilt.push('e');
+            rebuilt.push_str(esign);
+            rebuilt.push_str(&edigits);
+        }
+        let v: f64 = rebuilt
+            .parse()
+            .with_context(|| format!("malformed TOML: invalid float '{token}'"))?;
+        Ok(f64_to_json(v))
+    }
+
+    // -----------------------------------------------------------------
+    // Path resolution against the document tree
+    // -----------------------------------------------------------------
+
+    /// Walks a dotted key `path` from `root` (the LHS of a `key = value`
+    /// statement - top-level or inside an inline table), creating
+    /// ancestor tables as needed and setting the final segment to
+    /// `value`. Every table segment touched (ancestor or final parent)
+    /// gets `dotted_owned = true` (closing it to a *later* `[header]`,
+    /// but not to more dotted-key extension); walking through a table
+    /// with `via_header = true` is TOML's own deliberate error (see
+    /// `TomlTable::via_header`'s doc comment) - dotted keys can never
+    /// reach into an already `[header]`-defined table, even though the
+    /// *header* form can always walk through anything.
+    fn set_dotted(root: &mut TomlTable, path: &[String], value: TomlNode) -> Result<()> {
+        let mut cur = root;
+        for (i, seg) in path.iter().enumerate() {
+            let last = i == path.len() - 1;
+            if last {
+                if cur.get(seg).is_some() {
+                    bail!("malformed TOML: duplicate key '{seg}'");
+                }
+                cur.entries.push((seg.clone(), value));
+                return Ok(());
+            }
+            if cur.get(seg).is_none() {
+                cur.entries.push((
+                    seg.clone(),
+                    TomlNode::Table(TomlTable {
+                        dotted_owned: true,
+                        ..TomlTable::default()
+                    }),
+                ));
+            }
+            match cur.get_mut(seg).unwrap() {
+                TomlNode::Table(t) => {
+                    if t.via_header {
+                        bail!(
+                            "malformed TOML: cannot use dotted keys to add to an already-defined table '{seg}'"
+                        );
+                    }
+                    t.dotted_owned = true;
+                    cur = t;
+                }
+                TomlNode::ArrayOfTables(_) => {
+                    bail!(
+                        "malformed TOML: cannot use dotted keys to reach into an array of tables '{seg}'"
+                    );
+                }
+                TomlNode::Value(_) => {
+                    bail!("malformed TOML: '{seg}' is already defined and is not a table");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves (creating implicit ancestors as needed) the table a
+    /// `[header]` or `[[header]]` line names, per the walking rules
+    /// `set_dotted` documents (header paths may pass through explicit
+    /// ancestors freely - that's the standard "supertable defined
+    /// afterward" / nested-subtable pattern).
+    fn resolve_table_path<'t>(
+        root: &'t mut TomlTable,
+        path: &[String],
+    ) -> Result<&'t mut TomlTable> {
+        let mut cur = root;
+        for seg in path {
+            let exists = cur.get(seg).is_some();
+            if !exists {
+                cur.entries
+                    .push((seg.clone(), TomlNode::Table(TomlTable::default())));
+            }
+            match cur.get_mut(seg).unwrap() {
+                TomlNode::Table(t) => cur = t,
+                TomlNode::ArrayOfTables(elems) => {
+                    cur = elems
+                        .last_mut()
+                        .context("malformed TOML: empty array of tables")?;
+                }
+                TomlNode::Value(_) => {
+                    bail!("malformed TOML: '{seg}' is already defined and is not a table")
+                }
+            }
+        }
+        Ok(cur)
+    }
+
+    fn define_table_header(root: &mut TomlTable, path: &[String]) -> Result<()> {
+        let (last, ancestors) = path
+            .split_last()
+            .context("malformed TOML: empty table header")?;
+        let parent = resolve_table_path(root, ancestors)?;
+        match parent.get_mut(last) {
+            None => {
+                parent.entries.push((
+                    last.clone(),
+                    TomlNode::Table(TomlTable {
+                        via_header: true,
+                        ..TomlTable::default()
+                    }),
+                ));
+            }
+            Some(TomlNode::Table(t)) => {
+                if t.via_header || t.dotted_owned {
+                    bail!("malformed TOML: table '{}' redefined", path.join("."));
+                }
+                t.via_header = true;
+            }
+            Some(_) => bail!(
+                "malformed TOML: '{}' is already defined and is not a table",
+                path.join(".")
+            ),
+        }
+        Ok(())
+    }
+
+    fn define_array_of_tables_header(root: &mut TomlTable, path: &[String]) -> Result<()> {
+        let (last, ancestors) = path
+            .split_last()
+            .context("malformed TOML: empty table header")?;
+        let parent = resolve_table_path(root, ancestors)?;
+        match parent.get_mut(last) {
+            None => {
+                parent.entries.push((
+                    last.clone(),
+                    TomlNode::ArrayOfTables(vec![TomlTable {
+                        via_header: true,
+                        ..TomlTable::default()
+                    }]),
+                ));
+            }
+            Some(TomlNode::ArrayOfTables(elems)) => {
+                elems.push(TomlTable {
+                    via_header: true,
+                    ..TomlTable::default()
+                });
+            }
+            Some(_) => bail!(
+                "malformed TOML: '{}' is already defined and is not an array of tables",
+                path.join(".")
+            ),
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Document driver
+    // -----------------------------------------------------------------
+
+    fn parse_document(text: &str) -> Result<JsonValue> {
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+        let mut p = P::new(text);
+        let mut root = TomlTable::default();
+        // The table `key = value` lines currently append to, named by
+        // its full path from the root - re-resolved fresh each time
+        // it's needed (rather than holding a live `&mut` across loop
+        // iterations, which the borrow checker can't reconcile with
+        // `root` also being mutated by header lines in between) since a
+        // TOML document's header-switch frequency makes the O(depth)
+        // re-walk cost negligible.
+        let mut current_path: Vec<String> = Vec::new();
+
+        p.skip_ws_comments_newlines()?;
+        while !p.eof() {
+            if p.starts_with("[[") {
+                p.pos += 2;
+                p.skip_ws();
+                let path = p.parse_dotted_key()?;
+                p.skip_ws();
+                if !p.starts_with("]]") {
+                    bail!("malformed TOML: expected ']]'");
+                }
+                p.pos += 2;
+                define_array_of_tables_header(&mut root, &path)?;
+                current_path = path;
+                p.expect_newline_or_eof()?;
+            } else if p.peek() == Some('[') {
+                p.bump();
+                p.skip_ws();
+                let path = p.parse_dotted_key()?;
+                p.skip_ws();
+                if p.peek() != Some(']') {
+                    bail!("malformed TOML: expected ']'");
+                }
+                p.bump();
+                define_table_header(&mut root, &path)?;
+                current_path = path;
+                p.expect_newline_or_eof()?;
+            } else {
+                let path = p.parse_dotted_key()?;
+                p.skip_ws();
+                if p.bump() != Some('=') {
+                    bail!("malformed TOML: expected '='");
+                }
+                p.skip_ws();
+                let value = p.parse_value()?;
+                let cur = resolve_table_path(&mut root, &current_path)?;
+                set_dotted(cur, &path, TomlNode::Value(value))?;
+                p.expect_newline_or_eof()?;
+            }
+            p.skip_ws_comments_newlines()?;
+        }
+
+        Ok(table_to_json(&root))
+    }
+
+    pub(crate) fn columns_from_toml(path: &Path, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = parse_document(&content)
+            .with_context(|| format!("failed to parse {path:?} as TOML"))?;
+        let record = match value {
+            JsonValue::Object(m) => m,
+            _ => bail!("expected a TOML document with top-level key-value pairs in {path:?}"),
+        };
+        Ok(profile_json_records(&[record], n_samples))
+    }
+} // mod toml_support
 
 #[cfg(feature = "toml")]
 fn columns_from_toml(path: &Path, n_samples: usize) -> Result<Vec<ColumnProfile>> {
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let value: toml::Value =
-        toml::from_str(&content).with_context(|| format!("failed to parse {path:?} as TOML"))?;
-    let record = match toml_value_to_json(&value) {
-        JsonValue::Object(m) => m,
-        _ => bail!("expected a TOML document with top-level key-value pairs in {path:?}"),
-    };
-    Ok(profile_json_records(&[record], n_samples))
+    toml_support::columns_from_toml(path, n_samples)
 }
 
 #[cfg(not(feature = "toml"))]
@@ -4463,7 +5727,6 @@ fn columns_from_toml(_path: &Path, _n_samples: usize) -> Result<Vec<ColumnProfil
         "TOML support isn't compiled in - rebuild with `cargo build --release --features toml` (or --features full)"
     )
 }
-
 // --- YAML reader (opt-in via --features yaml, hand-rolled - see
 // `yaml_support` below and CLAUDE.md's Dependency footprint section for
 // the full writeup, including the real, disclosed scope boundaries this
@@ -16052,6 +17315,91 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
             let theirs = columns_from_msgpack_via_rmpv(path, 100)
                 .unwrap_or_else(|e| panic!("{f}: rmpv-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Test-only: `toml` is a dev-dependency now (see Cargo.toml and
+    /// CLAUDE.md's Dependency footprint section) - `toml_support`'s own
+    /// hand-rolled parser replaced it at runtime, so this function's only
+    /// remaining job is producing the "expected" side of
+    /// `toml_reader_matches_the_toml_crate_output_exactly`. A near-
+    /// verbatim copy of what `columns_from_toml` used to be before that
+    /// module replaced it.
+    #[cfg(all(test, feature = "toml"))]
+    fn columns_from_toml_via_toml_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        fn value_to_json(v: &toml::Value) -> JsonValue {
+            match v {
+                toml::Value::String(s) => JsonValue::String(s.clone()),
+                toml::Value::Integer(i) => JsonValue::from(*i),
+                toml::Value::Float(f) => {
+                    serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                }
+                toml::Value::Boolean(b) => JsonValue::Bool(*b),
+                toml::Value::Datetime(dt) => JsonValue::String(dt.to_string()),
+                toml::Value::Array(items) => {
+                    JsonValue::Array(items.iter().map(value_to_json).collect())
+                }
+                toml::Value::Table(t) => JsonValue::Object(
+                    t.iter()
+                        .map(|(k, v)| (k.clone(), value_to_json(v)))
+                        .collect(),
+                ),
+            }
+        }
+        let content = fs::read_to_string(path)?;
+        let value: toml::Value = toml::from_str(&content)?;
+        let record = match value_to_json(&value) {
+            JsonValue::Object(m) => m,
+            _ => bail!("expected a TOML document with top-level key-value pairs in {path:?}"),
+        };
+        Ok(profile_json_records(&[record], n_samples))
+    }
+
+    /// Cross-verification oracle for the hand-rolled TOML parser
+    /// (`toml_support` - see Cargo.toml) against the real `toml` crate,
+    /// kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "toml")]
+    #[test]
+    fn toml_reader_matches_the_toml_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.toml",
+            "tests/fixtures/type_detection.toml",
+            "tests/fixtures/edge_toml_v1_1_features.toml",
+        ] {
+            let path = Path::new(f);
+            if !path.exists() {
+                continue;
+            }
+            let mine = toml_support::columns_from_toml(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_toml_via_toml_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: toml-crate-based oracle failed: {e:?}"));
 
             assert_eq!(
                 mine.iter().map(|c| &c.name).collect::<Vec<_>>(),

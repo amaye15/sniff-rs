@@ -1041,6 +1041,42 @@ fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {
     assert_eq!(server_names["missing_pct"].as_f64().unwrap(), 0.0);
 }
 
+// TOML 1.1.0 features with zero prior coverage in this project's own
+// fixtures - found while auditing the hand-rolled `toml_support` parser
+// against toml-lang/toml-test: optional seconds in local time/datetime
+// values, newlines and a trailing comma inside an inline table, the
+// `\xHH`/`\e` string escapes, and a multi-line basic string starting with
+// an unescaped quote immediately after its opening delimiter.
+#[cfg(feature = "toml")]
+#[test]
+fn toml_handles_v1_1_0_features_with_no_prior_fixture_coverage() {
+    let doc = run_json("edge_toml_v1_1_features.toml", &[]);
+    let cols = table(&doc, "edge_toml_v1_1_features");
+
+    assert_eq!(column(cols, "time_no_seconds")["ideal_type"], "NaiveTime");
+    assert_eq!(column(cols, "time_no_seconds")["sample_values"][0], "13:37");
+    assert_eq!(
+        column(cols, "datetime_no_seconds")["sample_values"][0],
+        "1979-05-27T07:32Z"
+    );
+    assert_eq!(
+        column(cols, "escapes")["sample_values"][0],
+        "tab:\tesc:\u{1B} hex:A"
+    );
+    assert_eq!(
+        column(cols, "four_quotes")["sample_values"][0],
+        "\"four quotes at the start\""
+    );
+    assert_eq!(
+        column(cols, "inline_multiline.name")["sample_values"][0],
+        "multi-line inline table"
+    );
+    assert_eq!(
+        column(cols, "inline_multiline.values")["current_type"],
+        "Vec<i64>"
+    );
+}
+
 #[cfg(feature = "yaml")]
 #[test]
 fn yaml_reads_a_multi_document_stream_as_one_record_per_document() {
@@ -2699,6 +2735,39 @@ fn deeply_nested_msgpack_fails_cleanly_instead_of_a_stack_overflow() {
     );
     assert!(
         stderr.contains("nested more than 256 levels deep"),
+        "expected a nesting-depth error, got: {stderr}"
+    );
+}
+
+// Same class of gap as MessagePack's above, found the same way while
+// auditing the hand-rolled `toml_support` parser: TOML's array/inline-
+// table grammar recurses with no depth limit of its own. A hand-built
+// `[[[...]]]`-nested array genuinely stack-overflowed a debug build
+// somewhere between 5,000 and 10,000 levels (deeper than MessagePack's
+// own danger zone, but real and reachable all the same, since `cargo
+// test`/`cargo run` both default to the debug profile). `MAX_TOML_DEPTH`
+// (512) matches this project's own XML depth guard for the same reason -
+// comfortable margin, far deeper than any real document would nest.
+#[cfg(feature = "toml")]
+#[test]
+fn deeply_nested_toml_fails_cleanly_instead_of_a_stack_overflow() {
+    let output = Command::new(bin())
+        .args([fixture("malformed_deeply_nested.toml").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert!(
+        output.status.code().is_some(),
+        "expected a clean exit, not a signal (e.g. a stack-overflow abort): {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("RUST_BACKTRACE"),
+        "expected a clean handled error, got what looks like a crash: {stderr}"
+    );
+    assert!(
+        stderr.contains("nested more than 512 levels deep"),
         "expected a nesting-depth error, got: {stderr}"
     );
 }
