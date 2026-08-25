@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:atom="http://www.w3.org/2005/Atom" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <item xsi:type="Widget" id="1">
+    <atom:link href="http://example.com/1"/>
+    <link>plain-link-1</link>
+  </item>
+  <item xsi:type="Widget" id="2">
+    <atom:link href="http://example.com/2"/>
+    <link>plain-link-2</link>
+  </item>
+</feed>

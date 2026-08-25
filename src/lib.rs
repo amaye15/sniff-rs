@@ -5619,7 +5619,8 @@ fn columns_from_ini(_path: &Path, _n_samples: usize) -> Result<Vec<(String, Vec<
     )
 }
 
-// --- XML reader (opt-in via --features xml) ---
+// --- XML reader (opt-in via --features xml, hand-rolled - see
+// `xml_support` below and CLAUDE.md's Dependency footprint section) ---
 // XML's mixed content model (an element can carry attributes, text, and
 // child elements all at once) doesn't map onto a single generic Value enum
 // the way TOML/YAML/CBOR/MessagePack do, so this bridges by hand instead of
@@ -5629,189 +5630,418 @@ fn columns_from_ini(_path: &Path, _n_samples: usize) -> Result<Vec<(String, Vec<
 // rather than {"#text": "Alice"}), and repeated same-name child elements
 // pool into an array, same convention as everywhere else in this file.
 
+/// A from-scratch XML parser, replacing `xmltree` (kept as a dev-only
+/// cross-verification oracle - see Cargo.toml). Deliberately a *second*,
+/// independent implementation from the OOXML/ODF-scoped one in
+/// `xlsx_support` above, not a shared one - `xml` and `xlsx` are
+/// independently toggleable Cargo features (this module must compile
+/// and work with `--features xml` alone, so it can never reference
+/// anything gated behind `xlsx`), and, more importantly, the two need
+/// genuinely different behavior: the OOXML/ODF parser *preserves* a
+/// namespace prefix verbatim (`r:id` is looked up as literally
+/// `"r:id"`, since this project already knows OOXML's own fixed schema
+/// prefixes), while this one - reading arbitrary, unknown, real-world
+/// XML - *strips* prefixes, matching `xmltree`'s own observed behavior
+/// (confirmed empirically, not assumed: `xmltree::Element.name` is
+/// documented as excluding namespace info, and a synthetic file with
+/// both a plain `<link>` and a namespaced `<atom:link>` produced a
+/// single, merged `link` column through the old reader - independently
+/// consistent with this project's own real-world validation, which
+/// found the identical merge on a real BBC RSS feed mixing a plain
+/// `<link>` with an Atom-namespaced one under one flattened name).
+///
+/// Namespace handling here is real URI resolution's cheap, deliberately
+/// scoped stand-in: any element or attribute name containing a colon
+/// has everything up to and including the first colon stripped, with
+/// no validation that the prefix was ever actually declared via an
+/// `xmlns:prefix="..."` binding, and no scoping (a prefix is stripped
+/// the same way regardless of which element declared it or whether it
+/// was ever redeclared partway through the document) - real XML
+/// namespace resolution requires tracking a stack of prefix-to-URI
+/// bindings as the document is descended, and this project's own reader
+/// never uses the resolved URI at all (only ever the bare local name),
+/// so that real machinery would add real complexity for zero
+/// observable difference on any well-formed file. `xmlns` and
+/// `xmlns:*` attributes themselves are dropped rather than exposed as
+/// regular `@xmlns...` attributes, matching `xml-rs`'s own behavior
+/// (confirmed empirically) of treating them as namespace bindings, not
+/// regular attribute data.
+///
+/// Depth protection is structural here rather than a separate pre-parse
+/// scan: unlike `xmltree::Element::parse` (which recurses once per
+/// nesting level with nothing capping it - confirmed empirically to
+/// stack-overflow the compiled binary on a 50,000-level-deep adversarial
+/// document, the reason `xml_nesting_too_deep`'s pre-scan existed at
+/// all), this parser's own recursive descent carries an explicit depth
+/// counter and bails cleanly the moment it's exceeded - a strictly
+/// stronger guarantee than a heuristic pre-scan can offer (that old
+/// scan's own doc comment disclosed a real, if narrow, false-negative
+/// gap: a literal unescaped `>` inside an attribute value could end its
+/// tag scan early; a real recursive-descent parser has no equivalent
+/// gap, since it's tracking actual parse state, not guessing at tag
+/// boundaries from raw text).
 #[cfg(feature = "xml")]
-fn xml_element_to_json(el: &xmltree::Element) -> JsonValue {
-    use xmltree::XMLNode;
+mod xml_support {
+    use super::*;
 
-    let mut obj = serde_json::Map::new();
-    for (k, v) in &el.attributes {
-        obj.insert(format!("@{k}"), JsonValue::String(v.clone()));
+    const MAX_XML_DEPTH: usize = 512;
+
+    struct XmlElement {
+        name: String,
+        attrs: Vec<(String, String)>,
+        children: Vec<XmlElement>,
+        text: String,
     }
 
-    let mut text = String::new();
-    let mut child_order: Vec<String> = Vec::new();
-    let mut child_values: HashMap<String, Vec<JsonValue>> = HashMap::new();
-    for node in &el.children {
-        match node {
-            XMLNode::Element(child) => {
-                child_values
-                    .entry(child.name.clone())
-                    .or_insert_with(|| {
-                        child_order.push(child.name.clone());
-                        Vec::new()
-                    })
-                    .push(xml_element_to_json(child));
+    fn xml_decode_entities(s: &str) -> String {
+        if !s.contains('&') {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '&' {
+                out.push(c);
+                continue;
             }
-            XMLNode::Text(t) | XMLNode::CData(t) => text.push_str(t),
-            XMLNode::Comment(_) | XMLNode::ProcessingInstruction(..) => {}
+            let rest: String = chars.clone().take_while(|&c| c != ';').collect();
+            let consumed = rest.len() + 1; // + the trailing ';'
+            let replacement = match rest.as_str() {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "amp" => Some('&'),
+                "apos" => Some('\''),
+                "quot" => Some('"'),
+                _ if rest.starts_with("#x") || rest.starts_with("#X") => {
+                    u32::from_str_radix(&rest[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if rest.starts_with('#') => {
+                    rest[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            match replacement {
+                Some(ch) => {
+                    out.push(ch);
+                    for _ in 0..consumed {
+                        chars.next();
+                    }
+                }
+                None => out.push(c), // not a recognized entity - keep the '&' literally
+            }
         }
-    }
-    for name in child_order {
-        let mut values = child_values.remove(&name).unwrap();
-        let value = if values.len() == 1 {
-            values.pop().unwrap()
-        } else {
-            JsonValue::Array(values)
-        };
-        obj.insert(name, value);
+        out
     }
 
-    let text = text.trim();
-    if !text.is_empty() {
+    /// Strips a namespace prefix (everything up to and including the
+    /// first `:`) from an element or attribute name - see this module's
+    /// own doc comment for why this is a deliberate stand-in for real
+    /// URI-based namespace resolution, not an oversight.
+    fn xml_strip_prefix(name: String) -> String {
+        match name.find(':') {
+            Some(i) => name[i + 1..].to_string(),
+            None => name,
+        }
+    }
+
+    fn xml_skip_ws(chars: &[char], pos: &mut usize) {
+        while chars.get(*pos).is_some_and(|c| c.is_whitespace()) {
+            *pos += 1;
+        }
+    }
+
+    fn xml_starts_with(chars: &[char], pos: usize, needle: &str) -> bool {
+        let needle: Vec<char> = needle.chars().collect();
+        chars.len() >= pos + needle.len() && chars[pos..pos + needle.len()] == needle[..]
+    }
+
+    fn xml_skip_until(chars: &[char], pos: &mut usize, needle: &str) -> Result<()> {
+        while !xml_starts_with(chars, *pos, needle) {
+            if *pos >= chars.len() {
+                bail!("unterminated XML construct (expected {needle:?})");
+            }
+            *pos += 1;
+        }
+        *pos += needle.chars().count();
+        Ok(())
+    }
+
+    /// Skips whitespace, comments, processing instructions (including the
+    /// leading `<?xml ... ?>` declaration), and DOCTYPE declarations. A
+    /// DOCTYPE with an internal subset (`<!DOCTYPE svg [ <!ENTITY ... > ]>`,
+    /// occasionally emitted by SVG-authoring tools) needs its own
+    /// `]`-then-`>` skip rather than a naive skip-to-first-`>`, since the
+    /// internal subset's own declarations can themselves contain `>`
+    /// characters well before the DOCTYPE's real closing one.
+    fn xml_skip_misc(chars: &[char], pos: &mut usize) -> Result<()> {
+        loop {
+            xml_skip_ws(chars, pos);
+            if xml_starts_with(chars, *pos, "<!--") {
+                xml_skip_until(chars, pos, "-->")?;
+            } else if xml_starts_with(chars, *pos, "<?") {
+                xml_skip_until(chars, pos, "?>")?;
+            } else if xml_starts_with(chars, *pos, "<!") {
+                let has_internal_subset = {
+                    let mut p = *pos;
+                    while chars.get(p).is_some_and(|&c| c != '>' && c != '[') {
+                        p += 1;
+                    }
+                    chars.get(p) == Some(&'[')
+                };
+                if has_internal_subset {
+                    xml_skip_until(chars, pos, "]")?;
+                    xml_skip_ws(chars, pos);
+                }
+                xml_skip_until(chars, pos, ">")?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    fn xml_parse_name(chars: &[char], pos: &mut usize) -> Result<String> {
+        let start = *pos;
+        while chars
+            .get(*pos)
+            .is_some_and(|&c| !c.is_whitespace() && c != '>' && c != '/' && c != '=')
+        {
+            *pos += 1;
+        }
+        if *pos == start {
+            bail!("expected an XML name");
+        }
+        Ok(chars[start..*pos].iter().collect())
+    }
+
+    /// Parses attributes, stripping a namespace prefix from each name
+    /// and dropping `xmlns`/`xmlns:*` declarations entirely (they're
+    /// namespace bindings, not regular attribute data - see this
+    /// module's own doc comment).
+    fn xml_parse_attrs(chars: &[char], pos: &mut usize) -> Result<Vec<(String, String)>> {
+        let mut attrs = Vec::new();
+        loop {
+            xml_skip_ws(chars, pos);
+            match chars.get(*pos) {
+                Some('/') | Some('>') | None => return Ok(attrs),
+                _ => {}
+            }
+            let name = xml_parse_name(chars, pos)?;
+            xml_skip_ws(chars, pos);
+            if chars.get(*pos) != Some(&'=') {
+                bail!("expected '=' after attribute name '{name}'");
+            }
+            *pos += 1;
+            xml_skip_ws(chars, pos);
+            let quote = match chars.get(*pos) {
+                Some(&q @ ('"' | '\'')) => q,
+                _ => bail!("expected a quoted attribute value for '{name}'"),
+            };
+            *pos += 1;
+            let start = *pos;
+            while chars.get(*pos).is_some_and(|&c| c != quote) {
+                *pos += 1;
+            }
+            if *pos >= chars.len() {
+                bail!("unterminated attribute value for '{name}'");
+            }
+            let raw: String = chars[start..*pos].iter().collect();
+            *pos += 1; // closing quote
+            if name == "xmlns" || name.starts_with("xmlns:") {
+                continue;
+            }
+            attrs.push((xml_strip_prefix(name), xml_decode_entities(&raw)));
+        }
+    }
+
+    /// Parses one element (and everything nested inside it) starting at
+    /// `<`. `depth` is this element's own nesting level (the root is 1);
+    /// exceeding `MAX_XML_DEPTH` bails cleanly before recursing further,
+    /// the structural depth guard this module's own doc comment
+    /// describes.
+    fn xml_parse_element(chars: &[char], pos: &mut usize, depth: usize) -> Result<XmlElement> {
+        if depth > MAX_XML_DEPTH {
+            bail!("more than {MAX_XML_DEPTH} levels of nested XML elements");
+        }
+        if chars.get(*pos) != Some(&'<') {
+            bail!("expected '<' to start an element");
+        }
+        *pos += 1;
+        let name = xml_strip_prefix(xml_parse_name(chars, pos)?);
+        let attrs = xml_parse_attrs(chars, pos)?;
+        xml_skip_ws(chars, pos);
+
+        if xml_starts_with(chars, *pos, "/>") {
+            *pos += 2;
+            return Ok(XmlElement {
+                name,
+                attrs,
+                children: Vec::new(),
+                text: String::new(),
+            });
+        }
+        if chars.get(*pos) != Some(&'>') {
+            bail!("expected '>' or '/>' to close the start tag for '{name}'");
+        }
+        *pos += 1;
+
+        let mut children = Vec::new();
+        let mut text = String::new();
+        loop {
+            if *pos >= chars.len() {
+                bail!("unexpected end of XML inside element '{name}'");
+            }
+            if xml_starts_with(chars, *pos, "<![CDATA[") {
+                *pos += "<![CDATA[".len();
+                let start = *pos;
+                xml_skip_until(chars, pos, "]]>")?;
+                let end = *pos - "]]>".len();
+                text.push_str(&chars[start..end].iter().collect::<String>());
+            } else if xml_starts_with(chars, *pos, "<!--") {
+                xml_skip_until(chars, pos, "-->")?;
+            } else if xml_starts_with(chars, *pos, "<?") {
+                xml_skip_until(chars, pos, "?>")?;
+            } else if xml_starts_with(chars, *pos, "</") {
+                *pos += 2;
+                let close_name = xml_parse_name(chars, pos)?;
+                xml_skip_ws(chars, pos);
+                if chars.get(*pos) != Some(&'>') {
+                    bail!("expected '>' to close end tag '</{close_name}>'");
+                }
+                *pos += 1;
+                if xml_strip_prefix(close_name.clone()) != name {
+                    bail!("mismatched XML tags: '<{name}>' closed by '</{close_name}>'");
+                }
+                return Ok(XmlElement {
+                    name,
+                    attrs,
+                    children,
+                    text,
+                });
+            } else if chars[*pos] == '<' {
+                children.push(xml_parse_element(chars, pos, depth + 1)?);
+            } else {
+                let start = *pos;
+                while chars.get(*pos).is_some_and(|&c| c != '<') {
+                    *pos += 1;
+                }
+                let raw: String = chars[start..*pos].iter().collect();
+                text.push_str(&xml_decode_entities(&raw));
+            }
+        }
+    }
+
+    fn xml_parse(input: &str) -> Result<XmlElement> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut pos = 0;
+        xml_skip_misc(&chars, &mut pos)?;
+        let root = xml_parse_element(&chars, &mut pos, 1)?;
+        xml_skip_misc(&chars, &mut pos)?;
+        Ok(root)
+    }
+
+    fn xml_element_to_json(el: &XmlElement) -> JsonValue {
+        let mut obj = serde_json::Map::new();
+        for (k, v) in &el.attrs {
+            obj.insert(format!("@{k}"), JsonValue::String(v.clone()));
+        }
+
+        let mut text = String::new();
+        let mut child_order: Vec<String> = Vec::new();
+        let mut child_values: HashMap<String, Vec<JsonValue>> = HashMap::new();
+        for child in &el.children {
+            child_values
+                .entry(child.name.clone())
+                .or_insert_with(|| {
+                    child_order.push(child.name.clone());
+                    Vec::new()
+                })
+                .push(xml_element_to_json(child));
+        }
+        text.push_str(&el.text);
+        for name in child_order {
+            let mut values = child_values.remove(&name).unwrap();
+            let value = if values.len() == 1 {
+                values.pop().unwrap()
+            } else {
+                JsonValue::Array(values)
+            };
+            obj.insert(name, value);
+        }
+
+        let text = text.trim();
+        if !text.is_empty() {
+            if obj.is_empty() {
+                return JsonValue::String(text.to_string());
+            }
+            obj.insert("#text".to_string(), JsonValue::String(text.to_string()));
+        }
+
         if obj.is_empty() {
-            return JsonValue::String(text.to_string());
-        }
-        obj.insert("#text".to_string(), JsonValue::String(text.to_string()));
-    }
-
-    if obj.is_empty() {
-        JsonValue::Null
-    } else {
-        JsonValue::Object(obj)
-    }
-}
-
-// Every other nested format here (JSON, TOML, YAML, MessagePack, CBOR) is
-// protected against a stack-overflow crash on a deeply-nested adversarial
-// document by an explicit recursion/depth limit in its own parsing crate
-// (serde_json's built-in limit, toml_edit's `#![recursion_limit = "256"]`,
-// serde_norway's, rmpv's, ciborium's - each verified directly, not
-// assumed, the same discipline as everywhere else in this file). `xmltree`
-// has no such guard at all - `Element::parse`'s own tree-building recurses
-// once per nesting level with nothing capping it, so a document nested
-// tens of thousands of levels deep reliably aborts the whole process with
-// a real stack overflow, not a catchable error (confirmed empirically: a
-// 50,000-level `<a><a><a>...` document crashes the compiled binary).
-// Since the crash happens *inside* `Element::parse` itself, a depth check
-// added after that call would be too late - `xml_nesting_too_deep` scans
-// the raw text first and refuses to hand xmltree anything more deeply
-// nested than `MAX_XML_DEPTH`, the same "clean, actionable error instead
-// of a crash" contract every other format already has.
-#[cfg(feature = "xml")]
-const MAX_XML_DEPTH: usize = 512;
-
-/// A conservative pre-parse scan for excessive tag-nesting depth - not a
-/// full XML tokenizer, just enough state to walk past comments/CDATA/
-/// processing instructions/DOCTYPE (whose content must never affect the
-/// depth count) and tell an opening tag from a closing or self-closing
-/// one. Deliberately errs toward over-counting depth rather than under-
-/// counting it: the one known gap is a literal, unescaped '>' inside an
-/// attribute value (legal but very rare in practice - virtually every
-/// real XML writer escapes it as `&gt;` even though the spec doesn't
-/// strictly require it outside the literal sequence "]]>"), which could
-/// end a tag scan early. In that specific, narrow case this scan can
-/// still miss a genuinely deep document - a false negative that only
-/// returns this project to its pre-fix behavior for that one exotic
-/// shape, never worse than before.
-#[cfg(feature = "xml")]
-fn xml_nesting_too_deep(content: &str) -> bool {
-    let bytes = content.as_bytes();
-    let mut i = 0;
-    let mut depth: usize = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
-        }
-        let rest = &content[i..];
-        if rest.starts_with("<!--") {
-            i = rest.find("-->").map_or(bytes.len(), |p| i + p + 3);
-        } else if rest.starts_with("<![CDATA[") {
-            i = rest.find("]]>").map_or(bytes.len(), |p| i + p + 3);
-        } else if rest.starts_with("<?") {
-            i = rest.find("?>").map_or(bytes.len(), |p| i + p + 2);
-        } else if rest.starts_with("<!") {
-            // DOCTYPE or another markup declaration - skip to its closing '>'.
-            i = rest.find('>').map_or(bytes.len(), |p| i + p + 1);
-        } else if rest.as_bytes().get(1) == Some(&b'/') {
-            depth = depth.saturating_sub(1);
-            i = rest.find('>').map_or(bytes.len(), |p| i + p + 1);
+            JsonValue::Null
         } else {
-            let end = rest.find('>').map_or(bytes.len(), |p| i + p + 1);
-            let self_closing = end >= 2 && bytes.get(end - 2) == Some(&b'/');
-            if !self_closing {
-                depth += 1;
-                if depth > MAX_XML_DEPTH {
-                    return true;
+            JsonValue::Object(obj)
+        }
+    }
+
+    /// If the root element's children all share one tag name (the
+    /// common `<root><item>...</item><item>...</item></root>` shape),
+    /// each becomes a record - mirroring the JSON reader's `[...]`
+    /// array-of-objects mode. Otherwise the whole document is one
+    /// record, the same choice TOML and an INI section make for their
+    /// own single-document shapes.
+    pub(crate) fn columns_from_xml(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let root =
+            xml_parse(&content).with_context(|| format!("failed to parse {path:?} as XML"))?;
+
+        let homogeneous = root.children.len() > 1
+            && root
+                .children
+                .iter()
+                .all(|e| e.name == root.children[0].name);
+
+        let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+        if homogeneous {
+            for el in &root.children {
+                match xml_element_to_json(el) {
+                    JsonValue::Object(m) => records.push(m),
+                    other => {
+                        let mut m = serde_json::Map::new();
+                        m.insert("#text".to_string(), other);
+                        records.push(m);
+                    }
                 }
             }
-            i = end;
+        } else {
+            match xml_element_to_json(&root) {
+                JsonValue::Object(m) => records.push(m),
+                _ => bail!(
+                    "expected the root XML element in {path:?} to have attributes or child elements"
+                ),
+            }
         }
+
+        if let Some(n) = nrows {
+            records.truncate(n);
+        }
+        Ok(profile_json_records(&records, n_samples))
     }
-    false
 }
 
-/// If the root element's children all share one tag name (the common
-/// `<root><item>...</item><item>...</item></root>` shape), each becomes a
-/// record - mirroring the JSON reader's `[...]` array-of-objects mode.
-/// Otherwise the whole document is one record, the same choice TOML and an
-/// INI section make for their own single-document shapes.
 #[cfg(feature = "xml")]
 fn columns_from_xml(
     path: &Path,
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use xmltree::XMLNode;
-
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    if xml_nesting_too_deep(&content) {
-        bail!(
-            "{path:?} has more than {MAX_XML_DEPTH} levels of nested XML elements - refusing to parse it (this would otherwise risk a stack overflow, since xmltree has no recursion limit of its own)"
-        );
-    }
-    let root = xmltree::Element::parse(content.as_bytes())
-        .map_err(|e| anyhow!("{e}"))
-        .with_context(|| format!("failed to parse {path:?} as XML"))?;
-
-    let child_elements: Vec<&xmltree::Element> = root
-        .children
-        .iter()
-        .filter_map(|n| match n {
-            XMLNode::Element(el) => Some(el),
-            _ => None,
-        })
-        .collect();
-    let homogeneous = child_elements.len() > 1
-        && child_elements
-            .iter()
-            .all(|e| e.name == child_elements[0].name);
-
-    let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
-    if homogeneous {
-        for el in child_elements {
-            match xml_element_to_json(el) {
-                JsonValue::Object(m) => records.push(m),
-                other => {
-                    let mut m = serde_json::Map::new();
-                    m.insert("#text".to_string(), other);
-                    records.push(m);
-                }
-            }
-        }
-    } else {
-        match xml_element_to_json(&root) {
-            JsonValue::Object(m) => records.push(m),
-            _ => bail!(
-                "expected the root XML element in {path:?} to have attributes or child elements"
-            ),
-        }
-    }
-
-    if let Some(n) = nrows {
-        records.truncate(n);
-    }
-    Ok(profile_json_records(&records, n_samples))
+    xml_support::columns_from_xml(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "xml"))]
@@ -10993,6 +11223,148 @@ mod tests {
     /// `smb.conf.default` (223 lines) - both matched exactly, with zero
     /// hand-rolled-parser bugs found; see CLAUDE.md's Dependency
     /// footprint section for the full write-up.
+    /// The old `xmltree`-based reader, kept test-only for cross-
+    /// verification (`xmltree` itself is a dev-only dependency now -
+    /// see Cargo.toml) - a near-verbatim copy of what `columns_from_xml`
+    /// used to be before the hand-rolled `xml_support` module replaced
+    /// it. Never called on adversarial input (it has no depth guard at
+    /// all, exactly like the original code before that gap was found),
+    /// only on real fixtures.
+    #[cfg(all(test, feature = "xml"))]
+    fn columns_from_xml_via_xmltree(path: &Path, n_samples: usize) -> Vec<ColumnProfile> {
+        use xmltree::XMLNode;
+
+        fn to_json(el: &xmltree::Element) -> JsonValue {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in &el.attributes {
+                obj.insert(format!("@{k}"), JsonValue::String(v.clone()));
+            }
+            let mut text = String::new();
+            let mut child_order: Vec<String> = Vec::new();
+            let mut child_values: HashMap<String, Vec<JsonValue>> = HashMap::new();
+            for node in &el.children {
+                match node {
+                    XMLNode::Element(child) => {
+                        child_values
+                            .entry(child.name.clone())
+                            .or_insert_with(|| {
+                                child_order.push(child.name.clone());
+                                Vec::new()
+                            })
+                            .push(to_json(child));
+                    }
+                    XMLNode::Text(t) | XMLNode::CData(t) => text.push_str(t),
+                    XMLNode::Comment(_) | XMLNode::ProcessingInstruction(..) => {}
+                }
+            }
+            for name in child_order {
+                let mut values = child_values.remove(&name).unwrap();
+                let value = if values.len() == 1 {
+                    values.pop().unwrap()
+                } else {
+                    JsonValue::Array(values)
+                };
+                obj.insert(name, value);
+            }
+            let text = text.trim();
+            if !text.is_empty() {
+                if obj.is_empty() {
+                    return JsonValue::String(text.to_string());
+                }
+                obj.insert("#text".to_string(), JsonValue::String(text.to_string()));
+            }
+            if obj.is_empty() {
+                JsonValue::Null
+            } else {
+                JsonValue::Object(obj)
+            }
+        }
+
+        let content = std::fs::read_to_string(path).unwrap();
+        let root = xmltree::Element::parse(content.as_bytes()).unwrap();
+        let child_elements: Vec<&xmltree::Element> = root
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                XMLNode::Element(el) => Some(el),
+                _ => None,
+            })
+            .collect();
+        let homogeneous = child_elements.len() > 1
+            && child_elements
+                .iter()
+                .all(|e| e.name == child_elements[0].name);
+
+        let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+        if homogeneous {
+            for el in child_elements {
+                match to_json(el) {
+                    JsonValue::Object(m) => records.push(m),
+                    other => {
+                        let mut m = serde_json::Map::new();
+                        m.insert("#text".to_string(), other);
+                        records.push(m);
+                    }
+                }
+            }
+        } else {
+            match to_json(&root) {
+                JsonValue::Object(m) => records.push(m),
+                _ => panic!("xmltree root has neither attributes nor children"),
+            }
+        }
+        profile_json_records(&records, n_samples)
+    }
+
+    /// Cross-verifies the hand-rolled XML parser against `xmltree`
+    /// itself on this project's own existing fixtures plus a dedicated
+    /// namespace-stress fixture (see `xml_support`'s own doc comment
+    /// for why namespace-prefix *stripping*, not full URI resolution,
+    /// is the deliberately-scoped target here) - a synthetic file
+    /// mixing a plain `<link>` with a namespaced `<atom:link>` and a
+    /// namespaced `xsi:type` attribute, modeled directly on a real
+    /// finding from this project's own real-world XML validation (a BBC
+    /// RSS feed mixing a plain `<link>` with an Atom-namespaced one
+    /// under the same flattened column - see CLAUDE.md's Dependency
+    /// footprint section).
+    #[cfg(feature = "xml")]
+    #[test]
+    fn xml_reader_matches_xmltree_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.xml",
+            "tests/fixtures/edge_unicode.xml",
+            "tests/fixtures/edge_xml_namespaces.xml",
+        ] {
+            let path = Path::new(f);
+            let mine = xml_support::columns_from_xml(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled parser failed: {e:?}"));
+            let theirs = columns_from_xml_via_xmltree(path, 100);
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "ini")]
     #[test]
     fn ini_reader_matches_rust_ini_output_exactly() {
@@ -11367,44 +11739,64 @@ mod tests {
         assert_eq!(x.ideal_type, "i64");
     }
 
-    // xml_nesting_too_deep is the pre-parse guard added after discovering
-    // xmltree has no recursion limit of its own (unlike every other nested
-    // format's crate here) - a genuinely deep document reliably stack-
-    // overflowed the compiled binary before this existed, confirmed
-    // empirically at 50,000 levels of nesting, not assumed. These test the
-    // scanner directly; deeply_nested_xml_fails_cleanly_instead_of_a_stack_overflow
+    // xml_support's own recursive-descent parser carries an explicit depth
+    // counter (see that module's own doc comment for why this replaced a
+    // separate pre-parse scanner: xmltree has no recursion limit of its
+    // own, and a genuinely deep document reliably stack-overflowed the
+    // compiled binary before either guard existed, confirmed empirically
+    // at 50,000 levels of nesting, not assumed). These test the parser's
+    // depth guard directly, through the same public entry point
+    // `columns_from_xml` uses; deeply_nested_xml_fails_cleanly_instead_of_a_stack_overflow
     // in tests/integration.rs proves the fix holds through the full binary.
 
     #[cfg(feature = "xml")]
+    fn xml_doc_from_text(text: &str) -> Result<JsonValue> {
+        let mut tmp = TempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, text.as_bytes()).unwrap();
+        let cols = xml_support::columns_from_xml(tmp.path(), None, 1)?;
+        // Just need to know parsing succeeded or failed - the exact
+        // profiled columns aren't the point of these depth-guard tests.
+        Ok(JsonValue::Array(
+            cols.into_iter()
+                .map(|c| JsonValue::String(c.name))
+                .collect(),
+        ))
+    }
+
+    #[cfg(feature = "xml")]
     #[test]
-    fn xml_nesting_too_deep_rejects_a_document_past_the_limit() {
+    fn xml_parser_rejects_a_document_past_the_depth_limit() {
         let deep = format!("<root>{}1{}</root>", "<a>".repeat(600), "</a>".repeat(600));
-        assert!(xml_nesting_too_deep(&deep));
+        let err = xml_doc_from_text(&deep).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("nested XML elements"),
+            "{err:?}"
+        );
     }
 
     #[cfg(feature = "xml")]
     #[test]
-    fn xml_nesting_too_deep_accepts_a_document_comfortably_under_the_limit() {
+    fn xml_parser_accepts_a_document_comfortably_under_the_depth_limit() {
         let shallow = format!("<root>{}1{}</root>", "<a>".repeat(50), "</a>".repeat(50));
-        assert!(!xml_nesting_too_deep(&shallow));
+        assert!(xml_doc_from_text(&shallow).is_ok());
     }
 
     #[cfg(feature = "xml")]
     #[test]
-    fn xml_nesting_too_deep_ignores_angle_brackets_inside_comments_and_cdata() {
+    fn xml_parser_ignores_angle_brackets_inside_comments_and_cdata_for_depth_purposes() {
         let noisy = format!(
             "<root><!-- {} --><item><![CDATA[{}]]></item></root>",
             "<a>".repeat(600),
             "<a>".repeat(600)
         );
-        assert!(!xml_nesting_too_deep(&noisy));
+        assert!(xml_doc_from_text(&noisy).is_ok());
     }
 
     #[cfg(feature = "xml")]
     #[test]
-    fn xml_nesting_too_deep_does_not_count_self_closing_tags_as_adding_depth() {
+    fn xml_parser_does_not_count_self_closing_tags_as_adding_depth() {
         let wide = format!("<root>{}</root>", "<item/>".repeat(5000));
-        assert!(!xml_nesting_too_deep(&wide));
+        assert!(xml_doc_from_text(&wide).is_ok());
     }
 
     // avro_decimal_to_string is what stands between Avro's decimal logical

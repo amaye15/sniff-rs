@@ -2984,6 +2984,95 @@ this project could just implement directly rather than depend on:
   that existing filter) - zero hand-rolled-parser bugs found, the
   cleanest result of any hand-roll in this whole effort.
 
+- **`xmltree` → a *second*, independent hand-rolled XML parser, not a
+  shared one.** This project already had one hand-rolled XML parser -
+  `xlsx_support`'s own, built earlier for reading OOXML/ODF parts inside
+  `.xlsx`/`.ods` archives - but it couldn't simply be reused here, for
+  two real reasons rather than a style preference. First, `xml` and
+  `xlsx` are independently toggleable Cargo features (a build with
+  `--features xml` alone must compile and work without anything gated
+  behind `xlsx`), so nothing in one feature's code can reference the
+  other's. Second, and more fundamentally, the two need genuinely
+  *different* behavior: the OOXML/ODF parser deliberately *preserves* a
+  namespace prefix verbatim (`r:id` is looked up as literally the string
+  `"r:id"`, since this project already knows OOXML's own fixed schema
+  prefixes), while a general-purpose reader for arbitrary, unknown,
+  real-world XML needs to *strip* prefixes instead - confirmed
+  empirically, not assumed: `xmltree::Element.name` is documented as
+  excluding namespace info entirely, and a synthetic file mixing a plain
+  `<link>` with a namespaced `<atom:link>` and a namespaced `xsi:type`
+  attribute produced a single merged `link` column and a plain `@type`
+  attribute through the old xmltree-based reader - independently
+  consistent with this project's own prior real-world validation, which
+  found the identical merge on a real BBC RSS feed mixing a plain
+  `<link>` with an Atom-namespaced one under one flattened name (see the
+  "seventh pass, for XML" entry in this document's own real-world-
+  corpus-validation write-up above). `xml_support` (`src/lib.rs`) is
+  accordingly a second, separately-scoped implementation - substantial
+  structural overlap with the OOXML/ODF one (both are hand-rolled
+  recursive-descent parsers over the same core XML grammar: entities,
+  CDATA, comments, processing instructions, attributes, nesting), but a
+  real and deliberate divergence in namespace handling, matching the
+  same "controlled duplication across independently-gated format
+  modules" precedent this project already accepts elsewhere (e.g.
+  `zip_read_u16` and `CfbFile::read_u16` inside `xlsx_support` itself).
+
+  Namespace handling here is real URI-based resolution's cheap,
+  deliberately scoped stand-in: any element or attribute name containing
+  a colon has everything up to and including the first colon stripped -
+  no validation that the prefix was ever actually declared via an
+  `xmlns:prefix="..."` binding, and no real scoping (a prefix is
+  stripped the same way regardless of which element declared it, or
+  whether it was ever redeclared partway through the document). Real
+  namespace resolution requires tracking a stack of prefix-to-URI
+  bindings as the document is descended - genuine complexity this
+  project's own reader has no use for, since it never reads the resolved
+  URI at all, only ever the bare local name. `xmlns`/`xmlns:*`
+  attributes themselves are dropped rather than exposed as regular
+  `@xmlns...` attributes, matching `xml-rs`'s own behavior (`xmltree`'s
+  own underlying parsing crate, confirmed empirically) of treating them
+  as namespace bindings, not attribute data.
+
+  Depth protection became strictly better as a side effect of hand-
+  rolling, not just an afterthought carried over: the *old* xmltree-
+  based reader needed a separate pre-parse text scanner
+  (`xml_nesting_too_deep`) specifically because `xmltree::Element::parse`
+  has no recursion limit of its own (confirmed empirically: a
+  50,000-level-deep adversarial document reliably stack-overflowed the
+  compiled binary), and that scanner's own doc comment disclosed a real,
+  narrow false-negative gap - a literal unescaped `>` inside an
+  attribute value could end its tag scan early. This project's own new
+  recursive-descent parser needs no equivalent pre-scan at all: it
+  carries an explicit depth counter through its own real recursion and
+  bails cleanly the instant it's exceeded, a strictly stronger guarantee
+  than a heuristic text scan can offer, since it's tracking genuine
+  parse state rather than guessing at tag boundaries from raw text.
+  `xml_nesting_too_deep` is gone entirely, not kept alongside the new
+  parser - the four tests that used to exercise it directly now exercise
+  the new parser's own depth guard through its real public entry point
+  instead, and every existing depth-related fixture and integration test
+  (including the 50,000-level adversarial one) passed against the new
+  parser unchanged.
+
+  Verified two ways: a dedicated `xml_reader_matches_xmltree_output_exactly`
+  test cross-checks this parser against `xmltree` itself (kept as a
+  dev-only oracle, the same treatment every other replaced crate in this
+  section already gets) on this project's existing fixtures plus a new
+  `tests/fixtures/edge_xml_namespaces.xml` covering the exact plain/
+  namespaced-element and namespaced-attribute merge described above; and,
+  transiently and not committed (matching this project's usual large-
+  external-corpus practice), against the same four real files this
+  project's own original xmltree-based validation used - live BBC News
+  and NASA RSS feeds, Apache Maven's own real `pom.xml`, and a real SVG
+  icon using a *default* (unprefixed) namespace declaration, a
+  meaningfully different shape from the prefixed-namespace cases above
+  since it exercises elements that have no colon in their name at all.
+  All four matched `xmltree`'s own output exactly, including Maven's
+  `pom.xml` producing the identical 244 flattened columns this project's
+  own prior validation already documented - zero hand-rolled-parser bugs
+  found on real content, the cleanest large-scale real-world result of
+  any hand-roll in this effort alongside `rust-ini`'s.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -2992,9 +3081,10 @@ Avro, MessagePack, CBOR, XML) recurse through via `profile_json_path` -
 replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
-`.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, and now `rust-ini` all
-still were, however real their own risk. That's still a real,
-non-mechanical rewrite - the risk itself is why it's still deliberately
+`.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, and now
+`xmltree` all still were, however real their own risk. That's still a
+real, non-mechanical rewrite - the risk itself is why it's still
+deliberately
 a dependency, the same reasoning that applied to every other entry in
 this list right
 up until it didn't.

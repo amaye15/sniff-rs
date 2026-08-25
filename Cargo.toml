@@ -21,7 +21,6 @@ serde = "1.0.229"
 rmpv = { version = "1.3.1", optional = true }
 toml = { version = "1.1.4", optional = true }
 ciborium = { version = "0.2.2", optional = true }
-xmltree = { version = "0.12.0", features = ["attribute-order"], optional = true }
 zstd = { version = "0.13.3", optional = true }
 npyz = { version = "0.9.1", features = ["npz"], optional = true }
 regex = { version = "1.13.1", optional = true }
@@ -43,7 +42,7 @@ toml = ["dep:toml"]
 yaml = []
 cbor = ["dep:ciborium"]
 ini = []
-xml = ["dep:xmltree"]
+xml = []
 zstd = ["dep:zstd"]
 npy = ["dep:npyz"]
 weblog = ["dep:regex"]
@@ -74,6 +73,12 @@ chrono = "0.4"
 # for the `ini_reader_matches_rust_ini_output_exactly` cross-verification
 # test.
 rust-ini = "0.21.3"
+# Same dev-only treatment, same reason: the `xml` feature's own hand-rolled
+# reader (`xml_support` in src/lib.rs) replaced this at runtime; kept only
+# for the `xml_reader_matches_xmltree_output_exactly` cross-verification
+# test. Same `attribute-order` feature as before, so the comparison isn't
+# comparing against an artificially-reordered attribute map.
+xmltree = { version = "0.12.0", features = ["attribute-order"] }
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

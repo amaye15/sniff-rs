@@ -567,6 +567,32 @@ fn xml_treats_homogeneous_children_as_records_and_attributes_as_at_columns() {
     assert_eq!(date["ideal_type"], "NaiveDate / DateTime");
 }
 
+// Namespace prefixes are stripped (not resolved via real URI lookup - see
+// CLAUDE.md's Dependency footprint section for why that's a deliberate,
+// scoped stand-in), matching xmltree's own observed behavior: a plain
+// <link> and a namespaced <atom:link> merge into the same flattened
+// column, and a namespaced xsi:type attribute becomes plain @type - a
+// real shape found in a real BBC RSS feed during this project's own
+// real-world XML validation.
+#[cfg(feature = "xml")]
+#[test]
+fn xml_strips_namespace_prefixes_from_elements_and_attributes() {
+    let doc = run_json("edge_xml_namespaces.xml", &[]);
+    let cols = table(&doc, "edge_xml_namespaces");
+
+    let ty = column(cols, "@type");
+    assert_eq!(ty["sample_values"][0], "Widget");
+
+    // Both the plain <link> and the namespaced <atom:link> merged into
+    // one "link" column - the plain one contributes a string, the
+    // namespaced one contributes an object (it has an @href attribute),
+    // so the column is a real, disclosed scalar/object mix.
+    let link = column(cols, "link");
+    assert!(link["current_type"].as_str().unwrap().contains("mixed"));
+    let href = column(cols, "link.@href");
+    assert_eq!(href["ideal_type"], "URL");
+}
+
 #[cfg(feature = "npy")]
 #[test]
 fn npy_structured_array_gives_one_column_per_named_field() {
