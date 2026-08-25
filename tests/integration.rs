@@ -2336,6 +2336,42 @@ fn msgpack_top_level_array_of_scalars_becomes_one_value_column() {
     assert_eq!(value["missing_pct"].as_f64().unwrap(), 0.0);
 }
 
+// This project's existing MessagePack fixtures are small enough to only
+// ever exercise the fixstr/fixarray/fixmap/fixint marker ranges - every
+// "wide" marker (str8/str16, array16, map16, bin8, and a uint64 exceeding
+// i64::MAX, which only the u64 branch of the hand-rolled decoder's
+// integer handling can represent) had zero coverage until this fixture,
+// found while auditing `msgpack_support` against `rmp`'s own marker.rs.
+#[cfg(feature = "msgpack")]
+#[test]
+fn msgpack_handles_wide_string_array_map_and_uint64_markers() {
+    let doc = run_json("edge_msgpack_wide_markers.msgpack", &[]);
+    let cols = table(&doc, "edge_msgpack_wide_markers");
+
+    assert_eq!(
+        column(cols, "long_str")["sample_values"][0]
+            .as_str()
+            .unwrap()
+            .len(),
+        40
+    );
+    assert_eq!(
+        column(cols, "very_long_str")["sample_values"][0]
+            .as_str()
+            .unwrap()
+            .len(),
+        300
+    );
+    assert_eq!(column(cols, "many_items")["current_type"], "Vec<i64>");
+    assert!(cols.iter().any(|c| c["name"] == "wide_map.k49"));
+    let raw_bytes = column(cols, "raw_bytes");
+    assert_eq!(raw_bytes["sample_values"][0], "000102fffe");
+    // Exceeds i64::MAX - only representable via the hand-rolled decoder's
+    // separate UInt(u64) branch (see msgpack_support::Value).
+    let huge_uint = column(cols, "huge_uint");
+    assert_eq!(huge_uint["sample_values"][0], "18446744073709551615");
+}
+
 #[cfg(feature = "cbor")]
 #[test]
 fn cbor_top_level_array_of_scalars_becomes_one_value_column() {
@@ -2625,6 +2661,46 @@ fn msgpack_ascii_garbage_text_decodes_as_a_stream_of_small_integers() {
     assert_eq!(value["ideal_type"], "i64");
     // First three bytes of the fixture are 't','h','i' -> 116, 104, 105.
     assert_eq!(value["sample_values"][0], "116");
+}
+
+// Found via this project's own real-world adversarial testing while
+// replacing rmpv: a MessagePack-decoded `serde_json::Value` tree never
+// passes through `serde_json`'s own parse-time recursion guard (that
+// guard only fires while parsing *text*), so a deeply nested structure
+// bypasses the protection every plain `.json`/`.jsonl` file gets for
+// free. rmpv's own depth limit (1024) turned out to still be unsafe in a
+// debug build - confirmed directly, not assumed: an unoptimized build's
+// much larger, uninlined stack frames overflowed an 8MB thread stack
+// somewhere between 700 and 900 nesting levels, well under 1024, while
+// an optimized release build survived 1024 comfortably. `msgpack_support`
+// now uses 256 (matching `ciborium`'s own *default* CBOR recursion limit
+// - independent corroboration this is a real risk class, not specific to
+// this project's code) with comfortable margin under the empirically
+// found danger zone. Locks in the fix the same way
+// `deeply_nested_xml_fails_cleanly_instead_of_a_stack_overflow` does for
+// XML's own, differently-caused gap.
+#[cfg(feature = "msgpack")]
+#[test]
+fn deeply_nested_msgpack_fails_cleanly_instead_of_a_stack_overflow() {
+    let output = Command::new(bin())
+        .args([fixture("malformed_deeply_nested.msgpack").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert!(
+        output.status.code().is_some(),
+        "expected a clean exit, not a signal (e.g. a stack-overflow abort): {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("RUST_BACKTRACE"),
+        "expected a clean handled error, got what looks like a crash: {stderr}"
+    );
+    assert!(
+        stderr.contains("nested more than 256 levels deep"),
+        "expected a nesting-depth error, got: {stderr}"
+    );
 }
 
 #[cfg(feature = "cbor")]

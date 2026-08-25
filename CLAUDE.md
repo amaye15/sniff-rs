@@ -3253,6 +3253,101 @@ this project could just implement directly rather than depend on:
   and a 600-file bit-flip fuzz pass (300 each against a real `.npy` and a
   real `.npz`) produced zero panics.
 
+- **`rmpv`/`rmp` → a hand-rolled MessagePack decoder (`msgpack_support`).**
+  MessagePack's own wire format (msgpack.org's spec) is small and
+  completely specified by one table - `rmp`'s own `marker.rs`, checked
+  directly rather than recalled from memory, gives every marker byte's
+  exact meaning in one place (fixint/fixmap/fixarray/fixstr's bit-packed
+  ranges, the `0xc0`-`0xdf` fixed-purpose bytes, and the big-endian
+  multi-byte length/value encodings) - so this hand-roll was mostly
+  mechanical, a single `match` on the marker byte. The hand-rolled
+  `Value` enum deliberately isn't a byte-for-byte port of `rmpv::Value`:
+  integers collapse to a plain `Int(i64)` with a separate `UInt(u64)`
+  used only for the one case that genuinely can't fit `i64` (a `uint64`
+  marker whose value exceeds `i64::MAX`), mirroring the
+  `as_i64().or_else(as_u64())` fallback every call site in this project's
+  own `msgpack_value_to_json` already used - so the *behavior* matches
+  exactly without needing `rmpv::Integer`'s own richer internal
+  representation.
+
+  Two adversarial-safety details were carried over deliberately, not
+  independently discovered but *confirmed* by reading `rmpv`'s own
+  decoder before trusting the port: a string/binary length field
+  (`str32`/`bin32`'s length is a full `u32`) reads via
+  `Read::take(len).read_to_end(&mut buf)` with only a 64 KiB
+  pre-allocation cap, so a few bytes claiming gigabytes can't force a
+  huge allocation before any real data backs it up - and, more
+  significantly, `read_array`/`read_map` build their `Vec` with `.push()`
+  in a loop rather than `(0..len).map(...).collect()`, because the latter
+  would let an attacker-controlled `array32`/`map32` length (again, a
+  full `u32`) size an eager allocation via the iterator's own size hint
+  *before* a single element is decoded. This is a real, previously-fixed
+  issue in this exact ecosystem, not a theoretical one - `rmpv`'s own
+  `read_array_data`/`read_map_data` carry an identical fix with a comment
+  linking a GitHub issue (3Hren/msgpack-rust#151) recording the original
+  report. Both were verified as still closed in the new code, not just
+  copied on faith: a handful of bytes claiming a `u32::MAX`-element
+  array, string, or map each fail cleanly with a peak memory footprint
+  under 1 MB (measured, not assumed).
+
+  **Real-world/adversarial testing found one genuine bug, in the deeper
+  pipeline this decoder feeds into, not in the decoding itself.** A
+  MessagePack-decoded `serde_json::Value` tree never passes through
+  `serde_json`'s own parser, so it never benefits from that parser's
+  built-in recursion limit (the protection every plain `.json`/`.jsonl`
+  file gets for free, confirmed directly: feeding the equivalent
+  1-key-per-level nesting as JSON *text* fails cleanly at parse time with
+  serde_json's own "recursion limit exceeded", well before reaching
+  `profile_json_path` at all). `rmpv::decode::MAX_DEPTH` is 1024, and this
+  project's own first draft matched it exactly on the theory that
+  swapping decoders shouldn't change what depth a file is willing to
+  accept - but real testing (a hand-built, genuinely 900-level-deep
+  MessagePack structure, since Python's own `msgpack` packer recurses
+  and hits *its own* limit before producing anything deeper) found a real
+  stack overflow through the *compiled binary itself*, not just a unit
+  test - confirmed to be a debug-build-specific stack-frame-size issue,
+  not a logic bug (the identical structure decodes correctly in a
+  `--release` build all the way past 1024, where the depth guard then
+  correctly and cleanly rejects it) - but `cargo test` and a plain
+  `cargo build`/`cargo run` both default to the debug profile, so this
+  was a real, reachable gap, not a hypothetical one. Binary-searching the
+  actual crash boundary in a debug build placed it between 700 and 900
+  levels - and independently, `ciborium` (already a dependency for this
+  project's own CBOR reader) defaults to a 256-level recursion limit for
+  exactly this reason, with its own doc comment reading "Set a high
+  recursion limit at your own risk (of stack exhaustion)!" - real,
+  independent corroboration this is a known risk class for this shape of
+  recursive decoder, not something specific to this project's own code.
+  `MAX_DEPTH` was lowered to 256 to match, giving comfortable margin
+  under the empirically found danger zone while remaining far deeper than
+  any legitimate MessagePack document would plausibly nest.
+  `tests/fixtures/malformed_deeply_nested.msgpack` (50,000 levels, hand-
+  built the same way the crash-reproducing fixture was, matching the
+  scale of this project's own `malformed_deeply_nested.xml`) and
+  `deeply_nested_msgpack_fails_cleanly_instead_of_a_stack_overflow` lock
+  the fix in as a permanent regression test, run through the compiled
+  binary rather than in-process specifically because that's how the
+  original crash was actually reproduced.
+
+  Verified two ways: `msgpack_reader_matches_the_rmpv_crate_output_exactly`
+  cross-checks this decoder against `rmpv` itself (kept as a dev-only
+  oracle, the same treatment every other replaced crate in this section
+  already gets) on this project's existing fixtures plus a new
+  `tests/fixtures/edge_msgpack_wide_markers.msgpack` - this project's
+  existing MessagePack fixtures are all small enough to only ever
+  exercise the fix-sized marker ranges (fixstr/fixarray/fixmap/fixint),
+  so the wider str8/str16, array16, map16, bin8, and the `uint64`-
+  exceeding-`i64::MAX` case had zero prior coverage, found the same way
+  the big-endian/sub-array gaps were found while auditing the NumPy
+  reader against its own predecessor's source; and, transiently and not
+  committed (matching this project's usual real-world-corpus practice), a
+  500-record synthetic dataset exercising nested maps/arrays/negative
+  integers/large integers together, a `str16`/`array16`/`map16`-forcing
+  document, an explicit `uint64` beyond `i64::MAX`, `bin8`/`bin16` binary
+  payloads, and an `f32`-forced float - all matched the `rmpv` oracle
+  exactly - plus a 400-file bit-flip fuzz pass against the 500-record
+  dataset, zero panics.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3262,7 +3357,7 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, and now `npyz` all still were, however real their own risk.
+`zstd`, `npyz`, and now `rmpv` all still were, however real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/

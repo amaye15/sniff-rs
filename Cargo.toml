@@ -18,7 +18,6 @@ rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 # (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
 # still needed for that impl's own `S: serde::Serializer` bound.
 serde = "1.0.229"
-rmpv = { version = "1.3.1", optional = true }
 toml = { version = "1.1.4", optional = true }
 ciborium = { version = "0.2.2", optional = true }
 regex = { version = "1.13.1", optional = true }
@@ -35,7 +34,7 @@ xlsx = []
 avro = ["dep:apache-avro", "dep:num-bigint"]
 full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat"]
 sqlite = ["dep:rusqlite"]
-msgpack = ["dep:rmpv"]
+msgpack = []
 toml = ["dep:toml"]
 yaml = []
 cbor = ["dep:ciborium"]
@@ -94,6 +93,12 @@ zstd = "0.13.3"
 # is still needed here (unlike at runtime) purely for the oracle's own use
 # of `npyz::npz::NpzArchive`.
 npyz = { version = "0.9.1", features = ["npz"] }
+# Same dev-only treatment, same reason: the `msgpack` feature's own hand-
+# rolled decoder (`msgpack_support` in src/lib.rs) replaced it at runtime;
+# kept only as this project's own cross-verification oracle in
+# `msgpack_reader_matches_the_rmpv_crate_output_exactly`
+# (`#[cfg(all(test, feature = "msgpack"))]` in src/lib.rs).
+rmpv = "1.3.1"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

@@ -4009,125 +4009,401 @@ fn columns_from_avro(
 
 // --- MessagePack reader (opt-in via --features msgpack) ---
 // Decodes each top-level value to serde_json::Value and reuses the exact
-// same column-extraction/flattening path as JSON/Avro files.
+// same column-extraction/flattening path as JSON/Avro files. The decoder
+// itself (`msgpack_support`) is hand-rolled - see CLAUDE.md's Dependency
+// footprint section for why and how it was verified.
 
 #[cfg(feature = "msgpack")]
-fn msgpack_key_to_string(k: &rmpv::Value) -> String {
-    if let rmpv::Value::String(s) = k
-        && let Some(s) = s.as_str()
-    {
-        return s.to_string();
-    }
-    msgpack_value_to_json(k).to_string()
-}
+mod msgpack_support {
+    use super::*;
 
-#[cfg(feature = "msgpack")]
-fn msgpack_value_to_json(v: &rmpv::Value) -> JsonValue {
-    use rmpv::Value as MpValue;
-    match v {
-        MpValue::Nil => JsonValue::Null,
-        MpValue::Boolean(b) => JsonValue::Bool(*b),
-        MpValue::Integer(i) => i
-            .as_i64()
-            .map(JsonValue::from)
-            .or_else(|| i.as_u64().map(JsonValue::from))
-            .unwrap_or(JsonValue::Null),
-        MpValue::F32(f) => {
-            serde_json::Number::from_f64(f64::from(*f)).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        MpValue::F64(f) => {
-            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        MpValue::String(s) => JsonValue::String(match s.as_str() {
-            Some(s) => s.to_string(),
-            None => s.as_bytes().iter().map(|b| format!("{b:02x}")).collect(),
-        }),
-        MpValue::Binary(b) => {
-            JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
-        }
-        MpValue::Array(items) => {
-            JsonValue::Array(items.iter().map(msgpack_value_to_json).collect())
-        }
-        MpValue::Map(pairs) => JsonValue::Object(
-            pairs
-                .iter()
-                .map(|(k, v)| (msgpack_key_to_string(k), msgpack_value_to_json(v)))
-                .collect(),
-        ),
-        MpValue::Ext(kind, data) => JsonValue::String(format!("ext({kind}, {} bytes)", data.len())),
-    }
-}
+    /// A real, adversarial-testing-found bound, not an arbitrary round
+    /// number - and deliberately *not* `rmpv::decode::MAX_DEPTH` (1024),
+    /// which this project's own real-world testing found genuinely
+    /// unsafe: a MessagePack-decoded `serde_json::Value` tree bypasses
+    /// `serde_json`'s own parse-time recursion guard entirely (that guard
+    /// only fires while parsing *text*, and this reader never produces
+    /// any), so it's `profile_json_path`'s/this reader's own downstream
+    /// recursive conversion that has to survive whatever depth is let
+    /// through - and a debug build's much larger, uninlined stack frames
+    /// were confirmed (not assumed) to overflow an 8MB thread stack
+    /// somewhere between 700 and 900 levels, well under 1024, while an
+    /// optimized release build survives 1024 comfortably. 256 matches
+    /// `ciborium`'s own *default* recursion limit for CBOR - independent
+    /// corroboration this is a real, known risk class for exactly this
+    /// kind of recursive binary-format decoder, not specific to this
+    /// project's own code (`ciborium`'s own doc comment: "Set a high
+    /// recursion limit at your own risk (of stack exhaustion)!") - with
+    /// comfortable margin under the empirically-found debug-build danger
+    /// zone.
+    const MAX_DEPTH: u32 = 256;
 
-/// Reads a stream of top-level MessagePack values (each value is
-/// self-delimiting, so records can just be concatenated back-to-back in the
-/// file - the common convention for a MessagePack *data* file, as opposed to
-/// a single MessagePack-encoded document). If the file holds exactly one
-/// top-level value and it's an array, that array's elements are treated as
-/// the records instead, mirroring how the JSON reader treats a single
-/// top-level `[...]` array.
+    /// A pre-allocation cap for a single string/binary value's buffer,
+    /// matching `rmpv`'s own `read_bin_data` (see its own comment linking
+    /// https://github.com/3Hren/msgpack-rust/issues/151) - a handful of
+    /// bytes can otherwise claim an enormous length (`str32`/`bin32`'s
+    /// length field is a full `u32`) and force a huge upfront allocation
+    /// before a single byte of it has actually been read. Actual reads can
+    /// still grow past this via `Read::take(len).read_to_end`, which only
+    /// ever allocates as far as real bytes are actually available.
+    const PREALLOC_MAX: usize = 64 * 1024;
+
+    #[derive(Debug, Clone)]
+    pub(crate) enum Value {
+        Nil,
+        Bool(bool),
+        Int(i64),
+        /// Only used for a genuine `uint64` value too large for `i64`
+        /// (> `i64::MAX`) - every other integer marker fits `i64` and
+        /// uses `Int` directly, mirroring `rmpv::Value::Integer`'s own
+        /// `as_i64().or(as_u64())` fallback observed at every call site.
+        UInt(u64),
+        F32(f32),
+        F64(f64),
+        /// `Ok` for valid UTF-8 (the overwhelmingly common case); `Err`
+        /// keeps the raw bytes for a string whose content isn't valid
+        /// UTF-8 (legal MessagePack - `str` only promises bytes, not that
+        /// they decode) so the caller can still render *something*
+        /// (a hex dump, matching `rmpv::Utf8String`'s own lossless
+        /// behavior) rather than lossily mangling or discarding it.
+        Str(std::result::Result<String, Vec<u8>>),
+        Bin(Vec<u8>),
+        Array(Vec<Value>),
+        Map(Vec<(Value, Value)>),
+        Ext(i8, Vec<u8>),
+    }
+
+    fn read_bytes<const N: usize, R: std::io::Read>(r: &mut R) -> Result<[u8; N]> {
+        let mut buf = [0u8; N];
+        r.read_exact(&mut buf)
+            .with_context(|| format!("truncated MessagePack stream: expected {N} more byte(s)"))?;
+        Ok(buf)
+    }
+
+    fn read_u8<R: std::io::Read>(r: &mut R) -> Result<u8> {
+        Ok(read_bytes::<1, _>(r)?[0])
+    }
+    fn read_i8<R: std::io::Read>(r: &mut R) -> Result<i8> {
+        Ok(read_u8(r)? as i8)
+    }
+    fn read_u16<R: std::io::Read>(r: &mut R) -> Result<u16> {
+        Ok(u16::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_u32<R: std::io::Read>(r: &mut R) -> Result<u32> {
+        Ok(u32::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_u64<R: std::io::Read>(r: &mut R) -> Result<u64> {
+        Ok(u64::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_i16<R: std::io::Read>(r: &mut R) -> Result<i16> {
+        Ok(i16::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_i32<R: std::io::Read>(r: &mut R) -> Result<i32> {
+        Ok(i32::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_i64<R: std::io::Read>(r: &mut R) -> Result<i64> {
+        Ok(i64::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_f32<R: std::io::Read>(r: &mut R) -> Result<f32> {
+        Ok(f32::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_f64<R: std::io::Read>(r: &mut R) -> Result<f64> {
+        Ok(f64::from_be_bytes(read_bytes(r)?))
+    }
+
+    fn read_bin<R: std::io::Read>(r: &mut R, len: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut buf = Vec::with_capacity(len.min(PREALLOC_MAX));
+        let n = r
+            .take(len as u64)
+            .read_to_end(&mut buf)
+            .context("failed reading MessagePack binary/string data")?;
+        if n != len {
+            bail!("truncated MessagePack stream: expected {len} byte(s), got {n}");
+        }
+        Ok(buf)
+    }
+
+    fn read_str<R: std::io::Read>(
+        r: &mut R,
+        len: usize,
+    ) -> Result<std::result::Result<String, Vec<u8>>> {
+        Ok(String::from_utf8(read_bin(r, len)?).map_err(|e| e.into_bytes()))
+    }
+
+    /// Reads one MessagePack-encoded value (RFC-less but a stable, widely
+    /// implemented format - msgpack.org's own spec - verified directly
+    /// against the `rmp` crate's `marker.rs` byte-range table, the
+    /// authoritative source for the whole wire format, rather than
+    /// recalled from memory). `depth` is a remaining-recursion budget,
+    /// not a running total - it only ever counts down, and hitting zero
+    /// mid-array/mid-map is a clean, actionable error rather than a stack
+    /// overflow, the same contract every other nested format in this
+    /// project already gives adversarially deep input.
+    fn read_value<R: std::io::Read>(r: &mut R, depth: u32) -> Result<Value> {
+        if depth == 0 {
+            bail!("malformed MessagePack stream: nested more than {MAX_DEPTH} levels deep");
+        }
+        let marker = read_u8(r)?;
+        Ok(match marker {
+            0x00..=0x7f => Value::Int(marker as i64),
+            0x80..=0x8f => Value::Map(read_map(r, (marker & 0x0f) as usize, depth - 1)?),
+            0x90..=0x9f => Value::Array(read_array(r, (marker & 0x0f) as usize, depth - 1)?),
+            0xa0..=0xbf => Value::Str(read_str(r, (marker & 0x1f) as usize)?),
+            0xc0 => Value::Nil,
+            // 0xc1 is marked "never used" in the spec itself; rmpv treats
+            // an encounter as Nil rather than a hard error, and this
+            // reader matches that leniency rather than introducing a
+            // behavior difference for a byte no real encoder emits.
+            0xc1 => Value::Nil,
+            0xc2 => Value::Bool(false),
+            0xc3 => Value::Bool(true),
+            0xc4 => {
+                let len = read_u8(r)? as usize;
+                Value::Bin(read_bin(r, len)?)
+            }
+            0xc5 => {
+                let len = read_u16(r)? as usize;
+                Value::Bin(read_bin(r, len)?)
+            }
+            0xc6 => {
+                let len = read_u32(r)? as usize;
+                Value::Bin(read_bin(r, len)?)
+            }
+            0xc7 => {
+                let len = read_u8(r)? as usize;
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, len)?)
+            }
+            0xc8 => {
+                let len = read_u16(r)? as usize;
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, len)?)
+            }
+            0xc9 => {
+                let len = read_u32(r)? as usize;
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, len)?)
+            }
+            0xca => Value::F32(read_f32(r)?),
+            0xcb => Value::F64(read_f64(r)?),
+            0xcc => Value::Int(read_u8(r)? as i64),
+            0xcd => Value::Int(read_u16(r)? as i64),
+            0xce => Value::Int(read_u32(r)? as i64),
+            0xcf => {
+                let v = read_u64(r)?;
+                if v <= i64::MAX as u64 {
+                    Value::Int(v as i64)
+                } else {
+                    Value::UInt(v)
+                }
+            }
+            0xd0 => Value::Int(read_i8(r)? as i64),
+            0xd1 => Value::Int(read_i16(r)? as i64),
+            0xd2 => Value::Int(read_i32(r)? as i64),
+            0xd3 => Value::Int(read_i64(r)?),
+            0xd4 => {
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, 1)?)
+            }
+            0xd5 => {
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, 2)?)
+            }
+            0xd6 => {
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, 4)?)
+            }
+            0xd7 => {
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, 8)?)
+            }
+            0xd8 => {
+                let ty = read_i8(r)?;
+                Value::Ext(ty, read_bin(r, 16)?)
+            }
+            0xd9 => {
+                let len = read_u8(r)? as usize;
+                Value::Str(read_str(r, len)?)
+            }
+            0xda => {
+                let len = read_u16(r)? as usize;
+                Value::Str(read_str(r, len)?)
+            }
+            0xdb => {
+                let len = read_u32(r)? as usize;
+                Value::Str(read_str(r, len)?)
+            }
+            0xdc => {
+                let len = read_u16(r)? as usize;
+                Value::Array(read_array(r, len, depth - 1)?)
+            }
+            0xdd => {
+                let len = read_u32(r)? as usize;
+                Value::Array(read_array(r, len, depth - 1)?)
+            }
+            0xde => {
+                let len = read_u16(r)? as usize;
+                Value::Map(read_map(r, len, depth - 1)?)
+            }
+            0xdf => {
+                let len = read_u32(r)? as usize;
+                Value::Map(read_map(r, len, depth - 1)?)
+            }
+            0xe0..=0xff => Value::Int(marker as i8 as i64),
+        })
+    }
+
+    /// Deliberately builds the `Vec` incrementally (`Vec::new()` +
+    /// `.push()` per element) rather than `(0..len).map(...).collect()`,
+    /// which would let `len` - read directly from the untrusted stream,
+    /// up to a full `u32` for `array32`/`map32` - size an eager
+    /// allocation before a single element has actually been read. This
+    /// is a real, previously-found issue in this exact ecosystem, not a
+    /// theoretical one: `rmpv`'s own `read_array_data`/`read_map_data`
+    /// carry the identical fix with a comment linking
+    /// <https://github.com/3Hren/msgpack-rust/issues/151>, found and
+    /// checked directly rather than assumed safe by default. A stream
+    /// that can't actually supply `len` real elements fails via
+    /// `read_value`'s own `read_exact` long before the `Vec` grows
+    /// anywhere near `len` in size.
+    fn read_array<R: std::io::Read>(r: &mut R, len: usize, depth: u32) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        for _ in 0..len {
+            out.push(read_value(r, depth)?);
+        }
+        Ok(out)
+    }
+
+    fn read_map<R: std::io::Read>(
+        r: &mut R,
+        len: usize,
+        depth: u32,
+    ) -> Result<Vec<(Value, Value)>> {
+        let mut out = Vec::new();
+        for _ in 0..len {
+            out.push((read_value(r, depth)?, read_value(r, depth)?));
+        }
+        Ok(out)
+    }
+
+    fn key_to_string(k: &Value) -> String {
+        if let Value::Str(Ok(s)) = k {
+            return s.clone();
+        }
+        value_to_json(k).to_string()
+    }
+
+    fn value_to_json(v: &Value) -> JsonValue {
+        match v {
+            Value::Nil => JsonValue::Null,
+            Value::Bool(b) => JsonValue::Bool(*b),
+            Value::Int(i) => JsonValue::from(*i),
+            Value::UInt(u) => JsonValue::from(*u),
+            Value::F32(f) => serde_json::Number::from_f64(f64::from(*f))
+                .map_or(JsonValue::Null, JsonValue::Number),
+            Value::F64(f) => {
+                serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            Value::Str(Ok(s)) => JsonValue::String(s.clone()),
+            Value::Str(Err(bytes)) => {
+                JsonValue::String(bytes.iter().map(|b| format!("{b:02x}")).collect())
+            }
+            Value::Bin(b) => {
+                JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+            }
+            Value::Array(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),
+            Value::Map(pairs) => JsonValue::Object(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (key_to_string(k), value_to_json(v)))
+                    .collect(),
+            ),
+            Value::Ext(kind, data) => {
+                JsonValue::String(format!("ext({kind}, {} bytes)", data.len()))
+            }
+        }
+    }
+
+    /// Reads a stream of top-level MessagePack values (each value is
+    /// self-delimiting, so records can just be concatenated back-to-back
+    /// in the file - the common convention for a MessagePack *data* file,
+    /// as opposed to a single MessagePack-encoded document). If the file
+    /// holds exactly one top-level value and it's an array, that array's
+    /// elements are treated as the records instead, mirroring how the
+    /// JSON reader treats a single top-level `[...]` array.
+    pub(crate) fn columns_from_msgpack(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use std::fs::File;
+        use std::io::BufRead;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = BufReader::new(file);
+
+        let mut top_values = Vec::new();
+        while !reader
+            .fill_buf()
+            .with_context(|| format!("failed reading {path:?}"))?
+            .is_empty()
+        {
+            let v = read_value(&mut reader, MAX_DEPTH)
+                .with_context(|| format!("failed decoding a MessagePack value from {path:?}"))?;
+            top_values.push(v);
+        }
+
+        let values: Vec<Value> = if top_values.len() == 1 {
+            match top_values.into_iter().next().unwrap() {
+                Value::Array(items) => items,
+                other => vec![other],
+            }
+        } else {
+            top_values
+        };
+
+        let mut values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
+        if let Some(n) = nrows {
+            values.truncate(n);
+        }
+
+        // Not every MessagePack stream holds map-typed records - a stream of
+        // bare scalars (e.g. IoT/telemetry readings, a real, common shape for
+        // this format specifically because it's compact binary encoding) has
+        // no field names to extract, but is still a genuine single column.
+        // Same fallback the JSON/YAML/Avro readers already use for their own
+        // analogous case, found the same way: real-world testing.
+        if values.iter().all(JsonValue::is_object) {
+            let records: Vec<serde_json::Map<String, JsonValue>> = values
+                .into_iter()
+                .map(|v| match v {
+                    JsonValue::Object(m) => m,
+                    _ => unreachable!("just checked every value is an object"),
+                })
+                .collect();
+            Ok(profile_json_records(&records, n_samples))
+        } else {
+            let total = values.len();
+            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+            Ok(profile_json_path(
+                "value".to_string(),
+                total,
+                refs,
+                n_samples,
+            ))
+        }
+    }
+} // mod msgpack_support
+
 #[cfg(feature = "msgpack")]
 fn columns_from_msgpack(
     path: &Path,
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use std::fs::File;
-    use std::io::BufRead;
-    use std::io::BufReader;
-
-    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let mut reader = BufReader::new(file);
-
-    let mut top_values = Vec::new();
-    while !reader
-        .fill_buf()
-        .with_context(|| format!("failed reading {path:?}"))?
-        .is_empty()
-    {
-        let v = rmpv::decode::read_value(&mut reader)
-            .with_context(|| format!("failed decoding a MessagePack value from {path:?}"))?;
-        top_values.push(v);
-    }
-
-    let values: Vec<rmpv::Value> = if top_values.len() == 1 {
-        match top_values.into_iter().next().unwrap() {
-            rmpv::Value::Array(items) => items,
-            other => vec![other],
-        }
-    } else {
-        top_values
-    };
-
-    let mut values: Vec<JsonValue> = values.iter().map(msgpack_value_to_json).collect();
-    if let Some(n) = nrows {
-        values.truncate(n);
-    }
-
-    // Not every MessagePack stream holds map-typed records - a stream of
-    // bare scalars (e.g. IoT/telemetry readings, a real, common shape for
-    // this format specifically because it's compact binary encoding) has
-    // no field names to extract, but is still a genuine single column.
-    // Same fallback the JSON/YAML/Avro readers already use for their own
-    // analogous case, found the same way: real-world testing.
-    if values.iter().all(JsonValue::is_object) {
-        let records: Vec<serde_json::Map<String, JsonValue>> = values
-            .into_iter()
-            .map(|v| match v {
-                JsonValue::Object(m) => m,
-                _ => unreachable!("just checked every value is an object"),
-            })
-            .collect();
-        Ok(profile_json_records(&records, n_samples))
-    } else {
-        let total = values.len();
-        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-        Ok(profile_json_path(
-            "value".to_string(),
-            total,
-            refs,
-            n_samples,
-        ))
-    }
+    msgpack_support::columns_from_msgpack(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "msgpack"))]
@@ -4140,7 +4416,6 @@ fn columns_from_msgpack(
         "MessagePack support isn't compiled in - rebuild with `cargo build --release --features msgpack` (or --features full)"
     )
 }
-
 // --- TOML reader (opt-in via --features toml) ---
 // A TOML file is a single document, not inherently a table of many rows -
 // unlike every other reader in this file, there's no natural "row" to
@@ -15662,6 +15937,143 @@ mod tests {
                         m.name
                     );
                 }
+            }
+        }
+    }
+
+    /// Test-only: `rmpv`/`rmp` are dev-dependencies now (see Cargo.toml
+    /// and CLAUDE.md's Dependency footprint section) - `msgpack_support`'s
+    /// own hand-rolled decoder replaced them at runtime, so this
+    /// function's only remaining job is producing the "expected" side of
+    /// `msgpack_reader_matches_the_rmpv_crate_output_exactly`. A near-
+    /// verbatim copy of what `columns_from_msgpack` used to be before
+    /// that module replaced it.
+    #[cfg(all(test, feature = "msgpack"))]
+    fn columns_from_msgpack_via_rmpv(path: &Path, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+        use std::io::BufRead;
+
+        fn key_to_string(k: &rmpv::Value) -> String {
+            if let rmpv::Value::String(s) = k
+                && let Some(s) = s.as_str()
+            {
+                return s.to_string();
+            }
+            value_to_json(k).to_string()
+        }
+        fn value_to_json(v: &rmpv::Value) -> JsonValue {
+            use rmpv::Value as MpValue;
+            match v {
+                MpValue::Nil => JsonValue::Null,
+                MpValue::Boolean(b) => JsonValue::Bool(*b),
+                MpValue::Integer(i) => i
+                    .as_i64()
+                    .map(JsonValue::from)
+                    .or_else(|| i.as_u64().map(JsonValue::from))
+                    .unwrap_or(JsonValue::Null),
+                MpValue::F32(f) => serde_json::Number::from_f64(f64::from(*f))
+                    .map_or(JsonValue::Null, JsonValue::Number),
+                MpValue::F64(f) => {
+                    serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                }
+                MpValue::String(s) => JsonValue::String(match s.as_str() {
+                    Some(s) => s.to_string(),
+                    None => s.as_bytes().iter().map(|b| format!("{b:02x}")).collect(),
+                }),
+                MpValue::Binary(b) => {
+                    JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+                }
+                MpValue::Array(items) => {
+                    JsonValue::Array(items.iter().map(value_to_json).collect())
+                }
+                MpValue::Map(pairs) => JsonValue::Object(
+                    pairs
+                        .iter()
+                        .map(|(k, v)| (key_to_string(k), value_to_json(v)))
+                        .collect(),
+                ),
+                MpValue::Ext(kind, data) => {
+                    JsonValue::String(format!("ext({kind}, {} bytes)", data.len()))
+                }
+            }
+        }
+
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut top_values = Vec::new();
+        while !reader.fill_buf()?.is_empty() {
+            top_values.push(rmpv::decode::read_value(&mut reader)?);
+        }
+        let values: Vec<rmpv::Value> = if top_values.len() == 1 {
+            match top_values.into_iter().next().unwrap() {
+                rmpv::Value::Array(items) => items,
+                other => vec![other],
+            }
+        } else {
+            top_values
+        };
+        let values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
+
+        if values.iter().all(JsonValue::is_object) {
+            let records: Vec<serde_json::Map<String, JsonValue>> = values
+                .into_iter()
+                .map(|v| match v {
+                    JsonValue::Object(m) => m,
+                    _ => unreachable!(),
+                })
+                .collect();
+            Ok(profile_json_records(&records, n_samples))
+        } else {
+            let total = values.len();
+            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+            Ok(profile_json_path(
+                "value".to_string(),
+                total,
+                refs,
+                n_samples,
+            ))
+        }
+    }
+
+    /// Cross-verification oracle for the hand-rolled MessagePack decoder
+    /// (`msgpack_support` - see Cargo.toml) against the real `rmpv`
+    /// crate, kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "msgpack")]
+    #[test]
+    fn msgpack_reader_matches_the_rmpv_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.msgpack",
+            "tests/fixtures/type_detection.msgpack",
+            "tests/fixtures/edge_msgpack_scalar_array.msgpack",
+            "tests/fixtures/malformed_garbage.msgpack",
+            "tests/fixtures/edge_msgpack_wide_markers.msgpack",
+        ] {
+            let path = Path::new(f);
+            let mine = msgpack_support::columns_from_msgpack(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_msgpack_via_rmpv(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: rmpv-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
             }
         }
     }
