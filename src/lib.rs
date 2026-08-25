@@ -6058,380 +6058,930 @@ fn columns_from_xml(
 // --- NumPy reader (opt-in via --features npy; covers .npy and .npz) ---
 // A structured (record) dtype is the genuinely tabular case - one named
 // field per column - and is handled precisely: fields are read byte-for-
-// byte per npyz's own DType/TypeStr description, decoded per TypeChar
-// (int/uint/float by width and endianness, fixed-width byte/unicode
-// strings trimmed of their right-zero-padding), with anything not
-// representable as a simple value (a fixed-size sub-array field, `f16`,
-// pickled `object` dtype) falling back to a hex dump rather than fabricating
-// a value or failing the whole file. A plain (non-structured) array has no
-// field names at all - numpy doesn't carry them - so it's treated like a
-// headerless CSV: a 1D array is one column, a 2D array gets positional
-// `col_0..col_N` columns; anything higher-dimensional doesn't have an
-// honest 2D tabular reading, so it's a clear error rather than a guess.
-// .npz is just a zip of named .npy arrays, so - like SQLite's tables and
-// Excel's sheets - each array becomes its own table.
-
+// byte per this module's own DType/TypeStr description (a hand-rolled
+// stand-in for npyz's own types - see CLAUDE.md's Dependency footprint
+// section), decoded per TypeChar (int/uint/float by width and endianness,
+// fixed-width byte/unicode strings trimmed of their right-zero-padding),
+// with anything not representable as a simple value (a fixed-size
+// sub-array field, `f16`, pickled `object` dtype) falling back to a hex
+// dump rather than fabricating a value or failing the whole file. A plain
+// (non-structured) array has no field names at all - numpy doesn't carry
+// them - so it's treated like a headerless CSV: a 1D array is one column,
+// a 2D array gets positional `col_0..col_N` columns; anything higher-
+// dimensional doesn't have an honest 2D tabular reading, so it's a clear
+// error rather than a guess. .npz is just a zip of named `.npy` streams,
+// so - like SQLite's tables and Excel's sheets - each array becomes its
+// own table; it reuses `zip_support::ZipArchive` (see that module's own
+// header comment) rather than a second zip reader.
 #[cfg(feature = "npy")]
-fn npy_read_uint(bytes: &[u8], big_endian: bool) -> Option<u64> {
-    Some(match bytes.len() {
-        1 => bytes[0] as u64,
-        2 => {
-            let b: [u8; 2] = bytes.try_into().ok()?;
-            if big_endian {
-                u16::from_be_bytes(b)
-            } else {
-                u16::from_le_bytes(b)
-            }
-            .into()
-        }
-        4 => {
-            let b: [u8; 4] = bytes.try_into().ok()?;
-            if big_endian {
-                u32::from_be_bytes(b)
-            } else {
-                u32::from_le_bytes(b)
-            }
-            .into()
-        }
-        8 => {
-            let b: [u8; 8] = bytes.try_into().ok()?;
-            if big_endian {
-                u64::from_be_bytes(b)
-            } else {
-                u64::from_le_bytes(b)
-            }
-        }
-        _ => return None,
-    })
-}
+mod npy_support {
+    use super::*;
 
-#[cfg(feature = "npy")]
-fn npy_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+    // ---------------------------------------------------------------
+    // A minimal Python-literal parser - just enough for an NPY header
+    // dict (`{'descr': ..., 'fortran_order': ..., 'shape': ..., }`),
+    // not a general Python expression evaluator. Verified directly
+    // against real `numpy.save` output (a plain array, a structured
+    // array, a Fortran-order array, and a record field with its own
+    // fixed-size sub-array shape) rather than assumed from the NPY
+    // format spec's prose alone - see the four worked examples this was
+    // checked against in the commit that introduced this module.
+    // ---------------------------------------------------------------
 
-#[cfg(feature = "npy")]
-fn npy_scalar_to_string(ty: &npyz::TypeStr, bytes: &[u8]) -> String {
-    use npyz::{Endianness, TypeChar};
+    #[derive(Debug, Clone)]
+    enum PyValue {
+        Str(String),
+        Bool(bool),
+        Int(i64),
+        // A Python list or tuple - NPY headers never depend on which one
+        // it actually is, so both parse to the same variant.
+        Seq(Vec<PyValue>),
+    }
 
-    let big_endian = ty.endianness() == Endianness::Big;
-    match ty.type_char() {
-        TypeChar::Bool => (bytes.first() == Some(&1)).to_string(),
-        TypeChar::Int => match (bytes.len(), npy_read_uint(bytes, big_endian)) {
-            (1, Some(v)) => (v as u8 as i8).to_string(),
-            (2, Some(v)) => (v as u16 as i16).to_string(),
-            (4, Some(v)) => (v as u32 as i32).to_string(),
-            (8, Some(v)) => (v as i64).to_string(),
-            _ => npy_hex(bytes),
-        },
-        TypeChar::Uint | TypeChar::TimeDelta | TypeChar::DateTime => {
-            npy_read_uint(bytes, big_endian).map_or_else(|| npy_hex(bytes), |v| v.to_string())
+    struct PyParser<'a> {
+        s: &'a str,
+        pos: usize,
+    }
+
+    impl<'a> PyParser<'a> {
+        fn new(s: &'a str) -> Self {
+            PyParser { s, pos: 0 }
         }
-        TypeChar::Float => match bytes.len() {
-            4 => {
-                let b: [u8; 4] = bytes.try_into().unwrap();
-                if big_endian {
-                    f32::from_be_bytes(b)
-                } else {
-                    f32::from_le_bytes(b)
+
+        fn peek(&self) -> Option<char> {
+            self.s[self.pos..].chars().next()
+        }
+
+        fn bump(&mut self) -> Option<char> {
+            let c = self.peek()?;
+            self.pos += c.len_utf8();
+            Some(c)
+        }
+
+        fn skip_ws(&mut self) {
+            while matches!(self.peek(), Some(c) if c.is_whitespace()) {
+                self.bump();
+            }
+        }
+
+        fn expect(&mut self, c: char) -> Result<()> {
+            self.skip_ws();
+            if self.bump() == Some(c) {
+                Ok(())
+            } else {
+                bail!(
+                    "malformed NPY header: expected '{c}' at byte offset {}",
+                    self.pos
+                )
+            }
+        }
+
+        fn parse_string(&mut self) -> Result<String> {
+            let quote = match self.peek() {
+                Some(c @ ('\'' | '"')) => c,
+                _ => bail!(
+                    "malformed NPY header: expected a quoted string at byte offset {}",
+                    self.pos
+                ),
+            };
+            self.bump();
+            let mut out = String::new();
+            loop {
+                match self.bump() {
+                    None => bail!("malformed NPY header: unterminated string"),
+                    Some(c) if c == quote => break,
+                    Some('\\') => match self.bump() {
+                        Some('\\') => out.push('\\'),
+                        Some('\'') => out.push('\''),
+                        Some('"') => out.push('"'),
+                        Some('n') => out.push('\n'),
+                        Some('r') => out.push('\r'),
+                        Some('t') => out.push('\t'),
+                        Some(other) => out.push(other),
+                        None => bail!("malformed NPY header: unterminated escape sequence"),
+                    },
+                    Some(c) => out.push(c),
                 }
-                .to_string()
+            }
+            Ok(out)
+        }
+
+        fn parse_int(&mut self) -> Result<i64> {
+            let start = self.pos;
+            if self.peek() == Some('-') {
+                self.bump();
+            }
+            let mut any_digit = false;
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.bump();
+                any_digit = true;
+            }
+            if !any_digit {
+                bail!(
+                    "malformed NPY header: expected an integer at byte offset {}",
+                    start
+                );
+            }
+            self.s[start..self.pos].parse::<i64>().with_context(|| {
+                format!("malformed NPY header: invalid integer at byte offset {start}")
+            })
+        }
+
+        fn parse_seq(&mut self, open: char, close: char) -> Result<PyValue> {
+            self.expect(open)?;
+            let mut items = Vec::new();
+            loop {
+                self.skip_ws();
+                if self.peek() == Some(close) {
+                    self.bump();
+                    break;
+                }
+                items.push(self.parse_value()?);
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => {
+                        self.bump();
+                    }
+                    Some(c) if c == close => {
+                        self.bump();
+                        break;
+                    }
+                    _ => bail!(
+                        "malformed NPY header: expected ',' or '{close}' at byte offset {}",
+                        self.pos
+                    ),
+                }
+            }
+            Ok(PyValue::Seq(items))
+        }
+
+        fn parse_value(&mut self) -> Result<PyValue> {
+            self.skip_ws();
+            match self.peek() {
+                Some('\'' | '"') => self.parse_string().map(PyValue::Str),
+                Some('(') => self.parse_seq('(', ')'),
+                Some('[') => self.parse_seq('[', ']'),
+                Some(c) if c.is_ascii_digit() || c == '-' => self.parse_int().map(PyValue::Int),
+                _ if self.s[self.pos..].starts_with("True") => {
+                    self.pos += 4;
+                    Ok(PyValue::Bool(true))
+                }
+                _ if self.s[self.pos..].starts_with("False") => {
+                    self.pos += 5;
+                    Ok(PyValue::Bool(false))
+                }
+                _ if self.s[self.pos..].starts_with("None") => {
+                    self.pos += 4;
+                    Ok(PyValue::Seq(Vec::new())) // never a real NPY header value; a harmless placeholder
+                }
+                _ => bail!(
+                    "malformed NPY header: unexpected character at byte offset {}",
+                    self.pos
+                ),
+            }
+        }
+
+        /// Parses the header's own top-level `{...}` dict into an ordered
+        /// list of (key, value) pairs - a plain `Vec` rather than a map,
+        /// since there are only ever 3 keys and preserving source order
+        /// costs nothing.
+        fn parse_dict(&mut self) -> Result<Vec<(String, PyValue)>> {
+            self.expect('{')?;
+            let mut pairs = Vec::new();
+            loop {
+                self.skip_ws();
+                if self.peek() == Some('}') {
+                    self.bump();
+                    break;
+                }
+                let key = self.parse_string()?;
+                self.expect(':')?;
+                let value = self.parse_value()?;
+                pairs.push((key, value));
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => {
+                        self.bump();
+                    }
+                    Some('}') => {
+                        self.bump();
+                        break;
+                    }
+                    _ => bail!(
+                        "malformed NPY header: expected ',' or '}}' at byte offset {}",
+                        self.pos
+                    ),
+                }
+            }
+            Ok(pairs)
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // TypeStr / DType - a hand-rolled stand-in for npyz's own types of
+    // the same name, covering exactly what real `numpy.save` emits.
+    // Verified field-by-field against npyz's own `type_str.rs` (the
+    // endianness/type-character grammar, and which TypeChar values need
+    // an explicit width vs. which allow an empty one) before being
+    // trusted, the same "verify against source" discipline as every
+    // other hand-roll in this project.
+    // ---------------------------------------------------------------
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Endianness {
+        Little,
+        Big,
+        Irrelevant,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TypeChar {
+        Bool,
+        Int,
+        Uint,
+        Float,
+        Complex,
+        TimeDelta,
+        DateTime,
+        ByteStr,
+        UnicodeStr,
+        Object,
+        RawData,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TypeStr {
+        endianness: Endianness,
+        type_char: TypeChar,
+        size: u64,
+    }
+
+    impl TypeStr {
+        /// Get the number of bytes a single value occupies, or `None` if
+        /// the size isn't fixed (the pickled `object` dtype) - mirrors
+        /// `npyz::TypeStr::num_bytes` exactly, including `U`'s own
+        /// 4-bytes-per-code-point rule (numpy's fixed Unicode strings are
+        /// stored as UCS-4/UTF-32, so `size` there counts code points,
+        /// not bytes).
+        fn num_bytes(&self) -> Option<usize> {
+            let size = usize::try_from(self.size).ok()?;
+            match self.type_char {
+                TypeChar::Object => None,
+                TypeChar::UnicodeStr => size.checked_mul(4),
+                _ => Some(size),
+            }
+        }
+    }
+
+    fn parse_type_str(s: &str) -> Result<TypeStr> {
+        let mut chars = s.chars();
+        let e = chars
+            .next()
+            .with_context(|| format!("invalid numpy type string '{s}': empty"))?;
+        let endianness = match e {
+            '<' => Endianness::Little,
+            '>' => Endianness::Big,
+            '|' => Endianness::Irrelevant,
+            _ => bail!("invalid numpy type string '{s}': unknown endianness character '{e}'"),
+        };
+        let t = chars
+            .next()
+            .with_context(|| format!("invalid numpy type string '{s}': missing type character"))?;
+        let type_char = match t {
+            'b' => TypeChar::Bool,
+            'i' => TypeChar::Int,
+            'u' => TypeChar::Uint,
+            'f' => TypeChar::Float,
+            'c' => TypeChar::Complex,
+            'm' => TypeChar::TimeDelta,
+            'M' => TypeChar::DateTime,
+            'S' | 'a' => TypeChar::ByteStr,
+            'U' => TypeChar::UnicodeStr,
+            'O' => TypeChar::Object,
+            'V' => TypeChar::RawData,
+            _ => bail!("invalid numpy type string '{s}': unknown type character '{t}'"),
+        };
+        // Anything after the digits (a `[us]`-style time-unit suffix on
+        // `m`/`M` types) is deliberately not interpreted - this project
+        // never resolves timedelta64/datetime64 to a real date, only
+        // labels them "Timestamp" and renders the raw stored integer
+        // (see npy_type_label below), so the unit itself carries no
+        // information this tool acts on.
+        let rest = chars.as_str();
+        let digits = rest.split('[').next().unwrap_or(rest);
+        let size: u64 = if digits.is_empty() {
+            if type_char == TypeChar::Object {
+                0
+            } else {
+                bail!("invalid numpy type string '{s}': missing size");
+            }
+        } else {
+            digits
+                .parse()
+                .with_context(|| format!("invalid numpy type string '{s}': bad size '{digits}'"))?
+        };
+        Ok(TypeStr {
+            endianness,
+            type_char,
+            size,
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    struct Field {
+        name: String,
+        dtype: DType,
+    }
+
+    #[derive(Debug, Clone)]
+    enum DType {
+        Plain(TypeStr),
+        Array(u64, Box<DType>),
+        Record(Vec<Field>),
+    }
+
+    impl DType {
+        fn num_bytes(&self) -> Option<usize> {
+            match self {
+                DType::Plain(ty) => ty.num_bytes(),
+                DType::Array(n, inner) => inner.num_bytes()?.checked_mul(usize::try_from(*n).ok()?),
+                DType::Record(fields) => fields
+                    .iter()
+                    .try_fold(0usize, |acc, f| acc.checked_add(f.dtype.num_bytes()?)),
+            }
+        }
+
+        fn uses_pickled_array(&self) -> bool {
+            match self {
+                DType::Plain(ty) => ty.type_char == TypeChar::Object,
+                DType::Array(_, inner) => inner.uses_pickled_array(),
+                DType::Record(fields) => fields.iter().any(|f| f.dtype.uses_pickled_array()),
+            }
+        }
+
+        /// Converts a parsed `descr` value (either a plain type string, or
+        /// a list of 2/3-element tuples for a structured/record dtype)
+        /// into a `DType` - mirrors `npyz::DType::from_descr` and its
+        /// `convert_tuple_to_record_field` helper, including a 3-tuple's
+        /// third element (a shape) nesting `Array` from the innermost
+        /// dimension outward, verified against a real
+        /// `numpy.save`-produced sub-array field (`('vec', '<f4', (3,))`).
+        fn from_descr(v: &PyValue) -> Result<Self> {
+            match v {
+                PyValue::Str(s) => Ok(DType::Plain(parse_type_str(s)?)),
+                PyValue::Seq(items) => {
+                    let fields = items
+                        .iter()
+                        .map(|item| {
+                            let PyValue::Seq(tuple) = item else {
+                                bail!("malformed NPY header: record dtype entry must be a tuple");
+                            };
+                            if tuple.len() != 2 && tuple.len() != 3 {
+                                bail!(
+                                    "malformed NPY header: record dtype entry must have 2 or 3 items, got {}",
+                                    tuple.len()
+                                );
+                            }
+                            let PyValue::Str(name) = &tuple[0] else {
+                                bail!("malformed NPY header: record dtype entry name must be a string");
+                            };
+                            let mut dtype = DType::from_descr(&tuple[1])?;
+                            if let Some(shape_val) = tuple.get(2) {
+                                let PyValue::Seq(dims) = shape_val else {
+                                    bail!(
+                                        "malformed NPY header: record dtype sub-array shape must be a tuple"
+                                    );
+                                };
+                                let mut dims_u64 = dims
+                                    .iter()
+                                    .map(|d| match d {
+                                        PyValue::Int(n) if *n >= 0 => Ok(*n as u64),
+                                        _ => bail!(
+                                            "malformed NPY header: sub-array shape must contain non-negative integers"
+                                        ),
+                                    })
+                                    .collect::<Result<Vec<u64>>>()?;
+                                while let Some(dim) = dims_u64.pop() {
+                                    dtype = DType::Array(dim, Box::new(dtype));
+                                }
+                            }
+                            Ok(Field {
+                                name: name.clone(),
+                                dtype,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(DType::Record(fields))
+                }
+                _ => bail!("malformed NPY header: 'descr' must be a string or a list"),
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Header parsing (NPY format spec, verified against npyz's own
+    // `header.rs` - magic/version layout, the version-dependent header-
+    // length field width, and the trailing-newline-stripped header text
+    // being a single Python dict literal - and against four real
+    // `numpy.save` outputs inspected byte-for-byte: a plain 1D array, a
+    // structured array, a Fortran-order 2D array, and a sub-array field).
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    enum Order {
+        C,
+        Fortran,
+    }
+
+    struct NpyHeader {
+        dtype: DType,
+        shape: Vec<u64>,
+        order: Order,
+    }
+
+    fn read_npy_header<R: std::io::Read>(reader: &mut R) -> Result<NpyHeader> {
+        let mut magic_version = [0u8; 8];
+        reader
+            .read_exact(&mut magic_version)
+            .context("truncated .npy file: missing magic/version bytes")?;
+        if &magic_version[0..6] != b"\x93NUMPY" {
+            bail!("not a valid .npy file (bad magic bytes)");
+        }
+        let major = magic_version[6];
+        let header_size = match major {
+            1 => {
+                let mut b = [0u8; 2];
+                reader
+                    .read_exact(&mut b)
+                    .context("truncated .npy file: missing header length")?;
+                u16::from_le_bytes(b) as usize
+            }
+            2 | 3 => {
+                let mut b = [0u8; 4];
+                reader
+                    .read_exact(&mut b)
+                    .context("truncated .npy file: missing header length")?;
+                u32::from_le_bytes(b) as usize
+            }
+            other => bail!(
+                "unsupported .npy format version {other}.{} - only versions 1.x, 2.x, and 3.x are supported",
+                magic_version[7]
+            ),
+        };
+
+        let mut header_text = vec![0u8; header_size];
+        reader
+            .read_exact(&mut header_text)
+            .context("truncated .npy file: missing header text")?;
+        let text = std::str::from_utf8(&header_text)
+            .context("malformed .npy file: header is not valid UTF-8")?;
+        let text = text.strip_suffix('\n').unwrap_or(text);
+
+        let pairs = PyParser::new(text)
+            .parse_dict()
+            .context("malformed .npy file: could not parse header dict")?;
+
+        let mut descr = None;
+        let mut fortran_order = None;
+        let mut shape_val = None;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "descr" => descr = Some(value),
+                "fortran_order" => fortran_order = Some(value),
+                "shape" => shape_val = Some(value),
+                _ => {} // forward-compatible: ignore any other key
+            }
+        }
+
+        let dtype =
+            DType::from_descr(&descr.context("malformed .npy file: header is missing 'descr'")?)?;
+        let fortran_order = match fortran_order
+            .context("malformed .npy file: header is missing 'fortran_order'")?
+        {
+            PyValue::Bool(b) => b,
+            _ => bail!("malformed .npy file: 'fortran_order' must be a bool"),
+        };
+        let shape = match shape_val.context("malformed .npy file: header is missing 'shape'")? {
+            PyValue::Seq(items) => items
+                .iter()
+                .map(|v| match v {
+                    PyValue::Int(n) if *n >= 0 => Ok(*n as u64),
+                    _ => bail!("malformed .npy file: 'shape' must contain non-negative integers"),
+                })
+                .collect::<Result<Vec<u64>>>()?,
+            _ => bail!("malformed .npy file: 'shape' must be a tuple"),
+        };
+
+        Ok(NpyHeader {
+            dtype,
+            shape,
+            order: if fortran_order {
+                Order::Fortran
+            } else {
+                Order::C
+            },
+        })
+    }
+
+    // ---------------------------------------------------------------
+    // Value stringification - ported unchanged in spirit from this
+    // project's previous npyz-backed version, just retargeted at the
+    // local TypeStr/DType above instead of npyz's own types.
+    // ---------------------------------------------------------------
+
+    fn npy_read_uint(bytes: &[u8], big_endian: bool) -> Option<u64> {
+        Some(match bytes.len() {
+            1 => bytes[0] as u64,
+            2 => {
+                let b: [u8; 2] = bytes.try_into().ok()?;
+                if big_endian {
+                    u16::from_be_bytes(b)
+                } else {
+                    u16::from_le_bytes(b)
+                }
+                .into()
+            }
+            4 => {
+                let b: [u8; 4] = bytes.try_into().ok()?;
+                if big_endian {
+                    u32::from_be_bytes(b)
+                } else {
+                    u32::from_le_bytes(b)
+                }
+                .into()
             }
             8 => {
-                let b: [u8; 8] = bytes.try_into().unwrap();
+                let b: [u8; 8] = bytes.try_into().ok()?;
                 if big_endian {
-                    f64::from_be_bytes(b)
+                    u64::from_be_bytes(b)
                 } else {
-                    f64::from_le_bytes(b)
-                }
-                .to_string()
-            }
-            _ => npy_hex(bytes), // f16/f128 - rare, not worth a half-precision dependency
-        },
-        TypeChar::ByteStr => {
-            let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
-            String::from_utf8_lossy(trimmed).into_owned()
-        }
-        TypeChar::UnicodeStr => {
-            let mut s = String::new();
-            for chunk in bytes.chunks_exact(4) {
-                let code = npy_read_uint(chunk, big_endian).unwrap_or(0) as u32;
-                if code == 0 {
-                    break; // right-zero-padded, like ByteStr
-                }
-                if let Some(c) = char::from_u32(code) {
-                    s.push(c);
+                    u64::from_le_bytes(b)
                 }
             }
-            s
-        }
-        // Complex, Object (pickled - caught earlier via uses_pickled_array),
-        // RawData, and any future TypeChar variant: hex is always safe.
-        _ => npy_hex(bytes),
-    }
-}
-
-#[cfg(feature = "npy")]
-fn npy_value_to_string(dtype: &npyz::DType, bytes: &[u8]) -> String {
-    match dtype {
-        npyz::DType::Plain(ty) => npy_scalar_to_string(ty, bytes),
-        npyz::DType::Array(n, inner) => {
-            let Some(elem_size) = inner.num_bytes() else {
-                return npy_hex(bytes);
-            };
-            (0..*n as usize)
-                .filter_map(|i| bytes.get(i * elem_size..(i + 1) * elem_size))
-                .map(|chunk| npy_value_to_string(inner, chunk))
-                .collect::<Vec<_>>()
-                .join(";")
-        }
-        npyz::DType::Record(_) => npy_hex(bytes), // a field nested inside a field - rare
-    }
-}
-
-/// The declared numpy dtype, mapped to this tool's type labels - this is
-/// `current_type`, i.e. what the format *says* it is (mirrors
-/// `arrow_type_label` for Parquet/Arrow IPC). `profile_column` still
-/// independently re-derives `ideal_type` from the stringified values
-/// regardless of this label, same as every other format.
-#[cfg(feature = "npy")]
-fn npy_type_label(dtype: &npyz::DType) -> String {
-    use npyz::TypeChar;
-    match dtype {
-        npyz::DType::Plain(ty) => match ty.type_char() {
-            TypeChar::Bool => "bool".to_string(),
-            TypeChar::Int | TypeChar::Uint => "i64".to_string(),
-            TypeChar::Float => "f64".to_string(),
-            TypeChar::ByteStr | TypeChar::UnicodeStr => "String".to_string(),
-            TypeChar::TimeDelta | TypeChar::DateTime => "Timestamp".to_string(),
-            TypeChar::Complex => "Complex".to_string(),
-            TypeChar::RawData => "Bytes".to_string(),
-            _ => "Object".to_string(),
-        },
-        npyz::DType::Array(_, inner) => format!("Vec<{}>", npy_type_label(inner)),
-        npyz::DType::Record(_) => "Struct".to_string(),
-    }
-}
-
-/// Reads one already-opened `.npy` stream (a standalone file, or one array
-/// inside a `.npz` archive - the two share this same core). A structured
-/// dtype gives one column per field; a plain dtype gets positional
-/// `col_0..col_N` columns for a 2D array, or a single `value` column for 1D.
-#[cfg(feature = "npy")]
-fn columns_from_npy_reader<R: std::io::Read>(
-    npy: npyz::NpyFile<R>,
-    nrows: Option<usize>,
-    n_samples: usize,
-) -> Result<Vec<ColumnProfile>> {
-    let header = npy.header().clone();
-    let dtype = header.dtype();
-    if dtype.uses_pickled_array() {
-        bail!(
-            "this array uses numpy's pickled 'object' dtype, which isn't a fixed byte layout \
-             this tool can read - re-save it with a concrete dtype"
-        );
-    }
-    let shape = header.shape().to_vec();
-    let order = header.order();
-    let mut reader = npy.into_inner();
-
-    let fields: Vec<npyz::Field> = match &dtype {
-        npyz::DType::Record(fields) => fields.clone(),
-        other => vec![npyz::Field {
-            name: "value".to_string(),
-            dtype: other.clone(),
-        }],
-    };
-    let is_record = matches!(dtype, npyz::DType::Record(_));
-
-    // A plain (unnamed) dtype with a 2D shape gets one positional column per
-    // trailing-axis element instead of a single "value" column - the closest
-    // honest equivalent of a headerless CSV's columns. Anything with more
-    // axes than that has no natural row/column reading, so it's a clear
-    // error instead of silently flattening or guessing.
-    let n_cols = if is_record {
-        1
-    } else {
-        match shape.len() {
-            0 | 1 => 1,
-            2 => usize::try_from(shape[1]).context("array width overflows usize")?,
-            n => bail!(
-                "a {n}-dimensional plain (non-structured) array has no natural row/column \
-                 reading - only 1D, 2D, or a structured (record) dtype are supported"
-            ),
-        }
-    };
-    let n_rows = usize::try_from(shape.first().copied().unwrap_or(1))
-        .context("array length overflows usize")?;
-
-    let field_sizes: Vec<usize> = fields
-        .iter()
-        .map(|f| {
-            f.dtype
-                .num_bytes()
-                .with_context(|| format!("field '{}' has no fixed byte size", f.name))
+            _ => return None,
         })
-        .collect::<Result<_>>()?;
+    }
 
-    let mut columns: Vec<Vec<String>> = if is_record {
-        vec![Vec::new(); fields.len()]
-    } else {
-        vec![Vec::new(); n_cols]
-    };
-    let rows_to_read = nrows.map_or(n_rows, |limit| limit.min(n_rows));
+    fn npy_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
-    if is_record {
-        // A structured array's records are always laid out contiguously one
-        // after another (there's no "order" concept for records), so this
-        // can stream one record at a time.
-        let record_size: usize = field_sizes.iter().sum();
-        let mut buf = vec![0u8; record_size];
-        for row in 0..rows_to_read {
-            reader
-                .read_exact(&mut buf)
-                .with_context(|| format!("failed reading row {row}"))?;
-            let mut offset = 0;
-            for (col_idx, (field, size)) in fields.iter().zip(&field_sizes).enumerate() {
-                columns[col_idx].push(npy_value_to_string(
-                    &field.dtype,
-                    &buf[offset..offset + size],
-                ));
-                offset += size;
+    fn npy_scalar_to_string(ty: &TypeStr, bytes: &[u8]) -> String {
+        let big_endian = ty.endianness == Endianness::Big;
+        match ty.type_char {
+            TypeChar::Bool => (bytes.first() == Some(&1)).to_string(),
+            TypeChar::Int => match (bytes.len(), npy_read_uint(bytes, big_endian)) {
+                (1, Some(v)) => (v as u8 as i8).to_string(),
+                (2, Some(v)) => (v as u16 as i16).to_string(),
+                (4, Some(v)) => (v as u32 as i32).to_string(),
+                (8, Some(v)) => (v as i64).to_string(),
+                _ => npy_hex(bytes),
+            },
+            TypeChar::Uint | TypeChar::TimeDelta | TypeChar::DateTime => {
+                npy_read_uint(bytes, big_endian).map_or_else(|| npy_hex(bytes), |v| v.to_string())
             }
+            TypeChar::Float => match bytes.len() {
+                4 => {
+                    let b: [u8; 4] = bytes.try_into().unwrap();
+                    if big_endian {
+                        f32::from_be_bytes(b)
+                    } else {
+                        f32::from_le_bytes(b)
+                    }
+                    .to_string()
+                }
+                8 => {
+                    let b: [u8; 8] = bytes.try_into().unwrap();
+                    if big_endian {
+                        f64::from_be_bytes(b)
+                    } else {
+                        f64::from_le_bytes(b)
+                    }
+                    .to_string()
+                }
+                _ => npy_hex(bytes), // f16/f128 - rare, not worth a half-precision dependency
+            },
+            TypeChar::ByteStr => {
+                let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+                String::from_utf8_lossy(trimmed).into_owned()
+            }
+            TypeChar::UnicodeStr => {
+                let mut s = String::new();
+                for chunk in bytes.chunks_exact(4) {
+                    let code = npy_read_uint(chunk, big_endian).unwrap_or(0) as u32;
+                    if code == 0 {
+                        break; // right-zero-padded, like ByteStr
+                    }
+                    if let Some(c) = char::from_u32(code) {
+                        s.push(c);
+                    }
+                }
+                s
+            }
+            // Complex, Object (pickled - caught earlier via uses_pickled_array),
+            // RawData: hex is always safe.
+            _ => npy_hex(bytes),
         }
-    } else {
-        // A plain array has no such guarantee - in particular, Fortran
-        // (column-major) order means a single row's elements are scattered
-        // stride-n_rows apart through the whole file, not contiguous - so
-        // this reads every element up front and computes each one's flat
-        // index explicitly rather than trying to stream row-sized chunks.
-        let elem_size = field_sizes[0];
-        let total_elems = n_rows * n_cols;
-        let mut buf = vec![0u8; total_elems * elem_size];
-        reader
-            .read_exact(&mut buf)
-            .with_context(|| format!("failed reading the array body ({total_elems} elements)"))?;
-        for row in 0..rows_to_read {
-            for (col_idx, column) in columns.iter_mut().enumerate() {
-                let flat_index = match order {
-                    npyz::Order::C => row * n_cols + col_idx,
-                    npyz::Order::Fortran => col_idx * n_rows + row,
+    }
+
+    fn npy_value_to_string(dtype: &DType, bytes: &[u8]) -> String {
+        match dtype {
+            DType::Plain(ty) => npy_scalar_to_string(ty, bytes),
+            DType::Array(n, inner) => {
+                let Some(elem_size) = inner.num_bytes() else {
+                    return npy_hex(bytes);
                 };
-                let start = flat_index * elem_size;
-                column.push(npy_value_to_string(
-                    &fields[0].dtype,
-                    &buf[start..start + elem_size],
-                ));
+                (0..*n as usize)
+                    .filter_map(|i| bytes.get(i * elem_size..(i + 1) * elem_size))
+                    .map(|chunk| npy_value_to_string(inner, chunk))
+                    .collect::<Vec<_>>()
+                    .join(";")
             }
+            DType::Record(_) => npy_hex(bytes), // a field nested inside a field - rare
         }
     }
 
-    let names: Vec<String> = if is_record {
-        fields.iter().map(|f| f.name.clone()).collect()
-    } else if n_cols == 1 {
-        vec!["value".to_string()]
-    } else {
-        (0..n_cols).map(|i| format!("col_{i}")).collect()
-    };
-    let current_types: Vec<String> = if is_record {
-        fields.iter().map(|f| npy_type_label(&f.dtype)).collect()
-    } else {
-        vec![npy_type_label(&fields[0].dtype); n_cols]
-    };
-
-    Ok(names
-        .into_iter()
-        .zip(current_types)
-        .zip(columns)
-        .map(|((name, current_type), values)| {
-            let total = values.len();
-            profile_column(
-                ColumnInput {
-                    name,
-                    current_type,
-                    raw_values: values,
-                    total,
-                    skip_heuristics: false,
-                },
-                n_samples,
-            )
-        })
-        .collect())
-}
-
-#[cfg(feature = "npy")]
-fn columns_from_npy(
-    path: &Path,
-    nrows: Option<usize>,
-    n_samples: usize,
-) -> Result<Vec<ColumnProfile>> {
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let npy = npyz::NpyFile::new(BufReader::new(file))
-        .with_context(|| format!("failed to parse {path:?} as a .npy file"))?;
-    columns_from_npy_reader(npy, nrows, n_samples)
-}
-
-#[cfg(not(feature = "npy"))]
-fn columns_from_npy(
-    _path: &Path,
-    _nrows: Option<usize>,
-    _n_samples: usize,
-) -> Result<Vec<ColumnProfile>> {
-    bail!(
-        "NumPy support isn't compiled in - rebuild with `cargo build --release --features npy` (or --features full)"
-    )
-}
-
-#[cfg(feature = "npy")]
-fn columns_from_npz(
-    path: &Path,
-    nrows: Option<usize>,
-    n_samples: usize,
-) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-    let mut archive = npyz::npz::NpzArchive::open(path)
-        .with_context(|| format!("failed to open {path:?} as a .npz archive"))?;
-    let names: Vec<String> = archive.array_names().map(str::to_string).collect();
-    if names.is_empty() {
-        bail!("no arrays found in {path:?}");
+    /// The declared numpy dtype, mapped to this tool's type labels - this is
+    /// `current_type`, i.e. what the format *says* it is (mirrors
+    /// `arrow_type_label` for Parquet/Arrow IPC). `profile_column` still
+    /// independently re-derives `ideal_type` from the stringified values
+    /// regardless of this label, same as every other format.
+    fn npy_type_label(dtype: &DType) -> String {
+        match dtype {
+            DType::Plain(ty) => match ty.type_char {
+                TypeChar::Bool => "bool".to_string(),
+                TypeChar::Int | TypeChar::Uint => "i64".to_string(),
+                TypeChar::Float => "f64".to_string(),
+                TypeChar::ByteStr | TypeChar::UnicodeStr => "String".to_string(),
+                TypeChar::TimeDelta | TypeChar::DateTime => "Timestamp".to_string(),
+                TypeChar::Complex => "Complex".to_string(),
+                TypeChar::RawData => "Bytes".to_string(),
+                TypeChar::Object => "Object".to_string(),
+            },
+            DType::Array(_, inner) => format!("Vec<{}>", npy_type_label(inner)),
+            DType::Record(_) => "Struct".to_string(),
+        }
     }
 
-    // Found via real-world testing (MNIST's own .npz - x_train/x_test are
-    // genuine 3-D image arrays with no natural row/column reading, a real,
-    // documented boundary, not a bug - but y_train/y_test in the *same
-    // file* are perfectly ordinary 1-D label arrays): one array's shape or
-    // dtype not being representable shouldn't cost every other array in
-    // the same archive its own profile. Each array's read is caught
-    // independently and disclosed on just that array's own "table" rather
-    // than aborting the whole archive, the same principle already applied
-    // to a single unconvertible nested column in Parquet/Arrow.
-    let mut out = Vec::new();
-    for name in names {
-        let read_result = archive
-            .by_name(&name)
-            .with_context(|| format!("failed reading array '{name}' from {path:?}"))
-            .and_then(|npy| {
-                npy.ok_or_else(|| anyhow!("array '{name}' disappeared while reading {path:?}"))
-            })
-            .and_then(|npy| columns_from_npy_reader(npy, nrows, n_samples));
+    /// Reads one already-parsed `.npy` header plus its data stream (a
+    /// standalone file, or one array inside a `.npz` archive - the two
+    /// share this same core). A structured dtype gives one column per
+    /// field; a plain dtype gets positional `col_0..col_N` columns for a
+    /// 2D array, or a single `value` column for 1D.
+    fn columns_from_npy_reader<R: std::io::Read>(
+        header: NpyHeader,
+        mut reader: R,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let NpyHeader {
+            dtype,
+            shape,
+            order,
+        } = header;
+        if dtype.uses_pickled_array() {
+            bail!(
+                "this array uses numpy's pickled 'object' dtype, which isn't a fixed byte layout \
+                 this tool can read - re-save it with a concrete dtype"
+            );
+        }
 
-        let profiles = match read_result {
-            Ok(profiles) => profiles,
-            Err(e) => vec![ColumnProfile {
+        let fields: Vec<Field> = match &dtype {
+            DType::Record(fields) => fields.clone(),
+            other => vec![Field {
                 name: "value".to_string(),
-                current_type: "unknown".to_string(),
-                ideal_type: "String".to_string(),
-                description: String::new(),
-                missing_pct: 0.0,
-                sample_values: Vec::new(),
-                notes: format!("array '{name}' could not be profiled: {e}"),
+                dtype: other.clone(),
             }],
         };
-        out.push((name, profiles));
+        let is_record = matches!(dtype, DType::Record(_));
+
+        // A plain (unnamed) dtype with a 2D shape gets one positional column per
+        // trailing-axis element instead of a single "value" column - the closest
+        // honest equivalent of a headerless CSV's columns. Anything with more
+        // axes than that has no natural row/column reading, so it's a clear
+        // error instead of silently flattening or guessing.
+        let n_cols = if is_record {
+            1
+        } else {
+            match shape.len() {
+                0 | 1 => 1,
+                2 => usize::try_from(shape[1]).context("array width overflows usize")?,
+                n => bail!(
+                    "a {n}-dimensional plain (non-structured) array has no natural row/column \
+                     reading - only 1D, 2D, or a structured (record) dtype are supported"
+                ),
+            }
+        };
+        let n_rows = usize::try_from(shape.first().copied().unwrap_or(1))
+            .context("array length overflows usize")?;
+
+        let field_sizes: Vec<usize> = fields
+            .iter()
+            .map(|f| {
+                f.dtype
+                    .num_bytes()
+                    .with_context(|| format!("field '{}' has no fixed byte size", f.name))
+            })
+            .collect::<Result<_>>()?;
+
+        let mut columns: Vec<Vec<String>> = if is_record {
+            vec![Vec::new(); fields.len()]
+        } else {
+            vec![Vec::new(); n_cols]
+        };
+        let rows_to_read = nrows.map_or(n_rows, |limit| limit.min(n_rows));
+
+        if is_record {
+            // A structured array's records are always laid out contiguously one
+            // after another (there's no "order" concept for records), so this
+            // can stream one record at a time.
+            let record_size: usize = field_sizes.iter().sum();
+            let mut buf = vec![0u8; record_size];
+            for row in 0..rows_to_read {
+                reader
+                    .read_exact(&mut buf)
+                    .with_context(|| format!("failed reading row {row}"))?;
+                let mut offset = 0;
+                for (col_idx, (field, size)) in fields.iter().zip(&field_sizes).enumerate() {
+                    columns[col_idx].push(npy_value_to_string(
+                        &field.dtype,
+                        &buf[offset..offset + size],
+                    ));
+                    offset += size;
+                }
+            }
+        } else {
+            // A plain array has no such guarantee - in particular, Fortran
+            // (column-major) order means a single row's elements are scattered
+            // stride-n_rows apart through the whole file, not contiguous - so
+            // this reads every element up front and computes each one's flat
+            // index explicitly rather than trying to stream row-sized chunks.
+            let elem_size = field_sizes[0];
+            let total_elems = n_rows * n_cols;
+            let mut buf = vec![0u8; total_elems * elem_size];
+            reader.read_exact(&mut buf).with_context(|| {
+                format!("failed reading the array body ({total_elems} elements)")
+            })?;
+            for row in 0..rows_to_read {
+                for (col_idx, column) in columns.iter_mut().enumerate() {
+                    let flat_index = match order {
+                        Order::C => row * n_cols + col_idx,
+                        Order::Fortran => col_idx * n_rows + row,
+                    };
+                    let start = flat_index * elem_size;
+                    column.push(npy_value_to_string(
+                        &fields[0].dtype,
+                        &buf[start..start + elem_size],
+                    ));
+                }
+            }
+        }
+
+        let names: Vec<String> = if is_record {
+            fields.iter().map(|f| f.name.clone()).collect()
+        } else if n_cols == 1 {
+            vec!["value".to_string()]
+        } else {
+            (0..n_cols).map(|i| format!("col_{i}")).collect()
+        };
+        let current_types: Vec<String> = if is_record {
+            fields.iter().map(|f| npy_type_label(&f.dtype)).collect()
+        } else {
+            vec![npy_type_label(&fields[0].dtype); n_cols]
+        };
+
+        Ok(names
+            .into_iter()
+            .zip(current_types)
+            .zip(columns)
+            .map(|((name, current_type), values)| {
+                let total = values.len();
+                profile_column(
+                    ColumnInput {
+                        name,
+                        current_type,
+                        raw_values: values,
+                        total,
+                        skip_heuristics: false,
+                    },
+                    n_samples,
+                )
+            })
+            .collect())
     }
-    Ok(out)
+
+    pub(crate) fn columns_from_npy(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = BufReader::new(file);
+        let header = read_npy_header(&mut reader)
+            .with_context(|| format!("failed to parse {path:?} as a .npy file"))?;
+        columns_from_npy_reader(header, reader, nrows, n_samples)
+    }
+
+    /// Numpy's own convention for which zip entries count as arrays inside
+    /// an `.npz` (mirrors `npyz::npz::array_name_from_file_name`): case-
+    /// sensitive `.npy` suffix, with an interior null byte (if any)
+    /// truncating the name first.
+    fn array_name_from_entry_name(entry_name: &str) -> Option<&str> {
+        let name = match entry_name.find('\0') {
+            Some(idx) => &entry_name[..idx],
+            None => entry_name,
+        };
+        name.strip_suffix(".npy")
+    }
+
+    pub(crate) fn columns_from_npz(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let archive = zip_support::ZipArchive::open(path)
+            .with_context(|| format!("failed to open {path:?} as a .npz archive"))?;
+        let names: Vec<(String, String)> = archive
+            .names()
+            .filter_map(|entry_name| {
+                array_name_from_entry_name(entry_name)
+                    .map(|array_name| (array_name.to_string(), entry_name.to_string()))
+            })
+            .collect();
+        if names.is_empty() {
+            bail!("no arrays found in {path:?}");
+        }
+
+        // Found via real-world testing (MNIST's own .npz - x_train/x_test are
+        // genuine 3-D image arrays with no natural row/column reading, a real,
+        // documented boundary, not a bug - but y_train/y_test in the *same
+        // file* are perfectly ordinary 1-D label arrays): one array's shape or
+        // dtype not being representable shouldn't cost every other array in
+        // the same archive its own profile. Each array's read is caught
+        // independently and disclosed on just that array's own "table" rather
+        // than aborting the whole archive, the same principle already applied
+        // to a single unconvertible nested column in Parquet/Arrow.
+        let mut out = Vec::new();
+        for (array_name, entry_name) in names {
+            let read_result = archive
+                .read(&entry_name)
+                .with_context(|| format!("failed reading array '{array_name}' from {path:?}"))
+                .and_then(|bytes| {
+                    let mut cursor = std::io::Cursor::new(bytes);
+                    let header = read_npy_header(&mut cursor).with_context(|| {
+                        format!("failed to parse array '{array_name}' in {path:?} as .npy data")
+                    })?;
+                    columns_from_npy_reader(header, cursor, nrows, n_samples)
+                });
+
+            let profiles = match read_result {
+                Ok(profiles) => profiles,
+                Err(e) => vec![ColumnProfile {
+                    name: "value".to_string(),
+                    current_type: "unknown".to_string(),
+                    ideal_type: "String".to_string(),
+                    description: String::new(),
+                    missing_pct: 0.0,
+                    sample_values: Vec::new(),
+                    notes: format!("array '{array_name}' could not be profiled: {e}"),
+                }],
+            };
+            out.push((array_name, profiles));
+        }
+        Ok(out)
+    }
+} // mod npy_support
+
+#[cfg(feature = "npy")]
+fn columns_from_npy(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    npy_support::columns_from_npy(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "npy"))]
+fn columns_from_npy(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "NumPy support isn't compiled in - rebuild with `cargo build --release --features npy` (or --features full)"
+    )
+}
+
+#[cfg(feature = "npy")]
+fn columns_from_npz(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    npy_support::columns_from_npz(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "npy"))]
@@ -6444,7 +6994,6 @@ fn columns_from_npz(
         "NumPy support isn't compiled in - rebuild with `cargo build --release --features npy` (or --features full)"
     )
 }
-
 // --- Excel reader (opt-in via --features xlsx; also covers .xls/.xlsb/.ods) ---
 // A workbook can hold multiple sheets, so - like SQLite - this returns one
 // profile list per sheet rather than assuming a single implicit table.
@@ -6521,7 +7070,7 @@ fn columns_from_xlsx(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-    if let Ok(zip) = xlsx_support::ZipArchive::open(path) {
+    if let Ok(zip) = zip_support::ZipArchive::open(path) {
         let names: Vec<&str> = zip.names().collect();
         if names.contains(&"xl/workbook.xml") {
             return xlsx_support::columns_from_xlsx_ooxml(path, nrows, n_samples);
@@ -7744,30 +8293,35 @@ fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
 }
 
 // --- Hand-rolled ZIP reader (PKWARE APPNOTE.TXT) ---
-// Shared infrastructure for .xlsx/.xlsb/.ods, which are all a ZIP archive
-// of other files (OOXML/ODF XML documents, or XLSB's own binary records)
-// under the hood - see CLAUDE.md's Dependency footprint section. Reads
-// the archive entirely from its central directory (the authoritative
-// index at the end of the file), the same way every real ZIP reader
-// does, rather than scanning local file headers in order - a local
-// header's own size/CRC fields aren't even guaranteed reliable (the
-// "data descriptor" bit in its flags means they can be zeroed, with the
-// real values written *after* the compressed data instead), so trusting
-// the central directory's copy of those fields throughout is a
-// correctness requirement, not just a convenience. Compression method 8
-// (DEFLATE) reuses `inflate` above directly; method 0 (stored) is a raw
-// copy. ZIP64 (needed past 4GB or 65,535 entries - never realistic for a
-// spreadsheet's own small XML parts) is detected and rejected with a
+// Shared infrastructure for .xlsx/.xlsb/.ods and .npz, which are all a ZIP
+// archive of other files (OOXML/ODF XML documents, XLSB's own binary
+// records, or - for .npz - named .npy streams) under the hood - see
+// CLAUDE.md's Dependency footprint section. Reads the archive entirely
+// from its central directory (the authoritative index at the end of the
+// file), the same way every real ZIP reader does, rather than scanning
+// local file headers in order - a local header's own size/CRC fields
+// aren't even guaranteed reliable (the "data descriptor" bit in its flags
+// means they can be zeroed, with the real values written *after* the
+// compressed data instead), so trusting the central directory's copy of
+// those fields throughout is a correctness requirement, not just a
+// convenience. Compression method 8 (DEFLATE) reuses `inflate` above
+// directly; method 0 (stored) is a raw copy. ZIP64 (needed past 4GB or
+// 65,535 entries - never realistic for a spreadsheet's own small XML
+// parts, or a NumPy archive's own arrays) is detected and rejected with a
 // clear error rather than silently misread, the same "clean error over
 // silent misread" contract every other format in this project already
 // gives an unsupported case.
 
-// Gated as one module behind the same "xlsx" feature that already covers
-// .xls/.xlsb/.ods (see Cargo.toml) - this is shared infrastructure for
-// all four archive-based formats, not xlsx-exclusive, but there's no
-// separate feature flag for it and no reason to invent one.
-#[cfg(feature = "xlsx")]
-mod xlsx_support {
+// Gated behind either of the two independently-toggleable features that
+// need it (`xlsx` for .xlsx/.xlsb/.ods, `npy` for .npz) rather than living
+// inside `xlsx_support` itself and being duplicated for `npy_support` the
+// way the OOXML-scoped and general-purpose XML parsers deliberately are
+// (see that pair's own entry in CLAUDE.md's Dependency footprint section)
+// - there's no behavioral divergence a ZIP reader would ever need between
+// the two callers, so sharing one implementation is strictly better here,
+// not just more convenient.
+#[cfg(any(feature = "xlsx", feature = "npy"))]
+mod zip_support {
     use super::*;
 
     const ZIP_EOCD_SIG: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
@@ -7866,12 +8420,6 @@ mod xlsx_support {
                 .context("not a valid zip archive: end of central directory record not found")
         }
 
-        // Not called by columns_from_xlsx_ooxml itself (it looks up entries by
-        // exact name via `read`), but a genuinely useful, small piece of a
-        // general-purpose archive reader's API - kept for the same reason a
-        // library wouldn't drop it, and exercised directly by this module's
-        // own tests.
-        #[allow(dead_code)]
         pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
             self.entries.iter().map(|e| e.name.as_str())
         }
@@ -7928,6 +8476,12 @@ mod xlsx_support {
             Ok(decompressed)
         }
     }
+} // mod zip_support
+
+#[cfg(feature = "xlsx")]
+mod xlsx_support {
+    use super::zip_support::ZipArchive;
+    use super::*;
 
     // --- Hand-rolled minimal XML parser ---
     // Scoped deliberately narrowly: just enough to read the well-formed,
@@ -12077,7 +12631,8 @@ mod tests {
     #[cfg(feature = "xlsx")]
     #[test]
     fn zip_archive_reads_and_verifies_real_xlsx_entries() {
-        use xlsx_support::{ZipArchive, xml_parse};
+        use xlsx_support::xml_parse;
+        use zip_support::ZipArchive;
 
         let archive = ZipArchive::open(Path::new("tests/fixtures/sample.xlsx")).unwrap();
         let names: Vec<&str> = archive.names().collect();
@@ -14789,6 +15344,325 @@ mod tests {
             let theirs = zstd::stream::decode_all(compressed.as_slice())
                 .unwrap_or_else(|e| panic!("{f}: reference `zstd` crate failed: {e}"));
             assert_eq!(mine, theirs, "{f}: decompressed bytes differ");
+        }
+    }
+
+    /// Test-only: `npyz` is a dev-dependency now (see Cargo.toml and
+    /// CLAUDE.md's Dependency footprint section) - `npy_support`'s own
+    /// hand-rolled header/dtype parser replaced it at runtime, so this
+    /// function's only remaining job is producing the "expected" side of
+    /// `npy_reader_matches_the_npyz_crate_output_exactly`. A near-verbatim
+    /// copy of what `columns_from_npy_reader` used to be before that
+    /// module replaced it.
+    #[cfg(all(test, feature = "npy"))]
+    fn columns_from_npy_via_npyz<R: std::io::Read>(
+        npy: npyz::NpyFile<R>,
+        n_samples: usize,
+    ) -> Vec<ColumnProfile> {
+        fn read_uint(bytes: &[u8], big_endian: bool) -> Option<u64> {
+            Some(match bytes.len() {
+                1 => bytes[0] as u64,
+                2 => {
+                    let b: [u8; 2] = bytes.try_into().ok()?;
+                    if big_endian {
+                        u16::from_be_bytes(b)
+                    } else {
+                        u16::from_le_bytes(b)
+                    }
+                    .into()
+                }
+                4 => {
+                    let b: [u8; 4] = bytes.try_into().ok()?;
+                    if big_endian {
+                        u32::from_be_bytes(b)
+                    } else {
+                        u32::from_le_bytes(b)
+                    }
+                    .into()
+                }
+                8 => {
+                    let b: [u8; 8] = bytes.try_into().ok()?;
+                    if big_endian {
+                        u64::from_be_bytes(b)
+                    } else {
+                        u64::from_le_bytes(b)
+                    }
+                }
+                _ => return None,
+            })
+        }
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        fn scalar_to_string(ty: &npyz::TypeStr, bytes: &[u8]) -> String {
+            use npyz::{Endianness, TypeChar};
+            let big_endian = ty.endianness() == Endianness::Big;
+            match ty.type_char() {
+                TypeChar::Bool => (bytes.first() == Some(&1)).to_string(),
+                TypeChar::Int => match (bytes.len(), read_uint(bytes, big_endian)) {
+                    (1, Some(v)) => (v as u8 as i8).to_string(),
+                    (2, Some(v)) => (v as u16 as i16).to_string(),
+                    (4, Some(v)) => (v as u32 as i32).to_string(),
+                    (8, Some(v)) => (v as i64).to_string(),
+                    _ => hex(bytes),
+                },
+                TypeChar::Uint | TypeChar::TimeDelta | TypeChar::DateTime => {
+                    read_uint(bytes, big_endian).map_or_else(|| hex(bytes), |v| v.to_string())
+                }
+                TypeChar::Float => match bytes.len() {
+                    4 => {
+                        let b: [u8; 4] = bytes.try_into().unwrap();
+                        if big_endian {
+                            f32::from_be_bytes(b)
+                        } else {
+                            f32::from_le_bytes(b)
+                        }
+                        .to_string()
+                    }
+                    8 => {
+                        let b: [u8; 8] = bytes.try_into().unwrap();
+                        if big_endian {
+                            f64::from_be_bytes(b)
+                        } else {
+                            f64::from_le_bytes(b)
+                        }
+                        .to_string()
+                    }
+                    _ => hex(bytes),
+                },
+                TypeChar::ByteStr => {
+                    let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+                    String::from_utf8_lossy(trimmed).into_owned()
+                }
+                TypeChar::UnicodeStr => {
+                    let mut s = String::new();
+                    for chunk in bytes.chunks_exact(4) {
+                        let code = read_uint(chunk, big_endian).unwrap_or(0) as u32;
+                        if code == 0 {
+                            break;
+                        }
+                        if let Some(c) = char::from_u32(code) {
+                            s.push(c);
+                        }
+                    }
+                    s
+                }
+                _ => hex(bytes),
+            }
+        }
+        fn value_to_string(dtype: &npyz::DType, bytes: &[u8]) -> String {
+            match dtype {
+                npyz::DType::Plain(ty) => scalar_to_string(ty, bytes),
+                npyz::DType::Array(n, inner) => {
+                    let Some(elem_size) = inner.num_bytes() else {
+                        return hex(bytes);
+                    };
+                    (0..*n as usize)
+                        .filter_map(|i| bytes.get(i * elem_size..(i + 1) * elem_size))
+                        .map(|chunk| value_to_string(inner, chunk))
+                        .collect::<Vec<_>>()
+                        .join(";")
+                }
+                npyz::DType::Record(_) => hex(bytes),
+            }
+        }
+        fn type_label(dtype: &npyz::DType) -> String {
+            use npyz::TypeChar;
+            match dtype {
+                npyz::DType::Plain(ty) => match ty.type_char() {
+                    TypeChar::Bool => "bool".to_string(),
+                    TypeChar::Int | TypeChar::Uint => "i64".to_string(),
+                    TypeChar::Float => "f64".to_string(),
+                    TypeChar::ByteStr | TypeChar::UnicodeStr => "String".to_string(),
+                    TypeChar::TimeDelta | TypeChar::DateTime => "Timestamp".to_string(),
+                    TypeChar::Complex => "Complex".to_string(),
+                    TypeChar::RawData => "Bytes".to_string(),
+                    _ => "Object".to_string(),
+                },
+                npyz::DType::Array(_, inner) => format!("Vec<{}>", type_label(inner)),
+                npyz::DType::Record(_) => "Struct".to_string(),
+            }
+        }
+
+        let header = npy.header().clone();
+        let dtype = header.dtype();
+        let shape = header.shape().to_vec();
+        let order = header.order();
+        let mut reader = npy.into_inner();
+
+        let fields: Vec<npyz::Field> = match &dtype {
+            npyz::DType::Record(fields) => fields.clone(),
+            other => vec![npyz::Field {
+                name: "value".to_string(),
+                dtype: other.clone(),
+            }],
+        };
+        let is_record = matches!(dtype, npyz::DType::Record(_));
+        let n_cols = if is_record {
+            1
+        } else {
+            match shape.len() {
+                0 | 1 => 1,
+                2 => shape[1] as usize,
+                n => panic!("oracle doesn't support {n}-dimensional plain arrays"),
+            }
+        };
+        let n_rows = shape.first().copied().unwrap_or(1) as usize;
+        let field_sizes: Vec<usize> = fields
+            .iter()
+            .map(|f| f.dtype.num_bytes().unwrap())
+            .collect();
+        let mut columns: Vec<Vec<String>> =
+            vec![Vec::new(); if is_record { fields.len() } else { n_cols }];
+
+        if is_record {
+            let record_size: usize = field_sizes.iter().sum();
+            let mut buf = vec![0u8; record_size];
+            for _ in 0..n_rows {
+                std::io::Read::read_exact(&mut reader, &mut buf).unwrap();
+                let mut offset = 0;
+                for (col_idx, (field, size)) in fields.iter().zip(&field_sizes).enumerate() {
+                    columns[col_idx]
+                        .push(value_to_string(&field.dtype, &buf[offset..offset + size]));
+                    offset += size;
+                }
+            }
+        } else {
+            let elem_size = field_sizes[0];
+            let total_elems = n_rows * n_cols;
+            let mut buf = vec![0u8; total_elems * elem_size];
+            std::io::Read::read_exact(&mut reader, &mut buf).unwrap();
+            for row in 0..n_rows {
+                for (col_idx, column) in columns.iter_mut().enumerate() {
+                    let flat_index = match order {
+                        npyz::Order::C => row * n_cols + col_idx,
+                        npyz::Order::Fortran => col_idx * n_rows + row,
+                    };
+                    let start = flat_index * elem_size;
+                    column.push(value_to_string(
+                        &fields[0].dtype,
+                        &buf[start..start + elem_size],
+                    ));
+                }
+            }
+        }
+
+        let names: Vec<String> = if is_record {
+            fields.iter().map(|f| f.name.clone()).collect()
+        } else if n_cols == 1 {
+            vec!["value".to_string()]
+        } else {
+            (0..n_cols).map(|i| format!("col_{i}")).collect()
+        };
+        let current_types: Vec<String> = if is_record {
+            fields.iter().map(|f| type_label(&f.dtype)).collect()
+        } else {
+            vec![type_label(&fields[0].dtype); n_cols]
+        };
+
+        names
+            .into_iter()
+            .zip(current_types)
+            .zip(columns)
+            .map(|((name, current_type), values)| {
+                let total = values.len();
+                profile_column(
+                    ColumnInput {
+                        name,
+                        current_type,
+                        raw_values: values,
+                        total,
+                        skip_heuristics: false,
+                    },
+                    n_samples,
+                )
+            })
+            .collect()
+    }
+
+    /// Cross-verification oracle for the hand-rolled NumPy `.npy`/`.npz`
+    /// reader (`npy_support` - see Cargo.toml) against the real `npyz`
+    /// crate, kept as a dev-only dependency for exactly this purpose.
+    /// Covers a plain scalar array, a structured (record) array with a
+    /// fixed-width byte-string field, and a Fortran-order 2D array - the
+    /// three shapes that exercise every branch of `columns_from_npy_reader`
+    /// (plain-vs-record dispatch, and the C-vs-Fortran flat-index formula).
+    #[cfg(feature = "npy")]
+    #[test]
+    fn npy_reader_matches_the_npyz_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample_matrix.npy",
+            "tests/fixtures/sample_structured.npy",
+            "tests/fixtures/type_detection.npy",
+            "tests/fixtures/edge_npy_big_endian_and_subarray.npy",
+        ] {
+            let path = Path::new(f);
+            let mine = npy_support::columns_from_npy(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+
+            let file = std::fs::File::open(path).unwrap();
+            let npy = npyz::NpyFile::new(std::io::BufReader::new(file)).unwrap();
+            let theirs = columns_from_npy_via_npyz(npy, 100);
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Same cross-verification, for `.npz` - exercises the ZIP/DEFLATE
+    /// path (`zip_support::ZipArchive`) that standalone `.npy` files never
+    /// touch, including a `savez_compressed`-produced archive whose
+    /// entries are genuinely DEFLATE-compressed rather than stored.
+    #[cfg(feature = "npy")]
+    #[test]
+    fn npz_reader_matches_the_npyz_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.npz",
+            "tests/fixtures/type_detection.npz",
+        ] {
+            let path = Path::new(f);
+            let mine = npy_support::columns_from_npz(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+
+            let mut archive = npyz::npz::NpzArchive::open(path).unwrap();
+            let names: Vec<String> = archive.array_names().map(str::to_string).collect();
+            for name in names {
+                let npy = archive.by_name(&name).unwrap().unwrap();
+                let theirs = columns_from_npy_via_npyz(npy, 100);
+                let (_, mine_cols) = mine.iter().find(|(n, _)| n == &name).unwrap();
+                assert_eq!(
+                    mine_cols.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                    theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                    "{f} array '{name}': column names differ"
+                );
+                for (m, t) in mine_cols.iter().zip(theirs.iter()) {
+                    assert_eq!(
+                        m.sample_values, t.sample_values,
+                        "{f} array '{name}' col '{}': sample_values",
+                        m.name
+                    );
+                }
+            }
         }
     }
 }

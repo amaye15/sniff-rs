@@ -21,7 +21,6 @@ serde = "1.0.229"
 rmpv = { version = "1.3.1", optional = true }
 toml = { version = "1.1.4", optional = true }
 ciborium = { version = "0.2.2", optional = true }
-npyz = { version = "0.9.1", features = ["npz"], optional = true }
 regex = { version = "1.13.1", optional = true }
 dbase = { version = "0.8.0", optional = true }
 dta = { version = "0.6.0", optional = true }
@@ -43,7 +42,7 @@ cbor = ["dep:ciborium"]
 ini = []
 xml = []
 zstd = []
-npy = ["dep:npyz"]
+npy = []
 weblog = ["dep:regex"]
 syslog = ["dep:regex"]
 dbase = ["dep:dbase"]
@@ -85,6 +84,16 @@ xmltree = { version = "0.12.0", features = ["attribute-order"] }
 # `zstd_reader_matches_the_zstd_crate_output_exactly`
 # (`#[cfg(all(test, feature = "zstd"))]` in src/lib.rs).
 zstd = "0.13.3"
+# Same dev-only treatment, same reason: the `npy` feature's own hand-rolled
+# reader (`npy_support` in src/lib.rs - the NPY header/dtype format, plus
+# `zip_support::ZipArchive` for `.npz`) replaced this at runtime; kept only
+# as this project's own cross-verification oracle in
+# `npy_reader_matches_the_npyz_crate_output_exactly` and
+# `npz_reader_matches_the_npyz_crate_output_exactly`
+# (`#[cfg(all(test, feature = "npy"))]` in src/lib.rs). The `npz` feature
+# is still needed here (unlike at runtime) purely for the oracle's own use
+# of `npyz::npz::NpzArchive`.
+npyz = { version = "0.9.1", features = ["npz"] }
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

@@ -2390,6 +2390,31 @@ fn npy_recognizes_uuid_email_ipv4_and_date_columns() {
     );
 }
 
+// No existing .npy fixture used a non-native byte order or a fixed-size
+// sub-array field (`DType::Array` nested inside a `DType::Record`) - both
+// real numpy shapes with zero prior test coverage, found while auditing
+// the hand-rolled npy_support reader against npyz's own type_str.rs.
+#[cfg(feature = "npy")]
+#[test]
+fn npy_handles_big_endian_fields_and_fixed_size_subarray_fields() {
+    let doc = run_json("edge_npy_big_endian_and_subarray.npy", &[]);
+    let cols = table(&doc, "edge_npy_big_endian_and_subarray");
+
+    let score = column(cols, "score_be");
+    assert_eq!(score["current_type"], "f64");
+    assert_eq!(
+        score["sample_values"],
+        serde_json::json!(["9.5", "42", "100.25"])
+    );
+
+    let coords = column(cols, "coords");
+    assert_eq!(coords["current_type"], "Vec<f64>");
+    assert_eq!(
+        coords["sample_values"],
+        serde_json::json!(["1;2;3", "4;5;6", "7;8;9"])
+    );
+}
+
 #[cfg(feature = "npy")]
 #[test]
 fn npz_recognizes_uuid_email_ipv4_and_date_columns() {

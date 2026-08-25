@@ -97,12 +97,10 @@ the feature flag now gates the module's own code rather than a real
 dependency, since the `zstd` crate itself moved to a dev-only
 cross-verification role (see the Dependency footprint section).
 
-NumPy's `npyz` crate is worth a dependency note: its `npz` feature (for
-`.npz` archives) depends on the `zip` crate without trimming its default
-features, which pulls in `bzip2` and a second, older copy of `zstd`
-alongside this project's own. That's a handful of small, fast-compiling
-extra crates — nothing like the DuckDB situation below — so it was judged
-worth it for `.npz` support rather than treated as a reason to skip it.
+NumPy (`.npy`/`.npz`) is via a hand-rolled reader (`npy_support`, pure
+`std` too) behind `--features npy` - the `npyz` crate it used to depend on
+moved to a dev-only cross-verification role (see the Dependency footprint
+section).
 
 ## Content-based format auto-detection
 
@@ -293,11 +291,11 @@ concept (Parquet's scalar columns). A reader collects each column's
 non-null raw string values plus a `current_type` label, and `profile_column`
 runs the shared heuristic engine (`suggest_ideal_type`) over the raw
 strings to produce a `ColumnProfile`. NumPy also lands here, but is the one
-reader that decodes a binary layout by hand instead of leaning on a crate's
-own typed API: `npyz::Deserialize` requires a Rust type known at compile
-time, which doesn't work for an arbitrary user's `.npy` file whose dtype is
-only known at runtime, so `npy_scalar_to_string`/`npy_value_to_string`
-interpret each field's raw bytes directly from its `TypeStr`
+reader that decodes a binary layout entirely by hand (`npy_support` - see
+the Dependency footprint section for why, and for the npyz-crate history):
+an arbitrary user's `.npy` file has a dtype only known at runtime, not at
+compile time, so `npy_scalar_to_string`/`npy_value_to_string` interpret
+each field's raw bytes directly from its own hand-parsed `TypeStr`
 (`TypeChar` + byte width + endianness) - int/uint/float by width, fixed-
 width byte/unicode strings trimmed of right-zero-padding, and anything not
 representable as a simple value (a sub-array field, `f16`/`f128`, the
@@ -3194,6 +3192,67 @@ this project could just implement directly rather than depend on:
   at, never producing one): dictionary support (this project's own `.zst`
   reading never needs it), and encoding of any kind.
 
+- **`npyz` → a hand-rolled NumPy `.npy`/`.npz` reader (`npy_support`).**
+  Unlike most of this list, npyz's own on-disk format is small and
+  fully specified rather than algorithmically complex - the real work
+  here was replacing its typed Rust API (`DType`/`TypeStr`/`Field`,
+  built from a general Python-literal parser via the separate
+  `py_literal` crate) with narrow, purpose-built equivalents that only
+  need to understand the exact grammar `numpy.save` actually emits, the
+  same "just enough, not a general evaluator" scope every other small
+  parser in this project already keeps (`ini_support`, the OOXML-scoped
+  half of `xml_support`). A minimal recursive-descent `PyParser` reads
+  only what an NPY header dict can ever contain - a top-level `{...}`
+  dict, nested `(...)`/`[...]` sequences (treated identically; NPY never
+  cares which), single/double-quoted strings with backslash escapes,
+  `True`/`False`, and signed integers - verified against four real
+  `numpy.save` outputs inspected byte-for-byte (a plain 1D array, a
+  structured/record array, a Fortran-order 2D array, and a record field
+  with its own fixed-size sub-array shape, e.g.
+  `('vec', '<f4', (3,))`) rather than assumed from the NPY format spec's
+  prose alone. `TypeStr` parsing (endianness character + type character +
+  byte width, with `U`'s own byte-width-is-4×code-point-count rule) and
+  the record-dtype-from-a-list-of-2/3-tuples conversion were checked
+  field-by-field against npyz's own `type_str.rs`/`header.rs` before being
+  trusted, the same "verify against source" discipline as every other
+  hand-roll in this file - not just re-derived from the spec and assumed
+  correct.
+
+  `.npz` reuses `zip_support::ZipArchive` (see that module's own entry
+  above) rather than a second ZIP reader or the `zip` crate npyz's own
+  `npz` feature depended on - a real simplification this hand-roll
+  enabled, since `xlsx` and `npy` are independently-toggleable features
+  that both only ever needed a small, generic "open by name, decompress,
+  CRC-check" ZIP reader with no format-specific divergence between them
+  (unlike the deliberately *duplicated* OOXML-scoped and general-purpose
+  XML parsers, which do genuinely disagree on namespace handling - see
+  that pair's own entry above for why duplication was the right call
+  there and sharing is the right call here). `ZipArchive` itself moved
+  out of `xlsx_support` into a new `zip_support` module gated
+  `#[cfg(any(feature = "xlsx", feature = "npy"))]` so either feature
+  alone still compiles it without requiring the other.
+
+  Verified two ways: dedicated cross-verification tests
+  (`npy_reader_matches_the_npyz_crate_output_exactly`,
+  `npz_reader_matches_the_npyz_crate_output_exactly`) compare this
+  reader's output against `npyz` itself (kept as a dev-only oracle, the
+  same treatment every other replaced crate in this section already
+  gets) on this project's own fixtures plus a new
+  `tests/fixtures/edge_npy_big_endian_and_subarray.npy` - covering two
+  real numpy shapes with zero prior test coverage in this project, found
+  while auditing the new reader against npyz's own source: a non-native
+  (`>`) byte order (no existing fixture used one) and a fixed-size
+  sub-array field (`DType::Array` nested inside a `DType::Record` - no
+  existing fixture had one either); and, transiently and not committed
+  (matching this project's usual real-world-corpus practice), against
+  real scikit-learn-bundled datasets (Iris as a structured array, the
+  Diabetes dataset as a plain 2D array, Wine via `np.savez`), a
+  `savez_compressed`-produced archive (genuinely DEFLATE-compressed
+  `.npz` entries, not stored), a big-endian array, and Unicode-string and
+  fixed-width-byte-string arrays - all matched the `npyz` oracle exactly,
+  and a 600-file bit-flip fuzz pass (300 each against a real `.npy` and a
+  real `.npz`) produced zero panics.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3203,12 +3262,12 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-and now `zstd` all still were, however real their own risk. That's still
-a real, non-mechanical rewrite - the risk itself is why it's still
-deliberately a dependency, the same reasoning that applied to every other
-entry in this list right up until it didn't. With `zstd` gone, `serde`/
-`serde_json` are now genuinely the *only* dependency of any kind - direct
-or transitive - in the default build (`cargo build` with no `--features`
+`zstd`, and now `npyz` all still were, however real their own risk.
+That's still a real, non-mechanical rewrite - the risk itself is why
+it's still deliberately a dependency, the same reasoning that applied to
+every other entry in this list right up until it didn't. `serde`/
+`serde_json` are the *only* dependency of any kind - direct or
+transitive - in the default build (`cargo build` with no `--features`
 compiles CSV/TSV/JSON/JSONL support from those two crates plus `std`
 alone; every optional format's own additional dependencies are exactly
 as documented in the format table at the top of this file, none of them
