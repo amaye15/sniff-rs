@@ -384,6 +384,57 @@ fn zstd_without_the_feature_gives_an_actionable_error() {
     );
 }
 
+// A real, 3,000-row zstd file through the full pipeline (not just the
+// direct cross-verification unit test in lib.rs) - large/varied enough
+// that the system `zstd` command reaches for FSE_Compressed sequence
+// tables and a genuinely FSE-compressed Huffman weight list, rather than
+// the Predefined-mode-only path sample.csv.zst's tiny content produces.
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_with_fse_compressed_tables_reads_correctly_end_to_end() {
+    let doc = run_json("edge_zstd_dynamic_tables.csv.zst", &[]);
+    let cols = table(&doc, "edge_zstd_dynamic_tables");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "score")["ideal_type"], "f64");
+    assert_eq!(column(cols, "email")["ideal_type"], "Email");
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_with_a_corrupted_checksum_gives_an_actionable_error_not_a_panic() {
+    let output = Command::new(bin())
+        .args([
+            fixture("malformed_zstd_checksum.csv.zst").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("checksum"),
+        "error should mention the checksum mismatch, not panic: {stderr}"
+    );
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_with_an_invalid_magic_number_gives_an_actionable_error_not_a_panic() {
+    let bad_zst = fixture("_scratch_not_actually_zstd.csv.zst");
+    std::fs::write(&bad_zst, b"this is not zstd data").unwrap();
+    let output = Command::new(bin())
+        .args([bad_zst.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&bad_zst).ok();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("magic number"),
+        "error should mention the bad magic number, not panic: {stderr}"
+    );
+}
+
 #[cfg(feature = "parquet")]
 #[test]
 fn parquet_string_column_preserves_leading_zero_with_no_data_loss() {

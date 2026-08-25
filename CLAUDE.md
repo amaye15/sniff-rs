@@ -91,8 +91,11 @@ Detection and default output naming use the compression-stripped logical
 name (`data.csv.gz` behaves like `data.csv`); the JSON/Markdown `file`
 field still reports the real, original filename for traceability. gzip is
 via a hand-rolled DEFLATE/gzip decoder (pure `std`, no dependency at all -
-see the Dependency footprint section); zstd needs `--features zstd` since
-the `zstd` crate compiles a small vendored C library.
+see the Dependency footprint section); zstd is likewise a hand-rolled RFC
+8878 decoder (`zstd_support`, pure `std` too) behind `--features zstd` -
+the feature flag now gates the module's own code rather than a real
+dependency, since the `zstd` crate itself moved to a dev-only
+cross-verification role (see the Dependency footprint section).
 
 NumPy's `npyz` crate is worth a dependency note: its `npz` feature (for
 `.npz` archives) depends on the `zip` crate without trimming its default
@@ -3073,6 +3076,124 @@ this project could just implement directly rather than depend on:
   found on real content, the cleanest large-scale real-world result of
   any hand-roll in this effort alongside `rust-ini`'s.
 
+- **`zstd` → a hand-rolled RFC 8878 decoder - the most algorithmically
+  complex hand-roll of this whole effort, and the last one needed to get
+  the default build down to genuinely zero non-`std` dependencies for
+  every format this project reads.** Unlike DEFLATE/gzip (already
+  hand-rolled, needing only Huffman coding), Zstandard needs a second,
+  independent entropy coder - FSE (Finite State Entropy / tANS) - plus an
+  LZ77-style sequence-execution stage with its own three-slot
+  repeat-offset state machine, layered as frame → block → literals
+  section → sequences section. Every algorithmic piece was verified
+  against RFC 8878's own text first, then cross-checked against the
+  actual vendored C reference source inside the `zstd-sys` crate for the
+  parts where the RFC's prose alone left real ambiguity:
+    - **Bitstream direction.** FSE- and Huffman-coded data is read
+      *backward* from a sentinel bit (the highest set bit of the buffer's
+      last byte); a `BackwardBitReader` walks a single global LSB-first
+      bit index downward from there. FSE table *descriptions* (the
+      probability distributions themselves) are read *forward* instead -
+      a second, much simpler `ForwardBitReader` - confirmed by tracing
+      RFC 8878's own "0145" Huffman worked example (bytes `0x10, 0x0D`)
+      by hand, bit by bit, before trusting either reader.
+    - **FSE table construction.** `fse_read_ncount` (the probability-table
+      parser) and `fse_build_table` (the spread-and-assign decode-table
+      builder) were checked digit-for-digit against RFC 8878's own worked
+      examples (its Accuracy_Log=8 probability-decoding example, and its
+      Table 21 baseline/Number_of_Bits worked example) *and* against
+      `FSE_readNCount_body`/`FSE_buildDTable_internal` in zstd's vendored
+      `entropy_common.c`/`fse_decompress.c` - the RFC's own more manual
+      "sort states, assign widths" description and the C reference's
+      simpler incremental-per-symbol-counter approach were proven
+      equivalent by hand before the simpler one was implemented.
+    - **The predefined LL/ML/OF distributions** (RFC 8878 3.1.1.3.2.2) are
+      hand-transcribed as `const` arrays, but their fully-*built* decode
+      tables are also hardcoded directly from RFC 8878's own Appendix A
+      (which states outright that its tables exist "to crosscheck that an
+      implementation has built its decoding tables correctly") - a unit
+      test builds each from its raw distribution via this project's own
+      `fse_build_table` and asserts the result matches Appendix A's
+      tables exactly, so the general table-builder (needed anyway for
+      `FSE_Compressed` mode) gets proven correct against an independent
+      source, not just self-consistency.
+    - **The repeat-offset state machine** (RFC 8878 3.1.1.5) - resolving
+      offset codes 0 and 1 into one of three "repeat" slots, with a
+      documented but easy-to-mistranspose exception when the current
+      sequence's literals length is zero - was the one place the RFC's
+      own worked example (Table 18) didn't reconcile with a first attempt
+      at the prose description. Rather than keep guessing at the table,
+      `ZSTD_decodeSequence` in the vendored `zstd_decompress_block.c` was
+      read directly: offset codes ≥2 resolve via a precomputed `OF_base`
+      array that already has the RFC's "-3" folded in
+      (`OF_base[code] = (1<<code) - 3`, confirmed against several code
+      values by hand); codes 0 and 1 resolve through `prevOffset[]`
+      indexed directly by a small computed selector (`ll0`, or
+      `1 + ll0 + extrabit`), which - once traced through by hand for
+      every one of its four sub-cases (code 0 with ll≠0/ll==0, code 1
+      with ll≠0/ll==0) - matches the RFC's *prose* description of the
+      shift-by-one exception exactly, even though it never reconciled
+      with the specific numbers in the RFC's own Table 18 (left
+      unresolved rather than chased further, since the C reference is the
+      actual, deployed, battle-tested implementation and the real
+      correctness arbiter used throughout this validation - real,
+      independently-produced compressed files - is what a hand-transcribed
+      table's numbers can't substitute for).
+    - **A genuine, sequence-vs-FSE-internal field mix-up** was caught before
+      it ever reached real-file testing: a literals-length/match-length/
+      offset *value*'s own extra-bit count (`LL_bits`/`ML_bits`/the offset
+      code itself) is completely separate from the FSE table entry's own
+      state-transition `nb_bits`/`baseline` (used only to advance to the
+      *next* FSE state) - conflating the two, an easy mistake since both
+      are just "some bits associated with this table entry," was found and
+      fixed by re-reading `ZSTD_decodeSequence`'s own `llBits`/`llnbBits`-
+      style dual naming before it shipped.
+
+  **Real-world corpus validation** (the same practice used for every
+  other format's own validation pass, see below): every one of this
+  project's 129 committed test fixtures, compressed via the real `zstd`
+  CLI at three levels (1/3/19) each - 387 files total - decompresses
+  byte-exact through this decoder. A purpose-built larger fixture
+  (`tests/fixtures/edge_zstd_dynamic_tables.csv.zst`, 3,000 rows) is what
+  actually found this decoder's one real, shipped bug: an off-by-one in
+  `fse_read_ncount`'s accuracy-log recompute
+  (`nbbits = bit_length(remaining - 1)` instead of the correct
+  `bit_length(remaining)`) that only misbehaves when `remaining` lands
+  exactly on a power of 2 - invisible on every small fixture (none of
+  which happened to hit that exact boundary) and even on RFC 8878's own
+  worked example (which happens not to cross a power-of-2 boundary
+  either), but real and reproducible on large, real-content files, the
+  same "small fixtures alone don't stress this" lesson every other
+  hand-roll in this project has already hit at least once. A second, real
+  discrepancy - not a bug in the decoder itself - was found by comparing
+  behavior against the actual `zstd` CLI: a genuinely zero-byte `.zst`
+  file was being silently treated as valid empty content, while real
+  `zstd -d` correctly rejects it ("unexpected end of file"), since even
+  an empty stream needs its mandatory 4-byte magic number; fixed to match.
+  A 500-iteration bit-flip fuzz pass (1-20 random bit flips each, across a
+  real 158 KB compressed source-code fixture) produced zero panics and
+  zero out-of-bounds accesses - every corrupted input failed with a
+  clean, actionable error - confirming the decoder's error handling, not
+  just its happy path, holds up under adversarial input the same way
+  every other hand-rolled reader in this project has already been proven
+  to. Content-checksum verification (RFC 8878's optional XXH64 trailer,
+  hand-rolled the same as CRC32 was for gzip) was confirmed to genuinely
+  discriminate, not just be present in the code, via a deliberately
+  corrupted checksum byte that's correctly rejected.
+  `tests/fixtures/malformed_zstd_checksum.csv.zst` and
+  `zstd_with_a_corrupted_checksum_gives_an_actionable_error_not_a_panic`
+  lock this in as a permanent regression test, alongside
+  `zstd_with_fse_compressed_tables_reads_correctly_end_to_end` (the
+  dynamic-tables fixture, through the full CLI pipeline) and
+  `zstd_reader_matches_the_zstd_crate_output_exactly` (a direct
+  byte-for-byte cross-verification against the real `zstd` crate, kept as
+  a dev-only oracle the same way every other hand-roll in this section
+  keeps its own replaced crate around for exactly this purpose).
+
+  Deliberately out of scope, matching this decoder's actual real-world use
+  case here (decompressing whatever `.zst` file a user points this tool
+  at, never producing one): dictionary support (this project's own `.zst`
+  reading never needs it), and encoding of any kind.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3081,13 +3202,17 @@ Avro, MessagePack, CBOR, XML) recurse through via `profile_json_path` -
 replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
-`.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, and now
-`xmltree` all still were, however real their own risk. That's still a
-real, non-mechanical rewrite - the risk itself is why it's still
-deliberately
-a dependency, the same reasoning that applied to every other entry in
-this list right
-up until it didn't.
+`.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
+and now `zstd` all still were, however real their own risk. That's still
+a real, non-mechanical rewrite - the risk itself is why it's still
+deliberately a dependency, the same reasoning that applied to every other
+entry in this list right up until it didn't. With `zstd` gone, `serde`/
+`serde_json` are now genuinely the *only* dependency of any kind - direct
+or transitive - in the default build (`cargo build` with no `--features`
+compiles CSV/TSV/JSON/JSONL support from those two crates plus `std`
+alone; every optional format's own additional dependencies are exactly
+as documented in the format table at the top of this file, none of them
+pulled in unless that specific `--features` flag is passed).
 
 ## Known limitations / roadmap
 

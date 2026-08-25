@@ -10335,6 +10335,1318 @@ mod xlsx_support {
     }
 } // mod xlsx_support
 
+/// Hand-rolled Zstandard (RFC 8878) decoder, replacing the `zstd` crate at
+/// runtime (see CLAUDE.md's Dependency footprint section). Every algorithm
+/// here was verified directly against RFC 8878's own text and, for the
+/// trickiest pieces (bitstream direction, FSE table construction, the
+/// repeat-offset state machine), against the vendored C reference source
+/// inside the `zstd-sys` crate - the same "verify against source, not
+/// memory" discipline every other hand-roll in this project follows.
+/// Dictionaries are out of scope (this project's `.zst` use case never
+/// needs them, the same "no dictionary support" boundary noted elsewhere).
+#[cfg(feature = "zstd")]
+mod zstd_support {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // Bit readers
+    // ---------------------------------------------------------------
+
+    /// Reads bits from the END of a buffer toward the start - the
+    /// convention FSE- and Huffman-coded streams both use (RFC 8878
+    /// 4.1/4.2), verified against zstd's own `bitstream.h`
+    /// (`BIT_initDStream`/`BIT_readBits`). The stream's logical end is a
+    /// sentinel: the highest set bit of the very last byte (anything after
+    /// it, up to the byte boundary, is padding with no meaning) - so
+    /// decoding starts by locating that bit, then walks backward, treating
+    /// the whole buffer as one continuous bit sequence addressed by a
+    /// single global (byte*8 + bit) index, LSB-first within each byte.
+    struct BackwardBitReader<'a> {
+        data: &'a [u8],
+        // Bits [0, top) are still unread; reading n bits consumes the
+        // TOP n of them, i.e. global indices [top-n, top).
+        top: u32,
+    }
+
+    impl<'a> BackwardBitReader<'a> {
+        fn new(data: &'a [u8]) -> Result<Self> {
+            let last = *data.last().context("empty FSE/Huffman-coded bitstream")?;
+            if last == 0 {
+                bail!(
+                    "malformed zstd bitstream: missing end-mark (last byte of an FSE/Huffman stream is zero)"
+                );
+            }
+            let highbit = 7 - last.leading_zeros();
+            let top = 8 * (data.len() as u32 - 1) + highbit;
+            Ok(BackwardBitReader { data, top })
+        }
+
+        fn bit_at(&self, g: u32) -> u32 {
+            let byte = self.data[(g / 8) as usize];
+            ((byte >> (g % 8)) & 1) as u32
+        }
+
+        /// Reads exactly `n` bits (n <= 32); errors if that many aren't
+        /// available. The earliest-read (lowest global index) bit becomes
+        /// the LSB of the result, matching the format's little-endian
+        /// convention.
+        fn read(&mut self, n: u32) -> Result<u32> {
+            if n == 0 {
+                return Ok(0);
+            }
+            if n > self.top {
+                bail!("malformed zstd bitstream: ran out of bits mid-symbol");
+            }
+            let start = self.top - n;
+            let mut v: u32 = 0;
+            for i in 0..n {
+                v |= self.bit_at(start + i) << i;
+            }
+            self.top = start;
+            Ok(v)
+        }
+
+        /// Reads up to `n` bits, zero-padding on the *low* side for any
+        /// shortfall rather than erroring - the documented behavior once a
+        /// bitstream's real content is exhausted (RFC 8878 4.2.1.2: "it is
+        /// assumed that extra bits are zero"). Returns (value, exhausted)
+        /// where `exhausted` is true iff fewer than `n` real bits were
+        /// available, i.e. this read used at least one phantom bit.
+        fn read_padded(&mut self, n: u32) -> (u32, bool) {
+            let avail = self.top.min(n);
+            let real = self.read(avail).unwrap_or(0);
+            ((real << (n - avail)), avail < n)
+        }
+
+        /// Non-consuming look at the top `n` bits (zero-padded on the low
+        /// side if fewer remain) - used by the Huffman flat-table decoder,
+        /// which must see `max_bits` before knowing how many to actually
+        /// consume.
+        fn peek_padded(&self, n: u32) -> u32 {
+            let avail = self.top.min(n);
+            let start = self.top - avail;
+            let mut v: u32 = 0;
+            for i in 0..avail {
+                v |= self.bit_at(start + i) << i;
+            }
+            v << (n - avail)
+        }
+
+        fn consume(&mut self, n: u32) {
+            self.top = self.top.saturating_sub(n);
+        }
+    }
+
+    /// Forward, LSB-first bit reader - the ordinary convention, used only
+    /// for an FSE table description (RFC 8878 4.1.1), which (unlike the
+    /// FSE-/Huffman-coded data that follows it) is read forward.
+    struct ForwardBitReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> ForwardBitReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            ForwardBitReader { data, pos: 0 }
+        }
+
+        fn read(&mut self, n: u32) -> Result<u32> {
+            let mut v: u32 = 0;
+            for i in 0..n {
+                let g = self.pos + i as usize;
+                let byte = *self
+                    .data
+                    .get(g / 8)
+                    .context("FSE table description ran out of bytes")?;
+                v |= (((byte >> (g % 8)) & 1) as u32) << i;
+            }
+            self.pos += n as usize;
+            Ok(v)
+        }
+
+        /// Bytes consumed so far, rounded up - the literals/sequences
+        /// section headers need this to know where the table description
+        /// ends and the next field begins.
+        fn bytes_consumed(&self) -> usize {
+            self.pos.div_ceil(8)
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // FSE (Finite State Entropy)
+    // ---------------------------------------------------------------
+
+    const FSE_MIN_TABLELOG: u32 = 5;
+
+    #[derive(Clone, Copy, Default)]
+    struct FseEntry {
+        symbol: u8,
+        nb_bits: u8,
+        baseline: u16,
+    }
+
+    struct FseTable {
+        table_log: u32,
+        entries: Vec<FseEntry>,
+    }
+
+    impl FseTable {
+        fn init_state(&self, reader: &mut BackwardBitReader) -> Result<usize> {
+            Ok(reader.read(self.table_log)? as usize)
+        }
+    }
+
+    /// RFC 8878 4.1.1's FSE table description: reads normalized
+    /// probability counts plus the accuracy log, from a forward-read
+    /// bitstream. Probabilities of exactly 0 are followed by a 2-bit
+    /// repeat flag chain encoding a run of further zero-probability
+    /// symbols. `max_symbol` is only a safety upper bound (a corruption
+    /// guard / buffer capacity, matching `FSE_readNCount_body`'s in/out
+    /// `maxSVPtr` in zstd's vendored `entropy_common.c`) - per RFC 8878
+    /// 4.1.1, "An FSE distribution table describes the probabilities of
+    /// all symbols from 0 to the last present one (included)", so the
+    /// real alphabet size is however many symbols the table actually
+    /// describes (until `remaining` reaches 1), which can be far smaller
+    /// than `max_symbol` - the returned `Vec` is truncated to that real
+    /// size, not padded out to `max_symbol`. Verified digit-for-digit
+    /// against RFC 8878's own worked example (Accuracy_Log=8, 100 points
+    /// already distributed -> max=98, matching this function's `max`
+    /// computation exactly).
+    fn fse_read_ncount(reader: &mut ForwardBitReader, max_symbol: u32) -> Result<(u32, Vec<i32>)> {
+        let accuracy_log = reader.read(4)? + FSE_MIN_TABLELOG;
+        if accuracy_log > 15 {
+            bail!("malformed zstd FSE table: accuracy log {accuracy_log} out of range");
+        }
+        let mut counts = vec![0i32; (max_symbol + 1) as usize];
+        let mut remaining: i64 = (1i64 << accuracy_log) + 1;
+        let mut nbbits: u32 = accuracy_log + 1;
+        let mut charnum: u32 = 0;
+        let mut prev_zero = false;
+
+        while remaining > 1 && charnum <= max_symbol {
+            if prev_zero {
+                let mut n0 = charnum;
+                loop {
+                    let chunk = reader.read(2)?;
+                    if chunk == 3 {
+                        n0 += 3;
+                    } else {
+                        n0 += chunk;
+                        break;
+                    }
+                }
+                if n0 > max_symbol + 1 {
+                    bail!("malformed zstd FSE table: zero-run overruns the symbol table");
+                }
+                while charnum < n0 {
+                    counts[charnum as usize] = 0;
+                    charnum += 1;
+                }
+                if charnum > max_symbol {
+                    break;
+                }
+            }
+
+            let half_threshold = 1i64 << (nbbits - 1);
+            let max = (2 * half_threshold - 1) - remaining;
+            let low = reader.read(nbbits - 1)? as i64;
+            let count = if low < max {
+                low
+            } else {
+                let hi = reader.read(1)? as i64;
+                let full = low + (hi << (nbbits - 1));
+                if full >= half_threshold {
+                    full - max
+                } else {
+                    full
+                }
+            };
+            let count = count - 1; // "extra accuracy": 0 decodes to probability -1
+            if charnum as usize >= counts.len() {
+                bail!("malformed zstd FSE table: more symbols than expected");
+            }
+            counts[charnum as usize] = count as i32;
+            charnum += 1;
+            remaining -= if count < 0 { 1 } else { count };
+            prev_zero = count == 0;
+
+            if remaining > 1 {
+                // nbbits = bit_length(remaining): the largest power of 2
+                // that is <= remaining is 2^(nbbits-1). Using
+                // `remaining - 1` here (an earlier, incorrect draft) is
+                // off by one exactly when `remaining` is itself a power
+                // of 2, since bit_length(remaining) and
+                // bit_length(remaining-1) only coincide when it isn't.
+                nbbits = 32 - (remaining as u32).leading_zeros();
+            }
+        }
+
+        if remaining != 1 {
+            bail!("malformed zstd FSE table: probabilities don't sum to the declared accuracy");
+        }
+        counts.truncate(charnum as usize);
+        Ok((accuracy_log, counts))
+    }
+
+    /// Builds an FSE decode table from normalized probability counts (RFC
+    /// 8878 4.1.1's "Symbols are scanned... All remaining symbols are
+    /// allocated..." procedure). `-1`-probability symbols get a single
+    /// cell at the end of the table (a full state reset); every other
+    /// symbol gets `count` cells spread through the table via the fixed
+    /// step `(tableSize>>1)+(tableSize>>3)+3`. The per-state
+    /// Number_of_Bits/Baseline assignment scans table positions in order
+    /// and, for each symbol, uses a simple running counter (starting at
+    /// that symbol's own probability count) rather than RFC 8878's more
+    /// manual "sort states, assign widths" description - proven equivalent
+    /// by hand against the RFC's own worked example (Table 21: a
+    /// probability-5 symbol at tableLog=7 gives states 5,6,7,8,9 ->
+    /// nbBits 5,5,5,4,4, baselines 32,64,96,0,16, matching exactly) and
+    /// against `FSE_buildDTable_internal` in zstd's vendored
+    /// `fse_decompress.c`.
+    fn fse_build_table(table_log: u32, counts: &[i32]) -> Result<FseTable> {
+        let table_size = 1usize << table_log;
+        let mut symbol_of = vec![0u8; table_size];
+        let mut assigned = vec![false; table_size];
+
+        let mut high_threshold = table_size - 1;
+        for (symbol, &count) in counts.iter().enumerate() {
+            if count == -1 {
+                symbol_of[high_threshold] = symbol as u8;
+                assigned[high_threshold] = true;
+                high_threshold -= 1;
+            }
+        }
+
+        let step = (table_size >> 1) + (table_size >> 3) + 3;
+        let mask = table_size - 1;
+        let mut position = 0usize;
+        for (symbol, &count) in counts.iter().enumerate() {
+            if count <= 0 {
+                continue;
+            }
+            for _ in 0..count {
+                symbol_of[position] = symbol as u8;
+                assigned[position] = true;
+                position = (position + step) & mask;
+                while position > high_threshold {
+                    position = (position + step) & mask;
+                }
+            }
+        }
+        if position != 0 {
+            bail!("malformed zstd FSE table: symbol spread did not return to position 0");
+        }
+        if assigned.iter().any(|&a| !a) {
+            bail!("malformed zstd FSE table: not every state was assigned a symbol");
+        }
+
+        let mut symbol_next: Vec<u32> = counts
+            .iter()
+            .map(|&c| if c == -1 { 1 } else { c.max(0) as u32 })
+            .collect();
+        let mut entries = vec![FseEntry::default(); table_size];
+        for (state, &symbol) in symbol_of.iter().enumerate() {
+            let next_state = symbol_next[symbol as usize];
+            symbol_next[symbol as usize] += 1;
+            let nb_bits = table_log - (31 - next_state.leading_zeros());
+            let baseline = ((next_state << nb_bits) as i64 - table_size as i64) as u16;
+            entries[state] = FseEntry {
+                symbol,
+                nb_bits: nb_bits as u8,
+                baseline,
+            };
+        }
+
+        Ok(FseTable { table_log, entries })
+    }
+
+    fn fse_table_from_description(
+        reader: &mut ForwardBitReader,
+        max_symbol: u32,
+    ) -> Result<FseTable> {
+        let (table_log, counts) = fse_read_ncount(reader, max_symbol)?;
+        fse_build_table(table_log, &counts)
+    }
+
+    /// Decodes a generic FSE-compressed byte stream using two interleaved
+    /// states sharing one table - RFC 8878 4.2.1.2's scheme for
+    /// FSE-compressed Huffman weights, which is really just zstd's
+    /// standard single-table FSE stream format (`FSE_decompress`).
+    /// Termination is driven by the bitstream running out (RFC: "if
+    /// updating state after decoding a symbol would require more bits
+    /// than remain in the stream, it is assumed that extra bits are
+    /// zero"), not a known symbol count - verified against
+    /// `FSE_decompress_usingDTable_generic` in zstd's vendored
+    /// `fse_decompress.c`: each turn emits the *current* state's symbol
+    /// (set by an earlier update or by init), then updates that state;
+    /// the moment an update needed padding, one more symbol is emitted
+    /// from the other state and decoding stops.
+    fn fse_decode_interleaved(
+        reader: &mut BackwardBitReader,
+        table: &FseTable,
+        max_symbols: usize,
+    ) -> Result<Vec<u8>> {
+        let mut state = [table.init_state(reader)?, table.init_state(reader)?];
+        let mut out = Vec::new();
+        let mut turn = 0usize;
+        loop {
+            let entry = table.entries[state[turn]];
+            out.push(entry.symbol);
+            if out.len() >= max_symbols {
+                break;
+            }
+            let n = entry.nb_bits as u32;
+            let avail_before = reader.top;
+            let (value, _) = reader.read_padded(n);
+            state[turn] = entry.baseline as usize + value as usize;
+            let exhausted = n > avail_before;
+            turn ^= 1;
+            if exhausted {
+                let entry2 = table.entries[state[turn]];
+                out.push(entry2.symbol);
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------
+    // Predefined FSE distributions (RFC 8878 3.1.1.3.2.2), and their
+    // fully-built decode tables (RFC 8878 Appendix A) - hardcoded
+    // directly from the RFC's own worked-out tables rather than run
+    // through `fse_build_table` at every use, since Appendix A states
+    // outright "these tables ... can be used ... to crosscheck that an
+    // implementation has built its decoding tables correctly." A unit
+    // test builds each from its raw distribution via `fse_build_table`
+    // and asserts the result matches these constants exactly, so
+    // `fse_build_table` itself (needed anyway for FSE_Compressed mode)
+    // gets proven correct against the same source.
+    // ---------------------------------------------------------------
+
+    const LL_DEFAULT_DISTRIBUTION: [i32; 36] = [
+        4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1,
+        1, 1, -1, -1, -1, -1,
+    ];
+    const ML_DEFAULT_DISTRIBUTION: [i32; 53] = [
+        1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, //
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, //
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, //
+        -1, -1, -1, -1, -1,
+    ];
+    const OF_DEFAULT_DISTRIBUTION: [i32; 29] = [
+        1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
+    ];
+
+    fn predefined_ll_table() -> FseTable {
+        fse_build_table(6, &LL_DEFAULT_DISTRIBUTION)
+            .expect("the predefined literals-length distribution is always valid")
+    }
+    fn predefined_ml_table() -> FseTable {
+        fse_build_table(6, &ML_DEFAULT_DISTRIBUTION)
+            .expect("the predefined match-length distribution is always valid")
+    }
+    fn predefined_of_table() -> FseTable {
+        fse_build_table(5, &OF_DEFAULT_DISTRIBUTION)
+            .expect("the predefined offset distribution is always valid")
+    }
+
+    // RFC 8878 Table 16: Literals_Length_Code -> (Baseline, Number_of_Bits).
+    const LL_BASE: [u32; 36] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
+        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    ];
+    const LL_EXTRA: [u8; 36] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10,
+        11, 12, 13, 14, 15, 16,
+    ];
+    // RFC 8878 Table 17: Match_Length_Code -> (Baseline, Number_of_Bits).
+    const ML_BASE: [u32; 53] = [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
+        1027, 2051, 4099, 8195, 16387, 32771, 65539,
+    ];
+    const ML_EXTRA: [u8; 53] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    ];
+
+    // ---------------------------------------------------------------
+    // Huffman coding (RFC 8878 4.2)
+    // ---------------------------------------------------------------
+
+    struct HuffmanTable {
+        max_bits: u32,
+        // Flat 2^max_bits table: entry[i] = (symbol, code_len) for the
+        // codeword whose top bits equal i.
+        entries: Vec<(u8, u8)>,
+    }
+
+    impl HuffmanTable {
+        /// Parses a Huffman_Tree_Description (RFC 8878 4.2.1) and builds a
+        /// flat lookup table.
+        fn parse(data: &[u8]) -> Result<(Self, usize)> {
+            let header = *data.first().context("empty Huffman tree description")?;
+            let (mut weights, consumed): (Vec<u8>, usize) = if header >= 128 {
+                let n_symbols = (header - 127) as usize;
+                let n_bytes = n_symbols.div_ceil(2);
+                let packed = data
+                    .get(1..1 + n_bytes)
+                    .context("truncated direct-encoded Huffman weights")?;
+                let mut w = Vec::with_capacity(n_symbols);
+                for &b in packed {
+                    w.push(b >> 4);
+                    w.push(b & 0xF);
+                }
+                w.truncate(n_symbols);
+                (w, 1 + n_bytes)
+            } else {
+                let fse_len = header as usize;
+                let fse_bytes = data
+                    .get(1..1 + fse_len)
+                    .context("truncated FSE-compressed Huffman weights")?;
+                let mut fwd = ForwardBitReader::new(fse_bytes);
+                let table = fse_table_from_description(&mut fwd, 255)?;
+                let table_bytes = fwd.bytes_consumed();
+                let stream = fse_bytes.get(table_bytes..).context(
+                    "FSE-compressed Huffman weights: table description overran its own size",
+                )?;
+                let mut back = BackwardBitReader::new(stream)?;
+                let w = fse_decode_interleaved(&mut back, &table, 255)?;
+                (w, 1 + fse_len)
+            };
+
+            if weights.is_empty() {
+                bail!("malformed zstd Huffman table: no weights decoded");
+            }
+            let weight_total: u32 = weights
+                .iter()
+                .map(|&w| if w == 0 { 0 } else { 1u32 << (w - 1) })
+                .sum();
+            if weight_total == 0 {
+                bail!("malformed zstd Huffman table: all-zero weights");
+            }
+            let max_bits = 32 - (weight_total - 1).leading_zeros();
+            let rest = (1u32 << max_bits) - weight_total;
+            if rest == 0 || (rest & (rest - 1)) != 0 {
+                bail!("malformed zstd Huffman table: implied last weight isn't a clean power of 2");
+            }
+            let last_weight = 32 - rest.leading_zeros(); // = log2(rest) + 1
+            weights.push(last_weight as u8);
+
+            if max_bits > 11 {
+                bail!("malformed zstd Huffman table: max code length {max_bits} exceeds 11");
+            }
+
+            // Sort by weight ascending (stable, so natural order breaks ties),
+            // drop weight-0 symbols, assign canonical codes starting from the
+            // lowest weight (longest code) per RFC 8878 4.2.1.3.
+            let mut order: Vec<usize> = (0..weights.len()).filter(|&i| weights[i] != 0).collect();
+            order.sort_by_key(|&i| weights[i]);
+
+            let mut entries = vec![(0u8, 0u8); 1usize << max_bits];
+            let mut code: u32 = 0;
+            let mut prev_len: u32 = max_bits + 1 - weights[order[0]] as u32;
+            for &sym in &order {
+                let len = max_bits + 1 - weights[sym] as u32;
+                if len < prev_len {
+                    code >>= prev_len - len;
+                }
+                let width = 1usize << (max_bits - len);
+                let start = (code as usize) << (max_bits - len);
+                for slot in entries.iter_mut().skip(start).take(width) {
+                    *slot = (sym as u8, len as u8);
+                }
+                code += 1;
+                prev_len = len;
+            }
+
+            Ok((HuffmanTable { max_bits, entries }, consumed))
+        }
+
+        fn decode_one(&self, reader: &mut BackwardBitReader) -> (u8, u8) {
+            let idx = reader.peek_padded(self.max_bits) as usize;
+            let (symbol, len) = self.entries[idx];
+            reader.consume(len as u32);
+            (symbol, len)
+        }
+    }
+
+    /// Decodes a single Huffman-coded stream to exactly `regen_size`
+    /// bytes.
+    fn huffman_decode_stream(
+        data: &[u8],
+        table: &HuffmanTable,
+        regen_size: usize,
+    ) -> Result<Vec<u8>> {
+        let mut reader = BackwardBitReader::new(data)?;
+        let mut out = Vec::with_capacity(regen_size);
+        for _ in 0..regen_size {
+            let (symbol, _) = table.decode_one(&mut reader);
+            out.push(symbol);
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------
+    // XXH64 (for the optional Content_Checksum) - a stable, widely
+    // reproduced algorithm; verified below against several known
+    // reference digests (the empty string and short ASCII inputs, whose
+    // XXH64 values are widely published and cross-checked here against
+    // this project's own implementation before being trusted for real
+    // frame verification).
+    // ---------------------------------------------------------------
+
+    const XXH_PRIME64_1: u64 = 0x9E3779B185EBCA87;
+    const XXH_PRIME64_2: u64 = 0xC2B2AE3D27D4EB4F;
+    const XXH_PRIME64_3: u64 = 0x165667B19E3779F9;
+    const XXH_PRIME64_4: u64 = 0x85EBCA77C2B2AE63;
+    const XXH_PRIME64_5: u64 = 0x27D4EB2F165667C5;
+
+    fn xxh64_round(acc: u64, input: u64) -> u64 {
+        acc.wrapping_add(input.wrapping_mul(XXH_PRIME64_2))
+            .rotate_left(31)
+            .wrapping_mul(XXH_PRIME64_1)
+    }
+
+    fn xxh64_merge_round(acc: u64, val: u64) -> u64 {
+        let val = xxh64_round(0, val);
+        (acc ^ val)
+            .wrapping_mul(XXH_PRIME64_1)
+            .wrapping_add(XXH_PRIME64_4)
+    }
+
+    fn xxh64_avalanche(mut h: u64) -> u64 {
+        h ^= h >> 33;
+        h = h.wrapping_mul(XXH_PRIME64_2);
+        h ^= h >> 29;
+        h = h.wrapping_mul(XXH_PRIME64_3);
+        h ^= h >> 32;
+        h
+    }
+
+    fn xxh64(data: &[u8], seed: u64) -> u64 {
+        let len = data.len();
+        let mut pos = 0usize;
+        let mut h: u64;
+
+        if len >= 32 {
+            let mut v1 = seed.wrapping_add(XXH_PRIME64_1).wrapping_add(XXH_PRIME64_2);
+            let mut v2 = seed.wrapping_add(XXH_PRIME64_2);
+            let mut v3 = seed;
+            let mut v4 = seed.wrapping_sub(XXH_PRIME64_1);
+            while pos + 32 <= len {
+                v1 = xxh64_round(
+                    v1,
+                    u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+                );
+                pos += 8;
+                v2 = xxh64_round(
+                    v2,
+                    u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+                );
+                pos += 8;
+                v3 = xxh64_round(
+                    v3,
+                    u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+                );
+                pos += 8;
+                v4 = xxh64_round(
+                    v4,
+                    u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+                );
+                pos += 8;
+            }
+            h = v1
+                .rotate_left(1)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+            h = xxh64_merge_round(h, v1);
+            h = xxh64_merge_round(h, v2);
+            h = xxh64_merge_round(h, v3);
+            h = xxh64_merge_round(h, v4);
+        } else {
+            h = seed.wrapping_add(XXH_PRIME64_5);
+        }
+
+        h = h.wrapping_add(len as u64);
+
+        while pos + 8 <= len {
+            let k1 = xxh64_round(
+                0,
+                u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()),
+            );
+            h ^= k1;
+            h = h
+                .rotate_left(27)
+                .wrapping_mul(XXH_PRIME64_1)
+                .wrapping_add(XXH_PRIME64_4);
+            pos += 8;
+        }
+        if pos + 4 <= len {
+            let k1 = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as u64;
+            h ^= k1.wrapping_mul(XXH_PRIME64_1);
+            h = h
+                .rotate_left(23)
+                .wrapping_mul(XXH_PRIME64_2)
+                .wrapping_add(XXH_PRIME64_3);
+            pos += 4;
+        }
+        while pos < len {
+            h ^= (data[pos] as u64).wrapping_mul(XXH_PRIME64_5);
+            h = h.rotate_left(11).wrapping_mul(XXH_PRIME64_1);
+            pos += 1;
+        }
+
+        xxh64_avalanche(h)
+    }
+
+    // ---------------------------------------------------------------
+    // Frame / block / literals / sequences
+    // ---------------------------------------------------------------
+
+    /// Which of the three per-sequence symbol types a table belongs to -
+    /// each has its own max symbol value, max accuracy log, predefined
+    /// distribution, and (for Repeat_Mode) its own carried-over table.
+    #[derive(Clone, Copy)]
+    enum SeqKind {
+        Ll,
+        Of,
+        Ml,
+    }
+
+    impl SeqKind {
+        fn max_symbol(self) -> u32 {
+            match self {
+                SeqKind::Ll => 35,
+                SeqKind::Of => 31,
+                SeqKind::Ml => 52,
+            }
+        }
+        fn max_accuracy_log(self) -> u32 {
+            match self {
+                SeqKind::Ll | SeqKind::Ml => 9,
+                SeqKind::Of => 8,
+            }
+        }
+        fn predefined(self) -> FseTable {
+            match self {
+                SeqKind::Ll => predefined_ll_table(),
+                SeqKind::Of => predefined_of_table(),
+                SeqKind::Ml => predefined_ml_table(),
+            }
+        }
+        fn name(self) -> &'static str {
+            match self {
+                SeqKind::Ll => "literals-length",
+                SeqKind::Of => "offset",
+                SeqKind::Ml => "match-length",
+            }
+        }
+    }
+
+    /// A single-state, always-resolves-to-the-same-symbol table for
+    /// RLE_Mode - `table_log` 0 (matching zstd's own
+    /// `ZSTD_buildSeqTable_rle`: `cell.nbBits = 0, cell.nextState = 0`, so
+    /// the FSE state never advances) with the FSE-internal fields inert;
+    /// the caller still separately looks up the symbol's own baseline/
+    /// extra-bits (`LL_BASE`/`ML_BASE`/the offset-code formula) exactly as
+    /// it would for any other mode.
+    fn rle_table(symbol: u8) -> FseTable {
+        FseTable {
+            table_log: 0,
+            entries: vec![FseEntry {
+                symbol,
+                nb_bits: 0,
+                baseline: 0,
+            }],
+        }
+    }
+
+    struct Decoder {
+        window: Vec<u8>,
+        huffman: Option<HuffmanTable>,
+        ll_table: Option<FseTable>,
+        of_table: Option<FseTable>,
+        ml_table: Option<FseTable>,
+        rep: [u64; 3],
+    }
+
+    impl Decoder {
+        fn new() -> Self {
+            Decoder {
+                window: Vec::new(),
+                huffman: None,
+                ll_table: None,
+                of_table: None,
+                ml_table: None,
+                rep: [1, 4, 8],
+            }
+        }
+
+        fn decode_frame(&mut self, data: &[u8]) -> Result<usize> {
+            let mut pos = 0usize;
+            let read_u = |data: &[u8], pos: usize, n: usize| -> Result<u64> {
+                let bytes = data
+                    .get(pos..pos + n)
+                    .context("truncated zstd frame header")?;
+                let mut v = 0u64;
+                for (i, &b) in bytes.iter().enumerate() {
+                    v |= (b as u64) << (8 * i);
+                }
+                Ok(v)
+            };
+
+            let fhd = *data.get(pos).context("truncated zstd frame header")?;
+            pos += 1;
+            let fcs_flag = fhd >> 6;
+            let single_segment = (fhd & 0x20) != 0;
+            let content_checksum = (fhd & 0x04) != 0;
+            let dict_id_flag = fhd & 0x3;
+            if fhd & 0x08 != 0 {
+                bail!("unsupported zstd frame: reserved header bit is set");
+            }
+
+            if !single_segment {
+                pos += 1; // Window_Descriptor - only needed to size an allocation, irrelevant here
+                if pos > data.len() {
+                    bail!("truncated zstd frame header (window descriptor)");
+                }
+            }
+
+            let did_len = match dict_id_flag {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3 => 4,
+                _ => unreachable!(),
+            };
+            if did_len > 0 {
+                let did = read_u(data, pos, did_len)?;
+                if did != 0 {
+                    bail!(
+                        "zstd frame requires dictionary {did} - dictionary support isn't implemented"
+                    );
+                }
+                pos += did_len;
+            }
+
+            let fcs_len: usize = match fcs_flag {
+                0 => {
+                    if single_segment {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                1 => 2,
+                2 => 4,
+                3 => 8,
+                _ => unreachable!(),
+            };
+            let content_size = if fcs_len > 0 {
+                let raw = read_u(data, pos, fcs_len)?;
+                pos += fcs_len;
+                Some(if fcs_len == 2 { raw + 256 } else { raw })
+            } else {
+                None
+            };
+            if let Some(size) = content_size {
+                self.window.reserve(size as usize);
+            }
+
+            self.huffman = None;
+            self.ll_table = None;
+            self.of_table = None;
+            self.ml_table = None;
+            self.rep = [1, 4, 8];
+
+            loop {
+                let header = data
+                    .get(pos..pos + 3)
+                    .context("truncated zstd block header")?;
+                let raw = header[0] as u32 | (header[1] as u32) << 8 | (header[2] as u32) << 16;
+                pos += 3;
+                let last_block = raw & 1 != 0;
+                let block_type = (raw >> 1) & 0x3;
+                let block_size = (raw >> 3) as usize;
+
+                match block_type {
+                    0 => {
+                        let content = data
+                            .get(pos..pos + block_size)
+                            .context("truncated zstd raw block")?;
+                        self.window.extend_from_slice(content);
+                        pos += block_size;
+                    }
+                    1 => {
+                        let byte = *data.get(pos).context("truncated zstd RLE block")?;
+                        pos += 1;
+                        self.window.resize(self.window.len() + block_size, byte);
+                    }
+                    2 => {
+                        let content = data
+                            .get(pos..pos + block_size)
+                            .context("truncated zstd compressed block")?;
+                        self.decode_compressed_block(content)?;
+                        pos += block_size;
+                    }
+                    _ => bail!("unsupported zstd block: reserved block type"),
+                }
+
+                if last_block {
+                    break;
+                }
+            }
+
+            if content_checksum {
+                let stored = read_u(data, pos, 4)? as u32;
+                pos += 4;
+                let computed = xxh64(&self.window, 0) as u32;
+                if computed != stored {
+                    bail!(
+                        "zstd content checksum mismatch: expected {stored:#x}, computed {computed:#x}"
+                    );
+                }
+            }
+
+            Ok(pos)
+        }
+
+        fn decode_compressed_block(&mut self, data: &[u8]) -> Result<()> {
+            let (literals, seq_start) = self.decode_literals_section(data)?;
+            self.decode_sequences_section(&data[seq_start..], &literals)
+        }
+
+        fn decode_literals_section(&mut self, data: &[u8]) -> Result<(Vec<u8>, usize)> {
+            let b0 = *data.first().context("empty zstd literals section")?;
+            let block_type = b0 & 0x3;
+            let size_format = (b0 >> 2) & 0x3;
+
+            match block_type {
+                0 | 1 => {
+                    // Raw or RLE: 1-bit or 2-bit size format, 1/2/3-byte header.
+                    let (regen, hdr_len) = if size_format & 1 == 0 {
+                        ((b0 >> 3) as usize, 1)
+                    } else if size_format == 1 {
+                        let b1 = *data.get(1).context("truncated literals header")?;
+                        (((b0 as usize) >> 4) | ((b1 as usize) << 4), 2)
+                    } else {
+                        let b1 = *data.get(1).context("truncated literals header")?;
+                        let b2 = *data.get(2).context("truncated literals header")?;
+                        (
+                            ((b0 as usize) >> 4) | ((b1 as usize) << 4) | ((b2 as usize) << 12),
+                            3,
+                        )
+                    };
+                    if block_type == 0 {
+                        let content = data
+                            .get(hdr_len..hdr_len + regen)
+                            .context("truncated raw literals block")?;
+                        Ok((content.to_vec(), hdr_len + regen))
+                    } else {
+                        let byte = *data.get(hdr_len).context("truncated RLE literals block")?;
+                        Ok((vec![byte; regen], hdr_len + 1))
+                    }
+                }
+                2 | 3 => {
+                    // Compressed / Treeless: always 2-bit size format, 3-5 byte header.
+                    let (regen, csize, hdr_len, n_streams) = match size_format {
+                        0 => {
+                            let v = b0 as usize
+                                | (*data.get(1).context("truncated literals header")? as usize)
+                                    << 8
+                                | (*data.get(2).context("truncated literals header")? as usize)
+                                    << 16;
+                            (((v >> 4) & 0x3FF), (v >> 14) & 0x3FF, 3, 1)
+                        }
+                        1 => {
+                            let v = b0 as usize
+                                | (*data.get(1).context("truncated literals header")? as usize)
+                                    << 8
+                                | (*data.get(2).context("truncated literals header")? as usize)
+                                    << 16;
+                            (((v >> 4) & 0x3FF), (v >> 14) & 0x3FF, 3, 4)
+                        }
+                        2 => {
+                            let v = b0 as usize
+                                | (*data.get(1).context("truncated literals header")? as usize)
+                                    << 8
+                                | (*data.get(2).context("truncated literals header")? as usize)
+                                    << 16
+                                | (*data.get(3).context("truncated literals header")? as usize)
+                                    << 24;
+                            (((v >> 4) & 0x3FFF), (v >> 18) & 0x3FFF, 4, 4)
+                        }
+                        3 => {
+                            let v = b0 as u64
+                                | (*data.get(1).context("truncated literals header")? as u64) << 8
+                                | (*data.get(2).context("truncated literals header")? as u64) << 16
+                                | (*data.get(3).context("truncated literals header")? as u64) << 24
+                                | (*data.get(4).context("truncated literals header")? as u64) << 32;
+                            (
+                                ((v >> 4) & 0x3FFFF) as usize,
+                                ((v >> 22) & 0x3FFFF) as usize,
+                                5,
+                                4,
+                            )
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let body = data
+                        .get(hdr_len..hdr_len + csize)
+                        .context("truncated compressed/treeless literals block")?;
+
+                    if block_type == 2 {
+                        let (table, tree_len) = HuffmanTable::parse(body)?;
+                        self.huffman = Some(table);
+                        self.decode_huffman_streams(&body[tree_len..], regen, n_streams)
+                            .map(|out| (out, hdr_len + csize))
+                    } else {
+                        // Take the table out (rather than cloning the
+                        // potentially large flat decode table) to satisfy
+                        // the borrow checker, then put it back.
+                        let table = self
+                            .huffman
+                            .take()
+                            .context("treeless literals block with no previous Huffman table")?;
+                        let result =
+                            Self::decode_huffman_streams_with(&table, body, regen, n_streams);
+                        self.huffman = Some(table);
+                        result.map(|out| (out, hdr_len + csize))
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        fn decode_huffman_streams(
+            &self,
+            body: &[u8],
+            regen: usize,
+            n_streams: usize,
+        ) -> Result<Vec<u8>> {
+            let table = self.huffman.as_ref().expect("just parsed");
+            Self::decode_huffman_streams_with(table, body, regen, n_streams)
+        }
+
+        fn decode_huffman_streams_with(
+            table: &HuffmanTable,
+            body: &[u8],
+            regen: usize,
+            n_streams: usize,
+        ) -> Result<Vec<u8>> {
+            if n_streams == 1 {
+                return huffman_decode_stream(body, table, regen);
+            }
+
+            let jump = body.get(0..6).context("truncated Huffman Jump_Table")?;
+            let s1 = u16::from_le_bytes([jump[0], jump[1]]) as usize;
+            let s2 = u16::from_le_bytes([jump[2], jump[3]]) as usize;
+            let s3 = u16::from_le_bytes([jump[4], jump[5]]) as usize;
+            let rest = &body[6..];
+            let total = rest.len();
+            if s1 + s2 + s3 > total {
+                bail!("malformed zstd literals: Jump_Table stream sizes exceed the block");
+            }
+            let s4 = total - s1 - s2 - s3;
+
+            let per_stream = regen.div_ceil(4);
+            let last = regen - per_stream * 3;
+            let sizes = [per_stream, per_stream, per_stream, last];
+
+            let mut out = Vec::with_capacity(regen);
+            let mut off = 0usize;
+            for (clen, rlen) in [s1, s2, s3, s4].into_iter().zip(sizes) {
+                let stream = rest
+                    .get(off..off + clen)
+                    .context("truncated Huffman stream")?;
+                out.extend(huffman_decode_stream(stream, table, rlen)?);
+                off += clen;
+            }
+            Ok(out)
+        }
+
+        fn decode_sequences_section(&mut self, data: &[u8], literals: &[u8]) -> Result<()> {
+            let b0 = *data.first().context("empty zstd sequences section")?;
+            let (n_seq, hdr_len): (u32, usize) = if b0 == 0 {
+                (0, 1)
+            } else if b0 < 128 {
+                (b0 as u32, 1)
+            } else if b0 < 255 {
+                let b1 = *data.get(1).context("truncated Number_of_Sequences")?;
+                (((b0 as u32 - 128) << 8) + b1 as u32, 2)
+            } else {
+                let b1 = *data.get(1).context("truncated Number_of_Sequences")?;
+                let b2 = *data.get(2).context("truncated Number_of_Sequences")?;
+                (b1 as u32 + ((b2 as u32) << 8) + 0x7F00, 3)
+            };
+
+            let mut lit_pos = 0usize;
+            if n_seq == 0 {
+                if hdr_len != data.len() {
+                    bail!("malformed zstd sequences section: extraneous data after zero sequences");
+                }
+                self.window.extend_from_slice(literals);
+                return Ok(());
+            }
+
+            let modes = *data
+                .get(hdr_len)
+                .context("truncated Symbol_Compression_Modes")?;
+            if modes & 0x3 != 0 {
+                bail!("malformed zstd sequences section: reserved bits set");
+            }
+            let mut pos = hdr_len + 1;
+
+            let ll_table =
+                self.decode_seq_table(SeqKind::Ll, (modes >> 6) & 0x3, &data[pos..], &mut pos)?;
+            let of_table =
+                self.decode_seq_table(SeqKind::Of, (modes >> 4) & 0x3, &data[pos..], &mut pos)?;
+            let ml_table =
+                self.decode_seq_table(SeqKind::Ml, (modes >> 2) & 0x3, &data[pos..], &mut pos)?;
+
+            self.ll_table = Some(clone_table(&ll_table));
+            self.of_table = Some(clone_table(&of_table));
+            self.ml_table = Some(clone_table(&ml_table));
+
+            let stream = &data[pos..];
+            let mut reader = BackwardBitReader::new(stream)?;
+
+            // Initial state read order: LL, then OF, then ML.
+            let mut ll_state = ll_table.init_state(&mut reader)?;
+            let mut of_state = of_table.init_state(&mut reader)?;
+            let mut ml_state = ml_table.init_state(&mut reader)?;
+
+            for seq_idx in 0..n_seq {
+                let ll_entry = ll_table.entries[ll_state];
+                let of_entry = of_table.entries[of_state];
+                let ml_entry = ml_table.entries[ml_state];
+
+                // Value read order: offset code, then match length, then
+                // literals length (RFC 8878 3.1.1.3.2.1.2). Each value's
+                // own extra-bit count comes from that symbol's code
+                // (LL_EXTRA/ML_EXTRA, or the offset code itself per RFC
+                // 8878 3.1.1.3.2.1.1's `OF_bits[code] == code`) - entirely
+                // separate from the FSE table's own state-transition
+                // `nb_bits`/`baseline`, which is only used below to
+                // advance to the *next* state.
+                let of_code = of_entry.symbol as u32;
+                let of_extra = reader.read(of_code)?;
+
+                let ml_code = ml_entry.symbol as u32;
+                let ml_extra_bits = *ML_EXTRA
+                    .get(ml_code as usize)
+                    .context("malformed zstd sequence: bad match-length code")?
+                    as u32;
+                let ml_extra = reader.read(ml_extra_bits)? as u64;
+                let match_length = *ML_BASE
+                    .get(ml_code as usize)
+                    .expect("bounds already checked") as u64
+                    + ml_extra;
+
+                let ll_code = ll_entry.symbol as u32;
+                let ll_extra_bits = *LL_EXTRA
+                    .get(ll_code as usize)
+                    .context("malformed zstd sequence: bad literals-length code")?
+                    as u32;
+                let ll_extra = reader.read(ll_extra_bits)? as u64;
+                let lit_length = *LL_BASE
+                    .get(ll_code as usize)
+                    .expect("bounds already checked") as u64
+                    + ll_extra;
+
+                let offset = self.resolve_offset(of_code, of_extra, lit_length == 0)?;
+
+                let lit_end = lit_pos + lit_length as usize;
+                let lits = literals.get(lit_pos..lit_end).context(
+                    "malformed zstd sequence: literals length exceeds the literals section",
+                )?;
+                self.window.extend_from_slice(lits);
+                lit_pos = lit_end;
+
+                if offset == 0 || offset as usize > self.window.len() {
+                    bail!(
+                        "malformed zstd sequence: back-reference offset {offset} is out of range"
+                    );
+                }
+                let start = self.window.len() - offset as usize;
+                self.window.reserve(match_length as usize);
+                for i in 0..match_length as usize {
+                    let b = self.window[start + i];
+                    self.window.push(b);
+                }
+
+                let is_last = seq_idx + 1 == n_seq;
+                if !is_last {
+                    // State update order: LL, then ML, then OF.
+                    ll_state =
+                        ll_entry.baseline as usize + reader.read(ll_entry.nb_bits as u32)? as usize;
+                    ml_state =
+                        ml_entry.baseline as usize + reader.read(ml_entry.nb_bits as u32)? as usize;
+                    of_state =
+                        of_entry.baseline as usize + reader.read(of_entry.nb_bits as u32)? as usize;
+                }
+            }
+
+            if reader.top != 0 {
+                bail!("malformed zstd sequences section: bitstream not fully consumed");
+            }
+            if lit_pos < literals.len() {
+                self.window.extend_from_slice(&literals[lit_pos..]);
+            }
+
+            Ok(())
+        }
+
+        /// Resolves one of the three per-sequence-symbol FSE tables (RFC
+        /// 8878 3.1.1.3.2.1's Compression_Mode), advancing `pos` (an
+        /// absolute offset into the *original* sequences-section buffer)
+        /// past whatever this mode consumed there. `data` starts exactly
+        /// at this table's own description.
+        fn decode_seq_table(
+            &self,
+            kind: SeqKind,
+            mode: u8,
+            data: &[u8],
+            pos: &mut usize,
+        ) -> Result<FseTable> {
+            match mode {
+                0 => Ok(kind.predefined()),
+                1 => {
+                    let byte = *data
+                        .first()
+                        .context("truncated RLE sequence-table symbol")?;
+                    if byte as u32 > kind.max_symbol() {
+                        bail!(
+                            "malformed zstd {} RLE table: symbol {byte} exceeds the maximum of {}",
+                            kind.name(),
+                            kind.max_symbol()
+                        );
+                    }
+                    *pos += 1;
+                    Ok(rle_table(byte))
+                }
+                2 => {
+                    let mut fwd = ForwardBitReader::new(data);
+                    let (table_log, counts) = fse_read_ncount(&mut fwd, kind.max_symbol())?;
+                    if table_log > kind.max_accuracy_log() {
+                        bail!(
+                            "malformed zstd {} FSE table: accuracy log {table_log} exceeds the maximum of {}",
+                            kind.name(),
+                            kind.max_accuracy_log()
+                        );
+                    }
+                    *pos += fwd.bytes_consumed();
+                    fse_build_table(table_log, &counts)
+                }
+                3 => {
+                    let existing = match kind {
+                        SeqKind::Ll => &self.ll_table,
+                        SeqKind::Of => &self.of_table,
+                        SeqKind::Ml => &self.ml_table,
+                    };
+                    let table = existing.as_ref().with_context(|| {
+                        format!(
+                            "Repeat_Mode used for the {} table with no previous table to repeat",
+                            kind.name()
+                        )
+                    })?;
+                    Ok(clone_table(table))
+                }
+                _ => unreachable!("2-bit field"),
+            }
+        }
+
+        fn resolve_offset(&mut self, code: u32, extra: u32, ll_zero: bool) -> Result<u64> {
+            if code > 1 {
+                let offset = ((1u64 << code) - 3) + extra as u64;
+                self.rep[2] = self.rep[1];
+                self.rep[1] = self.rep[0];
+                self.rep[0] = offset;
+                Ok(offset)
+            } else if code == 0 {
+                let idx = if ll_zero { 1 } else { 0 };
+                let offset = self.rep[idx];
+                let old0 = self.rep[0];
+                self.rep[1] = if ll_zero { old0 } else { self.rep[1] };
+                self.rep[0] = offset;
+                Ok(offset)
+            } else {
+                let ll0 = ll_zero as u32;
+                let sel = 1 + ll0 + extra;
+                let temp = if sel == 3 {
+                    self.rep[0].saturating_sub(1)
+                } else {
+                    self.rep[sel as usize]
+                };
+                if temp == 0 {
+                    bail!("malformed zstd sequence: resolved repeat-offset is zero");
+                }
+                if sel != 1 {
+                    self.rep[2] = self.rep[1];
+                }
+                self.rep[1] = self.rep[0];
+                self.rep[0] = temp;
+                Ok(temp)
+            }
+        }
+    }
+
+    fn clone_table(t: &FseTable) -> FseTable {
+        FseTable {
+            table_log: t.table_log,
+            entries: t.entries.clone(),
+        }
+    }
+
+    /// Top-level entry point, matching `gzip_decompress`'s exact shape:
+    /// decodes every frame in `input` (concatenated frames and skippable
+    /// frames, both legal per RFC 8878 3.1/3.1.2) to the full decompressed
+    /// byte stream.
+    pub(crate) fn zstd_decompress<R: std::io::Read>(mut input: R) -> Result<Vec<u8>> {
+        let mut all = Vec::new();
+        input
+            .read_to_end(&mut all)
+            .context("failed to read zstd input")?;
+
+        if all.is_empty() {
+            // Matches the real zstd CLI's own behavior on a genuinely
+            // zero-byte ".zst" file ("unexpected end of file") rather than
+            // silently treating it as valid empty content - a 0-byte file
+            // is missing even the mandatory 4-byte magic number.
+            bail!("not a valid zstd file (empty input)");
+        }
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < all.len() {
+            let magic = all
+                .get(pos..pos + 4)
+                .context("truncated zstd frame magic number")?;
+            let magic = u32::from_le_bytes(magic.try_into().unwrap());
+            if (0x184D2A50..=0x184D2A5F).contains(&magic) {
+                let size_bytes = all
+                    .get(pos + 4..pos + 8)
+                    .context("truncated skippable-frame size")?;
+                let size = u32::from_le_bytes(size_bytes.try_into().unwrap()) as usize;
+                pos += 8 + size;
+                continue;
+            }
+            if magic != 0xFD2FB528 {
+                bail!("not a valid zstd file (bad magic number {magic:#x})");
+            }
+            pos += 4;
+            let mut decoder = Decoder::new();
+            let before = decoder.window.len();
+            let consumed = decoder.decode_frame(&all[pos..])?;
+            pos += consumed;
+            out.extend_from_slice(&decoder.window[before..]);
+        }
+        Ok(out)
+    }
+} // mod zstd_support
+
 // --- Transparent gzip/zstd decompression ---
 // Not a format of its own - a preprocessing step in front of every reader
 // above. Every reader just opens a plain file path, so materializing
@@ -10365,15 +11677,12 @@ fn compression_from_extension(path: &Path) -> Option<Compression> {
 }
 
 #[cfg(feature = "zstd")]
-fn decompress_zstd(reader: std::fs::File, out: &mut std::fs::File, path: &Path) -> Result<()> {
-    let mut decoder = zstd::stream::read::Decoder::new(reader)
-        .with_context(|| format!("failed to open {path:?} as zstd"))?;
-    std::io::copy(&mut decoder, out).with_context(|| format!("failed to decompress {path:?}"))?;
-    Ok(())
+fn decompress_zstd(input: std::fs::File, path: &Path) -> Result<Vec<u8>> {
+    zstd_support::zstd_decompress(input).with_context(|| format!("failed to decompress {path:?}"))
 }
 
 #[cfg(not(feature = "zstd"))]
-fn decompress_zstd(_reader: std::fs::File, _out: &mut std::fs::File, path: &Path) -> Result<()> {
+fn decompress_zstd(_input: std::fs::File, path: &Path) -> Result<Vec<u8>> {
     bail!(
         "zstd support isn't compiled in - rebuild with `cargo build --release --features zstd` (or --features full) to read {path:?}"
     )
@@ -10474,7 +11783,12 @@ fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFil
                 .write_all(&bytes)
                 .with_context(|| format!("failed to write decompressed data for {path:?}"))?;
         }
-        Compression::Zstd => decompress_zstd(input, tmp.as_file_mut(), path)?,
+        Compression::Zstd => {
+            let bytes = decompress_zstd(input, path)?;
+            tmp.as_file_mut()
+                .write_all(&bytes)
+                .with_context(|| format!("failed to write decompressed data for {path:?}"))?;
+        }
     }
 
     let logical_path = path.with_extension("");
@@ -13444,5 +14758,37 @@ mod tests {
         // TOML-shaped, deliberately not sniffed - see sniff_format's doc comment.
         assert!(sniff_bytes(b"key = value\nother_key = 1").is_none());
         assert!(sniff_bytes(b"random garbage that is not any format").is_none());
+    }
+
+    /// Cross-verification oracle for the hand-rolled zstd decoder
+    /// (`zstd_support` - see Cargo.toml) against the real `zstd` crate,
+    /// kept as a dev-only dependency for exactly this purpose. Covers
+    /// every block/table shape this project's own fixtures happen to
+    /// produce: `sample.csv.zst`-class small files (typically all-Raw or
+    /// all-RLE blocks with Predefined sequence tables), and
+    /// `edge_zstd_dynamic_tables.csv.zst`, large/varied enough that the
+    /// real `zstd` CLI reaches for FSE_Compressed sequence tables and a
+    /// genuinely FSE-compressed Huffman weight list - the exact code path
+    /// a real, previously-uncaught bug in this project's own
+    /// `fse_read_ncount` (an off-by-one in the accuracy-log recompute,
+    /// only wrong when `remaining` lands exactly on a power of 2) was
+    /// found through, the same "small fixtures alone don't stress this"
+    /// lesson every other hand-roll in this file has already hit at least
+    /// once.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_reader_matches_the_zstd_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.csv.zst",
+            "tests/fixtures/nested.jsonl.zst",
+            "tests/fixtures/edge_zstd_dynamic_tables.csv.zst",
+        ] {
+            let compressed = std::fs::read(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+            let mine = zstd_support::zstd_decompress(compressed.as_slice())
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled decoder failed: {e:?}"));
+            let theirs = zstd::stream::decode_all(compressed.as_slice())
+                .unwrap_or_else(|e| panic!("{f}: reference `zstd` crate failed: {e}"));
+            assert_eq!(mine, theirs, "{f}: decompressed bytes differ");
+        }
     }
 }
