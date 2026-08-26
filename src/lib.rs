@@ -3714,48 +3714,847 @@ fn columns_from_dbase(
 // silently dropped or guessed at. Variable/value labels (Stata's own
 // human-authored variable descriptions and coded-value names, e.g.
 // 1/2/3 meaning "male"/"female"/"other") aren't surfaced - see CLAUDE.md's
-// Known limitations.
+// Known limitations. The reader itself (`stata_support`) is hand-rolled -
+// see CLAUDE.md's Dependency footprint section for why and how it was
+// verified.
 
 #[cfg(feature = "stata")]
-fn stata_value_to_string(v: &dta::stata::dta::value::Value) -> Option<String> {
-    use dta::stata::dta::value::Value;
-    use dta::stata::stata_byte::StataByte;
-    use dta::stata::stata_double::StataDouble;
-    use dta::stata::stata_float::StataFloat;
-    use dta::stata::stata_int::StataInt;
-    use dta::stata::stata_long::StataLong;
-    match v {
-        Value::Byte(StataByte::Present(x)) => Some(x.to_string()),
-        Value::Byte(StataByte::Missing(_)) => None,
-        Value::Int(StataInt::Present(x)) => Some(x.to_string()),
-        Value::Int(StataInt::Missing(_)) => None,
-        Value::Long(StataLong::Present(x)) => Some(x.to_string()),
-        Value::Long(StataLong::Missing(_)) => None,
-        Value::Float(StataFloat::Present(x)) => Some(x.to_string()),
-        Value::Float(StataFloat::Missing(_)) => None,
-        Value::Double(StataDouble::Present(x)) => Some(x.to_string()),
-        Value::Double(StataDouble::Missing(_)) => None,
-        Value::String(s) => {
-            let s = s.trim();
-            if s.is_empty() {
-                None
+mod stata_support {
+    use super::*;
+    use std::fs::File;
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+
+    /// A defensive cap on the declared variable count, checked before any
+    /// buffer sized from it is allocated - not a real-world limitation
+    /// (Stata itself has never supported anywhere near this many
+    /// variables), but a guard against a corrupted/adversarial header
+    /// claiming an enormous count and forcing a huge upfront allocation
+    /// before a single byte of real schema data has been read, the same
+    /// class of guard `msgpack_support`/`cbor_support` already needed for
+    /// their own untrusted length fields.
+    const MAX_VARIABLES: u32 = 1_000_000;
+
+    /// Same reasoning, for the summed per-row byte width: even with
+    /// `MAX_VARIABLES` in place, that many maximum-width (2045-byte)
+    /// string variables could still describe a multi-gigabyte single row.
+    /// No real Stata dataset needs anywhying close to 100 MB per
+    /// observation.
+    const MAX_ROW_LEN: usize = 100_000_000;
+
+    /// A DTA format version (102-119, the `dbase` crate's ReadStat-derived
+    /// documented range), stored as its raw byte rather than a 18-variant
+    /// enum - every version-dependent field width below is a simple
+    /// comparison against this number, verified field-by-field against
+    /// the `dta` crate's own `release.rs` rather than assumed.
+    #[derive(Clone, Copy, PartialEq, PartialOrd)]
+    struct Release(u8);
+
+    impl Release {
+        fn is_xml_like(self) -> bool {
+            self.0 >= 117
+        }
+        /// Format 113+ reserves a range of each numeric type's encoding
+        /// for 27 distinct missing values (`.`, `.a`-`.z`); earlier
+        /// formats have only one system-missing sentinel per type.
+        fn supports_tagged_missing(self) -> bool {
+            self.0 >= 113
+        }
+        /// V104/V105's double missing value is the exact bit pattern
+        /// `0x54C0_0000_0000_0000` (2^333) - a value that falls *inside*
+        /// the normal valid `f64` range, so it must be matched exactly
+        /// rather than via a range check the way every other era's
+        /// sentinel can be.
+        fn uses_magic_double_missing(self) -> bool {
+            self.0 <= 105
+        }
+        fn default_encoding_is_utf8(self) -> bool {
+            self.0 >= 118
+        }
+        fn dataset_label_len(self) -> usize {
+            if self.0 < 108 { 32 } else { 81 }
+        }
+        /// `None` for V102-104 (no timestamp field at all in the binary
+        /// header).
+        fn timestamp_len(self) -> Option<usize> {
+            if self.0 < 105 { None } else { Some(18) }
+        }
+        /// XML-only: the observation count is a `u32` for format 117,
+        /// `u64` for 118+.
+        fn supports_extended_observation_count(self) -> bool {
+            self.0 >= 118
+        }
+        /// XML-only: the variable count is a `u16` for 117-118, `u32`
+        /// for 119.
+        fn supports_extended_variable_count(self) -> bool {
+            self.0 >= 119
+        }
+        /// Binary-only: the observation count is a `u16` for V102 only;
+        /// V103-116 use `u32` (the binary container tops out at V116,
+        /// so this never needs to consider 118's `u64`).
+        fn supports_extended_binary_observation_count(self) -> bool {
+            self.0 >= 103
+        }
+        /// Each type-list entry is 1 byte pre-117 (ASCII-ish codes or
+        /// 0xFB-0xFF), 2 bytes at 117+ (needed for strL and wider codes).
+        fn type_list_entry_len(self) -> usize {
+            if self.0 >= 117 { 2 } else { 1 }
+        }
+        fn variable_name_len(self) -> usize {
+            if self.0 >= 118 {
+                129
+            } else if self.0 >= 110 {
+                33
             } else {
-                Some(s.to_string())
+                9
             }
         }
-        Value::LongStringRef(_) => Some("<strL: long string not resolved>".to_string()),
+        fn format_entry_len(self) -> usize {
+            if self.0 >= 118 {
+                57
+            } else if self.0 >= 114 {
+                49
+            } else if self.0 >= 105 {
+                12
+            } else {
+                7
+            }
+        }
+        fn variable_label_len(self) -> usize {
+            if self.0 >= 118 {
+                321
+            } else if self.0 >= 108 {
+                81
+            } else {
+                32
+            }
+        }
+        fn sort_entry_len(self) -> usize {
+            if self.0 >= 119 { 4 } else { 2 }
+        }
+        /// XML-only: the `<label>` length prefix is a `u8` for 117,
+        /// `u16` for 118+.
+        fn supports_extended_dataset_label(self) -> bool {
+            self.0 >= 118
+        }
+        /// Binary-only: whether the file has an expansion-fields
+        /// (characteristics) section at all, and if so, whether each
+        /// entry's length is a `u16` (V105-109) or `u32` (V110+).
+        /// `None` for V102-104, which predate the section entirely.
+        fn supports_extended_expansion(self) -> Option<bool> {
+            if self.0 >= 110 {
+                Some(true)
+            } else if self.0 >= 105 {
+                Some(false)
+            } else {
+                None
+            }
+        }
     }
-}
 
-#[cfg(feature = "stata")]
-fn stata_type_label(t: dta::stata::dta::variable_type::VariableType) -> &'static str {
-    use dta::stata::dta::variable_type::VariableType;
-    match t {
-        VariableType::Byte | VariableType::Int | VariableType::Long => "i64",
-        VariableType::Float | VariableType::Double => "f64",
-        VariableType::FixedString(_) | VariableType::LongString => "String",
+    #[derive(Clone, Copy)]
+    enum ByteOrder {
+        Big,
+        Little,
     }
-}
+
+    impl ByteOrder {
+        fn u16(self, b: [u8; 2]) -> u16 {
+            match self {
+                Self::Big => u16::from_be_bytes(b),
+                Self::Little => u16::from_le_bytes(b),
+            }
+        }
+        fn u32(self, b: [u8; 4]) -> u32 {
+            match self {
+                Self::Big => u32::from_be_bytes(b),
+                Self::Little => u32::from_le_bytes(b),
+            }
+        }
+        fn u64(self, b: [u8; 8]) -> u64 {
+            match self {
+                Self::Big => u64::from_be_bytes(b),
+                Self::Little => u64::from_le_bytes(b),
+            }
+        }
+        fn f32(self, b: [u8; 4]) -> f32 {
+            match self {
+                Self::Big => f32::from_be_bytes(b),
+                Self::Little => f32::from_le_bytes(b),
+            }
+        }
+        fn f64(self, b: [u8; 8]) -> f64 {
+            match self {
+                Self::Big => f64::from_be_bytes(b),
+                Self::Little => f64::from_le_bytes(b),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum VariableType {
+        Byte,
+        Int,
+        Long,
+        Float,
+        Double,
+        FixedString(u16),
+        LongString,
+    }
+
+    impl VariableType {
+        fn width(self) -> usize {
+            match self {
+                Self::Byte => 1,
+                Self::Int => 2,
+                Self::Long | Self::Float => 4,
+                Self::Double | Self::LongString => 8,
+                Self::FixedString(len) => usize::from(len),
+            }
+        }
+    }
+
+    fn type_label(t: VariableType) -> &'static str {
+        match t {
+            VariableType::Byte | VariableType::Int | VariableType::Long => "i64",
+            VariableType::Float | VariableType::Double => "f64",
+            VariableType::FixedString(_) | VariableType::LongString => "String",
+        }
+    }
+
+    /// Decodes a variable's on-disk type code. Verified directly against
+    /// the `dta` crate's own `parse_type_code` (`schema_parse.rs`) for
+    /// all three type-code eras dBase-style version forking has produced:
+    /// pre-111 (ASCII-ish single-char codes, string = `0x80 + len`),
+    /// 111-116 (`0xFB`-`0xFF` numeric, 1-244 = string), and 117+
+    /// (`0xFFFA`-`0xFFF6` numeric, `0x8000` = strL, 1-2045 = string).
+    fn parse_type_code(code: u16, release: Release) -> Result<VariableType> {
+        if release.0 >= 117 {
+            Ok(match code {
+                0xFFFA => VariableType::Byte,
+                0xFFF9 => VariableType::Int,
+                0xFFF8 => VariableType::Long,
+                0xFFF7 => VariableType::Float,
+                0xFFF6 => VariableType::Double,
+                0x8000 => VariableType::LongString,
+                1..=2045 => VariableType::FixedString(code),
+                other => bail!("unrecognized Stata variable type code {other:#06x}"),
+            })
+        } else if release.0 >= 111 {
+            Ok(match code {
+                0xFB => VariableType::Byte,
+                0xFC => VariableType::Int,
+                0xFD => VariableType::Long,
+                0xFE => VariableType::Float,
+                0xFF => VariableType::Double,
+                1..=244 => VariableType::FixedString(code),
+                other => bail!("unrecognized Stata variable type code {other:#04x}"),
+            })
+        } else {
+            Ok(match code {
+                0x62 if release.0 >= 103 => VariableType::Byte, // 'b'
+                0x69 => VariableType::Int,                      // 'i'
+                0x6C => VariableType::Long,                     // 'l'
+                0x66 => VariableType::Float,                    // 'f'
+                0x64 => VariableType::Double,                   // 'd'
+                0x80..=0xCF => VariableType::FixedString(code - 0x7F),
+                other => bail!("unrecognized Stata variable type code {other:#04x}"),
+            })
+        }
+    }
+
+    /// WHATWG windows-1252's upper 128 code points (0x80-0xFF), verified
+    /// directly against `encoding_rs`'s own `data.rs` table rather than
+    /// assumed - notably, the five bytes with no real windows-1252
+    /// assignment (0x81/0x8D/0x8F/0x90/0x9D) map to their own C1-control
+    /// code point rather than erroring or falling back to a replacement
+    /// character, per the WHATWG encoding standard `encoding_rs`
+    /// implements - confirmed independently against Python's own `cp1252`
+    /// codec's *assigned* mappings for the other 123 bytes before trusting
+    /// this table. Pre-V118 Stata files default to this encoding; unlike
+    /// dBase's ~20 named legacy codepages (see that reader's own hand-roll
+    /// entry in CLAUDE.md), Stata only ever needs this one, so there's no
+    /// equivalent "unsupported codepage" boundary to draw here at all -
+    /// every pre-118 file's text is fully decodable.
+    const WINDOWS_1252_HIGH: [u16; 128] = [
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+        0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178, 0x00A0,
+        0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9, 0x00AA, 0x00AB,
+        0x00AC, 0x00AD, 0x00AE, 0x00AF, 0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6,
+        0x00B7, 0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF, 0x00C0, 0x00C1,
+        0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7, 0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC,
+        0x00CD, 0x00CE, 0x00CF, 0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+        0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF, 0x00E0, 0x00E1, 0x00E2,
+        0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7, 0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED,
+        0x00EE, 0x00EF, 0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7, 0x00F8,
+        0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF,
+    ];
+
+    fn decode_windows_1252(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|&b| {
+                if b < 0x80 {
+                    char::from(b)
+                } else {
+                    char::from_u32(u32::from(WINDOWS_1252_HIGH[usize::from(b) - 0x80]))
+                        .unwrap_or('\u{FFFD}')
+                }
+            })
+            .collect()
+    }
+
+    /// Finds the first NUL byte (Stata pads fixed-width string slots with
+    /// zero bytes, not spaces the way dBase does), or the buffer's full
+    /// length if there is none.
+    fn find_null(bytes: &[u8]) -> usize {
+        bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())
+    }
+
+    /// Decodes a NUL-terminated string slot. UTF-8 (V118+) is strict -
+    /// invalid bytes are a hard error, matching `encoding_rs`'s own
+    /// `decode_without_bom_handling_and_without_replacement` for UTF-8,
+    /// verified directly against the `dta` crate's own
+    /// `decode_null_terminated`. Windows-1252 (pre-V118) never fails,
+    /// per `decode_windows_1252`'s own doc comment above.
+    fn decode_text(bytes: &[u8], utf8: bool) -> Result<String> {
+        let content = &bytes[..find_null(bytes)];
+        if utf8 {
+            std::str::from_utf8(content)
+                .map(str::to_string)
+                .context("Stata string field is not valid UTF-8")
+        } else {
+            Ok(decode_windows_1252(content))
+        }
+    }
+
+    struct R {
+        inner: BufReader<File>,
+    }
+
+    impl R {
+        fn read_exact_buf(&mut self, n: usize) -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; n];
+            self.inner
+                .read_exact(&mut buf)
+                .with_context(|| format!("failed reading {n} byte(s) from a Stata .dta file"))?;
+            Ok(buf)
+        }
+        fn read_u8(&mut self) -> Result<u8> {
+            Ok(self.read_exact_buf(1)?[0])
+        }
+        fn read_u16(&mut self, bo: ByteOrder) -> Result<u16> {
+            let b = self.read_exact_buf(2)?;
+            Ok(bo.u16([b[0], b[1]]))
+        }
+        fn read_u32(&mut self, bo: ByteOrder) -> Result<u32> {
+            let b = self.read_exact_buf(4)?;
+            Ok(bo.u32([b[0], b[1], b[2], b[3]]))
+        }
+        fn read_u64(&mut self, bo: ByteOrder) -> Result<u64> {
+            let b = self.read_exact_buf(8)?;
+            Ok(bo.u64([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        }
+        /// Skips `n` bytes via a seek, not a discard-buffer read - the
+        /// characteristics section's own length field is untrusted input
+        /// (see `MAX_VARIABLES`'s own doc comment for the same class of
+        /// concern), and seeking costs nothing regardless of how large
+        /// `n` claims to be, unlike allocating and filling a buffer would.
+        fn skip(&mut self, n: u64) -> Result<()> {
+            self.inner
+                .seek(SeekFrom::Current(i64::try_from(n).unwrap_or(i64::MAX)))
+                .with_context(|| format!("failed skipping {n} byte(s) in a Stata .dta file"))?;
+            Ok(())
+        }
+        fn expect_bytes(&mut self, expected: &[u8]) -> Result<()> {
+            let actual = self.read_exact_buf(expected.len())?;
+            if actual != expected {
+                bail!(
+                    "expected {:?} in Stata .dta file, found {:?}",
+                    String::from_utf8_lossy(expected),
+                    String::from_utf8_lossy(&actual)
+                );
+            }
+            Ok(())
+        }
+    }
+
+    struct Preamble {
+        release: Release,
+        byte_order: ByteOrder,
+        variable_count: u32,
+        observation_count: u64,
+    }
+
+    /// Reads the file header - either the binary fixed-layout form
+    /// (102-116) or the XML-tagged form (117+) - and returns just what
+    /// this reader needs downstream (dataset label and timestamp are
+    /// read/skipped but never surfaced, matching this reader's existing
+    /// documented choice not to expose Stata's own metadata fields).
+    /// Verified field-by-field against the `dta` crate's own
+    /// `header_reader.rs`.
+    fn read_header(r: &mut R) -> Result<Preamble> {
+        let first = r.read_u8()?;
+        if first == b'<' {
+            r.expect_bytes(b"stata_dta><header><release>")?;
+            let release_bytes = r.read_exact_buf(3)?;
+            let release = parse_ascii_release(&release_bytes)?;
+            if !release.is_xml_like() {
+                bail!("Stata release {} appeared inside an XML header", release.0);
+            }
+            r.expect_bytes(b"</release><byteorder>")?;
+            let tag = r.read_exact_buf(3)?;
+            let byte_order = match &tag[..] {
+                b"MSF" => ByteOrder::Big,
+                b"LSF" => ByteOrder::Little,
+                other => bail!(
+                    "invalid Stata byte-order tag {:?}",
+                    String::from_utf8_lossy(other)
+                ),
+            };
+            r.expect_bytes(b"</byteorder><K>")?;
+            let variable_count = if release.supports_extended_variable_count() {
+                r.read_u32(byte_order)?
+            } else {
+                u32::from(r.read_u16(byte_order)?)
+            };
+            r.expect_bytes(b"</K><N>")?;
+            let observation_count = if release.supports_extended_observation_count() {
+                r.read_u64(byte_order)?
+            } else {
+                u64::from(r.read_u32(byte_order)?)
+            };
+            r.expect_bytes(b"</N><label>")?;
+            let label_len = if release.supports_extended_dataset_label() {
+                usize::from(r.read_u16(byte_order)?)
+            } else {
+                usize::from(r.read_u8()?)
+            };
+            r.skip(label_len as u64)?;
+            r.expect_bytes(b"</label><timestamp>")?;
+            let timestamp_len = usize::from(r.read_u8()?);
+            r.skip(timestamp_len as u64)?;
+            r.expect_bytes(b"</timestamp></header>")?;
+            Ok(Preamble {
+                release,
+                byte_order,
+                variable_count,
+                observation_count,
+            })
+        } else {
+            let release = Release(first);
+            if release.is_xml_like() || !(102..=116).contains(&first) {
+                bail!("unrecognized Stata .dta release byte {first:#04x}");
+            }
+            let byte_order_byte = r.read_u8()?;
+            let byte_order = match (byte_order_byte, first) {
+                (0x00, 102) => ByteOrder::Little,
+                (0x01, _) => ByteOrder::Big,
+                (0x02, _) => ByteOrder::Little,
+                _ => bail!("invalid Stata byte-order byte {byte_order_byte:#04x}"),
+            };
+            r.read_exact_buf(2)?; // filetype (always 0x01) + unused padding
+            let variable_count = u32::from(r.read_u16(byte_order)?);
+            let observation_count = if release.supports_extended_binary_observation_count() {
+                u64::from(r.read_u32(byte_order)?)
+            } else {
+                u64::from(r.read_u16(byte_order)?)
+            };
+            r.skip(release.dataset_label_len() as u64)?;
+            if let Some(len) = release.timestamp_len() {
+                r.skip(len as u64)?;
+            }
+            Ok(Preamble {
+                release,
+                byte_order,
+                variable_count,
+                observation_count,
+            })
+        }
+    }
+
+    fn parse_ascii_release(bytes: &[u8]) -> Result<Release> {
+        if bytes.len() != 3 || !bytes.iter().all(u8::is_ascii_digit) {
+            bail!(
+                "invalid Stata XML release number {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        let n = u32::from(bytes[0] - b'0') * 100
+            + u32::from(bytes[1] - b'0') * 10
+            + u32::from(bytes[2] - b'0');
+        let n = u8::try_from(n).with_context(|| format!("Stata release {n} out of range"))?;
+        if !(102..=119).contains(&n) {
+            bail!("unsupported Stata release {n} (expected 102-119)");
+        }
+        Ok(Release(n))
+    }
+
+    /// Reads the schema (variable types, names, sort list, formats,
+    /// value-label names, variable labels), returning just the types and
+    /// names this reader actually surfaces - every other subsection is
+    /// still read from the stream (its byte width is release-dependent,
+    /// so it can't just be skipped as one opaque blob) but its content is
+    /// discarded. Verified field-by-field against the `dta` crate's own
+    /// `schema_reader.rs`, including the XML-only 14-`u64` `<map>` section
+    /// this reader skips wholesale (`into_record_reader`'s own sequential
+    /// path - the one this project's usage takes - never actually
+    /// consults those offsets, only `seek_records`'s alternative
+    /// direct-seek path would).
+    fn read_schema(r: &mut R, preamble: &Preamble) -> Result<(Vec<VariableType>, Vec<String>)> {
+        let release = preamble.release;
+        let bo = preamble.byte_order;
+        let xml = release.is_xml_like();
+        let n = usize::try_from(preamble.variable_count)
+            .ok()
+            .filter(|_| preamble.variable_count <= MAX_VARIABLES)
+            .with_context(|| {
+                format!(
+                    "Stata variable count {} is out of a sane range",
+                    preamble.variable_count
+                )
+            })?;
+
+        if xml {
+            r.expect_bytes(b"<map>")?;
+            r.skip(14 * 8)?;
+            r.expect_bytes(b"</map>")?;
+        }
+
+        if xml {
+            r.expect_bytes(b"<variable_types>")?;
+        }
+        let entry_len = release.type_list_entry_len();
+        let type_bytes = r.read_exact_buf(n * entry_len)?;
+        let mut variable_types = Vec::with_capacity(n);
+        for i in 0..n {
+            let code = if entry_len == 2 {
+                bo.u16([type_bytes[i * 2], type_bytes[i * 2 + 1]])
+            } else {
+                u16::from(type_bytes[i])
+            };
+            variable_types.push(parse_type_code(code, release)?);
+        }
+        if xml {
+            r.expect_bytes(b"</variable_types>")?;
+        }
+
+        let utf8 = release.default_encoding_is_utf8();
+        let variable_names = read_fixed_string_array(
+            r,
+            n,
+            release.variable_name_len(),
+            xml,
+            b"<varnames>",
+            b"</varnames>",
+            utf8,
+        )?;
+
+        // Sort list: (n + 1) entries, zero-terminated by convention, but
+        // the on-disk size is fixed regardless of where a zero appears -
+        // this reader never uses sort order, so the whole section is just
+        // skipped by byte count.
+        if xml {
+            r.expect_bytes(b"<sortlist>")?;
+        }
+        r.skip(((n + 1) * release.sort_entry_len()) as u64)?;
+        if xml {
+            r.expect_bytes(b"</sortlist>")?;
+        }
+
+        skip_fixed_string_array(
+            r,
+            n,
+            release.format_entry_len(),
+            xml,
+            b"<formats>",
+            b"</formats>",
+        )?;
+        skip_fixed_string_array(
+            r,
+            n,
+            release.variable_name_len(),
+            xml,
+            b"<value_label_names>",
+            b"</value_label_names>",
+        )?;
+        skip_fixed_string_array(
+            r,
+            n,
+            release.variable_label_len(),
+            xml,
+            b"<variable_labels>",
+            b"</variable_labels>",
+        )?;
+
+        Ok((variable_types, variable_names))
+    }
+
+    fn read_fixed_string_array(
+        r: &mut R,
+        count: usize,
+        entry_len: usize,
+        xml: bool,
+        open: &[u8],
+        close: &[u8],
+        utf8: bool,
+    ) -> Result<Vec<String>> {
+        if xml {
+            r.expect_bytes(open)?;
+        }
+        let buf = r.read_exact_buf(count * entry_len)?;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            out.push(decode_text(&buf[i * entry_len..(i + 1) * entry_len], utf8)?);
+        }
+        if xml {
+            r.expect_bytes(close)?;
+        }
+        Ok(out)
+    }
+
+    fn skip_fixed_string_array(
+        r: &mut R,
+        count: usize,
+        entry_len: usize,
+        xml: bool,
+        open: &[u8],
+        close: &[u8],
+    ) -> Result<()> {
+        if xml {
+            r.expect_bytes(open)?;
+        }
+        r.skip((count * entry_len) as u64)?;
+        if xml {
+            r.expect_bytes(close)?;
+        }
+        Ok(())
+    }
+
+    /// Skips the characteristics section (binary "expansion fields", or
+    /// XML's `<characteristics>...</characteristics>`) without parsing
+    /// individual entries - this reader never surfaces characteristics,
+    /// the same disclosed non-surfacing choice as variable/value labels.
+    /// Verified against the `dta` crate's own `characteristic_reader.rs`:
+    /// binary format's entries are a simple `(type_byte, length)` header
+    /// repeated until `type_byte == 0`, with *every* non-zero type
+    /// (a real characteristic or an unrecognized future one) skipped the
+    /// same way - the crate's own forward-compatibility rule, replicated
+    /// here exactly rather than only handling the one type this reader
+    /// happens to know about.
+    fn skip_characteristics(r: &mut R, release: Release, bo: ByteOrder) -> Result<()> {
+        if release.is_xml_like() {
+            r.expect_bytes(b"<cha")?;
+            r.expect_bytes(b"racteristics>")?;
+            loop {
+                let head = r.read_exact_buf(4)?;
+                match &head[..] {
+                    b"<ch>" => {
+                        let len = r.read_u32(bo)?;
+                        r.skip(u64::from(len))?;
+                        r.expect_bytes(b"</ch>")?;
+                    }
+                    b"</ch" => {
+                        r.expect_bytes(b"aracteristics>")?;
+                        return Ok(());
+                    }
+                    other => bail!(
+                        "unexpected tag {:?} in Stata characteristics section",
+                        String::from_utf8_lossy(other)
+                    ),
+                }
+            }
+        } else {
+            let Some(extended) = release.supports_extended_expansion() else {
+                return Ok(()); // V102-104: no expansion-fields section at all
+            };
+            loop {
+                let data_type = r.read_u8()?;
+                let length = if extended {
+                    r.read_u32(bo)?
+                } else {
+                    u32::from(r.read_u16(bo)?)
+                };
+                if data_type == 0 {
+                    return Ok(());
+                }
+                r.skip(u64::from(length))?;
+            }
+        }
+    }
+
+    /// Decodes one column's raw bytes into its string representation (or
+    /// `None` for a missing value), applying the exact per-release,
+    /// per-type missing-value sentinel rules verified against the `dta`
+    /// crate's own `stata_byte.rs`/`stata_int.rs`/`stata_long.rs`/
+    /// `stata_float.rs`/`stata_double.rs` - see those files' own module
+    /// docs (and `missing_value.rs`'s summary table) for the exact bit
+    /// patterns. This reader only needs *whether* a value is missing, not
+    /// *which* of the 27 missing codes it is (this project's own
+    /// `raw_values` already treats every missing value identically), so
+    /// it never constructs the crate's own 27-variant `MissingValue` enum
+    /// at all.
+    fn decode_value(
+        bytes: &[u8],
+        vt: VariableType,
+        release: Release,
+        bo: ByteOrder,
+        utf8: bool,
+    ) -> Result<Option<String>> {
+        Ok(match vt {
+            VariableType::Byte => {
+                let raw = bytes[0];
+                let signed = raw.cast_signed();
+                let missing = if release.supports_tagged_missing() {
+                    signed > 100
+                } else {
+                    raw == 0x7F
+                };
+                if missing {
+                    None
+                } else {
+                    Some(signed.to_string())
+                }
+            }
+            VariableType::Int => {
+                let raw = bo.u16([bytes[0], bytes[1]]);
+                let signed = raw.cast_signed();
+                let missing = if release.supports_tagged_missing() {
+                    signed > 32_740
+                } else {
+                    raw == 0x7FFF
+                };
+                if missing {
+                    None
+                } else {
+                    Some(signed.to_string())
+                }
+            }
+            VariableType::Long => {
+                let raw = bo.u32([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let signed = raw.cast_signed();
+                let missing = if release.supports_tagged_missing() {
+                    signed > 2_147_483_620
+                } else {
+                    raw == 0x7FFF_FFFF
+                };
+                if missing {
+                    None
+                } else {
+                    Some(signed.to_string())
+                }
+            }
+            VariableType::Float => {
+                let raw = bo.f32([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let bits = raw.to_bits();
+                let positive = bits & 0x8000_0000 == 0;
+                let missing = if release.supports_tagged_missing() {
+                    positive && bits >= 0x7F00_0000
+                } else {
+                    positive && bits > 0x7EFF_FFFF
+                };
+                if missing { None } else { Some(raw.to_string()) }
+            }
+            VariableType::Double => {
+                let raw = bo.f64([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                let bits = raw.to_bits();
+                let positive = bits & 0x8000_0000_0000_0000 == 0;
+                let missing = if release.supports_tagged_missing() {
+                    positive && bits >= 0x7FE0_0000_0000_0000
+                } else if release.uses_magic_double_missing() && bits == 0x54C0_0000_0000_0000 {
+                    true
+                } else {
+                    positive && bits > 0x7FDF_FFFF_FFFF_FFFF
+                };
+                if missing { None } else { Some(raw.to_string()) }
+            }
+            VariableType::FixedString(_) => {
+                let s = decode_text(bytes, utf8)?;
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            VariableType::LongString => Some("<strL: long string not resolved>".to_string()),
+        })
+    }
+
+    pub(crate) fn columns_from_stata(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = R {
+            inner: BufReader::new(file),
+        };
+
+        let preamble = read_header(&mut r)
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+        let (variable_types, variable_names) = read_schema(&mut r, &preamble)
+            .with_context(|| format!("failed reading the schema of {path:?}"))?;
+        skip_characteristics(&mut r, preamble.release, preamble.byte_order)
+            .with_context(|| format!("failed skipping characteristics in {path:?}"))?;
+
+        if preamble.release.is_xml_like() {
+            r.expect_bytes(b"<data>")
+                .with_context(|| format!("failed reading {path:?}"))?;
+        }
+
+        let row_len: usize = variable_types.iter().map(|t| t.width()).sum();
+        if row_len > MAX_ROW_LEN {
+            bail!("Stata row width {row_len} is out of a sane range");
+        }
+
+        let utf8 = preamble.release.default_encoding_is_utf8();
+        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); variable_types.len()];
+        let mut total = 0usize;
+        for _ in 0..preamble.observation_count {
+            if nrows.is_some_and(|limit| total >= limit) {
+                break;
+            }
+            let row = r
+                .read_exact_buf(row_len)
+                .with_context(|| format!("failed reading a record from {path:?}"))?;
+            let mut offset = 0;
+            for (col_idx, vt) in variable_types.iter().enumerate() {
+                let width = vt.width();
+                let field_bytes = &row[offset..offset + width];
+                offset += width;
+                let value = decode_value(
+                    field_bytes,
+                    *vt,
+                    preamble.release,
+                    preamble.byte_order,
+                    utf8,
+                )
+                .with_context(|| format!("failed decoding a record from {path:?}"))?;
+                raw[col_idx].push(value);
+            }
+            total += 1;
+        }
+
+        let mut columns = Vec::new();
+        for ((name, vt), values) in variable_names.into_iter().zip(variable_types).zip(raw) {
+            let non_null: Vec<String> = values.into_iter().flatten().collect();
+            columns.push(profile_column(
+                ColumnInput {
+                    name,
+                    current_type: type_label(vt).to_string(),
+                    raw_values: non_null,
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            ));
+        }
+        Ok(columns)
+    }
+} // mod stata_support
 
 #[cfg(feature = "stata")]
 fn columns_from_stata(
@@ -3763,59 +4562,7 @@ fn columns_from_stata(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use dta::stata::dta::dta_reader::DtaReader;
-
-    let mut characteristic_reader = DtaReader::new()
-        .from_path(path)
-        .with_context(|| format!("failed to open {path:?}"))?
-        .read_header()
-        .with_context(|| format!("failed to read the header of {path:?}"))?
-        .read_schema()
-        .with_context(|| format!("failed to read the schema of {path:?}"))?;
-    characteristic_reader
-        .skip_to_end()
-        .with_context(|| format!("failed to skip characteristics in {path:?}"))?;
-
-    let mut record_reader = characteristic_reader
-        .into_record_reader()
-        .with_context(|| format!("failed to start reading records from {path:?}"))?;
-    let variables: Vec<(String, &'static str)> = record_reader
-        .schema()
-        .variables()
-        .iter()
-        .map(|v| (v.name().to_string(), stata_type_label(v.variable_type())))
-        .collect();
-
-    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); variables.len()];
-    let mut total = 0usize;
-    while let Some(record) = record_reader
-        .read_record()
-        .with_context(|| format!("failed reading a record from {path:?}"))?
-    {
-        if nrows.is_some_and(|limit| total >= limit) {
-            break;
-        }
-        for (col_idx, value) in record.values().iter().enumerate() {
-            raw[col_idx].push(stata_value_to_string(value));
-        }
-        total += 1;
-    }
-
-    let mut columns = Vec::new();
-    for ((name, current_type), values) in variables.into_iter().zip(raw) {
-        let non_null: Vec<String> = values.into_iter().flatten().collect();
-        columns.push(profile_column(
-            ColumnInput {
-                name,
-                current_type: current_type.to_string(),
-                raw_values: non_null,
-                total,
-                skip_heuristics: false,
-            },
-            n_samples,
-        ));
-    }
-    Ok(columns)
+    stata_support::columns_from_stata(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "stata"))]
@@ -19093,6 +19840,149 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
             let theirs = columns_from_dbase_via_dbase_crate(path, 100)
                 .unwrap_or_else(|e| panic!("{f}: dbase-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Test-only: `dta` is a dev-dependency now (see Cargo.toml and
+    /// CLAUDE.md's Dependency footprint section) - `stata_support`'s own
+    /// hand-rolled reader replaced it at runtime, so this function's only
+    /// remaining job is producing the "expected" side of
+    /// `stata_reader_matches_the_dta_crate_output_exactly`. A near-
+    /// verbatim copy of what `columns_from_stata` used to be before that
+    /// module replaced it.
+    #[cfg(all(test, feature = "stata"))]
+    fn stata_value_to_string_via_dta_crate(v: &dta::stata::dta::value::Value) -> Option<String> {
+        use dta::stata::dta::value::Value;
+        use dta::stata::stata_byte::StataByte;
+        use dta::stata::stata_double::StataDouble;
+        use dta::stata::stata_float::StataFloat;
+        use dta::stata::stata_int::StataInt;
+        use dta::stata::stata_long::StataLong;
+        match v {
+            Value::Byte(StataByte::Present(x)) => Some(x.to_string()),
+            Value::Byte(StataByte::Missing(_)) => None,
+            Value::Int(StataInt::Present(x)) => Some(x.to_string()),
+            Value::Int(StataInt::Missing(_)) => None,
+            Value::Long(StataLong::Present(x)) => Some(x.to_string()),
+            Value::Long(StataLong::Missing(_)) => None,
+            Value::Float(StataFloat::Present(x)) => Some(x.to_string()),
+            Value::Float(StataFloat::Missing(_)) => None,
+            Value::Double(StataDouble::Present(x)) => Some(x.to_string()),
+            Value::Double(StataDouble::Missing(_)) => None,
+            Value::String(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            }
+            Value::LongStringRef(_) => Some("<strL: long string not resolved>".to_string()),
+        }
+    }
+
+    #[cfg(all(test, feature = "stata"))]
+    fn stata_type_label_via_dta_crate(
+        t: dta::stata::dta::variable_type::VariableType,
+    ) -> &'static str {
+        use dta::stata::dta::variable_type::VariableType;
+        match t {
+            VariableType::Byte | VariableType::Int | VariableType::Long => "i64",
+            VariableType::Float | VariableType::Double => "f64",
+            VariableType::FixedString(_) | VariableType::LongString => "String",
+        }
+    }
+
+    #[cfg(all(test, feature = "stata"))]
+    fn columns_from_stata_via_dta_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use dta::stata::dta::dta_reader::DtaReader;
+
+        let mut characteristic_reader = DtaReader::new()
+            .from_path(path)?
+            .read_header()?
+            .read_schema()?;
+        characteristic_reader.skip_to_end()?;
+
+        let mut record_reader = characteristic_reader.into_record_reader()?;
+        let variables: Vec<(String, &'static str)> = record_reader
+            .schema()
+            .variables()
+            .iter()
+            .map(|v| {
+                (
+                    v.name().to_string(),
+                    stata_type_label_via_dta_crate(v.variable_type()),
+                )
+            })
+            .collect();
+
+        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); variables.len()];
+        let mut total = 0usize;
+        while let Some(record) = record_reader.read_record()? {
+            for (col_idx, value) in record.values().iter().enumerate() {
+                raw[col_idx].push(stata_value_to_string_via_dta_crate(value));
+            }
+            total += 1;
+        }
+
+        let mut columns = Vec::new();
+        for ((name, current_type), values) in variables.into_iter().zip(raw) {
+            let non_null: Vec<String> = values.into_iter().flatten().collect();
+            columns.push(profile_column(
+                ColumnInput {
+                    name,
+                    current_type: current_type.to_string(),
+                    raw_values: non_null,
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            ));
+        }
+        Ok(columns)
+    }
+
+    /// Cross-verification oracle for the hand-rolled Stata reader
+    /// (`stata_support` - see Cargo.toml) against the real `dta` crate,
+    /// kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "stata")]
+    #[test]
+    fn stata_reader_matches_the_dta_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.dta",
+            "tests/fixtures/type_detection.dta",
+        ] {
+            let path = Path::new(f);
+            let mine = stata_support::columns_from_stata(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_stata_via_dta_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: dta-crate-based oracle failed: {e:?}"));
 
             assert_eq!(
                 mine.iter().map(|c| &c.name).collect::<Vec<_>>(),

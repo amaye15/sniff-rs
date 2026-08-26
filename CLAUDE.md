@@ -322,10 +322,11 @@ exactly the kind of gap `ideal_type`'s independent re-derivation from the
 actual values exists to surface, the same way CSV's leading-zero check
 does for a different reason.
 
-Stata (`columns_from_stata`, via the `dta` crate) is architecturally the
-same shape again, with its own version of the same lesson: a DTA file
-marks each individual value present-or-missing explicitly (`.` through
-`.z`, decoded by the crate itself), so a `Missing` value is simply omitted
+Stata (`columns_from_stata`, via `stata_support` - a hand-rolled reader
+now, see the Dependency footprint section) is architecturally the same
+shape again, with its own version of the same lesson: a DTA file marks
+each individual value present-or-missing explicitly (`.` through `.z`),
+so a `Missing` value is simply omitted
 from `raw_values` - the same treatment every other reader here already
 gives an absent value - while a genuinely present value keeps going
 through the normal `current_type`/`ideal_type` split (a Stata `double`
@@ -3739,6 +3740,123 @@ this project could just implement directly rather than depend on:
   `malformed_dbase_memo_field.dbf`), the first two additionally verified
   against the real `dbase` crate via the same oracle before being trusted.
 
+- **`dta` → a hand-rolled reader (`stata_support`).** The largest hand-roll
+  in this whole effort by scope, not by algorithmic complexity - Stata's
+  own `.dta` format has been revised 18 times (releases 102-119, the
+  `dta` crate's own documented ReadStat-derived range) across two
+  genuinely different container shapes (a fixed binary layout for
+  102-116, an XML-tagged layout for 117+), with real byte-width changes
+  to variable names, display formats, and variable labels scattered
+  across that history. Verified field-by-field against the `dta` crate's
+  own `release.rs` (every version-dependent field width lives there as
+  one clean comparison table, not scattered through the reader), rather
+  than assumed from a spec summary - this is the same
+  "read the actual crate before implementing" discipline as every other
+  hand-roll in this section, just applied across a much wider version
+  matrix than any format tackled here before.
+
+  Several things worth calling out, each confirmed by reading the crate's
+  own source rather than inferred from the format's reputation:
+    1. **This project's usage never needs 23 of the crate's own 90-plus
+       source files** - `columns_from_stata` only ever reads a header, a
+       schema, and records, never writing, never the separate `.dct`
+       dictionary format, never async I/O, never value labels or
+       characteristics *content* (only their byte *extent*, to skip past
+       them), and never strL *resolution* (just recognizing the reference
+       shape). Scoping to exactly this usage surface - rather than porting
+       the crate wholesale - is what kept an otherwise 18-release format
+       tractable to hand-roll at all.
+    2. **Missing-value detection never needs the crate's own 27-variant
+       `MissingValue` enum.** This project's `raw_values` already treats
+       every missing value identically (`None`, filtered out) regardless
+       of *which* of Stata's 27 missing codes (`.`, `.a`-`.z`) a value
+       carries - so `stata_support` only ever needs a boolean "is this
+       value missing," derived directly from each numeric type's own
+       range/bit-pattern check (verified against the `dta` crate's
+       `stata_byte.rs`/`stata_int.rs`/`stata_long.rs`/`stata_float.rs`/
+       `stata_double.rs`, each carrying its own precise sentinel table).
+       Double's own history is the most intricate of the five: V104/V105
+       used the exact bit pattern `0x54C0_0000_0000_0000` (2^333) as system
+       missing - a value that falls *inside* the normal valid `f64` range,
+       so it must be matched exactly rather than range-checked - while
+       V106-112 switched to "any positive value above pandas' own
+       `OLD_VALID_RANGE` maximum," and 113+ moved to reserved NaN bit
+       patterns. All three eras are handled, not just the modern one.
+    3. **A DTA `DateTime` field's on-disk value is a Julian Day Number
+       plus a milliseconds-since-midnight word - the same underlying
+       problem this project's dBase hand-roll already solved, and the
+       same fix applies again**: JDN 2,440,588 is 1970-01-01, so
+       subtracting that constant and reusing `civil_from_days` sidesteps
+       porting the crate's own separate Julian-day arithmetic a second
+       time in the same session.
+    4. **Pre-118 files decode text as Windows-1252, and - unlike dBase's
+       ~20 named legacy codepages, which needed a disclosed
+       "unsupported" boundary - this needed no equivalent gap at all.**
+       Stata only ever has this one legacy single-byte encoding to
+       support (verified directly against `encoding_rs`'s own `data.rs`
+       table, the same crate the `dta` dependency itself already used for
+       this), so `stata_support` embeds that exact 128-entry table
+       instead. The one genuinely non-obvious detail, also confirmed
+       against the source rather than assumed: five bytes with no real
+       windows-1252 assignment (`0x81`/`0x8D`/`0x8F`/`0x90`/`0x9D`) map to
+       their own C1-control code point under the WHATWG encoding standard
+       `encoding_rs` implements, rather than erroring or falling back to a
+       replacement character the way Python's stricter `cp1252` codec
+       does - cross-checked against Python's `cp1252` for the other 123
+       bytes' *assigned* mappings before trusting the five-byte
+       divergence as real rather than a transcription error.
+    5. **A DoS-safety guard genuinely new to this hand-roll, not present
+       in the crate it replaces**: unlike dBase's field count (inherently
+       bounded by a `u16` header offset) or CBOR/MessagePack's per-value
+       length prefixes (already guarded by this project's own established
+       `PREALLOC_MAX` pattern), Stata's V119 variable count is a real,
+       unbounded `u32` with nothing in the file format itself capping it -
+       a corrupted or adversarial header could claim millions of
+       variables and force a huge upfront allocation before a single byte
+       of real schema data is read. `MAX_VARIABLES` (1,000,000, far above
+       any real Stata file's variable count) and `MAX_ROW_LEN` (100 MB,
+       guarding against that many maximum-width string variables even
+       under the first cap) are checked before any buffer sized from
+       either value is allocated - the same class of guard this project
+       has now added independently to three different hand-rolled binary
+       readers for the same underlying reason.
+    6. **Skipping the characteristics section replicates the crate's own
+       forward-compatibility rule exactly, not just the one entry type
+       this reader knows about**: a binary-format expansion field's type
+       byte can be `0` (terminator), `1` (a real characteristic), or -
+       per the format's own documented allowance for future extension -
+       anything else, and all three of the non-zero-terminator cases are
+       skipped identically by byte count. Confirmed directly against the
+       `dta` crate's own `characteristic_reader.rs`, which draws exactly
+       this "any unrecognized type is safe to skip" boundary rather than
+       treating an unknown type as a format violation.
+
+  Verified two ways: **(1)**
+  `stata_reader_matches_the_dta_crate_output_exactly` cross-checks this
+  reader against the real `dta` crate (kept as a dev-only oracle, the
+  same treatment every other replaced crate in this section already
+  gets) on this project's existing fixtures - `sample.dta` (release 118,
+  XML) and `type_detection.dta` (release 114, binary), the same two
+  container shapes this format actually has. **(2)** transiently and not
+  committed (matching this project's usual real-world-corpus practice),
+  against six real files spanning four format releases and both
+  container shapes: the same three official Stata-press teaching
+  datasets this project's own prior real-world validation pass already
+  used (`auto.dta`, `census.dta`, `nlswork.dta` - re-fetched fresh from
+  Stata 18's current data page, landing on releases 118/117/118
+  respectively, not necessarily the exact releases that earlier pass
+  saw), plus three older exports of the same `auto.dta` teaching dataset
+  pulled from Stata-press's own archived per-version data pages
+  specifically to reach the *binary* container (releases 8/9's export is
+  release 113, release 10-12's is 114, release 13's is already
+  XML/117) - closing a real gap the three modern files alone would have
+  left (all XML). Every one of the six matched the `dta` crate's own
+  output exactly, including `nlswork.dta`'s ~28,000 rows. A 600-iteration
+  bit-flip fuzz pass (300 each against a real binary-format and a real
+  XML-format file) produced zero panics and zero hangs. No fix was
+  needed anywhere in this pass - the cleanest real-world result of any
+  hand-roll in this effort alongside TOML's own equally clean pass.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3748,8 +3866,8 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, and now `dbase` all
-still were, however real their own risk.
+`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, `dbase`, and now `dta`
+all still were, however real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/
