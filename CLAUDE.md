@@ -308,12 +308,13 @@ a headerless CSV: 1D is a single `value` column, 2D gets positional
 handled), and anything higher-dimensional is a clear error rather than a
 guessed flattening.
 
-dBase is a more conventional flat reader (`columns_from_dbase`), but with
-one thing worth calling out: column order comes from `Reader::fields()`
-(the file's own field table) rather than iterating `Record`'s internal
-`HashMap`, whose order isn't guaranteed stable. Soft-deleted records
-(dBase's own "marked for deletion" flag) are skipped by the `dbase` crate
-itself before this code ever sees them - that's the format's own
+dBase is a more conventional flat reader (`columns_from_dbase`, via
+`dbase_support` - a hand-rolled reader now, see the Dependency footprint
+section), but with one thing worth calling out: column order comes from
+the file's own field descriptor table (in file order) rather than a
+HashMap's iteration order, which isn't guaranteed stable. Soft-deleted
+records (dBase's own "marked for deletion" flag) are skipped before this
+project's own heuristics ever see them - that's the format's own
 convention, not something this tool is choosing to hide. Its `Numeric`
 field type doesn't distinguish int from float at the storage level, so
 `current_type` reports the same `f64` for every numeric field regardless -
@@ -3650,6 +3651,94 @@ this project could just implement directly rather than depend on:
   separately zero panics/hangs confirmed via the compiled binary directly
   on the same corpus.
 
+- **`dbase` → a hand-rolled reader (`dbase_support`).** Unlike every other
+  crate declined in this project's own "No DuckDB"/"No SPSS" reasoning
+  below, dBase's own on-disk format turned out genuinely simple to hand-
+  roll once actually read rather than assumed complex by association with
+  "a database format": a fixed 32-byte header, a fixed 32-byte-per-field
+  descriptor table (count derived arithmetically from the header's own
+  declared offset to the first record, not a scan for the conventional
+  `0x0D` terminator byte - which is read but, matching the `dbase` crate's
+  own explicit choice, never actually checked against that value), and
+  fixed-length ASCII/binary records with a single leading deletion-flag
+  byte. Verified field-by-field against the `dbase` crate's own
+  `header.rs`/`field/mod.rs`/`field/types.rs`/`reading.rs`/`file.rs`
+  rather than assumed from a spec summary - this surfaced several
+  behaviors worth calling out because they're easy to get wrong by
+  reasoning from "how would I design this" instead of reading the actual
+  crate:
+    1. **The record's real on-disk size is recomputed from the field
+       table's own summed lengths, and the header's own separately-stored
+       record-length field is read but never trusted** - confirmed
+       directly in `open_dbase`'s own comment ("Some files seem not to
+       include the DELETION_FLAG_SIZE into the record size, but we rely on
+       it"). This reader does the same recomputation, not a shortcut that
+       happened to look equivalent.
+    2. **A DateTime field's on-disk representation is a Julian Day Number
+       plus a milliseconds-since-midnight word, not this project's own
+       Unix-epoch-day convention** - but the two are related by exactly
+       one fixed, well-known constant (JDN 2,440,588 is 1970-01-01 itself,
+       confirmed directly against the `dbase` crate's own
+       `Date::to_unix_days`), so `dbase_support` reuses this project's
+       already-verified `civil_from_days` after one subtraction, rather
+       than re-deriving the crate's own separate Julian-day arithmetic
+       (Howard Hinnant's algorithm proving out again, the same way it
+       already did for Excel's 1900-epoch date serials).
+    3. **Text decoding is genuinely limited in the exact same way the
+       `dbase` crate's own *default* build already is, not a new gap this
+       hand-roll introduces.** A dBase file's header carries a code-page
+       marker byte; correctly decoding any of the ~20 *named* legacy
+       single-byte code pages (CP437, CP1252, CP932, ...) needs a real
+       per-codepage byte-to-codepoint table, which the `dbase` crate only
+       provides behind two *optional* features (`yore`/`encoding_rs`) -
+       and this project's own prior `Cargo.toml` entry for the crate never
+       enabled either. Confirmed directly in `CodePageMark::to_encoding`
+       (`header.rs`): without those features, every named code page
+       resolves to `None`, and `open_dbase` hard-errors with
+       `UnsupportedCodePage` before a single record is ever read - only
+       the UTF-8 marker (strict) and the undefined/unrecognized-byte case
+       (lossy) ever actually worked. `dbase_support` reproduces this exact
+       boundary rather than "fixing" it into a bigger hand-roll than
+       verification could support - a real, disclosed limitation
+       inherited faithfully, not silently narrowed further or quietly
+       widened without the codepage tables to back it up.
+    4. **Memo fields (external `.dbt`/`.fpt` files) are a disclosed,
+       clear error** rather than an attempt at a second binary format
+       this project has no committed fixture to verify against - the same
+       "no fixture, no trust" boundary already drawn for SAS7BDAT and
+       old-style BIFF2-5 `.xls`.
+    5. **`trim_field_data`'s one real quirk was worth preserving exactly,
+       not smoothing over**: its leading/trailing-space scan stops dead at
+       the *first* NUL byte encountered anywhere in a field (not just a
+       trailing one), so content after an embedded NUL is silently
+       excluded - confirmed directly in the crate's own implementation,
+       including the fact that only the `BeginEnd` trim variant (the
+       crate's own default, and the only one this project's code ever
+       uses) actually needs implementing.
+
+  Verified two ways: **(1)**
+  `dbase_reader_matches_the_dbase_crate_output_exactly` cross-checks this
+  reader against the real `dbase` crate (kept as a dev-only oracle, the
+  same treatment every other replaced crate in this section already gets)
+  on this project's existing fixtures. **(2)** transiently and not
+  committed (matching this project's usual real-world-corpus practice,
+  re-fetched fresh rather than assumed unchanged), against the same real
+  US Census Bureau TIGER/Line shapefile's `.dbf` component this project's
+  own prior real-world validation pass already used (see the "eleventh
+  pass" entry above) - 56 real state/territory records, zero panics,
+  matching the `dbase` crate's output exactly via the same oracle test,
+  and reproducing the identical FIPS-leading-zero and declared-`f64`-but-
+  really-`i64` land/water-area findings that prior pass already
+  documented. A 500-iteration bit-flip fuzz pass against that same real
+  file produced zero panics and zero hangs. Four scenarios this project's
+  existing fixtures never exercised - a soft-deleted record, genuine
+  multi-byte UTF-8 field content, a named-code-page file (a disclosed
+  error), and a Memo-field file (also a disclosed error) - are now
+  permanent fixtures/tests (`edge_dbase_deleted_records.dbf`,
+  `edge_dbase_unicode.dbf`, `malformed_dbase_unsupported_codepage.dbf`,
+  `malformed_dbase_memo_field.dbf`), the first two additionally verified
+  against the real `dbase` crate via the same oracle before being trusted.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3659,8 +3748,8 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, and now `regex` all still were,
-however real their own risk.
+`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, and now `dbase` all
+still were, however real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/

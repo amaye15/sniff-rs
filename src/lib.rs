@@ -3177,49 +3177,511 @@ fn columns_from_syslog(
 
 // --- dBase reader (opt-in via --features dbase) ---
 // A soft-deleted record (dBase's own "marked for deletion" flag) is skipped
-// by the crate itself before this code ever sees it - the same convention
-// dBase and every tool built on it already treats as "logically absent",
-// not something this tool is choosing to hide. Column order comes from
-// Reader::fields() (the file's own field table) rather than from Record's
-// internal HashMap, whose iteration order isn't guaranteed to be stable.
+// by this reader before any of this project's own heuristics ever see it -
+// the same convention dBase and every tool built on it already treats as
+// "logically absent", not something this tool is choosing to hide. Column
+// order comes from the file's own field descriptor table (in file order)
+// rather than a HashMap's iteration order, which isn't guaranteed stable.
+// The reader itself (`dbase_support`) is hand-rolled - see CLAUDE.md's
+// Dependency footprint section for why and how it was verified.
 
 #[cfg(feature = "dbase")]
-fn dbase_field_type_label(t: dbase::FieldType) -> &'static str {
-    match t {
-        dbase::FieldType::Character | dbase::FieldType::Memo => "String",
-        dbase::FieldType::Numeric
-        | dbase::FieldType::Float
-        | dbase::FieldType::Double
-        | dbase::FieldType::Currency => "f64",
-        dbase::FieldType::Integer => "i64",
-        dbase::FieldType::Logical => "bool",
-        dbase::FieldType::Date => "Date",
-        dbase::FieldType::DateTime => "Timestamp",
-    }
-}
+mod dbase_support {
+    use super::*;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{BufReader, Read, Seek, SeekFrom};
 
-#[cfg(feature = "dbase")]
-fn dbase_value_to_string(v: &dbase::FieldValue) -> Option<String> {
-    use dbase::FieldValue;
-    match v {
-        FieldValue::Character(s) => s.clone(),
-        FieldValue::Numeric(n) => n.map(|x| x.to_string()),
-        FieldValue::Logical(b) => b.map(|x| x.to_string()),
-        FieldValue::Date(d) => d.map(|x| x.to_string()),
-        FieldValue::Float(f) => f.map(|x| x.to_string()),
-        FieldValue::Integer(i) => Some(i.to_string()),
-        FieldValue::Currency(c) => Some(c.to_string()),
-        FieldValue::DateTime(dt) => Some(format!(
-            "{} {:02}:{:02}:{:02}",
-            dt.date(),
-            dt.time().hours(),
-            dt.time().minutes(),
-            dt.time().seconds()
-        )),
-        FieldValue::Double(d) => Some(d.to_string()),
-        FieldValue::Memo(s) => Some(s.clone()),
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FieldType {
+        Character,
+        Date,
+        Float,
+        Numeric,
+        Logical,
+        Currency,
+        DateTime,
+        Integer,
+        Double,
+        Memo,
     }
-}
+
+    impl FieldType {
+        /// Verified directly against the `dbase` crate's own
+        /// `FieldType::from(char)` (`field/types.rs`) rather than assumed -
+        /// any byte outside this set is a hard, open-time error there too
+        /// (`ErrorKind::InvalidFieldType`), not a guess.
+        fn from_byte(b: u8) -> Result<Self> {
+            Ok(match b {
+                b'C' => Self::Character,
+                b'D' => Self::Date,
+                b'F' => Self::Float,
+                b'N' => Self::Numeric,
+                b'L' => Self::Logical,
+                b'Y' => Self::Currency,
+                b'T' => Self::DateTime,
+                b'I' => Self::Integer,
+                b'B' => Self::Double,
+                b'M' => Self::Memo,
+                other => bail!(
+                    "unrecognized dBase field type byte {:?} ({other:#04x})",
+                    other as char
+                ),
+            })
+        }
+    }
+
+    fn field_type_label(t: FieldType) -> &'static str {
+        match t {
+            FieldType::Character | FieldType::Memo => "String",
+            FieldType::Numeric | FieldType::Float | FieldType::Double | FieldType::Currency => {
+                "f64"
+            }
+            FieldType::Integer => "i64",
+            FieldType::Logical => "bool",
+            FieldType::Date => "Date",
+            FieldType::DateTime => "Timestamp",
+        }
+    }
+
+    struct FieldInfo {
+        name: String,
+        field_type: FieldType,
+        field_length: u8,
+    }
+
+    #[derive(Debug, Clone)]
+    enum Value {
+        Character(Option<String>),
+        Numeric(Option<f64>),
+        Logical(Option<bool>),
+        /// (year, month, day)
+        Date(Option<(u32, u32, u32)>),
+        Float(Option<f32>),
+        Integer(i32),
+        Currency(f64),
+        /// (year, month, day), (hour, minute, second)
+        DateTime((u32, u32, u32), (u32, u32, u32)),
+        Double(f64),
+    }
+
+    fn value_to_string(v: &Value) -> Option<String> {
+        match v {
+            Value::Character(s) => s.clone(),
+            Value::Numeric(n) => n.map(|x| x.to_string()),
+            Value::Logical(b) => b.map(|x| x.to_string()),
+            Value::Date(d) => d.map(|(y, m, d)| format!("{y:04}{m:02}{d:02}")),
+            Value::Float(f) => f.map(|x| x.to_string()),
+            Value::Integer(i) => Some(i.to_string()),
+            Value::Currency(c) => Some(c.to_string()),
+            Value::DateTime((y, m, d), (h, mi, s)) => {
+                Some(format!("{y:04}{m:02}{d:02} {h:02}:{mi:02}:{s:02}"))
+            }
+            Value::Double(d) => Some(d.to_string()),
+        }
+    }
+
+    /// Validates a dBase date exactly the way the `dbase` crate's own
+    /// `Date::new` does - used both for the header's own last-update date
+    /// (which the crate validates at *open* time, so a file with an out-
+    /// of-range last-update month/day fails to open at all - the same
+    /// constraint this project's own `sniff_format` dBase content-sniffing
+    /// check already independently relies on) and for every per-field
+    /// `FieldType::Date`/`DateTime` value.
+    fn validate_date(year: u32, month: u32, day: u32) -> Result<()> {
+        if year > 9999 {
+            bail!("dBase date year {year} is out of range (must be <= 9999)");
+        }
+        if !(1..=12).contains(&month) {
+            bail!("dBase date month {month} is out of range (must be 1..=12)");
+        }
+        if !(1..=31).contains(&day) {
+            bail!("dBase date day {day} is out of range (must be 1..=31)");
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum TextMode {
+        StrictUtf8,
+        LossyUtf8,
+    }
+
+    /// Whether a dBase file's text fields decode strictly as UTF-8
+    /// (`CodePageMark::Utf8`, byte `0xf0`) or leniently, replacing invalid
+    /// bytes (`CodePageMark::Undefined`/`Invalid` - byte `0x00` or any
+    /// value this project doesn't otherwise recognize). Any of the ~20
+    /// *named* legacy single-byte codepages (CP437, CP1252, CP932, ...) -
+    /// verified directly against the `dbase` crate's own
+    /// `CodePageMark::from(u8)` table, not guessed - is a disclosed, clear
+    /// error rather than silently misdecoding: correctly decoding those
+    /// needs a real per-codepage byte-to-codepoint table, which neither
+    /// this project nor the `dbase` crate's own *default* build (no
+    /// `yore`/`encoding_rs` feature enabled, exactly matching this
+    /// project's own prior `Cargo.toml` entry for it) actually carries -
+    /// a real, pre-existing limitation of the crate this hand-roll
+    /// replaces, confirmed rather than assumed: `CodePageMark::to_encoding`
+    /// returns `None` for every one of these bytes without those two
+    /// optional crate features, at which point `open_dbase` itself already
+    /// hard-errors with `UnsupportedCodePage` before a single record is
+    /// ever read.
+    fn resolve_text_mode(code_page_mark: u8) -> Result<TextMode> {
+        match code_page_mark {
+            0xf0 => Ok(TextMode::StrictUtf8),
+            0x00 => Ok(TextMode::LossyUtf8),
+            0x01 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0D | 0x0E | 0x0F | 0x10 | 0x11
+            | 0x12 | 0x13 | 0x4D | 0x64 | 0x65 | 0x66 | 0x67 | 0x68 | 0x69 | 0x6A | 0x6B | 0x78
+            | 0x79 | 0x7A | 0x7B | 0x7C | 0x7D | 0x7E | 0xC8 | 0xC9 | 0xCA | 0xCB => {
+                bail!(
+                    "dBase code page marker {code_page_mark:#04x} isn't supported - this reader (like the `dbase` crate's own default build) only reads UTF-8 or undefined/unmarked-codepage dBase files"
+                )
+            }
+            _ => Ok(TextMode::LossyUtf8),
+        }
+    }
+
+    fn decode_text(mode: TextMode, bytes: &[u8]) -> Result<String> {
+        match mode {
+            TextMode::StrictUtf8 => std::str::from_utf8(bytes)
+                .map(str::to_string)
+                .context("dBase field content is not valid UTF-8"),
+            TextMode::LossyUtf8 => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        }
+    }
+
+    /// Trims leading/trailing space (`0x20`) bytes, exactly matching the
+    /// `dbase` crate's own `trim_field_data` - including its one real
+    /// quirk, verified directly against its source rather than assumed:
+    /// the scan for the first/last non-space byte stops dead at the
+    /// *first* NUL byte encountered anywhere in the field (not just a
+    /// trailing one), so content after an embedded NUL is silently
+    /// excluded. This project's own reader only ever needs the crate's
+    /// default `TrimOption::BeginEnd` behavior (this project's code never
+    /// overrides `ReadingOptions::character_trim`), so that's the only
+    /// variant implemented.
+    fn trim_both(bytes: &[u8]) -> &[u8] {
+        let mut first: Option<usize> = None;
+        let mut last = 0usize;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == 0 {
+                break;
+            }
+            if b != b' ' {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        match first {
+            Some(first) => &bytes[first..=last],
+            None => &[],
+        }
+    }
+
+    fn parse_ascii_digits(bytes: &[u8]) -> u32 {
+        bytes
+            .iter()
+            .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'))
+    }
+
+    /// Decomposes a FoxBase/VFP `DateTime`'s time-of-day word (milliseconds
+    /// since midnight, stored as a signed `i32`) into hours/minutes/seconds,
+    /// with the exact same (lenient) range check the `dbase` crate's own
+    /// `Time::new` applies - `<= 24`/`<= 60`/`<= 60`, not the stricter
+    /// `< 24`/`< 60`/`< 60` a real time-of-day would need, since this is
+    /// what the crate being replaced actually does (verified against its
+    /// source, not tightened here for the sake of "correctness" the
+    /// original never had either).
+    fn time_from_word(time_word: i32) -> Result<(u32, u32, u32)> {
+        let hours_i = time_word / 3_600_000;
+        let rem = time_word - hours_i * 3_600_000;
+        let minutes_i = rem / 60_000;
+        let rem = rem - minutes_i * 60_000;
+        let seconds_i = rem / 1_000;
+        let (hours, minutes, seconds) = (hours_i as u32, minutes_i as u32, seconds_i as u32);
+        if hours > 24 {
+            bail!("dBase DateTime hour {hours} is out of range");
+        }
+        if minutes > 60 {
+            bail!("dBase DateTime minute {minutes} is out of range");
+        }
+        if seconds > 60 {
+            bail!("dBase DateTime second {seconds} is out of range");
+        }
+        Ok((hours, minutes, seconds))
+    }
+
+    struct Header {
+        num_records: u32,
+        offset_to_first_record: u16,
+        is_visual_foxpro: bool,
+        code_page_mark: u8,
+    }
+
+    /// Reads the fixed 32-byte dBase header. Verified byte-for-byte
+    /// against the `dbase` crate's own `Header::read_from` (`header.rs`):
+    /// version (1 byte), last-update date (3 bytes: year-since-1900/month/
+    /// day - validated here as `Header::read_from` itself does, so an
+    /// out-of-range month/day fails to open the file at all), record count
+    /// (`u32` LE), offset to first record / header length (`u16` LE),
+    /// record size (`u16` LE, read but - like the crate itself - never
+    /// trusted; the real record size used below is recomputed from the
+    /// field table), 4 reserved/flag bytes, 12 reserved bytes, table flags
+    /// (1 byte), code page mark (1 byte), 2 reserved bytes.
+    fn read_header<R: Read>(r: &mut R) -> Result<Header> {
+        let mut buf = [0u8; 32];
+        r.read_exact(&mut buf)
+            .context("failed reading dBase header")?;
+        let version = buf[0];
+        let year = 1900 + u32::from(buf[1]);
+        let month = u32::from(buf[2]);
+        let day = u32::from(buf[3]);
+        validate_date(year, month, day).context("dBase header's last-update date is invalid")?;
+        let num_records = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let offset_to_first_record = u16::from_le_bytes([buf[8], buf[9]]);
+        let code_page_mark = buf[29];
+        let is_visual_foxpro = matches!(version, 0x30..=0x32);
+        Ok(Header {
+            num_records,
+            offset_to_first_record,
+            is_visual_foxpro,
+            code_page_mark,
+        })
+    }
+
+    /// Reads one fixed 32-byte field descriptor: name (11 bytes, NUL-
+    /// padded/terminated), type (1 byte, ASCII), 4 bytes unused by reading
+    /// (displacement field), length (1 byte), 15 bytes unused by reading
+    /// (decimal places, flags, autoincrement state, reserved). Verified
+    /// against `FieldInfo::read_from`/`FieldInfo::SIZE` in the `dbase`
+    /// crate's `field/mod.rs`.
+    fn read_field_info<R: Read>(r: &mut R, text_mode: TextMode) -> Result<FieldInfo> {
+        let mut buf = [0u8; 32];
+        r.read_exact(&mut buf)
+            .context("failed reading a dBase field descriptor")?;
+        let name_bytes = buf[0..11].split(|&b| b == 0).next().unwrap_or(&[]);
+        let name = decode_text(text_mode, name_bytes)?;
+        let field_type = FieldType::from_byte(buf[11])?;
+        let field_length = buf[16];
+        Ok(FieldInfo {
+            name,
+            field_type,
+            field_length,
+        })
+    }
+
+    fn read_field_value(f: &FieldInfo, bytes: &[u8], text_mode: TextMode) -> Result<Value> {
+        Ok(match f.field_type {
+            FieldType::Logical => {
+                let c = bytes.first().copied().unwrap_or(b' ');
+                match c {
+                    b' ' | b'?' => Value::Logical(None),
+                    b'1' | b'T' | b't' | b'Y' | b'y' => Value::Logical(Some(true)),
+                    b'0' | b'F' | b'f' | b'N' | b'n' => Value::Logical(Some(false)),
+                    _ => Value::Logical(None),
+                }
+            }
+            FieldType::Character => {
+                let trimmed = trim_both(bytes);
+                if trimmed.is_empty() {
+                    Value::Character(None)
+                } else {
+                    Value::Character(Some(decode_text(text_mode, trimmed)?))
+                }
+            }
+            FieldType::Numeric => {
+                let trimmed = trim_both(bytes);
+                if trimmed.is_empty() || trimmed.iter().all(|&c| c == b'*') {
+                    Value::Numeric(None)
+                } else {
+                    let s = decode_text(text_mode, trimmed)?;
+                    Value::Numeric(Some(s.trim().parse::<f64>().with_context(|| {
+                        format!("dBase Numeric field {s:?} isn't a valid number")
+                    })?))
+                }
+            }
+            FieldType::Float => {
+                let trimmed = trim_both(bytes);
+                if trimmed.is_empty() || trimmed.iter().all(|&c| c == b'*') {
+                    Value::Float(None)
+                } else {
+                    let s = decode_text(text_mode, trimmed)?;
+                    Value::Float(Some(s.trim().parse::<f32>().with_context(|| {
+                        format!("dBase Float field {s:?} isn't a valid number")
+                    })?))
+                }
+            }
+            FieldType::Date => {
+                let trimmed = trim_both(bytes);
+                if trimmed.len() < 8 {
+                    Value::Date(None)
+                } else {
+                    let d = &trimmed[..8];
+                    if !d.iter().all(u8::is_ascii_digit) {
+                        bail!(
+                            "dBase Date field isn't 8 ASCII digits: {:?}",
+                            String::from_utf8_lossy(d)
+                        );
+                    }
+                    let year = parse_ascii_digits(&d[0..4]);
+                    let month = parse_ascii_digits(&d[4..6]);
+                    let day = parse_ascii_digits(&d[6..8]);
+                    validate_date(year, month, day)?;
+                    Value::Date(Some((year, month, day)))
+                }
+            }
+            FieldType::Integer => {
+                if bytes.len() < 4 {
+                    bail!("dBase Integer field is too short");
+                }
+                Value::Integer(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
+            FieldType::Double => {
+                if bytes.len() < 8 {
+                    bail!("dBase Double field is too short");
+                }
+                Value::Double(f64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            FieldType::Currency => {
+                if bytes.len() < 8 {
+                    bail!("dBase Currency field is too short");
+                }
+                Value::Currency(f64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            FieldType::DateTime => {
+                if bytes.len() < 8 {
+                    bail!("dBase DateTime field is too short");
+                }
+                let jdn = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                let time_word = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                // The dBase/VFP `DateTime` on-disk representation stores a
+                // Julian Day Number - a different epoch and algorithm from
+                // this project's own `civil_from_days` (days since the
+                // 1970-01-01 Unix epoch), but the two are
+                // related by one fixed, well-known constant: JDN 2440588 is
+                // 1970-01-01 itself (the same constant the `dbase` crate's
+                // own `Date::to_unix_days` uses: `julian_day - 2440588`).
+                // Subtracting it once lets this reuse the project's
+                // already-verified civil-calendar conversion directly
+                // rather than re-deriving the crate's own separate
+                // Julian-day arithmetic from scratch.
+                let unix_days = i64::from(jdn) - 2_440_588;
+                let (y, m, d) = civil_from_days(unix_days);
+                let (h, mi, s) = time_from_word(time_word)?;
+                validate_date(u32::try_from(y).unwrap_or(u32::MAX), m, d)?;
+                Value::DateTime((y as u32, m, d), (h, mi, s))
+            }
+            FieldType::Memo => unreachable!("memo fields are rejected before any record is read"),
+        })
+    }
+
+    pub(crate) fn columns_from_dbase(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = BufReader::new(file);
+
+        let header = read_header(&mut r).with_context(|| format!("failed reading {path:?}"))?;
+        let text_mode = resolve_text_mode(header.code_page_mark)?;
+
+        // Visual FoxPro stores a 263-byte "backlink" (the path to the
+        // database container) right before the field descriptor table -
+        // verified against `open_dbase`'s own `BACKLINK_SIZE` handling.
+        const BACKLINK_SIZE: u16 = 263;
+        let adjusted_offset = if header.is_visual_foxpro {
+            header
+                .offset_to_first_record
+                .checked_sub(BACKLINK_SIZE)
+                .ok_or_else(|| anyhow!("dBase file is invalid (BACKLINK_SIZE too big)"))?
+        } else {
+            header.offset_to_first_record
+        };
+
+        let num_fields = usize::from(adjusted_offset)
+            .checked_sub(32 + 1)
+            .map(|v| v / 32)
+            .ok_or_else(|| {
+                anyhow!("dBase file's offset to first record is before the end of its header")
+            })?;
+
+        let mut fields = Vec::with_capacity(num_fields);
+        for _ in 0..num_fields {
+            fields.push(read_field_info(&mut r, text_mode)?);
+        }
+        if fields.iter().any(|f| f.field_type == FieldType::Memo) {
+            bail!("dBase memo fields (external .dbt/.fpt files) aren't supported by this reader");
+        }
+
+        // The field-table terminator byte is read but - matching the
+        // `dbase` crate's own explicit choice - never checked against its
+        // conventional value (0x0D). The explicit seek right after is what
+        // actually establishes the first record's position, the same
+        // defensive choice `open_dbase` makes rather than trusting the
+        // stream position to already be correct.
+        let mut terminator = [0u8; 1];
+        r.read_exact(&mut terminator)
+            .context("failed reading dBase field-table terminator")?;
+        r.seek(SeekFrom::Start(u64::from(header.offset_to_first_record)))
+            .context("failed seeking to the first dBase record")?;
+
+        // The record's actual on-disk size is recomputed from the field
+        // table's own lengths, not trusted from the header's own
+        // (sometimes inconsistent) declared record size - matching
+        // `open_dbase`'s own `record_size` recomputation exactly.
+        let record_data_len: usize = fields.iter().map(|f| f.field_length as usize).sum();
+
+        let mut records: Vec<HashMap<String, Value>> = Vec::new();
+        let mut deletion_flag = [0u8; 1];
+        let mut record_buf = vec![0u8; record_data_len];
+        for _ in 0..header.num_records {
+            r.read_exact(&mut deletion_flag)
+                .context("failed reading a dBase record's deletion flag")?;
+            if deletion_flag[0] == 0x2A {
+                r.seek(SeekFrom::Current(record_data_len as i64))
+                    .context("failed skipping a deleted dBase record")?;
+                continue;
+            }
+            r.read_exact(&mut record_buf)
+                .context("failed reading a dBase record")?;
+
+            let mut map = HashMap::with_capacity(fields.len());
+            let mut pos = 0usize;
+            for f in &fields {
+                let field_bytes = &record_buf[pos..pos + f.field_length as usize];
+                pos += f.field_length as usize;
+                let value = read_field_value(f, field_bytes, text_mode)?;
+                map.insert(f.name.clone(), value);
+            }
+            records.push(map);
+        }
+        if let Some(n) = nrows {
+            records.truncate(n);
+        }
+        let total = records.len();
+
+        let mut columns = Vec::new();
+        for f in &fields {
+            let raw_values: Vec<String> = records
+                .iter()
+                .filter_map(|r| r.get(&f.name).and_then(value_to_string))
+                .collect();
+            columns.push(profile_column(
+                ColumnInput {
+                    name: f.name.clone(),
+                    current_type: field_type_label(f.field_type).to_string(),
+                    raw_values,
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            ));
+        }
+        Ok(columns)
+    }
+} // mod dbase_support
 
 #[cfg(feature = "dbase")]
 fn columns_from_dbase(
@@ -3227,40 +3689,7 @@ fn columns_from_dbase(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    let mut reader =
-        dbase::Reader::from_path(path).with_context(|| format!("failed to open {path:?}"))?;
-    let fields: Vec<(String, &'static str)> = reader
-        .fields()
-        .iter()
-        .map(|f| (f.name().to_string(), dbase_field_type_label(f.field_type())))
-        .collect();
-
-    let mut records = reader
-        .read()
-        .with_context(|| format!("failed reading records from {path:?}"))?;
-    if let Some(n) = nrows {
-        records.truncate(n);
-    }
-    let total = records.len();
-
-    let mut columns = Vec::new();
-    for (name, current_type) in fields {
-        let raw_values: Vec<String> = records
-            .iter()
-            .filter_map(|r| r.get(&name).and_then(dbase_value_to_string))
-            .collect();
-        columns.push(profile_column(
-            ColumnInput {
-                name,
-                current_type: current_type.to_string(),
-                raw_values,
-                total,
-                skip_heuristics: false,
-            },
-            n_samples,
-        ));
-    }
-    Ok(columns)
+    dbase_support::columns_from_dbase(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "dbase"))]
@@ -18560,6 +18989,132 @@ mod tests {
                     "{f} col '{name}': current_type"
                 );
                 assert_eq!(&m.raw_values, values, "{f} col '{name}': raw values");
+            }
+        }
+    }
+
+    /// Test-only: `dbase` is a dev-dependency now (see Cargo.toml and
+    /// CLAUDE.md's Dependency footprint section) - `dbase_support`'s own
+    /// hand-rolled reader replaced it at runtime, so this function's only
+    /// remaining job is producing the "expected" side of
+    /// `dbase_reader_matches_the_dbase_crate_output_exactly`. A near-
+    /// verbatim copy of what `columns_from_dbase` used to be before that
+    /// module replaced it.
+    #[cfg(all(test, feature = "dbase"))]
+    fn dbase_field_type_label_via_dbase_crate(t: dbase::FieldType) -> &'static str {
+        match t {
+            dbase::FieldType::Character | dbase::FieldType::Memo => "String",
+            dbase::FieldType::Numeric
+            | dbase::FieldType::Float
+            | dbase::FieldType::Double
+            | dbase::FieldType::Currency => "f64",
+            dbase::FieldType::Integer => "i64",
+            dbase::FieldType::Logical => "bool",
+            dbase::FieldType::Date => "Date",
+            dbase::FieldType::DateTime => "Timestamp",
+        }
+    }
+
+    #[cfg(all(test, feature = "dbase"))]
+    fn dbase_value_to_string_via_dbase_crate(v: &dbase::FieldValue) -> Option<String> {
+        use dbase::FieldValue;
+        match v {
+            FieldValue::Character(s) => s.clone(),
+            FieldValue::Numeric(n) => n.map(|x| x.to_string()),
+            FieldValue::Logical(b) => b.map(|x| x.to_string()),
+            FieldValue::Date(d) => d.map(|x| x.to_string()),
+            FieldValue::Float(f) => f.map(|x| x.to_string()),
+            FieldValue::Integer(i) => Some(i.to_string()),
+            FieldValue::Currency(c) => Some(c.to_string()),
+            FieldValue::DateTime(dt) => Some(format!(
+                "{} {:02}:{:02}:{:02}",
+                dt.date(),
+                dt.time().hours(),
+                dt.time().minutes(),
+                dt.time().seconds()
+            )),
+            FieldValue::Double(d) => Some(d.to_string()),
+            FieldValue::Memo(s) => Some(s.clone()),
+        }
+    }
+
+    #[cfg(all(test, feature = "dbase"))]
+    fn columns_from_dbase_via_dbase_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let mut reader = dbase::Reader::from_path(path)?;
+        let fields: Vec<(String, &'static str)> = reader
+            .fields()
+            .iter()
+            .map(|f| {
+                (
+                    f.name().to_string(),
+                    dbase_field_type_label_via_dbase_crate(f.field_type()),
+                )
+            })
+            .collect();
+
+        let records = reader.read()?;
+        let total = records.len();
+
+        let mut columns = Vec::new();
+        for (name, current_type) in fields {
+            let raw_values: Vec<String> = records
+                .iter()
+                .filter_map(|r| r.get(&name).and_then(dbase_value_to_string_via_dbase_crate))
+                .collect();
+            columns.push(profile_column(
+                ColumnInput {
+                    name,
+                    current_type: current_type.to_string(),
+                    raw_values,
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            ));
+        }
+        Ok(columns)
+    }
+
+    /// Cross-verification oracle for the hand-rolled dBase reader
+    /// (`dbase_support` - see Cargo.toml) against the real `dbase` crate,
+    /// kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "dbase")]
+    #[test]
+    fn dbase_reader_matches_the_dbase_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.dbf",
+            "tests/fixtures/type_detection.dbf",
+        ] {
+            let path = Path::new(f);
+            let mine = dbase_support::columns_from_dbase(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_dbase_via_dbase_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: dbase-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
             }
         }
     }

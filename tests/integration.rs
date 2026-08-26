@@ -2952,6 +2952,71 @@ fn malformed_dbase_fails_cleanly() {
     assert_fails_without_panicking("malformed_garbage.dbf");
 }
 
+// A soft-deleted dBase record (the 0x2A "marked for deletion" flag byte)
+// is skipped entirely - a real, documented code path (see CLAUDE.md's
+// Architecture section) that had zero fixture coverage before the
+// `dbase_support` hand-roll: neither `sample.dbf` nor `type_detection.dbf`
+// contains a deleted record. This fixture (hand-built raw bytes, matching
+// this project's usual practice when no tool is available to author a
+// specific binary shape) has three records - Alice/Bob/Carol - with Bob's
+// marked deleted.
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_skips_soft_deleted_records() {
+    let doc = run_json("edge_dbase_deleted_records.dbf", &[]);
+    let cols = table(&doc, "edge_dbase_deleted_records");
+    let name = column(cols, "NAME");
+    assert_eq!(name["sample_values"], serde_json::json!(["Alice", "Carol"]));
+}
+
+// A dBase file marked with the UTF-8 code page (`CodePageMark::Utf8`,
+// header byte `0xf0`) decodes its text fields strictly as UTF-8 - this
+// fixture's one Character value is genuine multi-byte content
+// (café日本語), confirming multi-byte text survives the hand-rolled
+// `trim_both`/`decode_text` path intact rather than being mangled by
+// byte-oriented trimming.
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_reads_utf8_code_page_content_correctly() {
+    let doc = run_json("edge_dbase_unicode.dbf", &[]);
+    let cols = table(&doc, "edge_dbase_unicode");
+    let name = column(cols, "NAME");
+    assert_eq!(name["sample_values"], serde_json::json!(["café日本語"]));
+}
+
+// A dBase file marked with one of the ~20 *named* legacy single-byte code
+// pages (here CP1252, header byte 0x03) is a disclosed, clear error rather
+// than a silent misdecode - this project's hand-rolled reader only
+// supports UTF-8 or undefined/unmarked-codepage dBase files, exactly
+// matching a real, pre-existing limitation of the `dbase` crate's own
+// default build (no `yore`/`encoding_rs` feature enabled) that this
+// hand-roll replaces - see CLAUDE.md's Dependency footprint section.
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_named_code_page_is_a_clear_disclosed_error() {
+    let output = Command::new(bin())
+        .args([fixture("malformed_dbase_unsupported_codepage.dbf")
+            .to_str()
+            .unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("code page") && stderr.contains("0x03"),
+        "expected a code-page error naming the byte, got: {stderr}"
+    );
+}
+
+// A dBase file with a Memo field (whose content lives in an external
+// .dbt/.fpt file this reader doesn't implement - see CLAUDE.md's Known
+// limitations) is a disclosed, clear error, not a silent drop or a panic.
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_memo_field_is_a_clear_disclosed_error() {
+    assert_fails_without_panicking("malformed_dbase_memo_field.dbf");
+}
+
 #[cfg(feature = "stata")]
 #[test]
 fn malformed_stata_fails_cleanly() {
