@@ -4284,9 +4284,154 @@ this project could just implement directly rather than depend on:
   different real files, run through the compiled release binary)
   produced zero panics, zero hangs, and no unexpected exit codes.
 
-**What's deliberately not being hand-rolled**: `serde`/`serde_json` are
-the last real dependency left, and the one that's always been more
-central than any of the others in this list: `serde_json::Value` is the
+- **`arrow`/`parquet` → a hand-rolled reader, in progress
+  (`parquet_support`).** Unlike every entry above this one, this is not a
+  finished hand-roll - it's the one still underway, explicitly chosen by
+  the user over two narrower alternatives (a flat-columns-only reader
+  leaving nested types and Arrow IPC/Feather on the `arrow`/`parquet`
+  crates, or stopping the campaign here and keeping both crates outright)
+  specifically because of its size: `arrow`+`parquet` together are the
+  largest dependency in this project by a wide margin, and - uniquely
+  among everything hand-rolled so far - Parquet's own footer metadata is
+  encoded with Thrift's compact protocol, a real general-purpose
+  serialization framework, not a single bespoke binary layout the way
+  every other format here has been. Arrow IPC/Feather adds a *second*,
+  entirely separate general-purpose framework (FlatBuffers) on top, not
+  yet started. This entry will keep growing across sessions as more of
+  the reader lands; treat it as a running log, not a finished writeup the
+  way every other entry in this section is.
+
+  **Phase A (this session): the Thrift compact protocol's read side, and
+  Parquet's footer schema.** `parquet` itself hand-rolls its own minimal
+  Thrift decoder rather than depending on a general Thrift library or
+  code-generating from the official `.thrift` IDL at build time
+  (documented in the crate's own `THRIFT.md`) - for the same reasons
+  every other hand-roll in this project exists, per that file's own
+  words: "performance and flexibility." That made it this phase's
+  authoritative source, the same role a pure-Rust crate's source has
+  played for every hand-roll before it: every field ID, enum
+  discriminant, and union-variant encoding below was read directly from
+  `parquet_thrift.rs` (the wire protocol itself) and
+  `file/metadata/thrift/mod.rs` / `basic.rs` (Parquet's own struct/enum
+  definitions, written as comments alongside the crate's hand-written
+  serialization code, since there's no separate `.thrift` file in the
+  crate to read structs from directly) before being trusted.
+
+  The wire protocol: ULEB128 varints and zigzag-encoded signed integers
+  (identical shape to Avro's own, a format this project already hand-
+  rolled a Thrift-free decoder for); struct fields identified by a 1-byte
+  header packing either a 4-bit field-ID *delta* from the previous field
+  or (when the delta doesn't fit, i.e. exceeds 15, or the field ID
+  actually decreases) a zero-delta marker followed by the field's full
+  zigzag `i16` ID - with one real compact-protocol-specific quirk found
+  by reading the reference source rather than assumed from a generic
+  Thrift description: a `bool` *struct field*'s value is encoded directly
+  in the field-type nibble itself (`BooleanTrue`/`BooleanFalse` are
+  distinct field types), not as a separate payload byte the way every
+  other primitive type is. List/set headers have the analogous packed-
+  nibble-with-varint-overflow shape. Every unrecognized field ID is
+  skipped via a single recursive `skip` function keyed only on the wire
+  type (not needing to know what the field *means*), which is what lets
+  every struct reader here stay a short, flat loop with no exhaustive
+  field list to keep in sync as Parquet's own schema gains fields over
+  time (bloom filters, page indexes, geospatial statistics, and others
+  are all skipped this way, since this project doesn't currently surface
+  any of them).
+
+  Parquet's own footer: `FileMetaData` (num_rows, `created_by`, and a
+  flat, depth-first-traversal-order list of `SchemaElement`s - Thrift has
+  no native support for a recursive/nested struct, so Parquet's own
+  schema tree is linearized with a `num_children` count driving
+  reconstruction, not reconstructed in this phase yet) -> `RowGroup` ->
+  `ColumnChunk` -> `ColumnMetaData` (physical type, encodings used,
+  compression codec, value/byte counts, data/dictionary page offsets).
+  `LogicalType` - the modern (2.4.0+) per-column type-annotation
+  mechanism (superseding the older `ConvertedType` enum, still read
+  alongside it since older files only ever set that one) - is a genuine
+  Thrift *union*: exactly one of 18 fields is present, selected by field
+  ID rather than a separate discriminant byte, with several variants
+  (`Decimal`/`Time`/`Timestamp`/`Integer`, plus three - `Variant`/
+  `Geometry`/`Geography` - this reader doesn't need individually and
+  collapses to one disclosed `Other` catch-all) carrying their own nested
+  struct payload rather than being empty.
+
+  **A real, if minor, bug found via real-world testing, the same
+  methodology every other hand-roll in this project already used**: this
+  phase's own oracle-comparison test (`footer_matches_parquet_crate_metadata`,
+  cross-checking against the real `parquet` crate's own
+  `ParquetMetaDataReader` - still a live runtime dependency at this phase,
+  so no dev-only gating needed yet) passed cleanly on this project's own 6
+  committed Parquet fixtures, but a further sweep against the official
+  `apache/parquet-testing` corpus (`data/`, 79 files - the same corpus
+  this project's prior real-world Parquet validation pass already used,
+  see the fourth-pass entry elsewhere in this document) surfaced one real
+  gap: `unknown-logical-type.parquet` carries a `LogicalType` union
+  variant id of 2555 - not one of Parquet's 18 currently-defined variants,
+  clearly a deliberately-adversarial forward-compatibility test case. The
+  reference crate's own macro for this exact union is named
+  `thrift_union_with_unknown!`, specifically to stay forward-compatible
+  with a future format version's new variant; this reader's first draft
+  hard-errored on an unrecognized id instead, fixed to match by falling
+  back to `Other` (still correctly advancing the reader past the unknown
+  variant's own payload bytes, using its wire type - a real requirement,
+  not just error-message politeness, since the reader would otherwise
+  desync on every field after it). Locked in with a vendored copy of the
+  real file (`tests/fixtures/parquet_unknown_logical_type.parquet` - see
+  `tests/fixtures/parquet_PROVENANCE.md`), the same "vendor a real file
+  when self-generation is genuinely impossible" call already made for the
+  POI `.xlsb` and `sas7bdat` fixtures, since no ordinary writer tool can
+  produce a file with a not-yet-assigned union variant id to re-derive
+  this fixture synthetically.
+
+  With that fix, 77 of the 79 real corpus files match the oracle exactly
+  (transient, not committed, matching this project's usual real-world-
+  corpus practice). The remaining 2 are both cases where the *oracle
+  itself* fails to parse the footer, not this reader:
+  `alp_extended.zstd.parquet` (an experimental encoding value this
+  version of the `parquet` crate doesn't recognize either - this reader
+  fails identically, for the same reason, matching CLAUDE.md's own prior
+  documented finding for this exact file) and, more interestingly,
+  `dict-page-offset-zero.parquet` - already documented elsewhere in this
+  file as a known limitation of the *current*, crate-based reader
+  ("page/buffer-decoding errors") - where this hand-rolled footer parser
+  succeeds cleanly (1 row group, 2 schema elements, 39 rows) where the
+  reference crate's own footer parser itself rejects the file
+  ("Expected list element type of I64 but got I16"). This is not yet
+  locked in as a passing regression test, since there's no oracle left to
+  cross-check the *decoded values* against until this reader can read
+  page data too (the next phase) - a footer that parses without error
+  doesn't yet prove the row group/column chunk offsets it found are being
+  interpreted correctly, only that they were read without crashing.
+
+  **Deliberately not started yet, in order**: reconstructing the nested
+  `SchemaElement` list into a real tree (needed before any column can be
+  matched to its schema node); page header parsing (the same Thrift
+  primitives, a much smaller additional struct); the actual value
+  encodings (PLAIN first, then RLE/bit-packing hybrid for definition/
+  repetition levels and dictionary indices, then `RLE_DICTIONARY` -
+  together the overwhelming common case for real files - with
+  `DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/`DELTA_BYTE_ARRAY`/
+  `BYTE_STREAM_SPLIT` after); compression codec wiring (Snappy, Gzip, and
+  Zstd are *already* hand-rolled elsewhere in this project for other
+  formats and only need plugging in here; LZO/Brotli/LZ4/LZ4_RAW are not
+  yet hand-rolled anywhere in this project and would each be a new,
+  separate undertaking); nested Struct/List/Map reconstruction from
+  definition/repetition levels; and, last, Arrow IPC/Feather's own
+  FlatBuffers-based schema/`RecordBatch` framework, entirely unstarted.
+  None of this is wired into `columns_from_parquet` yet - `parquet_support`
+  is a real but currently dormant module (`#[allow(dead_code)]`,
+  exercised only by its own tests), and the crate stays a live runtime
+  dependency until every behavior this project currently documents and
+  tests for Parquet/Arrow IPC (nested types, every compression codec,
+  Map non-string-key isolation, named-timezone support, INT96 legacy
+  timestamps, Decimal128, dictionary-encoding resolution, and more) is
+  matched, verified, and cut over in one deliberate step - not
+  incrementally swapped out from under a working build.
+
+**What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
+just above (in progress, not declined), `serde`/`serde_json` are meant to
+stay a dependency permanently. They're also the one that's always been
+more central than any of the others in this list: `serde_json::Value` is the
 literal bridge type seven different format readers (JSON, YAML, TOML,
 Avro, MessagePack, CBOR, XML) recurse through via `profile_json_path` -
 replacing it means writing and re-verifying a whole JSON value type,

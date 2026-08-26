@@ -6731,6 +6731,1167 @@ fn columns_from_arrow_ipc(
     )
 }
 
+// --- Hand-rolled Parquet reader (in progress - not yet wired into
+// columns_from_parquet). This is being built incrementally across several
+// sessions, following the user's explicit "full parity" choice over a
+// narrower flat-columns-only scope (see CLAUDE.md's Dependency footprint
+// section for the size of the undertaking this represents: unlike every
+// other hand-roll in this project, Parquet needs a general-purpose
+// serialization framework - Thrift's compact protocol - as its own
+// foundation, verified against the `parquet` crate's own from-scratch
+// Thrift implementation (`parquet_thrift.rs`) rather than a generic Thrift
+// library, since parquet-rs itself hand-rolls this exact layer for the
+// same reasons this project hand-rolls everything else here.
+//
+// Phase A (this commit): the Thrift compact protocol's read side, and
+// enough of Parquet's own Thrift-encoded footer schema (`FileMetaData` ->
+// `SchemaElement`/`RowGroup`/`ColumnChunk`/`ColumnMetaData`, including the
+// `LogicalType` union) to reconstruct a file's schema, row groups, and
+// column chunk locations/encodings/compression. Deliberately not yet
+// wired into `columns_from_parquet`, and deliberately not yet decoding
+// any actual page/column data - that's the next phase. Every struct
+// field ID, enum discriminant, and encoding rule below was read directly
+// from the `parquet` crate's own source (`parquet_thrift.rs`,
+// `file/metadata/thrift/mod.rs`, `basic.rs`) before being trusted, the
+// same "verify against source" discipline every prior hand-roll in this
+// project already holds itself to - there is no independent Parquet
+// specification document that isn't itself just prose describing what
+// that crate (the reference implementation) already does.
+#[allow(dead_code)]
+#[cfg(feature = "parquet")]
+mod parquet_support {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // Thrift compact protocol - read side only. Verified field-for-field
+    // against `parquet_thrift.rs`'s own `ThriftCompactInputProtocol`
+    // trait and its `ThriftSliceInputProtocol` impl.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FieldType {
+        Stop,
+        BoolTrue,
+        BoolFalse,
+        Byte,
+        I16,
+        I32,
+        I64,
+        Double,
+        Binary,
+        List,
+        Set,
+        Map,
+        Struct,
+        Uuid,
+    }
+
+    impl FieldType {
+        fn from_nibble(v: u8) -> Result<Self> {
+            Ok(match v {
+                0 => Self::Stop,
+                1 => Self::BoolTrue,
+                2 => Self::BoolFalse,
+                3 => Self::Byte,
+                4 => Self::I16,
+                5 => Self::I32,
+                6 => Self::I64,
+                7 => Self::Double,
+                8 => Self::Binary,
+                9 => Self::List,
+                10 => Self::Set,
+                11 => Self::Map,
+                12 => Self::Struct,
+                13 => Self::Uuid,
+                other => bail!("invalid Thrift compact-protocol field type {other}"),
+            })
+        }
+    }
+
+    /// Thrift's compact-protocol list/set element-type nibble is a
+    /// slightly different code space than a struct field's own type
+    /// nibble (a real, documented quirk: both `1` and `2` are accepted
+    /// for `bool`, for "historical and compatibility reasons" per the
+    /// upstream Thrift spec itself, quoted verbatim in
+    /// `parquet_thrift.rs`'s own `ElementType::try_from`).
+    fn element_type_to_field_type(v: u8) -> Result<FieldType> {
+        Ok(match v {
+            1 | 2 => FieldType::BoolTrue,
+            3 => FieldType::Byte,
+            4 => FieldType::I16,
+            5 => FieldType::I32,
+            6 => FieldType::I64,
+            7 => FieldType::Double,
+            8 => FieldType::Binary,
+            9 => FieldType::List,
+            10 => FieldType::Set,
+            11 => FieldType::Map,
+            12 => FieldType::Struct,
+            13 => FieldType::Uuid,
+            other => bail!("invalid Thrift compact-protocol list element type {other}"),
+        })
+    }
+
+    struct ThriftReader<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> ThriftReader<'a> {
+        fn new(buf: &'a [u8]) -> Self {
+            Self { buf, pos: 0 }
+        }
+
+        fn read_byte(&mut self) -> Result<u8> {
+            let b = *self
+                .buf
+                .get(self.pos)
+                .context("truncated Thrift compact-protocol input")?;
+            self.pos += 1;
+            Ok(b)
+        }
+
+        fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+            let end = self
+                .pos
+                .checked_add(n)
+                .context("Thrift compact-protocol length overflow")?;
+            let slice = self
+                .buf
+                .get(self.pos..end)
+                .context("truncated Thrift compact-protocol input")?;
+            self.pos = end;
+            Ok(slice)
+        }
+
+        /// ULEB128-encoded unsigned varint, up to 10 bytes (enough for a
+        /// full 64-bit value at 7 bits/byte) - matches
+        /// `ThriftCompactInputProtocol::read_vlq` exactly, including its
+        /// unbounded-shift-then-wrap behavior for a maliciously long
+        /// varint (harmless: a wrapping shift just produces a garbage
+        /// value that downstream bounds-checks then reject).
+        fn read_vlq(&mut self) -> Result<u64> {
+            let mut value = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let byte = self.read_byte()?;
+                value |= u64::from(byte & 0x7f).wrapping_shl(shift);
+                if byte & 0x80 == 0 {
+                    return Ok(value);
+                }
+                shift += 7;
+                if shift >= 70 {
+                    bail!("Thrift compact-protocol varint too long");
+                }
+            }
+        }
+
+        fn read_zigzag(&mut self) -> Result<i64> {
+            let v = self.read_vlq()?;
+            Ok(((v >> 1) as i64) ^ -((v & 1) as i64))
+        }
+
+        fn read_i16(&mut self) -> Result<i16> {
+            i16::try_from(self.read_zigzag()?).context("Thrift i16 field out of range")
+        }
+
+        fn read_i32(&mut self) -> Result<i32> {
+            i32::try_from(self.read_zigzag()?).context("Thrift i32 field out of range")
+        }
+
+        fn read_i64(&mut self) -> Result<i64> {
+            self.read_zigzag()
+        }
+
+        fn read_i8(&mut self) -> Result<i8> {
+            Ok(self.read_byte()? as i8)
+        }
+
+        fn read_double(&mut self) -> Result<f64> {
+            let b = self.read_bytes(8)?;
+            Ok(f64::from_le_bytes(b.try_into().unwrap()))
+        }
+
+        fn read_binary(&mut self) -> Result<&'a [u8]> {
+            let len = self.read_vlq()? as usize;
+            self.read_bytes(len)
+        }
+
+        fn read_string(&mut self) -> Result<String> {
+            let bytes = self.read_binary()?;
+            Ok(std::str::from_utf8(bytes)
+                .context("Thrift binary field is not valid UTF-8")?
+                .to_string())
+        }
+
+        /// A struct field header: either a single byte packing a 4-bit
+        /// field-ID *delta* (from the previous field) with the 4-bit
+        /// type nibble, or - when the delta doesn't fit in 4 bits (> 15),
+        /// or is non-positive - a zero delta nibble followed by the
+        /// field's full zigzag-encoded `i16` ID. A field type of `Stop`
+        /// (nibble 0) marks the end of the struct and carries no ID.
+        fn read_field_header(&mut self, last_field_id: i16) -> Result<(FieldType, i16)> {
+            let header = self.read_byte()?;
+            let type_nibble = header & 0x0f;
+            if type_nibble == 0 {
+                return Ok((FieldType::Stop, 0));
+            }
+            let field_type = FieldType::from_nibble(type_nibble)?;
+            let delta = (header & 0xf0) >> 4;
+            let id = if delta != 0 {
+                last_field_id
+                    .checked_add(i16::from(delta))
+                    .context("Thrift field-id delta overflow")?
+            } else {
+                self.read_i16()?
+            };
+            Ok((field_type, id))
+        }
+
+        /// A boolean *struct field*'s value lives in the field-type
+        /// nibble itself (`BoolTrue`/`BoolFalse`), not as separate
+        /// payload bytes - this must only be called after
+        /// `read_field_header` returned one of those two field types.
+        fn bool_field_value(field_type: FieldType) -> Result<bool> {
+            match field_type {
+                FieldType::BoolTrue => Ok(true),
+                FieldType::BoolFalse => Ok(false),
+                other => bail!("expected a boolean struct field, found {other:?}"),
+            }
+        }
+
+        /// A list/set header: one byte packing a 4-bit element count
+        /// (0-14) with the 4-bit element-type nibble; a count of 15
+        /// signals the real count follows as a separate ULEB128 varint.
+        /// A header byte of 0 is a real, observed writer quirk (an empty
+        /// list with no element type recorded at all) - treated as a
+        /// zero-length list of an arbitrary placeholder type, matching
+        /// `parquet_thrift.rs`'s own documented handling of it.
+        fn read_list_header(&mut self) -> Result<(FieldType, usize)> {
+            let header = self.read_byte()?;
+            if header == 0 {
+                return Ok((FieldType::Byte, 0));
+            }
+            let element_type = element_type_to_field_type(header & 0x0f)?;
+            let count_nibble = (header & 0xf0) >> 4;
+            let count = if count_nibble != 15 {
+                usize::from(count_nibble)
+            } else {
+                usize::try_from(self.read_vlq()?).context("Thrift list size exceeds usize")?
+            };
+            Ok((element_type, count))
+        }
+
+        /// Skip a value of `field_type`, recursively, honoring nested
+        /// structs/lists/maps - needed for every field this reader
+        /// doesn't itself care about (statistics, bloom filters, page
+        /// indexes, ...), so a struct never needs an exhaustive field
+        /// list to stay correct, only a `_ => skip` default arm. Depth-
+        /// capped the same defensive way this project's every other
+        /// hand-rolled recursive-structure reader already is.
+        fn skip(&mut self, field_type: FieldType, depth: u32) -> Result<()> {
+            if depth == 0 {
+                bail!("Thrift structure nested too deep to skip safely");
+            }
+            match field_type {
+                FieldType::BoolTrue | FieldType::BoolFalse => {}
+                FieldType::Byte => {
+                    self.read_byte()?;
+                }
+                FieldType::I16 | FieldType::I32 | FieldType::I64 => {
+                    self.read_vlq()?;
+                }
+                FieldType::Double => {
+                    self.read_bytes(8)?;
+                }
+                FieldType::Binary => {
+                    self.read_binary()?;
+                }
+                FieldType::Uuid => {
+                    self.read_bytes(16)?;
+                }
+                FieldType::Struct => loop {
+                    let (ft, _) = self.read_field_header(0)?;
+                    if ft == FieldType::Stop {
+                        break;
+                    }
+                    self.skip(ft, depth - 1)?;
+                },
+                FieldType::List | FieldType::Set => {
+                    let (elem_ty, count) = self.read_list_header()?;
+                    for _ in 0..count {
+                        self.skip(elem_ty, depth - 1)?;
+                    }
+                }
+                FieldType::Map => {
+                    let size = self.read_vlq()? as usize;
+                    if size > 0 {
+                        let kv = self.read_byte()?;
+                        let key_ty = element_type_to_field_type(kv >> 4)?;
+                        let val_ty = element_type_to_field_type(kv & 0x0f)?;
+                        for _ in 0..size {
+                            self.skip(key_ty, depth - 1)?;
+                            self.skip(val_ty, depth - 1)?;
+                        }
+                    }
+                }
+                FieldType::Stop => {}
+            }
+            Ok(())
+        }
+    }
+
+    const MAX_SKIP_DEPTH: u32 = 64;
+
+    // ---------------------------------------------------------------
+    // Parquet's own Thrift-encoded enums. Every discriminant verified
+    // directly against `basic.rs`'s own `thrift_enum!`/`thrift_union!`
+    // invocations.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum PhysicalType {
+        Boolean,
+        Int32,
+        Int64,
+        Int96,
+        Float,
+        Double,
+        ByteArray,
+        FixedLenByteArray,
+    }
+
+    impl PhysicalType {
+        fn from_i32(v: i32) -> Result<Self> {
+            Ok(match v {
+                0 => Self::Boolean,
+                1 => Self::Int32,
+                2 => Self::Int64,
+                3 => Self::Int96,
+                4 => Self::Float,
+                5 => Self::Double,
+                6 => Self::ByteArray,
+                7 => Self::FixedLenByteArray,
+                other => bail!("unrecognized Parquet physical type {other}"),
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Repetition {
+        Required,
+        Optional,
+        Repeated,
+    }
+
+    impl Repetition {
+        fn from_i32(v: i32) -> Result<Self> {
+            Ok(match v {
+                0 => Self::Required,
+                1 => Self::Optional,
+                2 => Self::Repeated,
+                other => bail!("unrecognized Parquet repetition type {other}"),
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ConvertedType {
+        Utf8,
+        Map,
+        MapKeyValue,
+        List,
+        Enum,
+        Decimal,
+        Date,
+        TimeMillis,
+        TimeMicros,
+        TimestampMillis,
+        TimestampMicros,
+        Uint8,
+        Uint16,
+        Uint32,
+        Uint64,
+        Int8,
+        Int16,
+        Int32,
+        Int64,
+        Json,
+        Bson,
+        Interval,
+    }
+
+    impl ConvertedType {
+        fn from_i32(v: i32) -> Result<Self> {
+            Ok(match v {
+                0 => Self::Utf8,
+                1 => Self::Map,
+                2 => Self::MapKeyValue,
+                3 => Self::List,
+                4 => Self::Enum,
+                5 => Self::Decimal,
+                6 => Self::Date,
+                7 => Self::TimeMillis,
+                8 => Self::TimeMicros,
+                9 => Self::TimestampMillis,
+                10 => Self::TimestampMicros,
+                11 => Self::Uint8,
+                12 => Self::Uint16,
+                13 => Self::Uint32,
+                14 => Self::Uint64,
+                15 => Self::Int8,
+                16 => Self::Int16,
+                17 => Self::Int32,
+                18 => Self::Int64,
+                19 => Self::Json,
+                20 => Self::Bson,
+                21 => Self::Interval,
+                other => bail!("unrecognized Parquet converted type {other}"),
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum TimeUnit {
+        Millis,
+        Micros,
+        Nanos,
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) enum LogicalType {
+        String,
+        Map,
+        List,
+        Enum,
+        Decimal {
+            scale: i32,
+            precision: i32,
+        },
+        Date,
+        Time {
+            is_adjusted_to_utc: bool,
+            unit: TimeUnit,
+        },
+        Timestamp {
+            is_adjusted_to_utc: bool,
+            unit: TimeUnit,
+        },
+        Integer {
+            bit_width: i8,
+            is_signed: bool,
+        },
+        Unknown,
+        Json,
+        Bson,
+        Uuid,
+        Float16,
+        /// Variant/Geometry/Geography (union IDs 16-18) carry their own
+        /// nested structs this reader has no use for yet - collapsed
+        /// to a single disclosed catch-all rather than three unused
+        /// variants, the same "not every corner needs its own case"
+        /// scope choice made throughout this project.
+        Other,
+    }
+
+    fn read_time_unit(r: &mut ThriftReader) -> Result<TimeUnit> {
+        // TimeUnit is a Thrift union whose 3 variants are all empty
+        // structs (`thrift_union_all_empty!`): reading it is just
+        // reading one field header (whose *id* selects the variant) then
+        // its empty-struct body (a lone Stop byte).
+        let (field_type, id) = r.read_field_header(0)?;
+        if field_type == FieldType::Stop {
+            bail!("TimeUnit union has no set variant");
+        }
+        r.skip(field_type, 1)?;
+        // consume the trailing struct-stop byte of the outer union
+        let (stop_type, _) = r.read_field_header(id)?;
+        if stop_type != FieldType::Stop {
+            bail!("TimeUnit union has more than one field set");
+        }
+        Ok(match id {
+            1 => TimeUnit::Millis,
+            2 => TimeUnit::Micros,
+            3 => TimeUnit::Nanos,
+            other => bail!("unrecognized Parquet TimeUnit variant id {other}"),
+        })
+    }
+
+    /// `LogicalType` is a Thrift union: exactly one field (selected by
+    /// its field ID, not a discriminant byte) is set, each corresponding
+    /// to one union variant. A variant's own payload is either an empty
+    /// struct (most variants) or a nested struct with real fields
+    /// (`Decimal`/`Time`/`Timestamp`/`Integer`/`Variant`/`Geometry`/
+    /// `Geography`) - verified field-by-field against `basic.rs`'s own
+    /// `thrift_union_with_unknown!` invocation and each nested struct's
+    /// own `thrift_struct!` definition.
+    fn read_logical_type(r: &mut ThriftReader) -> Result<LogicalType> {
+        let (field_type, id) = r.read_field_header(0)?;
+        if field_type == FieldType::Stop {
+            bail!("LogicalType union has no set variant");
+        }
+        let result = match id {
+            1..=4 => {
+                r.skip(field_type, 1)?;
+                match id {
+                    1 => LogicalType::String,
+                    2 => LogicalType::Map,
+                    3 => LogicalType::List,
+                    _ => LogicalType::Enum,
+                }
+            }
+            5 => {
+                // DecimalType { 1: required i32 scale; 2: required i32 precision }
+                let (mut scale, mut precision) = (None, None);
+                let mut last = 0i16;
+                loop {
+                    let (ft, fid) = r.read_field_header(last)?;
+                    if ft == FieldType::Stop {
+                        break;
+                    }
+                    match fid {
+                        1 => scale = Some(r.read_i32()?),
+                        2 => precision = Some(r.read_i32()?),
+                        _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+                    }
+                    last = fid;
+                }
+                LogicalType::Decimal {
+                    scale: scale.context("DecimalType missing scale")?,
+                    precision: precision.context("DecimalType missing precision")?,
+                }
+            }
+            6 => {
+                r.skip(field_type, 1)?;
+                LogicalType::Date
+            }
+            7 | 8 => {
+                // TimeType/TimestampType { 1: required bool is_adjusted_to_u_t_c; 2: required TimeUnit unit }
+                let (mut is_adjusted, mut unit) = (None, None);
+                let mut last = 0i16;
+                loop {
+                    let (ft, fid) = r.read_field_header(last)?;
+                    if ft == FieldType::Stop {
+                        break;
+                    }
+                    match fid {
+                        1 => is_adjusted = Some(ThriftReader::bool_field_value(ft)?),
+                        2 => unit = Some(read_time_unit(r)?),
+                        _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+                    }
+                    last = fid;
+                }
+                let is_adjusted_to_utc =
+                    is_adjusted.context("TimeType/TimestampType missing is_adjusted_to_u_t_c")?;
+                let unit = unit.context("TimeType/TimestampType missing unit")?;
+                if id == 7 {
+                    LogicalType::Time {
+                        is_adjusted_to_utc,
+                        unit,
+                    }
+                } else {
+                    LogicalType::Timestamp {
+                        is_adjusted_to_utc,
+                        unit,
+                    }
+                }
+            }
+            10 => {
+                // IntType { 1: required i8 bit_width; 2: required bool is_signed }
+                let (mut bit_width, mut is_signed) = (None, None);
+                let mut last = 0i16;
+                loop {
+                    let (ft, fid) = r.read_field_header(last)?;
+                    if ft == FieldType::Stop {
+                        break;
+                    }
+                    match fid {
+                        1 => bit_width = Some(r.read_i8()?),
+                        2 => is_signed = Some(ThriftReader::bool_field_value(ft)?),
+                        _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+                    }
+                    last = fid;
+                }
+                LogicalType::Integer {
+                    bit_width: bit_width.context("IntType missing bit_width")?,
+                    is_signed: is_signed.context("IntType missing is_signed")?,
+                }
+            }
+            11 => {
+                r.skip(field_type, 1)?;
+                LogicalType::Unknown
+            }
+            12 => {
+                r.skip(field_type, 1)?;
+                LogicalType::Json
+            }
+            13 => {
+                r.skip(field_type, 1)?;
+                LogicalType::Bson
+            }
+            14 => {
+                r.skip(field_type, 1)?;
+                LogicalType::Uuid
+            }
+            15 => {
+                r.skip(field_type, 1)?;
+                LogicalType::Float16
+            }
+            16..=18 => {
+                r.skip(field_type, MAX_SKIP_DEPTH)?;
+                LogicalType::Other
+            }
+            _ => {
+                // A union variant ID this reader doesn't recognize at
+                // all - not one of Parquet's own 18 defined `LogicalType`
+                // variants, past or present. `basic.rs` names its own
+                // macro for this exact union `thrift_union_with_unknown!`
+                // specifically to stay forward-compatible with a future
+                // format version's new variant, and a real file in the
+                // wild exercises exactly this (`unknown-logical-type
+                // .parquet` in the `apache/parquet-testing` corpus, using
+                // variant id 2555 - clearly not a real assigned id).
+                // Matching that forward-compatibility rather than hard-
+                // erroring: skip the payload using its own field type
+                // (still required to keep the reader's cursor correct)
+                // and fall back to `Other`, the same disclosed-unknown
+                // treatment variants 16-18 already get.
+                r.skip(field_type, MAX_SKIP_DEPTH)?;
+                LogicalType::Other
+            }
+        };
+        // consume the outer union's own trailing Stop byte
+        let (stop_type, _) = r.read_field_header(id)?;
+        if stop_type != FieldType::Stop {
+            bail!("LogicalType union has more than one field set");
+        }
+        Ok(result)
+    }
+
+    // ---------------------------------------------------------------
+    // Footer structures: FileMetaData -> SchemaElement (flat, depth-
+    // first list) / RowGroup -> ColumnChunk -> ColumnMetaData. Field IDs
+    // verified directly against `file/metadata/thrift/mod.rs`'s own
+    // write-side field-by-field comments (the crate's de-facto struct
+    // definition, since it hand-writes serialization rather than
+    // generating it from a `.thrift` IDL file at build time).
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct SchemaElement {
+        pub(crate) type_: Option<PhysicalType>,
+        pub(crate) type_length: Option<i32>,
+        pub(crate) repetition_type: Option<Repetition>,
+        pub(crate) name: String,
+        pub(crate) num_children: Option<i32>,
+        pub(crate) converted_type: Option<ConvertedType>,
+        pub(crate) scale: Option<i32>,
+        pub(crate) precision: Option<i32>,
+        pub(crate) logical_type: Option<LogicalType>,
+    }
+
+    fn read_schema_element(r: &mut ThriftReader) -> Result<SchemaElement> {
+        let (mut type_, mut type_length, mut repetition_type) = (None, None, None);
+        let mut name = None;
+        let (mut num_children, mut converted_type) = (None, None);
+        let (mut scale, mut precision) = (None, None);
+        let mut logical_type = None;
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => type_ = Some(PhysicalType::from_i32(r.read_i32()?)?),
+                2 => type_length = Some(r.read_i32()?),
+                3 => repetition_type = Some(Repetition::from_i32(r.read_i32()?)?),
+                4 => name = Some(r.read_string()?),
+                5 => num_children = Some(r.read_i32()?),
+                6 => converted_type = Some(ConvertedType::from_i32(r.read_i32()?)?),
+                7 => scale = Some(r.read_i32()?),
+                8 => precision = Some(r.read_i32()?),
+                10 => logical_type = Some(read_logical_type(r)?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(SchemaElement {
+            type_,
+            type_length,
+            repetition_type,
+            name: name.context("SchemaElement missing required field name")?,
+            num_children,
+            converted_type,
+            scale,
+            precision,
+            logical_type,
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Encoding {
+        Plain,
+        PlainDictionary,
+        Rle,
+        BitPacked,
+        DeltaBinaryPacked,
+        DeltaLengthByteArray,
+        DeltaByteArray,
+        RleDictionary,
+        ByteStreamSplit,
+    }
+
+    impl Encoding {
+        fn from_i32(v: i32) -> Result<Self> {
+            Ok(match v {
+                0 => Self::Plain,
+                2 => Self::PlainDictionary,
+                3 => Self::Rle,
+                4 => Self::BitPacked,
+                5 => Self::DeltaBinaryPacked,
+                6 => Self::DeltaLengthByteArray,
+                7 => Self::DeltaByteArray,
+                8 => Self::RleDictionary,
+                9 => Self::ByteStreamSplit,
+                other => bail!("unrecognized Parquet encoding {other}"),
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum CompressionCodec {
+        Uncompressed,
+        Snappy,
+        Gzip,
+        Lzo,
+        Brotli,
+        Lz4,
+        Zstd,
+        Lz4Raw,
+    }
+
+    impl CompressionCodec {
+        fn from_i32(v: i32) -> Result<Self> {
+            Ok(match v {
+                0 => Self::Uncompressed,
+                1 => Self::Snappy,
+                2 => Self::Gzip,
+                3 => Self::Lzo,
+                4 => Self::Brotli,
+                5 => Self::Lz4,
+                6 => Self::Zstd,
+                7 => Self::Lz4Raw,
+                other => bail!("unrecognized Parquet compression codec {other}"),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct ColumnMetaData {
+        pub(crate) type_: PhysicalType,
+        pub(crate) encodings: Vec<Encoding>,
+        pub(crate) path_in_schema: Vec<String>,
+        pub(crate) codec: CompressionCodec,
+        pub(crate) num_values: i64,
+        pub(crate) total_uncompressed_size: i64,
+        pub(crate) total_compressed_size: i64,
+        pub(crate) data_page_offset: i64,
+        pub(crate) dictionary_page_offset: Option<i64>,
+    }
+
+    fn read_list_of<T>(
+        r: &mut ThriftReader,
+        mut f: impl FnMut(&mut ThriftReader) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        let (_elem_ty, count) = r.read_list_header()?;
+        let mut out = Vec::with_capacity(count.min(1 << 20));
+        for _ in 0..count {
+            out.push(f(r)?);
+        }
+        Ok(out)
+    }
+
+    fn read_column_meta_data(r: &mut ThriftReader) -> Result<ColumnMetaData> {
+        let mut type_ = None;
+        let mut encodings = Vec::new();
+        let mut path_in_schema = Vec::new();
+        let mut codec = None;
+        let (mut num_values, mut total_uncompressed_size, mut total_compressed_size) =
+            (None, None, None);
+        let mut data_page_offset = None;
+        let mut dictionary_page_offset = None;
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => type_ = Some(PhysicalType::from_i32(r.read_i32()?)?),
+                2 => encodings = read_list_of(r, |r| Encoding::from_i32(r.read_i32()?))?,
+                3 => path_in_schema = read_list_of(r, |r| r.read_string())?,
+                4 => codec = Some(CompressionCodec::from_i32(r.read_i32()?)?),
+                5 => num_values = Some(r.read_i64()?),
+                6 => total_uncompressed_size = Some(r.read_i64()?),
+                7 => total_compressed_size = Some(r.read_i64()?),
+                9 => data_page_offset = Some(r.read_i64()?),
+                11 => dictionary_page_offset = Some(r.read_i64()?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(ColumnMetaData {
+            type_: type_.context("ColumnMetaData missing required field type")?,
+            encodings,
+            path_in_schema,
+            codec: codec.context("ColumnMetaData missing required field codec")?,
+            num_values: num_values.context("ColumnMetaData missing required field num_values")?,
+            total_uncompressed_size: total_uncompressed_size
+                .context("ColumnMetaData missing required field total_uncompressed_size")?,
+            total_compressed_size: total_compressed_size
+                .context("ColumnMetaData missing required field total_compressed_size")?,
+            data_page_offset: data_page_offset
+                .context("ColumnMetaData missing required field data_page_offset")?,
+            dictionary_page_offset,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct ColumnChunk {
+        pub(crate) file_path: Option<String>,
+        pub(crate) meta_data: Option<ColumnMetaData>,
+    }
+
+    fn read_column_chunk(r: &mut ThriftReader) -> Result<ColumnChunk> {
+        let mut file_path = None;
+        let mut meta_data = None;
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => file_path = Some(r.read_string()?),
+                3 => meta_data = Some(read_column_meta_data(r)?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(ColumnChunk {
+            file_path,
+            meta_data,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct RowGroup {
+        pub(crate) columns: Vec<ColumnChunk>,
+        pub(crate) num_rows: i64,
+    }
+
+    fn read_row_group(r: &mut ThriftReader) -> Result<RowGroup> {
+        let mut columns = Vec::new();
+        let mut num_rows = None;
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => columns = read_list_of(r, read_column_chunk)?,
+                3 => num_rows = Some(r.read_i64()?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(RowGroup {
+            columns,
+            num_rows: num_rows.context("RowGroup missing required field num_rows")?,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct FileMetaData {
+        pub(crate) schema: Vec<SchemaElement>,
+        pub(crate) num_rows: i64,
+        pub(crate) row_groups: Vec<RowGroup>,
+        pub(crate) created_by: Option<String>,
+    }
+
+    fn read_file_metadata(r: &mut ThriftReader) -> Result<FileMetaData> {
+        let mut schema = Vec::new();
+        let mut num_rows = None;
+        let mut row_groups = Vec::new();
+        let mut created_by = None;
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                2 => schema = read_list_of(r, read_schema_element)?,
+                3 => num_rows = Some(r.read_i64()?),
+                4 => row_groups = read_list_of(r, read_row_group)?,
+                6 => created_by = Some(r.read_string()?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(FileMetaData {
+            schema,
+            num_rows: num_rows.context("FileMetaData missing required field num_rows")?,
+            row_groups,
+            created_by,
+        })
+    }
+
+    const MAGIC: &[u8; 4] = b"PAR1";
+
+    /// Reads the whole file, verifies the leading and trailing `"PAR1"`
+    /// magic (the footer-length-encoding variant, `"PARE"`, signals an
+    /// encrypted footer - out of scope, a disclosed error), and decodes
+    /// the Thrift-encoded `FileMetaData` footer.
+    pub(crate) fn read_footer(path: &Path) -> Result<(Vec<u8>, FileMetaData)> {
+        let data = fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
+        if data.len() < 12 {
+            bail!("{path:?} is too small to be a Parquet file");
+        }
+        if &data[0..4] != MAGIC {
+            bail!("{path:?} does not start with the Parquet magic number \"PAR1\"");
+        }
+        let tail = &data[data.len() - 4..];
+        if tail == b"PARE" {
+            bail!("{path:?} has an encrypted Parquet footer, which isn't supported");
+        }
+        if tail != MAGIC {
+            bail!("{path:?} does not end with the Parquet magic number \"PAR1\"");
+        }
+        let footer_len_bytes = &data[data.len() - 8..data.len() - 4];
+        let footer_len = u32::from_le_bytes(footer_len_bytes.try_into().unwrap()) as usize;
+        let footer_start = (data.len() - 8)
+            .checked_sub(footer_len)
+            .context("Parquet footer length exceeds the file size")?;
+        let footer_bytes = &data[footer_start..data.len() - 8];
+        let mut reader = ThriftReader::new(footer_bytes);
+        let metadata = read_file_metadata(&mut reader)
+            .with_context(|| format!("failed to parse the Parquet footer metadata in {path:?}"))?;
+        Ok((data, metadata))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn reads_the_footer_of_a_real_parquet_file() {
+            let (_, meta) = read_footer(Path::new("tests/fixtures/sample.parquet"))
+                .expect("should parse a real parquet footer");
+            assert!(!meta.schema.is_empty());
+            assert!(!meta.row_groups.is_empty());
+            assert_eq!(
+                meta.row_groups.iter().map(|rg| rg.num_rows).sum::<i64>(),
+                meta.num_rows
+            );
+        }
+
+        #[test]
+        fn rejects_a_file_with_no_magic_number() {
+            let err = read_footer(Path::new("tests/fixtures/malformed_garbage.parquet"))
+                .expect_err("garbage bytes should not parse as a parquet footer");
+            let msg = format!("{err:?}");
+            assert!(msg.contains("PAR1") || msg.contains("small"), "{msg}");
+        }
+
+        /// Cross-verification oracle for the hand-rolled footer parser
+        /// against the real `parquet` crate's own
+        /// `ParquetMetaDataReader` - still a live runtime dependency at
+        /// this phase (Phase A doesn't remove it; see the module doc
+        /// comment), so no dev-only gating is needed yet.
+        fn footer_matches_parquet_crate_metadata(path: &str) {
+            let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let mut oracle_reader = parquet::file::metadata::ParquetMetaDataReader::new();
+            oracle_reader
+                .try_parse(&file)
+                .unwrap_or_else(|e| panic!("{path}: oracle failed to parse: {e}"));
+            let oracle = oracle_reader
+                .finish()
+                .unwrap_or_else(|e| panic!("{path}: oracle failed to finish: {e}"));
+
+            let (_, mine) = read_footer(Path::new(path))
+                .unwrap_or_else(|e| panic!("{path}: hand-rolled reader failed: {e:?}"));
+
+            assert_eq!(
+                mine.num_rows,
+                oracle.file_metadata().num_rows(),
+                "{path}: num_rows"
+            );
+            assert_eq!(
+                mine.row_groups.len(),
+                oracle.num_row_groups(),
+                "{path}: row group count"
+            );
+            for (i, my_rg) in mine.row_groups.iter().enumerate() {
+                let oracle_rg = oracle.row_group(i);
+                assert_eq!(
+                    my_rg.num_rows,
+                    oracle_rg.num_rows(),
+                    "{path}: row group {i} num_rows"
+                );
+                assert_eq!(
+                    my_rg.columns.len(),
+                    oracle_rg.columns().len(),
+                    "{path}: row group {i} column count"
+                );
+                for (j, my_col) in my_rg.columns.iter().enumerate() {
+                    let oracle_col = oracle_rg.column(j);
+                    let my_meta = my_col.meta_data.as_ref().unwrap_or_else(|| {
+                        panic!("{path}: row group {i} col {j} missing meta_data")
+                    });
+                    assert_eq!(
+                        my_meta.path_in_schema.join("."),
+                        oracle_col.column_path().string(),
+                        "{path}: row group {i} col {j} path"
+                    );
+                    use parquet::basic::{CompressionCodec as OracleCodec, Type as OracleType};
+                    let expected_type = match oracle_col.column_type() {
+                        OracleType::BOOLEAN => PhysicalType::Boolean,
+                        OracleType::INT32 => PhysicalType::Int32,
+                        OracleType::INT64 => PhysicalType::Int64,
+                        OracleType::INT96 => PhysicalType::Int96,
+                        OracleType::FLOAT => PhysicalType::Float,
+                        OracleType::DOUBLE => PhysicalType::Double,
+                        OracleType::BYTE_ARRAY => PhysicalType::ByteArray,
+                        OracleType::FIXED_LEN_BYTE_ARRAY => PhysicalType::FixedLenByteArray,
+                    };
+                    assert_eq!(
+                        my_meta.type_, expected_type,
+                        "{path}: row group {i} col {j} physical type"
+                    );
+                    let expected_codec = match oracle_col.compression_codec() {
+                        OracleCodec::UNCOMPRESSED => CompressionCodec::Uncompressed,
+                        OracleCodec::SNAPPY => CompressionCodec::Snappy,
+                        OracleCodec::GZIP => CompressionCodec::Gzip,
+                        OracleCodec::LZO => CompressionCodec::Lzo,
+                        OracleCodec::BROTLI => CompressionCodec::Brotli,
+                        OracleCodec::LZ4 => CompressionCodec::Lz4,
+                        OracleCodec::ZSTD => CompressionCodec::Zstd,
+                        OracleCodec::LZ4_RAW => CompressionCodec::Lz4Raw,
+                    };
+                    assert_eq!(
+                        my_meta.codec, expected_codec,
+                        "{path}: row group {i} col {j} compression codec"
+                    );
+                    assert_eq!(
+                        my_meta.num_values,
+                        oracle_col.num_values(),
+                        "{path}: row group {i} col {j} num_values"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn footer_matches_the_parquet_crate_on_real_fixtures() {
+            for f in [
+                "tests/fixtures/sample.parquet",
+                "tests/fixtures/type_detection.parquet",
+                "tests/fixtures/nested_types.parquet",
+                "tests/fixtures/edge_map_non_string_key.parquet",
+                "tests/fixtures/edge_named_timezone.parquet",
+                "tests/fixtures/edge_zero_rows.parquet",
+            ] {
+                footer_matches_parquet_crate_metadata(f);
+            }
+        }
+
+        #[test]
+        #[ignore]
+        fn footer_matches_the_parquet_crate_on_the_real_world_corpus() {
+            let dir = std::path::Path::new(
+                "/private/tmp/claude-501/-Users-andrewmayes-Projects-sniff-rs/48c37152-91f1-4659-9492-11b43ef0f2f8/scratchpad/pq_test/data",
+            );
+            let mut files = Vec::new();
+            fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                let Ok(rd) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if p.extension().is_some_and(|e| e == "parquet") {
+                        out.push(p);
+                    }
+                }
+            }
+            walk(dir, &mut files);
+            assert!(!files.is_empty(), "corpus not present at {dir:?}");
+            let mut failures = Vec::new();
+            for f in &files {
+                let result = std::panic::catch_unwind(|| {
+                    footer_matches_parquet_crate_metadata(f.to_str().unwrap())
+                });
+                if result.is_err() {
+                    failures.push(f.display().to_string());
+                }
+            }
+            eprintln!(
+                "{}/{} files matched the oracle exactly",
+                files.len() - failures.len(),
+                files.len()
+            );
+            for f in &failures {
+                eprintln!("MISMATCH: {f}");
+            }
+        }
+
+        /// A real-world sweep against the `apache/parquet-testing` corpus
+        /// (77/79 files matching the oracle exactly - see this module's
+        /// own doc comment) found this file's `LogicalType` union
+        /// carrying variant id 2555, not one of Parquet's 18 currently-
+        /// defined variants. The real `parquet` crate handles this
+        /// gracefully by design (`thrift_union_with_unknown!`); this
+        /// reader's first draft hard-errored instead, fixed to match by
+        /// falling back to `LogicalType::Other` for any unrecognized
+        /// variant id, the same disclosed-unknown treatment already used
+        /// for the Variant/Geometry/Geography variants this reader
+        /// doesn't otherwise need. Locked in with a vendored copy of the
+        /// real file (see `tests/fixtures/parquet_PROVENANCE.md`) rather
+        /// than left as a one-off manual finding, since no ordinary
+        /// writer tool can produce a file with a not-yet-assigned union
+        /// variant id to re-derive this fixture synthetically.
+        #[test]
+        fn reads_a_file_with_an_unrecognized_logical_type_union_variant() {
+            let (_, meta) = read_footer(Path::new(
+                "tests/fixtures/parquet_unknown_logical_type.parquet",
+            ))
+            .expect(
+                "an unrecognized LogicalType variant should be a disclosed fallback, not an error",
+            );
+            assert!(!meta.schema.is_empty());
+        }
+
+        // The same real-world sweep also found `dict-page-offset-zero.parquet`
+        // (from the same corpus) fails to parse in the real `parquet` crate
+        // itself ("Expected list element type of I64 but got I16") - a
+        // known, pre-existing limitation of that crate already documented
+        // in CLAUDE.md's own prior real-world validation pass for the
+        // arrow/parquet-based reader ("page/buffer-decoding errors").
+        // This hand-rolled footer parser reads it successfully (1 row
+        // group, 2 schema elements, 39 rows) - a genuine case of this
+        // reader already exceeding the reference crate's own robustness,
+        // not yet locked in as a passing test here since there's no
+        // oracle to cross-check the *decoded values* against until this
+        // reader can decode page data (the next phase) - correctly
+        // parsing the footer doesn't yet prove the values it points to
+        // are read correctly too.
+    }
+}
+
 // --- Avro reader (opt-in via --features avro) ---
 // Decodes each record to serde_json::Value and reuses the exact same
 // column-extraction/flattening path as JSON files. The reader itself
