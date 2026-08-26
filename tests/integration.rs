@@ -1428,6 +1428,69 @@ fn sqlite_excludes_views_and_handles_table_names_with_spaces() {
     assert_eq!(column(cols, "qty")["ideal_type"], "i64");
 }
 
+// A payload past the local-page threshold spills into SQLite's own
+// overflow-page linked list - this fixture's "body" column carries a
+// 15,000-byte value (well past the ~4,061-byte local max on a 4,096-byte
+// default page) alongside an ordinary short value, so both the overflow-
+// chain-assembly path and the plain local-payload path get exercised in
+// the same table.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_reassembles_a_payload_spanning_overflow_pages() {
+    let doc = run_json("edge_sqlite_overflow_pages.sqlite", &[]);
+    let cols = table(&doc, "docs");
+    let body = column(cols, "body");
+    assert_eq!(body["ideal_type"], "String");
+    let samples = body["sample_values"].as_array().unwrap();
+    assert!(
+        samples.iter().any(|v| v.as_str().unwrap().len() == 15000),
+        "expected a sample value carrying the full 15,000-byte overflowing payload"
+    );
+}
+
+// `PRIMARY KEY(id)` as a table-level constraint (rather than inline
+// `id INTEGER PRIMARY KEY`) makes `id` a rowid alias too, per SQLite's own
+// documented rule - a real, common schema style this fixture locks in
+// separately from the inline form.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_resolves_a_table_level_primary_key_as_a_rowid_alias() {
+    let doc = run_json("edge_sqlite_table_level_primary_key.sqlite", &[]);
+    let cols = table(&doc, "items");
+    let id = column(cols, "id");
+    assert_eq!(id["missing_pct"].as_f64().unwrap(), 0.0);
+    let samples = id["sample_values"].as_array().unwrap();
+    assert_eq!(
+        samples
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["1", "2"],
+        "id must resolve from the cell's own rowid, not a stored NULL"
+    );
+}
+
+// WITHOUT ROWID storage uses an index b-tree rather than a table b-tree -
+// a disclosed, unsupported shape (see CLAUDE.md) - so it gets a clear
+// placeholder column rather than either a crash or silently wrong data,
+// the same "one bad part shouldn't sink everything else" treatment a
+// bad Parquet column or .npz array already gets elsewhere in this project.
+// The other, ordinary table in the same file must still profile normally.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_without_rowid_table_is_a_disclosed_placeholder_not_a_crash() {
+    let doc = run_json("edge_sqlite_without_rowid.sqlite", &[]);
+    let kv = table(&doc, "kv");
+    assert_eq!(kv.len(), 1);
+    assert!(
+        kv[0]["notes"].as_str().unwrap().contains("WITHOUT ROWID"),
+        "expected a disclosed WITHOUT ROWID note, got {:?}",
+        kv[0]["notes"]
+    );
+    let normal = table(&doc, "normal");
+    assert_eq!(column(normal, "id")["ideal_type"], "i64");
+}
+
 #[test]
 fn csv_treats_missing_value_sentinels_as_null_not_literal_strings() {
     let doc = run_json("type_detection.csv", &[]);

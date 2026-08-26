@@ -11434,79 +11434,1034 @@ fn describe_sql_kinds(counts: &HashMap<&'static str, usize>) -> String {
 }
 
 #[cfg(feature = "sqlite")]
-fn columns_from_sqlite(
-    path: &Path,
-    nrows: Option<usize>,
-    n_samples: usize,
-) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-    use rusqlite::Connection;
-    use rusqlite::types::ValueRef;
+mod sqlite_support {
+    use super::*;
 
-    let conn = Connection::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let mut table_stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-        .with_context(|| format!("failed to list tables in {path:?}"))?;
-    let table_names: Vec<String> = table_stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .and_then(Iterator::collect)
-        .with_context(|| format!("failed to list tables in {path:?}"))?;
-    drop(table_stmt);
+    /// SQLite's own on-disk B-tree/record format, hand-decoded directly
+    /// from the file bytes. `rusqlite` couldn't play the same "read the
+    /// crate's own source" role every other hand-roll in this project
+    /// leaned on - it's a thin FFI binding over the real, linked SQLite C
+    /// library, not a Rust reimplementation of the file format, so the
+    /// authoritative source here is SQLite's own published file-format
+    /// specification (sqlite.org/fileformat2.html) rather than any
+    /// crate's source tree.
+    ///
+    /// Scope is deliberately narrow, matching exactly what this project's
+    /// prior rusqlite-based reader ever actually asked SQLite to do: list
+    /// user tables from `sqlite_master`, then an unfiltered, unordered
+    /// full table scan (`SELECT * FROM t`) per table - no WHERE/JOIN/
+    /// aggregation/index lookups of any kind, so only the table b-tree
+    /// (never an index b-tree) ever needs walking, and rowid-ascending
+    /// depth-first traversal order (the b-tree's own natural cell order)
+    /// is exactly what a real, index-free `SELECT *` returns too.
+    const MAX_BTREE_DEPTH: u32 = 64;
+    const MAX_OVERFLOW_PAGES: u32 = 10_000_000;
+    const MAX_ROW_PAYLOAD: i64 = 1024 * 1024 * 1024;
 
-    if table_names.is_empty() {
-        bail!("no user tables found in {path:?}");
+    struct DbHeader {
+        page_size: u32,
+        usable_size: u32,
+        text_encoding: u32,
     }
 
-    let mut out = Vec::new();
-    for table in table_names {
-        let query = match nrows {
-            Some(n) => format!("SELECT * FROM \"{table}\" LIMIT {n}"),
-            None => format!("SELECT * FROM \"{table}\""),
-        };
-        let mut stmt = conn
-            .prepare(&query)
-            .with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
-        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let n_cols = col_names.len();
+    #[derive(Debug, Clone)]
+    enum Value {
+        Null,
+        Integer(i64),
+        Real(f64),
+        Text(String),
+        Blob(usize), // length only - all this reader ever renders is "<blob: N bytes>"
+    }
 
+    fn value_to_string(
+        value: &Value,
+        kind_counts: &mut HashMap<&'static str, usize>,
+    ) -> Option<String> {
+        match value {
+            Value::Null => None,
+            Value::Integer(n) => {
+                *kind_counts.entry("i64").or_insert(0) += 1;
+                Some(n.to_string())
+            }
+            Value::Real(f) => {
+                *kind_counts.entry("f64").or_insert(0) += 1;
+                Some(f.to_string())
+            }
+            Value::Text(s) => {
+                *kind_counts.entry("String").or_insert(0) += 1;
+                Some(s.clone())
+            }
+            Value::Blob(len) => {
+                *kind_counts.entry("Blob").or_insert(0) += 1;
+                Some(format!("<blob: {len} bytes>"))
+            }
+        }
+    }
+
+    /// SQLite's own write-ahead log holds committed changes not yet
+    /// merged back into the base file - the real SQLite C library
+    /// reconciles it transparently on every open, which this hand-rolled
+    /// reader deliberately does not reimplement. Rather than silently
+    /// serve stale data (a real, disclosed scope boundary, not a silent
+    /// gap - the same "clean error over a wrong answer" choice every
+    /// other hand-roll in this project makes for its own out-of-scope
+    /// corner), a WAL file carrying more than just its own 32-byte header
+    /// (i.e. at least one real frame) is a hard, actionable error.
+    fn check_no_pending_wal(path: &Path) -> Result<()> {
+        let mut wal_name = path.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        let wal_path = PathBuf::from(wal_name);
+        if let Ok(meta) = fs::metadata(&wal_path)
+            && meta.len() > 32
+        {
+            bail!(
+                "{path:?} has a write-ahead log ({wal_path:?}) with pending, uncheckpointed \
+                 changes - run `PRAGMA wal_checkpoint(TRUNCATE);` (or close every connection \
+                 cleanly) before reading it with this tool"
+            );
+        }
+        Ok(())
+    }
+
+    fn read_header(data: &[u8], path: &Path) -> Result<DbHeader> {
+        if data.len() < 100 || &data[0..16] != b"SQLite format 3\0" {
+            bail!("{path:?} does not start with the SQLite file-format magic string");
+        }
+        let page_size_raw = u16::from_be_bytes([data[16], data[17]]);
+        let page_size: u32 = if page_size_raw == 1 {
+            65536
+        } else {
+            page_size_raw as u32
+        };
+        if page_size < 512 || (page_size & (page_size - 1)) != 0 {
+            bail!("{path:?} declares an invalid SQLite page size ({page_size})");
+        }
+        let reserved = data[20] as u32;
+        let usable_size = page_size.saturating_sub(reserved);
+        if usable_size < 480 {
+            bail!("{path:?} declares an invalid SQLite usable page size ({usable_size})");
+        }
+        let text_encoding = u32::from_be_bytes(data[56..60].try_into().unwrap());
+        Ok(DbHeader {
+            page_size,
+            usable_size,
+            text_encoding,
+        })
+    }
+
+    /// SQLite's own variable-length integer: up to 9 big-endian bytes,
+    /// the first 8 contributing 7 bits each behind a high continuation
+    /// bit, the 9th (if reached) contributing a full 8 bits with no
+    /// continuation bit of its own - verified directly against
+    /// sqlite.org's own file-format documentation.
+    fn read_varint(data: &[u8], offset: usize) -> Result<(i64, usize)> {
+        let mut result: i64 = 0;
+        for i in 0..8 {
+            let byte = *data.get(offset + i).context("truncated SQLite varint")?;
+            result = (result << 7) | (byte & 0x7f) as i64;
+            if byte & 0x80 == 0 {
+                return Ok((result, i + 1));
+            }
+        }
+        let byte = *data.get(offset + 8).context("truncated SQLite varint")?;
+        result = (result << 8) | byte as i64;
+        Ok((result, 9))
+    }
+
+    fn page_slice<'a>(
+        data: &'a [u8],
+        page_num: u32,
+        page_size: u32,
+        path: &Path,
+    ) -> Result<&'a [u8]> {
+        if page_num == 0 {
+            bail!("invalid SQLite page number 0 in {path:?}");
+        }
+        let start = (page_num as usize - 1) * page_size as usize;
+        let end = start + page_size as usize;
+        data.get(start..end).with_context(|| {
+            format!(
+                "SQLite page {page_num} is out of range in {path:?} (file truncated or corrupt)"
+            )
+        })
+    }
+
+    /// Walks a table b-tree (rowid table only - an index b-tree page type
+    /// here means the table uses WITHOUT ROWID storage, a disclosed,
+    /// unsupported shape) depth-first, appending every leaf row's
+    /// `(rowid, payload)` in ascending-rowid order - exactly the order an
+    /// index-free `SELECT *` returns rows in.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_table_rows(
+        data: &[u8],
+        page_num: u32,
+        page_size: u32,
+        usable_size: u32,
+        path: &Path,
+        depth: u32,
+        limit: Option<usize>,
+        out: &mut Vec<(i64, Vec<u8>)>,
+    ) -> Result<()> {
+        if limit.is_some_and(|n| out.len() >= n) {
+            return Ok(());
+        }
+        if depth > MAX_BTREE_DEPTH {
+            bail!(
+                "SQLite b-tree in {path:?} is nested past {MAX_BTREE_DEPTH} levels (likely a corrupt page-number cycle)"
+            );
+        }
+        let page = page_slice(data, page_num, page_size, path)?;
+        let hdr_off = if page_num == 1 { 100 } else { 0 };
+        let page_type = *page.get(hdr_off).context("truncated SQLite page header")?;
+        let num_cells = u16::from_be_bytes([
+            *page
+                .get(hdr_off + 3)
+                .context("truncated SQLite page header")?,
+            *page
+                .get(hdr_off + 4)
+                .context("truncated SQLite page header")?,
+        ]) as usize;
+        let (is_interior, header_len) = match page_type {
+            0x0d => (false, 8),
+            0x05 => (true, 12),
+            0x0a | 0x02 => bail!(
+                "page {page_num} in {path:?} is an index b-tree page - WITHOUT ROWID tables aren't supported"
+            ),
+            other => bail!(
+                "unrecognized SQLite b-tree page type {other:#04x} at page {page_num} in {path:?}"
+            ),
+        };
+        let cell_ptr_base = hdr_off + header_len;
+        for i in 0..num_cells {
+            if limit.is_some_and(|n| out.len() >= n) {
+                return Ok(());
+            }
+            let ptr_off = cell_ptr_base + i * 2;
+            let cell_off = u16::from_be_bytes([
+                *page
+                    .get(ptr_off)
+                    .context("truncated SQLite cell pointer array")?,
+                *page
+                    .get(ptr_off + 1)
+                    .context("truncated SQLite cell pointer array")?,
+            ]) as usize;
+            if is_interior {
+                let child = u32::from_be_bytes(
+                    page.get(cell_off..cell_off + 4)
+                        .context("truncated SQLite interior cell")?
+                        .try_into()
+                        .unwrap(),
+                );
+                collect_table_rows(
+                    data,
+                    child,
+                    page_size,
+                    usable_size,
+                    path,
+                    depth + 1,
+                    limit,
+                    out,
+                )?;
+            } else {
+                let (rowid, payload) =
+                    parse_leaf_cell(data, page, cell_off, page_size, usable_size, path)?;
+                out.push((rowid, payload));
+            }
+        }
+        if is_interior && limit.is_none_or(|n| out.len() < n) {
+            let rightmost = u32::from_be_bytes(
+                page.get(hdr_off + 8..hdr_off + 12)
+                    .context("truncated SQLite interior page header")?
+                    .try_into()
+                    .unwrap(),
+            );
+            collect_table_rows(
+                data,
+                rightmost,
+                page_size,
+                usable_size,
+                path,
+                depth + 1,
+                limit,
+                out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Table b-tree leaf cell: varint payload size, varint rowid, the
+    /// initial payload bytes, and - only when the payload is too large to
+    /// fit locally - a trailing 4-byte pointer to a linked list of
+    /// overflow pages. The `X`/`M`/`K` formulas are sqlite.org's own,
+    /// verified directly against its file-format documentation rather
+    /// than recalled from memory.
+    fn parse_leaf_cell(
+        data: &[u8],
+        page: &[u8],
+        cell_off: usize,
+        page_size: u32,
+        usable_size: u32,
+        path: &Path,
+    ) -> Result<(i64, Vec<u8>)> {
+        let (payload_size, n1) =
+            read_varint(page, cell_off).context("truncated SQLite leaf cell")?;
+        let (rowid, n2) = read_varint(page, cell_off + n1).context("truncated SQLite leaf cell")?;
+        if !(0..=MAX_ROW_PAYLOAD).contains(&payload_size) {
+            bail!("SQLite row payload size {payload_size} in {path:?} is out of a sane range");
+        }
+        let body_off = cell_off + n1 + n2;
+        let usable = usable_size as i64;
+        let x = usable - 35;
+        let payload = if payload_size <= x {
+            let end = body_off
+                .checked_add(payload_size as usize)
+                .context("SQLite leaf cell payload length overflow")?;
+            page.get(body_off..end)
+                .context("truncated SQLite leaf cell payload")?
+                .to_vec()
+        } else {
+            let m = ((usable - 12) * 32 / 255) - 23;
+            let k = m + ((payload_size - m) % (usable - 4));
+            let local_size = (if k <= x { k } else { m }) as usize;
+            let local_end = body_off
+                .checked_add(local_size)
+                .context("SQLite leaf cell local payload length overflow")?;
+            let mut buf = page
+                .get(body_off..local_end)
+                .context("truncated SQLite leaf cell local payload")?
+                .to_vec();
+            let overflow_off = local_end;
+            let mut next_page = u32::from_be_bytes(
+                page.get(overflow_off..overflow_off + 4)
+                    .context("truncated SQLite overflow page pointer")?
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut remaining = payload_size - local_size as i64;
+            let mut guard = 0u32;
+            while next_page != 0 && remaining > 0 {
+                guard += 1;
+                if guard > MAX_OVERFLOW_PAGES {
+                    bail!(
+                        "SQLite overflow chain in {path:?} is unreasonably long (possibly corrupt or cyclic)"
+                    );
+                }
+                let opage = page_slice(data, next_page, page_size, path)?;
+                let follow = u32::from_be_bytes(opage[0..4].try_into().unwrap());
+                let capacity = usable - 4;
+                let take = remaining.min(capacity) as usize;
+                buf.extend_from_slice(
+                    opage
+                        .get(4..4 + take)
+                        .context("truncated SQLite overflow page")?,
+                );
+                remaining -= take as i64;
+                next_page = follow;
+            }
+            if remaining > 0 {
+                bail!("SQLite overflow chain in {path:?} ended before the full payload was read");
+            }
+            buf
+        };
+        Ok((rowid, payload))
+    }
+
+    /// SQLite's own record format: a varint-prefixed header of one
+    /// serial-type varint per column, followed by the values themselves
+    /// in the same order. Serial type codes verified directly against
+    /// sqlite.org's own file-format documentation.
+    fn decode_record(payload: &[u8]) -> Result<Vec<Value>> {
+        let (header_len, n) = read_varint(payload, 0).context("truncated SQLite record header")?;
+        if header_len < n as i64 {
+            bail!("SQLite record header length is smaller than its own varint");
+        }
+        let header_end = header_len as usize;
+        let mut off = n;
+        let mut serial_types = Vec::new();
+        while off < header_end {
+            let (st, sn) = read_varint(payload, off).context("truncated SQLite record header")?;
+            serial_types.push(st);
+            off += sn;
+        }
+        let mut body_off = header_end;
+        let mut values = Vec::with_capacity(serial_types.len());
+        for st in serial_types {
+            let (value, size) = decode_serial(payload, body_off, st)?;
+            values.push(value);
+            body_off += size;
+        }
+        Ok(values)
+    }
+
+    fn decode_serial(payload: &[u8], off: usize, serial_type: i64) -> Result<(Value, usize)> {
+        Ok(match serial_type {
+            0 => (Value::Null, 0),
+            1 => (
+                Value::Integer(
+                    *payload.get(off).context("truncated SQLite record value")? as i8 as i64,
+                ),
+                1,
+            ),
+            2 => {
+                let b = payload
+                    .get(off..off + 2)
+                    .context("truncated SQLite record value")?;
+                (
+                    Value::Integer(i16::from_be_bytes(b.try_into().unwrap()) as i64),
+                    2,
+                )
+            }
+            3 => {
+                let b = payload
+                    .get(off..off + 3)
+                    .context("truncated SQLite record value")?;
+                let mut v = ((b[0] as i32) << 16) | ((b[1] as i32) << 8) | (b[2] as i32);
+                if b[0] & 0x80 != 0 {
+                    v -= 1 << 24;
+                }
+                (Value::Integer(v as i64), 3)
+            }
+            4 => {
+                let b = payload
+                    .get(off..off + 4)
+                    .context("truncated SQLite record value")?;
+                (
+                    Value::Integer(i32::from_be_bytes(b.try_into().unwrap()) as i64),
+                    4,
+                )
+            }
+            5 => {
+                let b = payload
+                    .get(off..off + 6)
+                    .context("truncated SQLite record value")?;
+                let mut buf = [0u8; 8];
+                buf[2..8].copy_from_slice(b);
+                let mut v = i64::from_be_bytes(buf);
+                if b[0] & 0x80 != 0 {
+                    v -= 1 << 48;
+                }
+                (Value::Integer(v), 6)
+            }
+            6 => {
+                let b = payload
+                    .get(off..off + 8)
+                    .context("truncated SQLite record value")?;
+                (Value::Integer(i64::from_be_bytes(b.try_into().unwrap())), 8)
+            }
+            7 => {
+                let b = payload
+                    .get(off..off + 8)
+                    .context("truncated SQLite record value")?;
+                (Value::Real(f64::from_be_bytes(b.try_into().unwrap())), 8)
+            }
+            8 => (Value::Integer(0), 0),
+            9 => (Value::Integer(1), 0),
+            10 | 11 => bail!("SQLite record uses reserved serial type {serial_type}"),
+            n if n >= 12 => {
+                if n % 2 == 0 {
+                    let len = ((n - 12) / 2) as usize;
+                    (Value::Blob(len), len)
+                } else {
+                    let len = ((n - 13) / 2) as usize;
+                    let end = off
+                        .checked_add(len)
+                        .context("SQLite record text length overflow")?;
+                    let bytes = payload
+                        .get(off..end)
+                        .context("truncated SQLite record text value")?;
+                    let text = String::from_utf8(bytes.to_vec())
+                        .map_err(|_| anyhow!("SQLite TEXT value is not valid UTF-8"))?;
+                    (Value::Text(text), len)
+                }
+            }
+            other => bail!("negative or invalid SQLite serial type {other}"),
+        })
+    }
+
+    struct SchemaEntry {
+        name: String,
+        rootpage: u32,
+        sql: String,
+    }
+
+    /// `sqlite_master`'s root page is always page 1 by construction - one
+    /// more fixed fact of the file format, not something to look up.
+    fn read_schema(data: &[u8], header: &DbHeader, path: &Path) -> Result<Vec<SchemaEntry>> {
+        let mut rows = Vec::new();
+        collect_table_rows(
+            data,
+            1,
+            header.page_size,
+            header.usable_size,
+            path,
+            0,
+            None,
+            &mut rows,
+        )
+        .with_context(|| format!("failed reading the SQLite schema (sqlite_master) in {path:?}"))?;
+
+        let mut entries = Vec::new();
+        for (_rowid, payload) in rows {
+            let values = decode_record(&payload)
+                .with_context(|| format!("failed decoding a sqlite_master row in {path:?}"))?;
+            if values.len() < 5 {
+                continue;
+            }
+            let Value::Text(kind) = &values[0] else {
+                continue;
+            };
+            if kind != "table" {
+                continue;
+            }
+            let Value::Text(name) = &values[1] else {
+                continue;
+            };
+            // Mirrors `NOT LIKE 'sqlite_%'`, which SQLite's own LIKE
+            // operator evaluates case-insensitively for ASCII.
+            if name.to_ascii_lowercase().starts_with("sqlite_") {
+                continue;
+            }
+            let Value::Integer(rootpage) = &values[3] else {
+                continue;
+            };
+            if *rootpage <= 0 {
+                continue;
+            }
+            let sql = match &values[4] {
+                Value::Text(s) => s.clone(),
+                _ => String::new(),
+            };
+            entries.push(SchemaEntry {
+                name: name.clone(),
+                rootpage: *rootpage as u32,
+                sql,
+            });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
+    struct ParsedTable {
+        columns: Vec<String>,
+        rowid_alias_index: Option<usize>,
+        without_rowid: bool,
+        // Whether each column's declared type resolves to REAL affinity -
+        // the one affinity that needs special handling on *read*, not
+        // just at write time (see `apply_affinity`).
+        real_affinity: Vec<bool>,
+    }
+
+    fn contains_word(haystack: &str, word: &str) -> bool {
+        haystack
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|w| w == word)
+    }
+
+    /// SQLite's own "Determination Of Column Affinity" algorithm
+    /// (sqlite.org/datatype3.html), five substring rules checked in
+    /// order - verified directly against that page's exact wording
+    /// rather than recalled from memory, since a real oracle-comparison
+    /// mismatch on `sample.sqlite`'s `amount REAL` column (a whole-number
+    /// value silently stored on disk as an integer, then read back as a
+    /// float - see the sibling `apply_affinity` doc comment) is exactly
+    /// what surfaced the need for this in the first place.
+    fn column_affinity_is_real(type_name: &str) -> bool {
+        let t = type_name.to_ascii_uppercase();
+        let is_integer = t.contains("INT");
+        let is_text = t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT");
+        let is_blob = t.contains("BLOB") || t.trim().is_empty();
+        !is_integer
+            && !is_text
+            && !is_blob
+            && (t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB"))
+    }
+
+    /// A REAL-affinity column's whole-number values are, per sqlite.org's
+    /// own documented internal optimization, "written to disk as integers
+    /// in order to take up less space and are automatically converted
+    /// back into floating point as the value is read out. This
+    /// optimization is completely invisible at the SQL level and can
+    /// only be detected by examining the raw bits of the database file" -
+    /// exactly the raw bits this hand-rolled reader examines directly,
+    /// so it has to replicate the read-time conversion `rusqlite`/the
+    /// real SQLite C library apply, or it reports a storage-class detail
+    /// no query against the same file would ever actually see. No other
+    /// affinity gets an equivalent read-time rewrite (NUMERIC affinity
+    /// may use the same integer-storage optimization for a whole-number
+    /// float, but - unlike REAL affinity - is *not* documented to convert
+    /// it back on read, a well-known asymmetry).
+    fn apply_affinity(value: Value, is_real_affinity: bool) -> Value {
+        match value {
+            Value::Integer(n) if is_real_affinity => Value::Real(n as f64),
+            other => other,
+        }
+    }
+
+    const COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
+        "primary",
+        "not",
+        "null",
+        "default",
+        "unique",
+        "check",
+        "references",
+        "collate",
+        "generated",
+        "as",
+        "constraint",
+    ];
+
+    /// Finds where a column's declared-type text ends and its own
+    /// constraints begin, by locating the first whole-word match (case-
+    /// insensitive) of a real column-constraint keyword - needed because
+    /// a declared type can be multiple words (`DOUBLE PRECISION`,
+    /// `UNSIGNED BIG INT`), so affinity has to be computed over the whole
+    /// span, not just the first token.
+    fn first_keyword_boundary(s: &[char], start: usize, end: usize, keywords: &[&str]) -> usize {
+        let mut i = start;
+        while i < end {
+            if s[i].is_alphanumeric() || s[i] == '_' {
+                let word_start = i;
+                while i < end && (s[i].is_alphanumeric() || s[i] == '_') {
+                    i += 1;
+                }
+                let word: String = s[word_start..i]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if keywords.contains(&word.as_str()) {
+                    return word_start;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        end
+    }
+
+    /// Replaces `-- line` and `/* block */` comments with a single space
+    /// each, leaving everything else - including quoted strings and
+    /// identifiers, verbatim - untouched. Quote-aware so a literal `--`
+    /// or `/*` inside a string default (`DEFAULT '--not a comment'`)
+    /// isn't mistaken for a real comment.
+    fn strip_comments(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '\'' | '"' | '`' => {
+                    let quote = chars[i];
+                    out.push(quote);
+                    i += 1;
+                    while i < chars.len() {
+                        out.push(chars[i]);
+                        if chars[i] == quote {
+                            if chars.get(i + 1) == Some(&quote) {
+                                out.push(chars[i + 1]);
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                '[' => {
+                    out.push('[');
+                    i += 1;
+                    while i < chars.len() {
+                        out.push(chars[i]);
+                        let end = chars[i] == ']';
+                        i += 1;
+                        if end {
+                            break;
+                        }
+                    }
+                }
+                '-' if chars.get(i + 1) == Some(&'-') => {
+                    i += 2;
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    out.push(' ');
+                }
+                '/' if chars.get(i + 1) == Some(&'*') => {
+                    i += 2;
+                    while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                        i += 1;
+                    }
+                    i = (i + 2).min(chars.len());
+                    out.push(' ');
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    fn find_first_top_level_char(s: &[char], target: char) -> Option<usize> {
+        let mut i = 0;
+        while i < s.len() {
+            match s[i] {
+                '\'' | '"' | '`' => {
+                    let quote = s[i];
+                    i += 1;
+                    while i < s.len() {
+                        if s[i] == quote {
+                            if s.get(i + 1) == Some(&quote) {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                '[' => {
+                    i += 1;
+                    while i < s.len() && s[i] != ']' {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                c if c == target => return Some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn find_matching_paren(s: &[char], open_idx: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut i = open_idx;
+        while i < s.len() {
+            match s[i] {
+                '\'' | '"' | '`' => {
+                    let quote = s[i];
+                    i += 1;
+                    while i < s.len() {
+                        if s[i] == quote {
+                            if s.get(i + 1) == Some(&quote) {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                '[' => {
+                    i += 1;
+                    while i < s.len() && s[i] != ']' {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn split_top_level_commas(s: &[char], start: usize, end: usize) -> Vec<(usize, usize)> {
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut item_start = start;
+        let mut i = start;
+        while i < end {
+            match s[i] {
+                '\'' | '"' | '`' => {
+                    let quote = s[i];
+                    i += 1;
+                    while i < end {
+                        if s[i] == quote {
+                            if s.get(i + 1) == Some(&quote) {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                '[' => {
+                    i += 1;
+                    while i < end && s[i] != ']' {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push((item_start, i));
+                    item_start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        items.push((item_start, end));
+        items
+    }
+
+    /// Reads one identifier (quoted via `"..."`/`` `...` ``/`'...'`/`[...]`,
+    /// or a bare word) starting at the first non-whitespace character in
+    /// `[start, end)`. Returns the identifier text and the index right
+    /// after it.
+    fn extract_identifier(s: &[char], start: usize, end: usize) -> Option<(String, usize)> {
+        let mut i = start;
+        while i < end && s[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= end {
+            return None;
+        }
+        match s[i] {
+            '"' | '`' | '\'' => {
+                let quote = s[i];
+                i += 1;
+                let mut name = String::new();
+                while i < end {
+                    if s[i] == quote {
+                        if s.get(i + 1) == Some(&quote) {
+                            name.push(quote);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    name.push(s[i]);
+                    i += 1;
+                }
+                Some((name, i))
+            }
+            '[' => {
+                i += 1;
+                let mut name = String::new();
+                while i < end && s[i] != ']' {
+                    name.push(s[i]);
+                    i += 1;
+                }
+                i += 1;
+                Some((name, i))
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let word_start = i;
+                while i < end && (s[i].is_alphanumeric() || s[i] == '_' || s[i] == '$') {
+                    i += 1;
+                }
+                Some((s[word_start..i].iter().collect(), i))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extracts column names (in declared order) and detects the two
+    /// things `SELECT *` needs beyond raw record decoding: a rowid-alias
+    /// `INTEGER PRIMARY KEY` column (whose serial type is always 0/NULL
+    /// in the record itself - the true value lives in the cell's own
+    /// rowid varint instead) and `WITHOUT ROWID` storage (a disclosed,
+    /// unsupported table shape - see the module doc comment). This is
+    /// deliberately not a general SQL parser: just enough tokenizing
+    /// (quotes, comments, paren depth) to correctly segment column
+    /// definitions from table-level constraint clauses, the same "just
+    /// enough, not a general evaluator" scope every other small hand-
+    /// rolled parser in this project keeps.
+    fn parse_create_table(sql: &str) -> Result<ParsedTable> {
+        let cleaned = strip_comments(sql);
+        let chars: Vec<char> = cleaned.chars().collect();
+
+        let open = find_first_top_level_char(&chars, '(')
+            .context("no column-definition list found (expected `CREATE TABLE ... (...)`)")?;
+        let close = find_matching_paren(&chars, open)
+            .context("unbalanced parentheses in CREATE TABLE column list")?;
+
+        let tail: String = chars[close + 1..].iter().collect();
+        let tail_lower = tail.to_ascii_lowercase();
+        let without_rowid =
+            contains_word(&tail_lower, "without") && contains_word(&tail_lower, "rowid");
+
+        let items = split_top_level_commas(&chars, open + 1, close);
+        let mut columns = Vec::new();
+        let mut col_types_are_integer = Vec::new();
+        let mut real_affinity = Vec::new();
+        let mut inline_rowid_alias = None;
+        let mut pk_constraint_text: Option<String> = None;
+
+        for (item_start, item_end) in items {
+            let text: String = chars[item_start..item_end].iter().collect();
+            if text.trim().is_empty() {
+                continue;
+            }
+            let lower = text.trim_start().to_ascii_lowercase();
+            let is_table_constraint = lower.starts_with("primary")
+                || lower.starts_with("foreign")
+                || lower.starts_with("unique")
+                || lower.starts_with("check")
+                || lower.starts_with("constraint");
+            if is_table_constraint {
+                if contains_word(&lower, "primary") && contains_word(&lower, "key") {
+                    pk_constraint_text = Some(text);
+                }
+                continue;
+            }
+
+            let (name, after) = extract_identifier(&chars, item_start, item_end)
+                .context("could not find a column name in a CREATE TABLE column definition")?;
+            let rest: String = chars[after..item_end].iter().collect();
+            let rest_lower = rest.to_ascii_lowercase();
+            let trimmed_rest = rest_lower.trim_start();
+            let type_end =
+                first_keyword_boundary(&chars, after, item_end, COLUMN_CONSTRAINT_KEYWORDS);
+            let type_name: String = chars[after..type_end].iter().collect();
+            real_affinity.push(column_affinity_is_real(&type_name));
+            // Only the literal type name "INTEGER" (case-insensitively)
+            // triggers rowid-aliasing - other integer-affinity spellings
+            // like "INT"/"BIGINT" deliberately do not, matching SQLite's
+            // own documented, easy-to-miss exact-spelling rule.
+            let type_is_integer = trimmed_rest.starts_with("integer")
+                && trimmed_rest[7..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            if type_is_integer
+                && contains_word(&rest_lower, "primary")
+                && contains_word(&rest_lower, "key")
+                && inline_rowid_alias.is_none()
+            {
+                let after_primary = rest_lower
+                    .find("primary")
+                    .map(|p| p + "primary".len())
+                    .unwrap_or(0);
+                if !contains_word(&rest_lower[after_primary..], "desc") {
+                    inline_rowid_alias = Some(columns.len());
+                }
+            }
+            col_types_are_integer.push(type_is_integer);
+            columns.push(name);
+        }
+
+        if columns.is_empty() {
+            bail!("no column definitions found");
+        }
+
+        let mut rowid_alias_index = inline_rowid_alias;
+        if rowid_alias_index.is_none()
+            && !without_rowid
+            && let Some(pk_text) = &pk_constraint_text
+        {
+            let pk_lower = pk_text.to_ascii_lowercase();
+            if !contains_word(&pk_lower, "desc")
+                && let (Some(op), Some(cl)) = (pk_text.find('('), pk_text.rfind(')'))
+            {
+                let inner = &pk_text[op + 1..cl];
+                let names: Vec<&str> = inner
+                    .split(',')
+                    .map(|s| {
+                        s.trim().trim_matches(|c| {
+                            c == '"' || c == '`' || c == '[' || c == ']' || c == '\''
+                        })
+                    })
+                    .collect();
+                if names.len() == 1
+                    && let Some(idx) = columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(names[0]))
+                    && col_types_are_integer.get(idx).copied().unwrap_or(false)
+                {
+                    rowid_alias_index = Some(idx);
+                }
+            }
+        }
+
+        Ok(ParsedTable {
+            columns,
+            rowid_alias_index: if without_rowid {
+                None
+            } else {
+                rowid_alias_index
+            },
+            without_rowid,
+            real_affinity,
+        })
+    }
+
+    fn profile_table(
+        data: &[u8],
+        header: &DbHeader,
+        entry: &SchemaEntry,
+        nrows: Option<usize>,
+        n_samples: usize,
+        path: &Path,
+    ) -> Result<Vec<ColumnProfile>> {
+        let parsed = parse_create_table(&entry.sql)?;
+        if parsed.without_rowid {
+            bail!("uses WITHOUT ROWID storage, which isn't supported");
+        }
+
+        let mut rows = Vec::new();
+        collect_table_rows(
+            data,
+            entry.rootpage,
+            header.page_size,
+            header.usable_size,
+            path,
+            0,
+            nrows,
+            &mut rows,
+        )
+        .with_context(|| format!("failed reading rows for table '{}'", entry.name))?;
+
+        let n_cols = parsed.columns.len();
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
         let mut kind_counts: Vec<HashMap<&'static str, usize>> = vec![HashMap::new(); n_cols];
 
-        let mut rows = stmt
-            .query([])
-            .with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
-        while let Some(row) = rows
-            .next()
-            .with_context(|| format!("failed reading a row from '{table}' in {path:?}"))?
-        {
+        for (rowid, payload) in rows {
+            let values = decode_record(&payload)?;
             for i in 0..n_cols {
-                let value_ref = row.get_ref(i).with_context(|| {
-                    format!("failed reading a value from '{table}' in {path:?}")
-                })?;
-                let value = match value_ref {
-                    ValueRef::Null => None,
-                    ValueRef::Integer(v) => {
-                        *kind_counts[i].entry("i64").or_insert(0) += 1;
-                        Some(v.to_string())
-                    }
-                    ValueRef::Real(v) => {
-                        *kind_counts[i].entry("f64").or_insert(0) += 1;
-                        Some(v.to_string())
-                    }
-                    ValueRef::Text(t) => {
-                        *kind_counts[i].entry("String").or_insert(0) += 1;
-                        Some(String::from_utf8_lossy(t).into_owned())
-                    }
-                    ValueRef::Blob(b) => {
-                        *kind_counts[i].entry("Blob").or_insert(0) += 1;
-                        Some(format!("<blob: {} bytes>", b.len()))
-                    }
+                // A record can legitimately have fewer values than the
+                // table's current column count (rows written before a
+                // later `ALTER TABLE ADD COLUMN`) - treated as NULL for
+                // that column, the same graceful-degradation choice every
+                // other reader in this project makes for a short row.
+                let value = values.get(i).cloned().unwrap_or(Value::Null);
+                let value = if Some(i) == parsed.rowid_alias_index && matches!(value, Value::Null) {
+                    Value::Integer(rowid)
+                } else {
+                    value
                 };
-                raw[i].push(value);
+                let value = apply_affinity(value, parsed.real_affinity[i]);
+                raw[i].push(value_to_string(&value, &mut kind_counts[i]));
             }
         }
 
         let mut profiles = Vec::new();
-        for (i, name) in col_names.into_iter().enumerate() {
+        for (i, name) in parsed.columns.into_iter().enumerate() {
             let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
             let current_type = if kind_counts[i].is_empty() {
                 "null".to_string()
@@ -11522,9 +12477,56 @@ fn columns_from_sqlite(
             };
             profiles.push(profile_column(col, n_samples));
         }
-        out.push((table, profiles));
+        Ok(profiles)
     }
-    Ok(out)
+
+    pub(crate) fn columns_from_sqlite(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        check_no_pending_wal(path)?;
+        let data = fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
+        let header = read_header(&data, path)?;
+        if header.text_encoding != 0 && header.text_encoding != 1 {
+            bail!(
+                "{path:?} uses SQLite text encoding {} (UTF-16), which isn't supported - only UTF-8 databases are",
+                header.text_encoding
+            );
+        }
+
+        let entries = read_schema(&data, &header, path)?;
+        if entries.is_empty() {
+            bail!("no user tables found in {path:?}");
+        }
+
+        let mut out = Vec::new();
+        for entry in entries {
+            let profiles = match profile_table(&data, &header, &entry, nrows, n_samples, path) {
+                Ok(p) => p,
+                Err(e) => vec![ColumnProfile {
+                    name: "value".to_string(),
+                    current_type: "unknown".to_string(),
+                    ideal_type: "String".to_string(),
+                    description: String::new(),
+                    missing_pct: 0.0,
+                    sample_values: Vec::new(),
+                    notes: format!("table '{}' could not be profiled: {e}", entry.name),
+                }],
+            };
+            out.push((entry.name, profiles));
+        }
+        Ok(out)
+    }
+} // mod sqlite_support
+
+#[cfg(feature = "sqlite")]
+fn columns_from_sqlite(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    sqlite_support::columns_from_sqlite(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "sqlite"))]
@@ -21032,6 +22034,159 @@ mod tests {
                     "{f} col '{}': sample_values",
                     m.name
                 );
+            }
+        }
+    }
+
+    /// Cross-verification oracle for the hand-rolled SQLite reader
+    /// (`sqlite_support` - see Cargo.toml) - a near-verbatim copy of this
+    /// project's own former `rusqlite`-based `columns_from_sqlite`, kept
+    /// as a dev-only dependency for exactly this purpose. Unlike every
+    /// other oracle in this file, `rusqlite` was never itself a Rust
+    /// reimplementation of the on-disk format - it's an FFI binding over
+    /// the real, linked SQLite C library - so this comparison is against
+    /// a genuinely independent codebase, not just a different Rust parser
+    /// of the same spec.
+    #[cfg(all(test, feature = "sqlite"))]
+    fn columns_from_sqlite_via_rusqlite(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        use rusqlite::Connection;
+        use rusqlite::types::ValueRef;
+
+        let conn = Connection::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut table_stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .with_context(|| format!("failed to list tables in {path:?}"))?;
+        let table_names: Vec<String> = table_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect)
+            .with_context(|| format!("failed to list tables in {path:?}"))?;
+        drop(table_stmt);
+
+        if table_names.is_empty() {
+            bail!("no user tables found in {path:?}");
+        }
+
+        let mut out = Vec::new();
+        for table in table_names {
+            let query = match nrows {
+                Some(n) => format!("SELECT * FROM \"{table}\" LIMIT {n}"),
+                None => format!("SELECT * FROM \"{table}\""),
+            };
+            let mut stmt = conn
+                .prepare(&query)
+                .with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
+            let col_names: Vec<String> =
+                stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let n_cols = col_names.len();
+
+            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
+            let mut kind_counts: Vec<HashMap<&'static str, usize>> = vec![HashMap::new(); n_cols];
+
+            let mut rows = stmt
+                .query([])
+                .with_context(|| format!("failed to query table '{table}' in {path:?}"))?;
+            while let Some(row) = rows
+                .next()
+                .with_context(|| format!("failed reading a row from '{table}' in {path:?}"))?
+            {
+                for i in 0..n_cols {
+                    let value_ref = row.get_ref(i).with_context(|| {
+                        format!("failed reading a value from '{table}' in {path:?}")
+                    })?;
+                    let value = match value_ref {
+                        ValueRef::Null => None,
+                        ValueRef::Integer(v) => {
+                            *kind_counts[i].entry("i64").or_insert(0) += 1;
+                            Some(v.to_string())
+                        }
+                        ValueRef::Real(v) => {
+                            *kind_counts[i].entry("f64").or_insert(0) += 1;
+                            Some(v.to_string())
+                        }
+                        ValueRef::Text(t) => {
+                            *kind_counts[i].entry("String").or_insert(0) += 1;
+                            Some(String::from_utf8_lossy(t).into_owned())
+                        }
+                        ValueRef::Blob(b) => {
+                            *kind_counts[i].entry("Blob").or_insert(0) += 1;
+                            Some(format!("<blob: {} bytes>", b.len()))
+                        }
+                    };
+                    raw[i].push(value);
+                }
+            }
+
+            let mut profiles = Vec::new();
+            for (i, name) in col_names.into_iter().enumerate() {
+                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let current_type = if kind_counts[i].is_empty() {
+                    "null".to_string()
+                } else {
+                    describe_sql_kinds(&kind_counts[i])
+                };
+                let col = ColumnInput {
+                    name,
+                    current_type,
+                    raw_values: non_null,
+                    total: raw[i].len(),
+                    skip_heuristics: false,
+                };
+                profiles.push(profile_column(col, n_samples));
+            }
+            out.push((table, profiles));
+        }
+        Ok(out)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_reader_matches_the_rusqlite_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.sqlite",
+            "tests/fixtures/edge_sqlite_view_excluded.sqlite",
+            "tests/fixtures/type_detection.sqlite",
+            "tests/fixtures/edge_zero_rows.sqlite",
+            "tests/fixtures/edge_sqlite_overflow_pages.sqlite",
+            "tests/fixtures/edge_sqlite_table_level_primary_key.sqlite",
+        ] {
+            let path = Path::new(f);
+            let mine = sqlite_support::columns_from_sqlite(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_sqlite_via_rusqlite(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: rusqlite-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|(t, _)| t).collect::<Vec<_>>(),
+                theirs.iter().map(|(t, _)| t).collect::<Vec<_>>(),
+                "{f}: table names differ"
+            );
+            for ((mt, mcols), (_, tcols)) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    mcols.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                    tcols.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                    "{f} table '{mt}': column names differ"
+                );
+                for (m, t) in mcols.iter().zip(tcols.iter()) {
+                    assert_eq!(
+                        m.current_type, t.current_type,
+                        "{f} table '{mt}' col '{}': current_type",
+                        m.name
+                    );
+                    assert_eq!(
+                        m.ideal_type, t.ideal_type,
+                        "{f} table '{mt}' col '{}': ideal_type",
+                        m.name
+                    );
+                    assert_eq!(
+                        m.sample_values, t.sample_values,
+                        "{f} table '{mt}' col '{}': sample_values",
+                        m.name
+                    );
+                }
             }
         }
     }

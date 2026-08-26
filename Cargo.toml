@@ -7,7 +7,6 @@ edition = "2024"
 serde_json = "1.0.151"
 arrow = { version = "59.2.0", features = ["ipc", "ipc_compression", "chrono-tz"], optional = true }
 parquet = { version = "59.2.0", features = ["arrow"], optional = true }
-rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 # No "derive" feature - ColumnProfile's own Serialize impl is hand-written
 # (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
 # still needed for that impl's own `S: serde::Serializer` bound.
@@ -22,7 +21,7 @@ parquet = ["dep:arrow", "dep:parquet"]
 xlsx = []
 avro = []
 full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat"]
-sqlite = ["dep:rusqlite"]
+sqlite = []
 msgpack = []
 toml = []
 yaml = []
@@ -135,6 +134,18 @@ dta = "0.6.0"
 # outside tests.
 apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
 num-bigint = "0.4"
+# Same dev-only treatment, same reason: the `sqlite` feature's own hand-
+# rolled reader (`sqlite_support` in src/lib.rs - direct B-tree page
+# traversal, record decoding, and a small CREATE-TABLE-column-name
+# parser) replaced this at runtime; kept only as this project's own
+# cross-verification oracle in
+# `sqlite_reader_matches_the_rusqlite_crate_output_exactly`
+# (`#[cfg(all(test, feature = "sqlite"))]` in src/lib.rs). Unlike every
+# other crate in this list, `rusqlite` was never a Rust reimplementation
+# of its format to begin with - it's an FFI binding over the real, linked
+# SQLite C library - so it still serves as a genuine independent oracle
+# (a different codebase entirely, not just a different Rust parser).
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

@@ -3968,6 +3968,165 @@ this project could just implement directly rather than depend on:
   crash) is expected for a format whose header is largely human-readable
   text, not a gap.
 
+- **`rusqlite` → a hand-rolled reader (`sqlite_support`).** The one
+  crate in this whole effort where "read the crate's own source" - the
+  discipline behind every other hand-roll in this file - genuinely
+  doesn't apply: `rusqlite` is a thin FFI binding over the real, linked
+  SQLite C library, not a Rust reimplementation of the on-disk format, so
+  there's no Rust source tree that actually describes the file's byte
+  layout. The authoritative source here was SQLite's own published file-
+  format specification (sqlite.org/fileformat2.html, cross-checked
+  against sqlite.org/datatype3.html for affinity rules) instead - fetched
+  and quoted directly rather than recalled from memory, the same
+  discipline every other hand-roll in this file applies to a crate's
+  source, just pointed at a different kind of authoritative document.
+
+  Scope is deliberately narrow, matching exactly what this project's own
+  usage ever asked SQLite to do: list user tables from `sqlite_master`,
+  then an unfiltered, unordered full table scan (`SELECT * FROM t`) per
+  table - no `WHERE`/`JOIN`/aggregation/index lookups of any kind. That
+  narrowness is what makes a full embedded-database engine tractable to
+  hand-roll at all: only the **table b-tree** (never an index b-tree)
+  ever needs walking, and a plain depth-first left-to-right traversal of
+  its cells is already exactly the rowid-ascending order a real, index-
+  free `SELECT *` returns.
+
+  The format itself layers cleanly: a 100-byte file header (magic string,
+  page size - including the special `0x0001` encoding for 65536, and
+  reserved-bytes-per-page, which together give the *usable* page size
+  every offset formula below is computed against); a big-endian varint
+  (up to 9 bytes, the first 8 contributing 7 bits each behind a
+  continuation bit, the 9th contributing a full 8 bits with none) used
+  throughout for lengths, rowids, and record header fields; b-tree pages
+  (an 8- or 12-byte header plus a cell-pointer array) of four types, of
+  which only two - table leaf (`0x0d`) and table interior (`0x05`) -
+  are ever walked, since a table using the other two (an index b-tree)
+  means `WITHOUT ROWID` storage (see below); a table leaf cell (varint
+  payload size, varint rowid, initial payload bytes, and - only past a
+  computed local-payload threshold - a 4-byte pointer into a linked list
+  of overflow pages, each a 4-byte next-page pointer plus payload bytes);
+  and, inside that payload, SQLite's own record format (a varint-prefixed
+  header of one serial-type varint per column, each code mapping to a
+  fixed-width integer/float, one of two zero-width shortcuts for the
+  integers 0/1, or a length-derived BLOB/TEXT). Every formula (`X = U -
+  35` for the max local payload, `M = ((U-12)*32/255) - 23` for the
+  minimum, `K = M + ((P-M) % (U-4))` for the actual local size once a
+  payload overflows) is sqlite.org's own, quoted directly rather than
+  re-derived, the same "verify against source" bar every other hand-roll
+  in this file already holds itself to.
+
+  Two things genuinely beyond raw b-tree/record decoding were needed to
+  match `SELECT *`'s real behavior, both found by testing against
+  `rusqlite` rather than reasoned out in advance:
+    1. **Column names have no home in the record format at all** - a row
+       is just positional values, so the table's own `CREATE TABLE`
+       statement (stored as a `TEXT` column in `sqlite_master`) has to be
+       parsed to get column names in order. `parse_create_table` is
+       deliberately not a general SQL parser, the same "just enough, not
+       a general evaluator" scope every other small hand-rolled parser in
+       this project keeps (`ini_support`, `toml_support`'s document-
+       structure layer): a quote-and-comment-aware character scanner
+       finds the top-level `(...)` column-list span, splits it into
+       comma-separated items at paren-depth zero (so a `CHECK(a > 0)` or
+       `DECIMAL(10,2)`'s own internal comma never causes a false split),
+       and classifies each item as a table-level constraint (skipped) or
+       a column definition (first token = the name, quoted via
+       `"..."`/`` `...` ``/`'...'`/`[...]` or bare). This also has to
+       resolve two more real SQLite behaviors the record format alone
+       can't reveal: an `INTEGER PRIMARY KEY` column (inline, or a
+       single-column table-level `PRIMARY KEY(col)` referencing an
+       `INTEGER`-typed column, per SQLite's own documented rule - checked
+       for a trailing `DESC`, which specifically disables the alias) is a
+       rowid alias, so a `NULL` serial type in *that* column's record
+       position means "use the cell's own rowid," not a genuine null; and
+       `WITHOUT ROWID` in the table's tail (after the column list) means
+       the table is stored as an index b-tree keyed by its declared
+       primary key instead - a real, disclosed, unsupported shape (see
+       below), not a guess.
+    2. **A real oracle-comparison mismatch, not a hypothetical one,
+       caught a genuine SQLite storage-format subtlety the file-format
+       page alone doesn't mention**: this project's own `sample.sqlite`
+       fixture's `amount REAL` column, cross-checked against `rusqlite`,
+       disagreed on one row's `current_type` - `mixed(String: 1, f64: 1,
+       i64: 1)` from this reader versus `mixed(String: 1, f64: 2)` from
+       `rusqlite`. Tracing it down (and confirming against
+       sqlite.org/datatype3.html directly rather than assuming) landed on
+       a specific, well-documented optimization: "a column with REAL
+       affinity... forces integer values into floating point
+       representation... small floating point values with no fractional
+       component and stored in columns with REAL affinity are written to
+       disk as integers in order to take up less space and are
+       automatically converted back into floating point as the value is
+       read out. This optimization is completely invisible at the SQL
+       level and can only be detected by examining the raw bits of the
+       database file" - exactly the raw bits this reader examines
+       directly. `column_affinity_is_real` implements sqlite.org's own
+       five-rule "Determination Of Column Affinity" algorithm (checked in
+       order: `"INT"` → INTEGER, `"CHAR"`/`"CLOB"`/`"TEXT"` → TEXT,
+       `"BLOB"` or empty → BLOB, `"REAL"`/`"FLOA"`/`"DOUB"` → REAL,
+       otherwise NUMERIC - substrings quoted verbatim from the spec, not
+       paraphrased) against each column's declared type (bounded to just
+       the type-name span via `first_keyword_boundary`, since a type can
+       be multiple words like `DOUBLE PRECISION` or `UNSIGNED BIG INT`,
+       and a real column-constraint keyword like `DEFAULT`/`CHECK` must
+       not be swept into the affinity check), and `apply_affinity`
+       converts an integer-serial-type value back to a float exactly when
+       the owning column has REAL affinity - matching the one affinity
+       documented to do this on *read*, deliberately not extended to
+       NUMERIC affinity's own similar write-time integer-storage
+       optimization, which sqlite.org does *not* document as being
+       converted back (a well-known asymmetry, and the reason "declare
+       REAL if you want floats back" is common SQLite advice).
+
+  **WAL (write-ahead log) reconciliation is a deliberate, disclosed scope
+  boundary, not a silent gap.** The real SQLite C library transparently
+  merges a `-wal` sibling file's committed-but-not-yet-checkpointed
+  frames into what a reader sees on every open; reimplementing that would
+  mean parsing a second file format and its own frame/checksum layout for
+  a case this project's own usage (profiling a data file, typically
+  captured or shipped at rest) rarely exercises. Rather than silently
+  serve stale data - a wrong answer with no indication anything was
+  missed - `check_no_pending_wal` looks for a sibling `-wal` file and, if
+  it carries more than just its own 32-byte header (i.e. at least one
+  real frame), hard-errors with an actionable message (checkpoint the
+  database, or close every connection cleanly, first) rather than guess.
+  A `WITHOUT ROWID` table gets the same "clean, disclosed boundary" over
+  a silent wrong answer, but the *other* failure-isolation treatment this
+  project already uses elsewhere (a bad Parquet nested column, a bad
+  `.npz` array): one table using it doesn't take down the rest of the
+  file - `profile_table`'s error is caught per-table and turned into a
+  single placeholder column carrying a clear note, exactly like the
+  `.npz` per-array isolation pattern.
+
+  Verified two ways: **(1)**
+  `sqlite_reader_matches_the_rusqlite_crate_output_exactly` cross-checks
+  this reader against `rusqlite` itself (kept as a dev-only dependency for
+  exactly this purpose - genuinely a different codebase, not just a
+  different Rust parser of the same spec, unlike every other oracle in
+  this file) on this project's existing fixtures plus two new ones this
+  pass added: `edge_sqlite_overflow_pages.sqlite` (a 15,000-byte `TEXT`
+  value, well past the ~4,061-byte local-payload threshold on a default
+  4,096-byte page, alongside an ordinary short value in the same table -
+  exercising both the overflow-chain-assembly path and the plain local-
+  payload path together) and `edge_sqlite_table_level_primary_key.sqlite`
+  (a table-level `PRIMARY KEY(id)` rowid alias, as opposed to the inline
+  `INTEGER PRIMARY KEY` form). A third new fixture,
+  `edge_sqlite_without_rowid.sqlite`, deliberately isn't run through the
+  oracle comparison - a `WITHOUT ROWID` table is expected to diverge from
+  `rusqlite`'s real data by design - and instead gets its own dedicated
+  test confirming the disclosed-placeholder shape. **(2)** transiently
+  and not committed (matching this project's usual real-world-corpus
+  practice), against two well-known real sample databases already
+  referenced elsewhere in this document - a fresh copy of Chinook (246
+  pages, ~1 MB) and the Northwind SQLite port (6,031 pages, ~23.6 MB,
+  large enough to force genuine multi-level b-tree interior pages and
+  real overflow chains) - both matched `rusqlite`'s output exactly via
+  the same oracle, including the just-fixed REAL-affinity conversion on
+  Northwind's own numeric columns. A 500-iteration bit-flip fuzz pass (1-
+  20 random bit flips each) against the real Chinook file, run through
+  the compiled release binary, produced zero panics, zero hangs, and no
+  unexpected exit codes.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3977,8 +4136,8 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, `dbase`, `dta`, and now
-`apache-avro` all still were, however real their own risk.
+`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, `dbase`, `dta`,
+`apache-avro`, and now `rusqlite` all still were, however real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/
