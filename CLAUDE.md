@@ -339,18 +339,20 @@ Variable and value labels - Stata's own human-authored variable
 descriptions and coded-value names (`1`/`2`/`3` meaning
 `"male"`/`"female"`/`"other"`) - aren't surfaced; see Known limitations.
 
-SAS7BDAT (`columns_from_sas7bdat`, via the `sas7bdat` crate) follows the
-same shape, but its `current_type` comes straight from the file's own
-`Dataset::columns()` metadata (a `LogicalType` per column) rather than
-being inferred from row values, the same as `arrow_type_label` does for
-Parquet/Arrow. That declared type is genuinely worth cross-checking: SAS
-stores nearly all numeric data as 8-byte doubles internally regardless of
-the value's real precision, so `current_type: "f64"` with `ideal_type`
-correctly narrowing to `"i64"` for a whole-number column isn't a bug in
-either the crate or this tool - it's the same "declared type is a hint,
-not the truth" lesson Parquet/Avro/dBase/Stata all already demonstrate,
-in one more format's own way of losing that distinction. SAS also has
-per-column labels (same considered non-surfacing decision as Stata's).
+SAS7BDAT (`columns_from_sas7bdat`, via `sas7bdat_support` - a hand-rolled
+reader now, see the Dependency footprint section) follows the same shape,
+but its `current_type` comes straight from the file's own column-format
+metadata (a numeric type code plus an optional format name, resolved to
+a logical type) rather than being inferred from row values, the same as
+`arrow_type_label` does for Parquet/Arrow. That declared type is
+genuinely worth cross-checking: SAS stores nearly all numeric data as
+8-byte doubles internally regardless of the value's real precision, so
+`current_type: "f64"` with `ideal_type` correctly narrowing to `"i64"`
+for a whole-number column isn't a bug in either the reader or this tool -
+it's the same "declared type is a hint, not the truth" lesson Parquet/
+Avro/dBase/Stata all already demonstrate, in one more format's own way of
+losing that distinction. SAS also has per-column labels (same considered
+non-surfacing decision as Stata's).
 
 Common/Combined Log Format also land here (`columns_from_weblog`, via
 `weblog_support` - a hand-rolled parser now, see the Dependency footprint
@@ -4127,6 +4129,161 @@ this project could just implement directly rather than depend on:
   the compiled release binary, produced zero panics, zero hangs, and no
   unexpected exit codes.
 
+- **`sas7bdat` → a hand-rolled reader (`sas7bdat_support`).** SAS
+  Institute never published a file-format specification, so - unlike
+  every hand-roll before it in this list, and like SQLite's own spec-vs-
+  FFI-binding distinction but for a different underlying reason - there
+  was no single authoritative document to verify against. The reference
+  crate's own extensively-commented source stood in for one instead: many
+  of its comments record a specific real-world fixture that caught a
+  specific bug, which is exactly the kind of hard-won detail worth
+  carrying forward rather than re-deriving from first principles. Scope
+  is deliberately narrower than the reference crate's own: that crate is
+  built for high-throughput batch/SIMD scanning across several
+  performance-motivated execution-class fast paths; this reader collapses
+  all of that back into the one underlying mechanism every file actually
+  uses - walk a page's subheader pointers (if any), decompress or borrow
+  whatever they reference, then fall back to whatever contiguous row
+  bytes remain on the page - since a single straightforward full-table
+  read has no need for a fast-path split at all. Variable/value labels
+  aren't surfaced, the same considered decision as Stata's own.
+
+  The format layers similarly to Stata's own binary form (unsurprising,
+  since both are proprietary statistical-package formats of a similar
+  vintage): a fixed header (32-byte magic, an alignment-offset byte pair
+  that determines 32- vs 64-bit pointer width, an endianness byte, a
+  numeric text-encoding code, header/page sizes each independently
+  sanity-range-checked); pages classified by a bitmasked type field into
+  Meta/Data/Mix/Amd/Meta2/Comp/CompTable/Unknown; a page's subheaders
+  (if any) reached via a pointer array immediately following its header,
+  each pointer carrying an offset/length/compression-mode triple *plus* a
+  separate flag byte (`is_compressed_data`); and, inside a subheader, a
+  fixed 4-byte signature (0xF7F7F7F7 for row-size metadata, 0xF6F6F6F6
+  for column count, and five more `0xFFFF_FFxx`-shaped constants for
+  column name/attribute/format/text entries) dispatching to one of a
+  handful of known layouts. Every constant, offset, and struct layout was
+  read directly from the reference crate's own `probe.rs`/`pages.rs`/
+  `layout.rs`/`internal.rs` before being trusted, the same discipline
+  applied to every other hand-roll's source crate in this list.
+
+  Two real bugs shipped in this reader's first draft, both found only
+  because the oracle comparison was run against genuine files rather than
+  trusted on the strength of the port - the exact scenario this project's
+  own real-world-validation discipline exists for:
+    1. **A missing pointer field, not a missing case.** The reference
+       crate's row-extraction pointer struct carries a 4th field
+       (`is_compressed_data`) that this reader's first draft simply never
+       read, having been modeled on the *metadata*-parsing pointer shape
+       (which only ever needs 3 fields, since it never reaches the
+       "otherwise treat as row data" fallback at all). Without that flag,
+       a compression-mode-0 pointer whose signature wasn't one of the
+       known metadata signatures was *always* treated as raw row data -
+       when the real rule requires `is_compressed_data` to be set too.
+       The result was real, reproducible corruption on real files
+       (`productsales.sas7bdat`, `cars.sas7bdat`, `load_log.sas7bdat`):
+       metadata bytes sliced into row-length chunks and decoded as
+       numeric values, producing a handful of giant near-zero floating-
+       point strings (`f64::from_bits` on effectively-random bytes)
+       spliced into otherwise-correct columns, and non-existent extra
+       text values inflating `missing_pct`.
+    2. **Two fields with the same name, different scope.** A `Mix`
+       page's trailing data row is capped by `rows_per_page` - a
+       *file-wide* value from the ROW_SIZE metadata subheader - while a
+       `Data` page's rows are capped by its own *per-page* header field.
+       This reader's first draft used the per-page field for both page
+       kinds (since a Mix page's own header carries a superficially
+       similar-looking count field at the same offset), and had never
+       parsed `rows_per_page` from the ROW_SIZE subheader at all. Without
+       the correct file-wide cap, a Mix page's leftover unused space past
+       its one genuine trailing row - padding, whenever it happened to be
+       an exact multiple of the row length - read as extra phantom rows.
+       This produced the identical symptom as bug 1 on the same real
+       files (garbage values spliced into real columns), which is what
+       made it easy to mistake for a single bug at first - only after
+       fixing the pointer-flag issue and re-running the oracle comparison
+       did the *second*, independent cause become visible on the same
+       fixtures.
+  A third, non-panic-inducing but still real finding: `encoding_rs` (the
+  crate the reference implementation delegates text-encoding resolution
+  to) implements the WHATWG Encoding Standard, which - for real-world
+  web-compatibility reasons documented in the standard itself, since
+  virtually all content ever labeled "ISO-8859-1" in practice is actually
+  Windows-1252 - defines `"iso-8859-1"` as a plain *alias* for the
+  `windows-1252` decoder, not genuine Latin-1. This reader's first draft
+  implemented true Latin-1 instead (a reasonable-looking, wrong
+  assumption), caught by an oracle mismatch on a real fixture
+  (`test16.sas7bdat`) whose CJK/Cyrillic/Hangul text only diverged from
+  the reference crate's own output in the specific high-byte range this
+  quirk affects - confirmed directly against `encoding_rs` itself
+  (`Encoding::for_label(b"iso-8859-1").name()` returns `"windows-1252"`)
+  before trusting the fix. Text decoding is otherwise the same disclosed-
+  boundary choice dBase's own reader already makes for its ~20 legacy
+  codepages: UTF-8/US-ASCII and Windows-1252 (reusing the exact table
+  already verified for Stata's own hand-roll) are decoded directly; every
+  other named encoding SAS can declare (~70 more, including several
+  genuinely complex multi-byte/stateful schemes - Shift-JIS, EUC-JP/KR,
+  Big5, GB18030, ISO-2022-\*) is a clear, disclosed error rather than a
+  guess, the same dependency-weight tradeoff already declined elsewhere
+  in this file (see "No SPSS"/"No DuckDB").
+
+  RLE (`"SASYZCRL"`) and RDC/binary (`"SASYZCR2"`) row decompression are
+  ported algorithm-for-algorithm from the reference crate's own
+  `compression.rs`, including its own worked byte-level test cases as
+  this reader's own verification - the `wild_copy`/`wild_fill` SIMD-style
+  buffer-overrun tricks are omitted (pure throughput optimizations,
+  irrelevant to a single-pass full read), but every length/bounds check
+  they sit alongside is kept, including the specific DoS-safety fix the
+  reference crate's own comments document: RDC's fill/copy tokens can
+  amplify a few input bytes into thousands of output bytes, so every
+  emit is bounds-checked against the row's declared length *before*
+  writing, not just compared after the fact. A SAS date/datetime/time
+  value only converts to a real date if it's a whole number within the
+  target field's integer range (`i32` for date/time, `i64` for datetime)
+  - ported from the reference crate's own `try_i64_from_f64`/
+  `try_i32_from_f64` - and, when it isn't (a genuinely fractional value,
+  or one too extreme to represent), falls back to rendering as a plain
+  number instead of a date. This fallback was a real gap in this reader's
+  first draft (a plain epoch-offset conversion with no fallback and, more
+  urgently, an `i64::MAX`/`MIN`-adjacent addition that could panic on
+  overflow on adversarial input), found by an oracle mismatch on
+  `dates_null.sas7bdat`'s own deliberately-extreme test value
+  (`"253717747199.999"`, a genuinely fractional datetime the reference
+  crate renders as a raw number rather than forcing a wrong date) and
+  fixed to match, using saturating/checked arithmetic throughout so an
+  out-of-range value degrades to the same fallback rather than crashing.
+
+  Verified two ways: **(1)**
+  `sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly` cross-checks
+  this reader against the real `sas7bdat` crate (kept as a dev-only
+  dependency for exactly this purpose) on `sas7bdat_people_nonascii
+  .sas7bdat` - a real file vendored from the reference crate's own MIT-
+  licensed test fixtures (see `tests/fixtures/sas7bdat_PROVENANCE.md`),
+  the same "vendor a real file when self-generation is genuinely
+  impossible" call already made for the POI `.xlsb` fixtures, and a real
+  gap this format had standing since it was first wired up (see Known
+  limitations) - no tool available in this environment can *write* a
+  genuine `.sas7bdat` file at all, so this is the first non-malformed-
+  input fixture this format has ever had. **(2)** transiently and not
+  committed (matching this project's usual real-world-corpus practice),
+  against two corpora: the reference crate's own remaining bundled
+  fixtures (its adversarial fuzz-regression files, each confirmed to
+  fail identically on both readers rather than merely "not crash" on
+  either) and, more substantially, all 30 files in pandas' own real
+  `.sas7bdat` test corpus (`pandas/tests/io/sas/data` - genuinely diverse
+  real and edge-case files: a corrupt file, zero-row and zero-variable
+  datasets, wide multi-hundred-column tables, a multi-page metadata
+  file, real production log data, non-ASCII text in several legacy
+  encodings). Both fixes above were found on real files in this corpus,
+  not synthesized in advance. Of the 30, 26 matched the `sas7bdat` crate's
+  output exactly after both fixes; the remaining 4 use a text encoding
+  outside this reader's deliberately-scoped support (`ISO-8859-15` on 3,
+  `WINDOWS-1251` on 1) and fail with a disclosed, actionable error on
+  both readers' own terms (this reader refuses cleanly; the oracle
+  decodes them, which is expected - the scope boundary is intentional,
+  not a bug). A 1,000-iteration bit-flip fuzz pass (500 each against two
+  different real files, run through the compiled release binary)
+  produced zero panics, zero hangs, and no unexpected exit codes.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -4137,7 +4294,8 @@ parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
 `zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, `dbase`, `dta`,
-`apache-avro`, and now `rusqlite` all still were, however real their own risk.
+`apache-avro`, `rusqlite`, and now `sas7bdat` all still were, however
+real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/
@@ -4188,18 +4346,15 @@ pulled in unless that specific `--features` flag is passed).
   renderer and output shape. Worth adding if there's real demand;
   `Variable::label()` in the `dta` crate and `ColumnMeta::label` in the
   `sas7bdat` crate already expose it.
-- **No SAS7BDAT test fixture is committed.** Unlike every other format in
-  this project, there's no tool available in this development environment
-  that can *write* a `.sas7bdat` file (it's a proprietary binary format;
-  `pyreadstat`, the usual option, only writes `.dta`/`.sav`/`.xport`, not
-  sas7bdat itself), and copying a third-party sample file of unclear
-  provenance into the repo wasn't worth the licensing risk. The reader was
-  manually verified against the `sas7bdat` crate's own bundled test
-  fixture during development (schema, non-ASCII text, and the same
-  `current_type`/`ideal_type` gap dBase and Stata already demonstrate);
-  the committed test only confirms the format is wired up, the same
-  fallback Feather already uses for the same underlying reason (no
-  fixture, not a missing capability).
+- **SAS7BDAT text decoding is limited to UTF-8/US-ASCII and Windows-1252**
+  (which, per the WHATWG Encoding Standard `encoding_rs` implements, also
+  covers files declaring "ISO-8859-1" - see the Dependency footprint
+  section for why that's not genuine Latin-1). SAS can declare roughly 70
+  more legacy codepages, several genuinely complex multi-byte/stateful
+  schemes (Shift-JIS, EUC-JP/KR, Big5, GB18030, ISO-2022-\*); a file
+  declaring one of them is a clear, disclosed error rather than a guess,
+  the same dependency-weight tradeoff already declined for dBase's own
+  ~20-codepage gap and for SPSS/DuckDB entirely (see below).
 - **A dotted-quad value valid as IPv4 is always reported as IPv4**, even if
   it's semantically something else - a version string like `"1.2.3.4"` is
   indistinguishable from an address at the string level, and there's no

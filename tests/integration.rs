@@ -983,21 +983,35 @@ fn stata_treats_missing_marker_as_absent_and_recovers_int_from_a_double() {
     assert_eq!(user_id["current_type"], "String");
 }
 
+// `sas7bdat_people_nonascii.sas7bdat` is a real, vendored file (see
+// tests/fixtures/sas7bdat_PROVENANCE.md - copied from the `sas7bdat`
+// crate's own MIT-licensed test fixtures, since no tool in this
+// environment can write a genuine .sas7bdat file). It exercises the same
+// current_type=f64/ideal_type=i64 gap as Stata and dBase (SAS stores
+// nearly all numeric data as doubles internally), and real non-ASCII
+// text content in its own GENDER column.
+#[cfg(feature = "sas7bdat")]
+#[test]
+fn sas7bdat_reads_a_real_file_with_non_ascii_text_and_the_f64_i64_gap() {
+    let doc = run_json("sas7bdat_people_nonascii.sas7bdat", &[]);
+    let cols = table(&doc, "sas7bdat_people_nonascii");
+
+    let age = column(cols, "AGE");
+    assert_eq!(age["current_type"], "f64");
+    assert_eq!(age["ideal_type"], "i64");
+
+    let gender = column(cols, "GENDER");
+    assert_eq!(gender["current_type"], "String");
+    let samples = gender["sample_values"].as_array().unwrap();
+    assert!(
+        samples.iter().any(|v| !v.as_str().unwrap().is_ascii()),
+        "expected at least one non-ASCII sample value in GENDER, got {samples:?}"
+    );
+}
+
 #[cfg(feature = "sas7bdat")]
 #[test]
 fn sas7bdat_format_is_recognized() {
-    // No dedicated fixture committed here: unlike every other format in this
-    // suite, there's no tool available in this environment that can write a
-    // real .sas7bdat file (SAS's binary format is proprietary; pyreadstat,
-    // the usual option, only writes .dta/.sav/.xport, not sas7bdat itself),
-    // and copying a third-party sample file of unclear provenance into this
-    // repo wasn't worth the licensing risk. columns_from_sas7bdat was
-    // manually verified against the sas7bdat crate's own bundled test
-    // fixture during development (schema, non-ASCII text, and the same
-    // current_type=f64/ideal_type=i64 gap as Stata and dBase, since SAS
-    // also stores nearly all numeric data as doubles internally). This test
-    // only confirms the format is wired up, mirroring how Feather - the
-    // other format without its own dedicated fixture - is tested.
     let output = Command::new(bin())
         .args(["--format", "sas7bdat", "nonexistent.sas7bdat"])
         .output()

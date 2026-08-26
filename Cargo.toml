@@ -11,7 +11,6 @@ parquet = { version = "59.2.0", features = ["arrow"], optional = true }
 # (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
 # still needed for that impl's own `S: serde::Serializer` bound.
 serde = "1.0.229"
-sas7bdat = { version = "0.8.0", optional = true }
 
 [features]
 default = []
@@ -34,7 +33,7 @@ weblog = []
 syslog = []
 dbase = []
 stata = []
-sas7bdat = ["dep:sas7bdat"]
+sas7bdat = []
 
 [dev-dependencies]
 # Dev-only - never affects the shipped binary or a consumer's build, unlike
@@ -146,6 +145,14 @@ num-bigint = "0.4"
 # SQLite C library - so it still serves as a genuine independent oracle
 # (a different codebase entirely, not just a different Rust parser).
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Same dev-only treatment, same reason: the `sas7bdat` feature's own hand-
+# rolled reader (`sas7bdat_support` in src/lib.rs - page/subheader
+# traversal, RLE/RDC row decompression, and format-driven date/datetime/
+# time classification) replaced this at runtime; kept only as this
+# project's own cross-verification oracle in
+# `sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly`
+# (`#[cfg(all(test, feature = "sas7bdat"))]` in src/lib.rs).
+sas7bdat = "0.8.0"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

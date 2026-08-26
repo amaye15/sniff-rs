@@ -1895,9 +1895,9 @@ dependencies = [
 
 [[package]]
 name = "sas7bdat"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31e1f2300b7c425ff154463af1e6e351b79d7af7d233cd17db890260abf2bc5a"
+checksum = "b160f475a15dc4c33a0891b25f7e5ddc7c52025fa963d77416e83417e938f353"
 dependencies = [
  "bytemuck",
  "encoding_rs",
