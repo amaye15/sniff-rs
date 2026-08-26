@@ -2456,19 +2456,241 @@ fn columns_from_fixed_width(
 // values there rather than a guessed split.
 
 #[cfg(feature = "weblog")]
-fn weblog_regex(combined: bool) -> regex::Regex {
-    let pattern = if combined {
-        r#"^(\S+) (\S+) (\S+) \[([^\]]+)\] "([^"]*)" (\d{3}|-) (\d+|-) "([^"]*)" "([^"]*)"$"#
-    } else {
-        r#"^(\S+) (\S+) (\S+) \[([^\]]+)\] "([^"]*)" (\d{3}|-) (\d+|-)$"#
-    };
-    regex::Regex::new(pattern).expect("hardcoded weblog regex is always valid")
-}
+mod weblog_support {
+    use super::*;
 
-#[cfg(feature = "weblog")]
-fn weblog_dash_to_none(s: &str) -> Option<String> {
-    if s == "-" { None } else { Some(s.to_string()) }
-}
+    /// Reads a `\S+` token (one or more non-whitespace characters) starting
+    /// at byte offset `pos`. `char::is_whitespace` matches the Unicode
+    /// `White_Space` property, the same class the `regex` crate's default
+    /// (Unicode-mode) `\s`/`\S` use - `str::find` with a `char` predicate
+    /// always returns a valid UTF-8 char boundary, so this stays safe on
+    /// multi-byte content (a non-ASCII referer/user-agent value) without
+    /// needing a byte-level safety precondition the way `is_iban`'s
+    /// ASCII-only slicing does.
+    fn read_token(line: &str, pos: usize) -> Option<(&str, usize)> {
+        let rest = &line[pos..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if end == 0 {
+            None
+        } else {
+            Some((&rest[..end], pos + end))
+        }
+    }
+
+    fn expect_char(line: &str, pos: usize, c: char) -> Option<usize> {
+        if line[pos..].starts_with(c) {
+            Some(pos + c.len_utf8())
+        } else {
+            None
+        }
+    }
+
+    /// `\d{3}|-`: exactly three ASCII digits, or a literal dash. A status
+    /// code with a *fourth* trailing digit isn't silently truncated to
+    /// three - `\d{3}` only ever consumes exactly three characters here,
+    /// so a fourth digit is left for the caller's next `expect_char(' ')`
+    /// to reject, the same way the original regex's own greedy-but-capped
+    /// `{3}` repetition would fail there instead of backtracking (there's
+    /// nothing shorter than 3 to backtrack to).
+    fn read_status_or_dash(line: &str, pos: usize) -> Option<(&str, usize)> {
+        if line[pos..].starts_with('-') {
+            return Some((&line[pos..pos + 1], pos + 1));
+        }
+        let bytes = line.as_bytes();
+        if pos + 3 <= bytes.len() && bytes[pos..pos + 3].iter().all(u8::is_ascii_digit) {
+            Some((&line[pos..pos + 3], pos + 3))
+        } else {
+            None
+        }
+    }
+
+    /// `\d+|-`: one or more ASCII digits (greedy - no cap), or a literal
+    /// dash.
+    fn read_digits_or_dash(line: &str, pos: usize) -> Option<(&str, usize)> {
+        if line[pos..].starts_with('-') {
+            return Some((&line[pos..pos + 1], pos + 1));
+        }
+        let bytes = line.as_bytes();
+        let mut end = pos;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == pos {
+            None
+        } else {
+            Some((&line[pos..end], end))
+        }
+    }
+
+    /// Hand-rolled replacement for the fixed Common/Combined Log Format
+    /// grammar (see CLAUDE.md's Dependency footprint section) - a plain
+    /// left-to-right scan needs no backtracking here since every field is
+    /// unambiguously delimited (a literal space, bracket, or quote) with
+    /// no two alternatives that could both match the same input
+    /// differently. Returns the same numbered fields the old regex's
+    /// `caps[1]`..`caps[9]` captured, in order, so `columns_from_weblog`
+    /// stays structurally unchanged below. `None` means the line doesn't
+    /// match the grammar at all - the same outcome `Regex::captures`
+    /// returning `None` already produced.
+    fn parse_line(line: &str, combined: bool) -> Option<Vec<&str>> {
+        let (host, pos) = read_token(line, 0)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (ident, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (authuser, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let pos = expect_char(line, pos, '[')?;
+        let bracket_len = line[pos..].find(']')?;
+        let timestamp = &line[pos..pos + bracket_len];
+        let pos = expect_char(line, pos + bracket_len, ']')?;
+        let pos = expect_char(line, pos, ' ')?;
+        let pos = expect_char(line, pos, '"')?;
+        let quote_len = line[pos..].find('"')?;
+        let request = &line[pos..pos + quote_len];
+        let pos = expect_char(line, pos + quote_len, '"')?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (status, pos) = read_status_or_dash(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (bytes, mut pos) = read_digits_or_dash(line, pos)?;
+
+        let mut groups = vec![host, ident, authuser, timestamp, request, status, bytes];
+
+        if combined {
+            pos = expect_char(line, pos, ' ')?;
+            pos = expect_char(line, pos, '"')?;
+            let quote_len = line[pos..].find('"')?;
+            let referer = &line[pos..pos + quote_len];
+            pos = expect_char(line, pos + quote_len, '"')?;
+            pos = expect_char(line, pos, ' ')?;
+            pos = expect_char(line, pos, '"')?;
+            let quote_len = line[pos..].find('"')?;
+            let user_agent = &line[pos..pos + quote_len];
+            pos = expect_char(line, pos + quote_len, '"')?;
+            groups.push(referer);
+            groups.push(user_agent);
+        }
+
+        // The original regex ends with `$` - the whole line must be
+        // consumed, not just a leading prefix of it.
+        if pos == line.len() {
+            Some(groups)
+        } else {
+            None
+        }
+    }
+
+    /// Hand-rolled replacement for `^(\S+) (\S+) (\S+)$` - exactly three
+    /// whitespace-delimited tokens spanning the entire string.
+    fn parse_request_line(s: &str) -> Option<(&str, &str, &str)> {
+        let (method, pos) = read_token(s, 0)?;
+        let pos = expect_char(s, pos, ' ')?;
+        let (path, pos) = read_token(s, pos)?;
+        let pos = expect_char(s, pos, ' ')?;
+        let (protocol, pos) = read_token(s, pos)?;
+        if pos == s.len() {
+            Some((method, path, protocol))
+        } else {
+            None
+        }
+    }
+
+    fn dash_to_none(s: &str) -> Option<String> {
+        if s == "-" { None } else { Some(s.to_string()) }
+    }
+
+    pub(crate) fn columns_from_weblog(
+        path: &Path,
+        nrows: Option<usize>,
+        combined: bool,
+    ) -> Result<Vec<ColumnInput>> {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+
+        let mut names: Vec<&str> = vec![
+            "host",
+            "ident",
+            "authuser",
+            "timestamp",
+            "method",
+            "path",
+            "protocol",
+            "status",
+            "bytes",
+        ];
+        if combined {
+            names.extend(["referer", "user_agent"]);
+        }
+
+        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
+        let mut total = 0usize;
+        for (line_no, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if nrows.is_some_and(|limit| total >= limit) {
+                break;
+            }
+            let format_name = if combined {
+                "Combined Log"
+            } else {
+                "Common Log"
+            };
+            let caps = parse_line(line, combined).ok_or_else(|| {
+                anyhow!(
+                    "line {} doesn't match {format_name} Format: {line:?}",
+                    line_no + 1
+                )
+            })?;
+
+            let (method, req_path, protocol) = match parse_request_line(caps[4]) {
+                Some((m, p, pr)) => (
+                    Some(m.to_string()),
+                    Some(p.to_string()),
+                    Some(pr.to_string()),
+                ),
+                None => (None, None, None),
+            };
+            let mut values = vec![
+                dash_to_none(caps[0]),
+                dash_to_none(caps[1]),
+                dash_to_none(caps[2]),
+                Some(caps[3].to_string()),
+                method,
+                req_path,
+                protocol,
+                dash_to_none(caps[5]),
+                dash_to_none(caps[6]),
+            ];
+            if combined {
+                values.push(dash_to_none(caps[7]));
+                values.push(dash_to_none(caps[8]));
+            }
+            for (col_idx, value) in values.into_iter().enumerate() {
+                raw[col_idx].push(value);
+            }
+            total += 1;
+        }
+
+        let mut columns = Vec::new();
+        for (col_idx, name) in names.into_iter().enumerate() {
+            let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+            let current_type = if non_null.is_empty() {
+                "String".to_string()
+            } else {
+                let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                naive_current_type(&refs).to_string()
+            };
+            columns.push(ColumnInput {
+                name: name.to_string(),
+                current_type,
+                raw_values: non_null,
+                total,
+                skip_heuristics: false,
+            });
+        }
+        Ok(columns)
+    }
+} // mod weblog_support
 
 #[cfg(feature = "weblog")]
 fn columns_from_weblog(
@@ -2476,93 +2698,7 @@ fn columns_from_weblog(
     nrows: Option<usize>,
     combined: bool,
 ) -> Result<Vec<ColumnInput>> {
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let re = weblog_regex(combined);
-    let request_re = regex::Regex::new(r"^(\S+) (\S+) (\S+)$").expect("hardcoded regex is valid");
-
-    let mut names: Vec<&str> = vec![
-        "host",
-        "ident",
-        "authuser",
-        "timestamp",
-        "method",
-        "path",
-        "protocol",
-        "status",
-        "bytes",
-    ];
-    if combined {
-        names.extend(["referer", "user_agent"]);
-    }
-
-    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
-    let mut total = 0usize;
-    for (line_no, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if nrows.is_some_and(|limit| total >= limit) {
-            break;
-        }
-        let format_name = if combined {
-            "Combined Log"
-        } else {
-            "Common Log"
-        };
-        let caps = re.captures(line).ok_or_else(|| {
-            anyhow!(
-                "line {} doesn't match {format_name} Format: {line:?}",
-                line_no + 1
-            )
-        })?;
-
-        let (method, req_path, protocol) = match request_re.captures(&caps[5]) {
-            Some(c) => (
-                Some(c[1].to_string()),
-                Some(c[2].to_string()),
-                Some(c[3].to_string()),
-            ),
-            None => (None, None, None),
-        };
-        let mut values = vec![
-            weblog_dash_to_none(&caps[1]),
-            weblog_dash_to_none(&caps[2]),
-            weblog_dash_to_none(&caps[3]),
-            Some(caps[4].to_string()),
-            method,
-            req_path,
-            protocol,
-            weblog_dash_to_none(&caps[6]),
-            weblog_dash_to_none(&caps[7]),
-        ];
-        if combined {
-            values.push(weblog_dash_to_none(&caps[8]));
-            values.push(weblog_dash_to_none(&caps[9]));
-        }
-        for (col_idx, value) in values.into_iter().enumerate() {
-            raw[col_idx].push(value);
-        }
-        total += 1;
-    }
-
-    let mut columns = Vec::new();
-    for (col_idx, name) in names.into_iter().enumerate() {
-        let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
-        let current_type = if non_null.is_empty() {
-            "String".to_string()
-        } else {
-            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-            naive_current_type(&refs).to_string()
-        };
-        columns.push(ColumnInput {
-            name: name.to_string(),
-            current_type,
-            raw_values: non_null,
-            total,
-            skip_heuristics: false,
-        });
-    }
-    Ok(columns)
+    weblog_support::columns_from_weblog(path, nrows, combined)
 }
 
 #[cfg(not(feature = "weblog"))]
@@ -2644,32 +2780,380 @@ fn syslog_severity_name(pri: u32) -> String {
 }
 
 #[cfg(feature = "syslog")]
-fn syslog_regex(rfc5424: bool) -> regex::Regex {
-    let pattern = if rfc5424 {
-        r#"^<(\d{1,3})>(\d+) (\S+) (\S+) (\S+) (\S+) (\S+) (-|\[[^\]]*\]) ?(.*)$"#
-    } else {
-        // The `<PRI>` prefix is optional here, unlike RFC 5424 above -
-        // found via real-world testing (loghub's own real Linux_2k.log,
-        // sourced from an actual production system's /var/log/messages):
-        // PRI is primarily a wire-protocol artifact, and virtually every
-        // real on-disk RFC 3164 file (/var/log/syslog, /var/log/messages,
-        // /var/log/auth.log on any real Linux box) is written by the
-        // local syslog daemon *without* it - RFC 3164 itself documents
-        // PRI as commonly stripped by relays, but this project's original
-        // regex required it unconditionally, rejecting the single most
-        // common real-world shape this format actually appears in.
-        // Capture group numbering is unaffected: wrapping the whole `<PRI>`
-        // segment in a non-capturing optional group doesn't renumber the
-        // groups after it, so every other field's index is unchanged.
-        r"^(?:<(\d{1,3})>)?([A-Za-z]{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}) (\S+) ([^:\[]+?)(?:\[(\d+)\])?: ?(.*)$"
-    };
-    regex::Regex::new(pattern).expect("hardcoded syslog regex is always valid")
-}
+mod syslog_support {
+    use super::*;
 
-#[cfg(feature = "syslog")]
-fn syslog_dash_to_none(s: &str) -> Option<String> {
-    if s == "-" { None } else { Some(s.to_string()) }
-}
+    fn expect_char(line: &str, pos: usize, c: char) -> Option<usize> {
+        if line[pos..].starts_with(c) {
+            Some(pos + c.len_utf8())
+        } else {
+            None
+        }
+    }
+
+    fn read_token(line: &str, pos: usize) -> Option<(&str, usize)> {
+        let rest = &line[pos..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if end == 0 {
+            None
+        } else {
+            Some((&rest[..end], pos + end))
+        }
+    }
+
+    /// One or more ASCII digits (`\d+`), no cap.
+    fn read_digits(line: &str, pos: usize) -> Option<(&str, usize)> {
+        let bytes = line.as_bytes();
+        let mut end = pos;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == pos {
+            None
+        } else {
+            Some((&line[pos..end], end))
+        }
+    }
+
+    /// `\d{1,max}`: one to `max` ASCII digits, greedy. Mirrors the regex's
+    /// own repetition cap directly rather than reading an unbounded run
+    /// and hoping the caller's next literal happens to reject any excess -
+    /// `<(\d{1,3})>` genuinely cannot consume a 4th digit as part of the
+    /// group at all (unlike `\d{3}` immediately followed by a literal,
+    /// where "read exactly 3, let the next check reject a 4th" already
+    /// works - see the weblog module's `read_status_or_dash`), it isn't
+    /// merely a defensive redundancy.
+    fn read_digits_capped(line: &str, pos: usize, max: usize) -> Option<(&str, usize)> {
+        let bytes = line.as_bytes();
+        let mut end = pos;
+        while end < bytes.len() && end - pos < max && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == pos {
+            None
+        } else {
+            Some((&line[pos..end], end))
+        }
+    }
+
+    fn dash_to_none(s: &str) -> Option<String> {
+        if s == "-" { None } else { Some(s.to_string()) }
+    }
+
+    /// Hand-rolled replacement for RFC 5424's fixed grammar:
+    /// `^<(\d{1,3})>(\d+) (\S+) (\S+) (\S+) (\S+) (\S+) (-|\[[^\]]*\]) ?(.*)$`
+    /// No ambiguity to resolve here (every field is either a fixed literal,
+    /// a whitespace-delimited token, or an unambiguous dash-vs-bracket
+    /// choice), so - like the Common/Combined Log parser above - a single
+    /// forward scan replicates the regex exactly with no backtracking
+    /// needed. Returns the same numbered fields `caps[1]`..`caps[9]`
+    /// captured, in order.
+    fn parse_rfc5424_line(line: &str) -> Option<Vec<&str>> {
+        let pos = expect_char(line, 0, '<')?;
+        let (pri, pos) = read_digits_capped(line, pos, 3)?;
+        let pos = expect_char(line, pos, '>')?;
+        let (version, pos) = read_digits(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (timestamp, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (hostname, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (app_name, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (procid, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+        let (msgid, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+
+        let (structured_data, pos) = if line[pos..].starts_with('-') {
+            (&line[pos..pos + 1], pos + 1)
+        } else if line[pos..].starts_with('[') {
+            let bracket_len = line[pos..].find(']')?;
+            (&line[pos..pos + bracket_len + 1], pos + bracket_len + 1)
+        } else {
+            return None;
+        };
+
+        // ` ?`: an optional single space before the message.
+        let pos = if line[pos..].starts_with(' ') {
+            pos + 1
+        } else {
+            pos
+        };
+        let message = &line[pos..];
+
+        Some(vec![
+            pri,
+            version,
+            timestamp,
+            hostname,
+            app_name,
+            procid,
+            msgid,
+            structured_data,
+            message,
+        ])
+    }
+
+    /// `(pri, timestamp, hostname, tag, pid, message)` - named here purely
+    /// to keep `parse_rfc3164_line`'s signature readable (`clippy::type_complexity`).
+    type Rfc3164Fields<'a> = (
+        Option<&'a str>,
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+    );
+
+    /// Hand-rolled replacement for RFC 3164's fixed grammar:
+    /// `^(?:<(\d{1,3})>)?([A-Za-z]{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}) (\S+) ([^:\[]+?)(?:\[(\d+)\])?: ?(.*)$`
+    ///
+    /// The one genuinely non-trivial piece: `([^:\[]+?)(?:\[(\d+)\])?:`
+    /// looks like it needs real backtracking (a non-greedy quantifier plus
+    /// an optional group), but doesn't - TAG's own character class already
+    /// excludes `:` and `[` outright, so it can never *consume* either one
+    /// regardless of greediness. That means TAG's true end is a hard
+    /// structural boundary (the first `:` or `[` encountered), not
+    /// something a backtracking search has to discover by trial and
+    /// error: scan forward once, stop at the first `:` or `[`, and dispatch
+    /// on which one it was. Landing on `[` *requires* the bracket+digits
+    /// pattern to fully match right there (TAG cannot extend past `[` to
+    /// try a different split point if it doesn't) - confirmed by reasoning
+    /// through the regex's own backtracking semantics before trusting this
+    /// shortcut, not assumed, and cross-checked empirically against the
+    /// real `regex` crate's output on real and adversarial syslog lines
+    /// (see CLAUDE.md).
+    fn parse_rfc3164_line(line: &str) -> Option<Rfc3164Fields<'_>> {
+        // `(?:<(\d{1,3})>)?` - if present but malformed, the group matches
+        // zero characters (not a partial one), leaving that `<` for the
+        // timestamp check right after to reject - so on any failure here,
+        // simply don't advance past the attempted position.
+        let (pri, pos) = (|| {
+            let p1 = expect_char(line, 0, '<')?;
+            let (digits, p2) = read_digits_capped(line, p1, 3)?;
+            let p3 = expect_char(line, p2, '>')?;
+            Some((digits, p3))
+        })()
+        .map_or((None, 0), |(d, p)| (Some(d), p));
+
+        // `[A-Za-z]{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}` as one matched span.
+        let ts_start = pos;
+        let bytes = line.as_bytes();
+        if pos + 3 > bytes.len() || !bytes[pos..pos + 3].iter().all(u8::is_ascii_alphabetic) {
+            return None;
+        }
+        let mut p = pos + 3;
+        let ws_start = p;
+        while p < line.len() && line[p..].chars().next()?.is_whitespace() {
+            p += line[p..].chars().next()?.len_utf8();
+        }
+        if p == ws_start {
+            return None;
+        }
+        // `\d{1,2}` greedy: try 2 digits first (only if immediately
+        // followed by the mandatory single whitespace), else fall back to
+        // 1 - the same explicit two-alternative check the weblog module's
+        // status-code parsing avoids needing, because here a wrong greedy
+        // choice *would* leave a valid but different match un-tried.
+        let day_bytes = line.as_bytes();
+        p = if p + 2 <= day_bytes.len()
+            && day_bytes[p].is_ascii_digit()
+            && day_bytes[p + 1].is_ascii_digit()
+            && line[p + 2..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            p + 2
+        } else if p < day_bytes.len()
+            && day_bytes[p].is_ascii_digit()
+            && line[p + 1..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            p + 1
+        } else {
+            return None;
+        };
+        p = expect_char(line, p, ' ').or_else(|| {
+            // `\s` (not `\s+`) - any single whitespace char, not just a
+            // literal space; `expect_char` only checks one exact char, so
+            // fall back to a manual single-whitespace-char check.
+            let c = line[p..].chars().next()?;
+            c.is_whitespace().then(|| p + c.len_utf8())
+        })?;
+        let hms = line.as_bytes();
+        let hms_ok = p + 8 <= hms.len()
+            && hms[p].is_ascii_digit()
+            && hms[p + 1].is_ascii_digit()
+            && hms[p + 2] == b':'
+            && hms[p + 3].is_ascii_digit()
+            && hms[p + 4].is_ascii_digit()
+            && hms[p + 5] == b':'
+            && hms[p + 6].is_ascii_digit()
+            && hms[p + 7].is_ascii_digit();
+        if !hms_ok {
+            return None;
+        }
+        p += 8;
+        let timestamp = &line[ts_start..p];
+
+        let pos = expect_char(line, p, ' ')?;
+        let (hostname, pos) = read_token(line, pos)?;
+        let pos = expect_char(line, pos, ' ')?;
+
+        // TAG: scan for the first `:` or `[` - see this function's own doc
+        // comment for why this replaces the regex's non-greedy `+?` plus
+        // optional-group backtracking exactly, not just approximately.
+        let tag_start = pos;
+        let mut idx = pos;
+        let boundary = loop {
+            match line[idx..].chars().next() {
+                None => return None,
+                Some(':') | Some('[') => break idx,
+                Some(c) => idx += c.len_utf8(),
+            }
+        };
+        if boundary == tag_start {
+            return None; // TAG requires at least one character (`+?`, not `*?`)
+        }
+        let tag = &line[tag_start..boundary];
+
+        let (pid, after_tag) = if line[boundary..].starts_with('[') {
+            let bp = boundary + 1;
+            let (digits, bp2) = read_digits(line, bp)?;
+            let bp3 = expect_char(line, bp2, ']')?;
+            (Some(digits), bp3)
+        } else {
+            (None, boundary)
+        };
+        let pos = expect_char(line, after_tag, ':')?;
+        let pos = if line[pos..].starts_with(' ') {
+            pos + 1
+        } else {
+            pos
+        };
+        let message = &line[pos..];
+
+        Some((pri, timestamp, hostname, tag, pid, message))
+    }
+
+    pub(crate) fn columns_from_syslog(
+        path: &Path,
+        nrows: Option<usize>,
+        rfc5424: bool,
+    ) -> Result<Vec<ColumnInput>> {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+
+        let names: Vec<&str> = if rfc5424 {
+            vec![
+                "facility",
+                "severity",
+                "version",
+                "timestamp",
+                "hostname",
+                "app_name",
+                "procid",
+                "msgid",
+                "structured_data",
+                "message",
+            ]
+        } else {
+            vec![
+                "facility",
+                "severity",
+                "timestamp",
+                "hostname",
+                "tag",
+                "pid",
+                "message",
+            ]
+        };
+
+        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
+        let mut total = 0usize;
+        for (line_no, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if nrows.is_some_and(|limit| total >= limit) {
+                break;
+            }
+            let format_name = if rfc5424 { "RFC 5424" } else { "RFC 3164" };
+
+            let values: Vec<Option<String>> = if rfc5424 {
+                let caps = parse_rfc5424_line(line).ok_or_else(|| {
+                    anyhow!(
+                        "line {} doesn't match syslog {format_name}: {line:?}",
+                        line_no + 1
+                    )
+                })?;
+                let pri: u32 = caps[0]
+                    .parse()
+                    .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
+                vec![
+                    Some(syslog_facility_name(pri)),
+                    Some(syslog_severity_name(pri)),
+                    Some(caps[1].to_string()),
+                    Some(caps[2].to_string()),
+                    dash_to_none(caps[3]),
+                    dash_to_none(caps[4]),
+                    dash_to_none(caps[5]),
+                    dash_to_none(caps[6]),
+                    dash_to_none(caps[7]),
+                    Some(caps[8].to_string()),
+                ]
+            } else {
+                let (pri, timestamp, hostname, tag, pid, message) = parse_rfc3164_line(line)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "line {} doesn't match syslog {format_name}: {line:?}",
+                            line_no + 1
+                        )
+                    })?;
+                let pri: Option<u32> = pri
+                    .map(str::parse)
+                    .transpose()
+                    .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
+                vec![
+                    pri.map(syslog_facility_name),
+                    pri.map(syslog_severity_name),
+                    Some(timestamp.to_string()),
+                    Some(hostname.to_string()),
+                    Some(tag.to_string()),
+                    pid.map(str::to_string),
+                    Some(message.to_string()),
+                ]
+            };
+            for (col_idx, value) in values.into_iter().enumerate() {
+                raw[col_idx].push(value);
+            }
+            total += 1;
+        }
+
+        let mut columns = Vec::new();
+        for (col_idx, name) in names.into_iter().enumerate() {
+            let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+            let current_type = if non_null.is_empty() {
+                "String".to_string()
+            } else {
+                let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                naive_current_type(&refs).to_string()
+            };
+            columns.push(ColumnInput {
+                name: name.to_string(),
+                current_type,
+                raw_values: non_null,
+                total,
+                skip_heuristics: false,
+            });
+        }
+        Ok(columns)
+    }
+} // mod syslog_support
 
 #[cfg(feature = "syslog")]
 fn columns_from_syslog(
@@ -2677,108 +3161,7 @@ fn columns_from_syslog(
     nrows: Option<usize>,
     rfc5424: bool,
 ) -> Result<Vec<ColumnInput>> {
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let re = syslog_regex(rfc5424);
-
-    let names: Vec<&str> = if rfc5424 {
-        vec![
-            "facility",
-            "severity",
-            "version",
-            "timestamp",
-            "hostname",
-            "app_name",
-            "procid",
-            "msgid",
-            "structured_data",
-            "message",
-        ]
-    } else {
-        vec![
-            "facility",
-            "severity",
-            "timestamp",
-            "hostname",
-            "tag",
-            "pid",
-            "message",
-        ]
-    };
-
-    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
-    let mut total = 0usize;
-    for (line_no, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if nrows.is_some_and(|limit| total >= limit) {
-            break;
-        }
-        let format_name = if rfc5424 { "RFC 5424" } else { "RFC 3164" };
-        let caps = re.captures(line).ok_or_else(|| {
-            anyhow!(
-                "line {} doesn't match syslog {format_name}: {line:?}",
-                line_no + 1
-            )
-        })?;
-        // Group 1 (PRI) is mandatory for RFC 5424 but optional for RFC 3164
-        // (see syslog_regex's doc comment) - `caps.get(1)` handles both via
-        // `None` rather than the panicking `caps[1]` index form.
-        let pri: Option<u32> = caps
-            .get(1)
-            .map(|m| m.as_str().parse::<u32>())
-            .transpose()
-            .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
-
-        let values: Vec<Option<String>> = if rfc5424 {
-            let pri = pri.expect("RFC 5424's regex always captures PRI");
-            vec![
-                Some(syslog_facility_name(pri)),
-                Some(syslog_severity_name(pri)),
-                Some(caps[2].to_string()),
-                Some(caps[3].to_string()),
-                syslog_dash_to_none(&caps[4]),
-                syslog_dash_to_none(&caps[5]),
-                syslog_dash_to_none(&caps[6]),
-                syslog_dash_to_none(&caps[7]),
-                syslog_dash_to_none(&caps[8]),
-                Some(caps[9].to_string()),
-            ]
-        } else {
-            vec![
-                pri.map(syslog_facility_name),
-                pri.map(syslog_severity_name),
-                Some(caps[2].to_string()),
-                Some(caps[3].to_string()),
-                Some(caps[4].to_string()),
-                caps.get(5).map(|m| m.as_str().to_string()),
-                Some(caps[6].to_string()),
-            ]
-        };
-        for (col_idx, value) in values.into_iter().enumerate() {
-            raw[col_idx].push(value);
-        }
-        total += 1;
-    }
-
-    let mut columns = Vec::new();
-    for (col_idx, name) in names.into_iter().enumerate() {
-        let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
-        let current_type = if non_null.is_empty() {
-            "String".to_string()
-        } else {
-            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-            naive_current_type(&refs).to_string()
-        };
-        columns.push(ColumnInput {
-            name: name.to_string(),
-            current_type,
-            raw_values: non_null,
-            total,
-            skip_heuristics: false,
-        });
-    }
-    Ok(columns)
+    syslog_support::columns_from_syslog(path, nrows, rfc5424)
 }
 
 #[cfg(not(feature = "syslog"))]
@@ -17919,6 +18302,264 @@ mod tests {
                     "{f} col '{}': sample_values",
                     m.name
                 );
+            }
+        }
+    }
+
+    /// Test-only: `regex` is a dev-dependency now (see Cargo.toml and
+    /// CLAUDE.md's Dependency footprint section) - `weblog_support`'s own
+    /// hand-rolled parser replaced it at runtime, so this function's only
+    /// remaining job is producing the "expected" side of
+    /// `weblog_reader_matches_the_regex_crate_output_exactly`. A near-
+    /// verbatim copy of what `columns_from_weblog` used to be before that
+    /// module replaced it.
+    #[cfg(all(test, feature = "weblog"))]
+    fn columns_from_weblog_via_regex(
+        path: &Path,
+        combined: bool,
+    ) -> Result<Vec<(String, String, Vec<String>)>> {
+        let pattern = if combined {
+            r#"^(\S+) (\S+) (\S+) \[([^\]]+)\] "([^"]*)" (\d{3}|-) (\d+|-) "([^"]*)" "([^"]*)"$"#
+        } else {
+            r#"^(\S+) (\S+) (\S+) \[([^\]]+)\] "([^"]*)" (\d{3}|-) (\d+|-)$"#
+        };
+        let re = regex::Regex::new(pattern)?;
+        let request_re = regex::Regex::new(r"^(\S+) (\S+) (\S+)$")?;
+        let dash_to_none =
+            |s: &str| -> Option<String> { if s == "-" { None } else { Some(s.to_string()) } };
+
+        let mut names: Vec<&str> = vec![
+            "host",
+            "ident",
+            "authuser",
+            "timestamp",
+            "method",
+            "path",
+            "protocol",
+            "status",
+            "bytes",
+        ];
+        if combined {
+            names.extend(["referer", "user_agent"]);
+        }
+
+        let content = fs::read_to_string(path)?;
+        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let caps = re
+                .captures(line)
+                .ok_or_else(|| anyhow!("line doesn't match: {line:?}"))?;
+            let (method, req_path, protocol) = match request_re.captures(&caps[5]) {
+                Some(c) => (
+                    Some(c[1].to_string()),
+                    Some(c[2].to_string()),
+                    Some(c[3].to_string()),
+                ),
+                None => (None, None, None),
+            };
+            let mut values = vec![
+                dash_to_none(&caps[1]),
+                dash_to_none(&caps[2]),
+                dash_to_none(&caps[3]),
+                Some(caps[4].to_string()),
+                method,
+                req_path,
+                protocol,
+                dash_to_none(&caps[6]),
+                dash_to_none(&caps[7]),
+            ];
+            if combined {
+                values.push(dash_to_none(&caps[8]));
+                values.push(dash_to_none(&caps[9]));
+            }
+            for (col_idx, value) in values.into_iter().enumerate() {
+                raw[col_idx].push(value);
+            }
+        }
+
+        Ok(names
+            .into_iter()
+            .enumerate()
+            .map(|(col_idx, name)| {
+                let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+                let current_type = if non_null.is_empty() {
+                    "String".to_string()
+                } else {
+                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                    naive_current_type(&refs).to_string()
+                };
+                (name.to_string(), current_type, non_null)
+            })
+            .collect())
+    }
+
+    /// Cross-verification oracle for the hand-rolled Common/Combined Log
+    /// Format parser (`weblog_support` - see Cargo.toml) against the real
+    /// `regex` crate, kept as a dev-only dependency for exactly this
+    /// purpose. Compares column names, `current_type` (run through the
+    /// same `naive_current_type` both sides use), and every raw value -
+    /// `ColumnProfile`'s own `ideal_type` isn't compared here since that
+    /// would just be re-testing `suggest_ideal_type` itself, already
+    /// covered exhaustively elsewhere; what this test actually needs to
+    /// prove is that the two *parsers* extract identical field values.
+    #[cfg(feature = "weblog")]
+    #[test]
+    fn weblog_reader_matches_the_regex_crate_output_exactly() {
+        for (f, combined) in [
+            ("tests/fixtures/sample_common.log", false),
+            ("tests/fixtures/sample_combined.log", true),
+        ] {
+            let path = Path::new(f);
+            let mine = weblog_support::columns_from_weblog(path, None, combined)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_weblog_via_regex(path, combined)
+                .unwrap_or_else(|e| panic!("{f}: regex-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                theirs.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, (name, current_type, values)) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    &m.current_type, current_type,
+                    "{f} col '{name}': current_type"
+                );
+                assert_eq!(&m.raw_values, values, "{f} col '{name}': raw values");
+            }
+        }
+    }
+
+    /// Test-only: near-verbatim copy of what `columns_from_syslog` used to
+    /// be before `syslog_support` replaced it - see the weblog oracle's
+    /// own doc comment above for why this exists.
+    #[cfg(all(test, feature = "syslog"))]
+    fn columns_from_syslog_via_regex(
+        path: &Path,
+        rfc5424: bool,
+    ) -> Result<Vec<(String, String, Vec<String>)>> {
+        let pattern = if rfc5424 {
+            r#"^<(\d{1,3})>(\d+) (\S+) (\S+) (\S+) (\S+) (\S+) (-|\[[^\]]*\]) ?(.*)$"#
+        } else {
+            r"^(?:<(\d{1,3})>)?([A-Za-z]{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}) (\S+) ([^:\[]+?)(?:\[(\d+)\])?: ?(.*)$"
+        };
+        let re = regex::Regex::new(pattern)?;
+        let dash_to_none =
+            |s: &str| -> Option<String> { if s == "-" { None } else { Some(s.to_string()) } };
+
+        let names: Vec<&str> = if rfc5424 {
+            vec![
+                "facility",
+                "severity",
+                "version",
+                "timestamp",
+                "hostname",
+                "app_name",
+                "procid",
+                "msgid",
+                "structured_data",
+                "message",
+            ]
+        } else {
+            vec![
+                "facility",
+                "severity",
+                "timestamp",
+                "hostname",
+                "tag",
+                "pid",
+                "message",
+            ]
+        };
+
+        let content = fs::read_to_string(path)?;
+        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let caps = re
+                .captures(line)
+                .ok_or_else(|| anyhow!("line doesn't match: {line:?}"))?;
+            let pri: Option<u32> = caps.get(1).map(|m| m.as_str().parse::<u32>()).transpose()?;
+            let values: Vec<Option<String>> = if rfc5424 {
+                let pri = pri.expect("RFC 5424's regex always captures PRI");
+                vec![
+                    Some(syslog_facility_name(pri)),
+                    Some(syslog_severity_name(pri)),
+                    Some(caps[2].to_string()),
+                    Some(caps[3].to_string()),
+                    dash_to_none(&caps[4]),
+                    dash_to_none(&caps[5]),
+                    dash_to_none(&caps[6]),
+                    dash_to_none(&caps[7]),
+                    dash_to_none(&caps[8]),
+                    Some(caps[9].to_string()),
+                ]
+            } else {
+                vec![
+                    pri.map(syslog_facility_name),
+                    pri.map(syslog_severity_name),
+                    Some(caps[2].to_string()),
+                    Some(caps[3].to_string()),
+                    Some(caps[4].to_string()),
+                    caps.get(5).map(|m| m.as_str().to_string()),
+                    Some(caps[6].to_string()),
+                ]
+            };
+            for (col_idx, value) in values.into_iter().enumerate() {
+                raw[col_idx].push(value);
+            }
+        }
+
+        Ok(names
+            .into_iter()
+            .enumerate()
+            .map(|(col_idx, name)| {
+                let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+                let current_type = if non_null.is_empty() {
+                    "String".to_string()
+                } else {
+                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
+                    naive_current_type(&refs).to_string()
+                };
+                (name.to_string(), current_type, non_null)
+            })
+            .collect())
+    }
+
+    /// Cross-verification oracle for the hand-rolled syslog parser
+    /// (`syslog_support` - see Cargo.toml) against the real `regex` crate,
+    /// kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "syslog")]
+    #[test]
+    fn syslog_reader_matches_the_regex_crate_output_exactly() {
+        for (f, rfc5424) in [
+            ("tests/fixtures/sample_rfc3164.log", false),
+            ("tests/fixtures/sample_rfc3164_no_pri.log", false),
+            ("tests/fixtures/sample_rfc5424.log", true),
+            ("tests/fixtures/edge_rfc5424_uniform_timestamps.log", true),
+        ] {
+            let path = Path::new(f);
+            let mine = syslog_support::columns_from_syslog(path, None, rfc5424)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_syslog_via_regex(path, rfc5424)
+                .unwrap_or_else(|e| panic!("{f}: regex-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                theirs.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, (name, current_type, values)) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    &m.current_type, current_type,
+                    "{f} col '{name}': current_type"
+                );
+                assert_eq!(&m.raw_values, values, "{f} col '{name}': raw values");
             }
         }
     }

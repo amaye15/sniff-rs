@@ -350,8 +350,10 @@ not the truth" lesson Parquet/Avro/dBase/Stata all already demonstrate,
 in one more format's own way of losing that distinction. SAS also has
 per-column labels (same considered non-surfacing decision as Stata's).
 
-Common/Combined Log Format also land here (`columns_from_weblog`), via a
-fixed `regex` per format matching each grammar's exact field layout. The
+Common/Combined Log Format also land here (`columns_from_weblog`, via
+`weblog_support` - a hand-rolled parser now, see the Dependency footprint
+section; each grammar's exact field layout used to be matched with a fixed
+`regex`, and still is, mechanically, just without the crate). The
 quoted `"METHOD path PROTOCOL"` request is split into its own
 `method`/`path`/`protocol` columns rather than kept as one opaque field -
 a line whose request doesn't cleanly split into three tokens just gets
@@ -363,9 +365,10 @@ line read as `--format common-log`, which has two extra trailing quoted
 fields the Common grammar doesn't expect) is a hard error naming the line
 number, not a silent skip or a truncated parse.
 
-Syslog (RFC 3164 and RFC 5424, `columns_from_syslog`) follows the exact
-same shape as the web access logs - same crate, same "hard error naming
-the line" behavior for a mismatched line, same `-`-as-nilvalue-so-missing
+Syslog (RFC 3164 and RFC 5424, `columns_from_syslog`, via `syslog_support`)
+follows the exact same shape as the web access logs - same hand-rolled-
+parser-over-a-fixed-grammar approach, same "hard error naming the line"
+behavior for a mismatched line, same `-`-as-nilvalue-so-missing
 convention for RFC 5424's optional fields. Its one extra step is decoding
 the leading `<PRI>`: `facility = PRI / 8`, `severity = PRI % 8` are the
 RFC's own fixed numeric-to-name tables (`SYSLOG_FACILITIES`,
@@ -1509,12 +1512,15 @@ Three questions determine the shape of a new reader:
    own type descriptor, and fall back to a hex dump for anything not
    representable as a simple value rather than fabricating one. If it's a
    fixed text grammar with no delimiter-based structure (a log format, a
-   report with a known layout), see `columns_from_weblog` or
-   `columns_from_syslog` for the pattern: one `regex` per variant, split
-   any compound fields into their own columns, decode any packed numeric
-   codes against the format's own fixed lookup table rather than leaving
-   them opaque, and hard-error with the line number on a line that doesn't
-   match rather than skip or misparse it.
+   report with a known layout), see `weblog_support`/`syslog_support` for
+   the pattern: one hand-rolled forward-scanning parser per variant (no
+   `regex` dependency needed for a small, fixed number of known grammars -
+   see the Dependency footprint section for why and how this was verified
+   against the real `regex` crate before trusting it), split any compound
+   fields into their own columns, decode any packed numeric codes against
+   the format's own fixed lookup table rather than leaving them opaque,
+   and hard-error with the line number on a line that doesn't match rather
+   than skip or misparse it.
 3. **Can one file hold multiple tables** (another embedded-database
    format, or anything with named sections/sheets/arrays)? Return
    `Vec<(String, Vec<ColumnProfile>)>` like `columns_from_sqlite`,
@@ -3569,6 +3575,81 @@ this project could just implement directly rather than depend on:
   every corrupted input either decoded successfully by coincidence or
   failed with a clean, actionable error.
 
+- **`regex` → hand-rolled forward-scanning parsers (`weblog_support`/
+  `syslog_support`).** The one dependency in this whole effort that never
+  needed a general-purpose engine in the first place: `weblog`/`syslog`
+  only ever construct a small, fixed number of hardcoded patterns (never a
+  user-supplied or dynamically-built regex), so replacing `regex::Regex`
+  meant writing purpose-built parsers for those specific grammars, not a
+  general regex engine - a much smaller scope than every other hand-roll
+  in this section, closer in spirit to `csv`'s hand-rolled state machine
+  than to a from-scratch reimplementation of `regex` itself.
+
+  Every field in all four patterns (Common Log, Combined Log, the nested
+  `"METHOD path PROTOCOL"` request, RFC 5424) is delimited by a literal
+  character, a fixed-width run, or an unambiguous dash-vs-something
+  choice - so a single left-to-right scan (read a token, expect a literal,
+  repeat) reproduces each pattern exactly with no backtracking required at
+  all. `\d{3}` immediately followed by a literal space doesn't even need
+  special handling for "what if there's a 4th digit": reading exactly 3
+  digits and letting the *next* `expect_char(' ')` call reject a 4th digit
+  in place reproduces the regex's own greedy-with-no-shorter-backtrack
+  behavior for that specific shape - confirmed by reasoning through why
+  `\d{3}` (fixed count, not a range) has no shorter alternative to
+  backtrack to, not assumed. `<(\d{1,3})>`, by contrast, genuinely does
+  need its explicit cap respected as a hard boundary (not "read digits
+  then let the next check reject"): the group literally cannot consume a
+  4th digit as part of itself regardless of what follows, so
+  `read_digits_capped` enforces the max directly.
+
+  **RFC 3164's `([^:\[]+?)(?:\[(\d+)\])?:` looked like it would need real
+  backtracking (a non-greedy quantifier plus a trailing optional group),
+  and turned out not to.** TAG's own character class already excludes `:`
+  and `[` outright - not just "avoided while greedy," genuinely
+  unable to consume either - so its true end is a hard structural
+  boundary (the first `:` or `[` encountered scanning forward), not
+  something a backtracking search has to discover by trial and error.
+  Landing on `[` *requires* the bracket-digits-close pattern to fully
+  match right there, with no fallback: TAG cannot extend past the `[` to
+  try a different split point if the bracket doesn't parse cleanly, so a
+  malformed bracket at that position fails the whole line, matching the
+  regex's own lack of any viable backtrack there. This was reasoned
+  through carefully before being trusted (not just implemented and hoped
+  for) precisely because it's the one place in this hand-roll where
+  getting the backtracking-equivalence argument wrong would have been
+  easy to miss in testing - real syslog tags are simple enough that a
+  subtly-wrong implementation could still pass on ordinary input.
+
+  Verified two ways: **(1)**
+  `weblog_reader_matches_the_regex_crate_output_exactly` and
+  `syslog_reader_matches_the_regex_crate_output_exactly` cross-check both
+  parsers against the real `regex` crate (kept as a dev-only oracle, the
+  same treatment every other replaced crate in this section already gets)
+  on this project's existing fixtures, including the trickiest real cases
+  already on file - RFC 3164 with no `<PRI>` prefix, a tag containing a
+  space (`"syslogd 1.4.1"`), a message with embedded colons and brackets
+  (`"[12345.678] eth0: link up"`), RFC 5424 with and without a numeric UTC
+  offset. **(2)** transiently and not committed (matching this project's
+  usual real-world-corpus practice), against the exact same two real
+  files this project's own prior real-world validation pass already used
+  for these formats (see the "tenth pass" entry above) - `loghub`'s real
+  1,999-line `Linux_2k.log` (production `/var/log/messages` excerpt) for
+  RFC 3164, and Elastic's real 10,000-line Apache Combined Log dataset -
+  both re-fetched fresh rather than assumed unchanged. Every RFC 3164 line
+  matched the `regex` oracle exactly; the Apache dataset matched on all
+  9,999 well-formed lines and failed on the *same* single line both times
+  (line 8899, a literal missing closing quote on the user-agent field -
+  genuine pre-existing data corruption, not a parser disagreement,
+  confirmed identical to this project's own prior documented finding for
+  this exact file). **(3)** a 1,200-line randomized-mutation fuzz pass
+  (character insertion/deletion/replacement/swap applied to one baseline
+  line per grammar, 300 mutations each) compared *both* parsers' verdicts
+  on every mutated line - not just "does it panic," but "do the two
+  parsers agree on match-or-no-match, and on every extracted field when
+  they do" - with zero disagreements across all 1,200 cases, and
+  separately zero panics/hangs confirmed via the compiled binary directly
+  on the same corpus.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3578,8 +3659,8 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, `rmpv`, `toml`, and now `ciborium` all still were, however
-real their own risk.
+`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, and now `regex` all still were,
+however real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/

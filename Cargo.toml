@@ -18,7 +18,6 @@ rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 # (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
 # still needed for that impl's own `S: serde::Serializer` bound.
 serde = "1.0.229"
-regex = { version = "1.13.1", optional = true }
 dbase = { version = "0.8.0", optional = true }
 dta = { version = "0.6.0", optional = true }
 sas7bdat = { version = "0.8.0", optional = true }
@@ -40,8 +39,8 @@ ini = []
 xml = []
 zstd = []
 npy = []
-weblog = ["dep:regex"]
-syslog = ["dep:regex"]
+weblog = []
+syslog = []
 dbase = ["dep:dbase"]
 stata = ["dep:dta"]
 sas7bdat = ["dep:sas7bdat"]
@@ -109,6 +108,15 @@ toml = "1.1.4"
 # `cbor_reader_matches_the_ciborium_crate_output_exactly`
 # (`#[cfg(all(test, feature = "cbor"))]` in src/lib.rs).
 ciborium = "0.2.2"
+# Same dev-only treatment, same reason: the `weblog` and `syslog` features'
+# own hand-rolled line parsers (`weblog_support`/`syslog_support` in
+# src/lib.rs) replaced this at runtime; kept only as this project's own
+# cross-verification oracle in
+# `weblog_reader_matches_the_regex_crate_output_exactly` and
+# `syslog_reader_matches_the_regex_crate_output_exactly`
+# (`#[cfg(all(test, feature = "weblog"))]`/`#[cfg(all(test, feature =
+# "syslog"))]` in src/lib.rs).
+regex = "1.13.1"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand
