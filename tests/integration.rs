@@ -2264,6 +2264,48 @@ fn avro_top_level_scalar_records_become_one_value_column() {
     assert_eq!(value["missing_pct"].as_f64().unwrap(), 0.0);
 }
 
+// A field can reference a *named* record/enum/fixed type defined elsewhere
+// in the same schema by its bare name - including a record referencing
+// *itself* inside one of its own fields (a real, common shape for
+// tree/list-like data, e.g. an "employee has a manager, who is also an
+// employee" chain). This exercises `avro_support`'s own name-resolution
+// mechanism, which has no analog in any other format this project reads:
+// a flat name -> schema table built once during parsing, with every
+// reference (forward, backward, or self) resolved lazily against it only
+// once decoding starts - see avro_support's own `Schema::Ref` doc comment.
+#[cfg(feature = "avro")]
+#[test]
+fn avro_resolves_named_type_references_including_self_reference() {
+    let doc = run_json("edge_avro_named_type_refs.avro", &[]);
+    let cols = table(&doc, "edge_avro_named_type_refs");
+
+    // `backup_address` references the earlier-defined "Address" record by
+    // name (inside a nullable union) - a plain backward reference.
+    assert_eq!(
+        column(cols, "backup_address.city")["sample_values"],
+        serde_json::json!(["Capital City"])
+    );
+
+    // `manager` is `["null", "Employee"]` - the record referencing its own
+    // name. Three levels of real recursion (Carol -> Bob -> Alice) must
+    // all flatten correctly, including the innermost employee's own
+    // (null) manager field.
+    assert_eq!(
+        column(cols, "manager.name")["sample_values"],
+        serde_json::json!(["Alice", "Bob"])
+    );
+    assert_eq!(
+        column(cols, "manager.manager.name")["sample_values"],
+        serde_json::json!(["Alice"])
+    );
+    assert_eq!(
+        column(cols, "manager.manager.manager")["missing_pct"]
+            .as_f64()
+            .unwrap(),
+        100.0
+    );
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_recognizes_uuid_email_ipv4_and_date_columns() {

@@ -418,31 +418,30 @@ The load-bearing design decision is that **non-native nested formats are
 bridged into `serde_json::Value` and handed to the exact same recursive
 flattener**, rather than reimplementing recursion per format:
 
-- Avro decodes each record to `serde_json::Value` (`avro_value_to_json`)
-  and calls `profile_json_records` — identical code path to a `.json` file
-  — or, if not every decoded value is an object (a real, valid shape: an
-  Avro RPC response file, for instance, decodes to a bare scalar), the
-  same top-level-scalar fallback the JSON/YAML readers use, profiling
-  the whole set as one `value` column instead. Unlike every other bridge
-  in this list, it also takes the record's
-  `Schema` alongside the value and co-recurses over both together, because
-  one Avro logical type - `decimal` - genuinely can't be rendered correctly
-  from the value alone: Avro stores only the unscaled two's-complement
-  integer in the value, the scale that says where the decimal point goes
-  lives in the schema. `avro_decimal_to_string` gets that scale from the
-  matching schema node (falling back gracefully to `None`/untyped
-  recursion on any schema/value shape mismatch, which shouldn't happen for
-  a spec-compliant file) and delegates the actual big-integer decoding to
-  `num_bigint::BigInt` - already a transitive dependency of `apache-avro`
-  itself, so depending on it directly too adds zero new crates, the same
-  "don't reimplement what's already there for free" call this project
-  makes for chrono/serde_json elsewhere. `timestamp-millis`/`-micros`/
-  `-nanos`, their `local-*` counterparts, and `time-millis`/`-micros` all
-  get resolved to real date-time/time-of-day strings the same way `date`
-  already was, rather than being left as opaque epoch integers - see the
-  design philosophy section for how this was found (cloud-platform Avro
-  producers like Kinesis Firehose, Event Hubs Capture, and Pub/Sub lean
-  heavily on exactly these logical types).
+- Avro decodes each record straight to `serde_json::Value`
+  (`avro_support::decode_to_json` - a hand-rolled reader now, see the
+  Dependency footprint section) and calls `profile_json_records` —
+  identical code path to a `.json` file — or, if not every decoded value
+  is an object (a real, valid shape: an Avro RPC response file, for
+  instance, decodes to a bare scalar), the same top-level-scalar fallback
+  the JSON/YAML readers use, profiling the whole set as one `value` column
+  instead. Unlike every other bridge in this list, decoding and JSON
+  conversion happen in a *single* pass rather than two: since the
+  `Schema` is already in hand at every step of decoding (unlike the
+  dynamic-value-tree bridges below, which decode first and only then walk
+  the result alongside a schema), there's no separate co-recursion step
+  needed to resolve a logical type like `decimal` - Avro stores only the
+  unscaled two's-complement integer in the value, and the scale that says
+  where the decimal point goes comes directly from the schema node already
+  being decoded against, converted to a string via hand-rolled schoolbook
+  long division (not a bignum library - see that reader's own dependency-
+  footprint entry for why plain digit-shifting arithmetic is enough here).
+  `timestamp-millis`/`-micros`/`-nanos`, their `local-*` counterparts, and
+  `time-millis`/`-micros` all get resolved to real date-time/time-of-day
+  strings the same way `date` already was, rather than being left as
+  opaque epoch integers - see the design philosophy section for how this
+  was found (cloud-platform Avro producers like Kinesis Firehose, Event
+  Hubs Capture, and Pub/Sub lean heavily on exactly these logical types).
 - MessagePack does the same (`msgpack_value_to_json`), reading a stream of
   concatenated top-level values (records are self-delimiting, so they don't
   need a separator the way JSON Lines needs newlines) - or, if the file
@@ -3857,6 +3856,118 @@ this project could just implement directly rather than depend on:
   needed anywhere in this pass - the cleanest real-world result of any
   hand-roll in this effort alongside TOML's own equally clean pass.
 
+- **`apache-avro` (+ `num-bigint`) → a hand-rolled reader (`avro_support`).**
+  Avro's own binary encoding turned out to be one of the *simplest* wire
+  formats hand-rolled in this whole effort - no Huffman coding, no
+  dictionary encoding, no page structure, just zigzag varints and
+  concatenated fields - but its *schema* is one of the most elaborate:
+  named-type registries, recursive self-reference, unions, and a dozen
+  logical types layered on top of a handful of primitives. Verified
+  directly against the `apache-avro` crate's own `reader/block.rs`
+  (Object Container File structure), `util.rs` (zigzag varint encoding),
+  `decode.rs` (per-type binary layout and the array/map negative-block-
+  count convention), `codec.rs` (which codecs mean what, and - critically -
+  that `apache-avro`'s own `Cargo.toml` already declares `snappy`/
+  `zstandard` as real, always-enabled features of this project's existing
+  dependency, not optional ones a user could have left off), and
+  `schema/name.rs` (namespace resolution) - not assumed from the public
+  Avro spec alone, since a hand-roll aiming for byte-exact oracle parity
+  needs to match the *crate's* specific choices, not just "a" valid
+  reading of the spec.
+
+  Several things worth calling out, each a direct consequence of reading
+  the source first:
+    1. **Schema parsing and binary decoding merge into a single pass**,
+       unlike every other nested format this project bridges through an
+       intermediate dynamic value type (JSON, YAML, MessagePack, CBOR,
+       TOML all decode to a generic value tree *first*, then flatten it
+       against the schema *separately* - `avro_value_to_json`'s own old
+       two-argument `(value, schema)` co-recursion, kept only as this
+       hand-roll's oracle now). Avro doesn't need that: the schema is
+       already in hand at every step of decoding, so `decode_to_json`
+       converts straight to `serde_json::Value` as it reads, with no
+       intermediate `Value` enum of its own at all.
+    2. **A self-referential schema (a record naming itself inside one of
+       its own fields - a real, common shape for tree/list-like data, not
+       a contrived edge case) needs no `Rc`/`RefCell` graph-building
+       trick.** Every named type (record/enum/fixed) is registered by its
+       fully-qualified name into a flat `HashMap<String, Schema>` as it's
+       parsed; a bare-name reference anywhere in the tree - forward,
+       backward, or to itself - becomes a `Schema::Ref(name)` marker that
+       is *never* resolved during parsing, only looked up lazily once
+       decoding (which only starts after the whole schema has been fully
+       parsed) actually reaches it. Since the name table is complete by
+       the time any lookup happens, there's no chicken-and-egg ordering
+       problem to solve at all - confirmed against a real, three-level-
+       deep self-referential recursion (`edge_avro_named_type_refs.avro`,
+       an "employee has a manager, who is also an employee" chain)
+       flattening correctly at every level.
+    3. **Two of Avro's three codecs this project already supported were
+       already free.** Deflate is Avro's own raw-RFC-1951 (no gzip/zlib
+       wrapper, no checksum) - exactly what this project's own `inflate`
+       (built for gzip) already implements, reused directly. Zstandard is
+       a standard zstd frame - exactly what `zstd_support` (built for the
+       top-level `.zst` format) already decodes, reused directly by
+       widening that module's own feature gate from `zstd` alone to
+       `any(zstd, avro)`, the same "one decoder, two independent features"
+       arrangement `zip_support` already has for `xlsx`/`npy`. Only
+       Snappy - Avro's *most common* production codec in Kafka/Hadoop
+       pipelines - needed a genuine new hand-roll.
+    4. **Snappy's raw block format (not its separate, higher-level "frame"
+       format, confirmed `apache-avro` uses the former via `snap::raw::*`)
+       is a simple literal/copy scheme**, verified directly against the
+       `snap` crate's own `decompress.rs` and the bit-layout table its
+       `build.rs` generates: a tag byte's low 2 bits select a literal
+       (length in the remaining 6 bits, or - if that field reads 60-63 -
+       the real length minus one follows as 1-4 raw little-endian bytes)
+       or a back-reference copy with a 1/2/4-byte offset. The trailing
+       4-byte big-endian CRC32 checksum Avro's own snappy codec appends is
+       the *standard* IEEE polynomial (`crc32fast`, confirmed in
+       `codec.rs`) - not the Castagnoli variant `snap`'s own internal
+       frame-format machinery uses elsewhere - so this project's own
+       `crc32` (already hand-rolled for gzip) verifies it directly, no
+       second checksum implementation needed.
+    5. **A decimal's unscaled two's-complement bytes are converted to a
+       scaled string via hand-rolled schoolbook long division**, not a
+       bignum library - the same "just enough, not a general-purpose
+       dependency" scoping as every other precisely-bounded conversion in
+       this project. `apache-avro`'s own `BigDecimal` extension (whose
+       scale is embedded *in the value*, via a nested length-prefixed
+       bytes-plus-zigzag-long encoding, unlike the schema-carried scale of
+       standard `decimal`) reuses the identical digit-shifting logic with
+       a value-supplied, possibly negative, scale. This path carries
+       lower verification confidence than the rest of this reader,
+       matching the same disclosed gap this project's prior real-world
+       Avro pass already recorded: no tool available while building this
+       project's own fixtures can write `big-decimal` test data, so it's
+       implemented directly from the crate's source rather than cross-
+       checked against a real file - the same honest boundary already
+       drawn for `Duration`'s own best-effort rendering.
+
+  Verified two ways: **(1)**
+  `avro_reader_matches_the_apache_avro_crate_output_exactly` cross-checks
+  this reader against the real `apache-avro` crate (kept as a dev-only
+  oracle, the same treatment every other replaced crate in this section
+  already gets) on this project's existing fixtures plus a new
+  `edge_avro_named_type_refs.avro` (generated with `fastavro`, matching
+  this project's established fixture-generation convention) covering the
+  named-type-reference/self-recursion mechanism above, which had zero
+  prior coverage even under the old apache-avro-based reader. **(2)**
+  transiently and not committed (matching this project's usual real-
+  world-corpus practice), against the same corpora this project's own
+  prior Avro validation pass used - the Apache Avro project's own
+  `weather.avro`/`weather-snappy.avro`/`weather-zstd.avro` interop
+  fixtures and the five `userdata*.avro` files from the widely-used
+  Teradata/kylo sample-data collection - all re-fetched fresh, all eight
+  matching the `apache-avro` crate's own output exactly via the same
+  oracle. A 900-iteration bit-flip fuzz pass (300 each against the
+  uncompressed, snappy, and zstd real files) produced zero panics and
+  zero hangs - the low proportion of inputs that still decoded
+  successfully after mutation (most bit flips landed in the schema's own
+  JSON text, correctly producing a clean parse error rather than a
+  crash) is expected for a format whose header is largely human-readable
+  text, not a gap.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3866,8 +3977,8 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, `dbase`, and now `dta`
-all still were, however real their own risk.
+`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, `dbase`, `dta`, and now
+`apache-avro` all still were, however real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/

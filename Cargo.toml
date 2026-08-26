@@ -7,12 +7,6 @@ edition = "2024"
 serde_json = "1.0.151"
 arrow = { version = "59.2.0", features = ["ipc", "ipc_compression", "chrono-tz"], optional = true }
 parquet = { version = "59.2.0", features = ["arrow"], optional = true }
-apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"], optional = true }
-# Already a transitive dependency of apache-avro itself (its Decimal value
-# type wraps a num_bigint::BigInt internally) - depending on it directly
-# too adds zero new crates to the build, just exposes a type that's
-# already being compiled whenever --features avro is on.
-num-bigint = { version = "0.4", optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 # No "derive" feature - ColumnProfile's own Serialize impl is hand-written
 # (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
@@ -26,7 +20,7 @@ default = []
 # formats sharing the same `arrow` crate, so there's no separate compile cost to split them.
 parquet = ["dep:arrow", "dep:parquet"]
 xlsx = []
-avro = ["dep:apache-avro", "dep:num-bigint"]
+avro = []
 full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat"]
 sqlite = ["dep:rusqlite"]
 msgpack = []
@@ -127,6 +121,20 @@ dbase = "0.8.0"
 # `stata_reader_matches_the_dta_crate_output_exactly`
 # (`#[cfg(all(test, feature = "stata"))]` in src/lib.rs).
 dta = "0.6.0"
+# Same dev-only treatment, same reason: the `avro` feature's own hand-
+# rolled reader (`avro_support` in src/lib.rs - schema parsing, binary
+# decoding, and its own Deflate/Snappy/Zstandard codec integration, the
+# latter two reusing `inflate`/`zstd_support` rather than duplicating
+# them) replaced this at runtime; kept only as this project's own
+# cross-verification oracle in
+# `avro_reader_matches_the_apache_avro_crate_output_exactly`
+# (`#[cfg(all(test, feature = "avro"))]` in src/lib.rs). `num-bigint`
+# moves with it - it was only ever depended on directly to decode
+# apache-avro's own `Decimal` value type (see that oracle's own
+# `avro_decimal_to_string_via_apache_avro_crate`), which no longer runs
+# outside tests.
+apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
+num-bigint = "0.4"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

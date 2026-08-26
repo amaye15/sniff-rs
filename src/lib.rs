@@ -5321,182 +5321,1007 @@ fn columns_from_arrow_ipc(
 
 // --- Avro reader (opt-in via --features avro) ---
 // Decodes each record to serde_json::Value and reuses the exact same
-// column-extraction/flattening path as JSON files.
+// column-extraction/flattening path as JSON files. The reader itself
+// (`avro_support`) is hand-rolled - see CLAUDE.md's Dependency footprint
+// section for why and how it was verified. Unlike every other bridge
+// format in this project, decoding and JSON conversion happen in a single
+// pass here rather than two (decode to a typed `Value` tree, then walk it
+// alongside the schema): since the schema is already in hand at every
+// step of decoding, there's no need to build an intermediate value tree
+// just to co-recurse over it a second time afterward.
 
-/// Avro's decimal logical type stores only the unscaled two's-complement
-/// integer in the *value* - the scale that says where the decimal point
-/// goes lives in the *schema*, not the value, so rendering a decimal
-/// column correctly needs both together (see avro_value_to_json's
-/// Option<&Schema> parameter). Delegates the actual big-integer decoding
-/// to num_bigint (already a transitive dependency of apache-avro itself -
-/// see the Cargo.toml comment) rather than hand-rolling two's-complement
-/// arithmetic, the same "don't reimplement what a well-tested crate
-/// already does for free" call this project makes elsewhere (chrono,
-/// serde_json).
 #[cfg(feature = "avro")]
-fn avro_decimal_to_string(decimal: apache_avro::Decimal, scale: usize) -> String {
-    let unscaled: num_bigint::BigInt = decimal.into();
-    let signed = unscaled.to_string();
-    let (negative, digits) = match signed.strip_prefix('-') {
-        Some(rest) => (true, rest.to_string()),
-        None => (false, signed),
-    };
-    let mut out = if digits.len() <= scale {
-        format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
-    } else {
-        digits
-    };
-    if scale > 0 {
-        out.insert(out.len() - scale, '.');
+mod avro_support {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Read;
+
+    /// Matches the `apache-avro` crate's own `DEFAULT_MAX_ALLOCATION_BYTES`,
+    /// guarding against a corrupted/adversarial length prefix (bytes,
+    /// string, fixed) forcing a huge allocation before any real data backs
+    /// it up - the same class of guard this project's other hand-rolled
+    /// binary readers already apply to their own untrusted length fields.
+    const MAX_ALLOC: usize = 512 * 1024 * 1024;
+
+    fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
+        let mut buf = [0u8; 1];
+        r.read_exact(&mut buf)
+            .context("failed reading a byte from an Avro file")?;
+        Ok(buf[0])
     }
-    if negative {
-        out.insert(0, '-');
-    }
-    out
-}
 
-#[cfg(feature = "avro")]
-fn avro_millis_to_string(millis: i64) -> JsonValue {
-    EpochDateTime::from_unix_millis(millis)
-        .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(3)))
-}
-
-#[cfg(feature = "avro")]
-fn avro_micros_to_string(micros: i64) -> JsonValue {
-    EpochDateTime::from_unix_micros(micros)
-        .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(6)))
-}
-
-#[cfg(feature = "avro")]
-fn avro_nanos_to_string(nanos: i64) -> JsonValue {
-    let secs = nanos.div_euclid(1_000_000_000);
-    let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
-    EpochDateTime::from_unix_seconds(secs, subsec_nanos)
-        .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(9)))
-}
-
-#[cfg(feature = "avro")]
-fn avro_time_millis_to_string(millis: i32) -> JsonValue {
-    let secs = (millis.div_euclid(1000)).rem_euclid(86_400) as u32;
-    let nanos = millis.rem_euclid(1000) as u32 * 1_000_000;
-    EpochTime::from_seconds_since_midnight(secs, nanos)
-        .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(3)))
-}
-
-#[cfg(feature = "avro")]
-fn avro_time_micros_to_string(micros: i64) -> JsonValue {
-    let secs = (micros.div_euclid(1_000_000)).rem_euclid(86_400) as u32;
-    let nanos = micros.rem_euclid(1_000_000) as u32 * 1000;
-    EpochTime::from_seconds_since_midnight(secs, nanos)
-        .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(6)))
-}
-
-/// `schema` co-recurses alongside `v` so logical types whose meaning isn't
-/// recoverable from the value alone - decimal's scale is the one real case
-/// here, see avro_decimal_to_string - can still be resolved correctly. A
-/// schema/value shape mismatch (which shouldn't happen with a
-/// spec-compliant file) degrades gracefully to `None` at that point rather
-/// than failing the whole record - every other case here doesn't actually
-/// need the schema at all, so recursion continues unaffected.
-#[cfg(feature = "avro")]
-fn avro_value_to_json(
-    v: &apache_avro::types::Value,
-    schema: Option<&apache_avro::Schema>,
-) -> JsonValue {
-    use apache_avro::Schema;
-    use apache_avro::types::Value as AvroValue;
-    match v {
-        AvroValue::Null => JsonValue::Null,
-        AvroValue::Boolean(b) => JsonValue::Bool(*b),
-        AvroValue::Int(i) => JsonValue::Number((*i).into()),
-        AvroValue::Long(i) => JsonValue::Number((*i).into()),
-        AvroValue::Float(f) => {
-            serde_json::Number::from_f64(f64::from(*f)).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        AvroValue::Double(f) => {
-            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        AvroValue::String(s) | AvroValue::Enum(_, s) => JsonValue::String(s.clone()),
-        AvroValue::Bytes(b) | AvroValue::Fixed(_, b) => {
-            JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
-        }
-        AvroValue::Union(idx, inner) => {
-            let variant_schema = match schema {
-                Some(Schema::Union(u)) => u.get_variant(*idx as usize).ok(),
-                _ => None,
-            };
-            avro_value_to_json(inner, variant_schema)
-        }
-        AvroValue::Array(items) => {
-            let item_schema = match schema {
-                Some(Schema::Array(a)) => Some(a.items.as_ref()),
-                _ => None,
-            };
-            JsonValue::Array(
-                items
-                    .iter()
-                    .map(|i| avro_value_to_json(i, item_schema))
-                    .collect(),
-            )
-        }
-        AvroValue::Map(m) => {
-            let value_schema = match schema {
-                Some(Schema::Map(ms)) => Some(ms.types.as_ref()),
-                _ => None,
-            };
-            JsonValue::Object(
-                m.iter()
-                    .map(|(k, v)| (k.clone(), avro_value_to_json(v, value_schema)))
-                    .collect(),
-            )
-        }
-        AvroValue::Record(fields) => {
-            let record_schema = match schema {
-                Some(Schema::Record(rs)) => Some(rs),
-                _ => None,
-            };
-            JsonValue::Object(
-                fields
-                    .iter()
-                    .map(|(k, v)| {
-                        let field_schema = record_schema.and_then(|rs| {
-                            rs.lookup
-                                .get(k)
-                                .and_then(|&i| rs.fields.get(i))
-                                .map(|f| &f.schema)
-                        });
-                        (k.clone(), avro_value_to_json(v, field_schema))
-                    })
-                    .collect(),
-            )
-        }
-        AvroValue::Date(days) => EpochDate::from_days(i64::from(*days))
-            .map_or(JsonValue::Null, |d| JsonValue::String(d.format_ymd())),
-        AvroValue::Uuid(u) => JsonValue::String(u.to_string()),
-        AvroValue::TimestampMillis(ms) | AvroValue::LocalTimestampMillis(ms) => {
-            avro_millis_to_string(*ms)
-        }
-        AvroValue::TimestampMicros(us) | AvroValue::LocalTimestampMicros(us) => {
-            avro_micros_to_string(*us)
-        }
-        AvroValue::TimestampNanos(ns) | AvroValue::LocalTimestampNanos(ns) => {
-            avro_nanos_to_string(*ns)
-        }
-        AvroValue::TimeMillis(ms) => avro_time_millis_to_string(*ms),
-        AvroValue::TimeMicros(us) => avro_time_micros_to_string(*us),
-        AvroValue::Decimal(d) => match schema {
-            Some(Schema::Decimal(ds)) => {
-                JsonValue::String(avro_decimal_to_string(d.clone(), ds.scale))
+    /// Reads one zigzag-encoded varint `long`, matching Avro's own
+    /// encoding (verified directly against the `apache-avro` crate's own
+    /// `util.rs`: a standard unsigned LEB128 varint, zigzag-decoded via
+    /// `(z >> 1) ^ -(z & 1)`). Used for every `int`/`long` value, every
+    /// `bytes`/`string` length prefix, every array/map block count, and
+    /// every union branch index - Avro's binary encoding leans on this one
+    /// primitive almost everywhere.
+    fn read_zigzag<R: Read>(r: &mut R) -> Result<i64> {
+        let mut n: u64 = 0;
+        let mut shift = 0u32;
+        loop {
+            if shift > 63 {
+                bail!("malformed Avro varint: too many continuation bytes");
             }
-            // No schema/scale available - shouldn't happen for a
-            // spec-compliant file (the writer schema always carries the
-            // scale), so fall back to a visible placeholder rather than
-            // guessing a scale and silently showing the wrong number.
-            _ => JsonValue::String(format!("{d:?}")),
-        },
-        AvroValue::BigDecimal(bg) => JsonValue::String(bg.to_string()),
-        other => JsonValue::String(format!("{other:?}")), // best-effort for Duration, the one remaining compound logical type
+            let b = read_u8(r)?;
+            n |= u64::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        Ok(if n & 1 == 0 {
+            (n >> 1) as i64
+        } else {
+            !(n >> 1) as i64
+        })
     }
+
+    /// Same as `read_zigzag`, but distinguishes "cleanly out of input right
+    /// at a value boundary" (returns `Ok(None)`, the normal way an Avro
+    /// Object Container File's block sequence ends - there's no sentinel
+    /// value, the file just stops) from "ran out of input mid-varint"
+    /// (a real truncation error). Verified against the `apache-avro`
+    /// crate's own block-reading loop, which draws this exact distinction
+    /// via the io error kind on the *first* byte of the next block's
+    /// count.
+    fn try_read_zigzag<R: Read>(r: &mut R) -> Result<Option<i64>> {
+        let mut buf = [0u8; 1];
+        match r.read(&mut buf) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {}
+            Err(e) => return Err(e).context("failed reading an Avro block header"),
+        }
+        let first = buf[0];
+        if first & 0x80 == 0 {
+            let n = u64::from(first);
+            return Ok(Some(if n & 1 == 0 {
+                (n >> 1) as i64
+            } else {
+                !(n >> 1) as i64
+            }));
+        }
+        let mut n = u64::from(first & 0x7F);
+        let mut shift = 7u32;
+        loop {
+            if shift > 63 {
+                bail!("malformed Avro varint: too many continuation bytes");
+            }
+            let b = read_u8(r)?;
+            n |= u64::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        Ok(Some(if n & 1 == 0 {
+            (n >> 1) as i64
+        } else {
+            !(n >> 1) as i64
+        }))
+    }
+
+    fn read_len<R: Read>(r: &mut R) -> Result<usize> {
+        let n = read_zigzag(r)?;
+        let n = usize::try_from(n).with_context(|| format!("invalid Avro length {n}"))?;
+        if n > MAX_ALLOC {
+            bail!("Avro length {n} exceeds the sanity cap of {MAX_ALLOC} bytes");
+        }
+        Ok(n)
+    }
+
+    fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf)
+            .with_context(|| format!("failed reading {n} byte(s) from an Avro file"))?;
+        Ok(buf)
+    }
+
+    fn expect_bytes<R: Read>(r: &mut R, expected: &[u8]) -> Result<()> {
+        let actual = read_exact_vec(r, expected.len())?;
+        if actual != expected {
+            bail!(
+                "expected {:?} in Avro file, found {:?}",
+                String::from_utf8_lossy(expected),
+                String::from_utf8_lossy(&actual)
+            );
+        }
+        Ok(())
+    }
+
+    /// `bytes`/`string` share one length-prefix-then-raw-bytes shape; only
+    /// the caller-side interpretation (raw bytes vs. UTF-8) differs.
+    fn read_length_prefixed<R: Read>(r: &mut R) -> Result<Vec<u8>> {
+        let len = read_len(r)?;
+        read_exact_vec(r, len)
+    }
+
+    #[derive(Clone, Copy)]
+    enum UuidKind {
+        Str,
+        Bytes,
+        Fixed,
+    }
+
+    /// A parsed Avro schema node. Named types (record/enum/fixed) are
+    /// registered by their fully-qualified name in a flat side table as
+    /// they're parsed (see `columns_from_avro`'s own `names` map) rather
+    /// than embedded as shared pointers in the tree itself - a `Ref` node
+    /// is just a name to look up in that table, resolved lazily at decode
+    /// time. This sidesteps needing `Rc`/`RefCell` to represent a
+    /// genuinely self-referential schema (a record naming itself inside
+    /// one of its own fields, a real and common pattern e.g. for
+    /// tree-shaped data): since a reference is never resolved *during*
+    /// parsing, there's no chicken-and-egg problem to solve - the name
+    /// table is simply guaranteed complete by the time decoding (which
+    /// only starts after the whole schema has been parsed) ever consults
+    /// it.
+    #[derive(Clone)]
+    enum Schema {
+        Null,
+        Boolean,
+        Int,
+        Long,
+        Float,
+        Double,
+        Bytes,
+        String,
+        Array(Box<Schema>),
+        Map(Box<Schema>),
+        Union(Vec<Schema>),
+        Record(Vec<(String, Schema)>),
+        Enum(Vec<String>),
+        Fixed(usize),
+        /// Wraps `Bytes` or `Fixed(n)`; the `usize` is the scale.
+        Decimal(Box<Schema>, usize),
+        /// `apache-avro`'s own extension: an arbitrary-precision decimal
+        /// whose scale is carried *in the value* rather than the schema -
+        /// see `decode_big_decimal`'s own doc comment.
+        BigDecimal,
+        Uuid(UuidKind),
+        Date,
+        TimeMillis,
+        TimeMicros,
+        TimestampMillis,
+        TimestampMicros,
+        TimestampNanos,
+        LocalTimestampMillis,
+        LocalTimestampMicros,
+        LocalTimestampNanos,
+        /// Wraps `Fixed(12)`.
+        Duration,
+        /// A reference to a record/enum/fixed defined elsewhere in the
+        /// schema, by fully-qualified name.
+        Ref(String),
+    }
+
+    /// Resolves a *definition's* fully-qualified name (a record, enum, or
+    /// fixed's own "name" - and, for its children, the namespace they
+    /// inherit). Verified against the `apache-avro` crate's own
+    /// `schema/name.rs`: a name containing a `.` is already fully
+    /// qualified; otherwise an explicit `namespace` attribute on this same
+    /// JSON node wins, falling back to the enclosing named type's own
+    /// namespace, falling back to no namespace at all.
+    fn resolve_definition_name(
+        name: &str,
+        own_namespace: Option<&str>,
+        enclosing_namespace: Option<&str>,
+    ) -> (String, Option<String>) {
+        if name.contains('.') {
+            let ns = name.rsplit_once('.').map(|(ns, _)| ns.to_string());
+            return (name.to_string(), ns);
+        }
+        match own_namespace.or(enclosing_namespace) {
+            Some(ns) if !ns.is_empty() => (format!("{ns}.{name}"), Some(ns.to_string())),
+            _ => (name.to_string(), None),
+        }
+    }
+
+    /// Resolves a bare-string *reference* to a fully-qualified name, using
+    /// whatever namespace is active at the point the reference occurs in
+    /// the schema tree - the same rule `resolve_definition_name` applies,
+    /// minus a "own namespace" attribute (a reference is just a string,
+    /// not an object with its own fields).
+    fn resolve_ref_name(name: &str, enclosing_namespace: Option<&str>) -> String {
+        if name.contains('.') {
+            return name.to_string();
+        }
+        match enclosing_namespace {
+            Some(ns) if !ns.is_empty() => format!("{ns}.{name}"),
+            _ => name.to_string(),
+        }
+    }
+
+    fn json_str<'a>(obj: &'a serde_json::Map<String, JsonValue>, key: &str) -> Option<&'a str> {
+        obj.get(key).and_then(JsonValue::as_str)
+    }
+
+    /// Parses one schema node, registering any named (record/enum/fixed)
+    /// definition it contains into `names` as it's encountered - in
+    /// whatever order the schema happens to define them, since references
+    /// are resolved lazily (see `Schema::Ref`'s own doc comment) rather
+    /// than during this walk.
+    fn parse_schema(
+        json: &JsonValue,
+        names: &mut HashMap<String, Schema>,
+        enclosing_namespace: Option<&str>,
+    ) -> Result<Schema> {
+        match json {
+            JsonValue::String(s) => Ok(match s.as_str() {
+                "null" => Schema::Null,
+                "boolean" => Schema::Boolean,
+                "int" => Schema::Int,
+                "long" => Schema::Long,
+                "float" => Schema::Float,
+                "double" => Schema::Double,
+                "bytes" => Schema::Bytes,
+                "string" => Schema::String,
+                other => Schema::Ref(resolve_ref_name(other, enclosing_namespace)),
+            }),
+            JsonValue::Array(variants) => {
+                let variants = variants
+                    .iter()
+                    .map(|v| parse_schema(v, names, enclosing_namespace))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Schema::Union(variants))
+            }
+            JsonValue::Object(obj) => parse_schema_object(obj, names, enclosing_namespace),
+            other => bail!("invalid Avro schema node: {other}"),
+        }
+    }
+
+    fn parse_schema_object(
+        obj: &serde_json::Map<String, JsonValue>,
+        names: &mut HashMap<String, Schema>,
+        enclosing_namespace: Option<&str>,
+    ) -> Result<Schema> {
+        let Some(type_field) = obj.get("type") else {
+            bail!("Avro schema object is missing its \"type\" field");
+        };
+        // `{"type": {...}}` / `{"type": [...]}` - a nested schema value
+        // rather than a plain type-name string. Real schemas rarely do
+        // this, but it costs nothing extra to support via plain recursion.
+        let type_name = match type_field {
+            JsonValue::String(s) => s.as_str(),
+            other => return parse_schema(other, names, enclosing_namespace),
+        };
+
+        match type_name {
+            "record" => {
+                let name = json_str(obj, "name").context("Avro record is missing \"name\"")?;
+                let (fqn, child_ns) =
+                    resolve_definition_name(name, json_str(obj, "namespace"), enclosing_namespace);
+                let fields_json = obj
+                    .get("fields")
+                    .and_then(JsonValue::as_array)
+                    .context("Avro record is missing \"fields\"")?;
+                let mut fields = Vec::with_capacity(fields_json.len());
+                for field in fields_json {
+                    let field_obj = field
+                        .as_object()
+                        .context("Avro record field must be a JSON object")?;
+                    let field_name = json_str(field_obj, "name")
+                        .context("Avro record field is missing \"name\"")?
+                        .to_string();
+                    let field_type = field_obj
+                        .get("type")
+                        .context("Avro record field is missing \"type\"")?;
+                    let field_schema = parse_schema(field_type, names, child_ns.as_deref())?;
+                    fields.push((field_name, field_schema));
+                }
+                let schema = Schema::Record(fields);
+                names.insert(fqn, schema.clone());
+                Ok(schema)
+            }
+            "enum" => {
+                let name = json_str(obj, "name").context("Avro enum is missing \"name\"")?;
+                let (fqn, _) =
+                    resolve_definition_name(name, json_str(obj, "namespace"), enclosing_namespace);
+                let symbols = obj
+                    .get("symbols")
+                    .and_then(JsonValue::as_array)
+                    .context("Avro enum is missing \"symbols\"")?
+                    .iter()
+                    .map(|s| {
+                        s.as_str()
+                            .map(str::to_string)
+                            .context("Avro enum symbol must be a string")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let schema = Schema::Enum(symbols);
+                names.insert(fqn, schema.clone());
+                Ok(schema)
+            }
+            "fixed" => {
+                let name = json_str(obj, "name").context("Avro fixed is missing \"name\"")?;
+                let (fqn, _) =
+                    resolve_definition_name(name, json_str(obj, "namespace"), enclosing_namespace);
+                let size = obj
+                    .get("size")
+                    .and_then(JsonValue::as_u64)
+                    .context("Avro fixed is missing \"size\"")?;
+                let size = usize::try_from(size).context("Avro fixed size out of range")?;
+                if let Some(logical) = json_str(obj, "logicalType") {
+                    if logical == "decimal"
+                        && let Some(precision) = obj.get("precision").and_then(JsonValue::as_u64)
+                    {
+                        let _ = precision; // only the scale affects rendering
+                        let scale = obj.get("scale").and_then(JsonValue::as_u64).unwrap_or(0);
+                        let schema = Schema::Decimal(Box::new(Schema::Fixed(size)), scale as usize);
+                        names.insert(fqn, Schema::Fixed(size));
+                        return Ok(schema);
+                    }
+                    if logical == "duration" && size == 12 {
+                        names.insert(fqn, Schema::Fixed(size));
+                        return Ok(Schema::Duration);
+                    }
+                    if logical == "uuid" && size == 16 {
+                        names.insert(fqn, Schema::Fixed(size));
+                        return Ok(Schema::Uuid(UuidKind::Fixed));
+                    }
+                }
+                let schema = Schema::Fixed(size);
+                names.insert(fqn, schema.clone());
+                Ok(schema)
+            }
+            "array" => {
+                let items = obj
+                    .get("items")
+                    .context("Avro array is missing \"items\"")?;
+                Ok(Schema::Array(Box::new(parse_schema(
+                    items,
+                    names,
+                    enclosing_namespace,
+                )?)))
+            }
+            "map" => {
+                let values = obj
+                    .get("values")
+                    .context("Avro map is missing \"values\"")?;
+                Ok(Schema::Map(Box::new(parse_schema(
+                    values,
+                    names,
+                    enclosing_namespace,
+                )?)))
+            }
+            // A primitive type name decorated with a "logicalType" - per
+            // the Avro spec, an invalid or unrecognized logicalType (a
+            // decimal on a type other than bytes/fixed, a missing required
+            // attribute) falls back to the plain underlying type rather
+            // than erroring.
+            primitive => {
+                let plain = parse_schema(
+                    &JsonValue::String(primitive.to_string()),
+                    names,
+                    enclosing_namespace,
+                )?;
+                let Some(logical) = json_str(obj, "logicalType") else {
+                    return Ok(plain);
+                };
+                Ok(match (logical, &plain) {
+                    ("decimal", Schema::Bytes) => {
+                        match obj.get("precision").and_then(JsonValue::as_u64) {
+                            Some(_) => {
+                                let scale =
+                                    obj.get("scale").and_then(JsonValue::as_u64).unwrap_or(0);
+                                Schema::Decimal(Box::new(Schema::Bytes), scale as usize)
+                            }
+                            None => plain,
+                        }
+                    }
+                    ("big-decimal", Schema::Bytes) => Schema::BigDecimal,
+                    ("uuid", Schema::String) => Schema::Uuid(UuidKind::Str),
+                    ("uuid", Schema::Bytes) => Schema::Uuid(UuidKind::Bytes),
+                    ("date", Schema::Int) => Schema::Date,
+                    ("time-millis", Schema::Int) => Schema::TimeMillis,
+                    ("time-micros", Schema::Long) => Schema::TimeMicros,
+                    ("timestamp-millis", Schema::Long) => Schema::TimestampMillis,
+                    ("timestamp-micros", Schema::Long) => Schema::TimestampMicros,
+                    ("timestamp-nanos", Schema::Long) => Schema::TimestampNanos,
+                    ("local-timestamp-millis", Schema::Long) => Schema::LocalTimestampMillis,
+                    ("local-timestamp-micros", Schema::Long) => Schema::LocalTimestampMicros,
+                    ("local-timestamp-nanos", Schema::Long) => Schema::LocalTimestampNanos,
+                    _ => plain,
+                })
+            }
+        }
+    }
+
+    /// Converts an arbitrary-length two's-complement big-endian byte
+    /// array into a scaled decimal string, via schoolbook long division by
+    /// 10 - the same numeric operation `num_bigint::BigInt`'s own
+    /// `to_string` performs internally, just scoped to exactly this one
+    /// conversion rather than pulling in a general bignum library for it
+    /// (the same "just enough, not a general-purpose dependency"
+    /// principle behind every other hand-roll in this project). `scale`
+    /// can be negative (only reachable from `BigDecimal`, whose scale is
+    /// carried in the value rather than fixed by the schema) - a negative
+    /// scale right-pads with zeros instead of inserting a decimal point.
+    pub(crate) fn bytes_to_decimal_string(bytes: &[u8], scale: i64) -> String {
+        if bytes.is_empty() {
+            return "0".to_string();
+        }
+        let negative = bytes[0] & 0x80 != 0;
+        let mut magnitude: Vec<u8> = if negative {
+            // Two's complement -> magnitude: invert every bit, add one.
+            let mut inverted: Vec<u8> = bytes.iter().map(|b| !b).collect();
+            let mut carry = 1u16;
+            for byte in inverted.iter_mut().rev() {
+                let sum = u16::from(*byte) + carry;
+                *byte = sum as u8;
+                carry = sum >> 8;
+                if carry == 0 {
+                    break;
+                }
+            }
+            inverted
+        } else {
+            bytes.to_vec()
+        };
+
+        let mut digits = Vec::new();
+        loop {
+            let mut remainder = 0u32;
+            let mut all_zero = true;
+            for byte in &mut magnitude {
+                let cur = (remainder << 8) | u32::from(*byte);
+                *byte = (cur / 10) as u8;
+                remainder = cur % 10;
+                if *byte != 0 {
+                    all_zero = false;
+                }
+            }
+            digits.push(b'0' + remainder as u8);
+            if all_zero {
+                break;
+            }
+        }
+        digits.reverse();
+        let mut digits = String::from_utf8(digits).expect("ASCII digits are valid UTF-8");
+
+        if scale > 0 {
+            let scale = scale as usize;
+            if digits.len() <= scale {
+                digits = format!("{}{digits}", "0".repeat(scale + 1 - digits.len()));
+            }
+            digits.insert(digits.len() - scale, '.');
+        } else if scale < 0 {
+            digits.push_str(&"0".repeat((-scale) as usize));
+        }
+        if negative {
+            digits.insert(0, '-');
+        }
+        digits
+    }
+
+    fn format_uuid_bytes(bytes: &[u8]) -> Option<String> {
+        if bytes.len() != 16 {
+            return None;
+        }
+        Some(format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15]
+        ))
+    }
+
+    /// `apache-avro`'s own extension logical type: an arbitrary-precision
+    /// decimal whose scale lives *in the value* (a nested zigzag `long`
+    /// after the magnitude bytes), unlike the schema-carried scale of the
+    /// standard `decimal` logical type - verified against the crate's own
+    /// `bigdecimal.rs`. Lower verification confidence than the rest of
+    /// this reader (see CLAUDE.md): no tool available while building this
+    /// project's own test fixtures can write `big-decimal` data, so this
+    /// path is implemented directly from the crate's source rather than
+    /// cross-checked against a real file.
+    fn decode_big_decimal<R: Read>(r: &mut R) -> Result<String> {
+        let outer = read_length_prefixed(r)?;
+        let mut cursor: &[u8] = &outer;
+        let magnitude = read_length_prefixed(&mut cursor)?;
+        let scale = read_zigzag(&mut cursor)?;
+        Ok(bytes_to_decimal_string(&magnitude, scale))
+    }
+
+    /// Decodes one value per `schema` and converts it directly to
+    /// `serde_json::Value` in the same pass - see this module's own
+    /// top-of-file comment for why a two-pass decode-then-convert isn't
+    /// needed here the way it is for the nested formats this project
+    /// bridges through an intermediate dynamic value type. A `Union`'s own
+    /// index is discarded once the matching variant is resolved, matching
+    /// this project's old ciborium/apache-avro-based bridges' identical
+    /// choice not to keep a "which variant" marker in the JSON output.
+    fn decode_to_json<R: Read>(
+        r: &mut R,
+        schema: &Schema,
+        names: &HashMap<String, Schema>,
+    ) -> Result<JsonValue> {
+        Ok(match schema {
+            Schema::Null => JsonValue::Null,
+            Schema::Boolean => match read_u8(r)? {
+                0 => JsonValue::Bool(false),
+                1 => JsonValue::Bool(true),
+                other => bail!("invalid Avro boolean byte {other:#04x}"),
+            },
+            Schema::Int => JsonValue::from(i32::try_from(read_zigzag(r)?).unwrap_or(0)),
+            Schema::Long => JsonValue::from(read_zigzag(r)?),
+            Schema::Float => {
+                let bytes = read_exact_vec(r, 4)?;
+                let f = f32::from_le_bytes(bytes.try_into().unwrap());
+                serde_json::Number::from_f64(f64::from(f))
+                    .map_or(JsonValue::Null, JsonValue::Number)
+            }
+            Schema::Double => {
+                let bytes = read_exact_vec(r, 8)?;
+                let f = f64::from_le_bytes(bytes.try_into().unwrap());
+                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            Schema::Bytes => {
+                let b = read_length_prefixed(r)?;
+                JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+            }
+            Schema::String => {
+                let b = read_length_prefixed(r)?;
+                JsonValue::String(String::from_utf8(b).context("Avro string is not valid UTF-8")?)
+            }
+            Schema::Fixed(size) => {
+                let b = read_exact_vec(r, *size)?;
+                JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+            }
+            Schema::Array(items) => {
+                let mut out = Vec::new();
+                loop {
+                    let raw_count = read_zigzag(r)?;
+                    let count = match raw_count.cmp(&0) {
+                        std::cmp::Ordering::Equal => break,
+                        std::cmp::Ordering::Less => {
+                            let _byte_size = read_zigzag(r)?; // unused: we always decode, never skip
+                            raw_count
+                                .checked_neg()
+                                .context("Avro array block count overflow")?
+                        }
+                        std::cmp::Ordering::Greater => raw_count,
+                    };
+                    for _ in 0..count {
+                        out.push(decode_to_json(r, items, names)?);
+                    }
+                }
+                JsonValue::Array(out)
+            }
+            Schema::Map(values) => {
+                let mut out = serde_json::Map::new();
+                loop {
+                    let raw_count = read_zigzag(r)?;
+                    let count = match raw_count.cmp(&0) {
+                        std::cmp::Ordering::Equal => break,
+                        std::cmp::Ordering::Less => {
+                            let _byte_size = read_zigzag(r)?;
+                            raw_count
+                                .checked_neg()
+                                .context("Avro map block count overflow")?
+                        }
+                        std::cmp::Ordering::Greater => raw_count,
+                    };
+                    for _ in 0..count {
+                        let key = read_length_prefixed(r)?;
+                        let key =
+                            String::from_utf8(key).context("Avro map key is not valid UTF-8")?;
+                        let value = decode_to_json(r, values, names)?;
+                        out.insert(key, value);
+                    }
+                }
+                JsonValue::Object(out)
+            }
+            Schema::Union(variants) => {
+                let index = read_zigzag(r)?;
+                let variant = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| variants.get(i))
+                    .with_context(|| format!("Avro union index {index} out of range"))?;
+                decode_to_json(r, variant, names)?
+            }
+            Schema::Record(fields) => {
+                let mut out = serde_json::Map::with_capacity(fields.len());
+                for (name, field_schema) in fields {
+                    let value = decode_to_json(r, field_schema, names)?;
+                    out.insert(name.clone(), value);
+                }
+                JsonValue::Object(out)
+            }
+            Schema::Enum(symbols) => {
+                let index = read_zigzag(r)?;
+                let symbol = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| symbols.get(i))
+                    .with_context(|| format!("Avro enum index {index} out of range"))?;
+                JsonValue::String(symbol.clone())
+            }
+            Schema::Decimal(inner, scale) => {
+                let bytes = match inner.as_ref() {
+                    Schema::Fixed(size) => read_exact_vec(r, *size)?,
+                    Schema::Bytes => read_length_prefixed(r)?,
+                    _ => unreachable!("Decimal only ever wraps Bytes or Fixed"),
+                };
+                JsonValue::String(bytes_to_decimal_string(&bytes, *scale as i64))
+            }
+            Schema::BigDecimal => JsonValue::String(decode_big_decimal(r)?),
+            Schema::Uuid(kind) => {
+                let bytes = match kind {
+                    UuidKind::Str => {
+                        let s = read_length_prefixed(r)?;
+                        return Ok(JsonValue::String(
+                            String::from_utf8(s).context("Avro UUID string is not valid UTF-8")?,
+                        ));
+                    }
+                    UuidKind::Bytes => read_length_prefixed(r)?,
+                    UuidKind::Fixed => read_exact_vec(r, 16)?,
+                };
+                JsonValue::String(
+                    format_uuid_bytes(&bytes).context("Avro UUID value is not 16 bytes")?,
+                )
+            }
+            Schema::Date => {
+                let days = read_zigzag(r)?;
+                EpochDate::from_days(days)
+                    .map_or(JsonValue::Null, |d| JsonValue::String(d.format_ymd()))
+            }
+            Schema::TimeMillis => {
+                let millis = i32::try_from(read_zigzag(r)?).unwrap_or(0);
+                let secs = (millis.div_euclid(1000)).rem_euclid(86_400) as u32;
+                let nanos = millis.rem_euclid(1000) as u32 * 1_000_000;
+                EpochTime::from_seconds_since_midnight(secs, nanos)
+                    .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(3)))
+            }
+            Schema::TimeMicros => {
+                let micros = read_zigzag(r)?;
+                let secs = (micros.div_euclid(1_000_000)).rem_euclid(86_400) as u32;
+                let nanos = micros.rem_euclid(1_000_000) as u32 * 1000;
+                EpochTime::from_seconds_since_midnight(secs, nanos)
+                    .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(6)))
+            }
+            Schema::TimestampMillis | Schema::LocalTimestampMillis => {
+                let millis = read_zigzag(r)?;
+                EpochDateTime::from_unix_millis(millis)
+                    .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(3)))
+            }
+            Schema::TimestampMicros | Schema::LocalTimestampMicros => {
+                let micros = read_zigzag(r)?;
+                EpochDateTime::from_unix_micros(micros)
+                    .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(6)))
+            }
+            Schema::TimestampNanos | Schema::LocalTimestampNanos => {
+                let nanos = read_zigzag(r)?;
+                let secs = nanos.div_euclid(1_000_000_000);
+                let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+                EpochDateTime::from_unix_seconds(secs, subsec_nanos)
+                    .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(9)))
+            }
+            Schema::Duration => {
+                // Best-effort, matching this project's old apache-avro-based
+                // bridge exactly: Duration (months, days, milliseconds - each
+                // a raw u32 LE) has no single natural string form, so this
+                // renders a disclosed placeholder rather than guessing at
+                // one. See CLAUDE.md's "Not covered, and out of scope" note.
+                let bytes = read_exact_vec(r, 12)?;
+                let months = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                let days = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                let millis = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                JsonValue::String(format!(
+                    "Duration {{ months: {months}, days: {days}, millis: {millis} }}"
+                ))
+            }
+            Schema::Ref(name) => {
+                let resolved = names
+                    .get(name)
+                    .with_context(|| format!("Avro schema references unknown name {name:?}"))?;
+                decode_to_json(r, resolved, names)?
+            }
+        })
+    }
+
+    /// Hand-rolled decoder for Snappy's *raw* block format (not the
+    /// higher-level "frame" format) - verified directly against the `snap`
+    /// crate's own `decompress.rs`/`build.rs` (which generates its tag
+    /// lookup table from the exact bit-layout rules this function encodes
+    /// directly): a header varint (plain, not zigzagged) giving the total
+    /// decompressed length, then a sequence of literal/copy elements. A
+    /// tag byte's low 2 bits select the element: `00` is a literal (length
+    /// in the top 6 bits, or - if that field is 60-63 - the real length
+    /// minus one follows as 1-4 little-endian bytes); `01`/`10`/`11` are
+    /// back-reference copies with a 1/2/4-byte offset respectively.
+    fn snappy_decompress(input: &[u8]) -> Result<Vec<u8>> {
+        let mut pos = 0usize;
+        let mut shift = 0u32;
+        let mut decompressed_len: u64 = 0;
+        loop {
+            let b = *input
+                .get(pos)
+                .context("truncated Snappy stream: missing length header")?;
+            pos += 1;
+            decompressed_len |= u64::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 35 {
+                bail!("malformed Snappy length header");
+            }
+        }
+        let decompressed_len =
+            usize::try_from(decompressed_len).context("Snappy decompressed length overflow")?;
+        if decompressed_len > MAX_ALLOC {
+            bail!("Snappy decompressed length {decompressed_len} exceeds the sanity cap");
+        }
+
+        let mut out = Vec::with_capacity(decompressed_len.min(MAX_ALLOC));
+        while pos < input.len() {
+            let tag = input[pos];
+            pos += 1;
+            match tag & 0x03 {
+                0b00 => {
+                    let mut len = usize::from(tag >> 2) + 1;
+                    if len > 60 {
+                        let n = len - 60;
+                        if pos + n > input.len() {
+                            bail!("truncated Snappy literal length");
+                        }
+                        let mut raw = 0u64;
+                        for i in 0..n {
+                            raw |= u64::from(input[pos + i]) << (8 * i);
+                        }
+                        pos += n;
+                        len = usize::try_from(raw + 1).context("Snappy literal length overflow")?;
+                    }
+                    if pos + len > input.len() {
+                        bail!("truncated Snappy literal");
+                    }
+                    out.extend_from_slice(&input[pos..pos + len]);
+                    pos += len;
+                }
+                0b01 => {
+                    let len = usize::from((tag >> 2) & 0x07) + 4;
+                    let offset_hi = usize::from((tag >> 5) & 0x07);
+                    let next = *input.get(pos).context("truncated Snappy copy offset")?;
+                    pos += 1;
+                    let offset = (offset_hi << 8) | usize::from(next);
+                    copy_from_offset(&mut out, offset, len)?;
+                }
+                0b10 => {
+                    let len = usize::from(tag >> 2) + 1;
+                    if pos + 2 > input.len() {
+                        bail!("truncated Snappy copy offset");
+                    }
+                    let offset = usize::from(input[pos]) | (usize::from(input[pos + 1]) << 8);
+                    pos += 2;
+                    copy_from_offset(&mut out, offset, len)?;
+                }
+                0b11 => {
+                    let len = usize::from(tag >> 2) + 1;
+                    if pos + 4 > input.len() {
+                        bail!("truncated Snappy copy offset");
+                    }
+                    let offset = usize::from(input[pos])
+                        | (usize::from(input[pos + 1]) << 8)
+                        | (usize::from(input[pos + 2]) << 16)
+                        | (usize::from(input[pos + 3]) << 24);
+                    pos += 4;
+                    copy_from_offset(&mut out, offset, len)?;
+                }
+                _ => unreachable!("2-bit tag"),
+            }
+        }
+        if out.len() != decompressed_len {
+            bail!(
+                "Snappy stream decoded to {} bytes, header declared {decompressed_len}",
+                out.len()
+            );
+        }
+        Ok(out)
+    }
+
+    /// Appends `len` bytes to `out`, each copied from `offset` bytes
+    /// before the current end - a back-reference that may legitimately
+    /// overlap itself (e.g. offset 1, len 10 repeats the last byte 10
+    /// times), so this must copy one byte at a time rather than via a
+    /// single slice copy.
+    fn copy_from_offset(out: &mut Vec<u8>, offset: usize, len: usize) -> Result<()> {
+        if offset == 0 || offset > out.len() {
+            bail!(
+                "invalid Snappy back-reference offset {offset} at output length {}",
+                out.len()
+            );
+        }
+        let start = out.len() - offset;
+        for i in 0..len {
+            let byte = out[start + i];
+            out.push(byte);
+        }
+        Ok(())
+    }
+
+    fn decompress_codec(codec: &str, data: Vec<u8>) -> Result<Vec<u8>> {
+        match codec {
+            "null" => Ok(data),
+            "deflate" => inflate(&data[..]).context("failed to inflate an Avro deflate block"),
+            "snappy" => {
+                let data_end = data
+                    .len()
+                    .checked_sub(4)
+                    .context("Avro snappy block is too short for its trailing CRC32")?;
+                let decoded = snappy_decompress(&data[..data_end])?;
+                let expected = u32::from_be_bytes(data[data_end..].try_into().unwrap());
+                let actual = crc32(&decoded);
+                if expected != actual {
+                    bail!(
+                        "Avro snappy block CRC32 mismatch: expected {expected:#010x}, got {actual:#010x}"
+                    );
+                }
+                Ok(decoded)
+            }
+            "zstandard" => zstd_support::zstd_decompress(&data[..])
+                .context("failed to decompress an Avro zstandard block"),
+            other => bail!("Codec {other:?} is not supported/enabled"),
+        }
+    }
+
+    /// Reads the Object Container File's metadata map (`avro.schema`,
+    /// `avro.codec`, and any user metadata) - encoded the same way any
+    /// other Avro `map<bytes>` value would be, just read directly here
+    /// rather than bootstrapping the general `Schema`-driven decoder for
+    /// this one, schema-less, always-known-shape case.
+    fn read_metadata<R: Read>(r: &mut R) -> Result<HashMap<String, Vec<u8>>> {
+        let mut out = HashMap::new();
+        loop {
+            let raw_count = read_zigzag(r)?;
+            let count = match raw_count.cmp(&0) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Less => {
+                    let _byte_size = read_zigzag(r)?;
+                    raw_count
+                        .checked_neg()
+                        .context("Avro metadata block count overflow")?
+                }
+                std::cmp::Ordering::Greater => raw_count,
+            };
+            for _ in 0..count {
+                let key = read_length_prefixed(r)?;
+                let key = String::from_utf8(key).context("Avro metadata key is not valid UTF-8")?;
+                let value = read_length_prefixed(r)?;
+                out.insert(key, value);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn columns_from_avro(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = BufReader::new(file);
+
+        expect_bytes(&mut r, b"Obj\x01")
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+        let metadata = read_metadata(&mut r)
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+
+        let schema_bytes = metadata
+            .get("avro.schema")
+            .with_context(|| format!("{path:?} has no avro.schema in its header"))?;
+        let schema_json: JsonValue = serde_json::from_slice(schema_bytes)
+            .with_context(|| format!("failed parsing the Avro schema in {path:?}"))?;
+        let mut names: HashMap<String, Schema> = HashMap::new();
+        let schema = parse_schema(&schema_json, &mut names, None)
+            .with_context(|| format!("failed parsing the Avro schema in {path:?}"))?;
+
+        let codec = metadata
+            .get("avro.codec")
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_else(|| "null".to_string());
+
+        let sync_marker = read_exact_vec(&mut r, 16)
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+
+        let mut values: Vec<JsonValue> = Vec::new();
+        'blocks: while let Some(count) = try_read_zigzag(&mut r)
+            .with_context(|| format!("failed reading a block from {path:?}"))?
+        {
+            let count = usize::try_from(count).context("invalid Avro block object count")?;
+            let block_len = read_len(&mut r)?;
+            let block_data = read_exact_vec(&mut r, block_len)
+                .with_context(|| format!("failed reading a block from {path:?}"))?;
+            let marker = read_exact_vec(&mut r, 16)
+                .with_context(|| format!("failed reading a block from {path:?}"))?;
+            if marker != sync_marker {
+                bail!("{path:?}: a data block's sync marker doesn't match the header's");
+            }
+            let decompressed = decompress_codec(&codec, block_data)
+                .with_context(|| format!("failed decompressing a block from {path:?}"))?;
+            let mut cursor: &[u8] = &decompressed;
+            for _ in 0..count {
+                if nrows.is_some_and(|limit| values.len() >= limit) {
+                    break 'blocks;
+                }
+                let value = decode_to_json(&mut cursor, &schema, &names)
+                    .with_context(|| format!("failed decoding a record from {path:?}"))?;
+                values.push(value);
+            }
+        }
+
+        // Not every Avro file holds record-typed rows - an Avro RPC
+        // response file, for instance, decodes to a bare scalar (found via
+        // a real-world sweep against the Apache Avro project's own interop
+        // test data: a "hello world" RPC response is just the string
+        // "Hello, world!", not an object). The same fallback the
+        // JSON/YAML/MessagePack/CBOR readers already use for their own
+        // analogous case applies here too.
+        if values.iter().all(JsonValue::is_object) {
+            let records: Vec<serde_json::Map<String, JsonValue>> = values
+                .into_iter()
+                .map(|v| match v {
+                    JsonValue::Object(m) => m,
+                    _ => unreachable!("just checked every value is an object"),
+                })
+                .collect();
+            Ok(profile_json_records(&records, n_samples))
+        } else {
+            let total = values.len();
+            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+            Ok(profile_json_path(
+                "value".to_string(),
+                total,
+                refs,
+                n_samples,
+            ))
+        }
+    }
+} // mod avro_support
+
+#[cfg(feature = "avro")]
+fn columns_from_avro_hand_rolled(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    avro_support::columns_from_avro(path, nrows, n_samples)
 }
 
 #[cfg(feature = "avro")]
@@ -5505,54 +6330,7 @@ fn columns_from_avro(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use apache_avro::Reader as AvroReader;
-    use std::fs::File;
-
-    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let reader =
-        AvroReader::new(file).with_context(|| format!("failed to read Avro file {path:?}"))?;
-    // Cloned before `reader` is consumed by `.enumerate()` below - needed so
-    // avro_value_to_json can resolve logical-type metadata (a decimal
-    // field's scale, the one case that isn't recoverable from the value
-    // alone) that only the schema carries.
-    let schema = reader.writer_schema().clone();
-
-    let mut values: Vec<JsonValue> = Vec::new();
-    for (i, value_result) in reader.enumerate() {
-        if nrows.is_some_and(|limit| i >= limit) {
-            break;
-        }
-        let value =
-            value_result.with_context(|| format!("failed decoding a record from {path:?}"))?;
-        values.push(avro_value_to_json(&value, Some(&schema)));
-    }
-
-    // Not every Avro file holds record-typed rows - an Avro RPC response
-    // file, for instance, decodes to a bare scalar (found via a real-world
-    // sweep against the Apache Avro project's own interop test data: a
-    // "hello world" RPC response is just the string "Hello, world!", not
-    // an object). The same fallback the JSON/YAML readers already use for
-    // their own analogous case applies here too: profile the whole set as
-    // one "value" column rather than rejecting a real, valid Avro file.
-    if values.iter().all(JsonValue::is_object) {
-        let records: Vec<serde_json::Map<String, JsonValue>> = values
-            .into_iter()
-            .map(|v| match v {
-                JsonValue::Object(m) => m,
-                _ => unreachable!("just checked every value is an object"),
-            })
-            .collect();
-        Ok(profile_json_records(&records, n_samples))
-    } else {
-        let total = values.len();
-        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-        Ok(profile_json_path(
-            "value".to_string(),
-            total,
-            refs,
-            n_samples,
-        ))
-    }
+    columns_from_avro_hand_rolled(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "avro"))]
@@ -14355,7 +15133,13 @@ mod xlsx_support {
 /// memory" discipline every other hand-roll in this project follows.
 /// Dictionaries are out of scope (this project's `.zst` use case never
 /// needs them, the same "no dictionary support" boundary noted elsewhere).
-#[cfg(feature = "zstd")]
+///
+/// Gated on `any(zstd, avro)`, not just `zstd`: the `avro` feature's own
+/// hand-rolled reader (`avro_support`) reuses `zstd_decompress` directly
+/// for Avro's Zstandard codec, the same way it reuses `inflate` for
+/// Avro's Deflate codec - one decoder serving two independent features,
+/// exactly like `zip_support` already serves both `xlsx` and `npy`.
+#[cfg(any(feature = "zstd", feature = "avro"))]
 mod zstd_support {
     use super::*;
 
@@ -17125,33 +17909,33 @@ mod tests {
         assert!(xml_doc_from_text(&wide).is_ok());
     }
 
-    // avro_decimal_to_string is what stands between Avro's decimal logical
-    // type and a Rust Debug dump like "Decimal(Decimal { value: 12345, len:
-    // 2 })" - found via exactly this kind of direct testing while checking
+    // avro_support::bytes_to_decimal_string is what stands between Avro's
+    // decimal logical type and an unusable raw dump of its two's-complement
+    // bytes - found via exactly this kind of direct testing while checking
     // whether cloud-platform-produced Avro files (Kinesis/Event Hubs/
     // Pub-Sub, which lean on decimal for money/precise numeric fields)
     // actually render correctly. Every case here was hand-verified against
-    // the digit-shifting logic before being relied on (see the comment
-    // above avro_decimal_to_string's definition for the worked examples).
-
-    #[cfg(feature = "avro")]
-    fn avro_decimal_from_i64(unscaled: i64) -> apache_avro::Decimal {
-        let big = num_bigint::BigInt::from(unscaled);
-        apache_avro::Decimal::from(big.to_signed_bytes_be())
-    }
+    // the digit-shifting logic before being relied on. Each unscaled value
+    // is passed as `i64::to_be_bytes()` - an 8-byte two's-complement
+    // encoding - since the function itself works on arbitrary-length
+    // two's-complement byte arrays, the same shape Avro's own `bytes`/
+    // `fixed`-encoded decimal values always are.
 
     #[cfg(feature = "avro")]
     #[test]
     fn avro_decimal_to_string_places_the_decimal_point_correctly() {
         assert_eq!(
-            avro_decimal_to_string(avro_decimal_from_i64(12345), 2),
+            avro_support::bytes_to_decimal_string(&12345i64.to_be_bytes(), 2),
             "123.45"
         );
         assert_eq!(
-            avro_decimal_to_string(avro_decimal_from_i64(-100), 2),
+            avro_support::bytes_to_decimal_string(&(-100i64).to_be_bytes(), 2),
             "-1.00"
         );
-        assert_eq!(avro_decimal_to_string(avro_decimal_from_i64(100), 0), "100");
+        assert_eq!(
+            avro_support::bytes_to_decimal_string(&100i64.to_be_bytes(), 0),
+            "100"
+        );
     }
 
     #[cfg(feature = "avro")]
@@ -17160,12 +17944,18 @@ mod tests {
         // unscaled=5, scale=2 must become "0.05", not "0.5" or ".05" - the
         // exact off-by-one a naive "just insert a dot N digits from the
         // right" implementation would get wrong on a short digit string.
-        assert_eq!(avro_decimal_to_string(avro_decimal_from_i64(5), 2), "0.05");
         assert_eq!(
-            avro_decimal_to_string(avro_decimal_from_i64(-5), 2),
+            avro_support::bytes_to_decimal_string(&5i64.to_be_bytes(), 2),
+            "0.05"
+        );
+        assert_eq!(
+            avro_support::bytes_to_decimal_string(&(-5i64).to_be_bytes(), 2),
             "-0.05"
         );
-        assert_eq!(avro_decimal_to_string(avro_decimal_from_i64(0), 2), "0.00");
+        assert_eq!(
+            avro_support::bytes_to_decimal_string(&0i64.to_be_bytes(), 2),
+            "0.00"
+        );
     }
 
     // --- YAML: what shapes of top-level document does the reader accept,
@@ -19983,6 +20773,243 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
             let theirs = columns_from_stata_via_dta_crate(path, 100)
                 .unwrap_or_else(|e| panic!("{f}: dta-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Test-only: `apache-avro` (plus `num-bigint`) is a dev-dependency now
+    /// (see Cargo.toml and CLAUDE.md's Dependency footprint section) -
+    /// `avro_support`'s own hand-rolled reader replaced it at runtime, so
+    /// these functions' only remaining job is producing the "expected"
+    /// side of `avro_reader_matches_the_apache_avro_crate_output_exactly`.
+    /// A near-verbatim copy of what `columns_from_avro`/`avro_value_to_json`
+    /// used to be before that module replaced them.
+    #[cfg(all(test, feature = "avro"))]
+    fn avro_decimal_to_string_via_apache_avro_crate(
+        decimal: apache_avro::Decimal,
+        scale: usize,
+    ) -> String {
+        let unscaled: num_bigint::BigInt = decimal.into();
+        let signed = unscaled.to_string();
+        let (negative, digits) = match signed.strip_prefix('-') {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, signed),
+        };
+        let mut out = if digits.len() <= scale {
+            format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
+        } else {
+            digits
+        };
+        if scale > 0 {
+            out.insert(out.len() - scale, '.');
+        }
+        if negative {
+            out.insert(0, '-');
+        }
+        out
+    }
+
+    #[cfg(all(test, feature = "avro"))]
+    fn avro_value_to_json_via_apache_avro_crate(
+        v: &apache_avro::types::Value,
+        schema: Option<&apache_avro::Schema>,
+    ) -> JsonValue {
+        use apache_avro::Schema;
+        use apache_avro::types::Value as AvroValue;
+        match v {
+            AvroValue::Null => JsonValue::Null,
+            AvroValue::Boolean(b) => JsonValue::Bool(*b),
+            AvroValue::Int(i) => JsonValue::Number((*i).into()),
+            AvroValue::Long(i) => JsonValue::Number((*i).into()),
+            AvroValue::Float(f) => serde_json::Number::from_f64(f64::from(*f))
+                .map_or(JsonValue::Null, JsonValue::Number),
+            AvroValue::Double(f) => {
+                serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            AvroValue::String(s) | AvroValue::Enum(_, s) => JsonValue::String(s.clone()),
+            AvroValue::Bytes(b) | AvroValue::Fixed(_, b) => {
+                JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+            }
+            AvroValue::Union(idx, inner) => {
+                let variant_schema = match schema {
+                    Some(Schema::Union(u)) => u.get_variant(*idx as usize).ok(),
+                    _ => None,
+                };
+                avro_value_to_json_via_apache_avro_crate(inner, variant_schema)
+            }
+            AvroValue::Array(items) => {
+                let item_schema = match schema {
+                    Some(Schema::Array(a)) => Some(a.items.as_ref()),
+                    _ => None,
+                };
+                JsonValue::Array(
+                    items
+                        .iter()
+                        .map(|i| avro_value_to_json_via_apache_avro_crate(i, item_schema))
+                        .collect(),
+                )
+            }
+            AvroValue::Map(m) => {
+                let value_schema = match schema {
+                    Some(Schema::Map(ms)) => Some(ms.types.as_ref()),
+                    _ => None,
+                };
+                JsonValue::Object(
+                    m.iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                avro_value_to_json_via_apache_avro_crate(v, value_schema),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            AvroValue::Record(fields) => {
+                let record_schema = match schema {
+                    Some(Schema::Record(rs)) => Some(rs),
+                    _ => None,
+                };
+                JsonValue::Object(
+                    fields
+                        .iter()
+                        .map(|(k, v)| {
+                            let field_schema = record_schema.and_then(|rs| {
+                                rs.lookup
+                                    .get(k)
+                                    .and_then(|&i| rs.fields.get(i))
+                                    .map(|f| &f.schema)
+                            });
+                            (
+                                k.clone(),
+                                avro_value_to_json_via_apache_avro_crate(v, field_schema),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            AvroValue::Date(days) => EpochDate::from_days(i64::from(*days))
+                .map_or(JsonValue::Null, |d| JsonValue::String(d.format_ymd())),
+            AvroValue::Uuid(u) => JsonValue::String(u.to_string()),
+            AvroValue::TimestampMillis(ms) | AvroValue::LocalTimestampMillis(ms) => {
+                EpochDateTime::from_unix_millis(*ms)
+                    .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(3)))
+            }
+            AvroValue::TimestampMicros(us) | AvroValue::LocalTimestampMicros(us) => {
+                EpochDateTime::from_unix_micros(*us)
+                    .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(6)))
+            }
+            AvroValue::TimestampNanos(ns) | AvroValue::LocalTimestampNanos(ns) => {
+                let secs = ns.div_euclid(1_000_000_000);
+                let subsec_nanos = ns.rem_euclid(1_000_000_000) as u32;
+                EpochDateTime::from_unix_seconds(secs, subsec_nanos)
+                    .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(9)))
+            }
+            AvroValue::TimeMillis(ms) => {
+                let secs = (ms.div_euclid(1000)).rem_euclid(86_400) as u32;
+                let nanos = ms.rem_euclid(1000) as u32 * 1_000_000;
+                EpochTime::from_seconds_since_midnight(secs, nanos)
+                    .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(3)))
+            }
+            AvroValue::TimeMicros(us) => {
+                let secs = (us.div_euclid(1_000_000)).rem_euclid(86_400) as u32;
+                let nanos = us.rem_euclid(1_000_000) as u32 * 1000;
+                EpochTime::from_seconds_since_midnight(secs, nanos)
+                    .map_or(JsonValue::Null, |t| JsonValue::String(t.format_hms_frac(6)))
+            }
+            AvroValue::Decimal(d) => match schema {
+                Some(Schema::Decimal(ds)) => JsonValue::String(
+                    avro_decimal_to_string_via_apache_avro_crate(d.clone(), ds.scale),
+                ),
+                _ => JsonValue::String(format!("{d:?}")),
+            },
+            AvroValue::BigDecimal(bg) => JsonValue::String(bg.to_string()),
+            other => JsonValue::String(format!("{other:?}")),
+        }
+    }
+
+    #[cfg(all(test, feature = "avro"))]
+    fn columns_from_avro_via_apache_avro_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use apache_avro::Reader as AvroReader;
+
+        let file = std::fs::File::open(path)?;
+        let reader = AvroReader::new(file)?;
+        let schema = reader.writer_schema().clone();
+
+        let mut values: Vec<JsonValue> = Vec::new();
+        for value_result in reader {
+            let value = value_result?;
+            values.push(avro_value_to_json_via_apache_avro_crate(
+                &value,
+                Some(&schema),
+            ));
+        }
+
+        if values.iter().all(JsonValue::is_object) {
+            let records: Vec<serde_json::Map<String, JsonValue>> = values
+                .into_iter()
+                .map(|v| match v {
+                    JsonValue::Object(m) => m,
+                    _ => unreachable!("just checked every value is an object"),
+                })
+                .collect();
+            Ok(profile_json_records(&records, n_samples))
+        } else {
+            let total = values.len();
+            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+            Ok(profile_json_path(
+                "value".to_string(),
+                total,
+                refs,
+                n_samples,
+            ))
+        }
+    }
+
+    /// Cross-verification oracle for the hand-rolled Avro reader
+    /// (`avro_support` - see Cargo.toml) against the real `apache-avro`
+    /// crate, kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "avro")]
+    #[test]
+    fn avro_reader_matches_the_apache_avro_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.avro",
+            "tests/fixtures/type_detection.avro",
+            "tests/fixtures/avro_logical_types.avro",
+            "tests/fixtures/edge_avro_scalar_records.avro",
+            "tests/fixtures/edge_avro_snappy_codec.avro",
+            "tests/fixtures/edge_avro_named_type_refs.avro",
+        ] {
+            let path = Path::new(f);
+            let mine = avro_support::columns_from_avro(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_avro_via_apache_avro_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: apache-avro-based oracle failed: {e:?}"));
 
             assert_eq!(
                 mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
