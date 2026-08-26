@@ -2420,6 +2420,126 @@ fn cbor_top_level_array_of_scalars_becomes_one_value_column() {
     assert_eq!(value["missing_pct"].as_f64().unwrap(), 0.0);
 }
 
+// RFC 8949 §3.2.3: an indefinite-length array/map/bytes/text is a sequence
+// of chunks terminated by the `0xFF` break byte rather than a fixed count
+// up front - a real, spec-legal encoding (used by streaming encoders that
+// don't know a collection's final size ahead of time) genuinely distinct
+// from the definite-length form every other CBOR fixture in this project
+// exercises. `edge_cbor_indefinite_length.cbor` is hand-built raw bytes (no
+// Python CBOR library used here emits indefinite length by default) with
+// an indefinite-length *outer* map containing an indefinite array, an
+// indefinite byte string (two chunks, `h'0102'` + `h'0304'`), and an
+// indefinite text string (two chunks, `"strea"` + `"ming"`) - covering
+// every one of `cbor_support`'s four chunked-decoding code paths
+// (`read_array_body`/`read_map_body`/`read_bytes_body`/`read_text_body`'s
+// own `None` branches) in one fixture.
+#[cfg(feature = "cbor")]
+#[test]
+fn cbor_reads_indefinite_length_arrays_maps_bytes_and_text() {
+    let doc = run_json("edge_cbor_indefinite_length.cbor", &[]);
+    let cols = table(&doc, "edge_cbor_indefinite_length");
+    assert_eq!(column(cols, "arr")["ideal_type"], "Vec<i64>");
+    assert_eq!(
+        column(cols, "arr")["sample_values"],
+        serde_json::json!(["1", "2", "3"])
+    );
+    // The two byte-string chunks (0x01 0x02, 0x03 0x04) concatenate to the
+    // hex string "01020304" before any type detection runs.
+    assert_eq!(
+        column(cols, "bytes")["sample_values"][0],
+        serde_json::json!("01020304")
+    );
+    // The two text chunks ("strea", "ming") concatenate to "streaming".
+    assert_eq!(
+        column(cols, "text")["sample_values"][0],
+        serde_json::json!("streaming")
+    );
+}
+
+// The old ciborium-based reader already widened an out-of-i64-range CBOR
+// integer to a string (`i64::try_from(*i).unwrap_or_else(|_| ...
+// i128::from(*i).to_string())`) rather than silently truncating it -
+// `cbor_support::Value::Integer` keeps that behavior by storing `i128`
+// directly (CBOR's own integer range is wider than i64 on both ends: an
+// unsigned major-type-0 value up to `u64::MAX`, and a negative major-
+// type-1 value down to `-1 - u64::MAX`, confirmed against
+// `ciborium::value::Integer`'s own internal representation - see
+// CLAUDE.md). This fixture carries exactly those two extremes.
+#[cfg(feature = "cbor")]
+#[test]
+fn cbor_reads_integers_beyond_i64_range_via_i128() {
+    let doc = run_json("edge_cbor_big_integers.cbor", &[]);
+    let cols = table(&doc, "edge_cbor_big_integers");
+    assert_eq!(
+        column(cols, "pos")["sample_values"][0],
+        serde_json::json!("18446744073709551615")
+    );
+    assert_eq!(
+        column(cols, "neg")["sample_values"][0],
+        serde_json::json!("-18446744073709551616")
+    );
+}
+
+// Half-precision (binary16) floats (major type 7, additional info 25) are a
+// real CBOR feature with no coverage at all in this project's old
+// ciborium-based fixtures - constrained-device/telemetry producers are the
+// usual real-world source. `cbor_support::f16_to_f64` converts via plain
+// floating-point arithmetic rather than the `half` crate (not otherwise a
+// dependency of this project); hand-verified against known reference bit
+// patterns before being trusted (see its own doc comment in src/lib.rs).
+// This fixture locks in two of those reference values end-to-end.
+#[cfg(feature = "cbor")]
+#[test]
+fn cbor_reads_half_precision_floats() {
+    let doc = run_json("edge_cbor_float16.cbor", &[]);
+    let cols = table(&doc, "edge_cbor_float16");
+    assert_eq!(
+        column(cols, "one")["sample_values"][0],
+        serde_json::json!("1.0")
+    );
+    assert_eq!(
+        column(cols, "neg_two")["sample_values"][0],
+        serde_json::json!("-2.0")
+    );
+}
+
+// Same class of debug-build stack-safety risk found (and fixed) for
+// MessagePack and TOML earlier in this project's dependency-removal effort
+// - a CBOR-decoded `serde_json::Value` tree never passes through
+// `serde_json`'s own parse-time recursion guard, so `cbor_support`'s own
+// recursive decode/convert path is what has to survive adversarially deep
+// input. Unlike those two, this one was designed in from the start rather
+// than discovered after the fact: `MAX_DEPTH` (256) was chosen up front to
+// match `ciborium`'s own default recursion limit, precisely *because* the
+// MessagePack finding already established that class of risk. Verified
+// empirically anyway, not just assumed safe by design: a hand-built
+// 50,000-level-deep definite-length array fails cleanly on a debug build
+// (this fixture), and a boundary check (255 levels succeeds, 256 fails)
+// confirmed the guard fires exactly where intended, not off by one.
+#[cfg(feature = "cbor")]
+#[test]
+fn deeply_nested_cbor_fails_cleanly_instead_of_a_stack_overflow() {
+    let output = Command::new(bin())
+        .args([fixture("malformed_deeply_nested.cbor").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert!(
+        output.status.code().is_some(),
+        "expected a clean exit, not a signal (e.g. a stack-overflow abort): {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("RUST_BACKTRACE"),
+        "expected a clean handled error, got what looks like a crash: {stderr}"
+    );
+    assert!(
+        stderr.contains("nested more than 256 levels deep"),
+        "expected a nesting-depth error, got: {stderr}"
+    );
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_recognizes_uuid_email_ipv4_and_date_columns() {

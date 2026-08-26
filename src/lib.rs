@@ -6805,53 +6805,469 @@ fn columns_from_yaml(
 // self-delimiting, so a data file is read as a stream of concatenated
 // top-level values (or, if there's exactly one top-level value and it's an
 // array, that array's elements instead - mirroring the JSON reader's
-// `[...]` mode).
+// `[...]` mode). The decoder itself (`cbor_support`) is hand-rolled - see
+// CLAUDE.md's Dependency footprint section for why and how it was verified.
+// It's a genuinely separate implementation from `msgpack_support` (its own
+// byte-reading helpers, its own `Value` type) rather than shared code -
+// the two wire formats only look similar at a glance; CBOR's major-
+// type/additional-info framing, indefinite-length chunking, and negative-
+// integer encoding are all structurally different from MessagePack's fixed
+// per-marker byte layout.
 
 #[cfg(feature = "cbor")]
-fn cbor_key_to_string(k: &ciborium::Value) -> String {
-    if let ciborium::Value::Text(s) = k {
-        return s.clone();
-    }
-    match cbor_value_to_json(k) {
-        JsonValue::String(s) => s,
-        other => other.to_string(),
-    }
-}
+mod cbor_support {
+    use super::*;
+    use std::io::Read;
 
-#[cfg(feature = "cbor")]
-fn cbor_value_to_json(v: &ciborium::Value) -> JsonValue {
-    use ciborium::Value as CborValue;
-    match v {
-        CborValue::Null => JsonValue::Null,
-        CborValue::Bool(b) => JsonValue::Bool(*b),
-        CborValue::Integer(i) => i64::try_from(*i)
-            .map(JsonValue::from)
-            .unwrap_or_else(|_| JsonValue::String(i128::from(*i).to_string())),
-        CborValue::Float(f) => {
-            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
-        }
-        CborValue::Text(s) => JsonValue::String(s.clone()),
-        CborValue::Bytes(b) => {
-            JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
-        }
-        CborValue::Array(items) => JsonValue::Array(items.iter().map(cbor_value_to_json).collect()),
-        CborValue::Map(pairs) => JsonValue::Object(
-            pairs
-                .iter()
-                .map(|(k, v)| (cbor_key_to_string(k), cbor_value_to_json(v)))
-                .collect(),
-        ),
-        // A tagged value (CBOR's major type 6, e.g. a date-time or bignum
-        // hint) - best-effort: keep the tag number visible rather than
-        // silently dropping it, same choice as YAML's `!Tag` handling.
-        CborValue::Tag(tag, inner) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert(format!("tag({tag})"), cbor_value_to_json(inner));
-            JsonValue::Object(obj)
-        }
-        _ => JsonValue::Null, // ciborium::Value is #[non_exhaustive]
+    /// Matches `ciborium`'s own *default* recursion limit exactly (see
+    /// `ciborium::de::from_reader_with_recursion_limit`'s doc comment:
+    /// "Set a high recursion limit at your own risk (of stack
+    /// exhaustion)!") - not a coincidence, but independent corroboration
+    /// of the same real, empirically-confirmed risk `msgpack_support`
+    /// already found and fixed for the identical underlying reason: a
+    /// CBOR-decoded `serde_json::Value` tree bypasses `serde_json`'s own
+    /// parse-time recursion guard entirely (that guard only fires while
+    /// parsing *text*), so this reader's own recursive decode/convert path
+    /// is the only thing standing between adversarially deep input and a
+    /// debug-build stack overflow (debug's much larger, uninlined stack
+    /// frames are what made `msgpack_support`'s 1024-level default unsafe
+    /// in the 700-900 level range, well under 1024 - see its own comment).
+    const MAX_DEPTH: u32 = 256;
+
+    /// Same pre-allocation-DoS guard as `msgpack_support::PREALLOC_MAX`,
+    /// for the same reason: CBOR's `bytes`/`text` length field can be a
+    /// full `u64` (major type 2/3, additional info 27), so a handful of
+    /// header bytes can otherwise claim an enormous length before a single
+    /// byte of real content has been read. `read_n_bytes` still lets an
+    /// actual read grow past this via `Read::take(len).read_to_end`, which
+    /// only ever allocates as far as real bytes are actually available.
+    const PREALLOC_MAX: usize = 64 * 1024;
+
+    #[derive(Debug, Clone)]
+    pub(crate) enum Value {
+        Null,
+        Bool(bool),
+        /// `i128`, not `i64` - CBOR's own integer range is asymmetric and
+        /// wider than `i64` on both ends (an unsigned major-type-0 value up
+        /// to `u64::MAX`, and a negative major-type-1 value down to
+        /// `-1 - u64::MAX`), confirmed directly against
+        /// `ciborium::value::Integer`'s own internal `i128` representation
+        /// rather than assumed - see CLAUDE.md's dependency-footprint entry
+        /// for the exact verification (`neg!(-18446744073709551616)`
+        /// round-tripping through raw bytes `3bffffffffffffffff`).
+        Integer(i128),
+        Float(f64),
+        Text(String),
+        Bytes(Vec<u8>),
+        Array(Vec<Value>),
+        Map(Vec<(Value, Value)>),
+        /// A tagged value (major type 6: a tag number plus one embedded
+        /// item). Verified directly against `ciborium::value::de`'s own
+        /// `Value`-deserialization path (not its *further* deserialization
+        /// into some other target type, where a handful of specific tags
+        /// like bignum get special-cased) that decoding straight into
+        /// `Value` keeps every tag uniform regardless of its number - so
+        /// this reader does too, rather than special-casing a handful of
+        /// well-known tags no differently than `ciborium` itself would.
+        Tag(u64, Box<Value>),
     }
-}
+
+    fn read_bytes<const N: usize, R: Read>(r: &mut R) -> Result<[u8; N]> {
+        let mut buf = [0u8; N];
+        r.read_exact(&mut buf)
+            .with_context(|| format!("truncated CBOR stream: expected {N} more byte(s)"))?;
+        Ok(buf)
+    }
+
+    fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
+        Ok(read_bytes::<1, _>(r)?[0])
+    }
+    fn read_u16<R: Read>(r: &mut R) -> Result<u16> {
+        Ok(u16::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
+        Ok(u32::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_u64<R: Read>(r: &mut R) -> Result<u64> {
+        Ok(u64::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_f32<R: Read>(r: &mut R) -> Result<f32> {
+        Ok(f32::from_be_bytes(read_bytes(r)?))
+    }
+    fn read_f64<R: Read>(r: &mut R) -> Result<f64> {
+        Ok(f64::from_be_bytes(read_bytes(r)?))
+    }
+
+    /// Converts a raw IEEE-754 half-precision (binary16) bit pattern to
+    /// `f64` via plain floating-point arithmetic rather than bit-twiddling
+    /// (simpler to verify by hand, and this project has no other use for
+    /// a general-purpose f16 type). Deliberately not the `half` crate,
+    /// which isn't already a dependency anywhere in this project and would
+    /// be a new one purely for this one conversion - contrary to the whole
+    /// point of this hand-roll. Hand-verified against eight known reference
+    /// bit patterns before being trusted: `0x3C00`=1.0, `0x4000`=2.0,
+    /// `0xC000`=-2.0, `0x7C00`=+inf, `0xFC00`=-inf, `0x7E00`=NaN,
+    /// `0x0001`=smallest subnormal (2^-24), `0x0400`=smallest normal
+    /// (2^-14) - every one matched by hand-computation before this formula
+    /// was relied on.
+    fn f16_to_f64(bits: u16) -> f64 {
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = (bits >> 10) & 0x1F;
+        let frac = f64::from(bits & 0x3FF);
+        match exp {
+            0 => sign * frac * 2f64.powi(-24),
+            0x1F if frac == 0.0 => sign * f64::INFINITY,
+            0x1F => f64::NAN,
+            _ => sign * (1.0 + frac / 1024.0) * 2f64.powi(i32::from(exp) - 15),
+        }
+    }
+
+    fn read_n_bytes<R: Read>(r: &mut R, len: usize) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(len.min(PREALLOC_MAX));
+        let n = r
+            .take(len as u64)
+            .read_to_end(&mut buf)
+            .context("failed reading CBOR bytes/text data")?;
+        if n != len {
+            bail!("truncated CBOR stream: expected {len} byte(s), got {n}");
+        }
+        Ok(buf)
+    }
+
+    /// Reads a major-type/additional-info argument (RFC 8949 §3): additional
+    /// info 0-23 is the value itself, 24/25/26/27 mean "1/2/4/8 more bytes
+    /// follow" (big-endian), 28-30 are reserved, and 31 means indefinite
+    /// length - returned as `None` since it carries no length at all.
+    /// Verified directly against `ciborium-ll`'s own `pull_title` (`dec.rs`)
+    /// rather than assumed from RFC prose alone.
+    fn read_argument<R: Read>(r: &mut R, info: u8) -> Result<Option<u64>> {
+        match info {
+            0..=23 => Ok(Some(u64::from(info))),
+            24 => Ok(Some(u64::from(read_u8(r)?))),
+            25 => Ok(Some(u64::from(read_u16(r)?))),
+            26 => Ok(Some(u64::from(read_u32(r)?))),
+            27 => Ok(Some(read_u64(r)?)),
+            28..=30 => bail!("malformed CBOR stream: reserved additional-info value {info}"),
+            31 => Ok(None),
+            _ => unreachable!("5-bit additional info"),
+        }
+    }
+
+    /// Same as `read_argument`, but for a context where an indefinite
+    /// length is never legal (an unsigned/negative integer, a tag number,
+    /// or one chunk of a chunked bytes/text string - RFC 8949 forbids
+    /// nesting indefinite-length inside indefinite-length).
+    fn read_definite_argument<R: Read>(r: &mut R, info: u8, context: &str) -> Result<u64> {
+        read_argument(r, info)?.with_context(|| {
+            format!("malformed CBOR stream: indefinite length is not valid for {context}")
+        })
+    }
+
+    /// Reads one CBOR-encoded value (RFC 8949). `depth` is a remaining-
+    /// recursion budget, not a running total - same contract as
+    /// `msgpack_support::read_value`.
+    fn read_value<R: Read>(r: &mut R, depth: u32) -> Result<Value> {
+        let initial = read_u8(r)?;
+        read_value_from(r, initial, depth)
+    }
+
+    /// Same as `read_value`, but for a caller that has already consumed the
+    /// initial marker byte (needed because a generic `Read` has no
+    /// peek/pushback: indefinite-length array/map/bytes/text decoding has
+    /// to read the next byte to check for the `0xFF` break marker, and if
+    /// it isn't one, feed that already-consumed byte back in here rather
+    /// than reading a fresh one).
+    fn read_value_from<R: Read>(r: &mut R, initial: u8, depth: u32) -> Result<Value> {
+        if depth == 0 {
+            bail!("malformed CBOR stream: nested more than {MAX_DEPTH} levels deep");
+        }
+        let major = initial >> 5;
+        let info = initial & 0x1F;
+        match major {
+            0 => Ok(Value::Integer(
+                read_definite_argument(r, info, "an unsigned integer")? as i128,
+            )),
+            1 => Ok(Value::Integer(
+                -1 - read_definite_argument(r, info, "a negative integer")? as i128,
+            )),
+            2 => Ok(Value::Bytes(read_bytes_body(r, info)?)),
+            3 => Ok(Value::Text(read_text_body(r, info)?)),
+            4 => Ok(Value::Array(read_array_body(r, info, depth - 1)?)),
+            5 => Ok(Value::Map(read_map_body(r, info, depth - 1)?)),
+            6 => {
+                let tag = read_definite_argument(r, info, "a tag")?;
+                let inner = read_value(r, depth - 1)?;
+                Ok(Value::Tag(tag, Box::new(inner)))
+            }
+            7 => read_simple_or_float(r, info),
+            _ => unreachable!("3-bit major type"),
+        }
+    }
+
+    /// Major type 7: booleans, null/undefined, simple values, and floats.
+    /// `undefined` (additional info 23) collapses to `Value::Null`, the
+    /// same as CBOR's own `null` (info 22) - verified directly against
+    /// `ciborium`'s own deserialization dispatch (`de/mod.rs`), which
+    /// routes both through `deserialize_option`/`visit_none` and has no
+    /// separate `Value` variant for `undefined` at all. Any other simple
+    /// value (an unassigned info 0-19, or an out-of-range byte following
+    /// info 24) is a hard decode error rather than a guess, matching
+    /// `ciborium`'s own `Err(h.expected("known simple value"))` for the
+    /// identical case.
+    fn read_simple_or_float<R: Read>(r: &mut R, info: u8) -> Result<Value> {
+        match info {
+            0..=19 => bail!("malformed CBOR stream: unsupported simple value {info}"),
+            20 => Ok(Value::Bool(false)),
+            21 => Ok(Value::Bool(true)),
+            22 | 23 => Ok(Value::Null),
+            24 => match read_u8(r)? {
+                20 => Ok(Value::Bool(false)),
+                21 => Ok(Value::Bool(true)),
+                22 | 23 => Ok(Value::Null),
+                n => bail!("malformed CBOR stream: unsupported simple value {n}"),
+            },
+            25 => Ok(Value::Float(f16_to_f64(read_u16(r)?))),
+            26 => Ok(Value::Float(f64::from(read_f32(r)?))),
+            27 => Ok(Value::Float(read_f64(r)?)),
+            28..=30 => bail!("malformed CBOR stream: reserved additional-info value {info}"),
+            31 => {
+                bail!(
+                    "malformed CBOR stream: unexpected break code outside an indefinite-length item"
+                )
+            }
+            _ => unreachable!("5-bit additional info"),
+        }
+    }
+
+    /// Definite length reads exactly `len` bytes; indefinite length (RFC
+    /// 8949 §3.2.3) is a sequence of definite-length chunks of the *same*
+    /// major type (2, here), terminated by the break byte `0xFF` - verified
+    /// directly against `ciborium`'s own `deserialize_byte_buf` rather than
+    /// assumed. A chunk of the wrong major type is a hard error, matching
+    /// the spec's own prohibition.
+    fn read_bytes_body<R: Read>(r: &mut R, info: u8) -> Result<Vec<u8>> {
+        match read_argument(r, info)? {
+            Some(len) => read_n_bytes(r, len as usize),
+            None => {
+                let mut out = Vec::new();
+                loop {
+                    let b = read_u8(r)?;
+                    if b == 0xFF {
+                        break;
+                    }
+                    if b >> 5 != 2 {
+                        bail!(
+                            "malformed CBOR stream: indefinite-length byte string contains a non-bytes chunk"
+                        );
+                    }
+                    let len = read_definite_argument(r, b & 0x1F, "a byte-string chunk")?;
+                    out.extend(read_n_bytes(r, len as usize)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Same chunking convention as `read_bytes_body`, but for major type 3
+    /// (text). UTF-8 is validated once over the fully-assembled bytes -
+    /// deliberately a hard error on invalid UTF-8 (unlike MessagePack's
+    /// looser hex-dump fallback), matching both RFC 8949's own requirement
+    /// that a `text` item's content always be UTF-8 and `ciborium`'s own
+    /// verified behavior (its `deserialize_str`/`deserialize_string`
+    /// explicitly call `core::str::from_utf8` and propagate the error).
+    fn read_text_body<R: Read>(r: &mut R, info: u8) -> Result<String> {
+        let bytes = match read_argument(r, info)? {
+            Some(len) => read_n_bytes(r, len as usize)?,
+            None => {
+                let mut out = Vec::new();
+                loop {
+                    let b = read_u8(r)?;
+                    if b == 0xFF {
+                        break;
+                    }
+                    if b >> 5 != 3 {
+                        bail!(
+                            "malformed CBOR stream: indefinite-length text string contains a non-text chunk"
+                        );
+                    }
+                    let len = read_definite_argument(r, b & 0x1F, "a text-string chunk")?;
+                    out.extend(read_n_bytes(r, len as usize)?);
+                }
+                out
+            }
+        };
+        String::from_utf8(bytes)
+            .map_err(|e| anyhow!("malformed CBOR stream: text string is not valid UTF-8: {e}"))
+    }
+
+    /// Definite length reads exactly `len` elements; indefinite length reads
+    /// values until the break byte. Deliberately builds the `Vec`
+    /// incrementally (`Vec::new()` + `.push()`) rather than
+    /// `(0..len).map(...).collect()`, the same pre-allocation-DoS fix
+    /// `msgpack_support::read_array` already needed for the identical
+    /// reason: `len` is read directly from the untrusted stream and can be
+    /// a full `u64` for a definite-length array.
+    fn read_array_body<R: Read>(r: &mut R, info: u8, depth: u32) -> Result<Vec<Value>> {
+        match read_argument(r, info)? {
+            Some(len) => {
+                let mut out = Vec::new();
+                for _ in 0..len {
+                    out.push(read_value(r, depth)?);
+                }
+                Ok(out)
+            }
+            None => {
+                let mut out = Vec::new();
+                loop {
+                    let b = read_u8(r)?;
+                    if b == 0xFF {
+                        break;
+                    }
+                    out.push(read_value_from(r, b, depth)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Same shape as `read_array_body`, alternating key/value reads.
+    fn read_map_body<R: Read>(r: &mut R, info: u8, depth: u32) -> Result<Vec<(Value, Value)>> {
+        match read_argument(r, info)? {
+            Some(len) => {
+                let mut out = Vec::new();
+                for _ in 0..len {
+                    let k = read_value(r, depth)?;
+                    let v = read_value(r, depth)?;
+                    out.push((k, v));
+                }
+                Ok(out)
+            }
+            None => {
+                let mut out = Vec::new();
+                loop {
+                    let b = read_u8(r)?;
+                    if b == 0xFF {
+                        break;
+                    }
+                    let k = read_value_from(r, b, depth)?;
+                    let v = read_value(r, depth)?;
+                    out.push((k, v));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn key_to_string(k: &Value) -> String {
+        if let Value::Text(s) = k {
+            return s.clone();
+        }
+        value_to_json(k).to_string()
+    }
+
+    fn value_to_json(v: &Value) -> JsonValue {
+        match v {
+            Value::Null => JsonValue::Null,
+            Value::Bool(b) => JsonValue::Bool(*b),
+            Value::Integer(i) => i64::try_from(*i)
+                .map(JsonValue::from)
+                .unwrap_or_else(|_| JsonValue::String(i.to_string())),
+            Value::Float(f) => {
+                serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            Value::Text(s) => JsonValue::String(s.clone()),
+            Value::Bytes(b) => {
+                JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+            }
+            Value::Array(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),
+            Value::Map(pairs) => JsonValue::Object(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (key_to_string(k), value_to_json(v)))
+                    .collect(),
+            ),
+            // A tagged value (CBOR's major type 6, e.g. a date-time or
+            // bignum hint) - best-effort: keep the tag number visible
+            // rather than silently dropping it, same choice as YAML's
+            // `!Tag` handling.
+            Value::Tag(tag, inner) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert(format!("tag({tag})"), value_to_json(inner));
+                JsonValue::Object(obj)
+            }
+        }
+    }
+
+    /// Reads a stream of top-level CBOR values (each value is self-
+    /// delimiting, so records can just be concatenated back-to-back in the
+    /// file). If the file holds exactly one top-level value and it's an
+    /// array, that array's elements are treated as the records instead,
+    /// mirroring how the JSON/MessagePack readers treat a single top-level
+    /// `[...]` array.
+    pub(crate) fn columns_from_cbor(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use std::fs::File;
+        use std::io::BufRead;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = BufReader::new(file);
+
+        let mut top_values = Vec::new();
+        while !reader
+            .fill_buf()
+            .with_context(|| format!("failed reading {path:?}"))?
+            .is_empty()
+        {
+            let v = read_value(&mut reader, MAX_DEPTH)
+                .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
+            top_values.push(v);
+        }
+
+        let values: Vec<Value> = if top_values.len() == 1 {
+            match top_values.into_iter().next().unwrap() {
+                Value::Array(items) => items,
+                other => vec![other],
+            }
+        } else {
+            top_values
+        };
+
+        let mut values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
+        if let Some(n) = nrows {
+            values.truncate(n);
+        }
+
+        // Same fallback as MessagePack's reader (and JSON/YAML/Avro before
+        // it): a stream of bare CBOR scalars (e.g. IoT/telemetry readings -
+        // CBOR is the format RFC 7049/8949 was written for, and
+        // constrained-device telemetry is exactly this shape in practice)
+        // has no field names to extract, but is still a genuine single
+        // column, not an error.
+        if values.iter().all(JsonValue::is_object) {
+            let records: Vec<serde_json::Map<String, JsonValue>> = values
+                .into_iter()
+                .map(|v| match v {
+                    JsonValue::Object(m) => m,
+                    _ => unreachable!("just checked every value is an object"),
+                })
+                .collect();
+            Ok(profile_json_records(&records, n_samples))
+        } else {
+            let total = values.len();
+            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+            Ok(profile_json_path(
+                "value".to_string(),
+                total,
+                refs,
+                n_samples,
+            ))
+        }
+    }
+} // mod cbor_support
 
 #[cfg(feature = "cbor")]
 fn columns_from_cbor(
@@ -6859,63 +7275,7 @@ fn columns_from_cbor(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use std::fs::File;
-    use std::io::BufRead;
-    use std::io::BufReader;
-
-    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let mut reader = BufReader::new(file);
-
-    let mut top_values: Vec<ciborium::Value> = Vec::new();
-    while !reader
-        .fill_buf()
-        .with_context(|| format!("failed reading {path:?}"))?
-        .is_empty()
-    {
-        let v: ciborium::Value = ciborium::from_reader(&mut reader)
-            .map_err(|e| anyhow!("{e}"))
-            .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
-        top_values.push(v);
-    }
-
-    let values: Vec<ciborium::Value> = if top_values.len() == 1 {
-        match top_values.into_iter().next().unwrap() {
-            ciborium::Value::Array(items) => items,
-            other => vec![other],
-        }
-    } else {
-        top_values
-    };
-
-    let mut values: Vec<JsonValue> = values.iter().map(cbor_value_to_json).collect();
-    if let Some(n) = nrows {
-        values.truncate(n);
-    }
-
-    // Same fallback as MessagePack's reader (and JSON/YAML/Avro before it):
-    // a stream of bare CBOR scalars (e.g. IoT/telemetry readings - CBOR is
-    // the format RFC 7049 was written for, and constrained-device telemetry
-    // is exactly this shape in practice) has no field names to extract, but
-    // is still a genuine single column, not an error.
-    if values.iter().all(JsonValue::is_object) {
-        let records: Vec<serde_json::Map<String, JsonValue>> = values
-            .into_iter()
-            .map(|v| match v {
-                JsonValue::Object(m) => m,
-                _ => unreachable!("just checked every value is an object"),
-            })
-            .collect();
-        Ok(profile_json_records(&records, n_samples))
-    } else {
-        let total = values.len();
-        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-        Ok(profile_json_path(
-            "value".to_string(),
-            total,
-            refs,
-            n_samples,
-        ))
-    }
+    cbor_support::columns_from_cbor(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "cbor"))]
@@ -17400,6 +17760,143 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
             let theirs = columns_from_toml_via_toml_crate(path, 100)
                 .unwrap_or_else(|e| panic!("{f}: toml-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Test-only: `ciborium` is a dev-dependency now (see Cargo.toml and
+    /// CLAUDE.md's Dependency footprint section) - `cbor_support`'s own
+    /// hand-rolled decoder replaced it at runtime, so this function's only
+    /// remaining job is producing the "expected" side of
+    /// `cbor_reader_matches_the_ciborium_crate_output_exactly`. A near-
+    /// verbatim copy of what `columns_from_cbor` used to be before that
+    /// module replaced it.
+    #[cfg(all(test, feature = "cbor"))]
+    fn columns_from_cbor_via_ciborium(path: &Path, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+        use std::io::BufRead;
+
+        fn key_to_string(k: &ciborium::Value) -> String {
+            if let ciborium::Value::Text(s) = k {
+                return s.clone();
+            }
+            match value_to_json(k) {
+                JsonValue::String(s) => s,
+                other => other.to_string(),
+            }
+        }
+        fn value_to_json(v: &ciborium::Value) -> JsonValue {
+            use ciborium::Value as CborValue;
+            match v {
+                CborValue::Null => JsonValue::Null,
+                CborValue::Bool(b) => JsonValue::Bool(*b),
+                CborValue::Integer(i) => i64::try_from(*i)
+                    .map(JsonValue::from)
+                    .unwrap_or_else(|_| JsonValue::String(i128::from(*i).to_string())),
+                CborValue::Float(f) => {
+                    serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                }
+                CborValue::Text(s) => JsonValue::String(s.clone()),
+                CborValue::Bytes(b) => {
+                    JsonValue::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+                }
+                CborValue::Array(items) => {
+                    JsonValue::Array(items.iter().map(value_to_json).collect())
+                }
+                CborValue::Map(pairs) => JsonValue::Object(
+                    pairs
+                        .iter()
+                        .map(|(k, v)| (key_to_string(k), value_to_json(v)))
+                        .collect(),
+                ),
+                CborValue::Tag(tag, inner) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert(format!("tag({tag})"), value_to_json(inner));
+                    JsonValue::Object(obj)
+                }
+                _ => JsonValue::Null, // ciborium::Value is #[non_exhaustive]
+            }
+        }
+
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut top_values: Vec<ciborium::Value> = Vec::new();
+        while !reader.fill_buf()?.is_empty() {
+            let v: ciborium::Value =
+                ciborium::from_reader(&mut reader).map_err(|e| anyhow!("{e}"))?;
+            top_values.push(v);
+        }
+        let values: Vec<ciborium::Value> = if top_values.len() == 1 {
+            match top_values.into_iter().next().unwrap() {
+                ciborium::Value::Array(items) => items,
+                other => vec![other],
+            }
+        } else {
+            top_values
+        };
+        let values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
+
+        if values.iter().all(JsonValue::is_object) {
+            let records: Vec<serde_json::Map<String, JsonValue>> = values
+                .into_iter()
+                .map(|v| match v {
+                    JsonValue::Object(m) => m,
+                    _ => unreachable!(),
+                })
+                .collect();
+            Ok(profile_json_records(&records, n_samples))
+        } else {
+            let total = values.len();
+            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+            Ok(profile_json_path(
+                "value".to_string(),
+                total,
+                refs,
+                n_samples,
+            ))
+        }
+    }
+
+    /// Cross-verification oracle for the hand-rolled CBOR decoder
+    /// (`cbor_support` - see Cargo.toml) against the real `ciborium` crate,
+    /// kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "cbor")]
+    #[test]
+    fn cbor_reader_matches_the_ciborium_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.cbor",
+            "tests/fixtures/type_detection.cbor",
+            "tests/fixtures/edge_cbor_scalar_array.cbor",
+        ] {
+            let path = Path::new(f);
+            if !path.exists() {
+                continue;
+            }
+            let mine = cbor_support::columns_from_cbor(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_cbor_via_ciborium(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: ciborium-based oracle failed: {e:?}"));
 
             assert_eq!(
                 mine.iter().map(|c| &c.name).collect::<Vec<_>>(),

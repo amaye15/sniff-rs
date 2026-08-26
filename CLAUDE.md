@@ -3312,9 +3312,11 @@ this project could just implement directly rather than depend on:
   `cargo build`/`cargo run` both default to the debug profile, so this
   was a real, reachable gap, not a hypothetical one. Binary-searching the
   actual crash boundary in a debug build placed it between 700 and 900
-  levels - and independently, `ciborium` (already a dependency for this
-  project's own CBOR reader) defaults to a 256-level recursion limit for
-  exactly this reason, with its own doc comment reading "Set a high
+  levels - and independently, `ciborium` (at the time still a real
+  dependency, for this project's own CBOR reader - it's a dev-only
+  cross-verification oracle now, see below) defaults to a 256-level
+  recursion limit for exactly this reason, with its own doc comment
+  reading "Set a high
   recursion limit at your own risk (of stack exhaustion)!" - real,
   independent corroboration this is a known risk class for this shape of
   recursive decoder, not something specific to this project's own code.
@@ -3461,6 +3463,112 @@ this project could just implement directly rather than depend on:
   the compiled binary rather than in-process, matching how the original
   crash was actually reproduced.
 
+- **`ciborium` → a hand-rolled CBOR decoder (`cbor_support`).** RFC 8949's
+  own byte format is a single small table, the same shape as MessagePack's
+  - verified directly against `ciborium-ll`'s own `hdr.rs`/`dec.rs`
+  (`pull_title`), not recalled from memory: an initial byte splits into a
+  3-bit major type (0-7) and a 5-bit "additional info" that's either the
+  value itself (0-23), a length-prefixed follow-on read (24/25/26/27 mean
+  1/2/4/8 more big-endian bytes), reserved (28-30), or "indefinite length"
+  (31). `read_value`/`read_value_from` are split the way they are
+  specifically because a generic `Read` has no peek/pushback: decoding an
+  indefinite-length array/map/bytes/text has to read the next byte to check
+  for the `0xFF` break marker, and - if it isn't one - feed that
+  already-consumed byte back into `read_value_from` rather than reading a
+  fresh one.
+
+  A genuinely different wire format from MessagePack under the surface
+  similarity, in three specific ways that shaped the implementation:
+    1. **Wider integers.** CBOR's own integer range is asymmetric and wider
+       than `i64` on *both* ends (an unsigned major-type-0 value up to
+       `u64::MAX`, a negative major-type-1 value down to `-1 - u64::MAX`) -
+       confirmed directly against `ciborium::value::Integer`'s own internal
+       `i128` representation (and its own test data,
+       `neg!(-18446744073709551616)` round-tripping through raw bytes
+       `3bffffffffffffffff`) rather than assumed, so `cbor_support::Value::Integer`
+       is `i128`-based too, preserving the old ciborium-based reader's own
+       already-correct `i64::try_from(..).unwrap_or_else(|_| i128::from(..).to_string())`
+       overflow-to-string fallback exactly.
+    2. **Real indefinite-length chunking** (RFC 8949 §3.2.3), a legitimate
+       encoding no MessagePack marker has an equivalent for: an
+       indefinite-length bytes/text value is a sequence of *definite*-length
+       chunks of the *same* major type, concatenated, terminated by the
+       break byte - a chunk of the wrong major type is a hard, disclosed
+       error, matching the spec's own prohibition and verified directly
+       against `ciborium`'s own `deserialize_byte_buf`/`deserialize_string`.
+       UTF-8 is validated once over the fully-assembled text bytes, and -
+       deliberately unlike MessagePack's looser hex-dump-on-invalid-UTF8
+       fallback - invalid UTF-8 in a CBOR text item is a hard error, matching
+       both RFC 8949's own requirement and `ciborium`'s confirmed behavior
+       (`core::str::from_utf8`, propagated as an error, not lossily
+       recovered).
+    3. **Major type 7's mixed grab-bag** (booleans, null, "undefined",
+       unassigned simple values, and three float widths sharing one major
+       type) needed its own research pass on how `ciborium::Value` -
+       which has no dedicated `Simple`/`Undefined` variant at all -
+       represents each case, since the old reader's oracle behavior had to
+       be matched exactly. Confirmed by reading `ciborium`'s own
+       deserialization dispatch (`de/mod.rs`): `false`/`true` map to `Bool`,
+       and - the one genuinely non-obvious finding - both `null` (info 22)
+       *and* `undefined` (info 23) collapse to the identical `Value::Null`,
+       routed through the same `deserialize_option`/`visit_none` path
+       internally. Any *other* simple value (an unassigned info 0-19, or an
+       out-of-range byte following the info-24 escape) is a hard decode
+       error in `ciborium` (`Err(h.expected("known simple value"))`), not a
+       silent fallback - `cbor_support` matches this exactly rather than
+       guessing at a value for an encoding CBOR itself leaves undefined.
+       Half-precision (binary16) floats (info 25) need their own
+       conversion with no existing dependency to lean on (the `half` crate
+       isn't otherwise used anywhere in this project, and adding it would
+       be a new dependency contrary to the point of this hand-roll) -
+       `f16_to_f64` converts via plain floating-point arithmetic rather
+       than bit manipulation, hand-verified against eight known reference
+       bit patterns (1.0, 2.0, -2.0, +inf, -inf, NaN, the smallest
+       subnormal at 2^-24, the smallest normal at 2^-14) before being
+       trusted.
+
+  Tag handling (major type 6) was checked, not assumed, to need no special
+  casing: `ciborium::value::de` only special-cases specific tags (bignum,
+  etc.) when deserializing a `Value` *into some other target type* - when
+  the target type *is* `Value` itself, every tag decodes uniformly
+  (`Value::Tag(tag, Box::new(inner))`) regardless of its number, confirmed
+  directly in its source. `cbor_support` does the same, and `value_to_json`
+  keeps the old reader's own best-effort JSON rendering
+  (`{"tag(N)": <inner>}`) unchanged for oracle compatibility.
+
+  `MAX_DEPTH` (256) was set from the start to match `ciborium`'s own
+  documented default recursion limit, rather than discovered after a crash
+  the way MessagePack's was - by this point in the dependency-removal
+  effort the debug-build stack-safety risk class (a hand-rolled decoder
+  that bridges to `serde_json::Value` without ever passing through
+  `serde_json`'s own parse-time recursion guard) was already known from
+  the MessagePack and TOML hand-rolls, so this one was designed defensively
+  up front. Verified empirically anyway, not just assumed safe by
+  design: a hand-built 50,000-level-deep definite-length array
+  (`tests/fixtures/malformed_deeply_nested.cbor`) fails cleanly on a debug
+  build with no crash, and a boundary check (255 levels succeeds, exactly
+  256 fails) confirmed the guard fires precisely where intended.
+
+  Verified two ways: `cbor_reader_matches_the_ciborium_crate_output_exactly`
+  cross-checks this decoder against `ciborium` itself (kept as a dev-only
+  oracle, the same treatment every other replaced crate in this section
+  already gets) on this project's existing fixtures; and, transiently and
+  not committed (matching this project's usual real-world-corpus practice,
+  via Python's independent `cbor2` library), a 20-record realistic dataset
+  mixing negative/positive integers, floats, nested maps/arrays, byte
+  strings, and a tag (date-time), plus dedicated hand-built-bytes fixtures
+  for indefinite-length arrays/maps/bytes/text, integers beyond `i64`'s
+  range on both ends, and half-precision floats - every one matched the
+  expected values by hand before being trusted, and three of these
+  (indefinite-length chunking, the `i128` integer range, and half-precision
+  floats) are now permanent fixtures/tests
+  (`edge_cbor_indefinite_length.cbor`, `edge_cbor_big_integers.cbor`,
+  `edge_cbor_float16.cbor`) since none of them had any prior coverage even
+  under the old ciborium-based reader. A 500-iteration bit-flip fuzz pass
+  against the realistic dataset produced zero panics and zero hangs -
+  every corrupted input either decoded successfully by coincidence or
+  failed with a clean, actionable error.
+
 **What's deliberately not being hand-rolled**: `serde`/`serde_json` are
 the last real dependency left, and the one that's always been more
 central than any of the others in this list: `serde_json::Value` is the
@@ -3470,8 +3578,8 @@ replacing it means writing and re-verifying a whole JSON value type,
 parser, and serializer, not swapping one call site at a time or
 hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
 `.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, `rmpv`, and now `toml` all still were, however real their
-own risk.
+`zstd`, `npyz`, `rmpv`, `toml`, and now `ciborium` all still were, however
+real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/
