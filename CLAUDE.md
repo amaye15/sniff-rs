@@ -5011,14 +5011,160 @@ this project could just implement directly rather than depend on:
   list, but not exercised by any flat-schema file in this corpus - now
   found to gate exactly one real nested file too, `large_string_map
   .brotli.parquet` - so there's still no real fixture to verify a
-  hand-roll against); and, last, Arrow IPC/Feather's own separate
-  FlatBuffers-based schema/`RecordBatch` framework, entirely unstarted -
-  now the only remaining piece of this campaign's original roadmap.
-  `parquet_support` remains a real but dormant module
+  hand-roll against). `parquet_support` remains a real but dormant module
   (`#[allow(dead_code)]`, exercised only by its own tests) and `arrow`/
   `parquet` remain live runtime dependencies until every behavior this
   project currently documents and tests for Parquet/Arrow IPC is matched,
   verified, and cut over in one deliberate step.
+
+- **`arrow`/`parquet` (Arrow IPC/Feather half) → a hand-rolled reader, in
+  progress (`arrow_ipc_support`).** The last remaining piece of this
+  campaign's original arrow/parquet roadmap: Arrow IPC needs a *second*,
+  entirely independent general-purpose serialization framework -
+  FlatBuffers - as its own foundation, the same way Parquet needed
+  Thrift. Picked up immediately after nested Struct/List/Map
+  reconstruction closed out the Parquet side of this dependency, since
+  it's now the only piece left. Built the same way every phase of the
+  Parquet hand-roll was: every wire-format detail verified directly
+  against the real `flatbuffers` crate's own read-side source
+  (`table.rs`/`vtable.rs`/`follow.rs`/`vector.rs`/`primitives.rs` - the
+  exact crate this project's own `arrow` dependency already uses at
+  runtime) rather than the abstract FlatBuffers specification's prose,
+  and every Arrow-specific field ID, table layout, and union tag value
+  verified against `arrow-ipc`'s own *generated* FlatBuffers bindings
+  (`gen/Schema.rs`/`gen/Message.rs`/`gen/File.rs`) - the reference
+  implementation's own source standing in as "the real spec" the same way
+  it has for every other hand-roll in this document.
+
+  **Phase 1 (this session): the FlatBuffers wire format's read side, and
+  Arrow IPC's own file-level framing and Schema/Field/DataType parsing -
+  not yet decoding any actual `RecordBatch` buffer data, and not yet
+  wired into `columns_from_arrow_ipc`.** The same "footer/schema first,
+  actual data next" split Parquet's own Phase A/B used.
+
+  FlatBuffers itself (`fb_root`/`fb_vtable_loc`/`fb_field_slot`/
+  `fb_get_*`/`fb_get_ref`/`fb_read_string`/`fb_vector_*` in
+  `arrow_ipc_support`): every scalar is little-endian; a *table* begins
+  with a 4-byte signed offset (`SOffsetT`) pointing *backward* to its own
+  vtable (`vtable_loc = table_loc - soffset`, verified against
+  `BackwardsSOffset::follow`); a vtable is a sequence of 2-byte unsigned
+  offsets (`VOffsetT`) - its own byte size, the table's own inline byte
+  size, then one entry per declared field (`0` meaning "field absent, use
+  the default" - a real, common case for a field from a newer schema
+  version than the file was written with, not just a theoretical
+  possibility) - giving that field's byte offset *within the table's own
+  inline data*, at vtable byte offset `4 + 2*field_id` (verified against
+  `VTable::get_field`). A "reference" field (string/vector/nested table/
+  union payload) stores a 4-byte unsigned *forward* offset (`UOffsetT`)
+  at that inline position, itself relative to its own position, which
+  must be followed once more to reach the real data (verified against
+  `ForwardsUOffset::follow`) - the FlatBuffers root itself is exactly this
+  same forward-offset pattern, applied once at the very start of the
+  buffer with no vtable involved at all. A *struct* (as opposed to a
+  table) has no vtable of its own either - it's packed directly inline at
+  a fixed byte layout with no field-presence flexibility, used by Arrow
+  IPC for `Block`/`Buffer`/`FieldNode` (verified against `gen/File.rs`'s
+  own `Block` - `offset: i64` @0, `metaDataLength: i32` @8, `bodyLength:
+  i64` @16, packed into a fixed 24-byte struct with no per-field
+  offsets to resolve at all).
+
+  Arrow IPC's own file-level framing (`read_footer`): the file's last 10
+  bytes are a 4-byte little-endian footer length followed by the 6-byte
+  `ARROW1` magic (verified against `reader.rs`'s own `read_footer_length`
+  and `FileReaderBuilder::build`, which seeks straight to those trailing
+  10 bytes and works backward from there); the `Footer` table (`gen/
+  File.rs`: `VT_VERSION`=4, `VT_SCHEMA`=6, `VT_DICTIONARIES`=8,
+  `VT_RECORDBATCHES`=10, `VT_CUSTOM_METADATA`=12) then lives immediately
+  before that trailing region, and carries the file's own `Schema` table
+  plus two vectors of `Block` structs (`dictionaries`/`recordBatches`)
+  giving the absolute file offset and byte lengths of every encapsulated
+  message in the file. One real, disclosed difference from the reference
+  reader found while researching this: `FileReaderBuilder::build` never
+  actually verifies the *leading* `ARROW1` magic at the very start of the
+  file at all (it has no reason to, since it never reads those bytes) -
+  this reader still checks it anyway, as a cheap, real sanity check
+  before trusting the rest of the file, the same "verify what's
+  verifiable" discipline every other format's own magic-number check in
+  this project already applies.
+
+  Schema/Field/DataType parsing (`parse_schema`/`parse_field`/
+  `parse_data_type`): a `Schema` table (`VT_FIELDS`=6) is a vector of
+  nested `Field` tables; a `Field` (`VT_NAME`=4, `VT_NULLABLE`=6,
+  `VT_TYPE_TYPE`=8, `VT_TYPE_`=10, `VT_DICTIONARY`=12, `VT_CHILDREN`=14,
+  `VT_CUSTOM_METADATA`=16) carries its own name, nullability, a
+  FlatBuffers *union* discriminant (`type_type`, a `u8` tag - verified
+  against `gen/Schema.rs`'s own `Type` enum, e.g. `Int`=2,
+  `FloatingPoint`=3, `Utf8`=5, `List`=12, `Struct_`=13, `Map`=17,
+  `LargeList`=21) selecting which type-specific table `type_` actually
+  points at, and its own `children` vector of nested `Field`s - Arrow
+  expresses nesting through the *schema's own field tree* (a List/
+  LargeList/FixedSizeList/Map field's children, a Struct field's
+  children), a real structural difference from Parquet's flat, depth-
+  first `SchemaElement` list with `num_children` counts. `Utf8`/`Binary`/
+  `LargeUtf8`/`LargeBinary`/`Bool`/`Struct_`/`List`/`LargeList` are all
+  empty marker tables in the FlatBuffers schema (Arrow still writes a
+  real, if zero-field, table for them, but this reader never needs to
+  dereference it); `Int`/`FloatingPoint`/`FixedSizeBinary`/`Decimal`/
+  `Date`/`Time`/`Timestamp`/`FixedSizeList`/`Map` each carry their own
+  real fields (bit width and signedness; precision; byte width; precision
+  and scale; day-vs-millisecond unit; time unit and bit width; time unit
+  and an optional timezone string; list size; keys-sorted flag) resolved
+  directly from their own type table.
+
+  Scoped deliberately, the same "confident common case, disclosed gap"
+  discipline as every other hand-roll in this project: `Union`,
+  `RunEndEncoded`, `Interval`, `Duration`, and the newer `*View` family
+  (`BinaryView`/`Utf8View`/`ListView`/`LargeListView`) all resolve to a
+  disclosed `ArrowDataType::Other` rather than a guess - none of them are
+  types this project's own Parquet reader fully supports either, so
+  matching that same scope rather than expanding it here first was a
+  deliberate choice, not an oversight.
+
+  **Verified against real files, not just the fixture generator's own
+  round-trip.** `type_detection.arrow` (already a committed fixture, a
+  flat `Int64` + four `Utf8` columns) parses correctly end to end - name,
+  nullability, and resolved type for every one of its five columns, plus
+  the correct single-record-batch block count and zero dictionary
+  blocks. A second, new fixture (`tests/fixtures/edge_arrow_nested_types
+  .arrow`, generated with `pyarrow`) locks in a `Struct`, a `List`, a
+  parametric `Decimal(10, 2)`, and a timezone-aware `Timestamp` - every
+  field's name and fully-resolved nested structure checked directly
+  against what `pyarrow` itself wrote, matching exactly on the first real
+  attempt. `Map`/`LargeList`/`LargeUtf8`/`LargeBinary` were additionally
+  verified by hand against a second, transient `pyarrow`-generated file
+  during development (not committed, since `Map`'s own nested `entries`/
+  `key`/`value` structure is the same code path as `Struct`/`List` with
+  different tag numbers, not a genuinely different shape needing its own
+  permanent regression fixture) - every field again matched exactly,
+  including Map's own two-level nesting (`Map` -> `entries: Struct` ->
+  `key`/`value`).
+
+  **Still deliberately not started**: decoding any actual `RecordBatch`
+  buffer data (the `FieldNode`/`Buffer` walk per field - verified while
+  researching this phase, but not yet implemented: primitives consume one
+  `FieldNode` and 2 buffers [validity, values]; `Utf8`/`Binary`/
+  `LargeUtf8`/`LargeBinary` consume 3 [validity, offsets, values];
+  `FixedSizeBinary` consumes 2; `List`/`LargeList`/`Map` consume 2
+  [validity, offsets] then recurse into the child field's own
+  node/buffers; `FixedSizeList` consumes 1 [validity only] then recurses;
+  `Struct` consumes 1 [validity only] then recurses into every child in
+  order; `Null` consumes a node but *zero* buffers - all verified
+  directly against `reader.rs`'s own `RecordBatchDecoder::create_array`
+  before being trusted, the same "verify against source" discipline as
+  everything else in this phase); the validity-bitmap convention itself
+  (a real thing still to verify bit-for-bit before relying on it, even
+  though it's a well-documented part of the Arrow spec, per this
+  project's own "checked, not assumed" standard); `DictionaryBatch`
+  messages and dictionary-encoded columns; `BodyCompression` (`LZ4_FRAME`/
+  `ZSTD`, reusing this project's own existing hand-rolled decoders for
+  both, the same way Parquet's own compression codecs already do); and
+  the streaming IPC format (no trailing footer, messages read until EOF)
+  as a second entry point alongside the file format. `arrow_ipc_support`
+  remains a real but dormant module (`#[allow(dead_code)]`, exercised
+  only by its own tests) and `arrow`/`parquet` remain live runtime
+  dependencies until every behavior this project currently documents and
+  tests for Parquet/Arrow IPC is matched, verified, and cut over in one
+  deliberate step.
 
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above (in progress, not declined), `serde`/`serde_json` are meant to

@@ -11274,6 +11274,754 @@ mod parquet_support {
     }
 }
 
+// --- Hand-rolled Arrow IPC / Feather reader (in progress - not yet wired
+// into columns_from_arrow_ipc). The last remaining piece of the
+// arrow/parquet hand-roll campaign (see `parquet_support` above and
+// CLAUDE.md's own Dependency footprint section for the full history):
+// Arrow IPC needs a *second*, entirely independent general-purpose
+// serialization framework - FlatBuffers - as its own foundation, the same
+// way Parquet needed Thrift. Built the same way every prior phase of this
+// campaign was: verified directly against the real `flatbuffers` crate's
+// own read-side source (`table.rs`/`vtable.rs`/`follow.rs`/`vector.rs`,
+// which this project's own `arrow` dependency already uses at runtime)
+// for the wire format itself, and against `arrow-ipc`'s own *generated*
+// FlatBuffers bindings (`gen/Schema.rs`/`gen/Message.rs`/`gen/File.rs`) -
+// not the abstract Arrow IPC format specification's prose - for the exact
+// field IDs, table layouts, and union tag values Arrow's own schema
+// assigns, the same "the reference implementation's own source is the
+// real spec" discipline this whole campaign already holds itself to.
+//
+// Phase 1 (this commit): the FlatBuffers wire format's read side, and
+// enough of Arrow IPC's own file-level framing (the `ARROW1` magic, the
+// trailing `Footer` table, its `Block` list pointing at each message) and
+// Schema/Field/DataType parsing to reconstruct a file's schema - not yet
+// decoding any actual RecordBatch buffer data, and deliberately not yet
+// wired into `columns_from_arrow_ipc`. That's the next phase, the same
+// "footer/schema first, then page/buffer data" order Parquet's own Phase
+// A/B split already used.
+#[allow(dead_code)]
+#[cfg(feature = "parquet")]
+mod arrow_ipc_support {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // FlatBuffers read-side primitives - verified directly against the
+    // real `flatbuffers` crate's own source, not derived from the format's
+    // prose specification alone. Every FlatBuffers scalar is stored
+    // little-endian; a "table" begins with a 4-byte signed offset (an
+    // `SOffsetT`) pointing *backward* to its vtable, and a vtable is a
+    // sequence of 2-byte unsigned offsets (`VOffsetT`): its own byte size,
+    // the table's own inline byte size, then one entry per declared field
+    // (0 meaning "field absent, use the default"), giving that field's
+    // byte offset *within the table's own inline data*. A "reference"
+    // field (string/vector/nested table/union payload) stores a 4-byte
+    // unsigned *forward* offset (`UOffsetT`) at that inline position,
+    // itself relative to its own position, which must be followed once
+    // more to reach the real data.
+    // ---------------------------------------------------------------
+
+    /// Reads the FlatBuffers root table's own absolute location: a single
+    /// forward `UOffsetT` at the very start of the buffer.
+    fn fb_root(buf: &[u8]) -> Result<usize> {
+        let off = fb_u32(buf, 0)?;
+        Ok(off as usize)
+    }
+
+    fn fb_u32(buf: &[u8], loc: usize) -> Result<u32> {
+        let bytes = buf.get(loc..loc + 4).context("truncated FlatBuffers u32")?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn fb_i32(buf: &[u8], loc: usize) -> Result<i32> {
+        let bytes = buf.get(loc..loc + 4).context("truncated FlatBuffers i32")?;
+        Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn fb_u16(buf: &[u8], loc: usize) -> Result<u16> {
+        let bytes = buf.get(loc..loc + 2).context("truncated FlatBuffers u16")?;
+        Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    /// A table's own vtable location: `table_loc` holds a backward
+    /// `SOffsetT` (a signed 4-byte int) that must be *subtracted* from
+    /// `table_loc` itself - verified directly against `flatbuffers`'s own
+    /// `BackwardsSOffset::follow` (`primitives.rs`).
+    fn fb_vtable_loc(buf: &[u8], table_loc: usize) -> Result<usize> {
+        let soffset = i64::from(fb_i32(buf, table_loc)?);
+        let vloc =
+            i64::try_from(table_loc).context("FlatBuffers table location exceeds i64")? - soffset;
+        usize::try_from(vloc).context("FlatBuffers vtable location out of range")
+    }
+
+    /// The byte offset (relative to `table_loc`) where field `field_id`'s
+    /// own value lives within the table's inline data, or `None` if the
+    /// field is absent (either the vtable is too short to mention it at
+    /// all - a real, common case for a field added in a newer schema
+    /// version than the file was written with - or its own vtable entry
+    /// is explicitly `0`). Verified against `VTable::get_field`/`get`
+    /// (`vtable.rs`): the field's own vtable entry lives at byte offset
+    /// `4 + 2*field_id` within the vtable (the first two `VOffsetT` slots
+    /// are the vtable's own metadata, not a field).
+    fn fb_field_slot(buf: &[u8], table_loc: usize, field_id: u16) -> Result<Option<usize>> {
+        let vloc = fb_vtable_loc(buf, table_loc)?;
+        let vtable_num_bytes = usize::from(fb_u16(buf, vloc)?);
+        let entry_offset = 4 + 2 * usize::from(field_id);
+        if entry_offset + 2 > vtable_num_bytes {
+            return Ok(None);
+        }
+        let field_rel = fb_u16(buf, vloc + entry_offset)?;
+        if field_rel == 0 {
+            return Ok(None);
+        }
+        Ok(Some(table_loc + usize::from(field_rel)))
+    }
+
+    fn fb_get_bool(buf: &[u8], table_loc: usize, field_id: u16, default: bool) -> Result<bool> {
+        match fb_field_slot(buf, table_loc, field_id)? {
+            None => Ok(default),
+            Some(loc) => Ok(*buf.get(loc).context("truncated FlatBuffers bool")? != 0),
+        }
+    }
+
+    fn fb_get_i16(buf: &[u8], table_loc: usize, field_id: u16, default: i16) -> Result<i16> {
+        match fb_field_slot(buf, table_loc, field_id)? {
+            None => Ok(default),
+            Some(loc) => {
+                let bytes = buf.get(loc..loc + 2).context("truncated FlatBuffers i16")?;
+                Ok(i16::from_le_bytes(bytes.try_into().unwrap()))
+            }
+        }
+    }
+
+    fn fb_get_i32(buf: &[u8], table_loc: usize, field_id: u16, default: i32) -> Result<i32> {
+        match fb_field_slot(buf, table_loc, field_id)? {
+            None => Ok(default),
+            Some(loc) => fb_i32(buf, loc),
+        }
+    }
+
+    fn fb_get_i64(buf: &[u8], table_loc: usize, field_id: u16, default: i64) -> Result<i64> {
+        match fb_field_slot(buf, table_loc, field_id)? {
+            None => Ok(default),
+            Some(loc) => {
+                let bytes = buf.get(loc..loc + 8).context("truncated FlatBuffers i64")?;
+                Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+            }
+        }
+    }
+
+    fn fb_get_u8(buf: &[u8], table_loc: usize, field_id: u16, default: u8) -> Result<u8> {
+        match fb_field_slot(buf, table_loc, field_id)? {
+            None => Ok(default),
+            Some(loc) => Ok(*buf.get(loc).context("truncated FlatBuffers u8")?),
+        }
+    }
+
+    /// Resolves a "reference" field (string/vector/nested table/union
+    /// payload) to its real, absolute location - the inline slot itself
+    /// holds a forward `UOffsetT` relative to *its own* position, which
+    /// must be followed once more (`ForwardsUOffset::follow`,
+    /// `primitives.rs`) to reach the real data.
+    fn fb_get_ref(buf: &[u8], table_loc: usize, field_id: u16) -> Result<Option<usize>> {
+        let Some(slot) = fb_field_slot(buf, table_loc, field_id)? else {
+            return Ok(None);
+        };
+        let rel = fb_u32(buf, slot)? as usize;
+        Ok(Some(slot + rel))
+    }
+
+    /// Follows a forward `UOffsetT` that isn't behind a table field slot -
+    /// used for the FlatBuffers root itself and for elements of a vector
+    /// of references (each vector slot is itself a bare forward offset,
+    /// not preceded by a vtable-mediated field lookup).
+    fn fb_follow_uoffset(buf: &[u8], loc: usize) -> Result<usize> {
+        let rel = fb_u32(buf, loc)? as usize;
+        Ok(loc + rel)
+    }
+
+    /// Reads a FlatBuffers string at `loc`: a `UOffsetT` length prefix
+    /// followed by that many UTF-8 bytes (plus a mandatory, uncounted NUL
+    /// terminator this reader doesn't need to skip explicitly, since the
+    /// length prefix alone already bounds the real content).
+    fn fb_read_string(buf: &[u8], loc: usize) -> Result<&str> {
+        let len = fb_u32(buf, loc)? as usize;
+        let bytes = buf
+            .get(loc + 4..loc + 4 + len)
+            .context("truncated FlatBuffers string")?;
+        std::str::from_utf8(bytes).context("FlatBuffers string is not valid UTF-8")
+    }
+
+    fn fb_get_string(buf: &[u8], table_loc: usize, field_id: u16) -> Result<Option<&str>> {
+        match fb_get_ref(buf, table_loc, field_id)? {
+            None => Ok(None),
+            Some(loc) => Ok(Some(fb_read_string(buf, loc)?)),
+        }
+    }
+
+    /// The element count of a FlatBuffers vector at `loc` (a `UOffsetT`
+    /// length prefix; elements immediately follow, packed for scalars/
+    /// structs or as one forward-offset-per-element for
+    /// strings/tables/unions).
+    fn fb_vector_len(buf: &[u8], loc: usize) -> Result<usize> {
+        Ok(fb_u32(buf, loc)? as usize)
+    }
+
+    /// The absolute location of element `i` in a vector-of-references
+    /// (strings/tables) at `loc`.
+    fn fb_vector_ref_at(buf: &[u8], loc: usize, i: usize) -> Result<usize> {
+        let elem_slot = loc + 4 + i * 4;
+        fb_follow_uoffset(buf, elem_slot)
+    }
+
+    /// The absolute location of element `i` in a vector of fixed-size
+    /// inline structs (e.g. `Block`/`Buffer`/`FieldNode`, each packed
+    /// directly with no offset indirection) at `loc`, given the struct's
+    /// own fixed byte width.
+    fn fb_vector_struct_at(loc: usize, i: usize, struct_size: usize) -> usize {
+        loc + 4 + i * struct_size
+    }
+
+    // ---------------------------------------------------------------
+    // Arrow IPC file-level framing and Schema/Field parsing.
+    // ---------------------------------------------------------------
+
+    const ARROW_MAGIC: &[u8; 6] = b"ARROW1";
+    const CONTINUATION_MARKER: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+
+    /// Verified against `arrow-ipc`'s own `gen/Schema.rs` (`Type` enum) -
+    /// the FlatBuffers union tag selecting which `DataType` table a
+    /// `Field`'s own `type_` payload is. Only the variants this reader
+    /// actually supports get a named case; everything else (Union,
+    /// RunEndEncoded, the *View family, Interval, Duration) is a
+    /// disclosed, explicit gap - the same "confident common case" scope
+    /// this project's own Parquet reader already draws for its own set of
+    /// supported logical types.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ArrowTypeTag {
+        Null,
+        Int,
+        FloatingPoint,
+        Binary,
+        Utf8,
+        Bool,
+        Decimal,
+        Date,
+        Time,
+        Timestamp,
+        List,
+        Struct,
+        FixedSizeBinary,
+        FixedSizeList,
+        Map,
+        LargeBinary,
+        LargeUtf8,
+        LargeList,
+        Other(u8),
+    }
+
+    impl ArrowTypeTag {
+        fn from_u8(v: u8) -> Self {
+            match v {
+                1 => Self::Null,
+                2 => Self::Int,
+                3 => Self::FloatingPoint,
+                4 => Self::Binary,
+                5 => Self::Utf8,
+                6 => Self::Bool,
+                7 => Self::Decimal,
+                8 => Self::Date,
+                9 => Self::Time,
+                10 => Self::Timestamp,
+                12 => Self::List,
+                13 => Self::Struct,
+                15 => Self::FixedSizeBinary,
+                16 => Self::FixedSizeList,
+                17 => Self::Map,
+                19 => Self::LargeBinary,
+                20 => Self::LargeUtf8,
+                21 => Self::LargeList,
+                other => Self::Other(other),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ArrowTimeUnit {
+        Second,
+        Millisecond,
+        Microsecond,
+        Nanosecond,
+    }
+
+    impl ArrowTimeUnit {
+        fn from_i16(v: i16) -> Result<Self> {
+            match v {
+                0 => Ok(Self::Second),
+                1 => Ok(Self::Millisecond),
+                2 => Ok(Self::Microsecond),
+                3 => Ok(Self::Nanosecond),
+                other => bail!("unrecognized Arrow TimeUnit {other}"),
+            }
+        }
+    }
+
+    /// This reader's own logical representation of an Arrow `DataType` -
+    /// deliberately its own small enum rather than a line-for-line port of
+    /// every `arrow::datatypes::DataType` variant, since only the shapes
+    /// this reader actually resolves into a rendering ever need a case
+    /// here (matching `SchemaNode`'s own equivalent role for Parquet).
+    #[derive(Clone, Debug)]
+    enum ArrowDataType {
+        Null,
+        Int {
+            bit_width: i32,
+            is_signed: bool,
+        },
+        Float16,
+        Float32,
+        Float64,
+        Utf8,
+        LargeUtf8,
+        Binary,
+        LargeBinary,
+        FixedSizeBinary {
+            byte_width: i32,
+        },
+        Bool,
+        Decimal {
+            precision: i32,
+            scale: i32,
+        },
+        Date {
+            unit_is_millisecond: bool,
+        },
+        Time {
+            unit: ArrowTimeUnit,
+            bit_width: i32,
+        },
+        Timestamp {
+            unit: ArrowTimeUnit,
+            timezone: Option<String>,
+        },
+        List {
+            child: Box<ArrowField>,
+        },
+        LargeList {
+            child: Box<ArrowField>,
+        },
+        FixedSizeList {
+            child: Box<ArrowField>,
+            list_size: i32,
+        },
+        Struct {
+            children: Vec<ArrowField>,
+        },
+        Map {
+            entries: Box<ArrowField>,
+            keys_sorted: bool,
+        },
+        Other(u8),
+    }
+
+    #[derive(Clone, Debug)]
+    struct ArrowField {
+        name: String,
+        nullable: bool,
+        data_type: ArrowDataType,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ArrowSchema {
+        fields: Vec<ArrowField>,
+    }
+
+    /// Parses a `Field` table at `loc` - verified field-by-field against
+    /// `arrow-ipc`'s own generated `gen/Schema.rs` (`Field::VT_NAME` = 4,
+    /// `VT_NULLABLE` = 6, `VT_TYPE_TYPE` = 8, `VT_TYPE_` = 10,
+    /// `VT_DICTIONARY` = 12, `VT_CHILDREN` = 14, `VT_CUSTOM_METADATA` =
+    /// 16). `children` (used by List/LargeList/FixedSizeList/Struct/Map,
+    /// and empty for every other type) is itself a vector of nested
+    /// `Field` tables - Arrow expresses nesting through the schema's own
+    /// field tree, unlike Parquet's flat, depth-first `SchemaElement`
+    /// list.
+    fn parse_field(buf: &[u8], loc: usize) -> Result<ArrowField> {
+        let name = fb_get_string(buf, loc, 0)?.unwrap_or("").to_string();
+        let nullable = fb_get_bool(buf, loc, 1, false)?;
+        let type_tag = ArrowTypeTag::from_u8(fb_get_u8(buf, loc, 2, 0)?);
+        let type_loc = fb_get_ref(buf, loc, 3)?;
+
+        let children = match fb_get_ref(buf, loc, 5)? {
+            None => Vec::new(),
+            Some(vec_loc) => {
+                let len = fb_vector_len(buf, vec_loc)?;
+                (0..len)
+                    .map(|i| {
+                        let field_loc = fb_vector_ref_at(buf, vec_loc, i)?;
+                        parse_field(buf, field_loc)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+
+        let data_type = parse_data_type(buf, type_tag, type_loc, children)?;
+
+        Ok(ArrowField {
+            name,
+            nullable,
+            data_type,
+        })
+    }
+
+    fn one_child(mut children: Vec<ArrowField>, type_name: &str) -> Result<ArrowField> {
+        if children.len() != 1 {
+            bail!(
+                "Arrow {type_name} field must have exactly one child, got {}",
+                children.len()
+            );
+        }
+        Ok(children.remove(0))
+    }
+
+    /// Resolves a `Field`'s own `type_type`/`type_`/`children` triple into
+    /// this reader's `ArrowDataType`. `type_loc` is `None` exactly when
+    /// the underlying FlatBuffers type table has no fields of its own
+    /// (verified against `gen/Schema.rs`: `Utf8`/`Binary`/`LargeUtf8`/
+    /// `LargeBinary`/`Bool`/`Struct_`/`List`/`LargeList` are all empty
+    /// marker tables - Arrow still writes a zero-length table for them so
+    /// `type_()` returns `Some`, but this reader never needs to dereference
+    /// it since there's nothing to read).
+    fn parse_data_type(
+        buf: &[u8],
+        tag: ArrowTypeTag,
+        type_loc: Option<usize>,
+        children: Vec<ArrowField>,
+    ) -> Result<ArrowDataType> {
+        Ok(match tag {
+            ArrowTypeTag::Null => ArrowDataType::Null,
+            ArrowTypeTag::Int => {
+                let loc = type_loc.context("Arrow Int field missing its own type table")?;
+                let bit_width = fb_get_i32(buf, loc, 0, 0)?;
+                let is_signed = fb_get_bool(buf, loc, 1, false)?;
+                ArrowDataType::Int {
+                    bit_width,
+                    is_signed,
+                }
+            }
+            ArrowTypeTag::FloatingPoint => {
+                let loc =
+                    type_loc.context("Arrow FloatingPoint field missing its own type table")?;
+                match fb_get_i16(buf, loc, 0, 0)? {
+                    0 => ArrowDataType::Float16,
+                    1 => ArrowDataType::Float32,
+                    2 => ArrowDataType::Float64,
+                    other => bail!("unrecognized Arrow FloatingPoint precision {other}"),
+                }
+            }
+            ArrowTypeTag::Utf8 => ArrowDataType::Utf8,
+            ArrowTypeTag::LargeUtf8 => ArrowDataType::LargeUtf8,
+            ArrowTypeTag::Binary => ArrowDataType::Binary,
+            ArrowTypeTag::LargeBinary => ArrowDataType::LargeBinary,
+            ArrowTypeTag::FixedSizeBinary => {
+                let loc =
+                    type_loc.context("Arrow FixedSizeBinary field missing its own type table")?;
+                ArrowDataType::FixedSizeBinary {
+                    byte_width: fb_get_i32(buf, loc, 0, 0)?,
+                }
+            }
+            ArrowTypeTag::Bool => ArrowDataType::Bool,
+            ArrowTypeTag::Decimal => {
+                let loc = type_loc.context("Arrow Decimal field missing its own type table")?;
+                ArrowDataType::Decimal {
+                    precision: fb_get_i32(buf, loc, 0, 0)?,
+                    scale: fb_get_i32(buf, loc, 1, 0)?,
+                }
+            }
+            ArrowTypeTag::Date => {
+                let loc = type_loc.context("Arrow Date field missing its own type table")?;
+                ArrowDataType::Date {
+                    unit_is_millisecond: fb_get_i16(buf, loc, 0, 0)? == 1,
+                }
+            }
+            ArrowTypeTag::Time => {
+                let loc = type_loc.context("Arrow Time field missing its own type table")?;
+                ArrowDataType::Time {
+                    unit: ArrowTimeUnit::from_i16(fb_get_i16(buf, loc, 0, 0)?)?,
+                    bit_width: fb_get_i32(buf, loc, 1, 32)?,
+                }
+            }
+            ArrowTypeTag::Timestamp => {
+                let loc = type_loc.context("Arrow Timestamp field missing its own type table")?;
+                let unit = ArrowTimeUnit::from_i16(fb_get_i16(buf, loc, 0, 0)?)?;
+                let timezone = fb_get_string(buf, loc, 1)?.map(str::to_string);
+                ArrowDataType::Timestamp { unit, timezone }
+            }
+            ArrowTypeTag::List => ArrowDataType::List {
+                child: Box::new(one_child(children, "List")?),
+            },
+            ArrowTypeTag::LargeList => ArrowDataType::LargeList {
+                child: Box::new(one_child(children, "LargeList")?),
+            },
+            ArrowTypeTag::FixedSizeList => {
+                let loc =
+                    type_loc.context("Arrow FixedSizeList field missing its own type table")?;
+                ArrowDataType::FixedSizeList {
+                    child: Box::new(one_child(children, "FixedSizeList")?),
+                    list_size: fb_get_i32(buf, loc, 0, 0)?,
+                }
+            }
+            ArrowTypeTag::Struct => ArrowDataType::Struct { children },
+            ArrowTypeTag::Map => {
+                let loc = type_loc.context("Arrow Map field missing its own type table")?;
+                ArrowDataType::Map {
+                    entries: Box::new(one_child(children, "Map")?),
+                    keys_sorted: fb_get_bool(buf, loc, 0, false)?,
+                }
+            }
+            ArrowTypeTag::Other(other) => ArrowDataType::Other(other),
+        })
+    }
+
+    /// Parses a `Schema` table at `loc` - `Schema::VT_FIELDS` = 6, a
+    /// vector of nested `Field` tables (verified against `gen/Schema.rs`).
+    fn parse_schema(buf: &[u8], loc: usize) -> Result<ArrowSchema> {
+        let fields = match fb_get_ref(buf, loc, 1)? {
+            None => Vec::new(),
+            Some(vec_loc) => {
+                let len = fb_vector_len(buf, vec_loc)?;
+                (0..len)
+                    .map(|i| {
+                        let field_loc = fb_vector_ref_at(buf, vec_loc, i)?;
+                        parse_field(buf, field_loc)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        Ok(ArrowSchema { fields })
+    }
+
+    /// One `Block` entry from the file footer's own `recordBatches`/
+    /// `dictionaries` vectors - a fixed-size FlatBuffers *struct* (24
+    /// bytes, no vtable at all: `offset` (i64) @0, `metaDataLength` (i32)
+    /// @8, `bodyLength` (i64) @16, verified against `gen/File.rs`), giving
+    /// the absolute file offset and byte lengths of one encapsulated
+    /// message.
+    #[derive(Clone, Copy, Debug)]
+    struct ArrowBlock {
+        offset: i64,
+        meta_data_length: i32,
+        body_length: i64,
+    }
+
+    fn read_block_struct(buf: &[u8], loc: usize) -> Result<ArrowBlock> {
+        let offset_bytes = buf.get(loc..loc + 8).context("truncated Arrow IPC Block")?;
+        let meta_bytes = buf
+            .get(loc + 8..loc + 12)
+            .context("truncated Arrow IPC Block")?;
+        let body_bytes = buf
+            .get(loc + 16..loc + 24)
+            .context("truncated Arrow IPC Block")?;
+        Ok(ArrowBlock {
+            offset: i64::from_le_bytes(offset_bytes.try_into().unwrap()),
+            meta_data_length: i32::from_le_bytes(meta_bytes.try_into().unwrap()),
+            body_length: i64::from_le_bytes(body_bytes.try_into().unwrap()),
+        })
+    }
+
+    #[derive(Debug)]
+    struct ArrowFileFooter {
+        schema: ArrowSchema,
+        dictionaries: Vec<ArrowBlock>,
+        record_batches: Vec<ArrowBlock>,
+    }
+
+    /// Reads an Arrow IPC file's own trailing footer, mirroring the
+    /// reference `arrow-ipc` crate's own `FileReaderBuilder::build`
+    /// (`reader.rs`): the file's last 10 bytes are a 4-byte little-endian
+    /// footer length followed by the 6-byte `ARROW1` magic (`gen/
+    /// File.rs`'s own `Footer` table then lives immediately before that,
+    /// `footer_len` bytes long). The reference reader never actually
+    /// verifies the *leading* magic at the start of the file (it seeks
+    /// straight to the trailing 10 bytes and works backward from there),
+    /// but this function still checks it as a cheap, real sanity check
+    /// before trusting the rest of the file - the same "verify what's
+    /// verifiable" discipline this project applies to every other format's
+    /// magic-number check.
+    fn read_footer(file_data: &[u8]) -> Result<ArrowFileFooter> {
+        if file_data.len() < 8 || &file_data[..6] != ARROW_MAGIC {
+            bail!("not a valid Arrow IPC file (missing leading ARROW1 magic)");
+        }
+        if file_data.len() < 10 {
+            bail!("Arrow IPC file too short to contain a footer");
+        }
+        let trailer_start = file_data.len() - 10;
+        let trailer = &file_data[trailer_start..];
+        if &trailer[4..10] != ARROW_MAGIC {
+            bail!("not a valid Arrow IPC file (missing trailing ARROW1 magic)");
+        }
+        let footer_len = u32::from_le_bytes(trailer[0..4].try_into().unwrap()) as usize;
+        let footer_start = trailer_start
+            .checked_sub(footer_len)
+            .context("Arrow IPC footer length exceeds file size")?;
+        let footer_buf = &file_data[footer_start..trailer_start];
+
+        let footer_table = fb_root(footer_buf)?;
+        let schema_loc = fb_get_ref(footer_buf, footer_table, 1)?
+            .context("Arrow IPC footer missing its own schema")?;
+        let schema = parse_schema(footer_buf, schema_loc)?;
+
+        let read_blocks = |field_id: u16| -> Result<Vec<ArrowBlock>> {
+            match fb_get_ref(footer_buf, footer_table, field_id)? {
+                None => Ok(Vec::new()),
+                Some(vec_loc) => {
+                    let len = fb_vector_len(footer_buf, vec_loc)?;
+                    (0..len)
+                        .map(|i| {
+                            let block_loc = fb_vector_struct_at(vec_loc, i, 24);
+                            read_block_struct(footer_buf, block_loc)
+                        })
+                        .collect()
+                }
+            }
+        };
+        let dictionaries = read_blocks(2)?;
+        let record_batches = read_blocks(3)?;
+
+        Ok(ArrowFileFooter {
+            schema,
+            dictionaries,
+            record_batches,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn reads_the_footer_of_a_real_arrow_ipc_file() {
+            let file_data = std::fs::read("tests/fixtures/type_detection.arrow").unwrap();
+            let footer = read_footer(&file_data).unwrap();
+            let names: Vec<&str> = footer
+                .schema
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    "id",
+                    "user_uuid",
+                    "contact_email",
+                    "ip_address",
+                    "signup_date"
+                ]
+            );
+            assert!(matches!(
+                footer.schema.fields[0].data_type,
+                ArrowDataType::Int {
+                    bit_width: 64,
+                    is_signed: true
+                }
+            ));
+            for f in &footer.schema.fields[1..] {
+                assert!(matches!(f.data_type, ArrowDataType::Utf8), "{f:?}");
+            }
+            assert_eq!(footer.record_batches.len(), 1);
+            assert!(footer.dictionaries.is_empty());
+        }
+
+        #[test]
+        fn rejects_a_file_with_no_magic_number() {
+            let file_data = std::fs::read("tests/fixtures/malformed_garbage.arrow").unwrap();
+            let err = read_footer(&file_data)
+                .expect_err("garbage bytes should not parse as an Arrow IPC file");
+            let msg = format!("{err:?}");
+            assert!(msg.contains("ARROW1") || msg.contains("magic"), "{msg}");
+        }
+
+        /// A struct, a list, a Decimal, and a timezone-aware Timestamp all
+        /// in one real file (generated with `pyarrow`) - locks in every
+        /// nested/nullable/parametric type this phase's own `parse_field`/
+        /// `parse_data_type` supports, beyond `type_detection.arrow`'s own
+        /// flat Int64/Utf8-only schema. Map/LargeList/LargeUtf8/
+        /// LargeBinary were also verified by hand against a second real
+        /// `pyarrow`-generated file during development (every field's
+        /// name, nullability, and resolved `ArrowDataType` matched
+        /// exactly, including Map's own nested `entries` struct with its
+        /// `key`/`value` children) but aren't part of this committed
+        /// fixture, since `type_detection.arrow`/this file together
+        /// already lock in one representative case of every *shape* this
+        /// phase's parsing logic branches on (a bare scalar type, a
+        /// parametric scalar type, a single-child nested type, and a
+        /// multi-child nested type) - Map/LargeList themselves are the
+        /// same code paths as List/Struct with different tag numbers, not
+        /// a genuinely different shape to lock in twice over.
+        #[test]
+        fn reads_the_schema_of_a_file_with_nested_and_parametric_types() {
+            let file_data = std::fs::read("tests/fixtures/edge_arrow_nested_types.arrow").unwrap();
+            let footer = read_footer(&file_data).unwrap();
+            let f = &footer.schema.fields;
+            assert_eq!(f.len(), 6);
+
+            assert_eq!(f[0].name, "user_id");
+            assert!(matches!(
+                f[0].data_type,
+                ArrowDataType::Int {
+                    bit_width: 64,
+                    is_signed: true
+                }
+            ));
+
+            assert_eq!(f[1].name, "name");
+            assert!(matches!(f[1].data_type, ArrowDataType::Utf8));
+
+            assert_eq!(f[2].name, "scores");
+            match &f[2].data_type {
+                ArrowDataType::List { child } => {
+                    assert!(matches!(
+                        child.data_type,
+                        ArrowDataType::Int {
+                            bit_width: 32,
+                            is_signed: true
+                        }
+                    ));
+                }
+                other => panic!("expected List, got {other:?}"),
+            }
+
+            assert_eq!(f[3].name, "address");
+            match &f[3].data_type {
+                ArrowDataType::Struct { children } => {
+                    assert_eq!(children.len(), 2);
+                    assert_eq!(children[0].name, "city");
+                    assert_eq!(children[1].name, "zip");
+                    assert!(matches!(children[0].data_type, ArrowDataType::Utf8));
+                }
+                other => panic!("expected Struct, got {other:?}"),
+            }
+
+            assert_eq!(f[4].name, "balance");
+            assert!(matches!(
+                f[4].data_type,
+                ArrowDataType::Decimal {
+                    precision: 10,
+                    scale: 2
+                }
+            ));
+
+            assert_eq!(f[5].name, "signup_ts");
+            match &f[5].data_type {
+                ArrowDataType::Timestamp { unit, timezone } => {
+                    assert_eq!(*unit, ArrowTimeUnit::Microsecond);
+                    assert_eq!(timezone.as_deref(), Some("UTC"));
+                }
+                other => panic!("expected Timestamp, got {other:?}"),
+            }
+        }
+    }
+}
+
 // --- Avro reader (opt-in via --features avro) ---
 // Decodes each record to serde_json::Value and reuses the exact same
 // column-extraction/flattening path as JSON files. The reader itself
