@@ -8584,7 +8584,7 @@ mod parquet_support {
     /// duplication across independently-gated format modules" precedent
     /// already used elsewhere in this project (the two independent XML
     /// parsers, `zip_support`'s vs `xlsx_support`'s own u16 readers).
-    fn decimal_bytes_to_string(bytes: &[u8], scale: i32) -> String {
+    pub(crate) fn decimal_bytes_to_string(bytes: &[u8], scale: i32) -> String {
         if bytes.is_empty() {
             return "0".to_string();
         }
@@ -8667,7 +8667,7 @@ mod parquet_support {
     /// `f16_to_f64` - duplicated rather than shared since `cbor`/`parquet`
     /// are independently togglable features, the same tradeoff already
     /// made for `decimal_bytes_to_string` above.
-    fn f16_bytes_to_f64(bytes: &[u8]) -> f64 {
+    pub(crate) fn f16_bytes_to_f64(bytes: &[u8]) -> f64 {
         let Ok(raw) = <[u8; 2]>::try_from(bytes) else {
             return f64::NAN;
         };
@@ -8953,8 +8953,16 @@ mod parquet_support {
 
     /// Decodes a raw LZ4 block (RFC-less, but a small, stable, widely
     /// implemented format - LZ4_Block_format.md in the reference `lz4`
-    /// project) into exactly `uncompressed_size` bytes. Verified directly
-    /// against `lz4_flex`'s own safe decoder
+    /// project) until the input is exhausted, which is how a decoder
+    /// recognizes the final, match-free sequence (there's no separate end
+    /// marker) - the core loop shared by Parquet's `LZ4`/`LZ4_RAW`/Hadoop-
+    /// framed pages (which always know the exact decompressed size up
+    /// front from the page header, and validate against it - see
+    /// `lz4_block_decompress` below, the thin wrapper that does that) and
+    /// Arrow IPC's `LZ4_FRAME` body compression (`arrow_ipc_support`'s own
+    /// frame decoder), which only knows where a block's compressed bytes
+    /// end, not its decompressed size, until the block is actually
+    /// decoded. Verified directly against `lz4_flex`'s own safe decoder
     /// (`block/decompress_safe.rs::decompress_internal`, the exact
     /// function this project's own `parquet`/`arrow` dependency already
     /// uses for this at runtime) rather than assumed from a general
@@ -8964,14 +8972,9 @@ mod parquet_support {
     /// remains: 2-byte little-endian match offset (never 0), then a
     /// match-length copy from `output[pos-offset..]` copied byte-by-byte
     /// so an offset smaller than the match length still produces the
-    /// correct RLE-style repeat] - continuing until the input is
-    /// exhausted, which is how a decoder recognizes the final,
-    /// match-free sequence (there's no separate end marker).
-    fn lz4_block_decompress(input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
-        if uncompressed_size > LZ4_MAX_ALLOC {
-            bail!("LZ4 page claims an implausibly large decompressed size");
-        }
-        let mut out = Vec::with_capacity(uncompressed_size);
+    /// correct RLE-style repeat].
+    pub(crate) fn lz4_block_decompress_core(input: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(input.len());
         let mut pos = 0usize;
         loop {
             let token = *input.get(pos).context("truncated LZ4 token")?;
@@ -9007,6 +9010,20 @@ mod parquet_support {
                 out.push(byte);
             }
         }
+        Ok(out)
+    }
+
+    /// Decodes a raw LZ4 block into exactly `uncompressed_size` bytes - a
+    /// thin wrapper around `lz4_block_decompress_core` adding the
+    /// allocation-size sanity check and the final length validation
+    /// Parquet's own LZ4 pages need (their page header always states the
+    /// target size up front, unlike Arrow IPC's `LZ4_FRAME` blocks - see
+    /// that function's own doc comment).
+    fn lz4_block_decompress(input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
+        if uncompressed_size > LZ4_MAX_ALLOC {
+            bail!("LZ4 page claims an implausibly large decompressed size");
+        }
+        let out = lz4_block_decompress_core(input)?;
         if out.len() != uncompressed_size {
             bail!(
                 "LZ4 block decompressed to {} bytes, expected {uncompressed_size}",
@@ -11591,6 +11608,7 @@ mod arrow_ipc_support {
         Decimal {
             precision: i32,
             scale: i32,
+            bit_width: i32,
         },
         Date {
             unit_is_millisecond: bool,
@@ -11623,11 +11641,29 @@ mod arrow_ipc_support {
         Other(u8),
     }
 
+    /// A `Field`'s own `DictionaryEncoding` (`gen/Schema.rs`'s
+    /// `DictionaryEncoding::VT_ID` = 4, `VT_INDEXTYPE` = 6, `VT_ISORDERED` =
+    /// 8), present only on a dictionary-encoded field. Confirmed directly
+    /// against `arrow-ipc`'s own `convert.rs` (`From<crate::Field> for
+    /// Field`/`get_data_type`) that this is a genuinely separate concept
+    /// from the field's own `type_type`/`type_` pair: those describe the
+    /// dictionary's *value* type (what index 0, 1, 2, ... each resolve to),
+    /// while `dictionary` carries the *index* type (the integer actually
+    /// stored per row in the `RecordBatch`) plus the id used to look the
+    /// right `DictionaryBatch` up by.
+    #[derive(Clone, Copy, Debug)]
+    struct ArrowDictionaryEncoding {
+        id: i64,
+        index_bit_width: i32,
+        index_is_signed: bool,
+    }
+
     #[derive(Clone, Debug)]
     struct ArrowField {
         name: String,
         nullable: bool,
         data_type: ArrowDataType,
+        dictionary: Option<ArrowDictionaryEncoding>,
     }
 
     #[derive(Clone, Debug)]
@@ -11650,6 +11686,25 @@ mod arrow_ipc_support {
         let type_tag = ArrowTypeTag::from_u8(fb_get_u8(buf, loc, 2, 0)?);
         let type_loc = fb_get_ref(buf, loc, 3)?;
 
+        // field 4 (`VT_DICTIONARY` = 12) - see `ArrowDictionaryEncoding`'s
+        // own doc comment for why this is parsed independently of the
+        // `type_type`/`type_` pair just above rather than folded into it.
+        let dictionary = match fb_get_ref(buf, loc, 4)? {
+            None => None,
+            Some(dict_loc) => {
+                let id = fb_get_i64(buf, dict_loc, 0, 0)?;
+                let index_type_loc = fb_get_ref(buf, dict_loc, 1)?
+                    .context("Arrow dictionary-encoded field missing its own index type")?;
+                let index_bit_width = fb_get_i32(buf, index_type_loc, 0, 0)?;
+                let index_is_signed = fb_get_bool(buf, index_type_loc, 1, false)?;
+                Some(ArrowDictionaryEncoding {
+                    id,
+                    index_bit_width,
+                    index_is_signed,
+                })
+            }
+        };
+
         let children = match fb_get_ref(buf, loc, 5)? {
             None => Vec::new(),
             Some(vec_loc) => {
@@ -11669,6 +11724,7 @@ mod arrow_ipc_support {
             name,
             nullable,
             data_type,
+            dictionary,
         })
     }
 
@@ -11734,6 +11790,10 @@ mod arrow_ipc_support {
                 ArrowDataType::Decimal {
                     precision: fb_get_i32(buf, loc, 0, 0)?,
                     scale: fb_get_i32(buf, loc, 1, 0)?,
+                    // Verified against `gen/Schema.rs`'s own `Decimal::
+                    // bitWidth` accessor: defaults to 128 when absent
+                    // (only 128 and 256 are ever valid).
+                    bit_width: fb_get_i32(buf, loc, 2, 128)?,
                 }
             }
             ArrowTypeTag::Date => {
@@ -11893,6 +11953,1283 @@ mod arrow_ipc_support {
         })
     }
 
+    // ---------------------------------------------------------------
+    // Phase 2: RecordBatch/DictionaryBatch message parsing and buffer
+    // decoding - turning a footer's own `Block` list (or, for the
+    // streaming format, a sequential run of encapsulated messages) into
+    // real column values. Verified the same way Phase 1 was: directly
+    // against `arrow-ipc`'s own generated FlatBuffers bindings
+    // (`gen/Message.rs`) for every field ID and struct layout below, and
+    // against `reader.rs`'s own `RecordBatchDecoder` for the per-type
+    // buffer/node consumption order and the body-compression framing
+    // (`compression.rs`).
+    // ---------------------------------------------------------------
+
+    /// One `FieldNode` entry - a fixed-size FlatBuffers *struct* (16
+    /// bytes, no vtable: `length` (i64) @0, `null_count` (i64) @8,
+    /// verified against `gen/Message.rs`), one per array-producing field
+    /// in a `RecordBatch`'s depth-first traversal (a nested type gets one
+    /// node for itself *and* one for each descendant).
+    #[derive(Clone, Copy, Debug)]
+    struct ArrowFieldNode {
+        length: i64,
+        null_count: i64,
+    }
+
+    fn read_field_node_struct(buf: &[u8], loc: usize) -> Result<ArrowFieldNode> {
+        let length_bytes = buf
+            .get(loc..loc + 8)
+            .context("truncated Arrow IPC FieldNode")?;
+        let null_count_bytes = buf
+            .get(loc + 8..loc + 16)
+            .context("truncated Arrow IPC FieldNode")?;
+        Ok(ArrowFieldNode {
+            length: i64::from_le_bytes(length_bytes.try_into().unwrap()),
+            null_count: i64::from_le_bytes(null_count_bytes.try_into().unwrap()),
+        })
+    }
+
+    /// One `Buffer` entry - another fixed-size struct (16 bytes: `offset`
+    /// (i64) @0, `length` (i64) @8, verified against `gen/Message.rs`),
+    /// giving one buffer's own byte range *relative to the message's own
+    /// body* (the bytes immediately following the message's metadata,
+    /// whose total length is `Message::bodyLength`).
+    #[derive(Clone, Copy, Debug)]
+    struct ArrowBufferRegion {
+        offset: i64,
+        length: i64,
+    }
+
+    fn read_buffer_region_struct(buf: &[u8], loc: usize) -> Result<ArrowBufferRegion> {
+        let offset_bytes = buf
+            .get(loc..loc + 8)
+            .context("truncated Arrow IPC Buffer")?;
+        let length_bytes = buf
+            .get(loc + 8..loc + 16)
+            .context("truncated Arrow IPC Buffer")?;
+        Ok(ArrowBufferRegion {
+            offset: i64::from_le_bytes(offset_bytes.try_into().unwrap()),
+            length: i64::from_le_bytes(length_bytes.try_into().unwrap()),
+        })
+    }
+
+    /// `RecordBatch::VT_COMPRESSION` = 10's own nested `BodyCompression`
+    /// table (`VT_CODEC` = 4, `VT_METHOD` = 6, both `i8` unions -
+    /// `CompressionType::LZ4_FRAME` = 0/`ZSTD` = 1,
+    /// `BodyCompressionMethod::BUFFER` = 0 - verified against `gen/
+    /// Message.rs`). Its mere *presence* on a `RecordBatch` (as opposed to
+    /// any particular codec value) is what signals every buffer in that
+    /// batch carries the 8-byte uncompressed-length prefix described on
+    /// `decompress_ipc_buffer` below - an uncompressed `RecordBatch` has
+    /// no `BodyCompression` table at all, not one with a "no compression"
+    /// codec value.
+    #[derive(Clone, Copy, Debug)]
+    struct ArrowBodyCompression {
+        codec: u8,
+        method: u8,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ArrowRecordBatchMeta {
+        length: i64,
+        nodes: Vec<ArrowFieldNode>,
+        buffers: Vec<ArrowBufferRegion>,
+        compression: Option<ArrowBodyCompression>,
+    }
+
+    fn parse_record_batch_meta(buf: &[u8], loc: usize) -> Result<ArrowRecordBatchMeta> {
+        let length = fb_get_i64(buf, loc, 0, 0)?;
+        let nodes = match fb_get_ref(buf, loc, 1)? {
+            None => Vec::new(),
+            Some(vec_loc) => {
+                let len = fb_vector_len(buf, vec_loc)?;
+                (0..len)
+                    .map(|i| read_field_node_struct(buf, fb_vector_struct_at(vec_loc, i, 16)))
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let buffers = match fb_get_ref(buf, loc, 2)? {
+            None => Vec::new(),
+            Some(vec_loc) => {
+                let len = fb_vector_len(buf, vec_loc)?;
+                (0..len)
+                    .map(|i| read_buffer_region_struct(buf, fb_vector_struct_at(vec_loc, i, 16)))
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let compression = match fb_get_ref(buf, loc, 3)? {
+            None => None,
+            Some(c_loc) => Some(ArrowBodyCompression {
+                codec: fb_get_u8(buf, c_loc, 0, 0)?,
+                method: fb_get_u8(buf, c_loc, 1, 0)?,
+            }),
+        };
+        Ok(ArrowRecordBatchMeta {
+            length,
+            nodes,
+            buffers,
+            compression,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    struct ArrowDictionaryBatchMeta {
+        id: i64,
+        is_delta: bool,
+        data: ArrowRecordBatchMeta,
+    }
+
+    fn parse_dictionary_batch_meta(buf: &[u8], loc: usize) -> Result<ArrowDictionaryBatchMeta> {
+        let id = fb_get_i64(buf, loc, 0, 0)?;
+        let data_loc = fb_get_ref(buf, loc, 1)?
+            .context("Arrow IPC DictionaryBatch missing its own nested RecordBatch")?;
+        let data = parse_record_batch_meta(buf, data_loc)?;
+        let is_delta = fb_get_bool(buf, loc, 2, false)?;
+        Ok(ArrowDictionaryBatchMeta { id, is_delta, data })
+    }
+
+    enum ArrowMessageHeader {
+        Schema,
+        DictionaryBatch(ArrowDictionaryBatchMeta),
+        RecordBatch(ArrowRecordBatchMeta),
+        None,
+    }
+
+    struct ArrowMessage {
+        header: ArrowMessageHeader,
+        body_length: i64,
+    }
+
+    /// Parses one encapsulated message's own metadata block: a 4-byte
+    /// continuation marker (`0xFFFFFFFF`, always written by every modern -
+    /// post-0.15 - Arrow IPC producer; this reader doesn't attempt the
+    /// legacy pre-continuation-marker framing, the same "confident common
+    /// case, disclosed gap" scope this whole campaign already draws
+    /// elsewhere), a 4-byte little-endian metadata length (verified
+    /// directly against `arrow-ipc`'s own `MessageReader::maybe_next` -
+    /// this length is the *exact* byte count of the FlatBuffers `Message`
+    /// that follows, already inclusive of whatever padding the writer
+    /// added to keep the whole prefix+message block 8-byte aligned; a
+    /// reader never re-derives or rounds it, just reads exactly that many
+    /// bytes), that many bytes of FlatBuffers-encoded `Message`, and then
+    /// (for File-format blocks - `ArrowBlock::meta_data_length` already
+    /// covers the same span) the message body immediately follows.
+    /// Returns `Ok(None)` for a streaming-format end-of-stream marker (a
+    /// zero metadata length), which never appears in a File-format block.
+    fn parse_message(meta_buf: &[u8]) -> Result<Option<ArrowMessage>> {
+        let marker = meta_buf
+            .get(0..4)
+            .context("truncated Arrow IPC message continuation marker")?;
+        if marker != CONTINUATION_MARKER {
+            bail!(
+                "Arrow IPC message is missing its own 0xFFFFFFFF continuation marker - a \
+                 pre-0.15 legacy-framed file isn't supported"
+            );
+        }
+        let meta_len = fb_i32(meta_buf, 4)? as usize;
+        if meta_len == 0 {
+            return Ok(None);
+        }
+        let fb_buf = meta_buf
+            .get(8..8 + meta_len)
+            .context("truncated Arrow IPC message metadata")?;
+        let root = fb_root(fb_buf)?;
+        let header_type = fb_get_u8(fb_buf, root, 1, 0)?;
+        let header_loc = fb_get_ref(fb_buf, root, 2)?;
+        let body_length = fb_get_i64(fb_buf, root, 3, 0)?;
+        let header = match header_type {
+            0 => ArrowMessageHeader::None,
+            1 => ArrowMessageHeader::Schema,
+            2 => {
+                let loc = header_loc
+                    .context("Arrow IPC DictionaryBatch message missing its own header")?;
+                ArrowMessageHeader::DictionaryBatch(parse_dictionary_batch_meta(fb_buf, loc)?)
+            }
+            3 => {
+                let loc =
+                    header_loc.context("Arrow IPC RecordBatch message missing its own header")?;
+                ArrowMessageHeader::RecordBatch(parse_record_batch_meta(fb_buf, loc)?)
+            }
+            other => bail!(
+                "unsupported Arrow IPC message header type {other} (Tensor/SparseTensor aren't \
+                 supported - this reader only handles Schema/DictionaryBatch/RecordBatch \
+                 messages)"
+            ),
+        };
+        Ok(Some(ArrowMessage {
+            header,
+            body_length,
+        }))
+    }
+
+    /// Reads one message at absolute file offset `offset`, given the whole
+    /// file's own bytes - the File-format entry point (a `Block`'s own
+    /// `offset`/`meta_data_length`/`body_length` already say exactly where
+    /// everything is, so no scanning is needed). Returns the parsed
+    /// message header plus the message's own body slice (immediately
+    /// following its metadata).
+    fn read_message_at(
+        file_data: &[u8],
+        offset: i64,
+        meta_data_length: i32,
+        body_length: i64,
+    ) -> Result<(ArrowMessageHeader, &[u8])> {
+        let offset = usize::try_from(offset).context("negative Arrow IPC Block offset")?;
+        let meta_len = usize::try_from(meta_data_length)
+            .context("negative Arrow IPC Block metadata length")?;
+        let body_len =
+            usize::try_from(body_length).context("negative Arrow IPC Block body length")?;
+        let meta_buf = file_data
+            .get(offset..offset + meta_len)
+            .context("Arrow IPC Block metadata region out of bounds")?;
+        let message = parse_message(meta_buf)?
+            .context("Arrow IPC Block points at a bare end-of-stream marker, not a real message")?;
+        let body = file_data
+            .get(offset + meta_len..offset + meta_len + body_len)
+            .context("Arrow IPC Block body region out of bounds")?;
+        Ok((message.header, body))
+    }
+
+    /// Slices one buffer region out of a message's own body and, if the
+    /// batch is compressed, decompresses it. A zero-length buffer region
+    /// is never run through compression at all (matching `arrow-ipc`'s own
+    /// `read_buffer`'s explicit "empty buffer" special case), since a
+    /// length-0 slice has no 8-byte uncompressed-length prefix to even
+    /// read.
+    fn read_ipc_buffer(
+        body: &[u8],
+        region: ArrowBufferRegion,
+        compression: Option<ArrowBodyCompression>,
+    ) -> Result<Vec<u8>> {
+        let start = usize::try_from(region.offset).context("negative Arrow IPC buffer offset")?;
+        let len = usize::try_from(region.length).context("negative Arrow IPC buffer length")?;
+        let raw = body
+            .get(start..start + len)
+            .context("Arrow IPC buffer region out of bounds of its own message body")?;
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        match compression {
+            None => Ok(raw.to_vec()),
+            Some(c) => decompress_ipc_buffer(raw, c),
+        }
+    }
+
+    /// The 8-byte uncompressed-length prefix every compressed buffer
+    /// carries individually (`BodyCompressionMethod::BUFFER`, the only
+    /// method this reader supports - `STREAM` mode, which compresses the
+    /// whole message body as one unit instead of per-buffer, is a
+    /// disclosed gap), verified directly against `compression.rs`'s own
+    /// `read_uncompressed_size`/`decompress_to_buffer`: `0` means the
+    /// buffer is genuinely empty, `-1` means the bytes that follow are
+    /// already-uncompressed raw data (compression would have made them
+    /// larger, so the writer skipped it), and any other value is the real
+    /// target size the compressed bytes that follow must decompress to
+    /// exactly.
+    fn decompress_ipc_buffer(raw: &[u8], compression: ArrowBodyCompression) -> Result<Vec<u8>> {
+        if compression.method != 0 {
+            bail!(
+                "Arrow IPC BodyCompressionMethod::STREAM isn't supported - this reader only \
+                 handles the (overwhelmingly common) per-buffer BUFFER compression method"
+            );
+        }
+        let prefix = raw
+            .get(0..8)
+            .context("truncated Arrow IPC compressed-buffer length prefix")?;
+        let declared = i64::from_le_bytes(prefix.try_into().unwrap());
+        if declared == 0 {
+            return Ok(Vec::new());
+        }
+        if declared == -1 {
+            return Ok(raw[8..].to_vec());
+        }
+        let target = usize::try_from(declared)
+            .context("negative/invalid Arrow IPC uncompressed buffer length")?;
+        let compressed = &raw[8..];
+        let out = match compression.codec {
+            0 => lz4_frame_decompress(compressed, target)?,
+            1 => super::zstd_support::zstd_decompress(compressed)?,
+            other => bail!("unsupported Arrow IPC BodyCompression codec {other}"),
+        };
+        if out.len() != target {
+            bail!(
+                "Arrow IPC compressed buffer decompressed to {} bytes, expected {target}",
+                out.len()
+            );
+        }
+        Ok(out)
+    }
+
+    /// Decodes a standard LZ4 Frame (magic `0x184D2204`) - the container
+    /// Arrow IPC's own `LZ4_FRAME` `BodyCompression` codec uses (via
+    /// `lz4_flex::frame::FrameDecoder`, confirmed directly in `arrow-ipc`'s
+    /// own `compression.rs`), a meaningfully different envelope from
+    /// Parquet's own raw-block/Hadoop-framed LZ4 conventions this project
+    /// already hand-rolled - only the innermost block-decode algorithm
+    /// (`lz4_block_decompress_core`, refactored out of `parquet_support`'s
+    /// own `lz4_block_decompress` specifically for this reuse - see that
+    /// function's own doc comment) is actually shared between the two.
+    /// Verified directly against the reference LZ4 Frame Format spec
+    /// (github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md): a 4-byte
+    /// magic, a frame descriptor (FLG byte - version/block-independence/
+    /// block-checksum/content-size/content-checksum/dict-id flag bits; BD
+    /// byte - block max-size, unused for decoding, since every block
+    /// already states its own size; optional 8-byte content size; optional
+    /// 4-byte dictionary ID, never expected here since this project's own
+    /// use case never *writes* Arrow IPC, only reads it; a 1-byte header
+    /// checksum, not verified - the same "skip, don't verify, an optional
+    /// checksum this reader has no independent need to check" treatment
+    /// already given to gzip/zstd's own optional checksums where this
+    /// project doesn't need write-side round-tripping), then a sequence of
+    /// blocks, each a 4-byte little-endian size word (the high bit flags
+    /// "already uncompressed", the low 31 bits are the byte count; an
+    /// all-zero word ends the sequence) followed by that many bytes -
+    /// either raw, or a standard LZ4 block decoded via the same core loop
+    /// Parquet's own LZ4 pages use - and an optional trailing 4-byte block
+    /// checksum (skipped, not verified, same reasoning as the header
+    /// checksum), ending with an optional 4-byte content checksum (also
+    /// skipped).
+    fn lz4_frame_decompress(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+        const LZ4_FRAME_MAGIC: u32 = 0x184D_2204;
+        let magic_bytes = input
+            .get(0..4)
+            .context("truncated LZ4 frame magic number")?;
+        let magic = u32::from_le_bytes(magic_bytes.try_into().unwrap());
+        if magic != LZ4_FRAME_MAGIC {
+            bail!("not a valid LZ4 frame (bad magic number)");
+        }
+        let flg = *input.get(4).context("truncated LZ4 frame descriptor")?;
+        let version = (flg >> 6) & 0b11;
+        if version != 1 {
+            bail!("unrecognized LZ4 frame version {version}");
+        }
+        let block_checksum_flag = (flg >> 4) & 1 == 1;
+        let content_size_flag = (flg >> 3) & 1 == 1;
+        let content_checksum_flag = (flg >> 2) & 1 == 1;
+        let dict_id_flag = flg & 1 == 1;
+
+        // FLG + BD = 2 bytes, then the optional fields, then a 1-byte
+        // header checksum - all fixed-width, so the header's total length
+        // is fully determined by the flag bits alone.
+        let mut pos = 6usize;
+        if content_size_flag {
+            pos += 8;
+        }
+        if dict_id_flag {
+            pos += 4;
+        }
+        pos += 1; // header checksum, unverified
+        if input.len() < pos {
+            bail!("truncated LZ4 frame header");
+        }
+
+        let mut out = Vec::with_capacity(expected_len);
+        loop {
+            let size_bytes = input
+                .get(pos..pos + 4)
+                .context("truncated LZ4 frame block size")?;
+            let size_word = u32::from_le_bytes(size_bytes.try_into().unwrap());
+            pos += 4;
+            if size_word == 0 {
+                break;
+            }
+            let is_uncompressed = size_word & 0x8000_0000 != 0;
+            let block_len = (size_word & 0x7FFF_FFFF) as usize;
+            let block = input
+                .get(pos..pos + block_len)
+                .context("truncated LZ4 frame block data")?;
+            pos += block_len;
+            if is_uncompressed {
+                out.extend_from_slice(block);
+            } else {
+                out.extend_from_slice(&super::parquet_support::lz4_block_decompress_core(block)?);
+            }
+            if block_checksum_flag {
+                pos += 4;
+            }
+        }
+        if content_checksum_flag {
+            pos += 4;
+        }
+        let _ = pos;
+        if out.len() != expected_len {
+            bail!(
+                "LZ4 frame decompressed to {} bytes, expected {expected_len}",
+                out.len()
+            );
+        }
+        Ok(out)
+    }
+
+    /// Reads one bit from a validity (or boolean-values) bitmap - LSB-
+    /// first within each byte, `1` meaning present/true, the standard
+    /// convention every Arrow buffer of this kind uses (verified directly
+    /// against `arrow-buffer`'s own `bit_util::get_bit` -
+    /// `(byte >> (i % 8)) & 1 != 0`). A `None` bitmap (Arrow permits
+    /// omitting the validity buffer entirely when a `FieldNode`'s own
+    /// `null_count` is 0) means "every value present".
+    fn bitmap_get(bitmap: Option<&[u8]>, index: usize) -> bool {
+        match bitmap {
+            None => true,
+            Some(bits) => match bits.get(index / 8) {
+                None => true,
+                Some(byte) => (byte >> (index % 8)) & 1 != 0,
+            },
+        }
+    }
+
+    fn read_i32_offsets(buf: &[u8], count: usize) -> Result<Vec<i32>> {
+        (0..=count)
+            .map(|i| {
+                let b = buf
+                    .get(i * 4..i * 4 + 4)
+                    .context("truncated Arrow IPC offsets buffer")?;
+                Ok(i32::from_le_bytes(b.try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    fn read_i64_offsets(buf: &[u8], count: usize) -> Result<Vec<i64>> {
+        (0..=count)
+            .map(|i| {
+                let b = buf
+                    .get(i * 8..i * 8 + 8)
+                    .context("truncated Arrow IPC offsets buffer")?;
+                Ok(i64::from_le_bytes(b.try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    /// The fixed byte width of one value in a primitive type's own values
+    /// buffer - every case this reader routes through `decode_primitive`
+    /// (everything except Null/Utf8/Binary/LargeUtf8/LargeBinary/List/
+    /// LargeList/FixedSizeList/Struct/Map/dictionary-encoded fields, all
+    /// handled separately in `decode_field`). `Bool` is deliberately not
+    /// covered here - unlike every other case, a bool's own "values"
+    /// buffer is itself a packed bitmap, not a slice of fixed-width bytes,
+    /// so `decode_primitive` reads it via `bitmap_get` directly rather
+    /// than through this function at all.
+    fn arrow_primitive_byte_width(data_type: &ArrowDataType) -> Result<usize> {
+        Ok(match data_type {
+            ArrowDataType::Int { bit_width, .. } => usize::try_from(*bit_width).unwrap_or(0) / 8,
+            ArrowDataType::Float16 => 2,
+            ArrowDataType::Float32 => 4,
+            ArrowDataType::Float64 => 8,
+            ArrowDataType::Decimal { bit_width, .. } => {
+                usize::try_from(*bit_width).unwrap_or(0) / 8
+            }
+            ArrowDataType::Date {
+                unit_is_millisecond,
+            } => {
+                if *unit_is_millisecond {
+                    8
+                } else {
+                    4
+                }
+            }
+            ArrowDataType::Time { bit_width, .. } => usize::try_from(*bit_width).unwrap_or(0) / 8,
+            ArrowDataType::Timestamp { .. } => 8,
+            ArrowDataType::FixedSizeBinary { byte_width } => {
+                usize::try_from(*byte_width).unwrap_or(0)
+            }
+            other => bail!("{other:?} isn't a fixed-width primitive type"),
+        })
+    }
+
+    /// Renders one scalar (non-nested, non-dictionary) value's raw bytes
+    /// to a `serde_json::Value`, the Arrow IPC counterpart to
+    /// `parquet_support`'s own `render_value_json` - the same physical-
+    /// bytes-to-typed-JSON-value final step every nested-format bridge in
+    /// this project eventually needs, keyed off `ArrowDataType` instead of
+    /// Parquet's `ColumnDescriptor` triple. Date/Time/Timestamp/Decimal/
+    /// Float16 all render as strings, matching how Arrow's own JSON writer
+    /// (`arrow-json`, this reader's cross-verification oracle) renders
+    /// them too - confirmed empirically via this module's own oracle test
+    /// rather than assumed from Parquet's already-verified convention
+    /// carrying over unchanged.
+    fn render_arrow_scalar(bytes: &[u8], data_type: &ArrowDataType) -> Result<JsonValue> {
+        Ok(match data_type {
+            ArrowDataType::Int {
+                bit_width,
+                is_signed,
+            } => match (bit_width, is_signed) {
+                (8, true) => JsonValue::Number((bytes[0] as i8).into()),
+                (8, false) => JsonValue::Number(bytes[0].into()),
+                (16, true) => JsonValue::Number(
+                    i16::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("Int16 value has the wrong width")?,
+                    )
+                    .into(),
+                ),
+                (16, false) => JsonValue::Number(
+                    u16::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("UInt16 value has the wrong width")?,
+                    )
+                    .into(),
+                ),
+                (32, true) => JsonValue::Number(
+                    i32::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("Int32 value has the wrong width")?,
+                    )
+                    .into(),
+                ),
+                (32, false) => JsonValue::Number(
+                    u32::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("UInt32 value has the wrong width")?,
+                    )
+                    .into(),
+                ),
+                (64, true) => JsonValue::Number(
+                    i64::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("Int64 value has the wrong width")?,
+                    )
+                    .into(),
+                ),
+                (64, false) => {
+                    let v = u64::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("UInt64 value has the wrong width")?,
+                    );
+                    i64::try_from(v)
+                        .map(|n| JsonValue::Number(n.into()))
+                        .unwrap_or_else(|_| JsonValue::String(v.to_string()))
+                }
+                (width, signed) => bail!("unsupported Arrow Int width {width} (signed={signed})"),
+            },
+            ArrowDataType::Float16 => {
+                let f = super::parquet_support::f16_bytes_to_f64(bytes);
+                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            ArrowDataType::Float32 => {
+                let f = f32::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .context("Float32 value has the wrong width")?,
+                );
+                serde_json::Number::from_f64(f64::from(f))
+                    .map_or(JsonValue::Null, JsonValue::Number)
+            }
+            ArrowDataType::Float64 => {
+                let f = f64::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .context("Float64 value has the wrong width")?,
+                );
+                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
+                JsonValue::String(String::from_utf8_lossy(bytes).into_owned())
+            }
+            ArrowDataType::Binary
+            | ArrowDataType::LargeBinary
+            | ArrowDataType::FixedSizeBinary { .. } => {
+                JsonValue::String(bytes.iter().map(|b| format!("{b:02x}")).collect())
+            }
+            ArrowDataType::Decimal { scale, .. } => {
+                // Arrow's own Decimal128/256 buffers are little-endian
+                // two's-complement (every Arrow buffer is); the shared
+                // `decimal_bytes_to_string` core expects Parquet's
+                // big-endian convention instead, so the bytes are
+                // reversed first. Unlike Parquet's own JSON rendering
+                // (where a Decimal is always string-shaped, since that's
+                // the only lossless option `render_value_json` has),
+                // Arrow's own JSON writer renders a Decimal128/256 array
+                // as a genuine JSON *number* (via an f64 conversion,
+                // confirmed empirically against this reader's own oracle
+                // test rather than assumed) - matched here the same way
+                // rather than staying string-shaped, so this reader's
+                // output actually lines up with the format it's reading.
+                let mut be = bytes.to_vec();
+                be.reverse();
+                let s = super::parquet_support::decimal_bytes_to_string(&be, *scale);
+                let f: f64 = s.parse().unwrap_or(f64::NAN);
+                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            ArrowDataType::Date {
+                unit_is_millisecond,
+            } => {
+                let days = if *unit_is_millisecond {
+                    let ms = i64::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("Date64 value has the wrong width")?,
+                    );
+                    ms.div_euclid(86_400_000)
+                } else {
+                    i64::from(i32::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("Date32 value has the wrong width")?,
+                    ))
+                };
+                EpochDate::from_days(days)
+                    .map(|d| JsonValue::String(d.format_ymd()))
+                    .unwrap_or(JsonValue::Null)
+            }
+            ArrowDataType::Time { unit, bit_width } => {
+                let raw: i64 = if *bit_width == 32 {
+                    i64::from(i32::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("Time32 value has the wrong width")?,
+                    ))
+                } else {
+                    i64::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("Time64 value has the wrong width")?,
+                    )
+                };
+                let rendered = match unit {
+                    ArrowTimeUnit::Second => u32::try_from(raw)
+                        .ok()
+                        .and_then(|s| EpochTime::from_seconds_since_midnight(s, 0))
+                        .map(|t| t.format_hms()),
+                    ArrowTimeUnit::Millisecond => {
+                        let secs = raw.div_euclid(1000);
+                        let nanos = (raw.rem_euclid(1000) as u32) * 1_000_000;
+                        u32::try_from(secs)
+                            .ok()
+                            .and_then(|s| EpochTime::from_seconds_since_midnight(s, nanos))
+                            .map(|t| t.format_hms_frac(3))
+                    }
+                    ArrowTimeUnit::Microsecond => {
+                        let secs = raw.div_euclid(1_000_000);
+                        let nanos = (raw.rem_euclid(1_000_000) as u32) * 1000;
+                        u32::try_from(secs)
+                            .ok()
+                            .and_then(|s| EpochTime::from_seconds_since_midnight(s, nanos))
+                            .map(|t| t.format_hms_frac(6))
+                    }
+                    ArrowTimeUnit::Nanosecond => {
+                        let secs = raw.div_euclid(1_000_000_000);
+                        let nanos = raw.rem_euclid(1_000_000_000) as u32;
+                        u32::try_from(secs)
+                            .ok()
+                            .and_then(|s| EpochTime::from_seconds_since_midnight(s, nanos))
+                            .map(|t| t.format_hms_frac(9))
+                    }
+                };
+                rendered.map(JsonValue::String).unwrap_or(JsonValue::Null)
+            }
+            ArrowDataType::Timestamp { unit, .. } => {
+                let raw = i64::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .context("Timestamp value has the wrong width")?,
+                );
+                let rendered = match unit {
+                    ArrowTimeUnit::Second => EpochDateTime::from_unix_seconds(raw, 0)
+                        .map(|dt| format!("{}T{}", dt.date.format_ymd(), dt.time.format_hms())),
+                    ArrowTimeUnit::Millisecond => {
+                        EpochDateTime::from_unix_millis(raw).map(|dt| dt.format_t_frac(3))
+                    }
+                    ArrowTimeUnit::Microsecond => {
+                        EpochDateTime::from_unix_micros(raw).map(|dt| dt.format_t_frac(6))
+                    }
+                    ArrowTimeUnit::Nanosecond => {
+                        let secs = raw.div_euclid(1_000_000_000);
+                        let nanos = raw.rem_euclid(1_000_000_000) as u32;
+                        EpochDateTime::from_unix_seconds(secs, nanos).map(|dt| dt.format_t_frac(9))
+                    }
+                };
+                rendered.map(JsonValue::String).unwrap_or(JsonValue::Null)
+            }
+            other => bail!("render_arrow_scalar called on a non-scalar type: {other:?}"),
+        })
+    }
+
+    /// Walks the not-yet-consumed `FieldNode`/buffer streams of one
+    /// `RecordBatch` (or a `DictionaryBatch`'s own nested one) in schema
+    /// order, decoding each top-level field's entire column - and, for a
+    /// nested type, recursing into its children - into one `JsonValue` per
+    /// row. The consumption order every branch below follows was verified
+    /// directly against `RecordBatchDecoder::create_array`
+    /// (`arrow-ipc`'s own `reader.rs`), not derived from the format's
+    /// prose specification alone.
+    struct ArrowArrayDecoder<'a> {
+        nodes: std::slice::Iter<'a, ArrowFieldNode>,
+        buffers: std::slice::Iter<'a, Vec<u8>>,
+        dictionaries: &'a HashMap<i64, Vec<JsonValue>>,
+    }
+
+    impl<'a> ArrowArrayDecoder<'a> {
+        fn next_node(&mut self, field_name: &str) -> Result<ArrowFieldNode> {
+            self.nodes.next().copied().with_context(|| {
+                format!("Arrow IPC RecordBatch is missing a FieldNode for {field_name:?}")
+            })
+        }
+
+        fn next_buffer(&mut self, field_name: &str) -> Result<&'a [u8]> {
+            self.buffers.next().map(Vec::as_slice).with_context(|| {
+                format!("Arrow IPC RecordBatch is missing a buffer for {field_name:?}")
+            })
+        }
+
+        fn decode_field(&mut self, field: &ArrowField) -> Result<Vec<JsonValue>> {
+            if let Some(dict) = &field.dictionary {
+                return self.decode_dictionary_field(field, dict);
+            }
+            match &field.data_type {
+                ArrowDataType::Null => {
+                    let node = self.next_node(&field.name)?;
+                    Ok(vec![
+                        JsonValue::Null;
+                        usize::try_from(node.length).unwrap_or(0)
+                    ])
+                }
+                ArrowDataType::Utf8 | ArrowDataType::Binary => {
+                    self.decode_variable_length(field, false)
+                }
+                ArrowDataType::LargeUtf8 | ArrowDataType::LargeBinary => {
+                    self.decode_variable_length(field, true)
+                }
+                ArrowDataType::List { child } | ArrowDataType::Map { entries: child, .. } => {
+                    self.decode_list(field, child, false)
+                }
+                ArrowDataType::LargeList { child } => self.decode_list(field, child, true),
+                ArrowDataType::FixedSizeList { child, list_size } => {
+                    self.decode_fixed_size_list(field, child, *list_size)
+                }
+                ArrowDataType::Struct { children } => self.decode_struct(field, children),
+                ArrowDataType::Other(tag) => bail!(
+                    "Arrow type tag {tag} isn't supported by this reader (Union/RunEndEncoded/ \
+                     the *View family/Interval/Duration are disclosed gaps)"
+                ),
+                // Bool/Int/Float16/Float32/Float64/FixedSizeBinary/
+                // Decimal/Date/Time/Timestamp all share the same node +
+                // [validity, values] shape.
+                _ => self.decode_primitive(field),
+            }
+        }
+
+        fn decode_primitive(&mut self, field: &ArrowField) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let values = self.next_buffer(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            if matches!(field.data_type, ArrowDataType::Bool) {
+                return (0..len)
+                    .map(|i| {
+                        if bitmap_get(validity, i) {
+                            Ok(JsonValue::Bool(bitmap_get(Some(values), i)))
+                        } else {
+                            Ok(JsonValue::Null)
+                        }
+                    })
+                    .collect();
+            }
+            let width = arrow_primitive_byte_width(&field.data_type)?;
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let bytes = values
+                        .get(i * width..i * width + width)
+                        .context("Arrow IPC primitive values buffer too short")?;
+                    render_arrow_scalar(bytes, &field.data_type)
+                })
+                .collect()
+        }
+
+        fn decode_variable_length(
+            &mut self,
+            field: &ArrowField,
+            is_large: bool,
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let offsets_raw = self.next_buffer(&field.name)?;
+            let values = self.next_buffer(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            let is_utf8 = matches!(
+                field.data_type,
+                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8
+            );
+            let offsets: Vec<i64> = if is_large {
+                read_i64_offsets(offsets_raw, len)?
+            } else {
+                read_i32_offsets(offsets_raw, len)?
+                    .into_iter()
+                    .map(i64::from)
+                    .collect()
+            };
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let start = usize::try_from(offsets[i]).context("negative Arrow IPC offset")?;
+                    let end =
+                        usize::try_from(offsets[i + 1]).context("negative Arrow IPC offset")?;
+                    let bytes = values
+                        .get(start..end)
+                        .context("Arrow IPC values buffer too short")?;
+                    Ok(if is_utf8 {
+                        JsonValue::String(String::from_utf8_lossy(bytes).into_owned())
+                    } else {
+                        JsonValue::String(bytes.iter().map(|b| format!("{b:02x}")).collect())
+                    })
+                })
+                .collect()
+        }
+
+        fn decode_list(
+            &mut self,
+            field: &ArrowField,
+            child: &ArrowField,
+            is_large: bool,
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let offsets_raw = self.next_buffer(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            let offsets: Vec<i64> = if is_large {
+                read_i64_offsets(offsets_raw, len)?
+            } else {
+                read_i32_offsets(offsets_raw, len)?
+                    .into_iter()
+                    .map(i64::from)
+                    .collect()
+            };
+            let child_values = self.decode_field(child)?;
+            let is_map = matches!(field.data_type, ArrowDataType::Map { .. });
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let start = usize::try_from(offsets[i]).context("negative Arrow IPC offset")?;
+                    let end =
+                        usize::try_from(offsets[i + 1]).context("negative Arrow IPC offset")?;
+                    let slice = child_values
+                        .get(start..end)
+                        .context("Arrow IPC list offsets out of bounds of the child array")?;
+                    if is_map {
+                        // `entries` is a non-nullable Struct{key, value} -
+                        // matching Arrow's own JSON writer, a Map column
+                        // renders as a genuine JSON object (last-key-wins
+                        // on a duplicate key, the same as any JSON object
+                        // literal), not an array of {key, value} pairs.
+                        let mut obj = serde_json::Map::new();
+                        for entry in slice {
+                            if let JsonValue::Object(pair) = entry
+                                && let Some(JsonValue::String(k)) = pair.get("key")
+                            {
+                                obj.insert(
+                                    k.clone(),
+                                    pair.get("value").cloned().unwrap_or(JsonValue::Null),
+                                );
+                            }
+                        }
+                        Ok(JsonValue::Object(obj))
+                    } else {
+                        Ok(JsonValue::Array(slice.to_vec()))
+                    }
+                })
+                .collect()
+        }
+
+        fn decode_fixed_size_list(
+            &mut self,
+            field: &ArrowField,
+            child: &ArrowField,
+            list_size: i32,
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            let size =
+                usize::try_from(list_size).context("negative Arrow IPC FixedSizeList list_size")?;
+            let child_values = self.decode_field(child)?;
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let start = i * size;
+                    let end = start + size;
+                    let slice = child_values
+                        .get(start..end)
+                        .context("Arrow IPC FixedSizeList size out of bounds of the child array")?;
+                    Ok(JsonValue::Array(slice.to_vec()))
+                })
+                .collect()
+        }
+
+        fn decode_struct(
+            &mut self,
+            field: &ArrowField,
+            children: &[ArrowField],
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            let mut child_columns: Vec<(String, Vec<JsonValue>)> =
+                Vec::with_capacity(children.len());
+            for c in children {
+                child_columns.push((c.name.clone(), self.decode_field(c)?));
+            }
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let mut obj = serde_json::Map::new();
+                    for (name, col) in &child_columns {
+                        obj.insert(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
+                    }
+                    Ok(JsonValue::Object(obj))
+                })
+                .collect()
+        }
+
+        fn decode_dictionary_field(
+            &mut self,
+            field: &ArrowField,
+            dict: &ArrowDictionaryEncoding,
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let indices_raw = self.next_buffer(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            let width = usize::try_from(dict.index_bit_width).unwrap_or(0) / 8;
+            // Per the IPC spec, a `DictionaryBatch` may be omitted
+            // entirely when every value in the column is null - matching
+            // `RecordBatchDecoder`'s own fallback in `arrow-ipc`'s
+            // `reader.rs`, an unresolved dict_id degrades to an empty
+            // dictionary rather than a hard error, since every actual
+            // lookup below is already gated on the value being non-null.
+            let empty = Vec::new();
+            let values = self.dictionaries.get(&dict.id).unwrap_or(&empty);
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let bytes = indices_raw
+                        .get(i * width..i * width + width)
+                        .context("Arrow IPC dictionary index buffer too short")?;
+                    let idx: i64 = match (dict.index_bit_width, dict.index_is_signed) {
+                        (8, true) => i64::from(bytes[0] as i8),
+                        (8, false) => i64::from(bytes[0]),
+                        (16, true) => i64::from(i16::from_le_bytes(bytes.try_into().unwrap())),
+                        (16, false) => i64::from(u16::from_le_bytes(bytes.try_into().unwrap())),
+                        (32, true) => i64::from(i32::from_le_bytes(bytes.try_into().unwrap())),
+                        (32, false) => i64::from(u32::from_le_bytes(bytes.try_into().unwrap())),
+                        (64, true) => i64::from_le_bytes(bytes.try_into().unwrap()),
+                        (64, false) => i64::try_from(u64::from_le_bytes(bytes.try_into().unwrap()))
+                            .unwrap_or(i64::MAX),
+                        (w, s) => {
+                            bail!("unsupported Arrow dictionary index width {w} (signed={s})")
+                        }
+                    };
+                    let idx = usize::try_from(idx).context("negative Arrow dictionary index")?;
+                    Ok(values.get(idx).cloned().unwrap_or(JsonValue::Null))
+                })
+                .collect()
+        }
+    }
+
+    /// Walks a schema (recursively, since a dictionary-encoded field can
+    /// appear nested inside a List/Struct/Map) collecting one
+    /// `dict_id -> value-typed field` entry per distinct dictionary -
+    /// needed because a `DictionaryBatch` message carries only an id and a
+    /// values array, not a self-describing type of its own; the type to
+    /// decode those bytes as has to come from the schema's own field that
+    /// referenced this id in the first place.
+    fn collect_dictionary_fields(field: &ArrowField, out: &mut HashMap<i64, ArrowField>) {
+        if let Some(dict) = &field.dictionary {
+            let value_field = ArrowField {
+                name: field.name.clone(),
+                nullable: field.nullable,
+                data_type: field.data_type.clone(),
+                dictionary: None,
+            };
+            out.entry(dict.id).or_insert(value_field);
+        }
+        match &field.data_type {
+            ArrowDataType::List { child }
+            | ArrowDataType::LargeList { child }
+            | ArrowDataType::FixedSizeList { child, .. }
+            | ArrowDataType::Map { entries: child, .. } => {
+                collect_dictionary_fields(child, out);
+            }
+            ArrowDataType::Struct { children } => {
+                for c in children {
+                    collect_dictionary_fields(c, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Decodes one `RecordBatch` message into row objects (`{field name:
+    /// value}` per row, matching how Arrow's own JSON writer - this
+    /// reader's cross-verification oracle - renders a batch), given the
+    /// schema and the message's own body bytes plus already-resolved
+    /// dictionaries.
+    fn decode_record_batch(
+        schema: &ArrowSchema,
+        meta: &ArrowRecordBatchMeta,
+        body: &[u8],
+        dictionaries: &HashMap<i64, Vec<JsonValue>>,
+    ) -> Result<Vec<JsonValue>> {
+        let buffers: Vec<Vec<u8>> = meta
+            .buffers
+            .iter()
+            .map(|region| read_ipc_buffer(body, *region, meta.compression))
+            .collect::<Result<Vec<_>>>()?;
+        let mut decoder = ArrowArrayDecoder {
+            nodes: meta.nodes.iter(),
+            buffers: buffers.iter(),
+            dictionaries,
+        };
+        let mut columns: Vec<(String, Vec<JsonValue>)> = Vec::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            columns.push((field.name.clone(), decoder.decode_field(field)?));
+        }
+        let row_count = usize::try_from(meta.length).unwrap_or(0);
+        Ok((0..row_count)
+            .map(|i| {
+                let mut obj = serde_json::Map::new();
+                for (name, col) in &columns {
+                    obj.insert(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
+                }
+                JsonValue::Object(obj)
+            })
+            .collect())
+    }
+
+    /// Decodes one `DictionaryBatch`'s own nested `RecordBatch` - always
+    /// exactly one top-level array, the dictionary's own values, typed as
+    /// `value_field` (the schema field that referenced this id, with its
+    /// own `dictionary` wrapper stripped - see `collect_dictionary_fields`).
+    fn decode_dictionary_batch(
+        value_field: &ArrowField,
+        meta: &ArrowRecordBatchMeta,
+        body: &[u8],
+        dictionaries: &HashMap<i64, Vec<JsonValue>>,
+    ) -> Result<Vec<JsonValue>> {
+        let buffers: Vec<Vec<u8>> = meta
+            .buffers
+            .iter()
+            .map(|region| read_ipc_buffer(body, *region, meta.compression))
+            .collect::<Result<Vec<_>>>()?;
+        let mut decoder = ArrowArrayDecoder {
+            nodes: meta.nodes.iter(),
+            buffers: buffers.iter(),
+            dictionaries,
+        };
+        decoder.decode_field(value_field)
+    }
+
+    /// Reads a complete Arrow IPC *File*-format file into row objects -
+    /// this reader's own top-level entry point, mirroring `arrow-ipc`'s
+    /// own `FileReader`: read the footer (Phase 1), resolve every
+    /// `DictionaryBatch` in file order (a delta batch appends to, rather
+    /// than replaces, its id's existing values - the IPC spec's own
+    /// "streaming dictionary" mechanism for a dictionary that grows across
+    /// a file), then decode every `RecordBatch` in file order.
+    fn read_arrow_ipc_file_rows(file_data: &[u8]) -> Result<Vec<JsonValue>> {
+        let footer = read_footer(file_data)?;
+        let mut dict_field_by_id = HashMap::new();
+        for field in &footer.schema.fields {
+            collect_dictionary_fields(field, &mut dict_field_by_id);
+        }
+
+        let mut dictionaries: HashMap<i64, Vec<JsonValue>> = HashMap::new();
+        for block in &footer.dictionaries {
+            let (header, body) = read_message_at(
+                file_data,
+                block.offset,
+                block.meta_data_length,
+                block.body_length,
+            )?;
+            let ArrowMessageHeader::DictionaryBatch(dict_meta) = header else {
+                bail!(
+                    "Arrow IPC footer's own dictionaries list points at a non-DictionaryBatch \
+                     message"
+                );
+            };
+            let value_field = dict_field_by_id.get(&dict_meta.id).with_context(|| {
+                format!(
+                    "Arrow IPC DictionaryBatch id {} has no matching schema field",
+                    dict_meta.id
+                )
+            })?;
+            let values =
+                decode_dictionary_batch(value_field, &dict_meta.data, body, &dictionaries)?;
+            if dict_meta.is_delta {
+                dictionaries.entry(dict_meta.id).or_default().extend(values);
+            } else {
+                dictionaries.insert(dict_meta.id, values);
+            }
+        }
+
+        let mut rows = Vec::new();
+        for block in &footer.record_batches {
+            let (header, body) = read_message_at(
+                file_data,
+                block.offset,
+                block.meta_data_length,
+                block.body_length,
+            )?;
+            let ArrowMessageHeader::RecordBatch(batch_meta) = header else {
+                bail!(
+                    "Arrow IPC footer's own recordBatches list points at a non-RecordBatch \
+                     message"
+                );
+            };
+            rows.extend(decode_record_batch(
+                &footer.schema,
+                &batch_meta,
+                body,
+                &dictionaries,
+            )?);
+        }
+        Ok(rows)
+    }
+
+    /// Reads a complete Arrow IPC *Streaming* format byte sequence into
+    /// row objects - the same message types as the File format (Schema,
+    /// DictionaryBatch, RecordBatch), but with no leading/trailing
+    /// `ARROW1` magic and no trailing `Footer`/`Block` list at all:
+    /// messages are read sequentially from the very first byte until
+    /// either a genuine end-of-stream marker (a zero-length message, see
+    /// `parse_message`) or the input is exhausted. The very first message
+    /// is always the schema itself (there's no footer to read it from up
+    /// front the way the File format has).
+    fn read_arrow_ipc_stream_rows(data: &[u8]) -> Result<Vec<JsonValue>> {
+        let mut pos = 0usize;
+        let mut schema: Option<ArrowSchema> = None;
+        let mut dict_field_by_id: HashMap<i64, ArrowField> = HashMap::new();
+        let mut dictionaries: HashMap<i64, Vec<JsonValue>> = HashMap::new();
+        let mut rows = Vec::new();
+
+        loop {
+            if pos + 8 > data.len() {
+                break;
+            }
+            let meta_len_field = i32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+            if meta_len_field == 0 {
+                break;
+            }
+            let meta_len = meta_len_field as usize;
+            // `Message::maybe_next` (`arrow-ipc`'s own streaming reader)
+            // reads exactly `meta_len` bytes for the FlatBuffers message
+            // itself - that length is already inclusive of whatever
+            // padding the writer added, so the metadata block's own total
+            // span is just the 8-byte marker+length prefix plus `meta_len`,
+            // with no further rounding needed here.
+            let total_meta_len = 8 + meta_len;
+            let meta_buf = data
+                .get(pos..pos + total_meta_len)
+                .context("truncated Arrow IPC stream message metadata")?;
+            let Some(message) = parse_message(meta_buf)? else {
+                break;
+            };
+            let body_len = usize::try_from(message.body_length)
+                .context("negative Arrow IPC message body length")?;
+            let body_start = pos + total_meta_len;
+            let body = data
+                .get(body_start..body_start + body_len)
+                .context("truncated Arrow IPC stream message body")?;
+            pos = body_start + body_len;
+
+            match message.header {
+                ArrowMessageHeader::Schema => {
+                    // Re-parse the schema table directly - `parse_message`
+                    // deliberately doesn't decode a Schema message's own
+                    // body (Phase 1's `parse_schema` takes a `(buf, loc)`
+                    // pair, not a pre-extracted `ArrowSchema`), so the
+                    // schema table's location has to be re-found here.
+                    let fb_buf = &meta_buf[8..8 + meta_len];
+                    let root = fb_root(fb_buf)?;
+                    let header_loc = fb_get_ref(fb_buf, root, 2)?
+                        .context("Arrow IPC stream Schema message missing its own header")?;
+                    let parsed = parse_schema(fb_buf, header_loc)?;
+                    let mut map = HashMap::new();
+                    for field in &parsed.fields {
+                        collect_dictionary_fields(field, &mut map);
+                    }
+                    dict_field_by_id = map;
+                    schema = Some(parsed);
+                }
+                ArrowMessageHeader::DictionaryBatch(dict_meta) => {
+                    let value_field = dict_field_by_id.get(&dict_meta.id).with_context(|| {
+                        format!(
+                            "Arrow IPC stream DictionaryBatch id {} has no matching schema field",
+                            dict_meta.id
+                        )
+                    })?;
+                    let values =
+                        decode_dictionary_batch(value_field, &dict_meta.data, body, &dictionaries)?;
+                    if dict_meta.is_delta {
+                        dictionaries.entry(dict_meta.id).or_default().extend(values);
+                    } else {
+                        dictionaries.insert(dict_meta.id, values);
+                    }
+                }
+                ArrowMessageHeader::RecordBatch(batch_meta) => {
+                    let schema = schema.as_ref().context(
+                        "Arrow IPC stream has a RecordBatch message before its own Schema message",
+                    )?;
+                    rows.extend(decode_record_batch(
+                        schema,
+                        &batch_meta,
+                        body,
+                        &dictionaries,
+                    )?);
+                }
+                ArrowMessageHeader::None => {}
+            }
+        }
+        Ok(rows)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -12006,7 +13343,8 @@ mod arrow_ipc_support {
                 f[4].data_type,
                 ArrowDataType::Decimal {
                     precision: 10,
-                    scale: 2
+                    scale: 2,
+                    bit_width: 128
                 }
             ));
 
@@ -12018,6 +13356,202 @@ mod arrow_ipc_support {
                 }
                 other => panic!("expected Timestamp, got {other:?}"),
             }
+        }
+
+        /// Recursively compares this reader's own row objects against
+        /// Arrow's own JSON writer output - the genuine, direct oracle for
+        /// Arrow IPC (unlike Parquet's own nested-reconstruction phase,
+        /// which had to route around a documented bug in the `record::Row`
+        /// API, reading an Arrow IPC file through `arrow::ipc::reader::
+        /// FileReader`/`StreamReader` *is* exactly what this reader is
+        /// trying to replicate, so there's no equivalent detour needed
+        /// here). Two tolerances carried over from the Parquet phase's own
+        /// oracle comparator, both real, independently-rediscovered
+        /// quirks of `arrow-json`'s own writer rather than anything
+        /// specific to this reader: a null struct-field value (and, since
+        /// this reader already renders Map as a genuine JSON object, a
+        /// null map-entry value too) is dropped from the JSON object
+        /// entirely instead of rendered as `null`, handled by unioning
+        /// keys from both sides and defaulting an absent key to `Null`;
+        /// and a timezone-aware timestamp string may carry a `Z`/`+00:00`
+        /// suffix or trailing zero fractional digits this reader's own
+        /// naive (always-UTC, no explicit offset) rendering doesn't add,
+        /// handled the same prefix/suffix-trimming normalization already
+        /// proven out there.
+        fn arrow_json_values_match(mine: &JsonValue, oracle: &JsonValue) -> bool {
+            match (mine, oracle) {
+                (JsonValue::Object(m), JsonValue::Object(o)) => {
+                    let keys: HashSet<&String> = m.keys().chain(o.keys()).collect();
+                    keys.into_iter().all(|k| {
+                        let mv = m.get(k).cloned().unwrap_or(JsonValue::Null);
+                        let ov = o.get(k).cloned().unwrap_or(JsonValue::Null);
+                        arrow_json_values_match(&mv, &ov)
+                    })
+                }
+                (JsonValue::Array(a), JsonValue::Array(b)) => {
+                    a.len() == b.len()
+                        && a.iter().zip(b).all(|(x, y)| arrow_json_values_match(x, y))
+                }
+                (JsonValue::Number(a), JsonValue::Number(b)) if a != b => {
+                    match (a.as_f64(), b.as_f64()) {
+                        (Some(fa), Some(fb)) => {
+                            let scale = fa.abs().max(fb.abs()).max(1.0);
+                            (fa - fb).abs() / scale <= 1e-9
+                        }
+                        _ => false,
+                    }
+                }
+                (JsonValue::String(a), JsonValue::String(b)) if a != b => {
+                    a.contains('T') && a.contains(':') && b.contains('T') && b.contains(':') && {
+                        let normalize = |s: &str| {
+                            s.trim_start_matches('+')
+                                .trim_end_matches('Z')
+                                .trim_end_matches(['0', '.'])
+                                .to_string()
+                        };
+                        normalize(a) == normalize(b)
+                    }
+                }
+                _ => mine == oracle,
+            }
+        }
+
+        fn read_file_and_compare_to_oracle(path: &str) {
+            let file_data = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let mine =
+                read_arrow_ipc_file_rows(&file_data).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+
+            let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let reader = arrow::ipc::reader::FileReader::try_new(file, None)
+                .unwrap_or_else(|e| panic!("{path}: oracle open failed: {e}"));
+            let mut oracle_rows: Vec<JsonValue> = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap_or_else(|e| panic!("{path}: oracle batch failed: {e}"));
+                let mut writer = arrow::json::writer::ArrayWriter::new(Vec::new());
+                writer
+                    .write(&batch)
+                    .and_then(|()| writer.finish())
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON writer failed: {e}"));
+                let buf = writer.into_inner();
+                let rows: Vec<JsonValue> = serde_json::from_slice(&buf)
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"));
+                oracle_rows.extend(rows);
+            }
+
+            assert_eq!(mine.len(), oracle_rows.len(), "{path}: row count mismatch");
+            for (i, (m, o)) in mine.iter().zip(&oracle_rows).enumerate() {
+                assert!(
+                    arrow_json_values_match(m, o),
+                    "{path} row {i}: mine={m} oracle={o}"
+                );
+            }
+        }
+
+        #[test]
+        fn decodes_the_flat_type_detection_file_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/type_detection.arrow");
+        }
+
+        #[test]
+        fn decodes_nested_struct_list_decimal_and_timestamp_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_nested_types.arrow");
+        }
+
+        /// Generated with `pyarrow` (`Array.dictionary_encode()` + `pa.
+        /// ipc.new_file`) - a genuine dictionary-encoded string column,
+        /// exercising `ArrowArrayDecoder::decode_dictionary_field` and the
+        /// `DictionaryBatch` resolution path end to end.
+        #[test]
+        fn decodes_a_dictionary_encoded_column_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_dictionary_encoded.arrow");
+        }
+
+        /// A dictionary-encoded column carrying real null values (as
+        /// opposed to `edge_arrow_dictionary_encoded.arrow`'s all-present
+        /// one) - exercises `decode_dictionary_field`'s own validity-
+        /// bitmap check ahead of the index lookup, a genuinely distinct
+        /// code path from a plain nullable primitive/string column.
+        #[test]
+        fn decodes_a_dictionary_encoded_column_with_nulls_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle(
+                "tests/fixtures/edge_arrow_dictionary_with_nulls.arrow",
+            );
+        }
+
+        /// Generated with `pyarrow` (`IpcWriteOptions(compression="lz4")`) -
+        /// a real `LZ4_FRAME`-compressed `RecordBatch` body, exercising
+        /// `lz4_frame_decompress` end to end (200 rows, large/repetitive
+        /// enough that pyarrow's own writer reaches for genuine LZ4 frame
+        /// blocks rather than skipping compression as not worth it).
+        #[test]
+        fn decodes_an_lz4_frame_compressed_batch_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_lz4_compressed.arrow");
+        }
+
+        /// Generated with `pyarrow` (`IpcWriteOptions(compression="zstd")`) -
+        /// exercises the `CompressionType::ZSTD` branch of
+        /// `decompress_ipc_buffer`, reusing this project's own already-
+        /// verified `zstd_support::zstd_decompress`.
+        #[test]
+        fn decodes_a_zstd_compressed_batch_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_zstd_compressed.arrow");
+        }
+
+        fn read_stream_and_compare_to_oracle(path: &str) {
+            let data = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let mine =
+                read_arrow_ipc_stream_rows(&data).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+
+            let reader = arrow::ipc::reader::StreamReader::try_new(&data[..], None)
+                .unwrap_or_else(|e| panic!("{path}: oracle open failed: {e}"));
+            let mut oracle_rows: Vec<JsonValue> = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap_or_else(|e| panic!("{path}: oracle batch failed: {e}"));
+                let mut writer = arrow::json::writer::ArrayWriter::new(Vec::new());
+                writer
+                    .write(&batch)
+                    .and_then(|()| writer.finish())
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON writer failed: {e}"));
+                let buf = writer.into_inner();
+                let rows: Vec<JsonValue> = serde_json::from_slice(&buf)
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"));
+                oracle_rows.extend(rows);
+            }
+
+            assert_eq!(mine.len(), oracle_rows.len(), "{path}: row count mismatch");
+            for (i, (m, o)) in mine.iter().zip(&oracle_rows).enumerate() {
+                assert!(
+                    arrow_json_values_match(m, o),
+                    "{path} row {i}: mine={m} oracle={o}"
+                );
+            }
+        }
+
+        /// Generated with `pyarrow` (`pa.ipc.new_stream`) - the Streaming
+        /// format's own entry point (`read_arrow_ipc_stream_rows`), which
+        /// shares every message-parsing/decode function with the File
+        /// format but has no magic/footer/`Block` list of its own to lean
+        /// on, plus a dictionary-encoded column so the streaming path
+        /// exercises `DictionaryBatch` resolution too.
+        #[test]
+        fn decodes_the_streaming_format_matching_the_arrow_oracle() {
+            read_stream_and_compare_to_oracle("tests/fixtures/edge_arrow_stream.arrows");
+        }
+
+        /// Generated with `pyarrow` (`IpcWriteOptions(emit_dictionary_deltas=True)`,
+        /// two `write_batch` calls sharing one column whose dictionary
+        /// grows from 2 to 3 values between them) - a genuine `isDelta`
+        /// `DictionaryBatch`, confirmed independently via `pyarrow`'s own
+        /// read of this exact file before trusting it as a real (not just
+        /// theoretical) delta batch. Exercises the
+        /// `dictionaries.entry(id).or_default().extend(values)` append
+        /// path in both `read_arrow_ipc_stream_rows` and (were a File-
+        /// format producer to ever emit one) `read_arrow_ipc_file_rows`,
+        /// rather than only ever hitting the replace path a non-delta
+        /// batch takes.
+        #[test]
+        fn decodes_a_streaming_delta_dictionary_batch_matching_the_arrow_oracle() {
+            read_stream_and_compare_to_oracle("tests/fixtures/edge_arrow_stream_delta_dict.arrows");
         }
     }
 }

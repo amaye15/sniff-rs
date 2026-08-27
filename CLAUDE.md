@@ -5139,32 +5139,173 @@ this project could just implement directly rather than depend on:
   including Map's own two-level nesting (`Map` -> `entries: Struct` ->
   `key`/`value`).
 
-  **Still deliberately not started**: decoding any actual `RecordBatch`
-  buffer data (the `FieldNode`/`Buffer` walk per field - verified while
-  researching this phase, but not yet implemented: primitives consume one
-  `FieldNode` and 2 buffers [validity, values]; `Utf8`/`Binary`/
-  `LargeUtf8`/`LargeBinary` consume 3 [validity, offsets, values];
-  `FixedSizeBinary` consumes 2; `List`/`LargeList`/`Map` consume 2
-  [validity, offsets] then recurse into the child field's own
-  node/buffers; `FixedSizeList` consumes 1 [validity only] then recurses;
-  `Struct` consumes 1 [validity only] then recurses into every child in
-  order; `Null` consumes a node but *zero* buffers - all verified
-  directly against `reader.rs`'s own `RecordBatchDecoder::create_array`
-  before being trusted, the same "verify against source" discipline as
-  everything else in this phase); the validity-bitmap convention itself
-  (a real thing still to verify bit-for-bit before relying on it, even
-  though it's a well-documented part of the Arrow spec, per this
-  project's own "checked, not assumed" standard); `DictionaryBatch`
-  messages and dictionary-encoded columns; `BodyCompression` (`LZ4_FRAME`/
-  `ZSTD`, reusing this project's own existing hand-rolled decoders for
-  both, the same way Parquet's own compression codecs already do); and
-  the streaming IPC format (no trailing footer, messages read until EOF)
-  as a second entry point alongside the file format. `arrow_ipc_support`
-  remains a real but dormant module (`#[allow(dead_code)]`, exercised
-  only by its own tests) and `arrow`/`parquet` remain live runtime
-  dependencies until every behavior this project currently documents and
-  tests for Parquet/Arrow IPC is matched, verified, and cut over in one
-  deliberate step.
+  **Phase 2 (this session): `RecordBatch`/`DictionaryBatch` message
+  parsing, buffer decoding for every scalar/nested/dictionary-encoded
+  type in scope, `BodyCompression` (`LZ4_FRAME`/`ZSTD`), and the
+  Streaming IPC format as a second entry point - still not wired into
+  `columns_from_arrow_ipc`.** The buffer/node consumption order Phase 1
+  had already researched and written up turned out to be exactly right,
+  confirmed field-by-field a second time directly against
+  `RecordBatchDecoder::create_array` (`reader.rs`) before writing a line
+  of decode code: primitives (`Bool`/`Int`/`Float16`/`Float32`/`Float64`/
+  `FixedSizeBinary`/`Decimal`/`Date`/`Time`/`Timestamp`) consume one
+  `FieldNode` and 2 buffers `[validity, values]`; `Utf8`/`Binary`/
+  `LargeUtf8`/`LargeBinary` consume 3 `[validity, offsets, values]`;
+  `List`/`LargeList`/`Map` consume 2 `[validity, offsets]` then recurse
+  into the child field's own node/buffers (the child array is decoded
+  *whole*, then sliced per row via that row's own offset range - lists
+  don't get their own separate node/buffer slice per row the way a
+  struct's children do); `FixedSizeList` consumes 1 `[validity]` then
+  recurses; `Struct` consumes 1 `[validity]` then recurses into every
+  child in schema order; `Null` consumes a node but zero buffers; a
+  dictionary-encoded field (any `Field` carrying a `DictionaryEncoding`,
+  regardless of its own `type_type`/`type_` - see below) consumes 2
+  buffers `[validity, indices]`, resolving each index against a
+  separately-tracked dictionary rather than the field's own buffers.
+
+  **A dictionary-encoded field's own value type and its index type are
+  two genuinely separate things, confirmed directly against
+  `convert.rs`'s own `get_data_type`/`From<crate::Field> for Field`**:
+  `type_type`/`type_` on a dictionary field describe the *dictionary's
+  values* (what index 0, 1, 2, ... each resolve to), while a *separate*
+  `dictionary` field (`Field::VT_DICTIONARY`=12, a `DictionaryEncoding`
+  table - `VT_ID`=4/`VT_INDEXTYPE`=6/`VT_ISORDERED`=8) carries the
+  integer type actually stored per row plus the id used to look the
+  right `DictionaryBatch` up by. `collect_dictionary_fields` walks the
+  schema recursively (a dictionary-encoded field can appear nested inside
+  a List/Struct/Map, not just at the top level) building one
+  `dict_id -> value-typed field` map, since a `DictionaryBatch` message
+  itself carries only an id and a values array with no self-describing
+  type of its own - the type to decode those bytes as has to come from
+  the schema's own field that referenced this id in the first place.
+  Per the spec, a `DictionaryBatch` may legitimately be omitted entirely
+  when every value in the column is null; `decode_dictionary_field`
+  matches `RecordBatchDecoder`'s own fallback for this (an unresolved
+  `dict_id` degrades to an empty dictionary rather than a hard error,
+  safe since every actual index lookup is already gated on the value
+  being non-null first).
+
+  **`BodyCompression`'s own 8-byte per-buffer framing** (`RecordBatch::
+  VT_COMPRESSION`=10 - its mere *presence*, not any particular codec
+  value, is what signals every buffer in that batch carries this prefix;
+  an uncompressed batch has no `BodyCompression` table at all) was
+  verified directly against `compression.rs`'s own
+  `read_uncompressed_size`/`decompress_to_buffer`: `0` means the buffer
+  is genuinely empty, `-1` means the bytes that follow are already-
+  uncompressed raw data (compression would have made them larger, so the
+  writer skipped it), and any other value is the real target size the
+  compressed bytes that follow must decompress to exactly.
+  `CompressionType::ZSTD` reuses this project's own already-hand-rolled
+  `zstd_support::zstd_decompress` directly, no new code needed at all.
+  `CompressionType::LZ4_FRAME` needed a genuinely new decoder,
+  `lz4_frame_decompress`: confirmed directly in `compression.rs` that
+  Arrow IPC's own LZ4 codec goes through `lz4_flex::frame::FrameDecoder`
+  - the standard LZ4 *Frame* Format (magic `0x184D2204`, a frame
+  descriptor byte carrying version/block-independence/block-checksum/
+  content-size/content-checksum/dict-id flags, then a sequence of
+  4-byte-size-prefixed blocks each either raw or a standard LZ4 block,
+  ending with an all-zero size word) - a meaningfully different envelope
+  from Parquet's own raw-block/Hadoop-framed LZ4 conventions this
+  project already hand-rolled for that format's own `LZ4`/`LZ4_RAW`
+  codecs. Only the innermost per-block decode algorithm is actually
+  shared between the two: `parquet_support::lz4_block_decompress` was
+  split into a new `pub(crate) lz4_block_decompress_core` (the bare
+  literal/match decode loop, running until input exhaustion with no
+  target-size parameter - the loop never needed one to begin with, since
+  it already terminates on its own once every byte of the block has been
+  consumed) plus a thin wrapper adding Parquet's own allocation-size
+  sanity check and exact-length validation, letting
+  `lz4_frame_decompress` call the shared core directly for each frame
+  block instead of duplicating it - a real, if small, DRY exception
+  compared to every *other* dual-feature helper in this document
+  (`decimal_bytes_to_string`, `f16_bytes_to_f64`, both deliberately
+  duplicated instead) specifically because `parquet_support` and
+  `arrow_ipc_support` share the exact same `#[cfg(feature = "parquet")]`
+  gate rather than being independently togglable, so there's no
+  "`--features parquet`-only build must not need the other module"
+  constraint standing in the way here the way there is for Avro/Parquet
+  or CBOR/Parquet's own duplicated helpers.
+
+  **The Streaming IPC format** (`read_arrow_ipc_stream_rows`) shares
+  every message-parsing/decode function already built for the File
+  format - `parse_message`, `decode_record_batch`,
+  `decode_dictionary_batch` - but has no magic/footer/`Block` list to
+  lean on at all: messages are read sequentially from byte 0 until either
+  a genuine end-of-stream marker (a message whose own length prefix is
+  `0`) or the input is exhausted, and the very first message is always
+  the schema itself (there's no footer to read it from up front the way
+  the File format has). Confirmed directly against `arrow-ipc`'s own
+  `MessageReader::maybe_next`/`StreamReader::read_meta_len` that a
+  message's own metadata-length prefix is already the *exact* byte count
+  to read for its FlatBuffers `Message` table - already inclusive of
+  whatever padding the writer added to keep the block 8-byte aligned, so
+  a reader just reads exactly that many bytes with no further rounding,
+  the identical convention the File format's own `Block::
+  meta_data_length` already uses.
+
+  **Verified against real files, not just this phase's own reasoning
+  about the reference source**, all generated with `pyarrow` (matching
+  this project's established fixture-generation convention) since none
+  of these shapes were reachable from the fixtures Phase 1 already had:
+  `edge_arrow_dictionary_encoded.arrow` (a genuine dictionary-encoded
+  string column) and `edge_arrow_dictionary_with_nulls.arrow` (the same,
+  but with real null values interleaved, exercising
+  `decode_dictionary_field`'s own validity-bitmap check ahead of the
+  index lookup - a genuinely distinct code path from a plain nullable
+  column) both decode correctly; `edge_arrow_lz4_compressed.arrow` (200
+  rows, large/repetitive enough that pyarrow's own writer reaches for
+  genuine multi-block LZ4 frames rather than skipping compression as not
+  worth it) and `edge_arrow_zstd_compressed.arrow` both decode correctly
+  through `decompress_ipc_buffer`; `edge_arrow_stream.arrows` (the
+  Streaming format's own entry point, with a dictionary-encoded column
+  too) and `edge_arrow_stream_delta_dict.arrows` (two `write_batch` calls
+  sharing one column whose dictionary genuinely grows from 2 to 3 values
+  between them via `emit_dictionary_deltas=True` - confirmed independently
+  via `pyarrow`'s own read of the exact same file before trusting it as a
+  real, not just theoretical, `isDelta` batch) both decode correctly,
+  the latter exercising the `dictionaries.entry(id).or_default().
+  extend(values)` append path rather than only ever hitting the replace
+  path a non-delta batch takes. Cross-verified via the same "read the
+  file both ways, compare the JSON" approach the Parquet nested-
+  reconstruction phase established, but with a genuinely more direct
+  oracle available this time: `arrow::ipc::reader::FileReader`/
+  `StreamReader` piped through `arrow::json::writer::ArrayWriter` *is*
+  exactly what this reader is trying to replicate (unlike Parquet's own
+  phase, which had to route around a documented upstream bug in the
+  `record::Row` API for repeated fields and use the Arrow bridge as a
+  substitute oracle instead), so there's no equivalent detour needed
+  here. One real rendering difference from Parquet's own convention was
+  found this way, not assumed in advance: Arrow's JSON writer renders a
+  `Decimal128`/`Decimal256` value as a genuine JSON *number* (via an f64
+  conversion - confirmed by the oracle test failing on `"100.50"` vs
+  `100.5` before the fix, not reasoned out ahead of time), not the
+  string Parquet's own `render_value_json` always uses for the same
+  logical type - `render_arrow_scalar`'s own Decimal case matches this
+  rather than carrying the string convention over unchanged. The oracle
+  comparator itself needed two of the same tolerances Parquet's own
+  nested-reconstruction test already established (a null struct-field or
+  map-entry value silently dropped from the JSON object rather than
+  rendered as `null`, handled by unioning keys from both sides and
+  defaulting an absent one to `Null`; a timezone-aware timestamp string
+  carrying a trailing `Z`/`+00:00`/zero-padded-fraction this reader's own
+  naive rendering doesn't add) - real, independently-rediscovered quirks
+  of `arrow-json`'s own writer, not anything specific to either reader.
+
+  **Still deliberately not started**: decoding `Union`/`RunEndEncoded`/
+  `Interval`/`Duration`/the `*View` family (all already a disclosed
+  `ArrowDataType::Other` gap since Phase 1, matching this project's own
+  Parquet reader's equivalent scope boundary); the LZO/Brotli/LZ4-raw/
+  LZ4_RAW compression codecs Parquet's own reader also doesn't support
+  yet (moot here anyway, since Arrow IPC's own `BodyCompression` union
+  only ever offers `LZ4_FRAME`/`ZSTD` in the first place - there's no
+  third codec value to eventually add); and wiring either
+  `parquet_support` or `arrow_ipc_support` into `columns_from_parquet`/
+  `columns_from_arrow_ipc`. Both modules remain real but dormant
+  (`#[allow(dead_code)]`, exercised only by their own tests) and
+  `arrow`/`parquet` remain live runtime dependencies until every
+  behavior this project currently documents and tests for Parquet/Arrow
+  IPC is matched, verified, and cut over in one deliberate step - not
+  incrementally swapped out from under a working build.
 
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above (in progress, not declined), `serde`/`serde_json` are meant to
