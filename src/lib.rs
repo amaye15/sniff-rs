@@ -6842,6 +6842,14 @@ mod parquet_support {
             Self { buf, pos: 0 }
         }
 
+        /// Bytes consumed so far - used by page-header reading, where the
+        /// page body immediately follows the Thrift-encoded header with
+        /// no length prefix of its own, so the caller needs to know
+        /// exactly where the header ended.
+        fn bytes_consumed(&self) -> usize {
+            self.pos
+        }
+
         fn read_byte(&mut self) -> Result<u8> {
             let b = *self
                 .buf
@@ -7682,6 +7690,1070 @@ mod parquet_support {
         Ok((data, metadata))
     }
 
+    // ---------------------------------------------------------------
+    // Phase B: schema tree reconstruction, page headers, the RLE/bit-
+    // packing hybrid encoding (shared by definition/repetition levels
+    // and RLE_DICTIONARY indices), PLAIN value decoding, and enough
+    // wiring to read a *flat* (no repeated/list ancestors - deferred to
+    // the nested-type phase) column chunk's real values end to end.
+    // ---------------------------------------------------------------
+
+    /// Parquet's schema tree, reconstructed from the footer's flat,
+    /// depth-first `SchemaElement` list via `num_children` - verified
+    /// directly against the reference crate's own
+    /// `schema_from_array_helper`/`build_tree` (`schema/types.rs`),
+    /// including its specific handling of an empty root (`num_children`
+    /// `None`/`Some(0)` at index 0) and of `num_children: Some(0)` on a
+    /// *non-root* group (a real writer quirk - parquet-cpp sometimes sets
+    /// it - kept distinct from a primitive by checking `r#type` too, not
+    /// `num_children` alone).
+    #[derive(Clone, Debug)]
+    pub(crate) enum SchemaNode {
+        Primitive {
+            name: String,
+            physical_type: PhysicalType,
+            type_length: Option<i32>,
+            repetition: Repetition,
+            converted_type: Option<ConvertedType>,
+            logical_type: Option<LogicalType>,
+            scale: Option<i32>,
+            precision: Option<i32>,
+        },
+        Group {
+            name: String,
+            /// `None` only for the synthetic root message type, which
+            /// (per the Parquet spec) carries no repetition of its own.
+            repetition: Option<Repetition>,
+            children: Vec<SchemaNode>,
+        },
+    }
+
+    impl SchemaNode {
+        fn name(&self) -> &str {
+            match self {
+                Self::Primitive { name, .. } | Self::Group { name, .. } => name,
+            }
+        }
+
+        fn repetition(&self) -> Option<Repetition> {
+            match self {
+                Self::Primitive { repetition, .. } => Some(*repetition),
+                Self::Group { repetition, .. } => *repetition,
+            }
+        }
+    }
+
+    fn schema_from_array_helper(
+        elements: &[SchemaElement],
+        index: usize,
+    ) -> Result<(usize, SchemaNode)> {
+        let is_root = index == 0;
+        let element = elements
+            .get(index)
+            .context("Parquet schema index out of bounds")?;
+
+        if is_root && matches!(element.num_children, None | Some(0)) {
+            return Ok((
+                index + 1,
+                SchemaNode::Group {
+                    name: element.name.clone(),
+                    repetition: None,
+                    children: Vec::new(),
+                },
+            ));
+        }
+
+        match element.num_children {
+            None | Some(0) => {
+                let repetition = element
+                    .repetition_type
+                    .context("Parquet schema element missing repetition")?;
+                if let Some(physical_type) = element.type_ {
+                    Ok((
+                        index + 1,
+                        SchemaNode::Primitive {
+                            name: element.name.clone(),
+                            physical_type,
+                            type_length: element.type_length,
+                            repetition,
+                            converted_type: element.converted_type,
+                            logical_type: element.logical_type.clone(),
+                            scale: element.scale,
+                            precision: element.precision,
+                        },
+                    ))
+                } else {
+                    Ok((
+                        index + 1,
+                        SchemaNode::Group {
+                            name: element.name.clone(),
+                            repetition: Some(repetition),
+                            children: Vec::new(),
+                        },
+                    ))
+                }
+            }
+            Some(n) => {
+                let n = usize::try_from(n)
+                    .context("Parquet schema element has a negative num_children")?;
+                let mut children = Vec::with_capacity(n.min(1 << 16));
+                let mut next_index = index + 1;
+                for _ in 0..n {
+                    let (ni, child) = schema_from_array_helper(elements, next_index)?;
+                    next_index = ni;
+                    children.push(child);
+                }
+                let repetition = if is_root {
+                    None
+                } else {
+                    Some(
+                        element
+                            .repetition_type
+                            .context("Parquet schema element missing repetition")?,
+                    )
+                };
+                Ok((
+                    next_index,
+                    SchemaNode::Group {
+                        name: element.name.clone(),
+                        repetition,
+                        children,
+                    },
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn build_schema(elements: &[SchemaElement]) -> Result<SchemaNode> {
+        if elements.is_empty() {
+            bail!("Parquet schema has no elements");
+        }
+        let (next, root) = schema_from_array_helper(elements, 0)?;
+        if next != elements.len() {
+            bail!("Parquet schema has trailing, unreferenced elements");
+        }
+        if !matches!(root, SchemaNode::Group { .. }) {
+            bail!("Parquet schema root must be a group type");
+        }
+        Ok(root)
+    }
+
+    /// A leaf (primitive) column's full path plus the two facts needed to
+    /// decode its definition/repetition level streams - verified against
+    /// the reference crate's own `build_tree`: `OPTIONAL` bumps the max
+    /// definition level, `REPEATED` bumps both max definition *and* max
+    /// repetition level.
+    #[derive(Clone, Debug)]
+    pub(crate) struct ColumnDescriptor {
+        pub(crate) path: Vec<String>,
+        pub(crate) max_def_level: i16,
+        pub(crate) max_rep_level: i16,
+        pub(crate) physical_type: PhysicalType,
+        pub(crate) type_length: Option<i32>,
+        pub(crate) converted_type: Option<ConvertedType>,
+        pub(crate) logical_type: Option<LogicalType>,
+        pub(crate) scale: Option<i32>,
+        pub(crate) precision: Option<i32>,
+    }
+
+    fn collect_leaves(
+        node: &SchemaNode,
+        mut max_rep: i16,
+        mut max_def: i16,
+        path: &mut Vec<String>,
+        out: &mut Vec<ColumnDescriptor>,
+    ) {
+        path.push(node.name().to_string());
+        match node.repetition() {
+            Some(Repetition::Optional) => max_def += 1,
+            Some(Repetition::Repeated) => {
+                max_def += 1;
+                max_rep += 1;
+            }
+            _ => {}
+        }
+        match node {
+            SchemaNode::Primitive {
+                physical_type,
+                type_length,
+                converted_type,
+                logical_type,
+                scale,
+                precision,
+                ..
+            } => out.push(ColumnDescriptor {
+                path: path.clone(),
+                max_def_level: max_def,
+                max_rep_level: max_rep,
+                physical_type: *physical_type,
+                type_length: *type_length,
+                converted_type: *converted_type,
+                logical_type: logical_type.clone(),
+                scale: *scale,
+                precision: *precision,
+            }),
+            SchemaNode::Group { children, .. } => {
+                for child in children {
+                    collect_leaves(child, max_rep, max_def, path, out);
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    /// Mirrors `SchemaDescriptor::new`'s own top-level loop: each of the
+    /// root message type's own direct fields starts a fresh path (the
+    /// root's own name is never part of any leaf's dotted path, matching
+    /// `ColumnMetaData::path_in_schema` - already cross-verified against
+    /// the oracle in Phase A).
+    pub(crate) fn schema_leaves(root: &SchemaNode) -> Vec<ColumnDescriptor> {
+        let mut out = Vec::new();
+        if let SchemaNode::Group { children, .. } = root {
+            for child in children {
+                let mut path = Vec::new();
+                collect_leaves(child, 0, 0, &mut path, &mut out);
+            }
+        }
+        out
+    }
+
+    // ---------------------------------------------------------------
+    // Page headers - the same Thrift primitives as the footer, applied
+    // to `PageHeader`/`DataPageHeader`(V1)/`DataPageHeaderV2`/
+    // `DictionaryPageHeader`. Field IDs verified against
+    // `file/metadata/thrift/mod.rs` the same way as every Phase A struct.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ParquetPageType {
+        DataPage,
+        IndexPage,
+        DictionaryPage,
+        DataPageV2,
+    }
+
+    impl ParquetPageType {
+        fn from_i32(v: i32) -> Result<Self> {
+            Ok(match v {
+                0 => Self::DataPage,
+                1 => Self::IndexPage,
+                2 => Self::DictionaryPage,
+                3 => Self::DataPageV2,
+                other => bail!("unrecognized Parquet page type {other}"),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct DataPageHeaderV1 {
+        pub(crate) num_values: i32,
+        pub(crate) encoding: Encoding,
+        pub(crate) definition_level_encoding: Encoding,
+        pub(crate) repetition_level_encoding: Encoding,
+    }
+
+    fn read_data_page_header_v1(r: &mut ThriftReader) -> Result<DataPageHeaderV1> {
+        let (mut num_values, mut encoding, mut def_enc, mut rep_enc) = (None, None, None, None);
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => num_values = Some(r.read_i32()?),
+                2 => encoding = Some(Encoding::from_i32(r.read_i32()?)?),
+                3 => def_enc = Some(Encoding::from_i32(r.read_i32()?)?),
+                4 => rep_enc = Some(Encoding::from_i32(r.read_i32()?)?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(DataPageHeaderV1 {
+            num_values: num_values.context("DataPageHeader missing num_values")?,
+            encoding: encoding.context("DataPageHeader missing encoding")?,
+            definition_level_encoding: def_enc
+                .context("DataPageHeader missing definition_level_encoding")?,
+            repetition_level_encoding: rep_enc
+                .context("DataPageHeader missing repetition_level_encoding")?,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct DataPageHeaderV2 {
+        pub(crate) num_values: i32,
+        pub(crate) num_nulls: i32,
+        pub(crate) num_rows: i32,
+        pub(crate) encoding: Encoding,
+        pub(crate) definition_levels_byte_length: i32,
+        pub(crate) repetition_levels_byte_length: i32,
+        pub(crate) is_compressed: bool,
+    }
+
+    fn read_data_page_header_v2(r: &mut ThriftReader) -> Result<DataPageHeaderV2> {
+        let (mut num_values, mut num_nulls, mut num_rows) = (None, None, None);
+        let mut encoding = None;
+        let (mut def_len, mut rep_len) = (None, None);
+        let mut is_compressed = true; // `optional bool is_compressed = true`
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => num_values = Some(r.read_i32()?),
+                2 => num_nulls = Some(r.read_i32()?),
+                3 => num_rows = Some(r.read_i32()?),
+                4 => encoding = Some(Encoding::from_i32(r.read_i32()?)?),
+                5 => def_len = Some(r.read_i32()?),
+                6 => rep_len = Some(r.read_i32()?),
+                7 => is_compressed = ThriftReader::bool_field_value(ft)?,
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(DataPageHeaderV2 {
+            num_values: num_values.context("DataPageHeaderV2 missing num_values")?,
+            num_nulls: num_nulls.context("DataPageHeaderV2 missing num_nulls")?,
+            num_rows: num_rows.context("DataPageHeaderV2 missing num_rows")?,
+            encoding: encoding.context("DataPageHeaderV2 missing encoding")?,
+            definition_levels_byte_length: def_len
+                .context("DataPageHeaderV2 missing definition_levels_byte_length")?,
+            repetition_levels_byte_length: rep_len
+                .context("DataPageHeaderV2 missing repetition_levels_byte_length")?,
+            is_compressed,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct DictionaryPageHeader {
+        pub(crate) num_values: i32,
+        pub(crate) encoding: Encoding,
+    }
+
+    fn read_dictionary_page_header(r: &mut ThriftReader) -> Result<DictionaryPageHeader> {
+        let (mut num_values, mut encoding) = (None, None);
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => num_values = Some(r.read_i32()?),
+                2 => encoding = Some(Encoding::from_i32(r.read_i32()?)?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(DictionaryPageHeader {
+            num_values: num_values.context("DictionaryPageHeader missing num_values")?,
+            encoding: encoding.context("DictionaryPageHeader missing encoding")?,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct ParquetPageHeader {
+        pub(crate) type_: ParquetPageType,
+        pub(crate) uncompressed_page_size: i32,
+        pub(crate) compressed_page_size: i32,
+        pub(crate) data_page_header: Option<DataPageHeaderV1>,
+        pub(crate) dictionary_page_header: Option<DictionaryPageHeader>,
+        pub(crate) data_page_header_v2: Option<DataPageHeaderV2>,
+    }
+
+    fn read_page_header(r: &mut ThriftReader) -> Result<ParquetPageHeader> {
+        let (mut type_, mut uncompressed, mut compressed) = (None, None, None);
+        let (mut dph, mut diph, mut dphv2) = (None, None, None);
+        let mut last = 0i16;
+        loop {
+            let (ft, id) = r.read_field_header(last)?;
+            if ft == FieldType::Stop {
+                break;
+            }
+            match id {
+                1 => type_ = Some(ParquetPageType::from_i32(r.read_i32()?)?),
+                2 => uncompressed = Some(r.read_i32()?),
+                3 => compressed = Some(r.read_i32()?),
+                5 => dph = Some(read_data_page_header_v1(r)?),
+                7 => diph = Some(read_dictionary_page_header(r)?),
+                8 => dphv2 = Some(read_data_page_header_v2(r)?),
+                _ => r.skip(ft, MAX_SKIP_DEPTH)?,
+            }
+            last = id;
+        }
+        Ok(ParquetPageHeader {
+            type_: type_.context("PageHeader missing type")?,
+            uncompressed_page_size: uncompressed
+                .context("PageHeader missing uncompressed_page_size")?,
+            compressed_page_size: compressed.context("PageHeader missing compressed_page_size")?,
+            data_page_header: dph,
+            dictionary_page_header: diph,
+            data_page_header_v2: dphv2,
+        })
+    }
+
+    // ---------------------------------------------------------------
+    // The RLE/bit-packing hybrid encoding - shared by definition/
+    // repetition levels (Data Page V1) and dictionary indices
+    // (RLE_DICTIONARY). Verified against the reference crate's own
+    // `encodings/rle.rs` (`RleDecoder::reload`, for the run-header
+    // scheme) and `util/bit_util.rs` (`BitReader::get_value`, whose own
+    // doc comment states plainly: "Bits are consumed from the stream in
+    // little-endian bit order").
+    // ---------------------------------------------------------------
+
+    fn read_uleb128(data: &[u8], mut pos: usize) -> Result<(u64, usize)> {
+        let start = pos;
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = *data
+                .get(pos)
+                .context("truncated RLE/bit-packed hybrid run header")?;
+            pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok((value, pos - start));
+            }
+            shift += 7;
+            if shift >= 64 {
+                bail!("RLE/bit-packed hybrid run header varint too long");
+            }
+        }
+    }
+
+    /// Reads `n` bits (`n` <= 64) starting at bit `*bit_offset` of `data`,
+    /// LSB-first (bit 0 of byte 0 is the first bit read, becoming bit 0 of
+    /// the result) - a plain bit-by-bit implementation rather than the
+    /// reference crate's own buffered 64-bit-word approach, since
+    /// correctness (verified against real decoded values, not raw
+    /// throughput) is what this project's own CLI use case needs.
+    fn read_bits(data: &[u8], bit_offset: &mut usize, n: u32) -> Result<u64> {
+        let mut result = 0u64;
+        for i in 0..n {
+            let bit_idx = *bit_offset + i as usize;
+            let byte = *data
+                .get(bit_idx / 8)
+                .context("truncated bit-packed value in RLE/bit-packed hybrid stream")?;
+            let bit = (byte >> (bit_idx % 8)) & 1;
+            result |= u64::from(bit) << i;
+        }
+        *bit_offset += n as usize;
+        Ok(result)
+    }
+
+    /// Decodes exactly `count` unsigned values (definition/repetition
+    /// levels, or dictionary indices) from an RLE/bit-packing hybrid-
+    /// encoded buffer. `bit_width` is known from context, not stored in
+    /// the stream itself: the max definition/repetition level (levels)
+    /// or the dictionary page's own leading bit-width byte (indices) -
+    /// see `decode_column_chunk`'s two call sites.
+    fn decode_rle_bit_packed_hybrid(data: &[u8], bit_width: u32, count: usize) -> Result<Vec<u64>> {
+        let mut out = Vec::with_capacity(count.min(1 << 20));
+        let mut pos = 0usize;
+        if bit_width == 0 {
+            // Every value is 0 by construction (no bits needed to
+            // represent it) - matches every level stream on a fully-
+            // required, non-repeated column (max level 0), which some
+            // writers still frame as a formal (empty-bodied) RLE stream.
+            return Ok(vec![0u64; count]);
+        }
+        while out.len() < count {
+            let (indicator, n) = read_uleb128(data, pos)?;
+            pos += n;
+            if indicator & 1 == 1 {
+                let num_groups = usize::try_from(indicator >> 1)
+                    .context("RLE/bit-packed hybrid group count overflow")?;
+                let byte_len = num_groups
+                    .checked_mul(bit_width as usize)
+                    .context("RLE/bit-packed hybrid run byte length overflow")?;
+                let bytes = data
+                    .get(pos..pos + byte_len)
+                    .context("truncated RLE/bit-packed hybrid bit-packed run")?;
+                pos += byte_len;
+                let mut bit_offset = 0usize;
+                for _ in 0..num_groups * 8 {
+                    if out.len() >= count {
+                        break;
+                    }
+                    out.push(read_bits(bytes, &mut bit_offset, bit_width)?);
+                }
+            } else {
+                let run_len = usize::try_from(indicator >> 1).context("RLE run length overflow")?;
+                let value_bytes = bit_width.div_ceil(8) as usize;
+                let bytes = data
+                    .get(pos..pos + value_bytes)
+                    .context("truncated RLE run value")?;
+                pos += value_bytes;
+                let mut value = 0u64;
+                for (i, &b) in bytes.iter().enumerate() {
+                    value |= u64::from(b) << (8 * i);
+                }
+                for _ in 0..run_len {
+                    if out.len() >= count {
+                        break;
+                    }
+                    out.push(value);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The minimum number of bits needed to represent `max_value`
+    /// (0 needs 0 bits) - used to derive a level stream's bit width from
+    /// the column's own max definition/repetition level, matching the
+    /// reference crate's own `num_required_bits`.
+    fn num_required_bits(max_value: i16) -> u32 {
+        let max_value = u32::try_from(max_value).unwrap_or(0);
+        u32::BITS - max_value.leading_zeros().min(u32::BITS)
+    }
+
+    // ---------------------------------------------------------------
+    // PLAIN value decoding, per physical type. BOOLEAN is handled
+    // separately by the caller (a page-wide bit-packed run with no RLE
+    // framing at all, unlike every other PLAIN-encoded type).
+    // ---------------------------------------------------------------
+
+    fn plain_decode_one(
+        data: &[u8],
+        pos: &mut usize,
+        physical_type: PhysicalType,
+        type_length: Option<i32>,
+    ) -> Result<Vec<u8>> {
+        Ok(match physical_type {
+            PhysicalType::Boolean => {
+                bail!("BOOLEAN values are decoded as a batch, not one at a time")
+            }
+            PhysicalType::Int32 | PhysicalType::Float => {
+                let b = data.get(*pos..*pos + 4).context("truncated PLAIN value")?;
+                *pos += 4;
+                b.to_vec()
+            }
+            PhysicalType::Int64 | PhysicalType::Double => {
+                let b = data.get(*pos..*pos + 8).context("truncated PLAIN value")?;
+                *pos += 8;
+                b.to_vec()
+            }
+            PhysicalType::Int96 => {
+                let b = data
+                    .get(*pos..*pos + 12)
+                    .context("truncated PLAIN INT96 value")?;
+                *pos += 12;
+                b.to_vec()
+            }
+            PhysicalType::ByteArray => {
+                let len_bytes = data
+                    .get(*pos..*pos + 4)
+                    .context("truncated PLAIN byte-array length")?;
+                let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                *pos += 4;
+                let bytes = data
+                    .get(*pos..*pos + len)
+                    .context("truncated PLAIN byte-array value")?;
+                *pos += len;
+                bytes.to_vec()
+            }
+            PhysicalType::FixedLenByteArray => {
+                let len = usize::try_from(
+                    type_length.context("FIXED_LEN_BYTE_ARRAY missing type_length")?,
+                )
+                .context("negative FIXED_LEN_BYTE_ARRAY type_length")?;
+                let bytes = data
+                    .get(*pos..*pos + len)
+                    .context("truncated PLAIN fixed-length byte array")?;
+                *pos += len;
+                bytes.to_vec()
+            }
+        })
+    }
+
+    /// A DECIMAL's unscaled value, stored as big-endian two's-complement
+    /// bytes (Parquet's own convention for a BYTE_ARRAY/
+    /// FIXED_LEN_BYTE_ARRAY-backed decimal - the *same* convention Avro's
+    /// `decimal` logical type uses), converted to a scaled string via
+    /// hand-rolled schoolbook long division - a near-verbatim duplicate of
+    /// `avro_support::bytes_to_decimal_string`, kept separate rather than
+    /// shared because `avro`/`parquet` are independently-toggleable
+    /// features (a `--features parquet`-only build must not need
+    /// `avro_support` compiled in at all), the same "controlled
+    /// duplication across independently-gated format modules" precedent
+    /// already used elsewhere in this project (the two independent XML
+    /// parsers, `zip_support`'s vs `xlsx_support`'s own u16 readers).
+    fn decimal_bytes_to_string(bytes: &[u8], scale: i32) -> String {
+        if bytes.is_empty() {
+            return "0".to_string();
+        }
+        let negative = bytes[0] & 0x80 != 0;
+        let mut magnitude: Vec<u8> = if negative {
+            let mut inverted: Vec<u8> = bytes.iter().map(|b| !b).collect();
+            let mut carry = 1u16;
+            for byte in inverted.iter_mut().rev() {
+                let sum = u16::from(*byte) + carry;
+                *byte = sum as u8;
+                carry = sum >> 8;
+                if carry == 0 {
+                    break;
+                }
+            }
+            inverted
+        } else {
+            bytes.to_vec()
+        };
+
+        let mut digits = Vec::new();
+        loop {
+            let mut remainder = 0u32;
+            let mut all_zero = true;
+            for byte in &mut magnitude {
+                let cur = (remainder << 8) | u32::from(*byte);
+                *byte = (cur / 10) as u8;
+                remainder = cur % 10;
+                if *byte != 0 {
+                    all_zero = false;
+                }
+            }
+            digits.push(b'0' + remainder as u8);
+            if all_zero {
+                break;
+            }
+        }
+        digits.reverse();
+        let mut digits = String::from_utf8(digits).expect("ASCII digits are valid UTF-8");
+
+        if scale > 0 {
+            let scale = scale as usize;
+            if digits.len() <= scale {
+                digits = format!("{}{digits}", "0".repeat(scale + 1 - digits.len()));
+            }
+            digits.insert(digits.len() - scale, '.');
+        } else if scale < 0 {
+            digits.push_str(&"0".repeat((-scale) as usize));
+        }
+        if negative {
+            digits.insert(0, '-');
+        }
+        digits
+    }
+
+    fn is_decimal(descriptor: &ColumnDescriptor) -> Option<i32> {
+        if let Some(LogicalType::Decimal { scale, .. }) = descriptor.logical_type {
+            return Some(scale);
+        }
+        if descriptor.converted_type == Some(ConvertedType::Decimal) {
+            return Some(descriptor.scale.unwrap_or(0));
+        }
+        None
+    }
+
+    fn is_utf8(descriptor: &ColumnDescriptor) -> bool {
+        matches!(
+            descriptor.logical_type,
+            Some(LogicalType::String | LogicalType::Enum | LogicalType::Json)
+        ) || matches!(
+            descriptor.converted_type,
+            Some(ConvertedType::Utf8 | ConvertedType::Enum | ConvertedType::Json)
+        )
+    }
+
+    /// Converts a `LogicalType::Float16` value's raw 2-byte little-endian
+    /// IEEE-754 binary16 pattern to `f64`, via the same plain floating-
+    /// point-arithmetic formula (not bit-twiddling) already hand-verified
+    /// against eight reference bit patterns for `cbor_support`'s own
+    /// `f16_to_f64` - duplicated rather than shared since `cbor`/`parquet`
+    /// are independently togglable features, the same tradeoff already
+    /// made for `decimal_bytes_to_string` above.
+    fn f16_bytes_to_f64(bytes: &[u8]) -> f64 {
+        let Ok(raw) = <[u8; 2]>::try_from(bytes) else {
+            return f64::NAN;
+        };
+        let bits = u16::from_le_bytes(raw);
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = (bits >> 10) & 0x1F;
+        let frac = f64::from(bits & 0x3FF);
+        match exp {
+            0 => sign * frac * 2f64.powi(-24),
+            0x1F if frac == 0.0 => sign * f64::INFINITY,
+            0x1F => f64::NAN,
+            _ => sign * (1.0 + frac / 1024.0) * 2f64.powi(i32::from(exp) - 15),
+        }
+    }
+
+    /// The final step from a decoded physical value's raw bytes to the
+    /// string this project's shared `suggest_ideal_type` heuristic engine
+    /// operates on - honoring `LogicalType`/`ConvertedType` annotations
+    /// where they change what the bytes actually *mean* (DECIMAL, DATE,
+    /// TIME, TIMESTAMP, UTF8), and falling back to a plain, type-
+    /// appropriate rendering otherwise. Deliberately conservative: a
+    /// physical type this function doesn't have a specific annotation
+    /// for still renders correctly as its own plain value (a numeric
+    /// string, or - for BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY with no UTF8/
+    /// DECIMAL annotation - a hex dump, matching how this project's
+    /// existing dBase/SAS7BDAT readers already render undifferentiated
+    /// binary data).
+    fn render_value_bytes(bytes: &[u8], descriptor: &ColumnDescriptor) -> Result<String> {
+        if let Some(scale) = is_decimal(descriptor) {
+            match descriptor.physical_type {
+                PhysicalType::Int32 => {
+                    let v = i32::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("DECIMAL(int32) value has the wrong width")?,
+                    );
+                    return Ok(decimal_bytes_to_string(&v.to_be_bytes(), scale));
+                }
+                PhysicalType::Int64 => {
+                    let v = i64::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("DECIMAL(int64) value has the wrong width")?,
+                    );
+                    return Ok(decimal_bytes_to_string(&v.to_be_bytes(), scale));
+                }
+                PhysicalType::ByteArray | PhysicalType::FixedLenByteArray => {
+                    return Ok(decimal_bytes_to_string(bytes, scale));
+                }
+                _ => {}
+            }
+        }
+        Ok(match descriptor.physical_type {
+            PhysicalType::Boolean => {
+                if bytes.first() == Some(&1) {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+            PhysicalType::Int32 => {
+                let v = i32::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .context("INT32 value has the wrong width")?,
+                );
+                match descriptor.logical_type {
+                    Some(LogicalType::Date) => EpochDate::from_days(i64::from(v))
+                        .map(|d| d.format_ymd())
+                        .unwrap_or_else(|| v.to_string()),
+                    Some(LogicalType::Time {
+                        unit: TimeUnit::Millis,
+                        ..
+                    }) => EpochTime::from_seconds_since_midnight(
+                        (v / 1000).try_into().unwrap_or(0),
+                        (v % 1000).unsigned_abs() * 1_000_000,
+                    )
+                    .map(|t| t.format_hms_frac(3))
+                    .unwrap_or_else(|| v.to_string()),
+                    _ if descriptor.converted_type == Some(ConvertedType::Date) => {
+                        EpochDate::from_days(i64::from(v))
+                            .map(|d| d.format_ymd())
+                            .unwrap_or_else(|| v.to_string())
+                    }
+                    _ => v.to_string(),
+                }
+            }
+            PhysicalType::Int64 => {
+                let v = i64::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .context("INT64 value has the wrong width")?,
+                );
+                match descriptor.logical_type {
+                    Some(LogicalType::Timestamp { unit, .. }) => match unit {
+                        TimeUnit::Millis => {
+                            EpochDateTime::from_unix_millis(v).map(|dt| dt.format_t_frac(3))
+                        }
+                        TimeUnit::Micros => {
+                            EpochDateTime::from_unix_micros(v).map(|dt| dt.format_t_frac(6))
+                        }
+                        TimeUnit::Nanos => {
+                            let secs = v.div_euclid(1_000_000_000);
+                            let nanos = v.rem_euclid(1_000_000_000) as u32;
+                            EpochDateTime::from_unix_seconds(secs, nanos)
+                                .map(|dt| dt.format_t_frac(9))
+                        }
+                    }
+                    .unwrap_or_else(|| v.to_string()),
+                    Some(LogicalType::Time { unit, .. }) => match unit {
+                        TimeUnit::Micros => {
+                            let secs = v.div_euclid(1_000_000);
+                            let micros = v.rem_euclid(1_000_000) as u32;
+                            u32::try_from(secs)
+                                .ok()
+                                .and_then(|s| {
+                                    EpochTime::from_seconds_since_midnight(s, micros * 1000)
+                                })
+                                .map(|t| t.format_hms_frac(6))
+                        }
+                        TimeUnit::Nanos => {
+                            let secs = v.div_euclid(1_000_000_000);
+                            let nanos = v.rem_euclid(1_000_000_000) as u32;
+                            u32::try_from(secs)
+                                .ok()
+                                .and_then(|s| EpochTime::from_seconds_since_midnight(s, nanos))
+                                .map(|t| t.format_hms_frac(9))
+                        }
+                        TimeUnit::Millis => None,
+                    }
+                    .unwrap_or_else(|| v.to_string()),
+                    _ if matches!(
+                        descriptor.converted_type,
+                        Some(ConvertedType::TimestampMillis | ConvertedType::TimestampMicros)
+                    ) =>
+                    {
+                        if descriptor.converted_type == Some(ConvertedType::TimestampMillis) {
+                            EpochDateTime::from_unix_millis(v).map(|dt| dt.format_t_frac(3))
+                        } else {
+                            EpochDateTime::from_unix_micros(v).map(|dt| dt.format_t_frac(6))
+                        }
+                        .unwrap_or_else(|| v.to_string())
+                    }
+                    _ => v.to_string(),
+                }
+            }
+            PhysicalType::Int96 => {
+                let nanos_of_day = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let julian_day = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                // Julian day 2,440,588 is 1970-01-01 (the Unix epoch) -
+                // the same well-known constant already used elsewhere in
+                // this project (dBase's own DateTime field).
+                let unix_day = i64::from(julian_day) - 2_440_588;
+                let secs_in_day = u32::try_from(nanos_of_day / 1_000_000_000).unwrap_or(0);
+                let subsec_nanos = u32::try_from(nanos_of_day % 1_000_000_000).unwrap_or(0);
+                EpochDateTime::from_days_and_seconds(unix_day, secs_in_day, subsec_nanos)
+                    .map(|dt| dt.format_t_frac(9))
+                    .unwrap_or_else(|| format!("{julian_day}:{nanos_of_day}"))
+            }
+            PhysicalType::Float => f32::from_le_bytes(
+                bytes
+                    .try_into()
+                    .context("FLOAT value has the wrong width")?,
+            )
+            .to_string(),
+            PhysicalType::Double => f64::from_le_bytes(
+                bytes
+                    .try_into()
+                    .context("DOUBLE value has the wrong width")?,
+            )
+            .to_string(),
+            PhysicalType::ByteArray | PhysicalType::FixedLenByteArray => {
+                if is_utf8(descriptor) {
+                    String::from_utf8_lossy(bytes).into_owned()
+                } else if matches!(descriptor.logical_type, Some(LogicalType::Float16)) {
+                    f16_bytes_to_f64(bytes).to_string()
+                } else {
+                    // Matches `arrow::util::display`'s own
+                    // `DisplayIndex for &GenericBinaryArray` (verified
+                    // directly against the `arrow-cast` crate's source):
+                    // an un-annotated byte array always renders as a hex
+                    // dump, with no "looks like printable text"
+                    // heuristic - a value that happens to decode as
+                    // printable UTF-8 is still hex-dumped, since nothing
+                    // in the file's own metadata claims it's text.
+                    bytes.iter().map(|b| format!("{b:02x}")).collect()
+                }
+            }
+        })
+    }
+
+    fn decompress_page_bytes(codec: CompressionCodec, data: &[u8]) -> Result<Vec<u8>> {
+        match codec {
+            CompressionCodec::Uncompressed => Ok(data.to_vec()),
+            CompressionCodec::Snappy => snappy_support::snappy_decompress(data),
+            CompressionCodec::Gzip => {
+                gzip_decompress(data).context("failed to gzip-decompress a Parquet page")
+            }
+            CompressionCodec::Zstd => zstd_support::zstd_decompress(data)
+                .context("failed to zstd-decompress a Parquet page"),
+            other => {
+                bail!("Parquet compression codec {other:?} isn't supported by this reader yet")
+            }
+        }
+    }
+
+    /// Reads a *flat* (no repeated/list ancestors - `max_rep_level` must
+    /// be 0, a disclosed limitation of this phase) column chunk's real
+    /// values end to end: walks its pages (an optional leading
+    /// DICTIONARY_PAGE, then one or more DATA_PAGEs), decompressing each
+    /// with the chunk's own codec, decoding definition levels to find
+    /// null positions, and decoding PLAIN or RLE_DICTIONARY-encoded
+    /// values - rendered immediately to the same `Vec<Option<String>>`
+    /// shape every other reader in this project already produces.
+    pub(crate) fn decode_column_chunk(
+        file_data: &[u8],
+        chunk: &ColumnMetaData,
+        descriptor: &ColumnDescriptor,
+        max_values: Option<usize>,
+    ) -> Result<Vec<Option<String>>> {
+        if descriptor.max_rep_level != 0 {
+            bail!("nested/repeated columns aren't supported by this reader yet");
+        }
+        let mut pos = usize::try_from(
+            chunk
+                .dictionary_page_offset
+                .unwrap_or(chunk.data_page_offset),
+        )
+        .context("Parquet page offset exceeds usize")?;
+        let mut dictionary: Option<Vec<Vec<u8>>> = None;
+        let mut values: Vec<Option<String>> = Vec::new();
+        let want = max_values.unwrap_or(usize::MAX);
+        let total = usize::try_from(chunk.num_values).unwrap_or(usize::MAX);
+
+        while values.len() < total.min(want) && pos < file_data.len() {
+            let mut r = ThriftReader::new(&file_data[pos..]);
+            let header = read_page_header(&mut r)?;
+            let header_len = r.bytes_consumed();
+            let page_start = pos + header_len;
+            let page_end = page_start
+                .checked_add(
+                    usize::try_from(header.compressed_page_size)
+                        .context("negative Parquet page size")?,
+                )
+                .context("Parquet page end offset overflow")?;
+            let compressed = file_data
+                .get(page_start..page_end)
+                .context("truncated Parquet page")?;
+            pos = page_end;
+
+            match header.type_ {
+                ParquetPageType::DictionaryPage => {
+                    let dph = header
+                        .dictionary_page_header
+                        .as_ref()
+                        .context("DICTIONARY_PAGE missing its own header")?;
+                    if descriptor.physical_type == PhysicalType::Boolean {
+                        bail!("a dictionary-encoded BOOLEAN column is not valid Parquet");
+                    }
+                    let raw = decompress_page_bytes(chunk.codec, compressed)?;
+                    let mut dict = Vec::with_capacity(
+                        usize::try_from(dph.num_values).unwrap_or(0).min(1 << 20),
+                    );
+                    let mut dpos = 0usize;
+                    for _ in 0..dph.num_values {
+                        dict.push(plain_decode_one(
+                            &raw,
+                            &mut dpos,
+                            descriptor.physical_type,
+                            descriptor.type_length,
+                        )?);
+                    }
+                    dictionary = Some(dict);
+                }
+                ParquetPageType::DataPage => {
+                    let dp = header
+                        .data_page_header
+                        .as_ref()
+                        .context("DATA_PAGE missing its own header")?;
+                    let raw = decompress_page_bytes(chunk.codec, compressed)?;
+                    let num_values = usize::try_from(dp.num_values)
+                        .context("negative Parquet page num_values")?;
+                    let mut rpos = 0usize;
+
+                    if descriptor.max_rep_level > 0 {
+                        let len_bytes = raw
+                            .get(rpos..rpos + 4)
+                            .context("truncated repetition-level length")?;
+                        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                        rpos += 4 + len;
+                    }
+
+                    let def_levels = if descriptor.max_def_level > 0 {
+                        let len_bytes = raw
+                            .get(rpos..rpos + 4)
+                            .context("truncated definition-level length")?;
+                        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                        rpos += 4;
+                        let bytes = raw
+                            .get(rpos..rpos + len)
+                            .context("truncated definition levels")?;
+                        rpos += len;
+                        decode_rle_bit_packed_hybrid(
+                            bytes,
+                            num_required_bits(descriptor.max_def_level),
+                            num_values,
+                        )?
+                    } else {
+                        vec![0u64; num_values]
+                    };
+                    let max_def = i64::from(descriptor.max_def_level);
+                    let num_present = def_levels.iter().filter(|&&d| d as i64 == max_def).count();
+
+                    let present_values: Vec<Vec<u8>> = match dp.encoding {
+                        Encoding::Plain => {
+                            if descriptor.physical_type == PhysicalType::Boolean {
+                                let mut bit_offset = 0usize;
+                                (0..num_present)
+                                    .map(|_| {
+                                        read_bits(&raw[rpos..], &mut bit_offset, 1)
+                                            .map(|b| vec![b as u8])
+                                    })
+                                    .collect::<Result<Vec<_>>>()?
+                            } else {
+                                let mut vpos = rpos;
+                                (0..num_present)
+                                    .map(|_| {
+                                        plain_decode_one(
+                                            &raw,
+                                            &mut vpos,
+                                            descriptor.physical_type,
+                                            descriptor.type_length,
+                                        )
+                                    })
+                                    .collect::<Result<Vec<_>>>()?
+                            }
+                        }
+                        Encoding::RleDictionary | Encoding::PlainDictionary => {
+                            let dict = dictionary.as_ref().context(
+                                "RLE_DICTIONARY data page with no preceding dictionary page",
+                            )?;
+                            let bit_width = u32::from(
+                                *raw.get(rpos)
+                                    .context("truncated dictionary-index bit width byte")?,
+                            );
+                            rpos += 1;
+                            let indices =
+                                decode_rle_bit_packed_hybrid(&raw[rpos..], bit_width, num_present)?;
+                            indices
+                                .into_iter()
+                                .map(|idx| {
+                                    let idx = usize::try_from(idx)
+                                        .context("dictionary index overflow")?;
+                                    dict.get(idx)
+                                        .cloned()
+                                        .context("dictionary index out of range")
+                                })
+                                .collect::<Result<Vec<_>>>()?
+                        }
+                        other => {
+                            bail!("Parquet encoding {other:?} isn't supported by this reader yet")
+                        }
+                    };
+
+                    let mut present_iter = present_values.into_iter();
+                    for d in &def_levels {
+                        if values.len() >= want {
+                            break;
+                        }
+                        if *d as i64 == max_def {
+                            let bytes = present_iter
+                                .next()
+                                .context("ran out of decoded values before definition levels")?;
+                            values.push(Some(render_value_bytes(&bytes, descriptor)?));
+                        } else {
+                            values.push(None);
+                        }
+                    }
+                }
+                ParquetPageType::DataPageV2 => {
+                    bail!("Data Page V2 isn't supported by this reader yet");
+                }
+                ParquetPageType::IndexPage => {}
+            }
+        }
+        Ok(values)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -7704,6 +8776,174 @@ mod parquet_support {
                 .expect_err("garbage bytes should not parse as a parquet footer");
             let msg = format!("{err:?}");
             assert!(msg.contains("PAR1") || msg.contains("small"), "{msg}");
+        }
+
+        /// Renders a `parquet` crate `record::Field` value to a plain
+        /// string matching this reader's own rendering conventions
+        /// (`render_value_bytes`) - deliberately *not* `Field`'s own
+        /// `Display` impl, which quotes strings and force-appends `.0`
+        /// to whole-number floats, neither of which this project's own
+        /// convention does.
+        fn oracle_field_to_string(field: &parquet::record::Field) -> Option<String> {
+            use parquet::record::Field;
+            match field {
+                Field::Null => None,
+                Field::Bool(v) => Some(v.to_string()),
+                Field::Byte(v) => Some(v.to_string()),
+                Field::Short(v) => Some(v.to_string()),
+                Field::Int(v) => Some(v.to_string()),
+                Field::Long(v) => Some(v.to_string()),
+                Field::UByte(v) => Some(v.to_string()),
+                Field::UShort(v) => Some(v.to_string()),
+                Field::UInt(v) => Some(v.to_string()),
+                Field::ULong(v) => Some(v.to_string()),
+                Field::Float(v) => Some(v.to_string()),
+                Field::Double(v) => Some(v.to_string()),
+                Field::Str(v) => Some(v.clone()),
+                Field::Bytes(v) => Some(v.data().iter().map(|b| format!("{b:02x}")).collect()),
+                Field::Date(days) => EpochDate::from_days(i64::from(*days)).map(|d| d.format_ymd()),
+                Field::TimestampMillis(ms) => {
+                    EpochDateTime::from_unix_millis(*ms).map(|dt| dt.format_t_frac(3))
+                }
+                Field::TimestampMicros(us) => {
+                    EpochDateTime::from_unix_micros(*us).map(|dt| dt.format_t_frac(6))
+                }
+                Field::TimeMillis(ms) => EpochTime::from_seconds_since_midnight(
+                    (ms / 1000).try_into().unwrap_or(0),
+                    (ms % 1000).unsigned_abs() * 1_000_000,
+                )
+                .map(|t| t.format_hms_frac(3)),
+                Field::TimeMicros(us) => {
+                    let secs = us.div_euclid(1_000_000);
+                    let micros = us.rem_euclid(1_000_000) as u32;
+                    u32::try_from(secs)
+                        .ok()
+                        .and_then(|s| EpochTime::from_seconds_since_midnight(s, micros * 1000))
+                        .map(|t| t.format_hms_frac(6))
+                }
+                Field::Decimal(d) => Some(decimal_bytes_to_string(d.data(), d.scale())),
+                // `half::f16`'s own `Display` always shows a decimal
+                // point (`Field::Float16(f16::ONE)` -> "1.0"), unlike
+                // `f32`/`f64`'s own `Display` (which drops a trailing
+                // `.0`) - normalized here to match this project's own
+                // established Float/Double rendering convention, the
+                // same "don't trust the oracle crate's raw Display,
+                // remap it" treatment Decimal/Date/Timestamp already get
+                // above.
+                Field::Float16(v) => Some(f64::from(*v).to_string()),
+                other => Some(format!("{other}")),
+            }
+        }
+
+        /// Cross-verification oracle for the hand-rolled column-chunk
+        /// value decoder against the real `parquet` crate's own
+        /// `record::Row` API - a genuinely independent code path within
+        /// the same crate (it doesn't go through Arrow at all, unlike
+        /// this project's own live `columns_from_parquet`), used here
+        /// specifically for the plain, typed value access it gives.
+        /// Scoped to flat schemas only (every leaf's `max_rep_level`
+        /// must be 0 AND its path a single segment - a required/optional
+        /// struct member can have `max_rep_level == 0` while still being
+        /// nested one or more levels deep, and `record::Row::
+        /// get_column_iter()` only ever exposes a row's own top-level
+        /// fields, not a flattened dotted path into a nested `Field::
+        /// Group` - so a real struct member is a genuine test-harness
+        /// gap here, not a decoder bug: `decode_column_chunk` itself
+        /// already decodes a nested leaf's raw values correctly
+        /// regardless of nesting depth, since Parquet's own column chunks
+        /// are always physically flat/columnar - only the *logical*
+        /// nested-object reconstruction (a separate, later phase) is
+        /// actually missing), matching this phase's own disclosed
+        /// limitation. INT96 columns are also skipped here: confirmed by
+        /// reading the `parquet` crate's own source
+        /// (`record::api::convert_int96`) that this oracle hardcodes
+        /// every INT96 value to millisecond precision
+        /// (`Field::TimestampMillis(value.to_millis())`), discarding real
+        /// sub-millisecond precision at the source - independently
+        /// confirmed (by reading `parquet::arrow::array_reader::
+        /// primitive_array`'s own `IntoBuffer for Vec<Int96>` impl) that
+        /// arrow-rs's own *default* INT96-to-Arrow conversion (the path
+        /// this project's actual live `columns_from_parquet` already
+        /// uses) targets `Timestamp(Nanosecond, _)`, not milliseconds -
+        /// so this reader's own nanosecond-precision INT96 rendering is
+        /// the behavior actually worth matching, and the record-API
+        /// oracle is lossy in a way that can't be normalized away by
+        /// reformatting, unlike every other oracle quirk this function
+        /// already accounts for.
+        fn decode_column_chunk_matches_the_record_api(path: &str) {
+            let (file_data, meta) =
+                read_footer(Path::new(path)).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+            let schema = build_schema(&meta.schema).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+            let leaves = schema_leaves(&schema);
+
+            let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let oracle_reader = parquet::file::reader::SerializedFileReader::new(file)
+                .unwrap_or_else(|e| panic!("{path}: oracle open failed: {e}"));
+            let oracle_rows: Vec<parquet::record::Row> = {
+                use parquet::file::reader::FileReader;
+                oracle_reader
+                    .get_row_iter(None)
+                    .unwrap_or_else(|e| panic!("{path}: oracle row iter failed: {e}"))
+                    .map(|r| r.unwrap_or_else(|e| panic!("{path}: oracle row failed: {e}")))
+                    .collect()
+            };
+
+            for descriptor in &leaves {
+                if descriptor.max_rep_level != 0 || descriptor.path.len() != 1 {
+                    continue; // out of scope for this phase - see doc comment above
+                }
+                if descriptor.physical_type == PhysicalType::Int96 {
+                    continue; // the record-API oracle is itself lossy here - see doc comment above
+                }
+                let col_name = descriptor.path.join(".");
+                let mut global_row = 0usize;
+                for rg in &meta.row_groups {
+                    let chunk = rg
+                        .columns
+                        .iter()
+                        .find_map(|c| {
+                            c.meta_data
+                                .as_ref()
+                                .filter(|m| m.path_in_schema.join(".") == col_name)
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("{path}: column {col_name:?} missing from a row group")
+                        });
+                    let mine = decode_column_chunk(&file_data, chunk, descriptor, None)
+                        .unwrap_or_else(|e| {
+                            panic!("{path} col {col_name:?}: hand-rolled decode failed: {e:?}")
+                        });
+                    for (local_row_idx, value) in mine.iter().enumerate() {
+                        let row_idx = global_row + local_row_idx;
+                        let oracle_row = &oracle_rows[row_idx];
+                        let oracle_field = oracle_row
+                            .get_column_iter()
+                            .find(|(name, _)| *name == descriptor.path.last().unwrap())
+                            .map(|(_, f)| f)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{path} col {col_name:?} row {row_idx}: missing from oracle row"
+                                )
+                            });
+                        let expected = oracle_field_to_string(oracle_field);
+                        assert_eq!(
+                            value, &expected,
+                            "{path} col {col_name:?} row {row_idx}: mine={value:?} oracle={expected:?}"
+                        );
+                    }
+                    global_row += mine.len();
+                }
+            }
+        }
+
+        #[test]
+        fn decode_column_chunk_matches_the_record_api_on_real_fixtures() {
+            for f in [
+                "tests/fixtures/sample.parquet",
+                "tests/fixtures/type_detection.parquet",
+            ] {
+                decode_column_chunk_matches_the_record_api(f);
+            }
         }
 
         /// Cross-verification oracle for the hand-rolled footer parser
@@ -7847,6 +9087,102 @@ mod parquet_support {
             for f in &failures {
                 eprintln!("MISMATCH: {f}");
             }
+        }
+
+        #[test]
+        #[ignore]
+        fn decode_column_chunk_matches_the_record_api_on_the_real_world_corpus() {
+            let dir = std::path::Path::new(
+                "/private/tmp/claude-501/-Users-andrewmayes-Projects-sniff-rs/48c37152-91f1-4659-9492-11b43ef0f2f8/scratchpad/pq_test/data",
+            );
+            let mut files = Vec::new();
+            fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                let Ok(rd) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if p.extension().is_some_and(|e| e == "parquet") {
+                        out.push(p);
+                    }
+                }
+            }
+            walk(dir, &mut files);
+            assert!(!files.is_empty(), "corpus not present at {dir:?}");
+            let mut ok = 0;
+            let mut skipped = 0;
+            let mut failures = Vec::new();
+            let mut known_gaps = Vec::new();
+            let mut oracle_limits = Vec::new();
+            for f in &files {
+                let path = f.to_str().unwrap();
+                // Filter to flat, single-segment-path schemas up front
+                // (rather than inside the panic boundary) so a nested
+                // file's *expected* refusal doesn't get counted as a real
+                // mismatch - matching `decode_column_chunk_matches_the_
+                // record_api`'s own scope (see its doc comment).
+                let is_flat = std::panic::catch_unwind(|| {
+                    let (_, meta) = read_footer(Path::new(path)).ok()?;
+                    let schema = build_schema(&meta.schema).ok()?;
+                    Some(
+                        schema_leaves(&schema)
+                            .iter()
+                            .all(|d| d.max_rep_level == 0 && d.path.len() == 1),
+                    )
+                })
+                .ok()
+                .flatten();
+                if is_flat != Some(true) {
+                    skipped += 1;
+                    continue;
+                }
+                let result =
+                    std::panic::catch_unwind(|| decode_column_chunk_matches_the_record_api(path));
+                if let Err(payload) = result {
+                    // Bucket a panic by its own message rather than
+                    // reporting every failure as an undifferentiated
+                    // "mismatch": a not-yet-implemented encoding/codec is
+                    // this reader's own disclosed, on-roadmap gap (not a
+                    // bug), and "oracle ... failed" means the real
+                    // `parquet` crate itself couldn't even open/iterate
+                    // the file - a pre-existing limitation of the oracle
+                    // being cross-checked against, not this reader.
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("");
+                    if msg.contains("isn't supported by this reader yet") {
+                        known_gaps.push(path.to_string());
+                    } else if msg.contains("oracle open failed")
+                        || msg.contains("oracle row iter failed")
+                        || msg.contains("oracle row failed")
+                    {
+                        oracle_limits.push(path.to_string());
+                    } else {
+                        failures.push(path.to_string());
+                    }
+                } else {
+                    ok += 1;
+                }
+            }
+            let total = ok + known_gaps.len() + oracle_limits.len() + failures.len();
+            eprintln!(
+                "{ok}/{total} flat-schema files matched the oracle exactly ({skipped} nested/unreadable files skipped, \
+                 {} on this reader's own disclosed roadmap gaps, {} the oracle crate's own pre-existing limits)",
+                known_gaps.len(),
+                oracle_limits.len()
+            );
+            for f in &failures {
+                eprintln!("MISMATCH: {f}");
+            }
+            assert!(
+                failures.is_empty(),
+                "{} genuine mismatch(es) found - see stderr",
+                failures.len()
+            );
         }
 
         /// A real-world sweep against the `apache/parquet-testing` corpus
@@ -8626,126 +9962,6 @@ mod avro_support {
         })
     }
 
-    /// Hand-rolled decoder for Snappy's *raw* block format (not the
-    /// higher-level "frame" format) - verified directly against the `snap`
-    /// crate's own `decompress.rs`/`build.rs` (which generates its tag
-    /// lookup table from the exact bit-layout rules this function encodes
-    /// directly): a header varint (plain, not zigzagged) giving the total
-    /// decompressed length, then a sequence of literal/copy elements. A
-    /// tag byte's low 2 bits select the element: `00` is a literal (length
-    /// in the top 6 bits, or - if that field is 60-63 - the real length
-    /// minus one follows as 1-4 little-endian bytes); `01`/`10`/`11` are
-    /// back-reference copies with a 1/2/4-byte offset respectively.
-    fn snappy_decompress(input: &[u8]) -> Result<Vec<u8>> {
-        let mut pos = 0usize;
-        let mut shift = 0u32;
-        let mut decompressed_len: u64 = 0;
-        loop {
-            let b = *input
-                .get(pos)
-                .context("truncated Snappy stream: missing length header")?;
-            pos += 1;
-            decompressed_len |= u64::from(b & 0x7F) << shift;
-            if b & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 35 {
-                bail!("malformed Snappy length header");
-            }
-        }
-        let decompressed_len =
-            usize::try_from(decompressed_len).context("Snappy decompressed length overflow")?;
-        if decompressed_len > MAX_ALLOC {
-            bail!("Snappy decompressed length {decompressed_len} exceeds the sanity cap");
-        }
-
-        let mut out = Vec::with_capacity(decompressed_len.min(MAX_ALLOC));
-        while pos < input.len() {
-            let tag = input[pos];
-            pos += 1;
-            match tag & 0x03 {
-                0b00 => {
-                    let mut len = usize::from(tag >> 2) + 1;
-                    if len > 60 {
-                        let n = len - 60;
-                        if pos + n > input.len() {
-                            bail!("truncated Snappy literal length");
-                        }
-                        let mut raw = 0u64;
-                        for i in 0..n {
-                            raw |= u64::from(input[pos + i]) << (8 * i);
-                        }
-                        pos += n;
-                        len = usize::try_from(raw + 1).context("Snappy literal length overflow")?;
-                    }
-                    if pos + len > input.len() {
-                        bail!("truncated Snappy literal");
-                    }
-                    out.extend_from_slice(&input[pos..pos + len]);
-                    pos += len;
-                }
-                0b01 => {
-                    let len = usize::from((tag >> 2) & 0x07) + 4;
-                    let offset_hi = usize::from((tag >> 5) & 0x07);
-                    let next = *input.get(pos).context("truncated Snappy copy offset")?;
-                    pos += 1;
-                    let offset = (offset_hi << 8) | usize::from(next);
-                    copy_from_offset(&mut out, offset, len)?;
-                }
-                0b10 => {
-                    let len = usize::from(tag >> 2) + 1;
-                    if pos + 2 > input.len() {
-                        bail!("truncated Snappy copy offset");
-                    }
-                    let offset = usize::from(input[pos]) | (usize::from(input[pos + 1]) << 8);
-                    pos += 2;
-                    copy_from_offset(&mut out, offset, len)?;
-                }
-                0b11 => {
-                    let len = usize::from(tag >> 2) + 1;
-                    if pos + 4 > input.len() {
-                        bail!("truncated Snappy copy offset");
-                    }
-                    let offset = usize::from(input[pos])
-                        | (usize::from(input[pos + 1]) << 8)
-                        | (usize::from(input[pos + 2]) << 16)
-                        | (usize::from(input[pos + 3]) << 24);
-                    pos += 4;
-                    copy_from_offset(&mut out, offset, len)?;
-                }
-                _ => unreachable!("2-bit tag"),
-            }
-        }
-        if out.len() != decompressed_len {
-            bail!(
-                "Snappy stream decoded to {} bytes, header declared {decompressed_len}",
-                out.len()
-            );
-        }
-        Ok(out)
-    }
-
-    /// Appends `len` bytes to `out`, each copied from `offset` bytes
-    /// before the current end - a back-reference that may legitimately
-    /// overlap itself (e.g. offset 1, len 10 repeats the last byte 10
-    /// times), so this must copy one byte at a time rather than via a
-    /// single slice copy.
-    fn copy_from_offset(out: &mut Vec<u8>, offset: usize, len: usize) -> Result<()> {
-        if offset == 0 || offset > out.len() {
-            bail!(
-                "invalid Snappy back-reference offset {offset} at output length {}",
-                out.len()
-            );
-        }
-        let start = out.len() - offset;
-        for i in 0..len {
-            let byte = out[start + i];
-            out.push(byte);
-        }
-        Ok(())
-    }
-
     fn decompress_codec(codec: &str, data: Vec<u8>) -> Result<Vec<u8>> {
         match codec {
             "null" => Ok(data),
@@ -8755,7 +9971,7 @@ mod avro_support {
                     .len()
                     .checked_sub(4)
                     .context("Avro snappy block is too short for its trailing CRC32")?;
-                let decoded = snappy_decompress(&data[..data_end])?;
+                let decoded = snappy_support::snappy_decompress(&data[..data_end])?;
                 let expected = u32::from_be_bytes(data[data_end..].try_into().unwrap());
                 let actual = crc32(&decoded);
                 if expected != actual {
@@ -18709,12 +19925,156 @@ mod xlsx_support {
 /// Dictionaries are out of scope (this project's `.zst` use case never
 /// needs them, the same "no dictionary support" boundary noted elsewhere).
 ///
-/// Gated on `any(zstd, avro)`, not just `zstd`: the `avro` feature's own
-/// hand-rolled reader (`avro_support`) reuses `zstd_decompress` directly
-/// for Avro's Zstandard codec, the same way it reuses `inflate` for
-/// Avro's Deflate codec - one decoder serving two independent features,
-/// exactly like `zip_support` already serves both `xlsx` and `npy`.
-#[cfg(any(feature = "zstd", feature = "avro"))]
+/// A hand-rolled decoder for Snappy's *raw* block format (not the higher-
+/// level "frame" format), shared by `avro_support` (Avro's own Snappy
+/// codec, which appends an extra trailing CRC32 this module knows nothing
+/// about - that framing is Avro's own concern, handled by its caller) and
+/// `parquet_support` (Parquet's SNAPPY page-compression codec, which uses
+/// the raw block with no extra framing at all) - one decoder serving two
+/// independent features, the same "one hand-rolled implementation, several
+/// gates" shape `zip_support`/`zstd_support` already use.
+#[cfg(any(feature = "avro", feature = "parquet"))]
+mod snappy_support {
+    use super::*;
+
+    /// A sanity cap on the decompressed length a Snappy stream's own
+    /// header varint claims, guarding against a corrupted/adversarial
+    /// length forcing a huge allocation before any real data backs it up,
+    /// the same class of guard this project's other hand-rolled binary
+    /// readers already apply to their own untrusted length fields (see
+    /// `avro_support`'s own identically-named, identically-valued
+    /// constant, kept separate since this module has no other reason to
+    /// depend on `avro_support`'s own internals).
+    const MAX_ALLOC: usize = 512 * 1024 * 1024;
+
+    /// Verified directly against the `snap` crate's own
+    /// `decompress.rs`/`build.rs` (which generates its tag lookup table
+    /// from the exact bit-layout rules this function encodes directly): a
+    /// header varint (plain, not zigzagged) giving the total decompressed
+    /// length, then a sequence of literal/copy elements. A tag byte's low
+    /// 2 bits select the element: `00` is a literal (length in the top 6
+    /// bits, or - if that field is 60-63 - the real length minus one
+    /// follows as 1-4 little-endian bytes); `01`/`10`/`11` are back-
+    /// reference copies with a 1/2/4-byte offset respectively.
+    pub(crate) fn snappy_decompress(input: &[u8]) -> Result<Vec<u8>> {
+        let mut pos = 0usize;
+        let mut shift = 0u32;
+        let mut decompressed_len: u64 = 0;
+        loop {
+            let b = *input
+                .get(pos)
+                .context("truncated Snappy stream: missing length header")?;
+            pos += 1;
+            decompressed_len |= u64::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 35 {
+                bail!("malformed Snappy length header");
+            }
+        }
+        let decompressed_len =
+            usize::try_from(decompressed_len).context("Snappy decompressed length overflow")?;
+        if decompressed_len > MAX_ALLOC {
+            bail!("Snappy decompressed length {decompressed_len} exceeds the sanity cap");
+        }
+
+        let mut out = Vec::with_capacity(decompressed_len.min(MAX_ALLOC));
+        while pos < input.len() {
+            let tag = input[pos];
+            pos += 1;
+            match tag & 0x03 {
+                0b00 => {
+                    let mut len = usize::from(tag >> 2) + 1;
+                    if len > 60 {
+                        let n = len - 60;
+                        if pos + n > input.len() {
+                            bail!("truncated Snappy literal length");
+                        }
+                        let mut raw = 0u64;
+                        for i in 0..n {
+                            raw |= u64::from(input[pos + i]) << (8 * i);
+                        }
+                        pos += n;
+                        len = usize::try_from(raw + 1).context("Snappy literal length overflow")?;
+                    }
+                    if pos + len > input.len() {
+                        bail!("truncated Snappy literal");
+                    }
+                    out.extend_from_slice(&input[pos..pos + len]);
+                    pos += len;
+                }
+                0b01 => {
+                    let len = usize::from((tag >> 2) & 0x07) + 4;
+                    let offset_hi = usize::from((tag >> 5) & 0x07);
+                    let next = *input.get(pos).context("truncated Snappy copy offset")?;
+                    pos += 1;
+                    let offset = (offset_hi << 8) | usize::from(next);
+                    copy_from_offset(&mut out, offset, len)?;
+                }
+                0b10 => {
+                    let len = usize::from(tag >> 2) + 1;
+                    if pos + 2 > input.len() {
+                        bail!("truncated Snappy copy offset");
+                    }
+                    let offset = usize::from(input[pos]) | (usize::from(input[pos + 1]) << 8);
+                    pos += 2;
+                    copy_from_offset(&mut out, offset, len)?;
+                }
+                0b11 => {
+                    let len = usize::from(tag >> 2) + 1;
+                    if pos + 4 > input.len() {
+                        bail!("truncated Snappy copy offset");
+                    }
+                    let offset = usize::from(input[pos])
+                        | (usize::from(input[pos + 1]) << 8)
+                        | (usize::from(input[pos + 2]) << 16)
+                        | (usize::from(input[pos + 3]) << 24);
+                    pos += 4;
+                    copy_from_offset(&mut out, offset, len)?;
+                }
+                _ => unreachable!("2-bit tag"),
+            }
+        }
+        if out.len() != decompressed_len {
+            bail!(
+                "Snappy stream decoded to {} bytes, header declared {decompressed_len}",
+                out.len()
+            );
+        }
+        Ok(out)
+    }
+
+    /// Appends `len` bytes to `out`, each copied from `offset` bytes
+    /// before the current end - a back-reference that may legitimately
+    /// overlap itself (e.g. offset 1, len 10 repeats the last byte 10
+    /// times), so this must copy one byte at a time rather than via a
+    /// single slice copy.
+    fn copy_from_offset(out: &mut Vec<u8>, offset: usize, len: usize) -> Result<()> {
+        if offset == 0 || offset > out.len() {
+            bail!(
+                "invalid Snappy back-reference offset {offset} at output length {}",
+                out.len()
+            );
+        }
+        let start = out.len() - offset;
+        for i in 0..len {
+            let byte = out[start + i];
+            out.push(byte);
+        }
+        Ok(())
+    }
+} // mod snappy_support
+
+/// Gated on `any(zstd, avro, parquet)`, not just `zstd`: the `avro`
+/// feature's own hand-rolled reader (`avro_support`) reuses
+/// `zstd_decompress` directly for Avro's Zstandard codec, the same way
+/// it reuses `inflate` for Avro's Deflate codec, and `parquet_support`
+/// reuses it too for Parquet's own ZSTD page-compression codec - one
+/// decoder serving three independent features, exactly like `zip_support`
+/// already serves both `xlsx` and `npy`.
+#[cfg(any(feature = "zstd", feature = "avro", feature = "parquet"))]
 mod zstd_support {
     use super::*;
 

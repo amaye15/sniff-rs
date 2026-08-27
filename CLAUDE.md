@@ -4428,6 +4428,169 @@ this project could just implement directly rather than depend on:
   matched, verified, and cut over in one deliberate step - not
   incrementally swapped out from under a working build.
 
+  **Phase B (this session): schema tree reconstruction, page headers, the
+  RLE/bit-packing hybrid, PLAIN decoding for every physical type,
+  dictionary encoding, and `LogicalType`-aware value rendering - still not
+  wired into `columns_from_parquet`.** `build_schema`/`schema_from_array_helper`
+  turn Phase A's flat, depth-first `SchemaElement` list into a real
+  `SchemaNode` tree (verified field-by-field against the `parquet` crate's
+  own `schema/types.rs`), and `collect_leaves`/`schema_leaves` walk it into
+  the flat `ColumnDescriptor` list (path, max definition/repetition level,
+  physical/converted/logical type) every later step keys off - the same
+  `build_tree` logic that crate uses internally. Page headers
+  (`ParquetPageHeader`/`DataPageHeaderV1`/`DataPageHeaderV2`/
+  `DictionaryPageHeader`) are just more Thrift structs read with the exact
+  same field-ID-loop-with-skip machinery Phase A already built. The RLE/
+  bit-packing hybrid encoding (shared by definition/repetition levels and
+  by `RLE_DICTIONARY` indices) was verified directly against
+  `util/bit_util.rs`'s own doc comment for one specific, easy-to-get-wrong
+  detail: a bit-packed run's values are consumed **LSB-first**, not MSB-
+  first the way a naive big-endian reading of "pack N-bit values into
+  bytes" would assume. PLAIN decoding covers all seven physical types,
+  including INT96's legacy 12-byte (8-byte nanoseconds-of-day + 4-byte
+  Julian day) layout, reusing the same Julian-day-2,440,588-is-the-Unix-
+  epoch constant this project's own dBase reader already established.
+  `LogicalType`/`ConvertedType`-aware rendering covers DECIMAL (both the
+  INT32/INT64-backed and BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY-backed forms, via
+  a near-duplicate of `avro_support`'s own schoolbook-long-division
+  decimal-to-string conversion - deliberately not shared, since `avro`/
+  `parquet` are independently togglable features, the same tradeoff made
+  throughout this section), DATE, TIME/TIMESTAMP at all three units
+  (millis/micros/nanos), and Float16 (see below). Compression codec
+  dispatch needed no new algorithmic work at all: Parquet's GZIP codec
+  wraps the *full* gzip container (reusing `gzip_decompress` directly),
+  while Snappy and Zstd are raw blocks/frames with no extra framing
+  (reusing `snappy_support::snappy_decompress`, newly extracted from
+  `avro_support` into its own `any(avro, parquet)`-gated module for this
+  purpose, and the existing `zstd_support::zstd_decompress`, whose own
+  feature gate widened the same way). Scope for this phase is deliberately
+  narrow and disclosed up front, matching this project's usual "confident
+  common case, explicit gap" discipline: only `max_rep_level == 0`
+  columns (no repeated fields, i.e. no arrays) are decoded at all, and
+  Data Page V2 and every non-PLAIN/non-dictionary encoding
+  (`DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/`DELTA_BYTE_ARRAY`/
+  `BYTE_STREAM_SPLIT`) and non-{Uncompressed,Snappy,Gzip,Zstd} codec
+  (LZO/Brotli/LZ4/LZ4_RAW) bail with a clear, disclosed error rather than
+  attempting a guess - all explicitly deferred to a later phase, per the
+  plan Phase A already laid out.
+
+  **Verification used a genuinely independent oracle, not the Arrow path
+  this project's own live reader depends on**: `parquet::record::Row` /
+  `Field` - a separate, non-Arrow read API the same crate also exposes -
+  so a bug shared between this hand-roll and the Arrow bridge code
+  wouldn't get invisibly rubber-stamped by comparing against itself.
+  `oracle_field_to_string` remaps several of that API's own rendering
+  quirks to match this project's already-established conventions (Decimal/
+  Date/Timestamp all need this already; Float16 needed a new one, see
+  below) rather than trusting `Field`'s raw `Display` output verbatim -
+  the same "don't trust the oracle crate's own formatting, normalize it"
+  treatment this project's other cross-verification oracles already get.
+
+  **A real bug was found - in the *test harness*, not the decoder itself -
+  via the same real-world-corpus methodology every other hand-roll in this
+  project already used.** The two core fixtures
+  (`sample.parquet`/`type_detection.parquet`, both single-row-group files)
+  passed cleanly on the first attempt, but a further sweep against the
+  official `apache/parquet-testing` corpus (`data/`, the same 79-file
+  corpus Phase A's own footer test already used) showed several
+  multi-row-group files decoding to values that looked wildly,
+  structurally wrong - not a formatting difference, but e.g. a `group`
+  column's row 0 reading as `"empty-geometries"` when both the oracle
+  *and* an independently-run `pyarrow` check agreed the real value was
+  `"all"`. Manually hand-tracing the file's own raw Thrift bytes
+  byte-by-byte (the same "verify against actual bytes, don't trust a
+  first read of the spec" discipline as every other hand-roll's own
+  verification) confirmed the *decoder's* own page-header and dictionary-
+  page parsing were correct throughout. The actual bug was in
+  `decode_column_chunk_matches_the_record_api` itself: its per-row-group
+  `mine` vector is indexed from 0 for *that* row group, but the test was
+  comparing it against `oracle_rows[row_idx]` - the *global*, whole-file
+  row list - so anything past the first row group silently compared
+  against the wrong rows. Invisible on both committed fixtures precisely
+  *because* they only have one row group each (index 0 is both the local
+  and the global row index there), and only surfaced by a real multi-row-
+  group file from the wider corpus. Fixed by threading a running
+  `global_row` offset (incremented by each row group's own decoded row
+  count) through the comparison loop.
+
+  **Two more real, narrower gaps were found and fixed once this test bug
+  no longer masked genuine results**: this reader's own printable-text
+  heuristic for an un-annotated (no UTF8 `LogicalType`/`ConvertedType`)
+  `BYTE_ARRAY`/`FIXED_LEN_BYTE_ARRAY` value was wrong - checked directly
+  against `arrow-cast`'s own `DisplayIndex for &GenericBinaryArray` (the
+  exact code this project's *own, currently-live* `columns_from_parquet`
+  already depends on for this), which always hex-dumps such a value with
+  no "does it happen to look like text" heuristic at all. Removed in favor
+  of always hex-dumping, matching the behavior this project's live reader
+  already has today. Separately, `LogicalType::Float16` had no rendering
+  case at all (falling through to a raw 2-byte hex dump instead of a real
+  float) - `f16_bytes_to_f64` (a deliberate, disclosed duplicate of
+  `cbor_support`'s own already-hand-verified half-precision conversion
+  formula, not shared for the same independently-togglable-features reason
+  as the decimal conversion above) closes this. Fixing Float16 rendering
+  then surfaced a *third*, oracle-side-only issue: `half::f16`'s own
+  `Display` impl always shows a decimal point (`Field::Float16(f16::ONE)`
+  formats as `"1.0"`, confirmed directly in the `parquet` crate's own
+  `record/api.rs` test module), unlike this project's established `f32`/
+  `f64` rendering convention (which drops a trailing `.0`, since Rust's own
+  float `Display` already does) - normalized in `oracle_field_to_string`
+  the same way every other oracle-specific quirk in that function already
+  is, not treated as a reason to change this reader's own, already-
+  consistent rendering.
+
+  **INT96 timestamps surfaced a genuine oracle limitation, not a bug in
+  this reader - confirmed by reading the source on both sides, not just
+  picking whichever output looked more familiar.** The `record` API oracle
+  renders every INT96 value at fixed millisecond precision -
+  `record::api::convert_int96`'s own body is `Field::TimestampMillis(value
+  .to_millis())`, discarding real sub-millisecond precision at the point
+  of conversion, confirmed directly in the crate's source. But this
+  project's own *live* `columns_from_parquet` doesn't go through the
+  `record` API at all - it reads through Arrow, whose own INT96-to-Arrow
+  conversion (confirmed in `parquet::arrow::array_reader::primitive_array`'s
+  `IntoBuffer for Vec<Int96>` impl) targets `Timestamp(Nanosecond, _)` by
+  default, not milliseconds. This reader's own nanosecond-precision INT96
+  rendering is therefore the behavior actually worth matching; the
+  record-API oracle is the one that's lossy here, in a way `oracle_field_
+  to_string` can't fix by reformatting (the precision is already gone by
+  the time `Field::TimestampMillis` exists). INT96 columns are excluded
+  from this specific cross-check with a comment explaining exactly this,
+  rather than either silently passing a wrong comparison or forcing this
+  reader to (incorrectly) truncate to match a lossy oracle.
+
+  **Final numbers after all of the above**: both committed fixtures still
+  match the oracle value-for-value on every in-scope column, and a fresh,
+  full sweep of the 79-file real-world corpus (transient, not committed,
+  same practice as every other corpus pass in this document) - now
+  correctly bucketing failures by *cause* rather than reporting an
+  undifferentiated pass/fail count - shows 43 of 63 flat, single-segment-
+  path-schema files matching the oracle exactly, 16 skipped for having a
+  nested/repeated column (out of scope for this phase, see above), 18
+  hitting this reader's own already-disclosed, on-the-roadmap gaps (Data
+  Page V2 encoding, `BYTE_STREAM_SPLIT`, or the LZ4/LZ4_RAW codecs - all
+  named above as deliberately not started yet), 2 hitting the oracle
+  crate's own pre-existing decoding limits (`dict-page-offset-zero.parquet`
+  and `nation.dict-malformed.parquet`, both already documented elsewhere in
+  this file as known `parquet`/`arrow` crate limits from this project's
+  prior real-world Parquet validation pass) - and **zero** genuine,
+  unexplained mismatches. The corpus test itself now asserts this last
+  count is zero, rather than only logging failures for a human to eyeball,
+  so a future regression here fails loudly rather than blending into an
+  expected-gaps list.
+
+  **Still deliberately not started, in the same order Phase A laid out**:
+  Data Page V2; `DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/
+  `DELTA_BYTE_ARRAY`/`BYTE_STREAM_SPLIT` encodings; the LZO/Brotli/LZ4/
+  LZ4_RAW compression codecs; nested Struct/List/Map reconstruction from
+  definition/repetition levels (`max_rep_level != 0` columns are still
+  explicitly rejected); and, last, Arrow IPC/Feather's own separate
+  FlatBuffers-based schema/`RecordBatch` framework, entirely unstarted.
+  `parquet_support` remains a real but dormant module
+  (`#[allow(dead_code)]`, exercised only by its own tests) and `arrow`/
+  `parquet` remain live runtime dependencies until every behavior this
+  project currently documents and tests for Parquet/Arrow IPC is matched,
+  verified, and cut over in one deliberate step.
+
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above (in progress, not declined), `serde`/`serde_json` are meant to
 stay a dependency permanently. They're also the one that's always been
