@@ -4834,16 +4834,187 @@ this project could just implement directly rather than depend on:
   (`delta_binary_packed.parquet`'s own `bitwidth0` column name states its
   own edge case directly: a miniblock where every delta is identical).
 
+  **Phase F (this session): nested Struct/List/Map reconstruction from
+  definition/repetition levels - still not wired into
+  `columns_from_parquet`.** By far the largest, most intricate piece of
+  this whole hand-roll campaign - genuinely the hardest part of the
+  Parquet format, comparable in complexity to the rest of the reader
+  combined - picked next specifically because it builds directly on
+  machinery already in place (this phase's own leaf-level decoding reuses
+  `decode_present_values`/`decompress_page_bytes`/the RLE/bit-packing
+  hybrid decoder unchanged) rather than requiring an entirely new parsing
+  framework the way Arrow IPC's own FlatBuffers layer still would, and
+  because 16 real corpus files were already sitting there, unlockable,
+  with concrete ground truth to verify against.
+
+  **The algorithm** (Dremel-style record assembly - reconstructing nested
+  objects/arrays from a leaf column's own flat, physically-columnar
+  definition-level/repetition-level/value triples) was deliberately *not*
+  independently derived from the Parquet/Dremel papers' own prose. Given
+  how easy this specific algorithm is to get subtly wrong (the official
+  `parquet` crate's own implementation of it - see below - has a
+  documented bug), this project's usual "verify against the real crate's
+  source" discipline was tightened here to "translate the real crate's
+  own working implementation line-for-line," not just check against it
+  after the fact: `record/reader.rs`'s `Reader` enum (`PrimitiveReader`/
+  `OptionReader`/`GroupReader`/`RepeatedReader`/`KeyValueReader`) and its
+  `reader_tree`/`read_field`/`current_def_level`/`current_rep_level`/
+  `advance_columns` methods were read in full before a line of this
+  project's own `ReaderNode`/`build_reader_tree` was written, and the
+  resulting structure is a direct, deliberate mirror of that reference -
+  `ReaderNode::read_field` reads as a translation of `Reader::read_field`,
+  not an independently-invented algorithm. Verified by hand against
+  `nested_types.parquet`'s own real schema (a 3-level LIST and a MAP)
+  before being trusted: tracing the exact definition/repetition-level
+  threshold and schema path the reference would compute at every step of
+  `reader_tree`, confirming this project's own `build_reader_tree`
+  produces the identical structure - and it did, on the first real
+  end-to-end test against that file, matching `pyarrow`'s own independent
+  `to_pydict()` output exactly across every row and every nesting shape
+  (a populated struct, a null struct, a populated list, an empty list, a
+  populated map, an empty map).
+
+  One deliberate, disclosed scope narrowing versus the reference: there is
+  no dedicated `KeyValueReader`/Map reader variant. A MAP-annotated group
+  is built as `Repeated` wrapping a synthetic two-field `Group` (`key`,
+  `value`) - structurally identical to how a 3-level LIST wraps its own
+  single `element` field, just with two fields instead of one - so a Map
+  reconstructs as a JSON *array* of `{"key":..., "value":...}` objects
+  rather than the reference's native keyed JSON object. This loses no
+  information (every entry, key, and value is still reconstructed with
+  full fidelity) and has a real advantage over the reference's own
+  approach found directly while testing: a Map with a non-string key type
+  (a real, legal shape - confirmed on two separate real corpus files,
+  `nested_maps.snappy.parquet` and `map_no_value.parquet`) can't be
+  represented as a native JSON object key at all, which is exactly why
+  Arrow's own JSON writer (used as this phase's oracle, see below) refuses
+  to serialize such a column outright - this reader's array-of-pairs
+  representation has no such restriction, since a key of any type flows
+  through the same `render_value_json` any other leaf value does. The
+  Parquet spec's own further-documented edge case - a MAP whose
+  `key_value` group carries no value field at all, "treat as a list" per
+  the reference's own comment - is also handled, reducing to a plain
+  `Repeated` over just the keys (found and fixed via a real corpus file,
+  `map_no_value.parquet`, whose own `my_map_no_v` column exercises exactly
+  this). The legacy 2-level LIST convention (superseded by the modern
+  3-level form pyarrow and every other current writer default to) is a
+  clear, disclosed error rather than a guess - no real fixture in this
+  project's corpus sweep uses it, so there was nothing to verify a hand-
+  roll against.
+
+  **The oracle for this phase had to be chosen carefully, and choosing it
+  became a real finding in its own right.** Every earlier Parquet phase
+  in this campaign cross-checked against `parquet::record::Row` (the same
+  crate's own non-Arrow read API) - but that same crate's own
+  `record/reader.rs` carries a documented, upstream-acknowledged
+  admission this project hadn't previously had reason to read closely:
+  "the current implementation does not correctly handle repeated fields
+  ([#2394])... workloads looking to handle such schema should use the
+  other APIs." Discovered while researching this phase specifically, not
+  assumed safe by analogy with every prior phase's own successful use of
+  that oracle - continuing to rely on it here would have meant verifying
+  this project's own new, unproven code against another implementation
+  that's *itself* known-wrong for exactly this case. Arrow's own JSON
+  writer (`arrow::json::writer::ArrayWriter`, reading via `parquet::
+  arrow::arrow_reader::ParquetRecordBatchReaderBuilder`) was used instead
+  - a genuinely independent, actively-maintained code path, and also the
+  more relevant one to match regardless, since it's what this project's
+  own *live* `columns_from_parquet` already depends on for nested columns
+  today (`arrow_batch_to_json_rows`). Enabling it needed the `parquet`
+  crate's own `json` Cargo feature (for `Row::to_json_value`, initially
+  considered before the above finding ruled that oracle out, then kept
+  enabled anyway since Arrow's own writer needed no extra feature but
+  `json` was already wired up) - checked before assuming it was free, the
+  same discipline as every other dependency-cost decision in this section:
+  `cargo tree` confirmed it adds exactly one new edge (`serde_json`,
+  already this project's own core dependency) and zero new crates.
+
+  **Real-world corpus testing against this new oracle found four more
+  genuine things worth recording, on top of the MAP-without-a-value case
+  above** - none of them where a first guess would have placed them:
+    1. **Arrow's own JSON writer omits a null struct field entirely**
+       rather than emitting `"field": null` (found on `nullable.impala
+       .parquet`) - and, separately, **drops a null-*valued* map entry
+       entirely** rather than emitting `"key": null` (found on the same
+       file's own `g` map column) - both confirmed as the oracle's own
+       formatting choice, not a defect in this project's reconstruction
+       (which correctly determined the field/entry was absent/null in
+       both cases), and normalized in the comparison logic accordingly.
+    2. **`arrow-json`'s own float-to-string formatter has a genuine 1-ULP
+       rounding bug** - found on `nested_structs.rust.parquet`'s
+       `ACTUAL_FRONTAGE.sum` field: this reader's own value
+       (`20275.350000000006`) independently confirmed correct against
+       `pyarrow`'s own separate C++ implementation (both agreeing
+       bit-for-bit), while Arrow's own JSON writer produced
+       `20275.35000000001` - traced to its own source
+       (`arrow-json`'s `encoder.rs`), which formats every float via the
+       `lexical_core` crate rather than `ryu`/std's `Display` (the
+       formatter this project's own rendering already uses throughout),
+       and confirmed the 1-ULP difference is that crate's own formatting
+       bug, not a decoding difference, by comparing both float values'
+       raw bit patterns directly (`0x1.3ccd666666668p+14` vs
+       `...669p+14`). Compared with a tight relative-error tolerance
+       rather than exact equality in the test harness - generous enough
+       to absorb this specific known formatting quirk, still tight enough
+       to catch a genuinely wrong value.
+    3. **A real, pre-existing `parquet`/`arrow` crate limitation**, found
+       on `repeated_no_annotation.parquet` (also useful for exercising a
+       bare repeated group with no LIST annotation at all - the Parquet
+       spec's own "implicitly a required list of required elements" case):
+       that file's top-level `FileMetaData.num_rows` field is a stale `0`,
+       disagreeing with the real row-group-level count of `6` - confirmed
+       correct independently via `pyarrow`'s own successful 6-row read.
+       `parquet::arrow::arrow_reader` clamps its own row production
+       directly to that stale file-level field (`arrow_reader/mod.rs`:
+       `batch_size.min(self.metadata.file_metadata().num_rows())`),
+       silently producing zero rows from a file whose row groups
+       genuinely hold real data - this reader was already unaffected,
+       since it only ever trusts the more granular, authoritative
+       row-group-level `num_rows`, never the file-level aggregate.
+    4. **Arrow's JSON writer refuses to serialize a Map with non-UTF8
+       keys at all** ("Only UTF8 keys supported by JSON MapArray Writer"),
+       the same already-documented `arrow-cast`/`ArrayWriter` limitation
+       this project's own *live* nested-column bridge
+       (`arrow_batch_to_json_rows`) already works around with its own
+       per-column isolation fallback - found again here on two more real
+       files (`nested_maps.snappy.parquet`, `map_no_value.parquet`),
+       confirming it's a real, recurring class of limitation in that
+       crate rather than a one-off.
+
+  **Final numbers**: the primary fixture (`nested_types.parquet`) matches
+  both a hardcoded, `pyarrow`-verified expectation and the Arrow oracle
+  exactly. The real-world corpus sweep (the same 79-file `apache/parquet-
+  testing` corpus every other phase in this campaign has used, now swept
+  a second time targeting exactly the 16 files the flat-schema sweep
+  always skipped) shows 11 of 15 readable nested-schema files matching
+  the Arrow oracle exactly - the corpus's 16th nested file
+  (`large_string_map.brotli.parquet`) needs the still-unimplemented
+  Brotli codec, so it's excluded from this phase's own denominator - with
+  the remaining 4 cleanly bucketed as either this reader's own disclosed
+  Brotli gap (1) or one of the confirmed oracle-crate limitations above
+  (3), and **zero** genuine, unexplained mismatches - the corpus test's
+  own `assert!` on that count passing, the same discipline every other
+  corpus sweep in this campaign already enforces. Four more real corpus
+  files were vendored as permanent fixtures (`tests/fixtures/
+  parquet_nested_map_no_value.parquet`, `parquet_nested_repeated_no_
+  annotation.parquet`, `parquet_nested_nullable_impala.parquet`, plus the
+  already-committed `nested_types.parquet` - see `tests/fixtures/
+  parquet_PROVENANCE.md`) with their own dedicated tests; the two files
+  that specifically trigger a known oracle limitation
+  (`parquet_nested_map_no_value.parquet`, `parquet_nested_repeated_no_
+  annotation.parquet`) are tested against a hardcoded, `pyarrow`-verified
+  expectation instead of the Arrow oracle directly, for the same reason
+  those two limitations exist in the first place.
+
   **Still deliberately not started**: the LZO/Brotli compression codecs
   (present in this project's own documented Parquet compression-codec
-  list, but not exercised by any flat-schema file in this corpus, so
-  there's no real fixture yet to verify a hand-roll against); nested
-  Struct/List/Map reconstruction from definition/repetition levels
-  (`max_rep_level != 0` columns are still explicitly rejected - the 16
-  corpus files this skips are *entirely* what's left of the 79-file
-  corpus that hasn't been proven end to end); and, last, Arrow IPC/
-  Feather's own separate FlatBuffers-based schema/`RecordBatch` framework,
-  entirely unstarted. `parquet_support` remains a real but dormant module
+  list, but not exercised by any flat-schema file in this corpus - now
+  found to gate exactly one real nested file too, `large_string_map
+  .brotli.parquet` - so there's still no real fixture to verify a
+  hand-roll against); and, last, Arrow IPC/Feather's own separate
+  FlatBuffers-based schema/`RecordBatch` framework, entirely unstarted -
+  now the only remaining piece of this campaign's original roadmap.
+  `parquet_support` remains a real but dormant module
   (`#[allow(dead_code)]`, exercised only by its own tests) and `arrow`/
   `parquet` remain live runtime dependencies until every behavior this
   project currently documents and tests for Parquet/Arrow IPC is matched,

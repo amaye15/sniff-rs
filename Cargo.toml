@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 serde_json = "1.0.151"
 arrow = { version = "59.2.0", features = ["ipc", "ipc_compression", "chrono-tz"], optional = true }
-parquet = { version = "59.2.0", features = ["arrow"], optional = true }
+parquet = { version = "59.2.0", features = ["arrow", "json"], optional = true }
 # No "derive" feature - ColumnProfile's own Serialize impl is hand-written
 # (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
 # still needed for that impl's own `S: serde::Serializer` bound.

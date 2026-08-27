@@ -1515,6 +1515,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "seq-macro",
+ "serde_json",
  "simdutf8",
  "snap",
  "twox-hash",

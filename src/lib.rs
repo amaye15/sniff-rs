@@ -7724,6 +7724,14 @@ mod parquet_support {
             /// `None` only for the synthetic root message type, which
             /// (per the Parquet spec) carries no repetition of its own.
             repetition: Option<Repetition>,
+            /// `Some(ConvertedType::List | ConvertedType::Map |
+            /// ConvertedType::MapKeyValue)` marks this group as the
+            /// standard 3-level LIST/MAP wrapper (see the reference
+            /// `parquet` crate's own `record::reader::Reader::reader_tree`
+            /// and its LIST/MAP backward-compatibility handling) - needed
+            /// to tell a genuine nested LIST/MAP apart from an ordinary
+            /// struct whose own repeated child happens to look similar.
+            converted_type: Option<ConvertedType>,
             children: Vec<SchemaNode>,
         },
     }
@@ -7758,6 +7766,7 @@ mod parquet_support {
                 SchemaNode::Group {
                     name: element.name.clone(),
                     repetition: None,
+                    converted_type: element.converted_type,
                     children: Vec::new(),
                 },
             ));
@@ -7788,6 +7797,7 @@ mod parquet_support {
                         SchemaNode::Group {
                             name: element.name.clone(),
                             repetition: Some(repetition),
+                            converted_type: element.converted_type,
                             children: Vec::new(),
                         },
                     ))
@@ -7817,6 +7827,7 @@ mod parquet_support {
                     SchemaNode::Group {
                         name: element.name.clone(),
                         repetition,
+                        converted_type: element.converted_type,
                         children,
                     },
                 ))
@@ -8848,6 +8859,72 @@ mod parquet_support {
         })
     }
 
+    /// The nested-reconstruction counterpart to `render_value_bytes`,
+    /// producing a genuine `serde_json::Value` rather than a plain
+    /// `String` - needed once a leaf value is going to live inside a
+    /// reconstructed JSON object/array rather than standing alone as one
+    /// flat column's own value, so it can flow through this project's
+    /// existing `profile_json_path` recursive engine (the same one every
+    /// other nested-format bridge - Avro, MessagePack, CBOR, XML - already
+    /// uses) with real type fidelity intact, matching how those bridges
+    /// already emit `JsonValue::Bool`/`JsonValue::Number` for a genuinely
+    /// scalar value rather than a pre-stringified one (see e.g.
+    /// `avro_support`'s own `AvroValue::Long => JsonValue::Number(...)`).
+    /// Deliberately built as a thin wrapper around `render_value_bytes`
+    /// rather than a second, parallel DECIMAL/DATE/TIME/TIMESTAMP
+    /// dispatch: every semantically-string-shaped case (DECIMAL, DATE,
+    /// TIME, TIMESTAMP, INT96, Float16, UTF8/hex-dump BYTE_ARRAY) is
+    /// already exactly right as a plain string - re-parsed here into a
+    /// real `JsonValue::Bool`/`JsonValue::Number` only for the "plain
+    /// scalar, no semantic annotation" cases, using the *already-rendered*
+    /// canonical string form as the source of truth rather than
+    /// re-deriving it from the raw bytes a second time (avoiding any risk
+    /// of the two renderings silently drifting apart from each other).
+    fn render_value_json(bytes: &[u8], descriptor: &ColumnDescriptor) -> Result<JsonValue> {
+        let s = render_value_bytes(bytes, descriptor)?;
+        let has_string_shaped_annotation = is_decimal(descriptor).is_some()
+            || matches!(
+                descriptor.logical_type,
+                Some(
+                    LogicalType::Date
+                        | LogicalType::Time { .. }
+                        | LogicalType::Timestamp { .. }
+                        | LogicalType::Float16
+                )
+            )
+            || matches!(
+                descriptor.converted_type,
+                Some(
+                    ConvertedType::Date
+                        | ConvertedType::TimeMillis
+                        | ConvertedType::TimeMicros
+                        | ConvertedType::TimestampMillis
+                        | ConvertedType::TimestampMicros
+                )
+            )
+            || descriptor.physical_type == PhysicalType::Int96;
+        if has_string_shaped_annotation || is_utf8(descriptor) {
+            return Ok(JsonValue::String(s));
+        }
+        Ok(match descriptor.physical_type {
+            PhysicalType::Boolean => JsonValue::Bool(s == "true"),
+            PhysicalType::Int32 | PhysicalType::Int64 => s
+                .parse::<i64>()
+                .map(|n| JsonValue::Number(n.into()))
+                .unwrap_or(JsonValue::String(s)),
+            PhysicalType::Float | PhysicalType::Double => {
+                let f: f64 = s.parse().unwrap_or(f64::NAN);
+                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            // Un-annotated BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY (already a hex
+            // dump string from `render_value_bytes`) and INT96 (already
+            // excluded above) - both string-shaped, nothing left to do.
+            PhysicalType::ByteArray | PhysicalType::FixedLenByteArray | PhysicalType::Int96 => {
+                JsonValue::String(s)
+            }
+        })
+    }
+
     /// A sanity cap on an LZ4-compressed page's claimed decompressed
     /// length, the same class of guard `snappy_support`/`zstd_support`
     /// already apply to their own untrusted length fields - here the
@@ -9404,9 +9481,827 @@ mod parquet_support {
         Ok(values)
     }
 
+    /// One leaf column's full decoded (repetition level, definition
+    /// level) sequence for a row group, plus every *present* value
+    /// (`def_level == max_def_level`) in the same order - the raw
+    /// material record assembly (`ReaderNode`/`assemble_row` below)
+    /// walks to reconstruct nested rows. Unlike `decode_column_chunk`'s
+    /// own `Vec<Option<String>>` (one entry per output *row*, meaningful
+    /// only when there's no repetition to reconstruct), a leaf inside a
+    /// repeated ancestor can occur zero, one, or many times per row, so
+    /// there's no single flat "one slot per row" shape to collapse to -
+    /// `rep_levels`/`def_levels` preserve exactly the Dremel-encoded
+    /// structure needed to tell rows and repetitions apart, matching the
+    /// reference `parquet` crate's own `TripletIter`.
+    struct LeafTriples {
+        rep_levels: Vec<i16>,
+        def_levels: Vec<i16>,
+        values: Vec<JsonValue>,
+    }
+
+    /// One page's already-decoded levels plus the raw bytes/position/
+    /// encoding needed to decode its present values - bundled into one
+    /// struct purely to keep `push_leaf_triples` under clippy's argument-
+    /// count lint, not because these particular fields have any deeper
+    /// relationship to each other.
+    struct PageLevels<'a> {
+        raw: &'a [u8],
+        rpos: usize,
+        def_levels: &'a [u64],
+        rep_levels: &'a [u64],
+        encoding: Encoding,
+    }
+
+    /// Decodes one page's worth of present values and appends the whole
+    /// page's (rep_level, def_level, value) triples to `out` - the per-
+    /// page body shared by `decode_column_chunk_triples`'s DATA_PAGE and
+    /// DATA_PAGE_V2 branches (which differ only in how they arrive at
+    /// `page.raw`/`page.rpos`/the two already-decoded level slices, not in
+    /// what happens once they have them). A free function taking `out` as
+    /// an explicit `&mut LeafTriples` parameter rather than a closure
+    /// capturing it, specifically to avoid a real borrow-checker conflict
+    /// a closure would create here: the caller's own `while` loop
+    /// condition needs to read `out.rep_levels.len()` between calls, which
+    /// an exclusively-capturing closure would make impossible.
+    fn push_leaf_triples(
+        page: PageLevels,
+        dictionary: Option<&[Vec<u8>]>,
+        descriptor: &ColumnDescriptor,
+        out: &mut LeafTriples,
+    ) -> Result<()> {
+        let max_def = i64::from(descriptor.max_def_level);
+        let num_present = page
+            .def_levels
+            .iter()
+            .filter(|&&d| d as i64 == max_def)
+            .count();
+        let present_values = decode_present_values(
+            page.raw,
+            page.rpos,
+            page.encoding,
+            num_present,
+            descriptor,
+            dictionary,
+        )?;
+        let mut present_iter = present_values.into_iter();
+        for (&d, &r) in page.def_levels.iter().zip(page.rep_levels) {
+            out.def_levels.push(i16::try_from(d).unwrap_or(i16::MAX));
+            out.rep_levels.push(i16::try_from(r).unwrap_or(i16::MAX));
+            if d as i64 == max_def {
+                let bytes = present_iter
+                    .next()
+                    .context("ran out of decoded values before definition levels")?;
+                out.values.push(render_value_json(&bytes, descriptor)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// The `decode_column_chunk_triples` counterpart to
+    /// `decode_column_chunk` - deliberately a separate, parallel
+    /// implementation rather than a refactor of that already-verified
+    /// function (61/63 real-world corpus files matching the oracle
+    /// exactly across Phases B-E), even though the two share most of
+    /// their page-walking structure: reusing this new, not-yet-proven
+    /// nested-reconstruction code as a foundation for the flat path would
+    /// put that hard-won correctness at risk for no real benefit, the
+    /// same "don't touch what's already verified" caution this project
+    /// applies throughout (e.g. the two independently-scoped XML
+    /// parsers). Two real differences from `decode_column_chunk`: the
+    /// repetition-level stream is actually *decoded* here (not skipped -
+    /// needed to tell where each repeated element/row boundary falls),
+    /// and every value renders through `render_value_json` (a real
+    /// `serde_json::Value`, not a `String`) so a leaf value keeps its
+    /// native type once it's living inside a reconstructed JSON object/
+    /// array rather than standing alone as a flat column.
+    fn decode_column_chunk_triples(
+        file_data: &[u8],
+        chunk: &ColumnMetaData,
+        descriptor: &ColumnDescriptor,
+    ) -> Result<LeafTriples> {
+        let mut pos = usize::try_from(
+            chunk
+                .dictionary_page_offset
+                .unwrap_or(chunk.data_page_offset),
+        )
+        .context("Parquet page offset exceeds usize")?;
+        let mut dictionary: Option<Vec<Vec<u8>>> = None;
+        let mut out = LeafTriples {
+            rep_levels: Vec::new(),
+            def_levels: Vec::new(),
+            values: Vec::new(),
+        };
+        let total = usize::try_from(chunk.num_values).unwrap_or(usize::MAX);
+
+        while out.rep_levels.len() < total && pos < file_data.len() {
+            let mut r = ThriftReader::new(&file_data[pos..]);
+            let header = read_page_header(&mut r)?;
+            let header_len = r.bytes_consumed();
+            let page_start = pos + header_len;
+            let page_end = page_start
+                .checked_add(
+                    usize::try_from(header.compressed_page_size)
+                        .context("negative Parquet page size")?,
+                )
+                .context("Parquet page end offset overflow")?;
+            let compressed = file_data
+                .get(page_start..page_end)
+                .context("truncated Parquet page")?;
+            pos = page_end;
+
+            match header.type_ {
+                ParquetPageType::DictionaryPage => {
+                    let dph = header
+                        .dictionary_page_header
+                        .as_ref()
+                        .context("DICTIONARY_PAGE missing its own header")?;
+                    if descriptor.physical_type == PhysicalType::Boolean {
+                        bail!("a dictionary-encoded BOOLEAN column is not valid Parquet");
+                    }
+                    let raw = decompress_page_bytes(
+                        chunk.codec,
+                        compressed,
+                        header.uncompressed_page_size,
+                    )?;
+                    let mut dict = Vec::with_capacity(
+                        usize::try_from(dph.num_values).unwrap_or(0).min(1 << 20),
+                    );
+                    let mut dpos = 0usize;
+                    for _ in 0..dph.num_values {
+                        dict.push(plain_decode_one(
+                            &raw,
+                            &mut dpos,
+                            descriptor.physical_type,
+                            descriptor.type_length,
+                        )?);
+                    }
+                    dictionary = Some(dict);
+                }
+                ParquetPageType::DataPage => {
+                    let dp = header
+                        .data_page_header
+                        .as_ref()
+                        .context("DATA_PAGE missing its own header")?;
+                    let raw = decompress_page_bytes(
+                        chunk.codec,
+                        compressed,
+                        header.uncompressed_page_size,
+                    )?;
+                    let num_values = usize::try_from(dp.num_values)
+                        .context("negative Parquet page num_values")?;
+                    let mut rpos = 0usize;
+
+                    let rep_levels_this_page = if descriptor.max_rep_level > 0 {
+                        let len_bytes = raw
+                            .get(rpos..rpos + 4)
+                            .context("truncated repetition-level length")?;
+                        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                        rpos += 4;
+                        let bytes = raw
+                            .get(rpos..rpos + len)
+                            .context("truncated repetition levels")?;
+                        rpos += len;
+                        decode_rle_bit_packed_hybrid(
+                            bytes,
+                            num_required_bits(descriptor.max_rep_level),
+                            num_values,
+                        )?
+                    } else {
+                        vec![0u64; num_values]
+                    };
+
+                    let def_levels_this_page = if descriptor.max_def_level > 0 {
+                        let len_bytes = raw
+                            .get(rpos..rpos + 4)
+                            .context("truncated definition-level length")?;
+                        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                        rpos += 4;
+                        let bytes = raw
+                            .get(rpos..rpos + len)
+                            .context("truncated definition levels")?;
+                        rpos += len;
+                        decode_rle_bit_packed_hybrid(
+                            bytes,
+                            num_required_bits(descriptor.max_def_level),
+                            num_values,
+                        )?
+                    } else {
+                        vec![0u64; num_values]
+                    };
+
+                    push_leaf_triples(
+                        PageLevels {
+                            raw: &raw,
+                            rpos,
+                            def_levels: &def_levels_this_page,
+                            rep_levels: &rep_levels_this_page,
+                            encoding: dp.encoding,
+                        },
+                        dictionary.as_deref(),
+                        descriptor,
+                        &mut out,
+                    )?;
+                }
+                ParquetPageType::DataPageV2 => {
+                    let dp = header
+                        .data_page_header_v2
+                        .as_ref()
+                        .context("DATA_PAGE_V2 missing its own header")?;
+                    let num_values = usize::try_from(dp.num_values)
+                        .context("negative Parquet page num_values")?;
+                    let rep_len = usize::try_from(dp.repetition_levels_byte_length)
+                        .context("negative repetition_levels_byte_length")?;
+                    let def_len = usize::try_from(dp.definition_levels_byte_length)
+                        .context("negative definition_levels_byte_length")?;
+                    let levels_len = rep_len
+                        .checked_add(def_len)
+                        .context("Parquet V2 level lengths overflow")?;
+                    let level_bytes = compressed
+                        .get(..levels_len)
+                        .context("truncated Parquet Data Page V2 level bytes")?;
+                    let data_compressed = &compressed[levels_len..];
+                    let data = if dp.is_compressed {
+                        let uncompressed_total = usize::try_from(header.uncompressed_page_size)
+                            .context("negative Parquet page size")?;
+                        let uncompressed_data_size = uncompressed_total
+                            .checked_sub(levels_len)
+                            .context("Parquet V2 level lengths exceed uncompressed_page_size")?;
+                        if uncompressed_data_size == 0 {
+                            Vec::new()
+                        } else {
+                            let size = i32::try_from(uncompressed_data_size)
+                                .context("Parquet V2 data size exceeds i32")?;
+                            decompress_page_bytes(chunk.codec, data_compressed, size)?
+                        }
+                    } else {
+                        data_compressed.to_vec()
+                    };
+                    let mut raw = Vec::with_capacity(levels_len + data.len());
+                    raw.extend_from_slice(level_bytes);
+                    raw.extend_from_slice(&data);
+
+                    let rep_levels_this_page = if descriptor.max_rep_level > 0 {
+                        let rep_bytes = raw
+                            .get(..rep_len)
+                            .context("truncated Parquet Data Page V2 repetition levels")?;
+                        decode_rle_bit_packed_hybrid(
+                            rep_bytes,
+                            num_required_bits(descriptor.max_rep_level),
+                            num_values,
+                        )?
+                    } else {
+                        vec![0u64; num_values]
+                    };
+                    let def_levels_this_page = if descriptor.max_def_level > 0 {
+                        let def_bytes = raw
+                            .get(rep_len..levels_len)
+                            .context("truncated Parquet Data Page V2 definition levels")?;
+                        decode_rle_bit_packed_hybrid(
+                            def_bytes,
+                            num_required_bits(descriptor.max_def_level),
+                            num_values,
+                        )?
+                    } else {
+                        vec![0u64; num_values]
+                    };
+
+                    push_leaf_triples(
+                        PageLevels {
+                            raw: &raw,
+                            rpos: levels_len,
+                            def_levels: &def_levels_this_page,
+                            rep_levels: &rep_levels_this_page,
+                            encoding: dp.encoding,
+                        },
+                        dictionary.as_deref(),
+                        descriptor,
+                        &mut out,
+                    )?;
+                }
+                ParquetPageType::IndexPage => {}
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// A cursor over one leaf's `LeafTriples`, mirroring the reference
+    /// `parquet` crate's own `TripletIter` interface (`current_def_level`/
+    /// `current_rep_level`/`current_value`/`advance`/`has_next`) closely
+    /// enough that `assemble_row` below reads as a direct translation of
+    /// `Reader::read_field` (`record/reader.rs`) rather than an
+    /// independently-invented algorithm - the actual Dremel record-
+    /// assembly logic is subtle enough that matching a working reference
+    /// implementation step-for-step is far safer than deriving it fresh.
+    struct LeafCursor<'a> {
+        triples: &'a LeafTriples,
+        max_def_level: i16,
+        level_pos: usize,
+        value_pos: usize,
+    }
+
+    impl<'a> LeafCursor<'a> {
+        fn new(triples: &'a LeafTriples, max_def_level: i16) -> Self {
+            Self {
+                triples,
+                max_def_level,
+                level_pos: 0,
+                value_pos: 0,
+            }
+        }
+
+        fn has_next(&self) -> bool {
+            self.level_pos < self.triples.rep_levels.len()
+        }
+
+        fn current_def_level(&self) -> i16 {
+            self.triples.def_levels[self.level_pos]
+        }
+
+        fn current_rep_level(&self) -> i16 {
+            self.triples.rep_levels[self.level_pos]
+        }
+
+        fn current_value(&self) -> JsonValue {
+            if self.current_def_level() == self.max_def_level {
+                self.triples.values[self.value_pos].clone()
+            } else {
+                JsonValue::Null
+            }
+        }
+
+        fn advance(&mut self) {
+            if self.current_def_level() == self.max_def_level {
+                self.value_pos += 1;
+            }
+            self.level_pos += 1;
+        }
+    }
+
+    /// Reader tree for Dremel record assembly, mirroring the reference
+    /// `parquet` crate's own `record::reader::Reader` (`PrimitiveReader`/
+    /// `OptionReader`/`GroupReader`/`RepeatedReader`) closely enough that
+    /// `ReaderNode::read_field` below is a direct translation of that
+    /// crate's own `Reader::read_field`, not an independently-derived
+    /// algorithm - see this module's own "Nested Struct/List/Map
+    /// reconstruction" doc comment for why matching a proven
+    /// implementation step-for-step matters here specifically.
+    ///
+    /// One deliberate scope narrowing versus the reference: there is no
+    /// dedicated `KeyValueReader`/Map variant. A MAP-annotated group is
+    /// built as `Repeated` wrapping a synthetic two-field `Group` (`key`,
+    /// `value`) - structurally identical to how a 3-level LIST wraps its
+    /// own single `element` field, just with two fields instead of one -
+    /// so a Map reconstructs as a JSON *array* of `{"key":...,
+    /// "value":...}` objects rather than the reference's native keyed
+    /// JSON object. Verified by hand against Parquet's own Dremel level
+    /// bookkeeping (`reader_tree` in `record/reader.rs`) before being
+    /// trusted, not assumed to be a harmless simplification: this
+    /// reconstructs a MAP's *entries* with full fidelity (nothing lost),
+    /// it just doesn't re-key them into a native object the way the
+    /// reference does - a disclosed, deliberate difference kept simple
+    /// on purpose, since this reader has no need to *look up* a map value
+    /// by key, only to type and profile whatever values a map contains.
+    enum ReaderNode {
+        /// The leaf's own dotted schema path - looked up in the row
+        /// group's `leaves: &HashMap<Vec<String>, LeafCursor>` map on
+        /// every call, rather than holding a direct reference, since many
+        /// `ReaderNode`s are built once per row group but every row's
+        /// worth of reads needs its own mutable cursor state.
+        Primitive(Vec<String>),
+        /// Wraps a reader whose value may be entirely absent at the
+        /// current row - `i16` is the definition-level threshold *below*
+        /// which the wrapped value counts as absent (`Null`).
+        Option(i16, Box<ReaderNode>),
+        /// A struct: field name, the field's own repetition (needed to
+        /// decide whether an `Optional` child's absence must be checked
+        /// at all - a `Required`/`Repeated` child is always read
+        /// directly, since it handles its own presence internally), and
+        /// the field's own reader. The `i16` is this group's own
+        /// definition-level threshold, compared against an `Optional`
+        /// child's current level to detect absence.
+        Group(i16, Vec<(String, Repetition, ReaderNode)>),
+        /// A list (or, per the note above, a map's own key-value
+        /// entries): definition-level and repetition-level thresholds,
+        /// and the reader for one element.
+        Repeated(i16, i16, Box<ReaderNode>),
+    }
+
+    impl ReaderNode {
+        fn has_next(&self, leaves: &HashMap<Vec<String>, LeafCursor>) -> bool {
+            match self {
+                ReaderNode::Primitive(path) => leaves[path].has_next(),
+                ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
+                    inner.has_next(leaves)
+                }
+                ReaderNode::Group(_, children) => children[0].2.has_next(leaves),
+            }
+        }
+
+        fn current_def_level(&self, leaves: &HashMap<Vec<String>, LeafCursor>) -> i16 {
+            match self {
+                ReaderNode::Primitive(path) => leaves[path].current_def_level(),
+                ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
+                    inner.current_def_level(leaves)
+                }
+                ReaderNode::Group(_, children) => children[0].2.current_def_level(leaves),
+            }
+        }
+
+        fn current_rep_level(&self, leaves: &HashMap<Vec<String>, LeafCursor>) -> i16 {
+            match self {
+                ReaderNode::Primitive(path) => leaves[path].current_rep_level(),
+                ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
+                    inner.current_rep_level(leaves)
+                }
+                ReaderNode::Group(_, children) => children[0].2.current_rep_level(leaves),
+            }
+        }
+
+        fn advance_columns(&self, leaves: &mut HashMap<Vec<String>, LeafCursor>) -> Result<()> {
+            match self {
+                ReaderNode::Primitive(path) => {
+                    leaves
+                        .get_mut(path)
+                        .context("Parquet nested reader: leaf cursor missing")?
+                        .advance();
+                    Ok(())
+                }
+                ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
+                    inner.advance_columns(leaves)
+                }
+                ReaderNode::Group(_, children) => {
+                    for (_, _, child) in children {
+                        child.advance_columns(leaves)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        /// Reads and advances past exactly one value at the current row
+        /// position - the direct translation of the reference's own
+        /// `Reader::read_field`.
+        fn read_field(&self, leaves: &mut HashMap<Vec<String>, LeafCursor>) -> Result<JsonValue> {
+            match self {
+                ReaderNode::Primitive(path) => {
+                    let cursor = leaves
+                        .get_mut(path)
+                        .context("Parquet nested reader: leaf cursor missing")?;
+                    if !cursor.has_next() {
+                        bail!("unexpected end of Parquet column data");
+                    }
+                    let value = cursor.current_value();
+                    cursor.advance();
+                    Ok(value)
+                }
+                ReaderNode::Option(def_level, inner) => {
+                    if !inner.has_next(leaves) {
+                        bail!("unexpected end of Parquet column data");
+                    }
+                    if inner.current_def_level(leaves) > *def_level {
+                        inner.read_field(leaves)
+                    } else {
+                        inner.advance_columns(leaves)?;
+                        Ok(JsonValue::Null)
+                    }
+                }
+                ReaderNode::Group(def_level, children) => {
+                    let mut map = serde_json::Map::with_capacity(children.len());
+                    for (name, repetition, child) in children {
+                        let present = *repetition != Repetition::Optional
+                            || child.current_def_level(leaves) > *def_level;
+                        let value = if present {
+                            child.read_field(leaves)?
+                        } else {
+                            child.advance_columns(leaves)?;
+                            JsonValue::Null
+                        };
+                        map.insert(name.clone(), value);
+                    }
+                    Ok(JsonValue::Object(map))
+                }
+                ReaderNode::Repeated(def_level, rep_level, inner) => {
+                    if !inner.has_next(leaves) {
+                        bail!("unexpected end of Parquet column data");
+                    }
+                    let mut elements = Vec::new();
+                    loop {
+                        if inner.current_def_level(leaves) > *def_level {
+                            elements.push(inner.read_field(leaves)?);
+                        } else {
+                            inner.advance_columns(leaves)?;
+                            break;
+                        }
+                        if !inner.has_next(leaves) || inner.current_rep_level(leaves) <= *rep_level
+                        {
+                            break;
+                        }
+                    }
+                    Ok(JsonValue::Array(elements))
+                }
+            }
+        }
+    }
+
+    /// Builds one field's reader subtree, threading `curr_def_level`/
+    /// `curr_rep_level` and `path` exactly the way the reference
+    /// `reader_tree` does (`record/reader.rs`) - verified by hand against
+    /// `nested_types.parquet`'s own real schema (a 3-level LIST and a
+    /// MAP) before being trusted, tracing the exact def/rep level and
+    /// path value the reference would compute at every step. `path` must
+    /// match `collect_leaves`'s own path convention exactly (every
+    /// intermediate group name included, LIST/MAP wrapper groups too -
+    /// confirmed directly against that function, which pushes every
+    /// node's name uniformly with no special-casing for a wrapper group)
+    /// so `ReaderNode::Primitive`'s stored path is a valid key into the
+    /// leaves map built from `schema_leaves`.
+    fn build_reader_tree(
+        node: &SchemaNode,
+        path: &mut Vec<String>,
+        mut curr_def_level: i16,
+        mut curr_rep_level: i16,
+    ) -> Result<ReaderNode> {
+        let repetition = node.repetition().unwrap_or(Repetition::Required);
+        match repetition {
+            Repetition::Optional => curr_def_level += 1,
+            Repetition::Repeated => {
+                curr_def_level += 1;
+                curr_rep_level += 1;
+            }
+            Repetition::Required => {}
+        }
+        path.push(node.name().to_string());
+
+        let reader = match node {
+            SchemaNode::Primitive { .. } => {
+                let leaf = ReaderNode::Primitive(path.clone());
+                if repetition == Repetition::Repeated {
+                    ReaderNode::Repeated(curr_def_level - 1, curr_rep_level - 1, Box::new(leaf))
+                } else {
+                    leaf
+                }
+            }
+            SchemaNode::Group {
+                children,
+                converted_type,
+                ..
+            } => match converted_type {
+                Some(ConvertedType::List) => {
+                    let wrapper = children
+                        .first()
+                        .context("Parquet LIST group has no wrapper child")?;
+                    let SchemaNode::Group {
+                        children: wrapper_children,
+                        ..
+                    } = wrapper
+                    else {
+                        bail!("Parquet LIST group's wrapper child must itself be a group");
+                    };
+                    let element = wrapper_children
+                        .first()
+                        .context("Parquet LIST wrapper group has no element child")?;
+                    if wrapper_children.len() != 1
+                        || wrapper.repetition() != Some(Repetition::Repeated)
+                    {
+                        bail!(
+                            "the legacy 2-level LIST convention isn't supported by this reader yet - \
+                             only the modern 3-level convention (a REPEATED wrapper group with exactly \
+                             one child) is"
+                        );
+                    }
+                    path.push(wrapper.name().to_string());
+                    let child_reader =
+                        build_reader_tree(element, path, curr_def_level + 1, curr_rep_level + 1)?;
+                    path.pop();
+                    ReaderNode::Repeated(curr_def_level, curr_rep_level, Box::new(child_reader))
+                }
+                Some(ConvertedType::Map | ConvertedType::MapKeyValue) => {
+                    let wrapper = children
+                        .first()
+                        .context("Parquet MAP group has no key_value wrapper child")?;
+                    let SchemaNode::Group {
+                        children: kv_children,
+                        ..
+                    } = wrapper
+                    else {
+                        bail!("Parquet MAP group's wrapper child must itself be a group");
+                    };
+                    if wrapper.repetition() != Some(Repetition::Repeated)
+                        || !(1..=2).contains(&kv_children.len())
+                    {
+                        bail!(
+                            "Parquet MAP group's key_value wrapper must be a REPEATED group with \
+                             a key and, optionally, a value child"
+                        );
+                    }
+                    path.push(wrapper.name().to_string());
+                    // The Parquet spec permits a MAP's key_value group to
+                    // carry no value field at all - verified directly
+                    // against the reference `parquet` crate's own
+                    // `record/reader.rs` (`reader_tree`'s own comment:
+                    // "Parquet spec allows no value. In that case treat as
+                    // a list"). When that's the case, this reduces to a
+                    // plain `Repeated` over just the key, not a synthetic
+                    // key/value `Group`.
+                    let inner = if kv_children.len() == 1 {
+                        build_reader_tree(
+                            &kv_children[0],
+                            path,
+                            curr_def_level + 1,
+                            curr_rep_level + 1,
+                        )?
+                    } else {
+                        let mut field_readers = Vec::with_capacity(2);
+                        for child in kv_children {
+                            let child_repetition =
+                                child.repetition().unwrap_or(Repetition::Required);
+                            let reader = build_reader_tree(
+                                child,
+                                path,
+                                curr_def_level + 1,
+                                curr_rep_level + 1,
+                            )?;
+                            field_readers.push((
+                                child.name().to_string(),
+                                child_repetition,
+                                reader,
+                            ));
+                        }
+                        ReaderNode::Group(curr_def_level + 1, field_readers)
+                    };
+                    path.pop();
+                    ReaderNode::Repeated(curr_def_level, curr_rep_level, Box::new(inner))
+                }
+                _ if repetition == Repetition::Repeated => {
+                    // A repeated group with no LIST/MAP annotation at all
+                    // is, per the Parquet spec, a required list of
+                    // required elements of the group's own type -
+                    // reconstructed here as `Repeated` wrapping a `Group`
+                    // built from this same node's own children, matching
+                    // the reference's own handling of this case
+                    // (`record/reader.rs`, the `_ if repetition ==
+                    // Repetition::REPEATED` arm).
+                    let mut field_readers = Vec::with_capacity(children.len());
+                    for child in children {
+                        let child_repetition = child.repetition().unwrap_or(Repetition::Required);
+                        let reader =
+                            build_reader_tree(child, path, curr_def_level, curr_rep_level)?;
+                        field_readers.push((child.name().to_string(), child_repetition, reader));
+                    }
+                    let synthetic_group = ReaderNode::Group(curr_def_level, field_readers);
+                    ReaderNode::Repeated(
+                        curr_def_level - 1,
+                        curr_rep_level - 1,
+                        Box::new(synthetic_group),
+                    )
+                }
+                _ => {
+                    let mut field_readers = Vec::with_capacity(children.len());
+                    for child in children {
+                        let child_repetition = child.repetition().unwrap_or(Repetition::Required);
+                        let reader =
+                            build_reader_tree(child, path, curr_def_level, curr_rep_level)?;
+                        field_readers.push((child.name().to_string(), child_repetition, reader));
+                    }
+                    ReaderNode::Group(curr_def_level, field_readers)
+                }
+            },
+        };
+        path.pop();
+
+        Ok(if repetition == Repetition::Optional {
+            ReaderNode::Option(curr_def_level - 1, Box::new(reader))
+        } else {
+            reader
+        })
+    }
+
+    /// Decodes an entire row group's worth of rows for a schema that may
+    /// contain nested/repeated columns, bridging the result into a
+    /// `Vec<JsonValue>` - one object per row - ready to hand to this
+    /// project's existing `profile_json_records`, the exact same
+    /// recursive flattening engine every other nested-format bridge in
+    /// this project (Avro, MessagePack, CBOR, XML) already uses. Builds
+    /// one `ReaderNode` per top-level field directly from the root
+    /// schema's own children (matching the reference `TreeBuilder::
+    /// build`'s own root handling - the synthetic message-type root
+    /// itself never appears in a leaf's path or gets its own reader
+    /// node), decodes every leaf's full triples once up front, then reads
+    /// exactly `row_group.num_rows` rows by calling `read_field` directly
+    /// on each top-level field's reader in turn (matching the reference's
+    /// own `Reader::read`, which - unlike `read_field`'s own `GroupReader`
+    /// handling - never checks an `Optional` top-level column's presence
+    /// before reading it, since that check is already the job of the
+    /// `Option` reader node wrapping that column, if it has one).
+    fn decode_row_group_nested(
+        file_data: &[u8],
+        schema: &SchemaNode,
+        row_group: &RowGroup,
+    ) -> Result<Vec<JsonValue>> {
+        let SchemaNode::Group {
+            children: root_fields,
+            ..
+        } = schema
+        else {
+            bail!("Parquet schema root must be a group type");
+        };
+        let leaf_descriptors = schema_leaves(schema);
+
+        let mut top_level: Vec<(String, ReaderNode)> = Vec::with_capacity(root_fields.len());
+        let mut leaves: HashMap<Vec<String>, LeafCursor> = HashMap::new();
+        for field in root_fields {
+            let mut path = Vec::new();
+            let reader = build_reader_tree(field, &mut path, 0, 0)?;
+            top_level.push((field.name().to_string(), reader));
+        }
+
+        // `LeafCursor` borrows its `LeafTriples`, so every leaf's triples
+        // must outlive the cursors referencing them - decoded up front
+        // into a stable `Vec` rather than inline in the loop above.
+        let mut all_triples: Vec<(Vec<String>, i16, LeafTriples)> =
+            Vec::with_capacity(leaf_descriptors.len());
+        for descriptor in &leaf_descriptors {
+            let col_name = descriptor.path.join(".");
+            let chunk = row_group
+                .columns
+                .iter()
+                .find_map(|c| {
+                    c.meta_data
+                        .as_ref()
+                        .filter(|m| m.path_in_schema.join(".") == col_name)
+                })
+                .with_context(|| format!("column {col_name:?} missing from a row group"))?;
+            let triples = decode_column_chunk_triples(file_data, chunk, descriptor)?;
+            all_triples.push((descriptor.path.clone(), descriptor.max_def_level, triples));
+        }
+        for (path, max_def_level, triples) in &all_triples {
+            leaves.insert(path.clone(), LeafCursor::new(triples, *max_def_level));
+        }
+
+        let num_rows =
+            usize::try_from(row_group.num_rows).context("negative Parquet row group num_rows")?;
+        let mut rows = Vec::with_capacity(num_rows);
+        for _ in 0..num_rows {
+            let mut fields = serde_json::Map::with_capacity(top_level.len());
+            for (name, reader) in &top_level {
+                fields.insert(name.clone(), reader.read_field(&mut leaves)?);
+            }
+            rows.push(JsonValue::Object(fields));
+        }
+        Ok(rows)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A struct (`info`), a modern 3-level LIST (`tags`), and a MAP
+        /// (`attributes`) all in one real, already-committed fixture -
+        /// exercises `decode_row_group_nested`/`ReaderNode` against every
+        /// shape this phase's own scope covers: a nested struct that's
+        /// itself null for one row (`info: None` for `U4`), an empty list
+        /// (`tags: []` for `U3`), and an empty map (`attributes: []` for
+        /// `U3`) alongside genuinely populated ones. Expected values
+        /// verified independently via `pyarrow.parquet.read_table(...)
+        /// .to_pydict()` before being hardcoded here (see this reader's
+        /// own doc comment on `ReaderNode` for why the Map column
+        /// reconstructs as an array of `{"key","value"}` pairs rather than
+        /// pyarrow's own native keyed object - a disclosed, deliberate
+        /// simplification, not a mismatch).
+        #[test]
+        fn decodes_nested_struct_list_and_map_columns_matching_pyarrow() {
+            let (file_data, meta) =
+                read_footer(Path::new("tests/fixtures/nested_types.parquet")).unwrap();
+            let schema = build_schema(&meta.schema).unwrap();
+            let mut rows = Vec::new();
+            for rg in &meta.row_groups {
+                rows.extend(decode_row_group_nested(&file_data, &schema, rg).unwrap());
+            }
+            let expected: Vec<JsonValue> = vec![
+                serde_json::json!({
+                    "user_id": "U1", "category": "gold", "tags": ["a", "b"],
+                    "info": {"age": 34, "active": true},
+                    "attributes": [{"key": "color", "value": "red"}, {"key": "size", "value": "M"}]
+                }),
+                serde_json::json!({
+                    "user_id": "U2", "category": "silver", "tags": ["c"],
+                    "info": {"age": 29, "active": false},
+                    "attributes": [{"key": "color", "value": "blue"}]
+                }),
+                serde_json::json!({
+                    "user_id": "U3", "category": "gold", "tags": [],
+                    "info": {"age": 45, "active": true},
+                    "attributes": []
+                }),
+                serde_json::json!({
+                    "user_id": "U4", "category": "bronze", "tags": ["d", "e", "f"],
+                    "info": null,
+                    "attributes": [{"key": "color", "value": "green"}, {"key": "size", "value": "L"}]
+                }),
+            ];
+            assert_eq!(rows, expected);
+        }
 
         #[test]
         fn reads_the_footer_of_a_real_parquet_file() {
@@ -9822,6 +10717,393 @@ mod parquet_support {
             eprintln!(
                 "{ok}/{total} flat-schema files matched the oracle exactly ({skipped} nested/unreadable files skipped, \
                  {} on this reader's own disclosed roadmap gaps, {} the oracle crate's own pre-existing limits)",
+                known_gaps.len(),
+                oracle_limits.len()
+            );
+            for f in &failures {
+                eprintln!("MISMATCH: {f}");
+            }
+            assert!(
+                failures.is_empty(),
+                "{} genuine mismatch(es) found - see stderr",
+                failures.len()
+            );
+        }
+
+        /// Recursively compares a hand-rolled nested reconstruction
+        /// against Arrow's own JSON rendering, treating the two Map
+        /// representations documented on `ReaderNode` (this reader's own
+        /// array of `{"key","value"}` pairs versus Arrow's native keyed
+        /// object) as equal whenever they carry the same entries - the
+        /// one deliberate, disclosed shape difference between the two,
+        /// checked structurally here rather than by schema lookup, since
+        /// nothing else in either tree ever produces a JSON array of
+        /// same-shaped `{"key","value"}` objects by coincidence. A
+        /// null-valued pair is allowed to simply be absent from Arrow's
+        /// own object rather than required to match - found on a real
+        /// file (`nullable.impala.parquet`), where Arrow's Map JSON
+        /// writer drops a null-valued entry entirely instead of emitting
+        /// `"key": null`, the same "a null field vanishes rather than
+        /// round-tripping as null" quirk already found and normalized for
+        /// plain struct fields below.
+        fn nested_json_values_match(mine: &JsonValue, oracle: &JsonValue) -> bool {
+            match (mine, oracle) {
+                (JsonValue::Array(pairs), JsonValue::Object(map))
+                    if pairs.iter().all(|p| {
+                        matches!(p, JsonValue::Object(o) if o.len() == 2 && o.contains_key("key") && o.contains_key("value"))
+                    }) =>
+                {
+                    let real_pairs: Vec<_> = pairs
+                        .iter()
+                        .filter(|p| !matches!(p["value"], JsonValue::Null))
+                        .collect();
+                    real_pairs.len() == map.len()
+                        && real_pairs.iter().all(|p| {
+                            let JsonValue::Object(o) = p else {
+                                unreachable!()
+                            };
+                            let Some(JsonValue::String(k)) = o.get("key") else {
+                                return false;
+                            };
+                            map.get(k).is_some_and(|ov| nested_json_values_match(&o["value"], ov))
+                        })
+                }
+                (JsonValue::Array(a), JsonValue::Array(b)) => {
+                    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| nested_json_values_match(x, y))
+                }
+                (JsonValue::Object(a), JsonValue::Object(b)) => {
+                    // Arrow's own JSON writer omits a null struct field
+                    // entirely rather than emitting `"field": null` (found
+                    // directly against a real file, not assumed) - treat a
+                    // key missing on either side the same as that key being
+                    // explicitly `Null`, rather than requiring both objects
+                    // to carry the exact same key set.
+                    let mut keys: std::collections::BTreeSet<&String> = a.keys().collect();
+                    keys.extend(b.keys());
+                    keys.iter().all(|k| {
+                        let av = a.get(*k).unwrap_or(&JsonValue::Null);
+                        let bv = b.get(*k).unwrap_or(&JsonValue::Null);
+                        nested_json_values_match(av, bv)
+                    })
+                }
+                // Arrow's own JSON writer (`arrow-json`'s `encoder.rs`)
+                // formats every float via the `lexical_core` crate, not
+                // `ryu`/std's own `Display` (the formatter this project's
+                // own `render_value_bytes`/`render_value_json` already
+                // uses throughout) - found to differ from the correct
+                // value by exactly 1 ULP on a real file
+                // (`nested_structs.rust.parquet`'s `ACTUAL_FRONTAGE.sum`:
+                // this reader's own `20275.350000000006` independently
+                // confirmed correct against `pyarrow`'s own separate C++
+                // implementation, both agreeing bit-for-bit, versus
+                // Arrow's own `20275.35000000001`) - a genuine, if tiny,
+                // formatting bug in the oracle's own float-to-string path,
+                // not a decoding difference. Compared with a tight
+                // relative-error tolerance rather than exact equality,
+                // generous enough to absorb a 1-ULP formatting quirk but
+                // still tight enough to catch a genuinely wrong value.
+                (JsonValue::Number(a), JsonValue::Number(b)) => {
+                    let (Some(a), Some(b)) = (a.as_f64(), b.as_f64()) else {
+                        return mine == oracle;
+                    };
+                    a == b || ((a - b).abs() <= a.abs().max(b.abs()) * 1e-9)
+                }
+                // Arrow's own JSON writer renders a Timestamp as ISO 8601
+                // with a leading `+` for a >9999 year and a trailing `Z`
+                // (`+52951-07-27T10:00:00Z` on the same real file above,
+                // for a genuinely extreme test value) - this project's own
+                // `EpochDateTime::format_t_frac` convention (already
+                // verified correct against the `record::Row` oracle
+                // throughout Phases B-E) has neither marker
+                // (`52951-07-27T10:00:00.000000`). Normalized here by
+                // stripping both before comparing, rather than changing
+                // this reader's own already-verified rendering to chase
+                // one oracle's own formatting choice.
+                (JsonValue::String(a), JsonValue::String(b))
+                    if a == b || (a.contains('T') && a.contains(':') && b.contains('T') && b.contains(':')) =>
+                {
+                    let normalize = |s: &str| {
+                        s.trim_start_matches('+')
+                            .trim_end_matches('Z')
+                            .trim_end_matches(['0', '.'])
+                            .to_string()
+                    };
+                    a == b || normalize(a) == normalize(b)
+                }
+                _ => mine == oracle,
+            }
+        }
+
+        /// Cross-verification for nested/repeated columns against Arrow's
+        /// own JSON writer (`arrow::json::writer::ArrayWriter`) - a
+        /// genuinely independent oracle for this specific case, since the
+        /// `parquet` crate's own `record::Row` API (used everywhere else
+        /// in this module) carries a documented, upstream-acknowledged bug
+        /// for repeated fields (`record/reader.rs`'s own doc comment:
+        /// "the current implementation does not correctly handle repeated
+        /// fields") - discovered while researching this phase, not assumed
+        /// safe by analogy with every other phase's use of that same API.
+        /// Arrow's own reader is this project's *live* `columns_from_parquet`
+        /// dependency for nested columns already (see `arrow_batch_to_
+        /// json_rows`), so it's also the more relevant oracle to match
+        /// regardless.
+        fn decode_row_group_nested_matches_arrow(path: &str) {
+            let (file_data, meta) =
+                read_footer(Path::new(path)).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+            let schema = build_schema(&meta.schema).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+            let mut mine = Vec::new();
+            for rg in &meta.row_groups {
+                mine.extend(
+                    decode_row_group_nested(&file_data, &schema, rg).unwrap_or_else(|e| {
+                        panic!("{path}: hand-rolled nested decode failed: {e:?}")
+                    }),
+                );
+            }
+
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap_or_else(|e| panic!("{path}: oracle open failed: {e}"));
+            let reader = builder
+                .build()
+                .unwrap_or_else(|e| panic!("{path}: oracle build failed: {e}"));
+            let mut oracle_rows: Vec<JsonValue> = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap_or_else(|e| panic!("{path}: oracle batch failed: {e}"));
+                let mut writer = arrow::json::writer::ArrayWriter::new(Vec::new());
+                writer
+                    .write(&batch)
+                    .and_then(|()| writer.finish())
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON writer failed: {e}"));
+                let buf = writer.into_inner();
+                let rows: Vec<JsonValue> = serde_json::from_slice(&buf)
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"));
+                oracle_rows.extend(rows);
+            }
+
+            // A real, confirmed `parquet`/`arrow` crate limitation, found
+            // on `repeated_no_annotation.parquet`: that file's top-level
+            // `FileMetaData.num_rows` field is a stale/inconsistent `0`,
+            // while every one of its row groups' own `num_rows` (the more
+            // granular, authoritative source this reader already uses)
+            // correctly says `6` - confirmed independently via `pyarrow`'s
+            // own successful 6-row read, a completely different
+            // implementation. `parquet::arrow::arrow_reader` clamps its
+            // own batch/row production to the file-level field directly
+            // (`arrow_reader/mod.rs`: `batch_size.min(self.metadata.
+            // file_metadata().num_rows())`), so it silently reads zero
+            // rows from a file whose row groups actually hold real data -
+            // an oracle limitation, not a bug in this reader, which
+            // already only ever trusts the row-group-level count.
+            if oracle_rows.is_empty() && !mine.is_empty() {
+                let rg_sum: i64 = meta.row_groups.iter().map(|rg| rg.num_rows).sum();
+                if rg_sum != meta.num_rows {
+                    panic!(
+                        "{path}: oracle file-level num_rows limitation (file-level num_rows={} \
+                         disagrees with the row-group sum {rg_sum}, and the oracle trusts the \
+                         former)",
+                        meta.num_rows
+                    );
+                }
+            }
+            assert_eq!(mine.len(), oracle_rows.len(), "{path}: row count mismatch");
+            for (i, (m, o)) in mine.iter().zip(&oracle_rows).enumerate() {
+                assert!(
+                    nested_json_values_match(m, o),
+                    "{path} row {i}: mine={m} oracle={o}"
+                );
+            }
+        }
+
+        #[test]
+        fn decode_row_group_nested_matches_arrow_on_real_fixtures() {
+            decode_row_group_nested_matches_arrow("tests/fixtures/nested_types.parquet");
+        }
+
+        /// Locks in the Parquet spec's own documented "MAP with no value
+        /// field is treated as a list" case (see `build_reader_tree`'s own
+        /// MAP-handling doc comment) against a real file - via a hardcoded
+        /// expectation (independently verified with `pyarrow.parquet.
+        /// read_table(...).to_pydict()`) rather than the Arrow JSON oracle
+        /// `decode_row_group_nested_matches_arrow` uses everywhere else in
+        /// this module, since this file's `my_map` column has an INT32
+        /// key - Arrow's own JSON writer refuses any non-UTF8 map key
+        /// outright ("Only UTF8 keys supported by JSON MapArray Writer"),
+        /// a real, pre-existing limitation this reader's own array-of-
+        /// pairs Map representation doesn't share (a key of any type
+        /// renders through the same `render_value_json` any other leaf
+        /// value does, with no string-only restriction).
+        #[test]
+        fn reads_a_map_with_no_value_field_as_a_plain_list() {
+            let (file_data, meta) = read_footer(Path::new(
+                "tests/fixtures/parquet_nested_map_no_value.parquet",
+            ))
+            .unwrap();
+            let schema = build_schema(&meta.schema).unwrap();
+            let mut rows = Vec::new();
+            for rg in &meta.row_groups {
+                rows.extend(decode_row_group_nested(&file_data, &schema, rg).unwrap());
+            }
+            let pairs = |keys: &[i64]| -> JsonValue {
+                JsonValue::Array(
+                    keys.iter()
+                        .map(|k| serde_json::json!({"key": k, "value": null}))
+                        .collect(),
+                )
+            };
+            let expected: Vec<JsonValue> = vec![
+                serde_json::json!({
+                    "my_map": pairs(&[1, 2, 3]), "my_map_no_v": [1, 2, 3], "my_list": [1, 2, 3]
+                }),
+                serde_json::json!({
+                    "my_map": pairs(&[4, 5, 6]), "my_map_no_v": [4, 5, 6], "my_list": [4, 5, 6]
+                }),
+                serde_json::json!({
+                    "my_map": pairs(&[7, 8, 9]), "my_map_no_v": [7, 8, 9], "my_list": [7, 8, 9]
+                }),
+            ];
+            assert_eq!(rows, expected);
+        }
+
+        /// Locks in a bare repeated group with no LIST annotation at all
+        /// (the Parquet spec's "implicitly a required list of required
+        /// elements" case) against a real file - via a hardcoded
+        /// expectation (independently verified with `pyarrow.parquet.
+        /// read_table(...).to_pydict()`) rather than the Arrow JSON
+        /// oracle, since this is also the file that found a real
+        /// `parquet`/`arrow` crate limitation: its own top-level
+        /// `FileMetaData.num_rows` field is a stale `0`, and `parquet::
+        /// arrow::arrow_reader` clamps its own row production to that
+        /// field directly, silently producing zero rows from a file whose
+        /// row groups genuinely hold six (see `decode_row_group_nested_
+        /// matches_arrow`'s own doc comment for the full finding).
+        #[test]
+        fn reads_a_bare_repeated_group_with_no_list_annotation() {
+            let (file_data, meta) = read_footer(Path::new(
+                "tests/fixtures/parquet_nested_repeated_no_annotation.parquet",
+            ))
+            .unwrap();
+            let schema = build_schema(&meta.schema).unwrap();
+            let mut rows = Vec::new();
+            for rg in &meta.row_groups {
+                rows.extend(decode_row_group_nested(&file_data, &schema, rg).unwrap());
+            }
+            let expected: Vec<JsonValue> = vec![
+                serde_json::json!({"id": 1, "phoneNumbers": null}),
+                serde_json::json!({"id": 2, "phoneNumbers": null}),
+                serde_json::json!({"id": 3, "phoneNumbers": {"phone": []}}),
+                serde_json::json!({"id": 4, "phoneNumbers": {"phone": [
+                    {"number": 5555555555_i64, "kind": null}
+                ]}}),
+                serde_json::json!({"id": 5, "phoneNumbers": {"phone": [
+                    {"number": 1111111111_i64, "kind": "home"}
+                ]}}),
+                serde_json::json!({"id": 6, "phoneNumbers": {"phone": [
+                    {"number": 1111111111_i64, "kind": "home"},
+                    {"number": 2222222222_i64, "kind": null},
+                    {"number": 3333333333_i64, "kind": "mobile"}
+                ]}}),
+            ];
+            assert_eq!(rows, expected);
+        }
+
+        /// The most structurally elaborate real nested fixture this
+        /// reader is tested against: lists of lists, a map inside a
+        /// struct, and a struct inside a list inside a map, all in one
+        /// real file - value-for-value against the independent Arrow JSON
+        /// oracle. Also the file that found Arrow's own JSON writer drops
+        /// a null-*valued* map entry entirely (see
+        /// `nested_json_values_match`'s own doc comment).
+        #[test]
+        fn reads_a_deeply_nested_file_with_lists_of_lists_and_maps_of_structs() {
+            decode_row_group_nested_matches_arrow(
+                "tests/fixtures/parquet_nested_nullable_impala.parquet",
+            );
+        }
+
+        /// The nested-reconstruction counterpart to `decode_column_chunk_
+        /// matches_the_record_api_on_the_real_world_corpus`: sweeps the
+        /// same `apache/parquet-testing` corpus, this time targeting
+        /// exactly the files that sweep skips (any schema with a
+        /// `max_rep_level != 0` leaf, or a nested `path.len() != 1` leaf),
+        /// cross-checking against Arrow's own JSON writer instead of the
+        /// `record::Row` API oracle (see `decode_row_group_nested_matches_
+        /// arrow`'s own doc comment for why).
+        #[test]
+        #[ignore]
+        fn decode_row_group_nested_matches_arrow_on_the_real_world_corpus() {
+            let dir = std::path::Path::new(
+                "/private/tmp/claude-501/-Users-andrewmayes-Projects-sniff-rs/48c37152-91f1-4659-9492-11b43ef0f2f8/scratchpad/pq_test/data",
+            );
+            let mut files = Vec::new();
+            fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                let Ok(rd) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if p.extension().is_some_and(|e| e == "parquet") {
+                        out.push(p);
+                    }
+                }
+            }
+            walk(dir, &mut files);
+            assert!(!files.is_empty(), "corpus not present at {dir:?}");
+            let mut ok = 0;
+            let mut skipped = 0;
+            let mut failures = Vec::new();
+            let mut known_gaps = Vec::new();
+            let mut oracle_limits = Vec::new();
+            for f in &files {
+                let path = f.to_str().unwrap();
+                let is_nested = std::panic::catch_unwind(|| {
+                    let (_, meta) = read_footer(Path::new(path)).ok()?;
+                    let schema = build_schema(&meta.schema).ok()?;
+                    Some(
+                        schema_leaves(&schema)
+                            .iter()
+                            .any(|d| d.max_rep_level != 0 || d.path.len() != 1),
+                    )
+                })
+                .ok()
+                .flatten();
+                if is_nested != Some(true) {
+                    skipped += 1;
+                    continue;
+                }
+                let result =
+                    std::panic::catch_unwind(|| decode_row_group_nested_matches_arrow(path));
+                if let Err(payload) = result {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("");
+                    if msg.contains("isn't supported by this reader yet")
+                        || msg.contains("isn't supported by this")
+                    {
+                        known_gaps.push(path.to_string());
+                    } else if msg.contains("oracle open failed")
+                        || msg.contains("oracle build failed")
+                        || msg.contains("oracle batch failed")
+                        || msg.contains("oracle JSON writer failed")
+                        || msg.contains("oracle file-level num_rows limitation")
+                    {
+                        oracle_limits.push(path.to_string());
+                    } else {
+                        failures.push(format!("{path}: {msg}"));
+                    }
+                } else {
+                    ok += 1;
+                }
+            }
+            let total = ok + known_gaps.len() + oracle_limits.len() + failures.len();
+            eprintln!(
+                "{ok}/{total} nested-schema files matched the Arrow oracle exactly ({skipped} flat files \
+                 skipped, {} on this reader's own disclosed roadmap gaps, {} the oracle crate's own \
+                 pre-existing limits)",
                 known_gaps.len(),
                 oracle_limits.len()
             );

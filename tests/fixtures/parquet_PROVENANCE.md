@@ -114,3 +114,41 @@ these three files already cover, just varying nullability, which this
 reader's shared definition-level/null-interleaving logic (already proven
 across every other encoding this reader supports) isn't specific to delta
 encoding at all.
+
+# Provenance of `parquet_nested_map_no_value.parquet`, `parquet_nested_repeated_no_annotation.parquet`, and `parquet_nested_nullable_impala.parquet`
+
+All three are real `.parquet` files copied verbatim from the same
+`apache/parquet-testing` project's own `data/` directory (same license as
+above):
+
+- `parquet_nested_map_no_value.parquet` was `map_no_value.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/map_no_value.parquet
+- `parquet_nested_repeated_no_annotation.parquet` was `repeated_no_annotation.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/repeated_no_annotation.parquet
+- `parquet_nested_nullable_impala.parquet` was `nullable.impala.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/nullable.impala.parquet
+
+Vendored for the same reason as the files above, and each locking in a
+real, distinct finding from the nested/repeated-column reconstruction
+phase (`ReaderNode`/`build_reader_tree`/`decode_row_group_nested` in
+`src/lib.rs` - see CLAUDE.md's own writeup for the full story):
+`parquet_nested_map_no_value.parquet` exercises a MAP whose `key_value`
+group carries no `value` field at all - a case the Parquet spec
+explicitly permits ("treat as a list"), confirmed directly against the
+`parquet` crate's own `record/reader.rs` comment, and a real code fix
+(`build_reader_tree`'s own MAP branch used to hard-error on this shape).
+`parquet_nested_repeated_no_annotation.parquet` exercises a bare repeated
+group with no LIST annotation at all (the "implicitly a required list of
+required elements" case the spec also documents) - and, independently, is
+the file that found a real `parquet`/`arrow` crate limitation: its own
+top-level `FileMetaData.num_rows` field is a stale `0`, disagreeing with
+the real row-group-level count of `6` (confirmed correct via `pyarrow`'s
+own independent read), and `parquet::arrow::arrow_reader` clamps its own
+row production to that stale file-level field, silently producing zero
+rows from a file that genuinely has six. `parquet_nested_nullable_impala
+.parquet` is the most structurally elaborate of the three - lists of
+lists, a map inside a struct, a struct inside a list inside a map - and is
+what found that Arrow's own JSON writer drops a null-*valued* map entry
+entirely rather than emitting it as `null`, the map-specific counterpart
+to the null-struct-field-omission quirk already documented on
+`nested_json_values_match` in `src/lib.rs`.
