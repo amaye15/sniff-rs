@@ -4658,17 +4658,108 @@ this project could just implement directly rather than depend on:
   tool exposes Hadoop's legacy LZ4 framing, its backward-compatible
   fallback, or `BYTE_STREAM_SPLIT` as an option.
 
+  **Phase D (this session): Data Page V2 - still not wired into
+  `columns_from_parquet`.** Picked next because it unlocks real files
+  outright (several corpus files use V2 purely for its own framing, not
+  for a delta encoding) and because most of the actual value-decoding
+  machinery already existed from Phase B/C - V2 needed new *framing*
+  logic, not a new decoder. `decode_present_values` (the PLAIN/
+  RLE_DICTIONARY/`BYTE_STREAM_SPLIT` dispatch) and
+  `interleave_present_values_with_nulls` (definition-level-driven null
+  placement) were extracted out of the V1 `DataPage` branch into their own
+  shared functions specifically so V2 could reuse them unchanged, rather
+  than duplicating that dispatch a second time - a page's value encoding
+  means the same thing regardless of which page format carries it.
+
+  V2's own framing differs from V1 in two ways, both verified directly
+  against the `parquet` crate's own `file/serialized_reader.rs` and
+  `column/reader.rs` rather than assumed from the format's prose spec:
+  first, its repetition/definition level streams carry no length prefix
+  of their own at all (V1's own 4-byte-length-prefix convention doesn't
+  apply here), since `DataPageHeaderV2` already gives their exact byte
+  lengths directly (`repetition_levels_byte_length`/
+  `definition_levels_byte_length`); second, *only* the trailing value data
+  is ever compressed (gated by the header's own `is_compressed` flag,
+  default true) - the level bytes are always stored raw, confirmed via
+  `serialized_reader.rs`'s own `offset = rep_levels_byte_length +
+  def_levels_byte_length` calculation, which is exactly how many leading
+  bytes of the page are excluded from decompression. `column/reader.rs`
+  also confirmed a real, easy-to-miss detail: V2 levels are always
+  `Encoding::RLE` - the same RLE/bit-packing hybrid stream this project's
+  own `decode_rle_bit_packed_hybrid` (built for V1's levels and dictionary
+  indices) already implements, with no separate encoding choice the way
+  V1's own `definition_level_encoding`/`repetition_level_encoding` header
+  fields nominally allow.
+
+  **Two real, separate bugs were found by this phase, neither one where
+  it was expected.** First: `rle_boolean_encoding.parquet` uses
+  `Encoding::RLE` as a genuine *value* encoding, not just a level
+  encoding - confirmed directly against the `parquet` crate's own
+  `RleValueDecoder::set_data`, this is only ever valid for BOOLEAN, and
+  keeps V1's own 4-byte length-prefix convention even though nothing else
+  about it resembles a V1 length-prefixed stream. Added as a new
+  `Encoding::Rle` arm in `decode_present_values`.
+
+  Second, and more consequential: `concatenated_gzip_members.parquet`
+  exposed a real, general bug in `gzip_decompress` itself - the function
+  every GZIP-compressed format in this project reads through, not
+  something Parquet-specific. RFC 1952 §2.2 permits a gzip stream to hold
+  multiple concatenated "members" with nothing before, between, or after
+  them, and every real gzip implementation decodes and concatenates every
+  member's output, not just the first - but this function's first draft
+  (written well before Parquet support existed) only ever decoded one
+  member and returned, silently discarding anything after it. This
+  produced a genuinely confusing downstream symptom on the Parquet side
+  ("truncated PLAIN value", not a gzip-level error, since the truncated
+  buffer still looked like a valid-but-short prefix) rather than pointing
+  at the real cause directly - exactly the kind of gap real-world corpus
+  testing exists to surface that a synthetic single-member fixture never
+  would. Fixed by looping until the underlying reader is genuinely
+  exhausted, checked via `BufRead::fill_buf`'s own non-consuming peek (the
+  only way to distinguish "one more member follows" from "the stream is
+  done" without speculatively reading past a real end). A related
+  regression this fix could easily have introduced, caught and fixed
+  before it shipped: a *genuinely* empty, 0-byte input has zero gzip
+  members, which is invalid per every real gzip decompressor (confirmed:
+  Python's `gzip.decompress(b"")` raises `EOFError`) - a naive "loop while
+  more data is available" restructuring would silently treat this as a
+  valid empty stream instead of the `"failed to read gzip header"` error
+  it always correctly produced before. `gzip_decompress` now only treats
+  "nothing left to read" as a clean stop *between* members, never in place
+  of the mandatory first one - locked in by
+  `gzip_decompress_rejects_a_genuinely_empty_input` alongside
+  `gzip_decompress_concatenates_every_member_not_just_the_first` (built
+  from two copies of an existing fixture's own bytes back to back, no new
+  fixture needed for that half of the fix).
+
+  **Final numbers**: both core fixtures still match the oracle value-for-
+  value, and the real-world corpus sweep moved from 50/63 to 56/63 exact
+  matches (63 total minus the same 2 unrelated pre-existing oracle-crate
+  limits and the 5 remaining delta-encoding files, all now failing with
+  their own specific, correctly-identified `DeltaBinaryPacked`/
+  `DeltaByteArray`/`DeltaLengthByteArray` "not supported yet" errors rather
+  than a generic "Data Page V2 isn't supported" catch-all) - zero genuine,
+  unexplained mismatches, the corpus test's own `assert!` on that count
+  still passing. Three more real corpus files were vendored as permanent
+  fixtures (`tests/fixtures/parquet_v2_rle_boolean.parquet`,
+  `parquet_v2_concatenated_gzip.parquet`, `parquet_v2_empty_compressed
+  .parquet` - see `tests/fixtures/parquet_PROVENANCE.md`) with their own
+  dedicated tests, the same "no ordinary writer tool exposes this as an
+  option" reasoning as Phase C's own vendored files (pyarrow's own writer
+  defaults to Data Page V1, with no option to force V2 or its RLE-boolean-
+  value encoding).
+
   **Still deliberately not started, in the same order Phase A laid out**:
-  Data Page V2; `DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/
-  `DELTA_BYTE_ARRAY` encodings; the LZO/Brotli compression codecs; nested
-  Struct/List/Map reconstruction from definition/repetition levels
-  (`max_rep_level != 0` columns are still explicitly rejected); and, last,
-  Arrow IPC/Feather's own separate FlatBuffers-based schema/`RecordBatch`
-  framework, entirely unstarted. `parquet_support` remains a real but
-  dormant module (`#[allow(dead_code)]`, exercised only by its own tests)
-  and `arrow`/`parquet` remain live runtime dependencies until every
-  behavior this project currently documents and tests for Parquet/Arrow
-  IPC is matched, verified, and cut over in one deliberate step.
+  `DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/`DELTA_BYTE_ARRAY`
+  encodings; the LZO/Brotli compression codecs; nested Struct/List/Map
+  reconstruction from definition/repetition levels (`max_rep_level != 0`
+  columns are still explicitly rejected); and, last, Arrow IPC/Feather's
+  own separate FlatBuffers-based schema/`RecordBatch` framework, entirely
+  unstarted. `parquet_support` remains a real but dormant module
+  (`#[allow(dead_code)]`, exercised only by its own tests) and `arrow`/
+  `parquet` remain live runtime dependencies until every behavior this
+  project currently documents and tests for Parquet/Arrow IPC is matched,
+  verified, and cut over in one deliberate step.
 
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above (in progress, not declined), `serde`/`serde_json` are meant to

@@ -49,3 +49,35 @@ crate's own `LZ4HadoopCodec` exists to handle (files written by older,
 non-conformant `parquet-cpp` versions), and this project's own hand-rolled
 `lz4_decompress` reader needed the identical two-tier fallback to read it
 correctly.
+
+# Provenance of `parquet_v2_rle_boolean.parquet`, `parquet_v2_concatenated_gzip.parquet`, and `parquet_v2_empty_compressed.parquet`
+
+All three are real `.parquet` files copied verbatim from the same
+`apache/parquet-testing` project's own `data/` directory (same license as
+above):
+
+- `parquet_v2_rle_boolean.parquet` was `rle_boolean_encoding.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/rle_boolean_encoding.parquet
+- `parquet_v2_concatenated_gzip.parquet` was `concatenated_gzip_members.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/concatenated_gzip_members.parquet
+- `parquet_v2_empty_compressed.parquet` was `page_v2_empty_compressed.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/page_v2_empty_compressed.parquet
+
+Vendored for the same reason as the files above: each exercises a Data
+Page V2-specific mechanism no ordinary writer tool exposes as an option
+(pyarrow's own Parquet writer defaults to Data Page V1). `parquet_v2_rle_
+boolean.parquet` uses `Encoding::RLE` as a genuine *value* encoding (not
+just a level encoding) for a BOOLEAN column - only valid for that one
+physical type, confirmed directly against the `parquet` crate's own
+`RleValueDecoder::set_data`. `parquet_v2_concatenated_gzip.parquet` is the
+file that found a real, general bug in this project's own `gzip_decompress`
+(shared by every GZIP-compressed format this project reads, not just
+Parquet): a GZIP-compressed V2 page whose bytes are two separate gzip
+members concatenated back to back, which - confirmed via RFC 1952 §2.2 and
+real `gzip`/`zlib` behavior - a conforming decompressor must decode and
+concatenate in full, not just the first member (see `gzip_decompress`'s own
+doc comment in `src/lib.rs` for the full fix). `parquet_v2_empty_compressed
+.parquet` exercises a V2 page whose non-null value count is zero - the
+"decompressed size of zero" case `serialized_reader.rs` documents by citing
+the Parquet format's own spec (`apache/parquet-format`'s README, "data
+pages" section) directly.

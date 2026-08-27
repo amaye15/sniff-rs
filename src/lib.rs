@@ -8796,6 +8796,131 @@ mod parquet_support {
         }
     }
 
+    /// Decodes exactly `num_present` non-null values starting at
+    /// `raw[rpos..]`, dispatching on the page's own value encoding -
+    /// shared between Data Page V1 (whose caller has already stripped any
+    /// length-prefixed level streams from `raw` before calling this) and
+    /// Data Page V2 (whose caller has already stripped the level bytes,
+    /// which - unlike V1 - carry no length prefix of their own at all,
+    /// per that format's own explicit `*_levels_byte_length` header
+    /// fields). Kept as one shared function rather than duplicated per
+    /// page version, since a page's value encoding (PLAIN/
+    /// RLE_DICTIONARY/`BYTE_STREAM_SPLIT`) means exactly the same thing
+    /// regardless of which page format carries it.
+    fn decode_present_values(
+        raw: &[u8],
+        rpos: usize,
+        encoding: Encoding,
+        num_present: usize,
+        descriptor: &ColumnDescriptor,
+        dictionary: Option<&[Vec<u8>]>,
+    ) -> Result<Vec<Vec<u8>>> {
+        match encoding {
+            Encoding::Plain => {
+                if descriptor.physical_type == PhysicalType::Boolean {
+                    let mut bit_offset = 0usize;
+                    (0..num_present)
+                        .map(|_| read_bits(&raw[rpos..], &mut bit_offset, 1).map(|b| vec![b as u8]))
+                        .collect::<Result<Vec<_>>>()
+                } else {
+                    let mut vpos = rpos;
+                    (0..num_present)
+                        .map(|_| {
+                            plain_decode_one(
+                                raw,
+                                &mut vpos,
+                                descriptor.physical_type,
+                                descriptor.type_length,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                }
+            }
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                let dict = dictionary
+                    .context("RLE_DICTIONARY data page with no preceding dictionary page")?;
+                let bit_width = u32::from(
+                    *raw.get(rpos)
+                        .context("truncated dictionary-index bit width byte")?,
+                );
+                let indices =
+                    decode_rle_bit_packed_hybrid(&raw[rpos + 1..], bit_width, num_present)?;
+                indices
+                    .into_iter()
+                    .map(|idx| {
+                        let idx = usize::try_from(idx).context("dictionary index overflow")?;
+                        dict.get(idx)
+                            .cloned()
+                            .context("dictionary index out of range")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            }
+            Encoding::ByteStreamSplit => {
+                let type_size = byte_stream_split_type_size(descriptor)?;
+                let stream = raw
+                    .get(rpos..)
+                    .context("truncated BYTE_STREAM_SPLIT data")?;
+                decode_byte_stream_split(stream, type_size, num_present)
+            }
+            Encoding::Rle => {
+                // Verified directly against the `parquet` crate's own
+                // `RleValueDecoder::set_data`: RLE as a *value* encoding
+                // (as opposed to a level encoding) is only ever valid for
+                // BOOLEAN, and - despite carrying no separate length
+                // field of its own in the Thrift header the way levels
+                // do - still keeps the same 4-byte little-endian length
+                // prefix V1's own length-prefixed level streams use,
+                // ahead of the actual bit_width=1 RLE/bit-packing hybrid
+                // stream.
+                if descriptor.physical_type != PhysicalType::Boolean {
+                    bail!("RLE is only a valid value encoding for BOOLEAN");
+                }
+                let len_bytes = raw
+                    .get(rpos..rpos + 4)
+                    .context("truncated RLE-encoded boolean length prefix")?;
+                let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+                let bytes = raw
+                    .get(rpos + 4..rpos + 4 + len)
+                    .context("truncated RLE-encoded boolean data")?;
+                let bits = decode_rle_bit_packed_hybrid(bytes, 1, num_present)?;
+                Ok(bits.into_iter().map(|b| vec![b as u8]).collect())
+            }
+            other => bail!("Parquet encoding {other:?} isn't supported by this reader yet"),
+        }
+    }
+
+    /// Walks a page's own definition levels, pulling a rendered string
+    /// from `present_values` (in order) wherever a level equals
+    /// `max_def` and pushing `None` everywhere else - the shared null-
+    /// interleaving step both Data Page V1 and V2 reduce to once their
+    /// own, format-specific level/value decoding is done. Stops early
+    /// once `values` reaches `want`, matching `decode_column_chunk`'s own
+    /// `max_values` early-exit contract.
+    fn interleave_present_values_with_nulls(
+        def_levels: &[u64],
+        max_def: i64,
+        present_values: Vec<Vec<u8>>,
+        descriptor: &ColumnDescriptor,
+        values: &mut Vec<Option<String>>,
+        want: usize,
+    ) -> Result<()> {
+        let mut present_iter = present_values.into_iter();
+        for d in def_levels {
+            if values.len() >= want {
+                break;
+            }
+            if *d as i64 == max_def {
+                let bytes = present_iter
+                    .next()
+                    .context("ran out of decoded values before definition levels")?;
+                values.push(Some(render_value_bytes(&bytes, descriptor)?));
+            } else {
+                values.push(None);
+            }
+        }
+        Ok(())
+    }
+
     /// Reads a *flat* (no repeated/list ancestors - `max_rep_level` must
     /// be 0, a disclosed limitation of this phase) column chunk's real
     /// values end to end: walks its pages (an optional leading
@@ -8911,81 +9036,104 @@ mod parquet_support {
                     let max_def = i64::from(descriptor.max_def_level);
                     let num_present = def_levels.iter().filter(|&&d| d as i64 == max_def).count();
 
-                    let present_values: Vec<Vec<u8>> = match dp.encoding {
-                        Encoding::Plain => {
-                            if descriptor.physical_type == PhysicalType::Boolean {
-                                let mut bit_offset = 0usize;
-                                (0..num_present)
-                                    .map(|_| {
-                                        read_bits(&raw[rpos..], &mut bit_offset, 1)
-                                            .map(|b| vec![b as u8])
-                                    })
-                                    .collect::<Result<Vec<_>>>()?
-                            } else {
-                                let mut vpos = rpos;
-                                (0..num_present)
-                                    .map(|_| {
-                                        plain_decode_one(
-                                            &raw,
-                                            &mut vpos,
-                                            descriptor.physical_type,
-                                            descriptor.type_length,
-                                        )
-                                    })
-                                    .collect::<Result<Vec<_>>>()?
-                            }
-                        }
-                        Encoding::RleDictionary | Encoding::PlainDictionary => {
-                            let dict = dictionary.as_ref().context(
-                                "RLE_DICTIONARY data page with no preceding dictionary page",
-                            )?;
-                            let bit_width = u32::from(
-                                *raw.get(rpos)
-                                    .context("truncated dictionary-index bit width byte")?,
-                            );
-                            rpos += 1;
-                            let indices =
-                                decode_rle_bit_packed_hybrid(&raw[rpos..], bit_width, num_present)?;
-                            indices
-                                .into_iter()
-                                .map(|idx| {
-                                    let idx = usize::try_from(idx)
-                                        .context("dictionary index overflow")?;
-                                    dict.get(idx)
-                                        .cloned()
-                                        .context("dictionary index out of range")
-                                })
-                                .collect::<Result<Vec<_>>>()?
-                        }
-                        Encoding::ByteStreamSplit => {
-                            let type_size = byte_stream_split_type_size(descriptor)?;
-                            let stream = raw
-                                .get(rpos..)
-                                .context("truncated BYTE_STREAM_SPLIT data")?;
-                            decode_byte_stream_split(stream, type_size, num_present)?
-                        }
-                        other => {
-                            bail!("Parquet encoding {other:?} isn't supported by this reader yet")
-                        }
-                    };
-
-                    let mut present_iter = present_values.into_iter();
-                    for d in &def_levels {
-                        if values.len() >= want {
-                            break;
-                        }
-                        if *d as i64 == max_def {
-                            let bytes = present_iter
-                                .next()
-                                .context("ran out of decoded values before definition levels")?;
-                            values.push(Some(render_value_bytes(&bytes, descriptor)?));
-                        } else {
-                            values.push(None);
-                        }
-                    }
+                    let present_values = decode_present_values(
+                        &raw,
+                        rpos,
+                        dp.encoding,
+                        num_present,
+                        descriptor,
+                        dictionary.as_deref(),
+                    )?;
+                    interleave_present_values_with_nulls(
+                        &def_levels,
+                        max_def,
+                        present_values,
+                        descriptor,
+                        &mut values,
+                        want,
+                    )?;
                 }
                 ParquetPageType::DataPageV2 => {
-                    bail!("Data Page V2 isn't supported by this reader yet");
+                    let dp = header
+                        .data_page_header_v2
+                        .as_ref()
+                        .context("DATA_PAGE_V2 missing its own header")?;
+                    let num_values = usize::try_from(dp.num_values)
+                        .context("negative Parquet page num_values")?;
+                    let rep_len = usize::try_from(dp.repetition_levels_byte_length)
+                        .context("negative repetition_levels_byte_length")?;
+                    let def_len = usize::try_from(dp.definition_levels_byte_length)
+                        .context("negative definition_levels_byte_length")?;
+                    // Unlike V1, a Data Page V2's repetition/definition
+                    // levels are never compressed (only the trailing
+                    // value data is, and only when `is_compressed` -
+                    // default true - says so) and carry no length prefix
+                    // of their own: the header already gives their exact
+                    // byte lengths, verified directly against the
+                    // `parquet` crate's own `serialized_reader.rs`
+                    // (`offset = rep_levels_byte_length +
+                    // definition_levels_byte_length`) rather than assumed
+                    // from the format's general prose description.
+                    let levels_len = rep_len
+                        .checked_add(def_len)
+                        .context("Parquet V2 level lengths overflow")?;
+                    let level_bytes = compressed
+                        .get(..levels_len)
+                        .context("truncated Parquet Data Page V2 level bytes")?;
+                    let data_compressed = &compressed[levels_len..];
+                    let data = if dp.is_compressed {
+                        let uncompressed_total = usize::try_from(header.uncompressed_page_size)
+                            .context("negative Parquet page size")?;
+                        let uncompressed_data_size = uncompressed_total
+                            .checked_sub(levels_len)
+                            .context("Parquet V2 level lengths exceed uncompressed_page_size")?;
+                        if uncompressed_data_size == 0 {
+                            // A page with no non-null values at all - see
+                            // https://github.com/apache/parquet-format/blob/master/README.md#data-pages
+                            Vec::new()
+                        } else {
+                            let size = i32::try_from(uncompressed_data_size)
+                                .context("Parquet V2 data size exceeds i32")?;
+                            decompress_page_bytes(chunk.codec, data_compressed, size)?
+                        }
+                    } else {
+                        data_compressed.to_vec()
+                    };
+                    let mut raw = Vec::with_capacity(levels_len + data.len());
+                    raw.extend_from_slice(level_bytes);
+                    raw.extend_from_slice(&data);
+
+                    let def_levels = if descriptor.max_def_level > 0 {
+                        let def_bytes = raw
+                            .get(rep_len..levels_len)
+                            .context("truncated Parquet Data Page V2 definition levels")?;
+                        decode_rle_bit_packed_hybrid(
+                            def_bytes,
+                            num_required_bits(descriptor.max_def_level),
+                            num_values,
+                        )?
+                    } else {
+                        vec![0u64; num_values]
+                    };
+                    let max_def = i64::from(descriptor.max_def_level);
+                    let num_present = def_levels.iter().filter(|&&d| d as i64 == max_def).count();
+
+                    let present_values = decode_present_values(
+                        &raw,
+                        levels_len,
+                        dp.encoding,
+                        num_present,
+                        descriptor,
+                        dictionary.as_deref(),
+                    )?;
+                    interleave_present_values_with_nulls(
+                        &def_levels,
+                        max_def,
+                        present_values,
+                        descriptor,
+                        &mut values,
+                        want,
+                    )?;
                 }
                 ParquetPageType::IndexPage => {}
             }
@@ -9488,6 +9636,43 @@ mod parquet_support {
         fn reads_a_non_hadoop_lz4_column_via_the_raw_block_fallback() {
             decode_column_chunk_matches_the_record_api(
                 "tests/fixtures/parquet_lz4_non_hadoop_fallback.parquet",
+            );
+        }
+
+        /// Locks in Data Page V2's own level/data framing (no length
+        /// prefix on the level streams, only the trailing value data
+        /// possibly compressed) against a real V2 file, plus
+        /// `Encoding::Rle` as a genuine value encoding (only valid for
+        /// BOOLEAN - see `decode_present_values`'s own doc comment on
+        /// that arm), value-for-value against the independent `record`
+        /// API oracle.
+        #[test]
+        fn reads_a_data_page_v2_column_using_rle_encoded_booleans() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_v2_rle_boolean.parquet",
+            );
+        }
+
+        /// Locks in the multi-member gzip fix (see `gzip_decompress`'s
+        /// own doc comment) specifically through the Parquet GZIP codec
+        /// path, not just the standalone `gzip_decompress` unit tests -
+        /// this file's own V2 page is what originally found the bug,
+        /// value-for-value against the independent `record` API oracle.
+        #[test]
+        fn reads_a_data_page_v2_column_compressed_as_concatenated_gzip_members() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_v2_concatenated_gzip.parquet",
+            );
+        }
+
+        /// Locks in a Data Page V2 page whose non-null value count is
+        /// zero (the "decompressed size of zero" case Parquet's own spec
+        /// documents for a page holding only null/absent values), value-
+        /// for-value against the independent `record` API oracle.
+        #[test]
+        fn reads_a_data_page_v2_column_with_zero_non_null_values() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_v2_empty_compressed.parquet",
             );
         }
 
@@ -17536,66 +17721,108 @@ fn read_null_terminated<R: std::io::Read>(input: &mut R) -> Result<()> {
 /// was actually decompressed - catching real data corruption a purely
 /// structural decode wouldn't (a bit-flipped byte deep in a compressed
 /// block can still often decode to *some* well-formed-looking output).
+/// RFC 1952 §2.2 permits a gzip stream to hold multiple concatenated
+/// "members", each a complete header+DEFLATE-data+footer unit with
+/// nothing before, between, or after them - and every real gzip
+/// implementation (the `gzip`/`zlib` reference tools included) decodes
+/// every member and concatenates their outputs, not just the first. This
+/// project's own `--features parquet` GZIP codec surfaced a real,
+/// previously-unnoticed gap here (this function's first draft, written
+/// well before Parquet support existed, only ever decoded one member):
+/// found via the real-world corpus sweep's own
+/// `concatenated_gzip_members.parquet` fixture from `apache/parquet-
+/// testing`, whose name states the mechanism directly - a page compressed
+/// as two separate gzip members back to back, which used to silently
+/// truncate to just the first member's data ("truncated PLAIN value"
+/// downstream, not a clean gzip-level error, since the truncated buffer
+/// still parsed as a valid-looking prefix). Fixed by looping until the
+/// underlying reader is genuinely exhausted (checked via `BufRead::
+/// fill_buf`'s own non-consuming peek, the only way to tell "one more
+/// member follows" from "stream is done" without speculatively reading
+/// past a real end), decoding and concatenating every member found - the
+/// exact same fix this function's own top-level `.gz`/`.gzip` file
+/// support needed too, since both paths share this one function.
 fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
-    use std::io::Read;
+    use std::io::{BufRead, Read};
     let mut input = std::io::BufReader::new(input);
+    let mut output = Vec::new();
+    let mut first = true;
 
-    let mut header = [0u8; 10];
-    input
-        .read_exact(&mut header)
-        .context("failed to read gzip header")?;
-    if header[0] != 0x1f || header[1] != 0x8b {
-        bail!("not a valid gzip file (bad magic bytes)");
-    }
-    if header[2] != 8 {
-        bail!("unsupported gzip compression method (only DEFLATE is supported)");
-    }
-    let flags = header[3];
+    loop {
+        // A valid gzip stream needs at least one member - only treat
+        // "nothing left to read" as a clean stop *between* members, never
+        // in place of the mandatory first one (a genuinely empty, 0-byte
+        // input is still the same "failed to read gzip header" error it
+        // always was, matching every real gzip decompressor).
+        if !first
+            && input
+                .fill_buf()
+                .context("failed to read gzip stream")?
+                .is_empty()
+        {
+            break;
+        }
+        first = false;
 
-    if flags & 0x04 != 0 {
-        // FEXTRA
-        let mut len_buf = [0u8; 2];
+        let mut header = [0u8; 10];
         input
-            .read_exact(&mut len_buf)
-            .context("failed to read gzip FEXTRA length")?;
-        let mut skip = vec![0u8; u16::from_le_bytes(len_buf) as usize];
+            .read_exact(&mut header)
+            .context("failed to read gzip header")?;
+        if header[0] != 0x1f || header[1] != 0x8b {
+            bail!("not a valid gzip file (bad magic bytes)");
+        }
+        if header[2] != 8 {
+            bail!("unsupported gzip compression method (only DEFLATE is supported)");
+        }
+        let flags = header[3];
+
+        if flags & 0x04 != 0 {
+            // FEXTRA
+            let mut len_buf = [0u8; 2];
+            input
+                .read_exact(&mut len_buf)
+                .context("failed to read gzip FEXTRA length")?;
+            let mut skip = vec![0u8; u16::from_le_bytes(len_buf) as usize];
+            input
+                .read_exact(&mut skip)
+                .context("failed to read gzip FEXTRA data")?;
+        }
+        if flags & 0x08 != 0 {
+            read_null_terminated(&mut input).context("failed to read gzip FNAME")?;
+        }
+        if flags & 0x10 != 0 {
+            read_null_terminated(&mut input).context("failed to read gzip FCOMMENT")?;
+        }
+        if flags & 0x02 != 0 {
+            // FHCRC - a checksum of the header only, not verified (the
+            // footer's CRC32 of the actual decompressed data below is the
+            // check that matters for catching real corruption).
+            let mut crc16 = [0u8; 2];
+            input
+                .read_exact(&mut crc16)
+                .context("failed to read gzip FHCRC")?;
+        }
+
+        let decompressed = inflate(&mut input)?;
+
+        let mut footer = [0u8; 8];
         input
-            .read_exact(&mut skip)
-            .context("failed to read gzip FEXTRA data")?;
-    }
-    if flags & 0x08 != 0 {
-        read_null_terminated(&mut input).context("failed to read gzip FNAME")?;
-    }
-    if flags & 0x10 != 0 {
-        read_null_terminated(&mut input).context("failed to read gzip FCOMMENT")?;
-    }
-    if flags & 0x02 != 0 {
-        // FHCRC - a checksum of the header only, not verified (the
-        // footer's CRC32 of the actual decompressed data below is the
-        // check that matters for catching real corruption).
-        let mut crc16 = [0u8; 2];
-        input
-            .read_exact(&mut crc16)
-            .context("failed to read gzip FHCRC")?;
+            .read_exact(&mut footer)
+            .context("failed to read gzip footer")?;
+        let expected_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+        let expected_isize = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+
+        if crc32(&decompressed) != expected_crc {
+            bail!("gzip CRC32 checksum mismatch - the file is corrupt or truncated");
+        }
+        if (decompressed.len() as u64 & 0xFFFF_FFFF) as u32 != expected_isize {
+            bail!("gzip size checksum mismatch - the file is corrupt or truncated");
+        }
+
+        output.extend_from_slice(&decompressed);
     }
 
-    let decompressed = inflate(&mut input)?;
-
-    let mut footer = [0u8; 8];
-    input
-        .read_exact(&mut footer)
-        .context("failed to read gzip footer")?;
-    let expected_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
-    let expected_isize = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
-
-    if crc32(&decompressed) != expected_crc {
-        bail!("gzip CRC32 checksum mismatch - the file is corrupt or truncated");
-    }
-    if (decompressed.len() as u64 & 0xFFFF_FFFF) as u32 != expected_isize {
-        bail!("gzip size checksum mismatch - the file is corrupt or truncated");
-    }
-
-    Ok(decompressed)
+    Ok(output)
 }
 
 // --- Hand-rolled ZIP reader (PKWARE APPNOTE.TXT) ---
@@ -22872,6 +23099,42 @@ mod tests {
         assert!(
             format!("{err:?}").contains("CRC32"),
             "expected a CRC32 mismatch error, got: {err:?}"
+        );
+    }
+
+    /// RFC 1952 permits multiple gzip members concatenated back to back
+    /// in one stream, and every real decompressor concatenates their
+    /// outputs - a real gap this project's own reader had until the
+    /// Parquet GZIP codec's real-world corpus sweep found it
+    /// (`concatenated_gzip_members.parquet`, from `apache/parquet-
+    /// testing`, silently truncated to just its first member's data
+    /// before this fix). Constructed here from two copies of an existing
+    /// real fixture's own bytes back to back, rather than needing a new
+    /// committed fixture, since any two valid gzip streams concatenated
+    /// are themselves a valid multi-member stream.
+    #[test]
+    fn gzip_decompress_concatenates_every_member_not_just_the_first() {
+        let bytes = include_bytes!("../tests/fixtures/sample.csv.gz");
+        let once = gzip_decompress(&bytes[..]).unwrap();
+        let mut doubled = bytes.to_vec();
+        doubled.extend_from_slice(bytes);
+        let twice = gzip_decompress(&doubled[..]).unwrap();
+        let mut expected = once.clone();
+        expected.extend_from_slice(&once);
+        assert_eq!(twice, expected);
+    }
+
+    /// A genuinely empty (0-byte) input has no gzip member at all - the
+    /// multi-member fix above must not treat "nothing left to read" as a
+    /// valid empty stream when it happens *before* any member has been
+    /// read, only between members. Every real gzip decompressor errors on
+    /// this the same way.
+    #[test]
+    fn gzip_decompress_rejects_a_genuinely_empty_input() {
+        let err = gzip_decompress(&b""[..]).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("gzip header"),
+            "expected a 'failed to read gzip header' error, got: {err:?}"
         );
     }
 
