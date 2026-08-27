@@ -4749,13 +4749,101 @@ this project could just implement directly rather than depend on:
   defaults to Data Page V1, with no option to force V2 or its RLE-boolean-
   value encoding).
 
-  **Still deliberately not started, in the same order Phase A laid out**:
-  `DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/`DELTA_BYTE_ARRAY`
-  encodings; the LZO/Brotli compression codecs; nested Struct/List/Map
-  reconstruction from definition/repetition levels (`max_rep_level != 0`
-  columns are still explicitly rejected); and, last, Arrow IPC/Feather's
-  own separate FlatBuffers-based schema/`RecordBatch` framework, entirely
-  unstarted. `parquet_support` remains a real but dormant module
+  **Phase E (this session): the three delta encodings
+  (`DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/`DELTA_BYTE_ARRAY`) -
+  still not wired into `columns_from_parquet`.** The last remaining
+  encoding gap for flat schemas, picked next because every one of this
+  corpus's own delta-encoded files was already failing with a specific,
+  correctly-identified "not supported yet" error rather than anything
+  unexplained - a clean, well-scoped unit of work with no ambiguity about
+  what was missing.
+
+  `DELTA_BINARY_PACKED` (INT32/INT64) is the foundation the other two
+  build on, verified field-by-field against the `parquet` crate's own
+  `DeltaBitPackDecoder` (`encodings/decoding.rs`) before writing a line of
+  Rust: a header (`block_size` - a uleb128 varint, must be a positive
+  multiple of 128; `mini_blocks_per_block` - uleb128, must evenly divide
+  `block_size`; `total_value_count` - uleb128, trusted from the caller's
+  own already-known `num_present` instead, the same "decode exactly what's
+  needed" choice every other decoder in this module already makes;
+  `first_value` - a zigzag varint, checked to fit `i32` when the physical
+  type is INT32, matching the reference's own checked - not wrapping -
+  conversion for specifically this one field), then, per block: `min_delta`
+  (zigzag varint), one raw *byte-aligned* (not bit-packed) bit-width byte
+  per miniblock, then each miniblock's own `values_per_mini_block`
+  (`block_size / mini_blocks_per_block`, always a multiple of 32) deltas
+  bit-packed at that miniblock's own width - reusing this project's
+  existing `read_bits` directly, since Parquet's own spec confirms delta
+  encoding shares the identical LSB-first bit-packing convention the RLE/
+  bit-packing hybrid already uses (both ride the same underlying
+  `BitReader` in the reference crate). Each delta reconstructs via
+  `value[i] = value[i-1].wrapping_add(raw + min_delta)`, in `i64` even for
+  INT32 columns - correct because truncating a wrapping-mod-2^64 result to
+  its low 32 bits at the very end is mathematically identical to
+  performing the same wrapping arithmetic natively in 32-bit width
+  throughout (2^32 evenly divides 2^64), letting one shared `i64`
+  implementation correctly serve both physical types without duplicating
+  it per width. One easy-to-miss detail confirmed directly in the
+  reference rather than assumed from the format's general description: a
+  miniblock's full bit-packed span is present on disk whenever it holds
+  *any* real value (even one mixed with encoder-chosen padding in the same
+  miniblock), but a miniblock holding zero real values at all (only
+  possible as a trailing miniblock in the final block) contributes zero
+  bytes to the stream - `delta_binary_packed_decode_i64` tracks this via a
+  single running `remaining` counter, matching the reference's own
+  `next_block`/`block_end_offset` computation.
+
+  `DELTA_LENGTH_BYTE_ARRAY` (BYTE_ARRAY only) is a `DELTA_BINARY_PACKED`
+  stream of every value's length, immediately followed by every value's
+  raw bytes concatenated in declaration order with no further per-value
+  framing - `decode_delta_length_byte_array` decodes the length stream via
+  the function above (which is why that function threads an explicit
+  `pos: &mut usize` through rather than just returning a value list: its
+  callers need to know exactly where the stream ends, not just what it
+  decoded), then reads each value's own bytes at that already-known
+  length. `DELTA_BYTE_ARRAY` (BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY) layers
+  prefix-compression on top: a `DELTA_BINARY_PACKED` stream of each
+  value's shared-prefix length with its *predecessor*, then a second,
+  immediately-following `DELTA_BINARY_PACKED` stream of each value's own
+  suffix length, then every suffix's raw bytes concatenated in order -
+  `decode_delta_byte_array` reconstructs each value as `previous[..prefix_
+  len] + suffix`, carrying the reference decoder's own bounds check
+  (a prefix length that exceeds the previous value's own length is a
+  disclosed error, not a panic) forward unchanged.
+
+  **Verification found zero bugs** - a first for this hand-roll campaign's
+  Parquet phases, matching the same "clean pass" experience TOML's own
+  hand-roll had (see that entry's own writeup above): both core fixtures
+  passed on the first attempt, and the real-world corpus sweep went
+  straight from 56/63 to 61/63 exact matches with no fix cycle needed in
+  between - the careful field-by-field verification against the reference
+  decoder's own source before writing any code (rather than after, the
+  more common order in this campaign's earlier Parquet phases) paid off
+  directly here. The only two remaining corpus mismatches are the same
+  pre-existing, already-documented oracle-crate limits (`dict-page-offset
+  -zero.parquet`, `nation.dict-malformed.parquet`) - meaning **every
+  flat-schema encoding gap this reader ever had is now closed**: zero
+  files in the corpus fail with a disclosed "not supported yet" roadmap
+  message any more. Three more real corpus files were vendored as
+  permanent fixtures (`tests/fixtures/parquet_delta_binary_packed.parquet`,
+  `parquet_delta_length_byte_array.parquet`, `parquet_delta_byte_array
+  .parquet` - see `tests/fixtures/parquet_PROVENANCE.md`) with their own
+  dedicated tests, since pyarrow's own writer has no option to force any
+  of the three delta encodings on write - including real, hard-to-
+  synthesize edge cases a hand-built fixture might not happen to exercise
+  (`delta_binary_packed.parquet`'s own `bitwidth0` column name states its
+  own edge case directly: a miniblock where every delta is identical).
+
+  **Still deliberately not started**: the LZO/Brotli compression codecs
+  (present in this project's own documented Parquet compression-codec
+  list, but not exercised by any flat-schema file in this corpus, so
+  there's no real fixture yet to verify a hand-roll against); nested
+  Struct/List/Map reconstruction from definition/repetition levels
+  (`max_rep_level != 0` columns are still explicitly rejected - the 16
+  corpus files this skips are *entirely* what's left of the 79-file
+  corpus that hasn't been proven end to end); and, last, Arrow IPC/
+  Feather's own separate FlatBuffers-based schema/`RecordBatch` framework,
+  entirely unstarted. `parquet_support` remains a real but dormant module
   (`#[allow(dead_code)]`, exercised only by its own tests) and `arrow`/
   `parquet` remain live runtime dependencies until every behavior this
   project currently documents and tests for Parquet/Arrow IPC is matched,

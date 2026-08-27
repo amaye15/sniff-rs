@@ -81,3 +81,36 @@ doc comment in `src/lib.rs` for the full fix). `parquet_v2_empty_compressed
 "decompressed size of zero" case `serialized_reader.rs` documents by citing
 the Parquet format's own spec (`apache/parquet-format`'s README, "data
 pages" section) directly.
+
+# Provenance of `parquet_delta_binary_packed.parquet`, `parquet_delta_length_byte_array.parquet`, and `parquet_delta_byte_array.parquet`
+
+All three are real `.parquet` files copied verbatim from the same
+`apache/parquet-testing` project's own `data/` directory (same license as
+above):
+
+- `parquet_delta_binary_packed.parquet` was `delta_binary_packed.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/delta_binary_packed.parquet
+- `parquet_delta_length_byte_array.parquet` was `delta_length_byte_array.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/delta_length_byte_array.parquet
+- `parquet_delta_byte_array.parquet` was `delta_byte_array.parquet`:
+  https://github.com/apache/parquet-testing/blob/master/data/delta_byte_array.parquet
+
+Vendored for the same reason as the files above: pyarrow's own Parquet
+writer has no option to force any of the three delta encodings
+(`DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/`DELTA_BYTE_ARRAY`) on
+write, so a real file from a writer that does (these three come from the
+Parquet reference implementation's own interop test suite) is the only way
+to verify this reader's hand-rolled decoder
+(`delta_binary_packed_decode_i64` and its two callers in `src/lib.rs`)
+against genuine encoded data - including real edge cases a synthetic
+fixture might not happen to exercise, such as a miniblock with bit_width
+0 (`delta_binary_packed.parquet`'s own `bitwidth0` column name states this
+directly) and prefix-compressed strings sharing real, varying-length
+common prefixes with their predecessor (`delta_byte_array.parquet`).
+`delta_encoding_optional_column.parquet`/`delta_encoding_required_column
+.parquet` (also in the same corpus directory) were deliberately *not*
+also vendored - they exercise the identical `DELTA_BINARY_PACKED` encoding
+these three files already cover, just varying nullability, which this
+reader's shared definition-level/null-interleaving logic (already proven
+across every other encoding this reader supports) isn't specific to delta
+encoding at all.

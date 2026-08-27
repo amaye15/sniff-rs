@@ -8325,6 +8325,242 @@ mod parquet_support {
             .collect())
     }
 
+    fn read_delta_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
+        let (v, n) = read_uleb128(data, *pos)?;
+        *pos += n;
+        Ok(v)
+    }
+
+    fn read_delta_zigzag(data: &[u8], pos: &mut usize) -> Result<i64> {
+        let v = read_delta_varint(data, pos)?;
+        Ok(((v >> 1) as i64) ^ -((v & 1) as i64))
+    }
+
+    /// Decodes exactly `num_values` `i64`s (the physical values, not yet
+    /// rendered to bytes) from a `DELTA_BINARY_PACKED`-encoded stream,
+    /// advancing `pos` to exactly where the stream ends - needed by
+    /// `decode_delta_length_byte_array`/`decode_delta_byte_array` below,
+    /// which both have real data immediately following this exact point,
+    /// not just by this function's own direct callers. Verified
+    /// field-by-field against the `parquet` crate's own
+    /// `DeltaBitPackDecoder` (`encodings/decoding.rs`), which this
+    /// project's own `parquet`/`arrow` dependency already uses for this
+    /// at runtime:
+    ///
+    /// Header: `block_size` (a uleb128 varint, must be a positive
+    /// multiple of 128), `mini_blocks_per_block` (uleb128, `block_size`
+    /// must be evenly divisible by it), `total_value_count` (uleb128 -
+    /// this reader trusts the caller's own `num_values` instead, the same
+    /// "decode exactly what's needed" choice `plain_decode_one` and
+    /// friends already make throughout this module), `first_value`
+    /// (zigzag varint, emitted as-is - checked to fit `i32` when
+    /// `physical_type` is INT32, matching the reference decoder's own
+    /// checked (not wrapping) `T::T::from_i64` conversion specifically
+    /// for this one field).
+    ///
+    /// Then, per block: `min_delta` (zigzag varint), one raw
+    /// (byte-aligned, *not* bit-packed) bit-width byte per miniblock -
+    /// always `mini_blocks_per_block` bytes, read unconditionally even
+    /// for a miniblock that turns out to hold no real values at all (see
+    /// below) - then each miniblock's own `values_per_mini_block`
+    /// (= `block_size / mini_blocks_per_block`, always a multiple of 32)
+    /// deltas, bit-packed at that miniblock's own bit width and reusing
+    /// this project's own `read_bits` (LSB-first - the identical bit-
+    /// packing convention Parquet already shares between the RLE/bit-
+    /// packing hybrid and delta encoding, both riding the same underlying
+    /// `BitReader` in the reference crate, confirmed rather than assumed
+    /// from the shared name alone). Each delta reconstructs to
+    /// `value[i] = value[i-1].wrapping_add(raw + min_delta)` using
+    /// wrapping arithmetic throughout (Parquet's own spec permits a delta
+    /// stream to represent values that "overflow", e.g. `i64::MAX`
+    /// followed by `i64::MIN`) - correct for INT32 too despite every
+    /// intermediate value here being a full `i64`, since truncating a
+    /// wrapping-mod-2^64 result down to its low 32 bits at the very end
+    /// is mathematically identical to performing the same wrapping
+    /// arithmetic natively in 32-bit width throughout (2^32 evenly
+    /// divides 2^64), so one shared `i64` implementation correctly serves
+    /// both physical types without duplicating it per width.
+    ///
+    /// A miniblock's own bit-packed bytes are present on disk in full
+    /// (`bit_width * values_per_mini_block / 8` bytes) whenever it holds
+    /// *any* real value, even if only some of its slots are real and the
+    /// rest are the encoder's own padding - but a miniblock that holds
+    /// zero real values at all (wholly past `num_values`, only possible
+    /// for a trailing miniblock in the final block) contributes zero
+    /// bytes to the stream. Tracked here via a single running `remaining`
+    /// counter decremented by however many *real* values each miniblock
+    /// actually contributes (`values_per_mini_block.min(remaining)`),
+    /// with a miniblock reached at `remaining == 0` correctly consuming
+    /// no position advancement at all - the same "don't advance past
+    /// bytes nothing on disk backs" contract `next_block`'s own
+    /// `block_end_offset` computation guarantees in the reference.
+    fn delta_binary_packed_decode_i64(
+        data: &[u8],
+        pos: &mut usize,
+        num_values: usize,
+        physical_type: PhysicalType,
+    ) -> Result<Vec<i64>> {
+        let max_bit_width = match physical_type {
+            PhysicalType::Int32 => 32u32,
+            PhysicalType::Int64 => 64u32,
+            other => {
+                bail!("DELTA_BINARY_PACKED is not a valid encoding for physical type {other:?}")
+            }
+        };
+        let block_size = usize::try_from(read_delta_varint(data, pos)?)
+            .context("Parquet DELTA_BINARY_PACKED block_size exceeds usize")?;
+        if block_size == 0 || block_size % 128 != 0 {
+            bail!(
+                "Parquet DELTA_BINARY_PACKED block_size must be a positive multiple of 128, got {block_size}"
+            );
+        }
+        let mini_blocks_per_block = usize::try_from(read_delta_varint(data, pos)?)
+            .context("Parquet DELTA_BINARY_PACKED mini_blocks_per_block exceeds usize")?;
+        if mini_blocks_per_block == 0 || block_size % mini_blocks_per_block != 0 {
+            bail!(
+                "Parquet DELTA_BINARY_PACKED block_size must be a multiple of mini_blocks_per_block"
+            );
+        }
+        let values_per_mini_block = block_size / mini_blocks_per_block;
+        if values_per_mini_block == 0 || values_per_mini_block % 32 != 0 {
+            bail!(
+                "Parquet DELTA_BINARY_PACKED values_per_mini_block must be a positive multiple of 32"
+            );
+        }
+        let _total_value_count = read_delta_varint(data, pos)?;
+        let first_value = read_delta_zigzag(data, pos)?;
+        if physical_type == PhysicalType::Int32 && i32::try_from(first_value).is_err() {
+            bail!("Parquet DELTA_BINARY_PACKED first_value {first_value} doesn't fit in INT32");
+        }
+
+        let mut out = Vec::with_capacity(num_values.min(1 << 20));
+        if num_values == 0 {
+            return Ok(out);
+        }
+        out.push(first_value);
+        let mut last_value = first_value;
+        let mut remaining = num_values - 1;
+
+        while remaining > 0 {
+            let min_delta = read_delta_zigzag(data, pos)?;
+            let bit_widths = data
+                .get(*pos..*pos + mini_blocks_per_block)
+                .context("truncated Parquet DELTA_BINARY_PACKED mini-block bit widths")?
+                .to_vec();
+            *pos += mini_blocks_per_block;
+
+            for bw_byte in bit_widths {
+                if remaining == 0 {
+                    continue; // wholly-unused trailing miniblock: nothing on disk
+                }
+                let bit_width = u32::from(bw_byte);
+                if bit_width > max_bit_width {
+                    bail!(
+                        "Parquet DELTA_BINARY_PACKED mini-block bit width {bit_width} exceeds {max_bit_width}"
+                    );
+                }
+                let to_decode = values_per_mini_block.min(remaining);
+                let mut bit_offset = *pos * 8;
+                for _ in 0..to_decode {
+                    let raw = read_bits(data, &mut bit_offset, bit_width)?;
+                    let delta = (raw as i64).wrapping_add(min_delta);
+                    last_value = last_value.wrapping_add(delta);
+                    out.push(last_value);
+                }
+                *pos += (bit_width as usize) * values_per_mini_block / 8;
+                remaining -= to_decode;
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn decode_delta_binary_packed(
+        data: &[u8],
+        physical_type: PhysicalType,
+        num_present: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut pos = 0usize;
+        let values = delta_binary_packed_decode_i64(data, &mut pos, num_present, physical_type)?;
+        Ok(values
+            .into_iter()
+            .map(|v| match physical_type {
+                PhysicalType::Int32 => (v as i32).to_le_bytes().to_vec(),
+                PhysicalType::Int64 => v.to_le_bytes().to_vec(),
+                _ => unreachable!(
+                    "physical_type already validated by delta_binary_packed_decode_i64"
+                ),
+            })
+            .collect())
+    }
+
+    /// `DELTA_LENGTH_BYTE_ARRAY`: a `DELTA_BINARY_PACKED` (INT32) stream
+    /// of every value's length, immediately followed by every value's raw
+    /// bytes concatenated in order with no further per-value framing -
+    /// verified against the `parquet` crate's own
+    /// `DeltaLengthByteArrayDecoder::set_data`, including its restriction
+    /// to `BYTE_ARRAY` only (unlike `DELTA_BYTE_ARRAY` below, which also
+    /// covers `FIXED_LEN_BYTE_ARRAY`).
+    fn decode_delta_length_byte_array(data: &[u8], num_present: usize) -> Result<Vec<Vec<u8>>> {
+        let mut pos = 0usize;
+        let lengths =
+            delta_binary_packed_decode_i64(data, &mut pos, num_present, PhysicalType::Int32)?;
+        let mut out = Vec::with_capacity(num_present);
+        for len in lengths {
+            let len = usize::try_from(len).context("negative DELTA_LENGTH_BYTE_ARRAY length")?;
+            let bytes = data
+                .get(pos..pos + len)
+                .context("truncated DELTA_LENGTH_BYTE_ARRAY data")?;
+            out.push(bytes.to_vec());
+            pos += len;
+        }
+        Ok(out)
+    }
+
+    /// `DELTA_BYTE_ARRAY`: prefix-compression on top of the two encodings
+    /// above - a `DELTA_BINARY_PACKED` (INT32) stream of every value's
+    /// shared-prefix length (with the *previous* decoded value), then a
+    /// second, immediately-following `DELTA_BINARY_PACKED` (INT32) stream
+    /// of every value's own suffix length (`DELTA_LENGTH_BYTE_ARRAY`'s own
+    /// length stream, inlined directly here rather than through that
+    /// function, since its trailing raw-data phase needs to interleave
+    /// with prefix reconstruction one value at a time, not decode as one
+    /// separate block), then every suffix's raw bytes concatenated in
+    /// order. Verified against the `parquet` crate's own
+    /// `DeltaByteArrayDecoder::set_data`/`get`, including its own
+    /// prefix-length-exceeds-previous-value bounds check.
+    fn decode_delta_byte_array(data: &[u8], num_present: usize) -> Result<Vec<Vec<u8>>> {
+        let mut pos = 0usize;
+        let prefix_lengths =
+            delta_binary_packed_decode_i64(data, &mut pos, num_present, PhysicalType::Int32)?;
+        let suffix_lengths =
+            delta_binary_packed_decode_i64(data, &mut pos, num_present, PhysicalType::Int32)?;
+        let mut out = Vec::with_capacity(num_present);
+        let mut previous: Vec<u8> = Vec::new();
+        for (prefix_len, suffix_len) in prefix_lengths.into_iter().zip(suffix_lengths) {
+            let prefix_len =
+                usize::try_from(prefix_len).context("negative DELTA_BYTE_ARRAY prefix length")?;
+            let suffix_len =
+                usize::try_from(suffix_len).context("negative DELTA_BYTE_ARRAY suffix length")?;
+            if prefix_len > previous.len() {
+                bail!(
+                    "DELTA_BYTE_ARRAY prefix length {prefix_len} exceeds previous value length {}",
+                    previous.len()
+                );
+            }
+            let suffix = data
+                .get(pos..pos + suffix_len)
+                .context("truncated DELTA_BYTE_ARRAY suffix data")?;
+            let mut value = Vec::with_capacity(prefix_len + suffix_len);
+            value.extend_from_slice(&previous[..prefix_len]);
+            value.extend_from_slice(suffix);
+            pos += suffix_len;
+            previous = value.clone();
+            out.push(value);
+        }
+        Ok(out)
+    }
+
     /// A DECIMAL's unscaled value, stored as big-endian two's-complement
     /// bytes (Parquet's own convention for a BYTE_ARRAY/
     /// FIXED_LEN_BYTE_ARRAY-backed decimal - the *same* convention Avro's
@@ -8884,6 +9120,33 @@ mod parquet_support {
                     .context("truncated RLE-encoded boolean data")?;
                 let bits = decode_rle_bit_packed_hybrid(bytes, 1, num_present)?;
                 Ok(bits.into_iter().map(|b| vec![b as u8]).collect())
+            }
+            Encoding::DeltaBinaryPacked => {
+                let stream = raw
+                    .get(rpos..)
+                    .context("truncated DELTA_BINARY_PACKED data")?;
+                decode_delta_binary_packed(stream, descriptor.physical_type, num_present)
+            }
+            Encoding::DeltaLengthByteArray => {
+                if descriptor.physical_type != PhysicalType::ByteArray {
+                    bail!("DELTA_LENGTH_BYTE_ARRAY is only a valid encoding for BYTE_ARRAY");
+                }
+                let stream = raw
+                    .get(rpos..)
+                    .context("truncated DELTA_LENGTH_BYTE_ARRAY data")?;
+                decode_delta_length_byte_array(stream, num_present)
+            }
+            Encoding::DeltaByteArray => {
+                if !matches!(
+                    descriptor.physical_type,
+                    PhysicalType::ByteArray | PhysicalType::FixedLenByteArray
+                ) {
+                    bail!(
+                        "DELTA_BYTE_ARRAY is only a valid encoding for BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY"
+                    );
+                }
+                let stream = raw.get(rpos..).context("truncated DELTA_BYTE_ARRAY data")?;
+                decode_delta_byte_array(stream, num_present)
             }
             other => bail!("Parquet encoding {other:?} isn't supported by this reader yet"),
         }
@@ -9673,6 +9936,42 @@ mod parquet_support {
         fn reads_a_data_page_v2_column_with_zero_non_null_values() {
             decode_column_chunk_matches_the_record_api(
                 "tests/fixtures/parquet_v2_empty_compressed.parquet",
+            );
+        }
+
+        /// Locks in `DELTA_BINARY_PACKED` (see
+        /// `delta_binary_packed_decode_i64`'s own doc comment), including
+        /// this real file's own `bitwidth0` column - a genuine bit_width=0
+        /// miniblock (every delta in it identical), value-for-value
+        /// against the independent `record` API oracle.
+        #[test]
+        fn reads_a_delta_binary_packed_column() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_delta_binary_packed.parquet",
+            );
+        }
+
+        /// Locks in `DELTA_LENGTH_BYTE_ARRAY` (a `DELTA_BINARY_PACKED`
+        /// length stream followed by raw concatenated value bytes - see
+        /// `decode_delta_length_byte_array`'s own doc comment), value-for-
+        /// value against the independent `record` API oracle.
+        #[test]
+        fn reads_a_delta_length_byte_array_column() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_delta_length_byte_array.parquet",
+            );
+        }
+
+        /// Locks in `DELTA_BYTE_ARRAY` (prefix-compression on top of the
+        /// two encodings above - see `decode_delta_byte_array`'s own doc
+        /// comment), value-for-value against the independent `record` API
+        /// oracle - real strings sharing genuine, varying-length common
+        /// prefixes with their predecessor, not just a synthetic worst
+        /// case.
+        #[test]
+        fn reads_a_delta_byte_array_column() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_delta_byte_array.parquet",
             );
         }
 
