@@ -8270,6 +8270,61 @@ mod parquet_support {
         })
     }
 
+    /// `BYTE_STREAM_SPLIT`'s per-value byte width - verified directly
+    /// against the `parquet` crate's own `encodings/decoding.rs`
+    /// (`impl GetDecoder for i32/i64/f32/f64/FixedLenByteArray`, the only
+    /// five `DataType`s that ever route `Encoding::BYTE_STREAM_SPLIT` to
+    /// a real decoder): INT32/FLOAT are 4 bytes, INT64/DOUBLE are 8,
+    /// FIXED_LEN_BYTE_ARRAY is whatever `type_length` says (2/4/8/16 and
+    /// anything else all fall through the same general path in the
+    /// reference decoder - `join_streams_variable` - so there's no
+    /// special-casing to replicate here either). BOOLEAN/INT96/BYTE_ARRAY
+    /// have no `BYTE_STREAM_SPLIT` arm in the crate at all - a variable-
+    /// length or non-fixed-byte-count value can't be byte-transposed the
+    /// way this encoding requires, so those are a disclosed error.
+    fn byte_stream_split_type_size(descriptor: &ColumnDescriptor) -> Result<usize> {
+        match descriptor.physical_type {
+            PhysicalType::Int32 | PhysicalType::Float => Ok(4),
+            PhysicalType::Int64 | PhysicalType::Double => Ok(8),
+            PhysicalType::FixedLenByteArray => usize::try_from(
+                descriptor
+                    .type_length
+                    .context("FIXED_LEN_BYTE_ARRAY missing type_length")?,
+            )
+            .context("negative FIXED_LEN_BYTE_ARRAY type_length"),
+            other => bail!("BYTE_STREAM_SPLIT is not valid for physical type {other:?}"),
+        }
+    }
+
+    /// Reverses `BYTE_STREAM_SPLIT`'s own encoding: each value's
+    /// `type_size` bytes are transposed into `type_size` separate byte
+    /// streams (all byte-position-0s, then all byte-position-1s, ...) so
+    /// same-position bytes across many values sit next to each other -
+    /// friendlier to compress and to SIMD-vectorize than plain
+    /// interleaved little-endian values. Verified directly against the
+    /// `parquet` crate's own `join_streams_const`/`join_streams_variable`
+    /// (`encodings/decoding/byte_stream_split_decoder.rs`): value `i`'s
+    /// byte `j` lives at `src[i + j * stride]`, where `stride` is the
+    /// total value count (`encoded_bytes.len() / type_size`) - the
+    /// inverse of a plain PLAIN-encoded layout's `src[i*type_size + j]`.
+    fn decode_byte_stream_split(
+        data: &[u8],
+        type_size: usize,
+        num_values: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        if data.len() != num_values * type_size {
+            bail!(
+                "BYTE_STREAM_SPLIT stream is {} bytes, expected {} ({num_values} values * {type_size} bytes)",
+                data.len(),
+                num_values * type_size
+            );
+        }
+        let stride = num_values;
+        Ok((0..num_values)
+            .map(|i| (0..type_size).map(|j| data[i + j * stride]).collect())
+            .collect())
+    }
+
     /// A DECIMAL's unscaled value, stored as big-endian two's-complement
     /// bytes (Parquet's own convention for a BYTE_ARRAY/
     /// FIXED_LEN_BYTE_ARRAY-backed decimal - the *same* convention Avro's
@@ -8557,7 +8612,166 @@ mod parquet_support {
         })
     }
 
-    fn decompress_page_bytes(codec: CompressionCodec, data: &[u8]) -> Result<Vec<u8>> {
+    /// A sanity cap on an LZ4-compressed page's claimed decompressed
+    /// length, the same class of guard `snappy_support`/`zstd_support`
+    /// already apply to their own untrusted length fields - here the
+    /// length comes from Parquet's own `uncompressed_page_size` (already
+    /// bounds-checked as a real Thrift `i32`), not a length embedded in
+    /// the compressed bytes themselves, but a corrupted/adversarial
+    /// footer could still claim an enormous page.
+    const LZ4_MAX_ALLOC: usize = 512 * 1024 * 1024;
+
+    /// Reads LZ4's "linear small integer code" (LSIC): a run of `0xFF`
+    /// bytes, each contributing 255, terminated by (and including) the
+    /// first byte under 255 - verified directly against `lz4_flex`'s own
+    /// `read_integer` (`block/decompress_safe.rs`), the exact function
+    /// name and doc comment it uses for this.
+    fn lz4_read_lsic(data: &[u8], pos: &mut usize) -> Result<usize> {
+        let mut n = 0usize;
+        loop {
+            let b = *data.get(*pos).context("truncated LZ4 length byte")?;
+            *pos += 1;
+            n += usize::from(b);
+            if b != 0xFF {
+                return Ok(n);
+            }
+        }
+    }
+
+    /// Decodes a raw LZ4 block (RFC-less, but a small, stable, widely
+    /// implemented format - LZ4_Block_format.md in the reference `lz4`
+    /// project) into exactly `uncompressed_size` bytes. Verified directly
+    /// against `lz4_flex`'s own safe decoder
+    /// (`block/decompress_safe.rs::decompress_internal`, the exact
+    /// function this project's own `parquet`/`arrow` dependency already
+    /// uses for this at runtime) rather than assumed from a general
+    /// description: a sequence of "sequences" - [token byte: high nibble
+    /// literal length, low nibble match length - 4, either half `0xF`
+    /// meaning "read more via LSIC"] [literal bytes] [if any input
+    /// remains: 2-byte little-endian match offset (never 0), then a
+    /// match-length copy from `output[pos-offset..]` copied byte-by-byte
+    /// so an offset smaller than the match length still produces the
+    /// correct RLE-style repeat] - continuing until the input is
+    /// exhausted, which is how a decoder recognizes the final,
+    /// match-free sequence (there's no separate end marker).
+    fn lz4_block_decompress(input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
+        if uncompressed_size > LZ4_MAX_ALLOC {
+            bail!("LZ4 page claims an implausibly large decompressed size");
+        }
+        let mut out = Vec::with_capacity(uncompressed_size);
+        let mut pos = 0usize;
+        loop {
+            let token = *input.get(pos).context("truncated LZ4 token")?;
+            pos += 1;
+            let mut literal_len = usize::from(token >> 4);
+            if literal_len == 15 {
+                literal_len += lz4_read_lsic(input, &mut pos)?;
+            }
+            let literal = input
+                .get(pos..pos + literal_len)
+                .context("truncated LZ4 literal")?;
+            out.extend_from_slice(literal);
+            pos += literal_len;
+
+            if pos >= input.len() {
+                break;
+            }
+            let offset_bytes = input
+                .get(pos..pos + 2)
+                .context("truncated LZ4 match offset")?;
+            let offset = usize::from(u16::from_le_bytes(offset_bytes.try_into().unwrap()));
+            pos += 2;
+            if offset == 0 || offset > out.len() {
+                bail!("LZ4 match offset out of bounds");
+            }
+            let mut match_len = 4 + usize::from(token & 0x0F);
+            if match_len == 19 {
+                match_len += lz4_read_lsic(input, &mut pos)?;
+            }
+            let start = out.len() - offset;
+            for i in 0..match_len {
+                let byte = out[start + i];
+                out.push(byte);
+            }
+        }
+        if out.len() != uncompressed_size {
+            bail!(
+                "LZ4 block decompressed to {} bytes, expected {uncompressed_size}",
+                out.len()
+            );
+        }
+        Ok(out)
+    }
+
+    /// Attempts Hadoop's own `Lz4Codec` framing: zero or more concatenated
+    /// frames, each an 8-byte big-endian `(decompressed_size,
+    /// compressed_size)` header followed by that many bytes of a *raw*
+    /// LZ4 block - verified directly against the `parquet` crate's own
+    /// `lz4_hadoop_codec::try_decompress_hadoop` (`compression.rs`),
+    /// including its own citation of Hadoop's `Lz4Codec.cc` as the origin
+    /// of this framing. Returns an error (never panics) on anything that
+    /// doesn't parse as valid framing - the caller falls back to treating
+    /// the whole input as one bare raw block, see `lz4_decompress` below.
+    fn lz4_try_hadoop_framed(input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(uncompressed_size.min(LZ4_MAX_ALLOC));
+        let mut pos = 0usize;
+        while pos + 8 <= input.len() && out.len() < uncompressed_size {
+            let frame_decompressed_size =
+                u32::from_be_bytes(input[pos..pos + 4].try_into().unwrap()) as usize;
+            let frame_compressed_size =
+                u32::from_be_bytes(input[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            let frame = input
+                .get(pos..pos + frame_compressed_size)
+                .context("truncated Hadoop LZ4 frame")?;
+            pos += frame_compressed_size;
+            let decoded = lz4_block_decompress(frame, frame_decompressed_size)?;
+            out.extend_from_slice(&decoded);
+        }
+        if out.len() != uncompressed_size || pos != input.len() {
+            bail!(
+                "Hadoop-framed LZ4 decompressed to {} bytes from {pos} of {} input bytes, expected {uncompressed_size}",
+                out.len(),
+                input.len()
+            );
+        }
+        Ok(out)
+    }
+
+    /// Parquet's deprecated `LZ4` codec (as opposed to the newer,
+    /// unambiguous `LZ4_RAW`) is nominally Hadoop-framed (see
+    /// `lz4_try_hadoop_framed` above), but real files exist that set this
+    /// same legacy codec ID while writing a bare, unframed raw LZ4 block
+    /// instead - confirmed on a real fixture in this project's own
+    /// real-world corpus sweep, not assumed: `non_hadoop_lz4_compressed
+    /// .parquet` (named for exactly this reason) has an 18-byte page
+    /// whose first 8 bytes, read as a Hadoop frame header, claim an
+    /// absurd ~4 billion-byte decompressed size - not valid framing at
+    /// all - while the *entire* 18 bytes decode cleanly as one raw LZ4
+    /// block (a single 16-byte literal run, no match needed) to exactly
+    /// the page's own declared `uncompressed_page_size` of 16. This
+    /// mirrors the real `parquet` crate's own documented backward-
+    /// compatibility fallback (`LZ4HadoopCodec`'s `backward_compatible_lz4`
+    /// path, "to be backward compatible with older versions ... and
+    /// older versions of parquet-cpp") - narrowed to skip that crate's
+    /// own middle tier (a standalone LZ4 "frame" format, `lz4_flex::
+    /// frame::FrameDecoder`) since no real fixture in this project's
+    /// corpus sweep ever needed it, the same "no fixture, no trust"
+    /// boundary already drawn elsewhere in this project (old-style
+    /// BIFF2-5 `.xls`, SAS7BDAT's non-Latin1/UTF-8 codepages).
+    fn lz4_decompress(input: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
+        if uncompressed_size > LZ4_MAX_ALLOC {
+            bail!("LZ4 page claims an implausibly large decompressed size");
+        }
+        lz4_try_hadoop_framed(input, uncompressed_size)
+            .or_else(|_| lz4_block_decompress(input, uncompressed_size))
+    }
+
+    fn decompress_page_bytes(
+        codec: CompressionCodec,
+        data: &[u8],
+        uncompressed_size: i32,
+    ) -> Result<Vec<u8>> {
         match codec {
             CompressionCodec::Uncompressed => Ok(data.to_vec()),
             CompressionCodec::Snappy => snappy_support::snappy_decompress(data),
@@ -8566,6 +8780,16 @@ mod parquet_support {
             }
             CompressionCodec::Zstd => zstd_support::zstd_decompress(data)
                 .context("failed to zstd-decompress a Parquet page"),
+            CompressionCodec::Lz4Raw => {
+                let size =
+                    usize::try_from(uncompressed_size).context("negative Parquet page size")?;
+                lz4_block_decompress(data, size)
+            }
+            CompressionCodec::Lz4 => {
+                let size =
+                    usize::try_from(uncompressed_size).context("negative Parquet page size")?;
+                lz4_decompress(data, size)
+            }
             other => {
                 bail!("Parquet compression codec {other:?} isn't supported by this reader yet")
             }
@@ -8625,7 +8849,11 @@ mod parquet_support {
                     if descriptor.physical_type == PhysicalType::Boolean {
                         bail!("a dictionary-encoded BOOLEAN column is not valid Parquet");
                     }
-                    let raw = decompress_page_bytes(chunk.codec, compressed)?;
+                    let raw = decompress_page_bytes(
+                        chunk.codec,
+                        compressed,
+                        header.uncompressed_page_size,
+                    )?;
                     let mut dict = Vec::with_capacity(
                         usize::try_from(dph.num_values).unwrap_or(0).min(1 << 20),
                     );
@@ -8645,7 +8873,11 @@ mod parquet_support {
                         .data_page_header
                         .as_ref()
                         .context("DATA_PAGE missing its own header")?;
-                    let raw = decompress_page_bytes(chunk.codec, compressed)?;
+                    let raw = decompress_page_bytes(
+                        chunk.codec,
+                        compressed,
+                        header.uncompressed_page_size,
+                    )?;
                     let num_values = usize::try_from(dp.num_values)
                         .context("negative Parquet page num_values")?;
                     let mut rpos = 0usize;
@@ -8724,6 +8956,13 @@ mod parquet_support {
                                         .context("dictionary index out of range")
                                 })
                                 .collect::<Result<Vec<_>>>()?
+                        }
+                        Encoding::ByteStreamSplit => {
+                            let type_size = byte_stream_split_type_size(descriptor)?;
+                            let stream = raw
+                                .get(rpos..)
+                                .context("truncated BYTE_STREAM_SPLIT data")?;
+                            decode_byte_stream_split(stream, type_size, num_present)?
                         }
                         other => {
                             bail!("Parquet encoding {other:?} isn't supported by this reader yet")
@@ -9209,6 +9448,47 @@ mod parquet_support {
                 "an unrecognized LogicalType variant should be a disclosed fallback, not an error",
             );
             assert!(!meta.schema.is_empty());
+        }
+
+        /// `BYTE_STREAM_SPLIT` (a byte-transposition encoding for fixed-
+        /// width physical types, unrelated to compression) had zero real-
+        /// file coverage until this real fixture - locks in
+        /// `decode_byte_stream_split`/`byte_stream_split_type_size`
+        /// against a genuinely `BYTE_STREAM_SPLIT`-encoded, Zstd-
+        /// compressed column, value-for-value against the independent
+        /// `record` API oracle.
+        #[test]
+        fn reads_a_byte_stream_split_encoded_column() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_byte_stream_split.parquet",
+            );
+        }
+
+        /// Locks in genuine Hadoop `Lz4Codec` framing (see
+        /// `lz4_try_hadoop_framed`'s own doc comment) against a real file
+        /// that actually uses it, value-for-value against the
+        /// independent `record` API oracle.
+        #[test]
+        fn reads_a_hadoop_framed_lz4_column() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_lz4_hadoop_framed.parquet",
+            );
+        }
+
+        /// The real-world sweep's most surprising codec finding: a file
+        /// using the deprecated `LZ4` codec ID whose page bytes are
+        /// actually a *bare*, unframed raw LZ4 block, not Hadoop-framed
+        /// at all - see `lz4_decompress`'s own doc comment for the full
+        /// byte-level trace that found this. `lz4_decompress`'s fallback
+        /// (try Hadoop framing, fall back to a bare raw block on failure)
+        /// is what this test locks in, value-for-value against the
+        /// independent `record` API oracle - without the fallback, this
+        /// file fails with "truncated Hadoop LZ4 frame" instead.
+        #[test]
+        fn reads_a_non_hadoop_lz4_column_via_the_raw_block_fallback() {
+            decode_column_chunk_matches_the_record_api(
+                "tests/fixtures/parquet_lz4_non_hadoop_fallback.parquet",
+            );
         }
 
         // The same real-world sweep also found `dict-page-offset-zero.parquet`

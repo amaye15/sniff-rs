@@ -4578,18 +4578,97 @@ this project could just implement directly rather than depend on:
   so a future regression here fails loudly rather than blending into an
   expected-gaps list.
 
+  **Phase C (this session): `BYTE_STREAM_SPLIT` and the LZ4/LZ4_RAW
+  compression codecs - still not wired into `columns_from_parquet`.**
+  Picked as the next two easiest remaining gaps: `BYTE_STREAM_SPLIT` needs
+  no new page-framing work at all (it slots into the existing Data Page V1
+  decode path as a third encoding alongside PLAIN/RLE_DICTIONARY), and
+  LZ4's block format is simpler than the Snappy/Zstd decoders this project
+  already hand-rolled.
+
+  `BYTE_STREAM_SPLIT` is a byte-transposition scheme, not compression: a
+  page of `N` fixed-width values has each value's bytes reordered so all
+  byte-position-0s come first, then all byte-position-1s, and so on -
+  friendlier to compress and to SIMD-vectorize than plain interleaved
+  little-endian values. Verified directly against the `parquet` crate's
+  own `encodings/decoding.rs` (`impl GetDecoder for i32/i64/f32/f64/
+  FixedLenByteArray` - the only five types that ever route this encoding
+  to a real decoder) and `byte_stream_split_decoder.rs`'s own
+  `join_streams_const`/`join_streams_variable`: value `i`'s byte `j` lives
+  at `src[i + j*stride]` where `stride` is the value count - the inverse
+  of PLAIN's own `src[i*type_size + j]` layout. `byte_stream_split_type_size`
+  resolves the per-type byte width (4 for INT32/FLOAT, 8 for INT64/DOUBLE,
+  `type_length` for FIXED_LEN_BYTE_ARRAY) and `decode_byte_stream_split`
+  does the de-interleaving; BOOLEAN/INT96/BYTE_ARRAY have no
+  `BYTE_STREAM_SPLIT` arm in the reference crate at all (a variable-length
+  or non-fixed-byte-count value can't be byte-transposed this way), so
+  those stay a disclosed error.
+
+  LZ4 support needed two real pieces: `lz4_block_decompress` (the actual
+  LZ4 block algorithm - a sequence of token-prefixed literal-then-match
+  operations, verified directly against `lz4_flex`'s own safe decoder,
+  `block/decompress_safe.rs::decompress_internal`, the exact function
+  this project's own `parquet` dependency already uses for this at
+  runtime) backing `CompressionCodec::Lz4Raw` directly, and
+  `lz4_decompress` for the older, deprecated `CompressionCodec::Lz4`
+  value, which is nominally Hadoop-framed (`lz4_try_hadoop_framed`: zero
+  or more concatenated frames, each an 8-byte big-endian `(decompressed_
+  size, compressed_size)` header followed by that many bytes of a raw LZ4
+  block - verified against the `parquet` crate's own `lz4_hadoop_codec::
+  try_decompress_hadoop`, including its citation of Hadoop's own
+  `Lz4Codec.cc` as the framing's origin).
+
+  **A real, genuinely surprising finding, not assumed from the reference
+  crate's own code alone**: the reference crate's `LZ4HadoopCodec` carries
+  a documented backward-compatibility fallback ("to be backward compatible
+  with older versions of this library and older versions of parquet-cpp")
+  for files that set the deprecated `LZ4` codec ID but don't actually use
+  Hadoop framing - and a real file in the `apache/parquet-testing` corpus,
+  literally named `non_hadoop_lz4_compressed.parquet`, hits exactly this
+  case. Confirmed by hand-decoding its actual page bytes (not just trusting
+  the filename): its first 8 bytes, read as a Hadoop frame header, claim
+  an implausible ~4-billion-byte decompressed size for a 16-byte page -
+  clearly not valid framing - while the *entire* 18-byte page decodes
+  cleanly as a single bare LZ4 block (one 16-byte literal run, no match
+  needed) to exactly the page's own declared `uncompressed_page_size`.
+  `lz4_decompress` mirrors this with its own two-tier fallback (try
+  Hadoop framing; on any error, retry the whole input as one bare raw
+  block) - narrower than the reference crate's own three-tier chain (which
+  has a middle tier for a standalone LZ4 "frame" format,
+  `lz4_flex::frame::FrameDecoder`) since no real fixture in this project's
+  corpus sweep ever needed that middle tier, the same "no fixture, no
+  trust" boundary already drawn elsewhere in this project (old-style
+  BIFF2-5 `.xls`, SAS7BDAT's non-Latin1/UTF-8 codepages).
+
+  Verified two ways, matching every other phase in this section: the same
+  independent `parquet::record` API oracle on the two core fixtures (both
+  still passing on every in-scope column) and a fresh real-world corpus
+  sweep, which moved from 43/63 to 50/63 exact matches once both features
+  landed (the 2 `BYTE_STREAM_SPLIT` files and all 5 LZ4/LZ4_RAW/Hadoop-LZ4
+  files in the corpus now match exactly), still with zero genuine,
+  unexplained mismatches - the corpus test's own `assert!` on that count
+  continues to pass. Three real corpus files were vendored as permanent
+  fixtures (`tests/fixtures/parquet_byte_stream_split.parquet`,
+  `parquet_lz4_hadoop_framed.parquet`, `parquet_lz4_non_hadoop_fallback
+  .parquet` - see `tests/fixtures/parquet_PROVENANCE.md`) with their own
+  dedicated tests, rather than relying on the transient, uncommitted
+  corpus sweep alone to keep proving this - the same "vendor a real file
+  when self-generation is genuinely impossible" call already made for the
+  `unknown-logical-type.parquet` fixture above, since no ordinary writer
+  tool exposes Hadoop's legacy LZ4 framing, its backward-compatible
+  fallback, or `BYTE_STREAM_SPLIT` as an option.
+
   **Still deliberately not started, in the same order Phase A laid out**:
   Data Page V2; `DELTA_BINARY_PACKED`/`DELTA_LENGTH_BYTE_ARRAY`/
-  `DELTA_BYTE_ARRAY`/`BYTE_STREAM_SPLIT` encodings; the LZO/Brotli/LZ4/
-  LZ4_RAW compression codecs; nested Struct/List/Map reconstruction from
-  definition/repetition levels (`max_rep_level != 0` columns are still
-  explicitly rejected); and, last, Arrow IPC/Feather's own separate
-  FlatBuffers-based schema/`RecordBatch` framework, entirely unstarted.
-  `parquet_support` remains a real but dormant module
-  (`#[allow(dead_code)]`, exercised only by its own tests) and `arrow`/
-  `parquet` remain live runtime dependencies until every behavior this
-  project currently documents and tests for Parquet/Arrow IPC is matched,
-  verified, and cut over in one deliberate step.
+  `DELTA_BYTE_ARRAY` encodings; the LZO/Brotli compression codecs; nested
+  Struct/List/Map reconstruction from definition/repetition levels
+  (`max_rep_level != 0` columns are still explicitly rejected); and, last,
+  Arrow IPC/Feather's own separate FlatBuffers-based schema/`RecordBatch`
+  framework, entirely unstarted. `parquet_support` remains a real but
+  dormant module (`#[allow(dead_code)]`, exercised only by its own tests)
+  and `arrow`/`parquet` remain live runtime dependencies until every
+  behavior this project currently documents and tests for Parquet/Arrow
+  IPC is matched, verified, and cut over in one deliberate step.
 
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above (in progress, not declined), `serde`/`serde_json` are meant to
