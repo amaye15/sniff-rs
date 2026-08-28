@@ -5452,14 +5452,231 @@ this project could just implement directly rather than depend on:
   naive rendering doesn't add) - real, independently-rediscovered quirks
   of `arrow-json`'s own writer, not anything specific to either reader.
 
-  **Still deliberately not started**: decoding `Union`/`RunEndEncoded`/
-  `Interval`/`Duration`/the `*View` family (all already a disclosed
-  `ArrowDataType::Other` gap since Phase 1, matching this project's own
-  Parquet reader's equivalent scope boundary); LZO, the one Parquet
-  compression codec still not hand-rolled anywhere in this project (moot
-  here anyway, since Arrow IPC's own `BodyCompression` union only ever
-  offers `LZ4_FRAME`/`ZSTD` in the first place - there's no LZO or Brotli
-  codec value to ever add on this side regardless); and wiring either
+  **Phase 3 (this session): `Union`/`RunEndEncoded`/`Interval`/`Duration`/
+  the `*View` family - closing a real, audited gap, not a cosmetic
+  cleanup.** These five had sat as a disclosed `ArrowDataType::Other`
+  scope boundary since Phase 1, on the same "matches Parquet's own
+  equivalent boundary" reasoning documented above - but that boundary
+  was never actually checked against what the *live*, crate-based reader
+  this project ships today already does with a column of one of these
+  types. It was worth checking specifically because the planned cutover
+  policy is "full parity, one deliberate step" (stated at the end of
+  every phase in this section) - so before this hand-roll could
+  legitimately call itself done, "is Parquet's own scope boundary
+  actually the right one to copy here" needed a real answer, not an
+  assumption.
+
+  The answer, read directly out of the exact crate version this project
+  depends on (`arrow-cast` 59.2.0's `display.rs`, `arrow-schema`
+  59.2.0's `datatype.rs`, `arrow-array` 59.2.0's `cast.rs`) rather than
+  assumed from the type names alone: **all five are already fully
+  readable through `columns_from_parquet`/`columns_from_arrow_ipc`'s own
+  live `arrow_type_label`/`array_value_to_string` path today.**
+  `array_value_to_string`'s dispatch (`make_default_display_index`)
+  explicitly handles `Union`, `RunEndEncoded`, `Utf8View`/`BinaryView`,
+  and `ListView`/`LargeListView` by name; `Duration`/`Interval` aren't
+  *named* in that dispatch at all, but both are among the types
+  `downcast_primitive_array!` treats as genuine primitive arrays (backed
+  by one native scalar per row, confirmed directly in `arrow-array`'s own
+  `downcast_primitive!` macro, which lists every `Interval`/`Duration`
+  unit combination explicitly), so they're already covered by the same
+  generic primitive-array branch every ordinary numeric column already
+  goes through. The only thing the live reader gets wrong for these five
+  is cosmetic: `arrow_type_label`'s `other => format!("{other:?}")`
+  fallback reports a Debug-formatted type name (e.g.
+  `"Duration(Millisecond)"`) instead of a friendly `current_type` label
+  like every other type gets - the *values* were never actually
+  unreadable. That makes this hand-roll's old `ArrowDataType::Other(tag)
+  => bail!(...)` a real regression versus what ships today, not a
+  defensible parity boundary the way LZO or Arrow IPC's own still-`Other`
+  scope genuinely is (nothing in the *live* reader can read an LZO-
+  compressed Parquet page either) - so, unlike LZO, these five needed
+  real implementation work before the eventual cutover could honestly
+  claim parity.
+
+  **Duration** slots in almost for free, since it already goes through
+  the exact same node + `[validity, values]` shape (confirmed directly
+  against `RecordBatchDecoder::create_array`'s own fallback branch,
+  which every primitive type this reader didn't special-case already
+  used) - the only new work is its own 8-byte-always native width
+  (regardless of unit) and a rendering choice. Unlike Interval (below),
+  Duration's own oracle rendering *is* worth matching exactly: `arrow-
+  json`'s encoder routes any `DataType::is_temporal()` type (which
+  includes both Duration and Interval, confirmed directly in `arrow-
+  schema`) through `ArrayFormatter`, and Duration's own `DisplayIndex`
+  impl (`duration_display`/`duration_option_display` in `arrow-cast`)
+  renders through `chrono::TimeDelta`'s `Display` - a genuine ISO 8601
+  duration string (`PT5S`, `PT1.5S`, `-PT2.5S`, `P0D` for exactly zero),
+  not an ad hoc format, so `format_arrow_duration` replicates it exactly:
+  decompose the raw `i64` (scaled to nanoseconds via `i128` to avoid
+  overflow) into `(abs_secs, frac_ns)` and strip trailing zeros from the
+  9-digit fraction the same way chrono's own significant-digit loop
+  does. Two of `TimeDelta`'s own construction limits are replicated too
+  (`try_seconds` rejects `|raw| > i64::MAX/1000`, `try_milliseconds`
+  rejects only `i64::MIN`), rendering the same literal `"<invalid>"`
+  string the oracle falls back to rather than a computed - and wrong -
+  value.
+
+  **Interval** is the one deliberate non-oracle-matched rendering in
+  this batch. `arrow-cast`'s own three `DisplayIndex` impls for
+  `IntervalYearMonthType`/`IntervalDayTimeType`/`IntervalMonthDayNanoType`
+  are an ad hoc English-sentence format ("N years M mons", "N days N.NNN
+  secs") with no real standard behind it - a genuinely different case
+  from Duration's real ISO 8601 grammar, so it isn't worth chasing
+  byte-for-byte the way every other oracle-matched rendering in this
+  project is. `render_arrow_scalar`'s Interval arm instead emits a plain
+  JSON object naming the type's own real fields (`{"months": N}` for
+  YearMonth; `{"days": N, "milliseconds": N}` for DayTime; `{"months":
+  N, "days": N, "nanoseconds": N}` for MonthDayNano) - at least as
+  informative, and far simpler to keep correct than replicating a
+  multi-branch prefix-joining sentence builder. Byte layout for all
+  three (`#[repr(C)]`, confirmed directly in `arrow-buffer`'s own
+  `interval.rs`) is `months: i32` for YearMonth (4 bytes); `days: i32,
+  milliseconds: i32` for DayTime (8 bytes); `months: i32, days: i32,
+  nanoseconds: i64` for MonthDayNano (16 bytes) - all little-endian, the
+  same as every other Arrow buffer. Verified two ways: direct, hand-
+  computed `render_arrow_scalar` unit tests cover all three units
+  (`render_arrow_scalar_renders_every_interval_unit_as_a_structured_object`),
+  since `pyarrow`'s own Python API has no constructor for YearMonth or
+  DayTime intervals at all (only `month_day_nano_interval()`) - and a
+  real `pyarrow`-generated MonthDayNano file is checked against a
+  hardcoded, hand-verified expectation for full end-to-end pipeline
+  coverage (`decodes_a_month_day_nano_interval_file_against_a_hardcoded_expectation`),
+  not the oracle, for the reason above.
+
+  **`Utf8View`/`BinaryView`** use Arrow's "German string" view layout
+  (verified directly against `arrow-data`'s own `byte_view.rs`,
+  `ByteView`/`MAX_INLINE_VIEW_LEN`): a fixed 16-byte view per row
+  (`length: u32`, then either up to 12 inline data bytes when `length <=
+  12`, or a 4-byte prefix - redundant with the real data, so this reader
+  never reads it - plus a `buffer_index: u32` and `offset: u32` into one
+  of the column's own trailing data buffers when it's longer). The
+  buffer *count* for one of these columns isn't fixed by its type the
+  way every other column's is - it genuinely varies batch to batch - so
+  it comes from a side channel this reader hadn't parsed before now:
+  `RecordBatch`'s own `variadicBufferCounts` field (`VT_VARIADICBUFFER
+  COUNTS` = 12, a plain `Vector<i64>`, one entry per `Utf8View`/
+  `BinaryView` column in schema-encounter order), popped from the front
+  exactly the way `RecordBatchDecoder::create_array`'s own
+  `variadic_counts.pop_front()` does. `fb_read_i64_vector` (a small new
+  FlatBuffers scalar-vector reader, alongside `fb_read_i32_vector` for
+  Union's own `typeIds` below) reads it the same way every other packed-
+  scalar FlatBuffers vector in this project already is.
+
+  **`ListView`/`LargeListView`** carry 3 buffers (`[validity, offsets,
+  sizes]`, confirmed directly against `RecordBatchDecoder::
+  create_list_view_array`) instead of plain `List`'s 2
+  (`[validity, offsets]`) - each row `i` independently covers
+  `child[offsets[i]..offsets[i]+sizes[i]]` rather than `List`'s
+  N+1-cumulative-boundary convention, which is what actually lets a
+  `ListView`'s rows reference non-contiguous or reordered spans of its
+  own child array (the entire point of the view variant existing at
+  all). `read_i32_n`/`read_i64_n` (new, since this is a genuinely
+  different convention from `read_i32_offsets`/`read_i64_offsets`'s own
+  N+1-length reads) read exactly `len` independent values for both the
+  offsets and sizes buffers.
+
+  **`RunEndEncoded`** carries no buffers of its own at all beyond its
+  own `FieldNode` (for its logical row count) - its two children
+  (`run_ends`, `values`, always in that fixed order per the IPC spec)
+  are decoded as complete, ordinary arrays immediately after it,
+  confirmed directly against `RecordBatchDecoder::create_array`'s own
+  `RunEndEncoded(run_ends_field, values_field)` arm. Expanding back to
+  one value per logical row means repeating `values[k]` `run_ends[k] -
+  run_ends[k-1]` times (run 0 implicitly starts at 0) - `decode_run_end
+  _encoded` caps every run's repeat count at however many logical rows
+  are still actually needed, rather than trusting a run length read
+  straight from the file, so a corrupted or adversarial `run_ends` value
+  can't force an unbounded allocation the way an uncapped read would.
+
+  **`Union`** (Sparse and Dense mode) is the structurally largest of the
+  five, and the one place this phase drew a real, disclosed scope
+  boundary rather than chasing full fidelity: this reader targets IPC
+  format version V5 onward only (the version every modern writer,
+  including this project's own `pyarrow`-based fixture generator,
+  emits) - a legacy V4 file's extra leading validity buffer on a Union
+  column isn't read, the same kind of version boundary this reader's
+  message-framing layer already draws for pre-continuation-marker
+  files. `type_ids` is one signed byte per row (read for exactly `len`
+  bytes, not length-prefixed); Dense mode additionally carries one
+  `i32` value-offset per row into whichever child that row's type-id
+  resolves to, while Sparse mode has no offsets buffer at all - every
+  child is already the same length as the parent, so a Sparse row uses
+  its own row index directly into the resolved child. `Union.typeIds`
+  (the FlatBuffers vector pairing each child with the runtime type-id
+  byte that selects it) is genuinely arbitrary, not necessarily a dense
+  `0..n` range, confirmed directly against `gen/Schema.rs`'s own
+  `Union::typeIds` accessor - defaulting to the implicit `0..children
+  .len()` range only when the file omits it entirely, matching
+  `arrow-ipc`'s own `UnionFields` resolution. A resolved row's rendered
+  value is the child's own value unwrapped directly, not `{field_name:
+  value}` - Union has no single field name of its own to wrap it in.
+  There's no oracle at all to verify this rendering against, a first for
+  this whole campaign's Arrow IPC work: `arrow-json`'s own `encoder.rs`
+  has no `DataType::Union` case anywhere in its dispatch, falling
+  through to a hard `"Unsupported data type for JSON encoding"` error -
+  confirmed by reading its source, not by a failed test. Both Sparse and
+  Dense fixtures were instead independently checked against `pyarrow`'s
+  own `to_pylist()` on the exact same file before being trusted
+  (`[1, 1.5, 2, None]` for Dense, `[1, 2.5, 3, 4.5]` for Sparse) and
+  locked in as hardcoded-expectation tests.
+
+  **Two real, pre-existing bugs were found along the way - both genuine
+  default-value mismatches, not anything to do with the buffer-decoding
+  logic above.** `Duration`'s own oracle-comparison test failed
+  immediately on a real `pyarrow`-written Millisecond-unit column: every
+  value rendered 1000x too large (`"PT1500S"` instead of `"PT1.5S"`).
+  Traced to `gen/Schema.rs`'s own `Duration::unit()` accessor, which
+  defaults to `TimeUnit::MILLISECOND` when the field is absent - *not*
+  `SECOND` (0), confirmed directly in its source
+  (`Some(TimeUnit::MILLISECOND)`) rather than assumed the way `Time`/
+  `Timestamp`'s own genuinely-`SECOND`-or-`MILLISECOND`-respectively
+  defaults might suggest by analogy. A Millisecond-unit Duration column
+  is exactly the shape any compliant FlatBuffers writer omits the
+  `unit` field for at all (`TimeBuilder`/`DurationBuilder`'s own
+  `push_slot(..., unit, TimeUnit::MILLISECOND)` skips writing a field
+  that already equals its declared default - the standard convention,
+  not a `pyarrow`-specific quirk), so this reader's old `fb_get_i16(...,
+  0)` fallback silently misread every such column as Second-precision.
+  Checking whether the *same* mistake existed anywhere else this project
+  already shipped - rather than declaring the one instance found fixed
+  and moving on - surfaced a second, independent instance in code from
+  an *earlier* phase (Phase 1's own `Time` parsing, not part of this
+  session's new work at all): `Time::unit()` defaults to
+  `TimeUnit::MILLISECOND` too (confirmed the same way), while this
+  reader's existing `Time` arm had defaulted to Second since the day it
+  was written. `edge_arrow_time_units.arrow` (`pa.time32('s'/'ms')`/
+  `pa.time64('us'/'ns')`, `pyarrow`-generated) locks both fixes in via
+  the same oracle-comparison path every other Arrow IPC test in this
+  project already uses - and fixing it surfaced one more small, genuine
+  finding of its own: `arrow-cast`'s own `NaiveTime` Display drops a
+  `.000`/`.000000`/`.000000000` fraction entirely when it's exactly
+  zero (confirmed via the oracle rendering midnight as bare `"00:00:00"`
+  where this reader's own `format_hms_frac` always pads to a fixed
+  width), a formatting-only divergence the existing oracle comparator's
+  own `T`-scoped tolerance didn't yet cover for a *bare* time value (as
+  opposed to a full timestamp) - extended to match, scoped narrowly by
+  checking the string's actual `HH:MM:SS` shape (byte offsets 2 and 5
+  are `:`) rather than "contains a colon anywhere," so it can't
+  accidentally paper over a genuine mismatch in an unrelated colon-
+  containing string column.
+
+  Verified with real `pyarrow`-generated fixtures throughout, each
+  locked in as a permanent regression test:
+  `edge_arrow_duration.arrow`/`edge_arrow_run_end_encoded.arrow`/
+  `edge_arrow_view_types.arrow`/`edge_arrow_list_view.arrow`/
+  `edge_arrow_time_units.arrow` (all compared against the real
+  `arrow::json::writer::ArrayWriter` oracle, since all five genuinely
+  have one) and `edge_arrow_interval.arrow`/`edge_arrow_union_dense
+  .arrow`/`edge_arrow_union_sparse.arrow` (compared against a hardcoded,
+  hand/`pyarrow`-verified expectation instead, for the two disclosed
+  reasons above).
+
+  **Still deliberately not started**: LZO, the one Parquet compression
+  codec still not hand-rolled anywhere in this project (moot for Arrow
+  IPC specifically either way, since its own `BodyCompression` union
+  only ever offers `LZ4_FRAME`/`ZSTD` - there's no LZO or Brotli codec
+  value to ever add on this side regardless); and wiring either
   `parquet_support` or `arrow_ipc_support` into `columns_from_parquet`/
   `columns_from_arrow_ipc`. Both modules remain real but dormant
   (`#[allow(dead_code)]`, exercised only by their own tests) and

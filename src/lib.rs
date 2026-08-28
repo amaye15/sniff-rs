@@ -26780,6 +26780,7 @@ mod parquet_support {
 #[cfg(feature = "parquet")]
 mod arrow_ipc_support {
     use super::*;
+    use std::collections::VecDeque;
 
     // ---------------------------------------------------------------
     // FlatBuffers read-side primitives - verified directly against the
@@ -26958,6 +26959,33 @@ mod arrow_ipc_support {
         loc + 4 + i * struct_size
     }
 
+    /// Reads a FlatBuffers vector of packed (non-offset-indirect) `i32`
+    /// scalars at `loc` - `Union::typeIds` is the one case this reader
+    /// needs it for.
+    fn fb_read_i32_vector(buf: &[u8], loc: usize) -> Result<Vec<i32>> {
+        let len = fb_vector_len(buf, loc)?;
+        (0..len)
+            .map(|i| fb_i32(buf, fb_vector_struct_at(loc, i, 4)))
+            .collect()
+    }
+
+    /// Reads a FlatBuffers vector of packed `i64` scalars at `loc` -
+    /// `RecordBatch::variadicBufferCounts` (the per-column buffer count
+    /// for a variadic type like `Utf8View`/`BinaryView`) is the one case
+    /// this reader needs it for.
+    fn fb_read_i64_vector(buf: &[u8], loc: usize) -> Result<Vec<i64>> {
+        let len = fb_vector_len(buf, loc)?;
+        (0..len)
+            .map(|i| {
+                let elem_loc = fb_vector_struct_at(loc, i, 8);
+                let bytes = buf
+                    .get(elem_loc..elem_loc + 8)
+                    .context("truncated FlatBuffers i64 vector element")?;
+                Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+            })
+            .collect()
+    }
+
     // ---------------------------------------------------------------
     // Arrow IPC file-level framing and Schema/Field parsing.
     // ---------------------------------------------------------------
@@ -26985,14 +27013,22 @@ mod arrow_ipc_support {
         Date,
         Time,
         Timestamp,
+        Interval,
         List,
         Struct,
+        Union,
         FixedSizeBinary,
         FixedSizeList,
         Map,
+        Duration,
         LargeBinary,
         LargeUtf8,
         LargeList,
+        RunEndEncoded,
+        BinaryView,
+        Utf8View,
+        ListView,
+        LargeListView,
         Other(u8),
     }
 
@@ -27009,15 +27045,43 @@ mod arrow_ipc_support {
                 8 => Self::Date,
                 9 => Self::Time,
                 10 => Self::Timestamp,
+                11 => Self::Interval,
                 12 => Self::List,
                 13 => Self::Struct,
+                14 => Self::Union,
                 15 => Self::FixedSizeBinary,
                 16 => Self::FixedSizeList,
                 17 => Self::Map,
+                18 => Self::Duration,
                 19 => Self::LargeBinary,
                 20 => Self::LargeUtf8,
                 21 => Self::LargeList,
+                22 => Self::RunEndEncoded,
+                23 => Self::BinaryView,
+                24 => Self::Utf8View,
+                25 => Self::ListView,
+                26 => Self::LargeListView,
                 other => Self::Other(other),
+            }
+        }
+    }
+
+    /// `gen/Schema.rs`'s own `IntervalUnit` (`YEAR_MONTH` = 0, `DAY_TIME` =
+    /// 1, `MONTH_DAY_NANO` = 2).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ArrowIntervalUnit {
+        YearMonth,
+        DayTime,
+        MonthDayNano,
+    }
+
+    impl ArrowIntervalUnit {
+        fn from_i16(v: i16) -> Result<Self> {
+            match v {
+                0 => Ok(Self::YearMonth),
+                1 => Ok(Self::DayTime),
+                2 => Ok(Self::MonthDayNano),
+                other => bail!("unrecognized Arrow IntervalUnit {other}"),
             }
         }
     }
@@ -27097,6 +27161,38 @@ mod arrow_ipc_support {
         Map {
             entries: Box<ArrowField>,
             keys_sorted: bool,
+        },
+        Duration {
+            unit: ArrowTimeUnit,
+        },
+        Interval {
+            unit: ArrowIntervalUnit,
+        },
+        Utf8View,
+        BinaryView,
+        ListView {
+            child: Box<ArrowField>,
+        },
+        LargeListView {
+            child: Box<ArrowField>,
+        },
+        /// Per the IPC spec, `run_ends` and `values` are always exactly
+        /// the type's two children, in that fixed order - no field ever
+        /// carries a `RunEndEncoded`-specific type table of its own (it's
+        /// an empty marker table, the same as `Struct_`/`List`).
+        RunEndEncoded {
+            run_ends: Box<ArrowField>,
+            values: Box<ArrowField>,
+        },
+        /// `(type_id, field)` pairs in the schema's own declared order -
+        /// `type_id` is whatever the file's own `Union.typeIds` vector
+        /// says (or, if that vector is absent, the implicit `0..children
+        /// .len()`), *not* necessarily a dense `0..n` range, so a row's
+        /// runtime type-id byte has to be matched against this list by
+        /// value, not used as a direct index.
+        Union {
+            is_dense: bool,
+            children: Vec<(i32, ArrowField)>,
         },
         Other(u8),
     }
@@ -27265,7 +27361,17 @@ mod arrow_ipc_support {
             ArrowTypeTag::Time => {
                 let loc = type_loc.context("Arrow Time field missing its own type table")?;
                 ArrowDataType::Time {
-                    unit: ArrowTimeUnit::from_i16(fb_get_i16(buf, loc, 0, 0)?)?,
+                    // Default is Millisecond (1), not Second (0) - the
+                    // same real, found-not-assumed default mismatch as
+                    // `Duration`'s own fix just above, verified directly
+                    // against `gen/Schema.rs`'s `Time::unit` accessor
+                    // (`Some(TimeUnit::MILLISECOND)`) and `TimeBuilder::
+                    // add_unit`'s own `push_slot(..., TimeUnit::
+                    // MILLISECOND)` (which omits the field whenever the
+                    // real value equals this default, the standard
+                    // FlatBuffers convention every compliant writer
+                    // follows, not just `pyarrow`'s).
+                    unit: ArrowTimeUnit::from_i16(fb_get_i16(buf, loc, 0, 1)?)?,
                     bit_width: fb_get_i32(buf, loc, 1, 32)?,
                 }
             }
@@ -27295,6 +27401,75 @@ mod arrow_ipc_support {
                 ArrowDataType::Map {
                     entries: Box::new(one_child(children, "Map")?),
                     keys_sorted: fb_get_bool(buf, loc, 0, false)?,
+                }
+            }
+            ArrowTypeTag::Duration => {
+                let loc = type_loc.context("Arrow Duration field missing its own type table")?;
+                // Default is Millisecond (1), not Second (0) - verified
+                // directly against `gen/Schema.rs`'s own `Duration::unit`
+                // accessor (`Some(TimeUnit::MILLISECOND)`), unlike
+                // Time/Timestamp's genuinely-0/Second default. A real,
+                // found-not-assumed bug: a `pyarrow`-written Millisecond-
+                // unit Duration column omits this field entirely (its
+                // value equals the schema's own declared default, so
+                // FlatBuffers never writes it), and the wrong fallback
+                // silently resolved it as Second instead - caught by the
+                // oracle comparison test, not reasoned out in advance.
+                ArrowDataType::Duration {
+                    unit: ArrowTimeUnit::from_i16(fb_get_i16(buf, loc, 0, 1)?)?,
+                }
+            }
+            ArrowTypeTag::Interval => {
+                let loc = type_loc.context("Arrow Interval field missing its own type table")?;
+                ArrowDataType::Interval {
+                    unit: ArrowIntervalUnit::from_i16(fb_get_i16(buf, loc, 0, 0)?)?,
+                }
+            }
+            ArrowTypeTag::Utf8View => ArrowDataType::Utf8View,
+            ArrowTypeTag::BinaryView => ArrowDataType::BinaryView,
+            ArrowTypeTag::ListView => ArrowDataType::ListView {
+                child: Box::new(one_child(children, "ListView")?),
+            },
+            ArrowTypeTag::LargeListView => ArrowDataType::LargeListView {
+                child: Box::new(one_child(children, "LargeListView")?),
+            },
+            ArrowTypeTag::RunEndEncoded => {
+                if children.len() != 2 {
+                    bail!(
+                        "Arrow RunEndEncoded field must have exactly two children (run_ends, \
+                         values), got {}",
+                        children.len()
+                    );
+                }
+                let mut it = children.into_iter();
+                ArrowDataType::RunEndEncoded {
+                    run_ends: Box::new(it.next().unwrap()),
+                    values: Box::new(it.next().unwrap()),
+                }
+            }
+            ArrowTypeTag::Union => {
+                let loc = type_loc.context("Arrow Union field missing its own type table")?;
+                // `mode` defaults to Sparse when the slot is absent,
+                // verified against `gen/Schema.rs`'s own `Union::mode`
+                // accessor.
+                let is_dense = fb_get_i16(buf, loc, 0, 0)? == 1;
+                let type_ids = match fb_get_ref(buf, loc, 1)? {
+                    Some(vec_loc) => fb_read_i32_vector(buf, vec_loc)?,
+                    // `typeIds` absent means the implicit `0..children.len()`
+                    // range, verified against `arrow-ipc`'s own
+                    // `convert.rs` (`UnionMode`/`UnionFields` resolution).
+                    None => (0..i32::try_from(children.len()).unwrap_or(0)).collect(),
+                };
+                if type_ids.len() != children.len() {
+                    bail!(
+                        "Arrow Union has {} children but {} typeIds",
+                        children.len(),
+                        type_ids.len()
+                    );
+                }
+                ArrowDataType::Union {
+                    is_dense,
+                    children: type_ids.into_iter().zip(children).collect(),
                 }
             }
             ArrowTypeTag::Other(other) => ArrowDataType::Other(other),
@@ -27495,6 +27670,13 @@ mod arrow_ipc_support {
         nodes: Vec<ArrowFieldNode>,
         buffers: Vec<ArrowBufferRegion>,
         compression: Option<ArrowBodyCompression>,
+        /// `RecordBatch::VT_VARIADICBUFFERCOUNTS` (field 4, offset 12) -
+        /// one entry per `Utf8View`/`BinaryView` column in the schema (in
+        /// schema-encounter order), giving how many trailing data buffers
+        /// that column's own view buffer references in *this* batch. Only
+        /// present in files that actually use a variadic type; absent
+        /// (an empty `Vec`) otherwise.
+        variadic_counts: Vec<i64>,
     }
 
     fn parse_record_batch_meta(buf: &[u8], loc: usize) -> Result<ArrowRecordBatchMeta> {
@@ -27524,11 +27706,16 @@ mod arrow_ipc_support {
                 method: fb_get_u8(buf, c_loc, 1, 0)?,
             }),
         };
+        let variadic_counts = match fb_get_ref(buf, loc, 4)? {
+            None => Vec::new(),
+            Some(vec_loc) => fb_read_i64_vector(buf, vec_loc)?,
+        };
         Ok(ArrowRecordBatchMeta {
             length,
             nodes,
             buffers,
             compression,
+            variadic_counts,
         })
     }
 
@@ -27860,6 +28047,35 @@ mod arrow_ipc_support {
             .collect()
     }
 
+    /// Reads exactly `count` packed `i32` values (not `count + 1`
+    /// cumulative offsets) - `ListView`/`LargeListView`'s own `sizes`
+    /// buffer, and `Union`'s Dense-mode value-offsets buffer, both carry
+    /// one independent value per row rather than List's N+1-boundary
+    /// convention.
+    fn read_i32_n(buf: &[u8], count: usize) -> Result<Vec<i32>> {
+        (0..count)
+            .map(|i| {
+                let b = buf
+                    .get(i * 4..i * 4 + 4)
+                    .context("truncated Arrow IPC fixed-width buffer")?;
+                Ok(i32::from_le_bytes(b.try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    /// The `i64` counterpart of [`read_i32_n`], for `LargeListView`'s own
+    /// `offsets`/`sizes` buffers.
+    fn read_i64_n(buf: &[u8], count: usize) -> Result<Vec<i64>> {
+        (0..count)
+            .map(|i| {
+                let b = buf
+                    .get(i * 8..i * 8 + 8)
+                    .context("truncated Arrow IPC fixed-width buffer")?;
+                Ok(i64::from_le_bytes(b.try_into().unwrap()))
+            })
+            .collect()
+    }
+
     /// The fixed byte width of one value in a primitive type's own values
     /// buffer - every case this reader routes through `decode_primitive`
     /// (everything except Null/Utf8/Binary/LargeUtf8/LargeBinary/List/
@@ -27892,8 +28108,73 @@ mod arrow_ipc_support {
             ArrowDataType::FixedSizeBinary { byte_width } => {
                 usize::try_from(*byte_width).unwrap_or(0)
             }
+            ArrowDataType::Duration { .. } => 8,
+            ArrowDataType::Interval { unit } => match unit {
+                ArrowIntervalUnit::YearMonth => 4,
+                ArrowIntervalUnit::DayTime => 8,
+                ArrowIntervalUnit::MonthDayNano => 16,
+            },
             other => bail!("{other:?} isn't a fixed-width primitive type"),
         })
+    }
+
+    /// Renders a Duration's raw native `i64` (in `unit`'s own scale) as
+    /// the exact ISO 8601 string `chrono::TimeDelta`'s own `Display`
+    /// produces - the format Arrow's own JSON writer renders a Duration
+    /// column through, verified directly against `chrono-0.4.45`'s own
+    /// `time_delta.rs` (`TimeDelta::fmt`) and `arrow-array`'s own
+    /// `temporal_conversions.rs` (`try_duration_s_to_duration` ->
+    /// `TimeDelta::try_seconds`, `try_duration_ms_to_duration` ->
+    /// `TimeDelta::try_milliseconds`, `duration_us_to_duration` ->
+    /// `TimeDelta::microseconds`, `duration_ns_to_duration` ->
+    /// `TimeDelta::nanoseconds`) rather than assumed. Returns `None`
+    /// exactly when the real `chrono::TimeDelta` constructor would have -
+    /// `TimeDelta::try_seconds` rejects `raw > i64::MAX/1000` or `raw <
+    /// -i64::MAX/1000`, `TimeDelta::try_milliseconds` rejects only
+    /// `raw == i64::MIN` - in which case the oracle renders the literal
+    /// string `"<invalid>"` instead.
+    fn format_arrow_duration(raw: i64, unit: ArrowTimeUnit) -> Option<String> {
+        let scale: i128 = match unit {
+            ArrowTimeUnit::Second => {
+                if !(-i64::MAX / 1000..=i64::MAX / 1000).contains(&raw) {
+                    return None;
+                }
+                1_000_000_000
+            }
+            ArrowTimeUnit::Millisecond => {
+                if raw == i64::MIN {
+                    return None;
+                }
+                1_000_000
+            }
+            ArrowTimeUnit::Microsecond => 1_000,
+            ArrowTimeUnit::Nanosecond => 1,
+        };
+        let total_ns = i128::from(raw) * scale;
+        let sign = if total_ns < 0 { "-" } else { "" };
+        let abs_ns = total_ns.unsigned_abs();
+        let abs_secs = abs_ns / 1_000_000_000;
+        let frac_ns = abs_ns % 1_000_000_000;
+        if abs_secs == 0 && frac_ns == 0 {
+            return Some("P0D".to_string());
+        }
+        if frac_ns == 0 {
+            return Some(format!("{sign}PT{abs_secs}S"));
+        }
+        // Strips trailing zeros from the 9-digit fraction, keeping at
+        // least one digit - matching chrono's own significant-digit loop
+        // exactly rather than always printing all 9.
+        let mut figures = 9usize;
+        let mut frac = frac_ns;
+        loop {
+            let last = frac % 10;
+            if last != 0 {
+                break;
+            }
+            frac /= 10;
+            figures -= 1;
+        }
+        Some(format!("{sign}PT{abs_secs}.{frac:0figures$}S"))
     }
 
     /// Renders one scalar (non-nested, non-dictionary) value's raw bytes
@@ -28106,6 +28387,68 @@ mod arrow_ipc_support {
                 };
                 rendered.map(JsonValue::String).unwrap_or(JsonValue::Null)
             }
+            ArrowDataType::Duration { unit } => {
+                let raw = i64::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .context("Duration value has the wrong width")?,
+                );
+                JsonValue::String(
+                    format_arrow_duration(raw, *unit).unwrap_or_else(|| "<invalid>".to_string()),
+                )
+            }
+            // Deliberately this reader's own structured rendering, not a
+            // byte-for-byte match of `arrow-cast`'s own Display for
+            // Interval ("N years M mons" / "N days N.NNN secs", etc.) -
+            // unlike Duration's genuine ISO 8601 format, that convention
+            // is an ad hoc English-sentence format with no real standard
+            // behind it, so it isn't worth chasing exactly; a plain
+            // object naming the type's own real fields is at least as
+            // informative and far simpler to keep correct. See
+            // `render_arrow_scalar`'s own test coverage for why this is
+            // verified against a hardcoded, pyarrow-checked expectation
+            // rather than the Arrow JSON-writer oracle for this one type.
+            ArrowDataType::Interval { unit } => match unit {
+                ArrowIntervalUnit::YearMonth => {
+                    let months = i32::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .context("IntervalYearMonth value has the wrong width")?,
+                    );
+                    json!({ "months": months })
+                }
+                ArrowIntervalUnit::DayTime => {
+                    let days = i32::from_le_bytes(
+                        bytes[0..4]
+                            .try_into()
+                            .context("IntervalDayTime value has the wrong width")?,
+                    );
+                    let milliseconds = i32::from_le_bytes(
+                        bytes[4..8]
+                            .try_into()
+                            .context("IntervalDayTime value has the wrong width")?,
+                    );
+                    json!({ "days": days, "milliseconds": milliseconds })
+                }
+                ArrowIntervalUnit::MonthDayNano => {
+                    let months = i32::from_le_bytes(
+                        bytes[0..4]
+                            .try_into()
+                            .context("IntervalMonthDayNano value has the wrong width")?,
+                    );
+                    let days = i32::from_le_bytes(
+                        bytes[4..8]
+                            .try_into()
+                            .context("IntervalMonthDayNano value has the wrong width")?,
+                    );
+                    let nanoseconds = i64::from_le_bytes(
+                        bytes[8..16]
+                            .try_into()
+                            .context("IntervalMonthDayNano value has the wrong width")?,
+                    );
+                    json!({ "months": months, "days": days, "nanoseconds": nanoseconds })
+                }
+            },
             other => bail!("render_arrow_scalar called on a non-scalar type: {other:?}"),
         })
     }
@@ -28122,6 +28465,15 @@ mod arrow_ipc_support {
         nodes: std::slice::Iter<'a, ArrowFieldNode>,
         buffers: std::slice::Iter<'a, Vec<u8>>,
         dictionaries: &'a HashMap<i64, Vec<JsonValue>>,
+        /// One entry per `Utf8View`/`BinaryView` column encountered so
+        /// far in schema order, each giving how many trailing variable-
+        /// length data buffers that column's own view buffer references -
+        /// popped from the front, mirroring `arrow-ipc`'s own
+        /// `variadic_counts.pop_front()` in `reader.rs`. Comes from the
+        /// `RecordBatch` message's own `variadicBufferCounts` field, not
+        /// the schema (the same value type can vary its own buffer count
+        /// batch to batch).
+        variadic_counts: VecDeque<i64>,
     }
 
     impl<'a> ArrowArrayDecoder<'a> {
@@ -28163,13 +28515,21 @@ mod arrow_ipc_support {
                     self.decode_fixed_size_list(field, child, *list_size)
                 }
                 ArrowDataType::Struct { children } => self.decode_struct(field, children),
-                ArrowDataType::Other(tag) => bail!(
-                    "Arrow type tag {tag} isn't supported by this reader (Union/RunEndEncoded/ \
-                     the *View family/Interval/Duration are disclosed gaps)"
-                ),
+                ArrowDataType::Utf8View | ArrowDataType::BinaryView => self.decode_view(field),
+                ArrowDataType::ListView { child } => self.decode_list_view(field, child, false),
+                ArrowDataType::LargeListView { child } => self.decode_list_view(field, child, true),
+                ArrowDataType::RunEndEncoded { run_ends, values } => {
+                    self.decode_run_end_encoded(field, run_ends, values)
+                }
+                ArrowDataType::Union { is_dense, children } => {
+                    self.decode_union(field, *is_dense, children)
+                }
+                ArrowDataType::Other(tag) => {
+                    bail!("Arrow type tag {tag} isn't recognized by this reader")
+                }
                 // Bool/Int/Float16/Float32/Float64/FixedSizeBinary/
-                // Decimal/Date/Time/Timestamp all share the same node +
-                // [validity, values] shape.
+                // Decimal/Date/Time/Timestamp/Duration/Interval all share
+                // the same node + [validity, values] shape.
                 _ => self.decode_primitive(field),
             }
         }
@@ -28381,6 +28741,240 @@ mod arrow_ipc_support {
                 .collect()
         }
 
+        /// Decodes a `Utf8View`/`BinaryView` column - the "German string"
+        /// view layout (RFC verified directly against `arrow-data`'s own
+        /// `byte_view.rs`, `ByteView`/`MAX_INLINE_VIEW_LEN`): 3+N buffers
+        /// (`[validity, views, data_buffer_0, ..., data_buffer_{N-1}]`,
+        /// `N` popped from this batch's own `variadicBufferCounts` side
+        /// channel - it isn't derivable from the schema alone, since the
+        /// same column can use a different number of backing buffers in
+        /// different batches). Each 16-byte view is `length: u32` then
+        /// either up to 12 inline data bytes (when `length <= 12`) or
+        /// `prefix: u32` (redundant with the real data, so not read
+        /// here) + `buffer_index: u32` + `offset: u32` pointing into one
+        /// of the trailing data buffers.
+        fn decode_view(&mut self, field: &ArrowField) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let count = self.variadic_counts.pop_front().with_context(|| {
+                format!(
+                    "Arrow IPC RecordBatch is missing a variadic buffer count for {:?}",
+                    field.name
+                )
+            })?;
+            let count =
+                usize::try_from(count).context("negative Arrow IPC variadic buffer count")?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let views_raw = self.next_buffer(&field.name)?;
+            let data_buffers = (0..count)
+                .map(|_| self.next_buffer(&field.name))
+                .collect::<Result<Vec<_>>>()?;
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            let is_utf8 = matches!(field.data_type, ArrowDataType::Utf8View);
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let view = views_raw
+                        .get(i * 16..i * 16 + 16)
+                        .context("Arrow IPC view buffer too short")?;
+                    let length = u32::from_le_bytes(view[0..4].try_into().unwrap()) as usize;
+                    let bytes: &[u8] = if length <= 12 {
+                        &view[4..4 + length]
+                    } else {
+                        let buffer_index =
+                            u32::from_le_bytes(view[8..12].try_into().unwrap()) as usize;
+                        let offset = u32::from_le_bytes(view[12..16].try_into().unwrap()) as usize;
+                        data_buffers
+                            .get(buffer_index)
+                            .context("Arrow IPC view buffer_index out of range")?
+                            .get(offset..offset + length)
+                            .context("Arrow IPC view offset/length out of bounds")?
+                    };
+                    Ok(if is_utf8 {
+                        JsonValue::String(String::from_utf8_lossy(bytes).into_owned())
+                    } else {
+                        JsonValue::String(bytes.iter().map(|b| format!("{b:02x}")).collect())
+                    })
+                })
+                .collect()
+        }
+
+        /// Decodes a `ListView`/`LargeListView` column - 3 buffers
+        /// (`[validity, offsets, sizes]`, verified directly against
+        /// `RecordBatchDecoder::create_list_view_array`), unlike plain
+        /// `List`'s 2 (`[validity, offsets]`): each row `i` independently
+        /// covers `child[offsets[i]..offsets[i] + sizes[i]]` rather than
+        /// `List`'s N+1-cumulative-boundary convention, which is what
+        /// lets a `ListView` array's rows reference non-contiguous or
+        /// reordered spans of its child array.
+        fn decode_list_view(
+            &mut self,
+            field: &ArrowField,
+            child: &ArrowField,
+            is_large: bool,
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let validity_raw = self.next_buffer(&field.name)?;
+            let offsets_raw = self.next_buffer(&field.name)?;
+            let sizes_raw = self.next_buffer(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let validity = if node.null_count == 0 {
+                None
+            } else {
+                Some(validity_raw)
+            };
+            let (offsets, sizes): (Vec<i64>, Vec<i64>) = if is_large {
+                (read_i64_n(offsets_raw, len)?, read_i64_n(sizes_raw, len)?)
+            } else {
+                (
+                    read_i32_n(offsets_raw, len)?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect(),
+                    read_i32_n(sizes_raw, len)?
+                        .into_iter()
+                        .map(i64::from)
+                        .collect(),
+                )
+            };
+            let child_values = self.decode_field(child)?;
+            (0..len)
+                .map(|i| {
+                    if !bitmap_get(validity, i) {
+                        return Ok(JsonValue::Null);
+                    }
+                    let start = usize::try_from(offsets[i])
+                        .context("negative Arrow IPC ListView offset")?;
+                    let size =
+                        usize::try_from(sizes[i]).context("negative Arrow IPC ListView size")?;
+                    let slice = child_values.get(start..start + size).context(
+                        "Arrow IPC ListView offset/size out of bounds of the child array",
+                    )?;
+                    Ok(JsonValue::Array(slice.to_vec()))
+                })
+                .collect()
+        }
+
+        /// Decodes a `RunEndEncoded` column. The type itself carries no
+        /// buffers of its own beyond a `FieldNode` (for its own logical
+        /// row count) - its two children (`run_ends`, `values`, always in
+        /// that fixed order) are decoded as complete, ordinary arrays
+        /// right after it, verified directly against
+        /// `RecordBatchDecoder::create_array`'s own `RunEndEncoded(...)`
+        /// arm. Per the IPC spec, `run_ends[k]` is the exclusive upper
+        /// bound (in the *logical*, expanded row space) of run `k`, with
+        /// run 0 implicitly starting at 0 - so expanding back to one
+        /// value per logical row is a matter of repeating `values[k]`
+        /// `run_ends[k] - run_ends[k-1]` times. Every run's repeat count
+        /// is capped at however many logical rows are still needed
+        /// (rather than trusted verbatim from the file), so a corrupted
+        /// or adversarial `run_ends` value can't force an unbounded
+        /// allocation.
+        fn decode_run_end_encoded(
+            &mut self,
+            field: &ArrowField,
+            run_ends: &ArrowField,
+            values: &ArrowField,
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let logical_len = usize::try_from(node.length).unwrap_or(0);
+            let run_ends_values = self.decode_field(run_ends)?;
+            let values_values = self.decode_field(values)?;
+            let mut out = Vec::with_capacity(logical_len);
+            let mut prev: i64 = 0;
+            for (end_json, value) in run_ends_values.iter().zip(values_values.iter()) {
+                if out.len() >= logical_len {
+                    break;
+                }
+                let end = end_json
+                    .as_i64()
+                    .context("Arrow RunEndEncoded run_ends value isn't an integer")?;
+                let run_len = usize::try_from(end.saturating_sub(prev).max(0)).unwrap_or(0);
+                let run_len = run_len.min(logical_len - out.len());
+                for _ in 0..run_len {
+                    out.push(value.clone());
+                }
+                prev = end;
+            }
+            out.resize(logical_len, JsonValue::Null);
+            Ok(out)
+        }
+
+        /// Decodes a `Union` column - Sparse or Dense mode, verified
+        /// directly against `RecordBatchDecoder::create_array`'s own
+        /// `Union(fields, mode)` arm. This reader targets IPC format
+        /// version V5 onward only (the version every modern writer,
+        /// including this project's own fixture generator, emits) - a
+        /// legacy V4 file's extra leading validity buffer isn't read, a
+        /// disclosed scope boundary matching this reader's existing
+        /// "no pre-continuation-marker framing" one. `type_ids` is one
+        /// signed byte per row (not length-prefixed - the buffer is read
+        /// for exactly `len` bytes, matching how `arrow-ipc` slices it);
+        /// Dense mode additionally carries one `i32` value-offset per row
+        /// into that row's own resolved child array, while Sparse mode
+        /// has no offsets buffer at all - a Sparse child is always the
+        /// same length as the parent, so the same row index `i` is used
+        /// directly. A row's rendered value is the resolved child's own
+        /// value unwrapped, not `{field_name: value}` - Union has no
+        /// single field name to wrap it in, and (unlike every other type
+        /// this reader decodes) there's no oracle to match here at all:
+        /// Arrow's own JSON writer has no encoder for `DataType::Union`
+        /// whatsoever (confirmed directly in `arrow-json`'s own
+        /// `encoder.rs` - it falls through to a hard
+        /// `"Unsupported data type for JSON encoding"` error), so this
+        /// rendering is verified against a hardcoded, `pyarrow`-checked
+        /// expectation instead.
+        fn decode_union(
+            &mut self,
+            field: &ArrowField,
+            is_dense: bool,
+            children: &[(i32, ArrowField)],
+        ) -> Result<Vec<JsonValue>> {
+            let node = self.next_node(&field.name)?;
+            let len = usize::try_from(node.length).unwrap_or(0);
+            let type_ids_raw = self.next_buffer(&field.name)?;
+            let type_ids: Vec<i8> = type_ids_raw
+                .get(0..len)
+                .context("Arrow IPC Union type_ids buffer too short")?
+                .iter()
+                .map(|&b| b as i8)
+                .collect();
+            let offsets: Option<Vec<i32>> = if is_dense {
+                let offsets_raw = self.next_buffer(&field.name)?;
+                Some(read_i32_n(offsets_raw, len)?)
+            } else {
+                None
+            };
+            let mut child_columns: Vec<Vec<JsonValue>> = Vec::with_capacity(children.len());
+            for (_, child_field) in children {
+                child_columns.push(self.decode_field(child_field)?);
+            }
+            (0..len)
+                .map(|i| {
+                    let type_id = i32::from(type_ids[i]);
+                    let ci = children
+                        .iter()
+                        .position(|(id, _)| *id == type_id)
+                        .with_context(|| {
+                            format!("Arrow IPC Union row {i} has type_id {type_id} with no matching child")
+                        })?;
+                    let row_idx = match &offsets {
+                        Some(offs) => {
+                            usize::try_from(offs[i]).context("negative Arrow IPC Union offset")?
+                        }
+                        None => i,
+                    };
+                    Ok(child_columns[ci].get(row_idx).cloned().unwrap_or(JsonValue::Null))
+                })
+                .collect()
+        }
+
         fn decode_dictionary_field(
             &mut self,
             field: &ArrowField,
@@ -28454,11 +29048,22 @@ mod arrow_ipc_support {
             ArrowDataType::List { child }
             | ArrowDataType::LargeList { child }
             | ArrowDataType::FixedSizeList { child, .. }
-            | ArrowDataType::Map { entries: child, .. } => {
+            | ArrowDataType::Map { entries: child, .. }
+            | ArrowDataType::ListView { child }
+            | ArrowDataType::LargeListView { child } => {
                 collect_dictionary_fields(child, out);
             }
             ArrowDataType::Struct { children } => {
                 for c in children {
+                    collect_dictionary_fields(c, out);
+                }
+            }
+            ArrowDataType::RunEndEncoded { run_ends, values } => {
+                collect_dictionary_fields(run_ends, out);
+                collect_dictionary_fields(values, out);
+            }
+            ArrowDataType::Union { children, .. } => {
+                for (_, c) in children {
                     collect_dictionary_fields(c, out);
                 }
             }
@@ -28486,6 +29091,7 @@ mod arrow_ipc_support {
             nodes: meta.nodes.iter(),
             buffers: buffers.iter(),
             dictionaries,
+            variadic_counts: meta.variadic_counts.iter().copied().collect(),
         };
         let mut columns: Vec<(String, Vec<JsonValue>)> = Vec::with_capacity(schema.fields.len());
         for field in &schema.fields {
@@ -28522,6 +29128,7 @@ mod arrow_ipc_support {
             nodes: meta.nodes.iter(),
             buffers: buffers.iter(),
             dictionaries,
+            variadic_counts: meta.variadic_counts.iter().copied().collect(),
         };
         decoder.decode_field(value_field)
     }
@@ -28862,7 +29469,30 @@ mod arrow_ipc_support {
                     }
                 }
                 (JsonValue::String(a), JsonValue::String(b)) if a != b => {
-                    a.contains('T') && a.contains(':') && b.contains('T') && b.contains(':') && {
+                    // A bare `HH:MM:SS[.fff]` time value (checked by
+                    // shape - digits at byte offsets 2/5 are `:` - not
+                    // just "contains a colon somewhere", so this can't
+                    // accidentally swallow a genuine mismatch in an
+                    // unrelated colon-containing string column, e.g. a
+                    // URL or a MAC address) additionally tolerates a
+                    // zero-fraction divergence, the same as the `T`-
+                    // containing full-timestamp case just below:
+                    // `arrow-cast`'s own `NaiveTime` Display drops a
+                    // `.000`/`.000000`/`.000000000` fraction entirely
+                    // when it's exactly zero, found via this session's
+                    // own `Time`-unit-default fix - midnight round-trips
+                    // as `"00:00:00"` on the oracle side, but this
+                    // reader's own `format_hms_frac` always pads to a
+                    // fixed width regardless of whether the fraction is
+                    // zero.
+                    let looks_like_bare_time = |s: &str| {
+                        let b = s.as_bytes();
+                        b.len() >= 8 && b[2] == b':' && b[5] == b':'
+                    };
+                    let both_timestamps =
+                        a.contains('T') && a.contains(':') && b.contains('T') && b.contains(':');
+                    let both_bare_times = looks_like_bare_time(a) && looks_like_bare_time(b);
+                    (both_timestamps || both_bare_times) && {
                         let normalize = |s: &str| {
                             s.trim_start_matches('+')
                                 .trim_end_matches('Z')
@@ -29012,6 +29642,250 @@ mod arrow_ipc_support {
         #[test]
         fn decodes_a_streaming_delta_dictionary_batch_matching_the_arrow_oracle() {
             read_stream_and_compare_to_oracle("tests/fixtures/edge_arrow_stream_delta_dict.arrows");
+        }
+
+        // --- Union/RunEndEncoded/Interval/Duration/*View - closing the
+        // "disclosed gap" this reader used to have for all five, once the
+        // audit found the live crate-based reader already supports every
+        // one of them (see CLAUDE.md's own writeup). ---
+
+        /// `chrono::TimeDelta::fmt`'s own significant-digit-stripping
+        /// fraction loop, traced by hand against its source in
+        /// `format_arrow_duration`'s own doc comment - these cases
+        /// exercise every branch: whole seconds, a fraction that strips
+        /// down to one digit, the exact zero case, and both boundary
+        /// values where the real `chrono::TimeDelta` constructor would
+        /// fail (`try_seconds`/`try_milliseconds`), which is when this
+        /// reader's own `"<invalid>"` fallback (matching the oracle's own
+        /// fallback string) should fire instead of a computed value.
+        #[test]
+        fn format_arrow_duration_matches_chronos_own_iso_8601_display() {
+            assert_eq!(
+                format_arrow_duration(5, ArrowTimeUnit::Second).as_deref(),
+                Some("PT5S")
+            );
+            assert_eq!(
+                format_arrow_duration(-3, ArrowTimeUnit::Second).as_deref(),
+                Some("-PT3S")
+            );
+            assert_eq!(
+                format_arrow_duration(0, ArrowTimeUnit::Second).as_deref(),
+                Some("P0D")
+            );
+            assert_eq!(
+                format_arrow_duration(1500, ArrowTimeUnit::Millisecond).as_deref(),
+                Some("PT1.5S")
+            );
+            assert_eq!(
+                format_arrow_duration(-2500, ArrowTimeUnit::Millisecond).as_deref(),
+                Some("-PT2.5S")
+            );
+            assert_eq!(
+                format_arrow_duration(-1, ArrowTimeUnit::Nanosecond).as_deref(),
+                Some("-PT0.000000001S")
+            );
+            // `i64::MAX / 1000` is the exact inclusive boundary
+            // `TimeDelta::try_seconds` accepts; one past it fails.
+            assert!(format_arrow_duration(i64::MAX / 1000, ArrowTimeUnit::Second).is_some());
+            assert!(format_arrow_duration(i64::MAX / 1000 + 1, ArrowTimeUnit::Second).is_none());
+            assert!(format_arrow_duration(-(i64::MAX / 1000), ArrowTimeUnit::Second).is_some());
+            assert!(format_arrow_duration(-(i64::MAX / 1000) - 1, ArrowTimeUnit::Second).is_none());
+            // `TimeDelta::try_milliseconds` only ever rejects `i64::MIN`.
+            assert!(format_arrow_duration(-i64::MAX, ArrowTimeUnit::Millisecond).is_some());
+            assert!(format_arrow_duration(i64::MIN, ArrowTimeUnit::Millisecond).is_none());
+        }
+
+        /// This reader's own deliberately-chosen Interval rendering (a
+        /// plain JSON object naming the real fields, not a replica of
+        /// `arrow-cast`'s ad hoc "N years M mons" Display) - see
+        /// `render_arrow_scalar`'s own Interval arm for why. Computed by
+        /// hand from each unit's documented byte layout
+        /// (`arrow-buffer`'s own `IntervalDayTime`/`IntervalMonthDayNano`,
+        /// both `#[repr(C)]`), not run against any oracle.
+        #[test]
+        fn render_arrow_scalar_renders_every_interval_unit_as_a_structured_object() {
+            let year_month_bytes = 5i32.to_le_bytes();
+            assert_eq!(
+                render_arrow_scalar(
+                    &year_month_bytes,
+                    &ArrowDataType::Interval {
+                        unit: ArrowIntervalUnit::YearMonth
+                    }
+                )
+                .unwrap(),
+                json!({ "months": 5 })
+            );
+
+            let mut day_time_bytes = Vec::new();
+            day_time_bytes.extend_from_slice(&3i32.to_le_bytes());
+            day_time_bytes.extend_from_slice(&(-250i32).to_le_bytes());
+            assert_eq!(
+                render_arrow_scalar(
+                    &day_time_bytes,
+                    &ArrowDataType::Interval {
+                        unit: ArrowIntervalUnit::DayTime
+                    }
+                )
+                .unwrap(),
+                json!({ "days": 3, "milliseconds": -250 })
+            );
+
+            let mut month_day_nano_bytes = Vec::new();
+            month_day_nano_bytes.extend_from_slice(&1i32.to_le_bytes());
+            month_day_nano_bytes.extend_from_slice(&2i32.to_le_bytes());
+            month_day_nano_bytes.extend_from_slice(&3_000_000_000i64.to_le_bytes());
+            assert_eq!(
+                render_arrow_scalar(
+                    &month_day_nano_bytes,
+                    &ArrowDataType::Interval {
+                        unit: ArrowIntervalUnit::MonthDayNano
+                    }
+                )
+                .unwrap(),
+                json!({ "months": 1, "days": 2, "nanoseconds": 3_000_000_000i64 })
+            );
+        }
+
+        /// Generated with `pyarrow` (`pa.time32('s'/'ms')`/`pa.time64('us'/
+        /// 'ns')`) - found a real, pre-existing bug in this reader's own
+        /// `Time` unit parsing (present since Phase 1, well before this
+        /// session's Duration/Interval/Union/RunEndEncoded/View work):
+        /// `gen/Schema.rs`'s own `Time::unit` accessor defaults to
+        /// `TimeUnit::MILLISECOND`, not `SECOND` - the same real default
+        /// mismatch this session's own `Duration` fix already found and
+        /// fixed (see that arm's own doc comment) - so a Millisecond-unit
+        /// `t32_ms` column, whose unit value equals the schema's own
+        /// declared default, has its `unit` field omitted by every
+        /// compliant FlatBuffers writer (not just `pyarrow`'s), and the
+        /// old `fb_get_i16(..., 0)` fallback silently misread it as
+        /// Second - a magnitude-1000 error on every value in that column.
+        #[test]
+        fn decodes_time_columns_at_every_unit_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_time_units.arrow");
+        }
+
+        /// Generated with `pyarrow` (`pa.duration('s'/'ms'/'us'/'ns')`) -
+        /// signed, zero, and null values across all four units. Arrow's
+        /// own JSON writer renders a Duration column through the exact
+        /// `chrono::TimeDelta` ISO 8601 Display `format_arrow_duration`
+        /// replicates (confirmed directly in `arrow-schema`'s
+        /// `is_temporal`/`arrow-json`'s encoder dispatch - see
+        /// `format_arrow_duration`'s own doc comment), so this is a real
+        /// byte-exact oracle comparison, not a hardcoded expectation.
+        #[test]
+        fn decodes_duration_columns_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_duration.arrow");
+        }
+
+        /// Generated with `pyarrow` (`RunEndEncodedArray.from_arrays`) -
+        /// three runs plus a null value mid-run, resolving to 10 logical
+        /// rows from 4 physical (run_ends, values) pairs. `arrow-json`'s
+        /// encoder does support `DataType::RunEndEncoded` directly
+        /// (confirmed in its own `encoder.rs`), so this compares against
+        /// the real oracle rather than a hardcoded expectation.
+        #[test]
+        fn decodes_run_end_encoded_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_run_end_encoded.arrow");
+        }
+
+        /// Generated with `pyarrow` (`pa.string_view()`/`pa.binary_view()`),
+        /// a mix of short (inline, <= 12 bytes) and long (out-of-line,
+        /// referencing a real trailing data buffer) values, including one
+        /// long value repeated twice (proving two views can independently
+        /// reference the same underlying data buffer), plus a null.
+        /// Exercises `decode_view`'s own `variadicBufferCounts` side
+        /// channel end to end, not just the view-struct layout in
+        /// isolation.
+        #[test]
+        fn decodes_utf8_and_binary_view_columns_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_view_types.arrow");
+        }
+
+        /// Generated with `pyarrow` (`pa.list_view()`/`pa.large_list_view()`),
+        /// a null entry and an empty (zero-size) entry alongside ordinary
+        /// populated ones, exercising `decode_list_view`'s own independent
+        /// (offset, size) pair per row rather than `List`'s
+        /// N+1-cumulative-boundary convention.
+        #[test]
+        fn decodes_list_view_and_large_list_view_matching_the_arrow_oracle() {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_list_view.arrow");
+        }
+
+        /// Generated with `pyarrow` (`month_day_nano_interval()`) - the
+        /// only Interval unit pyarrow's own Python API can construct
+        /// (YearMonth/DayTime have no Python constructor at all, hence
+        /// `render_arrow_scalar_renders_every_interval_unit_as_a_structured_object`'s
+        /// direct, hand-computed coverage of those two). Compared against
+        /// a hardcoded expectation, not the oracle - `arrow-json` has no
+        /// Interval-specific encoder of its own (it falls through to
+        /// `is_temporal()` -> `ArrayFormatter`'s ad hoc English-sentence
+        /// Display, which this reader deliberately doesn't replicate; see
+        /// `render_arrow_scalar`'s own Interval arm).
+        #[test]
+        fn decodes_a_month_day_nano_interval_file_against_a_hardcoded_expectation() {
+            let file_data = std::fs::read("tests/fixtures/edge_arrow_interval.arrow")
+                .unwrap_or_else(|e| panic!("tests/fixtures/edge_arrow_interval.arrow: {e}"));
+            let rows = read_arrow_ipc_file_rows(&file_data).unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    json!({ "mdn": { "months": 1, "days": 2, "nanoseconds": 3_000_000_000i64 } }),
+                    json!({ "mdn": { "months": -1, "days": -2, "nanoseconds": -3_000_000_000i64 } }),
+                    json!({ "mdn": { "months": 0, "days": 0, "nanoseconds": 0 } }),
+                    json!({ "mdn": null }),
+                ]
+            );
+        }
+
+        /// Generated with `pyarrow` (`UnionArray.from_dense`) - two
+        /// children (`ints: Int32`, `floats: Float64`), including a null
+        /// value in the child a given row's type-id actually resolves
+        /// to. Independently confirmed correct against `pyarrow`'s own
+        /// `to_pylist()` on this exact file before being trusted
+        /// (`[1, 1.5, 2, None]`) - Union rows resolve to `ints[0]`,
+        /// `floats[0]`, `ints[1]`, `floats[1]` via the dense mode's own
+        /// per-row value-offset, not the row's own index. Compared
+        /// against a hardcoded expectation, not the oracle - `arrow-json`
+        /// has no `DataType::Union` encoder at all (see `decode_union`'s
+        /// own doc comment).
+        #[test]
+        fn decodes_a_dense_union_against_a_hardcoded_expectation() {
+            let file_data = std::fs::read("tests/fixtures/edge_arrow_union_dense.arrow")
+                .unwrap_or_else(|e| panic!("tests/fixtures/edge_arrow_union_dense.arrow: {e}"));
+            let rows = read_arrow_ipc_file_rows(&file_data).unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    json!({ "u_dense": 1 }),
+                    json!({ "u_dense": 1.5 }),
+                    json!({ "u_dense": 2 }),
+                    json!({ "u_dense": null }),
+                ]
+            );
+        }
+
+        /// Generated with `pyarrow` (`UnionArray.from_sparse`) - unlike
+        /// the Dense case, every child is the same length as the parent
+        /// (padded with unused/null slots at rows the type-id doesn't
+        /// select), so a Sparse row's value comes from `child[type_id][i]`
+        /// directly, the same row index `i` rather than a separate
+        /// offset. Independently confirmed against `pyarrow`'s own
+        /// `to_pylist()` on this exact file (`[1, 2.5, 3, 4.5]`) before
+        /// being trusted.
+        #[test]
+        fn decodes_a_sparse_union_against_a_hardcoded_expectation() {
+            let file_data = std::fs::read("tests/fixtures/edge_arrow_union_sparse.arrow")
+                .unwrap_or_else(|e| panic!("tests/fixtures/edge_arrow_union_sparse.arrow: {e}"));
+            let rows = read_arrow_ipc_file_rows(&file_data).unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    json!({ "u_sparse": 1 }),
+                    json!({ "u_sparse": 2.5 }),
+                    json!({ "u_sparse": 3 }),
+                    json!({ "u_sparse": 4.5 }),
+                ]
+            );
         }
     }
 }
