@@ -5006,16 +5006,177 @@ this project could just implement directly rather than depend on:
   expectation instead of the Arrow oracle directly, for the same reason
   those two limitations exist in the first place.
 
-  **Still deliberately not started**: the LZO/Brotli compression codecs
-  (present in this project's own documented Parquet compression-codec
-  list, but not exercised by any flat-schema file in this corpus - now
-  found to gate exactly one real nested file too, `large_string_map
-  .brotli.parquet` - so there's still no real fixture to verify a
-  hand-roll against). `parquet_support` remains a real but dormant module
-  (`#[allow(dead_code)]`, exercised only by its own tests) and `arrow`/
-  `parquet` remain live runtime dependencies until every behavior this
-  project currently documents and tests for Parquet/Arrow IPC is matched,
-  verified, and cut over in one deliberate step.
+  **Still deliberately not started at the time**: the LZO/Brotli
+  compression codecs (present in this project's own documented Parquet
+  compression-codec list, but not exercised by any flat-schema file in
+  this corpus - now found to gate exactly one real nested file too,
+  `large_string_map.brotli.parquet` - so there's still no real fixture to
+  verify a hand-roll against). Brotli was picked up next (see its own
+  entry below); LZO remains the one Parquet codec with no real fixture
+  anywhere in this project's corpus sweeps to verify a hand-roll against,
+  so it stays a disclosed gap.
+
+- **Brotli (RFC 7932) - the largest single hand-roll of this entire
+  campaign, chosen deliberately over declaring it a permanent gap.**
+  Sized up before starting (the same "measure before committing" step
+  every other big-ticket decision in this document gets): a pure-Rust
+  reference decoder (`brotli-decompressor`, the exact crate `parquet`'s
+  own `brotli` feature depends on) is itself ~6,000 lines of real decode
+  logic plus ~13,000 more lines of static dictionary/table data - larger
+  than this project's own Zstd decoder, the previous record-holder for
+  "most algorithmically complex hand-roll" in this document - to unblock
+  exactly one real corpus file. Flagged explicitly to the user as a
+  disproportionate-effort decision point rather than assumed; the user
+  chose the full hand-roll anyway. Decode-only, matching every other
+  hand-roll in this project - large-window Brotli (the rarely-used
+  streaming extension permitting windows above 2^24) is a disclosed,
+  out-of-scope gap, since Parquet's own Brotli usage is always a single
+  self-contained block with an ordinary window and no corpus file
+  exercises the extension.
+
+  Verified the same way every other hand-roll in this campaign was: every
+  algorithmic detail read directly from `brotli-decompressor`'s own
+  source (`decode.rs`, `huffman/mod.rs`, `context.rs`, `transform.rs`,
+  `dictionary/mod.rs`) rather than the abstract RFC 7932 prose alone -
+  the same "the reference implementation's own source is the real spec"
+  discipline this whole campaign already holds itself to. The single
+  biggest architectural simplification versus the reference: this reader
+  writes into one plain, growable `Vec<u8>` rather than a fixed-size
+  ring buffer sized to the window, since this project never needs
+  bounded-memory streaming decode - a self-referencing LZ77 copy is just
+  "read `length` bytes starting `distance` bytes before the current end
+  of output, one byte at a time" (the same overlapping-copy handling
+  this project's own LZ4/gzip decoders already use), with no
+  ring-buffer wraparound bookkeeping at all. A second simplification: the
+  Huffman tables use one flat, `2^max_code_length`-entry array indexed
+  directly by "the next N bits read LSB-first as a plain integer" rather
+  than the reference's own memory-optimized two-level root/sub-table
+  split - a little more memory, a meaningfully simpler and easier-to-
+  verify construction, correctness hinging on one specific, confirmed-
+  not-assumed detail: canonical Huffman codes are assigned MSB-first by
+  the standard algorithm, but Brotli's own encoder always *writes* a
+  code's bits to the LSB-first bitstream in bit-reversed order, so the
+  table has to be built pre-reversed for a flat "next N bits as a plain
+  integer" lookup to work at all.
+
+  **Three real, independently-confirmed bugs were found via testing, not
+  reasoned out in advance** - each caught the same way every other
+  hand-roll's bugs in this document were caught: real files, a genuine
+  independent oracle, and a systematic bisection down to the exact wrong
+  line, not just "it didn't crash so it's probably right":
+    1. **`log2_floor`'s name doesn't mean what it says.** The reference's
+       own `Log2Floor(x)` is *not* the mathematical `floor(log2(x))` (the
+       0-indexed bit position of the highest set bit) - it's the number
+       of bits needed to represent `x` at all (`floor(log2(x)) + 1` for
+       `x > 0`), confirmed by tracing the reference's own `while x != 0 {
+       x >>= 1; result += 1; }` loop by hand after a real decode
+       diverged. The "obvious" one-less reading silently under-reads the
+       correct number of bits per raw symbol value whenever a simple
+       Huffman code's `alphabet_size - 1` isn't already one less than a
+       power of two (a 4-symbol block-type alphabet needs 2 bits per
+       symbol, not 1) - every simple-coded Huffman table in the file
+       after the first mismatched read decoded from a silently-shifted
+       bit position, corrupting everything downstream.
+    2. **The dictionary-vs-backreference cutoff isn't the fixed window
+       bound.** This reader's first draft compared a resolved distance
+       against a constant `max_backward_distance` computed once at
+       stream start. The reference recomputes a *dynamic* `max_distance`
+       per command instead: early in the stream (before `output.len()`
+       reaches the window bound), a distance can only ever be a genuine
+       back-reference if it's within what's actually been produced so
+       far, so the real cutoff is `min(pos, max_backward_distance)` (the
+       reference's own `custom_dict_size` term is always 0 here, since
+       this project's use case never supplies a custom dictionary). Found
+       on a real file whose first non-trivial distance (199) legitimately
+       exceeded `output.len()` (23) at that point in the stream - not a
+       corrupted file, just a real dictionary-word reference that this
+       reader's fixed-cutoff first draft mis-classified as an
+       out-of-bounds real back-reference instead.
+    3. **The ring-buffer short-code add/subtract branch checked the wrong
+       variable.** `TakeDistanceFromRingBuffer`'s own reference source
+       decides whether to add or subtract the packed `kDistanceShort
+       CodeValueOffset` delta based on `distance_code & 0x3`, where
+       `distance_code` in that function is `raw_code << 1` (already
+       shifted) - not the original, unshifted `raw_code`. This reader's
+       first draft checked `raw_code & 0x3` directly, which happens to
+       agree with the reference for some raw code values (any where the
+       low 2 bits of `raw_code` and `raw_code << 1` coincidentally imply
+       the same branch) but silently picks the wrong arithmetic sign for
+       others. Found by tracing a real decode's own ring-buffer state
+       (`dist_rb`/`dist_rb_idx`) bit-for-bit against a debug-instrumented
+       copy of the reference decoder for the exact same input, at the
+       exact command where a decoded word's content first diverged from
+       ground truth (`"lazynbrown"` instead of `"lazy brown"` - the
+       wrong-signed delta silently substituted a nearby-but-wrong ring-
+       buffer distance, corrupting one specific 5-byte copy while every
+       surrounding command stayed byte-for-byte correct, which is what
+       made this the single hardest bug in this hand-roll to isolate -
+       everything else "looked" right until the exact corrupted position
+       was found by bisecting a live-decoded buffer against the real
+       input file's own known plaintext, byte offset by byte offset).
+  All three were found using the same debugging methodology: a second,
+  independently-instrumented copy of the real `brotli-decompressor`
+  crate (vendored locally, `eprintln!` patched directly into its own
+  state machine at the exact points needed) run side-by-side against
+  this reader on the *same* real compressed input, comparing every
+  intermediate value - decoded code lengths, per-command insert/copy
+  lengths, resolved distances, and full ring-buffer state - until the
+  first point of disagreement pinpointed the exact wrong line. This is a
+  more invasive verification technique than most other entries in this
+  document needed (most hand-rolls here were verified by comparing final
+  output only), used here specifically because Brotli's own state
+  (Huffman tables, block-type ring buffers, the 4-slot recent-distance
+  cache) is complex enough that "the final output differs" alone gave
+  almost no signal about *where* in a multi-thousand-command decode the
+  actual bug lived.
+
+  **Verified against real files, not just synthetic round-trips**: eight
+  real-`brotli`-CLI-compressed files spanning a deliberately wide range -
+  an 11-byte input too short to benefit from entropy coding at all (the
+  `ISUNCOMPRESSED` meta-block path); ~2,000 space-separated words from a
+  small fixed vocabulary at `-q 11` (multiple literal/insert-copy/
+  distance block types, a non-trivial 2-tree literal context map, the
+  NPOSTFIX/NDIRECT-parameterized distance encoding - the fixture that
+  caught all three bugs above); a real English pangram sentence at three
+  quality levels (`-q 11`/`-q 5`/`-q 0` - short, common English words are
+  exactly what Brotli's own static dictionary is tuned for, so this is
+  the main coverage for dictionary-word references and their 121
+  transforms); ~5,000 words from 7 fruit names (highly repetitive,
+  forcing long copies and repeated-distance ring-buffer short codes);
+  3,000 bytes of genuine random data (the opposite stress case - low
+  compressibility, long runs of plain literal decoding); and, for
+  interactive validation only (not committed, matching this project's
+  own established real-world-corpus practice), this project's own
+  358KB `CLAUDE.md` at three quality levels (multiple meta-blocks, heavy
+  dictionary usage, extensive block-type switching across a genuinely
+  large real document) and the actual official `apache/parquet-testing`
+  corpus file that originally motivated this whole hand-roll,
+  `large_string_map.brotli.parquet` - which turned out to contain a
+  single Map entry with a **1,073,741,824-byte (exactly 1GiB) key of
+  all-`a` bytes**, decoded correctly and byte-for-byte uniform by this
+  reader without hanging or truncating, a real stress test of long-
+  running copy execution at a scale none of the committed fixtures
+  approach. That file's own row-group-level oracle comparison (via
+  `arrow`'s `ArrayWriter`) independently fails with a pre-existing,
+  already-documented, Brotli-unrelated limitation (a "large string"
+  buffer-layout issue - confirmed against `pyarrow`'s own independent
+  reader hitting a *different* but equally unrelated "nested data
+  conversions not implemented" error on the identical file), so it was
+  validated by direct content inspection (exact byte length, byte
+  uniformity) rather than the usual oracle-comparison harness, and -
+  since its own JSON-serialized oracle comparison takes 45+ seconds and
+  produces gigabytes of output for a 4KB input file - deliberately not
+  committed as a routine fixture; the five smaller, fast, diverse
+  fixtures above (`tests/fixtures/edge_brotli_*`) carry the permanent
+  regression coverage instead.
+
+  Wired into `decompress_page_bytes` (the same per-codec dispatch
+  Snappy/gzip/Zstd/LZ4/LZ4_RAW already use), but `parquet_support`
+  remains dormant overall (`#[allow(dead_code)]`) - Brotli closing this
+  gap doesn't by itself trigger the cutover, which still waits on LZO
+  (the one remaining flat-schema codec gap) and the Arrow IPC `Union`/
+  `RunEndEncoded`/`Interval`/`Duration`/`*View` audit before `arrow`/
+  `parquet` can move to `[dev-dependencies]` in one deliberate step.
 
 - **`arrow`/`parquet` (Arrow IPC/Feather half) → a hand-rolled reader, in
   progress (`arrow_ipc_support`).** The last remaining piece of this
@@ -5294,11 +5455,11 @@ this project could just implement directly rather than depend on:
   **Still deliberately not started**: decoding `Union`/`RunEndEncoded`/
   `Interval`/`Duration`/the `*View` family (all already a disclosed
   `ArrowDataType::Other` gap since Phase 1, matching this project's own
-  Parquet reader's equivalent scope boundary); the LZO/Brotli/LZ4-raw/
-  LZ4_RAW compression codecs Parquet's own reader also doesn't support
-  yet (moot here anyway, since Arrow IPC's own `BodyCompression` union
-  only ever offers `LZ4_FRAME`/`ZSTD` in the first place - there's no
-  third codec value to eventually add); and wiring either
+  Parquet reader's equivalent scope boundary); LZO, the one Parquet
+  compression codec still not hand-rolled anywhere in this project (moot
+  here anyway, since Arrow IPC's own `BodyCompression` union only ever
+  offers `LZ4_FRAME`/`ZSTD` in the first place - there's no LZO or Brotli
+  codec value to ever add on this side regardless); and wiring either
   `parquet_support` or `arrow_ipc_support` into `columns_from_parquet`/
   `columns_from_arrow_ipc`. Both modules remain real but dormant
   (`#[allow(dead_code)]`, exercised only by their own tests) and
