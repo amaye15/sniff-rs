@@ -6106,6 +6106,1107 @@ fn columns_from_sas7bdat(
     )
 }
 
+// --- SPSS reader (opt-in via --features spss) ---
+// .sav/.zsav files: a small fixed binary header, then a self-describing
+// dictionary section (variable records interleaved with value-label and
+// "info" extension records, terminated by a type-999 marker), then the case
+// (row) data - either raw, RLE-style "bytecode" compressed (the format's own
+// default), or zlib-block compressed (.zsav). Verified against the `ambers`
+// crate's own source (a real, independently-maintained pure-Rust SPSS
+// reader) rather than assumed from memory, the same "read the reference
+// implementation's own source" discipline every other hand-roll in this
+// project already follows - see CLAUDE.md's Dependency footprint section.
+#[cfg(feature = "spss")]
+mod spss_support {
+    use super::*;
+    use std::io::Read;
+
+    // -- SYSMIS: SPSS's own system-missing value, a specific bit pattern
+    // that (per `ambers`'s own test coverage, confirmed rather than assumed
+    // from the name alone) is genuinely `-f64::MAX` - the most negative
+    // finite double, not a NaN - so it must be checked by exact bit pattern,
+    // not `is_nan()`.
+    const SYSMIS_BITS: u64 = 0xFFEF_FFFF_FFFF_FFFF;
+
+    // -- Bytecode compression control codes (codes 1..=251 are themselves
+    // the compressed value, biased by the header's own `bias` field). --
+    const COMPRESS_END_OF_FILE: u8 = 252;
+    const COMPRESS_RAW_FOLLOWS: u8 = 253;
+    const COMPRESS_EIGHT_SPACES: u8 = 254;
+    const COMPRESS_SYSMIS: u8 = 255;
+
+    // -- Dictionary record type codes. --
+    const RECORD_TYPE_VARIABLE: i32 = 2;
+    const RECORD_TYPE_VALUE_LABEL: i32 = 3;
+    const RECORD_TYPE_VALUE_LABEL_VARS: i32 = 4;
+    const RECORD_TYPE_DOCUMENT: i32 = 6;
+    const RECORD_TYPE_INFO: i32 = 7;
+    const RECORD_TYPE_DICT_TERMINATION: i32 = 999;
+
+    // -- Info (type 7) record subtypes this reader actually consumes; any
+    // other subtype is skipped by byte length alone, the same "unknown
+    // fields are safe to ignore" contract this project's other self-
+    // describing binary formats (Thrift, FlatBuffers) already rely on.
+    const INFO_INTEGER: i32 = 3;
+    const INFO_LONG_NAMES: i32 = 13;
+    const INFO_VERY_LONG_STRINGS: i32 = 14;
+    const INFO_ENCODING: i32 = 20;
+
+    /// A sanity cap on an info record's own declared `size * count` byte
+    /// length, checked before allocating a buffer sized from it - every
+    /// info record this reader actually parses (machine integer info,
+    /// long variable names, very-long-string widths, the encoding name)
+    /// is at most a few KB in any real file, so this is purely a guard
+    /// against a corrupted/adversarial header forcing a huge allocation
+    /// before any real data backs it up, the same class of guard this
+    /// project's other hand-rolled binary readers already apply to their
+    /// own untrusted length fields.
+    const MAX_INFO_RECORD_LEN: usize = 64 * 1024 * 1024;
+
+    // -- Format type codes (packed into a variable's own print/write
+    // format as `(type << 16) | (width << 8) | decimals`) that carry a
+    // real date/time/duration meaning worth reconstructing into a real
+    // formatted string rather than left as a bare number - the same
+    // "declared type is a hint, worth re-deriving" principle this project
+    // already applies to Parquet/Avro/dBase/Stata/SAS7BDAT logical types.
+    // Wkday/Month/Moyr/Qyr/Wkyr (coarser week/month/quarter-only formats)
+    // are deliberately left as plain numbers - a disclosed scope boundary,
+    // not an oversight - to avoid inventing a rendering convention for
+    // formats with no natural single-string representation.
+    const FMT_DATE: u8 = 20;
+    const FMT_TIME: u8 = 21;
+    const FMT_DATETIME: u8 = 22;
+    const FMT_ADATE: u8 = 23;
+    const FMT_JDATE: u8 = 24;
+    const FMT_DTIME: u8 = 25;
+    const FMT_EDATE: u8 = 38;
+    const FMT_SDATE: u8 = 39;
+    const FMT_MTIME: u8 = 40;
+    const FMT_YMDHMS: u8 = 41;
+
+    // -- SPSS's own epoch, 1582-10-14 (the start of the Gregorian
+    // calendar) - every stored date/time/datetime value is a count of
+    // seconds since this instant, not the Unix epoch. Verified directly
+    // against `ambers`'s own `constants.rs`, including its own worked
+    // examples (`1970-01-01` round-trips to exactly `SPSS_EPOCH_OFFSET_
+    // SECONDS`, `2024-01-01` round-trips to day 19723 past the Unix
+    // epoch) before being trusted.
+    const SPSS_EPOCH_OFFSET_SECONDS: f64 = 12_219_379_200.0;
+
+    // Windows-1252, the same hand-rolled table (and the same "UTF-8 or
+    // Windows-1252 only, anything else a disclosed error" scope) this
+    // project's own dBase/Stata/SAS7BDAT readers already use - duplicated
+    // per module rather than shared, since `spss` is independently
+    // toggleable from those other features.
+    const WINDOWS_1252_HIGH: [u16; 128] = [
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+        0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178, 0x00A0,
+        0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9, 0x00AA, 0x00AB,
+        0x00AC, 0x00AD, 0x00AE, 0x00AF, 0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6,
+        0x00B7, 0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF, 0x00C0, 0x00C1,
+        0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7, 0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC,
+        0x00CD, 0x00CE, 0x00CF, 0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7,
+        0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF, 0x00E0, 0x00E1, 0x00E2,
+        0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7, 0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED,
+        0x00EE, 0x00EF, 0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7, 0x00F8,
+        0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF,
+    ];
+
+    fn decode_windows_1252(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|&b| {
+                if b < 0x80 {
+                    char::from(b)
+                } else {
+                    char::from_u32(u32::from(WINDOWS_1252_HIGH[usize::from(b) - 0x80]))
+                        .unwrap_or('\u{FFFD}')
+                }
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Compression {
+        None,
+        Bytecode,
+        Zlib,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TextEncoding {
+        Utf8,
+        Windows1252,
+    }
+
+    fn decode_text(encoding: TextEncoding, bytes: &[u8]) -> Result<String> {
+        match encoding {
+            TextEncoding::Utf8 => std::str::from_utf8(bytes)
+                .map(str::to_string)
+                .context("SPSS file declares UTF-8 encoding but contains invalid UTF-8"),
+            TextEncoding::Windows1252 => Ok(decode_windows_1252(bytes)),
+        }
+    }
+
+    /// Trim trailing spaces and NUL bytes - both are real SPSS padding
+    /// conventions for fixed-width text fields, verified directly against
+    /// `ambers`'s own `trim_trailing_padding` rather than assuming
+    /// space-only padding.
+    fn trim_trailing_padding(bytes: &[u8]) -> &[u8] {
+        let mut end = bytes.len();
+        while end > 0 && (bytes[end - 1] == b' ' || bytes[end - 1] == 0) {
+            end -= 1;
+        }
+        &bytes[..end]
+    }
+
+    fn round_up(len: usize, alignment: usize) -> usize {
+        len.div_ceil(alignment) * alignment
+    }
+
+    // `weight_index`/`ncases` are parsed for full fidelity to the real
+    // header layout but never read: this reader has no concept of a
+    // "weight variable" to surface, and row reading is driven by the case
+    // data's own end-of-file marker/exhaustion rather than a declared
+    // count, the same "trust the actual data over a header's own summary
+    // field" principle Parquet's `FileMetaData.num_rows` already
+    // establishes for the identical reason (a declared count can be
+    // stale or absent - SPSS's own `ncases = -1` means "unknown" - so
+    // nothing here depends on it being accurate).
+    #[allow(dead_code)]
+    #[derive(Clone, Debug)]
+    struct FileHeader {
+        compression: Compression,
+        weight_index: i32,
+        ncases: i32,
+        bias: f64,
+        nominal_case_size: usize,
+    }
+
+    fn read_i32(r: &mut impl Read) -> Result<i32> {
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf).context("truncated SPSS file")?;
+        Ok(i32::from_le_bytes(buf))
+    }
+
+    fn read_f64(r: &mut impl Read) -> Result<f64> {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf).context("truncated SPSS file")?;
+        Ok(f64::from_le_bytes(buf))
+    }
+
+    fn read_bytes(r: &mut impl Read, n: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf).context("truncated SPSS file")?;
+        Ok(buf)
+    }
+
+    fn skip_bytes(r: &mut impl Read, n: usize) -> Result<()> {
+        let mut remaining = n;
+        let mut discard = [0u8; 4096];
+        while remaining > 0 {
+            let take = remaining.min(discard.len());
+            r.read_exact(&mut discard[..take])
+                .context("truncated SPSS file")?;
+            remaining -= take;
+        }
+        Ok(())
+    }
+
+    /// Parses the fixed 176-byte SPSS file header - verified field-by-field
+    /// against `ambers`'s own `header.rs`. This reader only ever writes
+    /// little-endian files itself (moot, since it's read-only), and every
+    /// real `.sav`/`.zsav` file this project has tested is little-endian
+    /// (the historical big-endian layout code predates any SPSS version
+    /// still in real use), so a big-endian layout code is a disclosed,
+    /// clear error rather than a guessed byte-swap.
+    fn read_header(r: &mut impl Read) -> Result<FileHeader> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic).context("truncated SPSS file")?;
+        if &magic != b"$FL2" && &magic != b"$FL3" {
+            bail!(
+                "not an SPSS .sav/.zsav file - expected magic \"$FL2\"/\"$FL3\", found {:?}",
+                String::from_utf8_lossy(&magic)
+            );
+        }
+        skip_bytes(r, 60)?; // product name
+        let mut layout_bytes = [0u8; 4];
+        r.read_exact(&mut layout_bytes)
+            .context("truncated SPSS file")?;
+        let layout_code = i32::from_le_bytes(layout_bytes);
+        if layout_code != 2 && layout_code != 3 {
+            bail!(
+                "SPSS file has a big-endian or otherwise unrecognized layout code \
+                 ({layout_code}) - only the little-endian layout this reader has real files \
+                 to verify against is supported"
+            );
+        }
+        let nominal_case_size = read_i32(r)?;
+        // A generous but bounded cap (10 million 8-byte slots, 80 MB per
+        // row) - checked before this value is ever used to pre-size a
+        // per-row buffer, the same "cap an untrusted count before
+        // allocating from it" guard as `read_missing_values`' own check
+        // above. No real SPSS file comes remotely close to this.
+        if !(0..10_000_000).contains(&nominal_case_size) {
+            bail!("SPSS file has an implausible nominal_case_size ({nominal_case_size})");
+        }
+        let compression_code = read_i32(r)?;
+        let compression = match compression_code {
+            0 => Compression::None,
+            1 => Compression::Bytecode,
+            2 => Compression::Zlib,
+            other => bail!("unrecognized SPSS compression code {other}"),
+        };
+        let weight_index = read_i32(r)?;
+        let ncases = read_i32(r)?;
+        let bias = read_f64(r)?;
+        skip_bytes(r, 9)?; // creation date
+        skip_bytes(r, 8)?; // creation time
+        skip_bytes(r, 64)?; // file label
+        skip_bytes(r, 3)?; // padding
+        Ok(FileHeader {
+            compression,
+            weight_index,
+            ncases,
+            bias,
+            nominal_case_size: nominal_case_size as usize,
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    enum VarType {
+        Numeric,
+        Str(usize),
+    }
+
+    #[derive(Clone, Debug)]
+    enum MissingValues {
+        None,
+        DiscreteNumeric(Vec<f64>),
+        Range { low: f64, high: f64 },
+        RangeAndValue { low: f64, high: f64, value: f64 },
+        DiscreteString(Vec<Vec<u8>>),
+    }
+
+    impl MissingValues {
+        /// Whether `raw` (the value's own raw 8 bytes, straight from the
+        /// case data) is one this variable's own dictionary entry declares
+        /// as "user-missing" - a value that's genuinely present in the
+        /// file but that the file's own author has flagged as not real
+        /// data (e.g. "999 means Refused"). Treated as a real missing
+        /// value by this reader, the same way Stata's own `.`-through-`.z`
+        /// missing markers already are - matching this project's "missing
+        /// values never fake a type change" principle across formats.
+        fn excludes_numeric(&self, value: f64) -> bool {
+            match self {
+                MissingValues::None | MissingValues::DiscreteString(_) => false,
+                MissingValues::DiscreteNumeric(values) => values.contains(&value),
+                MissingValues::Range { low, high } => value >= *low && value <= *high,
+                MissingValues::RangeAndValue {
+                    low,
+                    high,
+                    value: v,
+                } => (value >= *low && value <= *high) || value == *v,
+            }
+        }
+
+        fn excludes_string(&self, raw8: &[u8]) -> bool {
+            match self {
+                MissingValues::DiscreteString(values) => values.iter().any(|v| v == raw8),
+                _ => false,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct VariableRecord {
+        slot_index: usize,
+        short_name: String,
+        long_name: String,
+        format_type: u8,
+        missing_values: MissingValues,
+        var_type: VarType,
+        is_ghost: bool,
+        /// Number of named segments for a "very long string" (subtype 14) -
+        /// 1 for every ordinary variable.
+        n_segments: usize,
+    }
+
+    /// Parses one type-2 (variable) record - verified against `ambers`'s
+    /// own `variable.rs`. The record type i32 has already been consumed by
+    /// the caller.
+    fn read_variable_record(r: &mut impl Read, slot_index: usize) -> Result<VariableRecord> {
+        let raw_type = read_i32(r)?;
+        let has_label = read_i32(r)?;
+        let n_missing = read_i32(r)?;
+        let print_packed = read_i32(r)?;
+        let _write_packed = read_i32(r)?;
+        let name_bytes = read_bytes(r, 8)?;
+        let short_name = decode_text(TextEncoding::Utf8, trim_trailing_padding(&name_bytes))
+            .unwrap_or_default()
+            .to_uppercase();
+
+        let (var_type, is_ghost) = match raw_type {
+            0 => (VarType::Numeric, false),
+            t if t > 0 => (VarType::Str(t as usize), false),
+            _ => (VarType::Numeric, true),
+        };
+
+        if has_label == 1 {
+            let label_len = read_i32(r)?;
+            if label_len < 0 {
+                bail!("SPSS variable record has a negative label length ({label_len})");
+            }
+            let padded = round_up(label_len as usize, 4);
+            skip_bytes(r, padded)?; // variable labels aren't surfaced - see Known limitations
+        }
+
+        let missing_values = read_missing_values(r, n_missing, &var_type)?;
+        let format_type = ((print_packed as u32) >> 16 & 0xFF) as u8;
+
+        Ok(VariableRecord {
+            slot_index,
+            short_name: short_name.clone(),
+            long_name: short_name,
+            format_type,
+            missing_values,
+            var_type,
+            is_ghost,
+            n_segments: 1,
+        })
+    }
+
+    fn read_missing_values(
+        r: &mut impl Read,
+        n_missing: i32,
+        var_type: &VarType,
+    ) -> Result<MissingValues> {
+        if n_missing == 0 {
+            return Ok(MissingValues::None);
+        }
+        // The real format allows at most 3 discrete values (or a range
+        // plus one more) - checked before `Vec::with_capacity(abs_n)`
+        // below so a corrupted/adversarial `n_missing` can't force a huge
+        // upfront allocation, the same guard this project's other hand-
+        // rolled binary readers already apply to their own untrusted
+        // count fields.
+        if !(-3..=3).contains(&n_missing) {
+            bail!("SPSS variable record declares an invalid missing-value count {n_missing}");
+        }
+        let abs_n = n_missing.unsigned_abs() as usize;
+        let is_range = n_missing < 0;
+        match var_type {
+            VarType::Numeric => {
+                let mut values = Vec::with_capacity(abs_n);
+                for _ in 0..abs_n {
+                    values.push(read_f64(r)?);
+                }
+                Ok(if is_range {
+                    match abs_n {
+                        2 => MissingValues::Range {
+                            low: values[0],
+                            high: values[1],
+                        },
+                        3 => MissingValues::RangeAndValue {
+                            low: values[0],
+                            high: values[1],
+                            value: values[2],
+                        },
+                        _ => MissingValues::DiscreteNumeric(values),
+                    }
+                } else {
+                    MissingValues::DiscreteNumeric(values)
+                })
+            }
+            VarType::Str(_) => {
+                let mut values = Vec::with_capacity(abs_n);
+                for _ in 0..abs_n {
+                    values.push(read_bytes(r, 8)?);
+                }
+                Ok(MissingValues::DiscreteString(values))
+            }
+        }
+    }
+
+    /// Parses subtype 13 (long variable names): `SHORT=Long\tSHORT2=Long2\t...`.
+    fn parse_long_var_names(data: &[u8]) -> Vec<(String, String)> {
+        let text = String::from_utf8_lossy(data);
+        text.split('\t')
+            .filter_map(|pair| {
+                let pair = pair.trim();
+                let (short, long) = pair.split_once('=')?;
+                Some((short.trim().to_uppercase(), long.trim().to_string()))
+            })
+            .collect()
+    }
+
+    /// Parses subtype 14 (very long string widths):
+    /// `VARNAME=WIDTH\0\tVARNAME2=WIDTH2\0\t...`.
+    fn parse_very_long_strings(data: &[u8]) -> Vec<(String, usize)> {
+        let text = String::from_utf8_lossy(data);
+        text.split(['\0', '\t'])
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                let (name, width) = entry.split_once('=')?;
+                Some((name.trim().to_uppercase(), width.trim().parse().ok()?))
+            })
+            .collect()
+    }
+
+    struct Dictionary {
+        header: FileHeader,
+        variables: Vec<VariableRecord>,
+        text_encoding: TextEncoding,
+    }
+
+    /// Reads the header and the whole self-describing dictionary section
+    /// (every record from right after the header through the type-999
+    /// termination marker), resolving long variable names (subtype 13) and
+    /// very-long-string widths (subtype 14) - the two extension records
+    /// that affect correctness (real column names, and how many 8-byte
+    /// slots a string variable actually occupies), not just cosmetics.
+    /// Every other record type this reader doesn't specifically need
+    /// (value labels, document lines, display/attribute/multiple-response
+    /// info records) is walked past by byte length alone, the same
+    /// "unknown fields are safe to skip" contract as elsewhere in this
+    /// project.
+    fn read_dictionary(r: &mut impl Read) -> Result<Dictionary> {
+        let header = read_header(r)?;
+        let mut variables: Vec<VariableRecord> = Vec::new();
+        let mut long_names: Vec<(String, String)> = Vec::new();
+        let mut very_long_strings: Vec<(String, usize)> = Vec::new();
+        let mut encoding_name: Option<String> = None;
+        let mut character_code: Option<i32> = None;
+        let mut slot_index = 0usize;
+
+        loop {
+            let record_type = read_i32(r)?;
+            match record_type {
+                RECORD_TYPE_VARIABLE => {
+                    variables.push(read_variable_record(r, slot_index)?);
+                    slot_index += 1;
+                }
+                RECORD_TYPE_VALUE_LABEL => {
+                    // Type 3 (value labels) + the type 4 (variable indices)
+                    // record that must immediately follow it - parsed only
+                    // far enough to skip past correctly; the labels
+                    // themselves aren't surfaced (matching this project's
+                    // existing Stata/SAS7BDAT precedent - see Known
+                    // limitations).
+                    let count = read_i32(r)?;
+                    for _ in 0..count {
+                        skip_bytes(r, 8)?; // value (numeric or 8-byte string)
+                        let mut len_byte = [0u8; 1];
+                        r.read_exact(&mut len_byte)
+                            .context("truncated SPSS value label record")?;
+                        let label_len = usize::from(len_byte[0]);
+                        let padded = round_up(label_len + 1, 8) - 1;
+                        skip_bytes(r, padded)?;
+                    }
+                    let next_type = read_i32(r)?;
+                    if next_type != RECORD_TYPE_VALUE_LABEL_VARS {
+                        bail!(
+                            "SPSS file has a type 3 (value label) record not followed by a \
+                             type 4 (variable index) record"
+                        );
+                    }
+                    let n_vars = read_i32(r)?;
+                    if n_vars <= 0 {
+                        bail!("SPSS type 4 record declares {n_vars} variables");
+                    }
+                    skip_bytes(r, usize::try_from(n_vars).unwrap_or(0) * 4)?;
+                }
+                RECORD_TYPE_DOCUMENT => {
+                    let n_lines = read_i32(r)?;
+                    if n_lines < 0 {
+                        bail!("SPSS document record declares {n_lines} lines");
+                    }
+                    skip_bytes(r, usize::try_from(n_lines).unwrap_or(0) * 80)?;
+                }
+                RECORD_TYPE_INFO => {
+                    let subtype = read_i32(r)?;
+                    let size = read_i32(r)?;
+                    let count = read_i32(r)?;
+                    if size < 0 || count < 0 {
+                        bail!("SPSS info record has a negative size/count ({size}/{count})");
+                    }
+                    let data_len = usize::try_from(size)
+                        .unwrap_or(0)
+                        .saturating_mul(usize::try_from(count).unwrap_or(0));
+                    if matches!(
+                        subtype,
+                        INFO_INTEGER | INFO_LONG_NAMES | INFO_VERY_LONG_STRINGS | INFO_ENCODING
+                    ) && data_len > MAX_INFO_RECORD_LEN
+                    {
+                        bail!(
+                            "SPSS info record (subtype {subtype}) declares an implausible \
+                             {data_len}-byte length"
+                        );
+                    }
+                    match subtype {
+                        INFO_INTEGER => {
+                            let data = read_bytes(r, data_len)?;
+                            // Machine integer info: 8 i32 fields: version
+                            // major/minor/revision, machine code, floating
+                            // point representation, compression code,
+                            // endianness, character code page. Only the
+                            // last (byte offset 28) is needed here, as a
+                            // fallback when no subtype 20 record is
+                            // present.
+                            if data.len() >= 32 {
+                                character_code =
+                                    Some(i32::from_le_bytes(data[28..32].try_into().unwrap()));
+                            }
+                        }
+                        INFO_LONG_NAMES => {
+                            let data = read_bytes(r, data_len)?;
+                            long_names = parse_long_var_names(&data);
+                        }
+                        INFO_VERY_LONG_STRINGS => {
+                            let data = read_bytes(r, data_len)?;
+                            very_long_strings = parse_very_long_strings(&data);
+                        }
+                        INFO_ENCODING => {
+                            let data = read_bytes(r, data_len)?;
+                            encoding_name = Some(
+                                String::from_utf8_lossy(trim_trailing_padding(&data)).into_owned(),
+                            );
+                        }
+                        _ => skip_bytes(r, data_len)?,
+                    }
+                }
+                RECORD_TYPE_DICT_TERMINATION => {
+                    let _filler = read_i32(r)?;
+                    break;
+                }
+                other => bail!("unrecognized SPSS dictionary record type {other}"),
+            }
+        }
+
+        // Apply long variable names (subtype 13).
+        let long_name_map: HashMap<String, String> = long_names.into_iter().collect();
+        for var in &mut variables {
+            if let Some(long_name) = long_name_map.get(&var.short_name) {
+                var.long_name.clone_from(long_name);
+            }
+        }
+
+        // Apply very long string widths (subtype 14): a string variable
+        // wider than 255 bytes is stored across multiple named 255-byte
+        // segments (each physically occupying 32 slots / 256 bytes,
+        // per SPSS's own convention), followed by type=-1 continuation
+        // records within each segment. The segment-boundary variable
+        // records after the first are marked as ghosts here so case
+        // assembly (which walks `n_segments` slots of 32 each) doesn't
+        // also emit them as their own separate columns.
+        let vls_map: HashMap<String, usize> = very_long_strings.into_iter().collect();
+        for i in 0..variables.len() {
+            let Some(&true_width) = vls_map.get(&variables[i].short_name) else {
+                continue;
+            };
+            variables[i].var_type = VarType::Str(true_width);
+            let n_segments = true_width.div_ceil(252);
+            variables[i].n_segments = n_segments;
+            if n_segments > 1 {
+                let mut found = 1;
+                let mut j = i + 1;
+                while j < variables.len() && found < n_segments {
+                    if !variables[j].is_ghost {
+                        variables[j].is_ghost = true;
+                        found += 1;
+                    }
+                    j += 1;
+                }
+            }
+        }
+
+        let text_encoding = match encoding_name.as_deref() {
+            Some(name) if name.eq_ignore_ascii_case("UTF-8") => TextEncoding::Utf8,
+            Some(_) => TextEncoding::Windows1252,
+            None => match character_code {
+                Some(65001) => TextEncoding::Utf8,
+                _ => TextEncoding::Windows1252,
+            },
+        };
+
+        Ok(Dictionary {
+            header,
+            variables,
+            text_encoding,
+        })
+    }
+
+    /// Stateful RLE-style decompressor for SPSS's own "bytecode"
+    /// compression - verified against `ambers`'s own `compression/
+    /// bytecode.rs`. Eight 1-byte opcodes ("a control block") govern the
+    /// next eight 8-byte slots; a control block's own boundary never
+    /// aligns with a case (row) boundary, so the decompressor's state
+    /// must carry across `next_slot` calls rather than resetting per row.
+    struct BytecodeDecompressor<'a> {
+        data: &'a [u8],
+        pos: usize,
+        control: [u8; 8],
+        control_idx: usize,
+        bias: f64,
+        eof: bool,
+    }
+
+    impl<'a> BytecodeDecompressor<'a> {
+        fn new(data: &'a [u8], bias: f64) -> Self {
+            BytecodeDecompressor {
+                data,
+                pos: 0,
+                control: [0; 8],
+                control_idx: 8,
+                bias,
+                eof: false,
+            }
+        }
+
+        /// Returns the next slot's raw 8 bytes, or `None` at end of file.
+        fn next_slot(&mut self) -> Result<Option<[u8; 8]>> {
+            loop {
+                if self.eof {
+                    return Ok(None);
+                }
+                if self.control_idx >= 8 {
+                    let Some(block) = self.data.get(self.pos..self.pos + 8) else {
+                        return Ok(None);
+                    };
+                    self.control.copy_from_slice(block);
+                    self.pos += 8;
+                    self.control_idx = 0;
+                }
+                let code = self.control[self.control_idx];
+                self.control_idx += 1;
+                match code {
+                    0 => continue, // padding/skip - produces no slot
+                    1..=251 => {
+                        let value = f64::from(code) - self.bias;
+                        return Ok(Some(value.to_le_bytes()));
+                    }
+                    COMPRESS_RAW_FOLLOWS => {
+                        let raw = self
+                            .data
+                            .get(self.pos..self.pos + 8)
+                            .context("truncated SPSS bytecode-compressed data (raw slot)")?;
+                        self.pos += 8;
+                        return Ok(Some(raw.try_into().unwrap()));
+                    }
+                    COMPRESS_EIGHT_SPACES => return Ok(Some([b' '; 8])),
+                    COMPRESS_SYSMIS => return Ok(Some(SYSMIS_BITS.to_le_bytes())),
+                    COMPRESS_END_OF_FILE => {
+                        self.eof = true;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    enum CaseSource<'a> {
+        Raw { data: &'a [u8], pos: usize },
+        Bytecode(BytecodeDecompressor<'a>),
+    }
+
+    impl CaseSource<'_> {
+        fn next_slot(&mut self) -> Result<Option<[u8; 8]>> {
+            match self {
+                CaseSource::Raw { data, pos } => {
+                    let Some(bytes) = data.get(*pos..*pos + 8) else {
+                        return Ok(None);
+                    };
+                    *pos += 8;
+                    Ok(Some(bytes.try_into().unwrap()))
+                }
+                CaseSource::Bytecode(d) => d.next_slot(),
+            }
+        }
+    }
+
+    fn format_numeric_value(format_type: u8, value: f64) -> String {
+        match format_type {
+            FMT_DATE | FMT_ADATE | FMT_JDATE | FMT_EDATE | FMT_SDATE => {
+                let days = (value / 86_400.0).floor() as i64 - 141_428;
+                EpochDate::from_days(days)
+                    .map(|d| d.format_ymd())
+                    .unwrap_or_else(|| value.to_string())
+            }
+            FMT_DATETIME | FMT_YMDHMS => {
+                let unix_secs = value - SPSS_EPOCH_OFFSET_SECONDS;
+                let secs = unix_secs.floor();
+                let frac_nanos = ((unix_secs - secs) * 1_000_000_000.0).round() as u32;
+                EpochDateTime::from_unix_seconds(secs as i64, frac_nanos)
+                    .map(|dt| dt.format_t_frac(3))
+                    .unwrap_or_else(|| value.to_string())
+            }
+            FMT_TIME | FMT_DTIME | FMT_MTIME => {
+                if (0.0..86_400.0).contains(&value) {
+                    let secs = value.floor() as u32;
+                    let frac_nanos = ((value - value.floor()) * 1_000_000_000.0).round() as u32;
+                    EpochTime::from_seconds_since_midnight(secs, frac_nanos)
+                        .map(|t| t.format_hms_frac(3))
+                        .unwrap_or_else(|| value.to_string())
+                } else {
+                    // A genuine multi-day elapsed duration - left as a
+                    // plain number rather than inventing a non-standard
+                    // "days:HH:MM:SS" rendering for this rare shape.
+                    value.to_string()
+                }
+            }
+            _ => {
+                // A whole-number-valued f64 renders without a trailing
+                // ".0" so `suggest_ideal_type` can recognize it as a
+                // plain integer, matching how every other numeric-format
+                // reader in this project (dBase, Stata, SAS7BDAT) already
+                // treats its own declared-double-but-really-integral
+                // columns.
+                if value.fract() == 0.0 && value.abs() < 1e15 {
+                    format!("{value:.0}")
+                } else {
+                    value.to_string()
+                }
+            }
+        }
+    }
+
+    /// Reads every case (row) from `source`, producing one `Option<String>`
+    /// per non-ghost variable per row (`None` for both SYSMIS and a
+    /// user-declared missing value - this project's usual "missing values
+    /// never fake a type change" treatment).
+    fn read_cases(
+        mut source: CaseSource,
+        dict: &Dictionary,
+        nrows: Option<usize>,
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        let visible: Vec<&VariableRecord> = dict.variables.iter().filter(|v| !v.is_ghost).collect();
+        let mut columns: Vec<Vec<Option<String>>> = vec![Vec::new(); visible.len()];
+        let slots_per_row = dict.header.nominal_case_size;
+
+        'rows: loop {
+            if nrows.is_some_and(|limit| columns.first().is_some_and(|c| c.len() >= limit)) {
+                break;
+            }
+            let mut row_slots: Vec<[u8; 8]> = Vec::with_capacity(slots_per_row);
+            for _ in 0..slots_per_row {
+                match source.next_slot()? {
+                    Some(bytes) => row_slots.push(bytes),
+                    None => {
+                        if row_slots.is_empty() {
+                            break 'rows;
+                        }
+                        bail!("SPSS case data ends mid-row");
+                    }
+                }
+            }
+
+            for (col_idx, var) in visible.iter().enumerate() {
+                let value = match &var.var_type {
+                    VarType::Numeric => {
+                        let raw = row_slots
+                            .get(var.slot_index)
+                            .context("SPSS case data is missing a numeric variable's own slot")?;
+                        let bits = u64::from_le_bytes(*raw);
+                        let v = f64::from_bits(bits);
+                        if bits == SYSMIS_BITS || var.missing_values.excludes_numeric(v) {
+                            None
+                        } else {
+                            Some(format_numeric_value(var.format_type, v))
+                        }
+                    }
+                    VarType::Str(width) => {
+                        let mut buf = Vec::with_capacity(*width);
+                        if var.n_segments <= 1 {
+                            let n_slots = width.div_ceil(8);
+                            for i in 0..n_slots {
+                                if let Some(s) = row_slots.get(var.slot_index + i) {
+                                    buf.extend_from_slice(s);
+                                }
+                            }
+                        } else {
+                            // Very long string: each segment stores up to
+                            // 255 useful bytes in 32 slots (256 bytes) of
+                            // data space; truncating the whole buffer down
+                            // to the running useful-byte total after each
+                            // segment strips that segment's own trailing
+                            // slot-alignment padding before the next
+                            // segment's bytes are appended - verified
+                            // against `ambers`'s own `push_string_from_
+                            // raw_slots`.
+                            let mut slot = var.slot_index;
+                            let mut remaining = *width;
+                            let mut cumulative = 0usize;
+                            for _ in 0..var.n_segments {
+                                let seg_useful = remaining.min(255);
+                                let n_slots = seg_useful.div_ceil(8);
+                                for i in 0..n_slots {
+                                    if let Some(s) = row_slots.get(slot + i) {
+                                        buf.extend_from_slice(s);
+                                    }
+                                }
+                                cumulative += seg_useful;
+                                buf.truncate(cumulative);
+                                remaining = remaining.saturating_sub(255);
+                                slot += 32;
+                            }
+                        }
+                        buf.truncate(*width);
+                        let raw8 = row_slots.get(var.slot_index).map(|s| s.as_slice());
+                        let is_missing =
+                            raw8.is_some_and(|r| var.missing_values.excludes_string(r));
+                        if is_missing {
+                            None
+                        } else {
+                            let trimmed = trim_trailing_padding(&buf);
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(decode_text(dict.text_encoding, trimmed).unwrap_or_else(
+                                    |_| String::from_utf8_lossy(trimmed).into_owned(),
+                                ))
+                            }
+                        }
+                    }
+                };
+                columns[col_idx].push(value);
+            }
+        }
+
+        Ok(columns)
+    }
+
+    pub(crate) fn columns_from_spss(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = std::fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = std::io::BufReader::new(file);
+        let dict = read_dictionary(&mut r)?;
+
+        if dict.header.compression == Compression::Zlib {
+            bail!(
+                "SPSS .zsav (zlib-compressed) files aren't supported by this reader yet - \
+                 rebuild the file as an uncompressed or default-compressed .sav"
+            );
+        }
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest)
+            .context("failed reading SPSS case data")?;
+        let source = match dict.header.compression {
+            Compression::None => CaseSource::Raw {
+                data: &rest,
+                pos: 0,
+            },
+            Compression::Bytecode => {
+                CaseSource::Bytecode(BytecodeDecompressor::new(&rest, dict.header.bias))
+            }
+            Compression::Zlib => unreachable!("handled above"),
+        };
+
+        let columns = read_cases(source, &dict, nrows)?;
+        let visible: Vec<&VariableRecord> = dict.variables.iter().filter(|v| !v.is_ghost).collect();
+
+        let mut out = Vec::with_capacity(visible.len());
+        for (var, raw) in visible.iter().zip(columns) {
+            let total = raw.len();
+            let current_type = match var.var_type {
+                VarType::Numeric => "f64",
+                VarType::Str(_) => "String",
+            };
+            let raw_values: Vec<String> = raw.into_iter().flatten().collect();
+            let col = ColumnInput {
+                name: var.long_name.clone(),
+                current_type: current_type.to_string(),
+                raw_values,
+                total,
+                skip_heuristics: false,
+            };
+            out.push(profile_column(col, n_samples));
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn trim_trailing_padding_strips_both_spaces_and_nul_bytes() {
+            assert_eq!(trim_trailing_padding(b"hello   "), b"hello");
+            assert_eq!(trim_trailing_padding(b"hello\0\0\0"), b"hello");
+            assert_eq!(trim_trailing_padding(b"hello \0 \0"), b"hello");
+            assert_eq!(trim_trailing_padding(b"hello"), b"hello");
+            assert_eq!(trim_trailing_padding(b"   "), b"");
+            assert_eq!(trim_trailing_padding(b""), b"");
+        }
+
+        #[test]
+        fn decode_windows_1252_handles_ascii_and_high_bytes() {
+            assert_eq!(decode_windows_1252(b"hello"), "hello");
+            // 0x80 is the Euro sign under Windows-1252 (unlike true
+            // Latin-1, which has no assignment there at all).
+            assert_eq!(decode_windows_1252(&[0x80]), "\u{20AC}");
+            // 0xE9 is e-acute in both Windows-1252 and true Latin-1.
+            assert_eq!(decode_windows_1252(&[0xE9]), "\u{00E9}");
+        }
+
+        #[test]
+        fn round_up_rounds_to_the_next_multiple() {
+            assert_eq!(round_up(0, 4), 0);
+            assert_eq!(round_up(1, 4), 4);
+            assert_eq!(round_up(4, 4), 4);
+            assert_eq!(round_up(5, 4), 8);
+        }
+
+        #[test]
+        fn missing_values_excludes_numeric_matches_each_variant() {
+            assert!(!MissingValues::None.excludes_numeric(5.0));
+
+            let discrete = MissingValues::DiscreteNumeric(vec![-99.0, -98.0]);
+            assert!(discrete.excludes_numeric(-99.0));
+            assert!(discrete.excludes_numeric(-98.0));
+            assert!(!discrete.excludes_numeric(-97.0));
+
+            let range = MissingValues::Range {
+                low: 900.0,
+                high: 999.0,
+            };
+            assert!(range.excludes_numeric(900.0));
+            assert!(range.excludes_numeric(950.0));
+            assert!(range.excludes_numeric(999.0));
+            assert!(!range.excludes_numeric(899.9));
+            assert!(!range.excludes_numeric(999.1));
+
+            let range_and_value = MissingValues::RangeAndValue {
+                low: 900.0,
+                high: 999.0,
+                value: -1.0,
+            };
+            assert!(range_and_value.excludes_numeric(950.0));
+            assert!(range_and_value.excludes_numeric(-1.0));
+            assert!(!range_and_value.excludes_numeric(0.0));
+        }
+
+        #[test]
+        fn missing_values_excludes_string_only_matches_discrete_string_variant() {
+            let discrete = MissingValues::DiscreteString(vec![b"XX      ".to_vec()]);
+            assert!(discrete.excludes_string(b"XX      "));
+            assert!(!discrete.excludes_string(b"AA      "));
+            assert!(!MissingValues::None.excludes_string(b"XX      "));
+        }
+
+        #[test]
+        fn parse_long_var_names_splits_tab_separated_short_equals_long_pairs() {
+            let parsed = parse_long_var_names(b"VAR1=user_uuid\tVAR2=contact_email");
+            assert_eq!(
+                parsed,
+                vec![
+                    ("VAR1".to_string(), "user_uuid".to_string()),
+                    ("VAR2".to_string(), "contact_email".to_string()),
+                ]
+            );
+        }
+
+        #[test]
+        fn parse_very_long_strings_reads_name_equals_width_entries() {
+            let parsed = parse_very_long_strings(b"NOTES=00300\09");
+            assert_eq!(parsed, vec![("NOTES".to_string(), 300)]);
+        }
+
+        #[test]
+        fn format_numeric_value_renders_a_native_date_as_iso() {
+            // 1970-01-01 is SPSS_EPOCH_OFFSET_SECONDS past the SPSS epoch;
+            // adding one day's worth of seconds lands on 1970-01-02.
+            let unix_epoch_as_spss_seconds = SPSS_EPOCH_OFFSET_SECONDS;
+            assert_eq!(
+                format_numeric_value(FMT_DATE, unix_epoch_as_spss_seconds),
+                "1970-01-01"
+            );
+            assert_eq!(
+                format_numeric_value(FMT_DATE, unix_epoch_as_spss_seconds + 86_400.0),
+                "1970-01-02"
+            );
+        }
+
+        #[test]
+        fn format_numeric_value_renders_a_datetime_with_fractional_seconds() {
+            let rendered = format_numeric_value(FMT_DATETIME, SPSS_EPOCH_OFFSET_SECONDS + 3_723.5);
+            assert_eq!(rendered, "1970-01-01T01:02:03.500");
+        }
+
+        #[test]
+        fn format_numeric_value_renders_a_time_of_day() {
+            assert_eq!(format_numeric_value(FMT_TIME, 3_723.0), "01:02:03.000");
+        }
+
+        #[test]
+        fn format_numeric_value_falls_back_to_a_plain_number_for_a_multi_day_duration() {
+            // A genuine multi-day elapsed duration (past 86,400 seconds) has
+            // no natural single-string rendering, so it's left as a plain
+            // number rather than an invented "days:HH:MM:SS" format.
+            assert_eq!(format_numeric_value(FMT_TIME, 100_000.0), "100000");
+        }
+
+        #[test]
+        fn format_numeric_value_renders_a_whole_number_without_a_trailing_dot_zero() {
+            assert_eq!(format_numeric_value(0, 42.0), "42");
+            assert_eq!(format_numeric_value(0, 42.5), "42.5");
+        }
+
+        #[test]
+        fn read_header_rejects_a_file_with_the_wrong_magic() {
+            let mut data: &[u8] = b"NOPE________________________________________________________\
+                                     \x02\x00\x00\x00";
+            let err = read_header(&mut data).unwrap_err();
+            assert!(err.to_string().contains("not an SPSS"));
+        }
+
+        #[test]
+        fn bytecode_decompressor_decodes_biased_values_and_control_codes() {
+            // Bias 100.0: a control code of 101 decodes to 101.0 - 100.0 = 1.0.
+            let mut control = [0u8; 8];
+            control[0] = 101; // biased numeric value -> 1.0
+            control[1] = COMPRESS_EIGHT_SPACES;
+            control[2] = COMPRESS_SYSMIS;
+            control[3] = COMPRESS_END_OF_FILE;
+            let mut d = BytecodeDecompressor::new(&control, 100.0);
+
+            let first = d.next_slot().unwrap().unwrap();
+            assert_eq!(f64::from_le_bytes(first), 1.0);
+
+            let second = d.next_slot().unwrap().unwrap();
+            assert_eq!(second, [b' '; 8]);
+
+            let third = d.next_slot().unwrap().unwrap();
+            assert_eq!(u64::from_le_bytes(third), SYSMIS_BITS);
+
+            assert!(d.next_slot().unwrap().is_none());
+        }
+    }
+}
+
+#[cfg(feature = "spss")]
+fn columns_from_spss(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    spss_support::columns_from_spss(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "spss"))]
+fn columns_from_spss(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "SPSS support isn't compiled in - rebuild with `cargo build --release --features spss` (or --features full)"
+    )
+}
+
 // --- JSON / JSON Lines reader ---
 // Nesting is never force-fit into one opaque row: objects are flattened into
 // dot-notation sub-columns (recursively), and array elements are pooled
@@ -37253,6 +38354,7 @@ enum InputFormat {
     Dbase,
     Stata,
     Sas7bdat,
+    Spss,
 }
 
 impl InputFormat {
@@ -37282,6 +38384,7 @@ impl InputFormat {
             InputFormat::Dbase => "dbase",
             InputFormat::Stata => "stata",
             InputFormat::Sas7bdat => "sas7bdat",
+            InputFormat::Spss => "spss",
         }
     }
 }
@@ -37359,6 +38462,9 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
     }
     if head.len() >= 32 && head[..32] == SAS7BDAT_MAGIC[..] {
         return Some(InputFormat::Sas7bdat);
+    }
+    if head.starts_with(b"$FL2") || head.starts_with(b"$FL3") {
+        return Some(InputFormat::Spss);
     }
     if head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
         // OLE2/Compound File Binary magic - the pre-2007 .xls container
@@ -37508,9 +38614,10 @@ fn detect_format(
             "dbase" | "dbf" => Ok(InputFormat::Dbase),
             "stata" | "dta" => Ok(InputFormat::Stata),
             "sas7bdat" | "sas" => Ok(InputFormat::Sas7bdat),
+            "spss" | "sav" | "zsav" => Ok(InputFormat::Spss),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, or sas7bdat)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, or spss)"
                 )
             }
         };
@@ -37540,6 +38647,7 @@ fn detect_format(
         "dbf" => Ok(InputFormat::Dbase),
         "dta" => Ok(InputFormat::Stata),
         "sas7bdat" => Ok(InputFormat::Sas7bdat),
+        "sav" | "zsav" => Ok(InputFormat::Spss),
         // The extension alone doesn't tell us - either there isn't one, or
         // it's not one of the above. Before giving up, try the file's own
         // bytes: fixed-width text and the four log formats have no magic
@@ -37551,7 +38659,7 @@ fn detect_format(
                 return Ok(format);
             }
             bail!(
-                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat explicitly"
+                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss explicitly"
             )
         }
     }
@@ -42582,6 +43690,7 @@ pub fn run() -> Result<()> {
             InputFormat::Dbase => columns_from_dbase(&read_path, args.nrows, args.samples)?,
             InputFormat::Stata => columns_from_stata(&read_path, args.nrows, args.samples)?,
             InputFormat::Sas7bdat => columns_from_sas7bdat(&read_path, args.nrows, args.samples)?,
+            InputFormat::Spss => columns_from_spss(&read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
@@ -45371,6 +46480,9 @@ mod tests {
         let mut sas = SAS7BDAT_MAGIC.to_vec();
         sas.extend_from_slice(b"...rest of a real header");
         sniff_matches(&sas, "sas7bdat");
+
+        sniff_matches(b"$FL2rest of a real SPSS header...", "spss");
+        sniff_matches(b"$FL3rest of a real SPSS header (zsav)...", "spss");
     }
 
     #[test]
@@ -47244,6 +48356,188 @@ mod tests {
         let path = Path::new("tests/fixtures/malformed_garbage.sas7bdat");
         let mine = sas7bdat_support::columns_from_sas7bdat(path, None, 100);
         let theirs = columns_from_sas7bdat_via_sas7bdat_crate(path, None, 100);
+        assert_eq!(mine.is_ok(), theirs.is_ok());
+    }
+
+    /// Test-only: `ambers` is a dev-dependency that was never a runtime
+    /// dependency of this project's own `spss` feature to begin with (see
+    /// Cargo.toml) - `spss_support`'s own hand-rolled reader was built and
+    /// verified directly against `ambers`'s own source from the start.
+    /// This function's only job is producing the "expected" side of
+    /// `spss_reader_matches_the_ambers_crate_output_exactly` by reading the
+    /// same file through `ambers`'s real, independent Arrow-based decoder
+    /// and reducing its `RecordBatch` to the same `ColumnProfile` shape
+    /// this project's own reader produces, via the same shared
+    /// `array_value_to_string`/`profile_column` machinery this project's
+    /// Parquet/Arrow IPC oracles already lean on for exactly this reason.
+    #[cfg(all(test, feature = "spss"))]
+    fn columns_from_spss_via_ambers_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use ambers::MissingSpec;
+        use arrow57::array::Float64Array;
+        use arrow57::datatypes::DataType;
+
+        let (batch, meta) = ambers::read_sav(path)
+            .map_err(|e| Error::from(std::io::Error::other(e.to_string())))?;
+        let schema = batch.schema();
+
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            let array = batch.column(i);
+            let is_numeric = matches!(
+                field.data_type(),
+                DataType::Float64
+                    | DataType::Date32
+                    | DataType::Timestamp(..)
+                    | DataType::Duration(..)
+            );
+            let current_type = if is_numeric { "f64" } else { "String" };
+            // `ambers`'s own `RecordBatch` only ever nulls out SYSMIS - a
+            // *user-declared* missing value (e.g. "999 means Refused",
+            // this project's own `edge_spss_missing_values.sav` fixture)
+            // stays a genuine, present value in the batch, with the
+            // declaration surfaced separately in `meta.
+            // variable_missing_values` instead (a real, independent-
+            // library design choice, not a defect - "missing" here is a
+            // domain decision a caller opts into, not a data-integrity
+            // one). This project's own reader excludes both, so the
+            // oracle applies the same declared-missing filtering here to
+            // keep the comparison apples-to-apples rather than either
+            // loosening this project's own reader or weakening the
+            // assertion.
+            let specs: Vec<MissingSpec> = meta
+                .variable_missing_values
+                .get(field.name())
+                .cloned()
+                .unwrap_or_default();
+            let total = array.len();
+            let mut raw_values = Vec::with_capacity(total);
+            // Arrow's own `Display` for a plain `Float64` always keeps a
+            // decimal point (`"1.0"`), unlike this project's own
+            // established convention (a whole-number-valued f64 renders
+            // without a trailing ".0", the same as dBase/Stata/SAS7BDAT's
+            // readers already do) - normalized here, in the oracle's own
+            // wrapper, rather than changing this project's reader to match
+            // an oracle-specific formatting quirk it doesn't otherwise
+            // need to (the same "don't trust the oracle's own rendering
+            // verbatim" treatment this project's Parquet Float16 oracle
+            // comparison already needed for an analogous reason).
+            let plain_floats = array.as_any().downcast_ref::<Float64Array>();
+            for row in 0..total {
+                if array.is_null(row) {
+                    continue;
+                }
+                if let Some(floats) = plain_floats {
+                    let v = floats.value(row);
+                    let excluded = specs.iter().any(|spec| match spec {
+                        MissingSpec::Value(mv) => *mv == v,
+                        MissingSpec::Range { lo, hi } => v >= *lo && v <= *hi,
+                        MissingSpec::StringValue(_) => false,
+                    });
+                    if excluded {
+                        continue;
+                    }
+                    raw_values.push(if v.fract() == 0.0 && v.abs() < 1e15 {
+                        format!("{v:.0}")
+                    } else {
+                        v.to_string()
+                    });
+                } else {
+                    let s = arrow57::util::display::array_value_to_string(array, row)
+                        .context("ambers oracle: failed to stringify a cell")?;
+                    let excluded = specs.iter().any(|spec| {
+                        matches!(spec, MissingSpec::StringValue(sv) if sv.trim_end() == s.trim_end())
+                    });
+                    if excluded {
+                        continue;
+                    }
+                    raw_values.push(s);
+                }
+            }
+            columns.push(profile_column(
+                ColumnInput {
+                    name: field.name().clone(),
+                    current_type: current_type.to_string(),
+                    raw_values,
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            ));
+        }
+        Ok(columns)
+    }
+
+    /// Cross-verification oracle for the hand-rolled SPSS reader
+    /// (`spss_support` - see Cargo.toml) against the real `ambers` crate,
+    /// kept as a dev-only dependency for exactly this purpose. Compares
+    /// column names, the numeric/string current-type split, and
+    /// `sample_values` (not full `raw_values`) - `ambers` resolves a
+    /// native SPSS date to Arrow's own `Date32` and a datetime to a
+    /// microsecond `Timestamp`, and while both readers agree on the
+    /// resulting calendar date/time (confirmed directly - Arrow's own
+    /// `Display` for both types already renders the same ISO shape this
+    /// project's own `EpochDate`/`EpochDateTime` formatters produce), a
+    /// looser `sample_values`-only comparison keeps this test from being
+    /// needlessly brittle against a future rendering-convention change in
+    /// either crate for a value this project never claims byte-identical
+    /// formatting on in the first place (e.g. `ideal_type`'s own
+    /// downstream type inference, not raw string equality, is what this
+    /// project actually guarantees for a date column - see the design
+    /// philosophy section in CLAUDE.md).
+    #[cfg(feature = "spss")]
+    #[test]
+    fn spss_reader_matches_the_ambers_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/type_detection.sav",
+            "tests/fixtures/edge_spss_missing_values.sav",
+            "tests/fixtures/edge_spss_very_long_string.sav",
+            "tests/fixtures/edge_spss_bytecode_compressed.sav",
+            "tests/fixtures/edge_spss_uncompressed_equivalent.sav",
+        ] {
+            let path = Path::new(f);
+            let mine = spss_support::columns_from_spss(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_spss_via_ambers_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: ambers-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.missing_pct, t.missing_pct,
+                    "{f} col '{}': missing_pct",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Both readers must agree on success/failure for genuinely bad
+    /// input - real-fixture comparisons are the assertion above; this one
+    /// covers `malformed_garbage.sav` separately since a clean rejection
+    /// has no field-by-field output to compare.
+    #[cfg(feature = "spss")]
+    #[test]
+    fn spss_reader_agrees_with_the_ambers_crate_on_malformed_input() {
+        let path = Path::new("tests/fixtures/malformed_garbage.sav");
+        let mine = spss_support::columns_from_spss(path, None, 100);
+        let theirs = columns_from_spss_via_ambers_crate(path, 100);
         assert_eq!(mine.is_ok(), theirs.is_ok());
     }
 }

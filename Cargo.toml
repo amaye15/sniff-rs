@@ -22,7 +22,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss"]
 sqlite = []
 msgpack = []
 toml = []
@@ -37,6 +37,7 @@ syslog = []
 dbase = []
 stata = []
 sas7bdat = []
+spss = []
 
 [dev-dependencies]
 # Dev-only - never affects the shipped binary or a consumer's build, unlike
@@ -172,6 +173,26 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # `sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly`
 # (`#[cfg(all(test, feature = "sas7bdat"))]` in src/lib.rs).
 sas7bdat = "0.8.0"
+# Unlike every other dev-dependency in this list, `ambers` was never a real
+# runtime dependency of this project's own `spss` feature to begin with -
+# SPSS support went straight to a hand-rolled reader (`spss_support` in
+# src/lib.rs, verified directly against `ambers`'s own source) from the
+# start (this project's own earlier "No SPSS" decision was about avoiding
+# `ambers`'s then-unconditional `arrow` dependency as a *runtime* cost, not
+# about the format itself being untractable to hand-roll). Kept the same
+# dev-only "never touches the shipped binary" treatment as every other
+# oracle here regardless, since it plays the identical role: cross-
+# verification in `spss_reader_matches_the_ambers_crate_output_exactly`
+# (`#[cfg(all(test, feature = "spss"))]` in src/lib.rs).
+ambers = "0.4.2"
+# `ambers` itself pins `arrow` 57, a whole major version behind this
+# project's own `arrow` 59.2.0 dev-dependency above (kept for the Parquet/
+# Arrow IPC oracles) - the two `DataType`/`Array` types aren't the same
+# type to the compiler even though they share a name, so the SPSS oracle
+# needs its own explicitly-versioned, renamed handle on the exact `arrow`
+# `ambers`'s own `RecordBatch` is built from, rather than reusing this
+# project's newer one.
+arrow57 = { package = "arrow", version = "57", default-features = false }
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

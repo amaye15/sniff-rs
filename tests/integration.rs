@@ -2778,6 +2778,117 @@ fn stata_recognizes_uuid_email_ipv4_and_date_columns() {
     );
 }
 
+#[cfg(feature = "spss")]
+#[test]
+fn spss_recognizes_uuid_email_ipv4_and_date_columns() {
+    // `signup_date` is a genuine native SPSS date variable (numeric
+    // storage, an ADATE10 print format) rather than a string that merely
+    // looks like a date - so this also exercises the current_type/
+    // ideal_type gap this project's other declared-numeric-but-really-a-
+    // date readers (dBase, SAS7BDAT) already demonstrate: `current_type`
+    // stays "f64" (SPSS stores every date as a numeric offset), while
+    // `ideal_type` correctly resolves to a real date once
+    // `format_numeric_value` renders it as an ISO string.
+    let doc = run_json("type_detection.sav", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(column(cols, "signup_date")["current_type"], "f64");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_excludes_declared_missing_values_not_just_sysmis() {
+    // `score`/`rating` each declare their own user-missing values (two
+    // discrete codes, and a 900-999 range respectively) on top of SPSS's
+    // own SYSMIS sentinel; `code` declares a discrete missing string.
+    // None of the three real fixture rows involved is SYSMIS at all - the
+    // exclusion only happens because this reader consults each
+    // variable's own missing-value declaration, not just the bit pattern.
+    let doc = run_json("edge_spss_missing_values.sav", &[]);
+    let cols = table(&doc, "edge_spss_missing_values");
+    assert_eq!(column(cols, "score")["missing_pct"], 40.0);
+    assert_eq!(
+        column(cols, "score")["sample_values"],
+        serde_json::json!(["10", "20", "30"])
+    );
+    assert_eq!(column(cols, "rating")["missing_pct"], 40.0);
+    assert_eq!(column(cols, "code")["missing_pct"], 40.0);
+    assert_eq!(
+        column(cols, "code")["sample_values"],
+        serde_json::json!(["AA", "BB", "CC"])
+    );
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_reconstructs_a_very_long_string_split_across_named_segments() {
+    // `notes` is 300 characters wide - past SPSS's 255-byte single-
+    // segment limit, so it's stored across multiple named "very long
+    // string" segments (subtype 14) that this reader has to reassemble
+    // in the right order, stripping each segment's own trailing slot-
+    // alignment padding before appending the next segment's bytes.
+    let doc = run_json("edge_spss_very_long_string.sav", &[]);
+    let cols = table(&doc, "edge_spss_very_long_string");
+    let notes = column(cols, "notes");
+    let samples = notes["sample_values"].as_array().unwrap();
+    assert_eq!(samples[0], "A".repeat(300));
+    let expected_second = "B".repeat(137) + &"Z".repeat(163);
+    assert_eq!(samples[1], expected_second);
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_bytecode_compression_reads_identically_to_uncompressed() {
+    // Same underlying data, one written with row_compress=True (SPSS's
+    // own "bytecode" RLE-style compression) and one without - proving
+    // compression is transparent, the same "compressed reads identically
+    // to uncompressed" contract this project's gzip/zstd readers already
+    // get.
+    let compressed = run_json("edge_spss_bytecode_compressed.sav", &[]);
+    let uncompressed = run_json("edge_spss_uncompressed_equivalent.sav", &[]);
+    let compressed_cols = table(&compressed, "edge_spss_bytecode_compressed");
+    let uncompressed_cols = table(&uncompressed, "edge_spss_uncompressed_equivalent");
+    assert_eq!(compressed_cols.len(), uncompressed_cols.len());
+    for (c, u) in compressed_cols.iter().zip(uncompressed_cols.iter()) {
+        assert_eq!(c["name"], u["name"]);
+        assert_eq!(c["current_type"], u["current_type"]);
+        assert_eq!(c["ideal_type"], u["ideal_type"]);
+        assert_eq!(c["sample_values"], u["sample_values"]);
+        assert_eq!(c["missing_pct"], u["missing_pct"]);
+    }
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_zsav_zlib_compression_gives_an_actionable_error_not_a_panic() {
+    let output = Command::new(bin())
+        .args([fixture("edge_spss_zlib_compressed.zsav").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("zsav"),
+        "expected a zsav-specific error message: {stderr}"
+    );
+    assert!(!stderr.contains("panicked at"));
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_format_recognized_via_extension_and_override() {
+    let doc = run_with_format("type_detection.sav", "json", &[]);
+    assert_eq!(doc["format"], "spss");
+    let doc = run_with_format("type_detection.sav", "json", &["--format", "spss"]);
+    assert_eq!(doc["format"], "spss");
+}
+
 #[test]
 fn fixed_width_recognizes_uuid_email_ipv4_and_date_columns() {
     let doc = run_with_format(
@@ -3150,6 +3261,12 @@ fn malformed_stata_fails_cleanly() {
 #[test]
 fn malformed_sas7bdat_fails_cleanly() {
     assert_fails_without_panicking("malformed_garbage.sas7bdat");
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn malformed_spss_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.sav");
 }
 
 // --- Format-level edge-case tests --------------------------------------

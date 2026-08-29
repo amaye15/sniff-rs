@@ -5,9 +5,9 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, RFC 3164/5424 syslog, dBase, Stata, and SAS7BDAT — any of them gzip-
-or zstd-compressed too — and writes Markdown, this tool's own rich JSON,
-or json-schema.org-standard JSON.
+logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, and SPSS — any of them
+gzip- or zstd-compressed too — and writes Markdown, this tool's own rich
+JSON, or json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -60,6 +60,7 @@ every format. See "Testing" below.
 | dBase | `.dbf` | `--features dbase` | soft-deleted records skipped (dBase's own convention); `current_type` can reveal a Numeric field that's really an integer |
 | Stata | `.dta` | `--features stata` | every DTA release (102-119); Stata's own missing markers become missing values, not literal strings |
 | SAS7BDAT | `.sas7bdat` | `--features sas7bdat` | `current_type` from the file's own declared type; SAS stores nearly all numerics as doubles, so `ideal_type` often narrows further |
+| SPSS | `.sav`, `.zsav` | `--features spss` | a native SPSS date/time/datetime variable is stored as a plain numeric offset, so `current_type` stays `f64` while `ideal_type` narrows to a real date once it's rendered; `.zsav` (zlib-compressed) is a disclosed, not-yet-supported error - see below |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -353,6 +354,28 @@ it's the same "declared type is a hint, not the truth" lesson Parquet/
 Avro/dBase/Stata all already demonstrate, in one more format's own way of
 losing that distinction. SAS also has per-column labels (same considered
 non-surfacing decision as Stata's).
+
+SPSS (`columns_from_spss`, via `spss_support` - a hand-rolled reader from
+the start, see the Dependency footprint section) is architecturally the
+same flat `ColumnInput` -> `profile_column` shape again, with its own
+version of the same declared-type-vs-real-value gap: a native SPSS date/
+time/datetime variable is stored as a plain numeric offset from the
+format's own 1582-10-14 epoch, so `current_type` stays `"f64"` (SPSS's
+own dictionary never distinguishes "a number" from "a number formatted as
+a date" at the storage level) while `ideal_type` correctly narrows to a
+real date once the variable's own print format is used to render it as an
+ISO string - the same lesson dBase's Numeric-vs-integer gap and SAS7BDAT's
+declared-double-vs-real-integer gap already demonstrate, in this format's
+own way of losing the distinction. Missing-value handling has two layers,
+both genuinely checked rather than just the more obvious one: SYSMIS
+(SPSS's own system-missing sentinel, a specific bit pattern) and a
+variable's own separately-declared user-missing specification (discrete
+values, or a range, e.g. "900-999 means not administered") - both are
+treated as absent, the same "missing values never fake a type change"
+principle Stata's own `.`-through-`.z` missing markers already get.
+Variable/value labels aren't surfaced (same considered non-surfacing
+decision as Stata's/SAS7BDAT's). A `.zsav` file's own zlib compression
+layer isn't implemented yet - see Known limitations.
 
 Common/Combined Log Format also land here (`columns_from_weblog`, via
 `weblog_support` - a hand-rolled parser now, see the Dependency footprint
@@ -1593,8 +1616,14 @@ nilvalue-as-missing handling, dBase's current-vs-ideal-type gap on a
 Numeric field that's really an integer, Stata's missing-marker-as-absent
 handling and its own current-vs-ideal-type gap (a double column holding
 one `NaN` alongside otherwise-integer data), SAS7BDAT being wired up
-(see Known limitations for why it has no dedicated fixture), and that
-Markdown output never has a trailing blank line.
+(see Known limitations for why it has no dedicated fixture), SPSS's own
+current-vs-ideal-type gap on a native date variable (numeric storage,
+resolved to a real date), its declared-missing-value exclusion (both
+discrete and range, on top of SYSMIS), its "very long string"
+reconstruction across a real segment boundary, its bytecode compression
+reading identically to an uncompressed equivalent, and its `.zsav`
+(zlib-compressed) files failing with a clean, actionable error rather
+than a guess, and that Markdown output never has a trailing blank line.
 
 **Every format also has at least one test proving a precise-grammar
 semantic type (UUID/Email/IPv4/date, not just a bare scalar shape) survives
@@ -3653,9 +3682,9 @@ this project could just implement directly rather than depend on:
   separately zero panics/hangs confirmed via the compiled binary directly
   on the same corpus.
 
-- **`dbase` → a hand-rolled reader (`dbase_support`).** Unlike every other
-  crate declined in this project's own "No DuckDB"/"No SPSS" reasoning
-  below, dBase's own on-disk format turned out genuinely simple to hand-
+- **`dbase` → a hand-rolled reader (`dbase_support`).** Unlike DuckDB
+  (still declined - see "No DuckDB" in the Known limitations section
+  below), dBase's own on-disk format turned out genuinely simple to hand-
   roll once actually read rather than assumed complex by association with
   "a database format": a fixed 32-byte header, a fixed 32-byte-per-field
   descriptor table (count derived arithmetically from the header's own
@@ -4224,7 +4253,7 @@ this project could just implement directly rather than depend on:
   genuinely complex multi-byte/stateful schemes - Shift-JIS, EUC-JP/KR,
   Big5, GB18030, ISO-2022-\*) is a clear, disclosed error rather than a
   guess, the same dependency-weight tradeoff already declined elsewhere
-  in this file (see "No SPSS"/"No DuckDB").
+  in this file (see "No DuckDB").
 
   RLE (`"SASYZCRL"`) and RDC/binary (`"SASYZCR2"`) row decompression are
   ported algorithm-for-algorithm from the reference crate's own
@@ -5865,13 +5894,122 @@ this project could just implement directly rather than depend on:
   trusted" bar this entire hand-roll campaign has held itself to
   without exception. LZO is accordingly the sole remaining, permanently
   disclosed gap in this entire multi-session hand-roll, retired to the
-  same category as "No ORC"/"No DuckDB"/"No SPSS" in the Known
-  Limitations section below - not a weaker case than those, a stronger
-  one, since it's not even a dependency-weight tradeoff to reconsider
+  same category as "No ORC"/"No DuckDB" in the Known Limitations section
+  below - not a weaker case than those, a stronger one, since it's not
+  even a dependency-weight tradeoff to reconsider
   later, just nothing real anywhere to verify against. Moot for Arrow
   IPC specifically either way, since its own `BodyCompression` union
   only ever offers `LZ4_FRAME`/`ZSTD` - there's no LZO codec value to
   ever add on that side regardless.
+
+- **`ambers` → a hand-rolled reader (`spss_support`), unlike every other
+  entry in this list.** Every prior hand-roll in this document replaced a
+  crate this project already depended on at runtime; SPSS is the one
+  exception - this project's own earlier "No SPSS" decision (see the
+  Known limitations section's history) was declined purely over
+  `ambers`'s then-unconditional `arrow` v57 dependency as a *runtime*
+  cost, never a judgment that the format itself was too hard to hand-roll.
+  Once Parquet/Arrow IPC's own cutover moved this project's `arrow`/
+  `parquet` to `[dev-dependencies]` (see above), there was nothing left in
+  the shipped build for `ambers`'s own `arrow` dependency to add weight
+  to or dedupe against - so SPSS support went straight to a hand-rolled
+  reader from the very start, verified against `ambers`'s own source the
+  same "read the real crate's source as the spec" way every other format
+  in this document was, rather than ever shipping `ambers` as a runtime
+  dependency first and replacing it later.
+
+  The on-disk format layers the same way Stata's own binary form does (a
+  real, if coincidental, family resemblance between statistical-package
+  formats of a similar vintage): a fixed 176-byte header (`$FL2`/`$FL3`
+  magic, a layout code selecting endianness - only the little-endian
+  layout this reader has real files to verify against is supported, the
+  same disclosed boundary Stata's own big-endian gap already draws for an
+  identical reason), then a self-describing dictionary section built from
+  a handful of typed records: type-2 variable records (one per column,
+  each carrying its own declared width, print/write format, and
+  optionally a declared missing-value specification), type-3/4 value-label
+  records (parsed only far enough to skip correctly - the labels
+  themselves aren't surfaced, matching this project's existing Stata/
+  SAS7BDAT precedent), type-6 document records, and type-7 "info"
+  extension records dispatched by subtype - of which this reader only
+  actually needs four (machine-integer info for a codepage fallback, long
+  variable names, very-long-string segment widths, and the file's own
+  declared text encoding name), with every other subtype skipped by byte
+  length alone, the same "unknown fields are safe to ignore" contract this
+  project's Thrift/FlatBuffers-based Parquet/Arrow IPC readers already
+  rely on for the identical reason.
+
+  Three format-specific details were worth getting right, each confirmed
+  against `ambers`'s own source rather than assumed from a spec summary:
+    1. **SYSMIS, SPSS's own system-missing sentinel, is a specific bit
+       pattern - genuinely `-f64::MAX` (`0xFFEF_FFFF_FFFF_FFFF`), not a
+       NaN** - confirmed directly against `ambers`'s own test coverage
+       before trusting it, since a NaN-based check would have silently
+       missed every real missing value in every fixture.
+    2. **A variable's own declared missing-value specification is
+       genuinely separate from SYSMIS**, and is checked independently:
+       up to three discrete values, or a range (optionally plus one more
+       discrete value) for a numeric variable, or up to three discrete
+       string values for a string variable - the same "missing values
+       never fake a type change" treatment this project's Stata reader
+       already gives its own `.`-through-`.z` missing markers, just via a
+       different on-disk mechanism.
+    3. **"Very long string" (VLS) reconstruction.** A string variable
+       wider than 255 bytes is split across multiple named 32-slot
+       (256-byte) segments, each holding up to 255 *useful* bytes (not
+       256 - the format's own one-byte-per-segment overhead) - confirmed
+       against `ambers`'s own `push_string_from_raw_slots`, including the
+       specific detail that a segment's own trailing slot-alignment
+       padding has to be stripped via a running cumulative-byte-count
+       truncation *after* each segment is appended, not just once at the
+       very end, or a later segment's real content gets silently
+       corrupted by an earlier segment's own padding bytes.
+
+  "Bytecode" compression (SPSS's own default RLE-style scheme, distinct
+  from `.zsav`'s separate zlib layer - see the Known limitations section
+  for that boundary) is a stateful decompressor whose 8-byte control
+  blocks never align with a case (row) boundary, so its decode state has
+  to persist across `next_slot` calls rather than resetting per row - the
+  same shape this project's own gzip/zstd decoders already have for an
+  analogous reason. A native date/time/datetime variable is stored as a
+  plain numeric offset from SPSS's own epoch (1582-10-14, the start of
+  the Gregorian calendar - not the Unix epoch), converted through this
+  project's already-verified `EpochDate`/`EpochTime`/`EpochDateTime`
+  formatters after a single fixed-offset subtraction, the same "reuse
+  already-proven civil-calendar arithmetic rather than re-deriving a
+  second implementation" choice this project's dBase reader already made
+  for Julian Day Number dates.
+
+  Verified against the real `ambers` crate (kept as a dev-only oracle, the
+  same treatment every other replaced crate in this document already
+  gets, in `spss_reader_matches_the_ambers_crate_output_exactly`) on a
+  `type_detection.sav` fixture (the same UUID/email/IPv4/date convention
+  every other format's own fixture already uses, generated via
+  `pyreadstat` - itself a Python binding over the independent ReadStat C
+  library, not a second Rust implementation of the same spec, the same
+  "genuinely different codebase" oracle-strength property `rusqlite`'s
+  own entry in this list already noted for SQLite) plus dedicated fixtures
+  for declared missing values (both discrete and range), very-long-string
+  reconstruction across a real segment boundary, and bytecode compression
+  compared directly against an uncompressed equivalent. Cross-verification
+  surfaced one genuine, if narrow, oracle-specific rendering quirk rather
+  than a bug in this reader: Arrow's own `Display` for a plain `Float64`
+  always keeps a trailing decimal point (`"1.0"`), unlike this project's
+  own established convention (a whole-number-valued f64 renders without
+  one, the same as dBase/Stata/SAS7BDAT's own readers already do) -
+  normalized in the oracle's own wrapper rather than treated as a reason
+  to change this reader, the same "don't trust the oracle crate's own
+  formatting verbatim" treatment this project's Parquet Float16 oracle
+  comparison already needed for an analogous reason. A second, real
+  finding was closer to a design difference than a quirk: `ambers`'s own
+  `RecordBatch` only ever nulls out SYSMIS, leaving a *user-declared*
+  missing value as a genuinely present value in the batch (with the
+  declaration itself surfaced separately via `SpssMetadata::
+  variable_missing_values` instead) - a defensible, independent design
+  choice for a general-purpose library, not a defect, but one the oracle
+  wrapper has to replicate manually (by consulting that same metadata)
+  to keep the comparison meaningful rather than either loosening this
+  project's own reader or weakening the test's assertions.
 
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above - now fully cut over, the largest entry in this whole list -
@@ -5885,8 +6023,8 @@ swapping one call site at a time or hand-rolling a narrower, self-
 contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`, `.xls`,
 `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`, `zstd`, `npyz`, `rmpv`,
 `toml`, `ciborium`, `regex`, `dbase`, `dta`, `apache-avro`, `rusqlite`,
-`sas7bdat`, and now `arrow`/`parquet` all still were, however real their
-own risk.
+`sas7bdat`, `ambers`, and now `arrow`/`parquet` all still were, however
+real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/
@@ -5932,29 +6070,30 @@ pulled in unless that specific `--features` flag is passed).
   stack for one format was judged not worth it here; would reconsider if
   the crate trims that footprint, or if there's a concrete need for
   `.duckdb` files.
-- **No SPSS (`.sav`/`.zsav`).** Considered alongside Stata and SAS7BDAT,
-  and declined for the same dependency-weight reason as DuckDB, just at
-  smaller scale. `ambers` is the only pure-Rust SPSS reader on crates.io,
-  and its `Cargo.toml` depends on `arrow` v57 *unconditionally* - no
-  feature flag disables it - which would be a real ~10-13-crate addition
-  to the shipped build today (though unlike DuckDB there's no HTTP client
-  or other unrelated baggage riding along), for the same "nothing left to
-  dedupe against" reason DuckDB's own entry above now states explicitly.
-  The only other option, `polars-readstat-rs`, pulls in all of Polars
-  instead, which is heavier still. Would reconsider if `ambers` makes
-  `arrow` optional, or if there's a concrete need for `.sav` files.
-- **Stata/SAS7BDAT variable/value labels aren't surfaced.** A `.dta` or
-  `.sas7bdat` file can carry a human-authored description per variable (a
-  "variable label") and, for Stata, a named mapping for coded values (a
-  "value label", e.g. `1`/`2`/`3` → `"male"`/`"female"`/`"other"`) - both
-  genuinely useful, authoritative metadata, not a guess. Deliberately out
-  of scope for now: surfacing them well would mean either overloading the
-  existing (always-empty) `description` field with format-provided text -
-  a different kind of content than what it's documented to hold - or
+- **No SPSS `.zsav` (zlib-compressed) support yet.** `spss_support`
+  (see the Dependency footprint section for the full hand-roll writeup)
+  reads a plain `.sav`'s two real compression schemes - none, and SPSS's
+  own "bytecode" RLE-style compression - but a `.zsav` file's own
+  zlib-wrapped-bytecode layer isn't implemented yet, and the reader bails
+  cleanly with an actionable error naming the gap rather than guessing at
+  the framing. Would reconsider given a concrete need for `.zsav` files;
+  the format's own dictionary/case-data layout is otherwise fully
+  understood at this point (verified against `ambers`'s own source), so
+  this is a scoping decision, not an unverifiable gap the way LZO is.
+- **Stata/SAS7BDAT/SPSS variable/value labels aren't surfaced.** A `.dta`,
+  `.sas7bdat`, or `.sav` file can carry a human-authored description per
+  variable (a "variable label") and, for Stata and SPSS, a named mapping
+  for coded values (a "value label", e.g. `1`/`2`/`3` →
+  `"male"`/`"female"`/`"other"`) - both genuinely useful, authoritative
+  metadata, not a guess. Deliberately out of scope for now: surfacing them
+  well would mean either overloading the existing (always-empty)
+  `description` field with format-provided text - a different kind of
+  content than what it's documented to hold - or
   adding a new field to `ColumnProfile`, which is shared by every format's
   renderer and output shape. Worth adding if there's real demand;
-  `Variable::label()` in the `dta` crate and `ColumnMeta::label` in the
-  `sas7bdat` crate already expose it.
+  `Variable::label()` in the `dta` crate, `ColumnMeta::label` in the
+  `sas7bdat` crate, and `SpssMetadata::variable_labels`/
+  `variable_value_labels` in `ambers` already expose it.
 - **SAS7BDAT text decoding is limited to UTF-8/US-ASCII and Windows-1252**
   (which, per the WHATWG Encoding Standard `encoding_rs` implements, also
   covers files declaring "ISO-8859-1" - see the Dependency footprint
