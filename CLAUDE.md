@@ -5826,14 +5826,52 @@ this project could just implement directly rather than depend on:
   way, which is the property that actually matters for this project's
   own stated dependency-weight concerns.
 
-  **Still deliberately not started**: LZO, the one Parquet compression
-  codec still not hand-rolled anywhere in this project (moot for Arrow
+  **LZO stays permanently declined - checked properly, not just left
+  aside on the original assumption.** A later session revisited it
+  specifically to see whether the "no fixture, no trust" gap could
+  actually be closed, and found the situation is more conclusive than
+  "no fixture happens to exist yet": neither of the two reference
+  implementations this whole campaign already leans on for everything
+  else Parquet-related actually *implements* LZO at all. The real Rust
+  `parquet` crate's own `compression.rs::create_codec` has no `LZO` arm
+  whatsoever - it falls through to a generic "not supported yet" error,
+  confirmed directly in its source, not assumed from the crate's own
+  public `Compression::LZO` enum variant existing (that variant exists
+  only so file *metadata* naming LZO round-trips and CLI tools can name
+  it, not because anything can actually decode one). Arrow's C++
+  implementation (via `pyarrow`) gives the identical answer even more
+  bluntly on an attempted write: "LZO compression is supported by the
+  Parquet format in general, [but] is currently not supported by the
+  C++ implementation." And the official `apache/parquet-format` spec's
+  own `Compression.md` gives LZO a single, un-detailed sentence ("a
+  codec based on or interoperable with the LZO compression library"),
+  with none of the framing detail the deprecated `LZ4` codec's own
+  entry at least discloses (that one names its "additional undocumented
+  framing scheme" outright, which is exactly what let this project's
+  own `hadoop_lz4_compressed.parquet`/`non_hadoop_lz4_compressed.parquet`
+  fixtures pin down and hand-roll correctly in an earlier phase). LZO
+  the *algorithm* itself is entirely tractable to hand-roll in isolation
+  - a small, fully published byte-stream grammar (LZO1X, the variant
+  every real LZO compressor emits) with permissively-licensed pure-Rust
+  reference implementations already on crates.io (`am-lzo1x`, written
+  explicitly from the grammar prose published in the Linux kernel's own
+  `Documentation/staging/lzo.rst`, not from any GPL source) to verify
+  against - the genuinely unresolvable part is Parquet's own *framing*
+  around it, which no real file, no real implementation, and no detailed
+  spec text exists anywhere to confirm. Implementing it anyway would
+  mean guessing at that framing with literally nothing to check the
+  guess against - a real, qualitative break from the "verified against
+  a real file or a real independent implementation before being
+  trusted" bar this entire hand-roll campaign has held itself to
+  without exception. LZO is accordingly the sole remaining, permanently
+  disclosed gap in this entire multi-session hand-roll, retired to the
+  same category as "No ORC"/"No DuckDB"/"No SPSS" in the Known
+  Limitations section below - not a weaker case than those, a stronger
+  one, since it's not even a dependency-weight tradeoff to reconsider
+  later, just nothing real anywhere to verify against. Moot for Arrow
   IPC specifically either way, since its own `BodyCompression` union
-  only ever offers `LZ4_FRAME`/`ZSTD` - there's no LZO or Brotli codec
-  value to ever add on this side regardless) - the sole remaining,
-  permanently disclosed gap in this entire multi-session hand-roll,
-  matching the same "no fixture, no trust" bar this project already
-  holds every other narrow scope boundary to.
+  only ever offers `LZ4_FRAME`/`ZSTD` - there's no LZO codec value to
+  ever add on that side regardless.
 
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above - now fully cut over, the largest entry in this whole list -
@@ -5861,6 +5899,20 @@ pulled in unless that specific `--features` flag is passed).
 
 ## Known limitations / roadmap
 
+- **No LZO support for Parquet's own `LZO` compression codec.** Unlike
+  every other gap in this list, this isn't a dependency-weight tradeoff -
+  it's genuinely unverifiable. Neither the real Rust `parquet` crate nor
+  Arrow's C++ implementation (`pyarrow`) actually implements LZO
+  decoding at all (both recognize the enum value for metadata/CLI
+  purposes only), the official `parquet-format` spec gives it one
+  undetailed sentence with none of the framing detail even the
+  deprecated `LZ4` codec's own entry discloses, and no real LZO-
+  compressed Parquet file exists in the official `apache/parquet-
+  testing` corpus or anywhere else this project could find. See the
+  Dependency footprint section's own Parquet/Arrow IPC entry for the
+  full research trail - the LZO1X algorithm itself is well-published and
+  tractable, but Parquet's own framing around it has nothing real
+  anywhere to verify a guess against.
 - **No ORC.** Deliberately skipped — Rust ecosystem support is weak enough
   that it wasn't worth the dependency risk.
 - **No DuckDB.** Considered and deliberately skipped for the same reason as
