@@ -459,41 +459,45 @@ fn parquet_map_and_dictionary_columns_are_handled() {
     assert_eq!(category["current_type"], "String");
     assert_eq!(category["sample_values"][0], "gold");
 
-    // A Map column bridges through the same JSON flattener as Struct/List -
-    // it becomes a JSON object per row, then flattens into dot-notation
-    // sub-columns exactly like a nested object would.
+    // A Map column reconstructs as an array of {"key", "value"} pairs (the
+    // hand-rolled reader's own deliberate choice - see CLAUDE.md's Phase F
+    // writeup - rather than a native keyed JSON object), so it flattens
+    // into fixed `.key`/`.value` sub-columns rather than one sub-column per
+    // distinct map key.
     let attributes = column(cols, "attributes");
-    assert_eq!(attributes["current_type"], "object");
-    assert!(cols.iter().any(|c| c["name"] == "attributes.color"));
-    assert!(cols.iter().any(|c| c["name"] == "attributes.size"));
+    assert_eq!(attributes["current_type"], "Vec<object>");
+    assert!(cols.iter().any(|c| c["name"] == "attributes.key"));
+    assert!(cols.iter().any(|c| c["name"] == "attributes.value"));
 
-    let color = column(cols, "attributes.color");
-    assert_eq!(color["current_type"], "String");
+    let value = column(cols, "attributes.value");
+    assert_eq!(value["current_type"], "String");
 }
 
 // Found via a real-world sweep against the official apache/parquet-testing
 // corpus: a Map column with non-UTF8 keys (Map<Int32, T> is legal Parquet/
 // Arrow, e.g. a numeric-code-to-description lookup) used to fail Arrow's
-// own JSON writer for the *whole batch*, taking every other column in the
-// file down with it - a single unsupported column shouldn't cost the rest
-// of a file that's otherwise perfectly readable.
+// own JSON writer for the *whole batch* under the old Arrow-crate-based
+// reader, taking every other column in the file down with it. The hand-
+// rolled reader's own array-of-{"key","value"}-pairs Map representation
+// has no such restriction at all - a non-string key is just another leaf
+// value, so this column now profiles completely normally rather than
+// needing the old reader's own per-column isolation/disclosed-placeholder
+// fallback.
 #[cfg(feature = "parquet")]
 #[test]
-fn parquet_map_with_non_string_keys_does_not_sink_the_rest_of_the_file() {
+fn parquet_map_with_non_string_keys_is_profiled_normally() {
     let doc = run_json("edge_map_non_string_key.parquet", &[]);
     let cols = table(&doc, "edge_map_non_string_key");
 
-    let map_col = column(cols, "code_lookup");
-    assert_eq!(map_col["current_type"], "Map");
-    assert!(
-        map_col["notes"]
-            .as_str()
-            .unwrap()
-            .contains("could not be converted")
-    );
+    let key = column(cols, "code_lookup.key");
+    assert_eq!(key["current_type"], "i64");
+    assert_eq!(key["ideal_type"], "i64");
+
+    let value = column(cols, "code_lookup.value");
+    assert_eq!(value["current_type"], "String");
 
     // The plain scalar column alongside it must still be profiled
-    // normally - this is the whole point of the isolation.
+    // normally too.
     let plain = column(cols, "plain_id");
     assert_eq!(plain["ideal_type"], "i64");
     assert_eq!(plain["missing_pct"].as_f64().unwrap(), 0.0);

@@ -4284,22 +4284,29 @@ this project could just implement directly rather than depend on:
   different real files, run through the compiled release binary)
   produced zero panics, zero hangs, and no unexpected exit codes.
 
-- **`arrow`/`parquet` → a hand-rolled reader, in progress
-  (`parquet_support`).** Unlike every entry above this one, this is not a
-  finished hand-roll - it's the one still underway, explicitly chosen by
-  the user over two narrower alternatives (a flat-columns-only reader
-  leaving nested types and Arrow IPC/Feather on the `arrow`/`parquet`
-  crates, or stopping the campaign here and keeping both crates outright)
-  specifically because of its size: `arrow`+`parquet` together are the
-  largest dependency in this project by a wide margin, and - uniquely
-  among everything hand-rolled so far - Parquet's own footer metadata is
-  encoded with Thrift's compact protocol, a real general-purpose
-  serialization framework, not a single bespoke binary layout the way
-  every other format here has been. Arrow IPC/Feather adds a *second*,
-  entirely separate general-purpose framework (FlatBuffers) on top, not
-  yet started. This entry will keep growing across sessions as more of
-  the reader lands; treat it as a running log, not a finished writeup the
-  way every other entry in this section is.
+- **`arrow`/`parquet` → hand-rolled readers, now fully cut over
+  (`parquet_support`).** Unlike every entry above this one, this wasn't a
+  single-session hand-roll - it's the campaign's largest, spanning many
+  sessions, explicitly chosen by the user over two narrower alternatives
+  (a flat-columns-only reader leaving nested types and Arrow IPC/Feather
+  on the `arrow`/`parquet` crates, or stopping the campaign here and
+  keeping both crates outright) specifically because of its size:
+  `arrow`+`parquet` together were the largest dependency in this project
+  by a wide margin, and - uniquely among everything hand-rolled so far -
+  Parquet's own footer metadata is encoded with Thrift's compact
+  protocol, a real general-purpose serialization framework, not a single
+  bespoke binary layout the way every other format here has been. Arrow
+  IPC/Feather added a *second*, entirely separate general-purpose
+  framework (FlatBuffers) on top. See the "Cutover" entry at the end of
+  this pair's own writeup (after the Arrow IPC half below) for how both
+  readers actually replaced the crate-based ones in the live CLI, and
+  how `arrow`/`parquet` themselves ended up moving to
+  `[dev-dependencies]`, matching every other crate in this document's
+  history. What follows is kept as the original running log of each
+  phase, in the order it actually happened, rather than rewritten after
+  the fact into a single finished-feeling narrative - that history is
+  worth keeping precisely because of how large and multi-session this
+  hand-roll was.
 
   **Phase A (this session): the Thrift compact protocol's read side, and
   Parquet's footer schema.** `parquet` itself hand-rolls its own minimal
@@ -5178,8 +5185,8 @@ this project could just implement directly rather than depend on:
   `RunEndEncoded`/`Interval`/`Duration`/`*View` audit before `arrow`/
   `parquet` can move to `[dev-dependencies]` in one deliberate step.
 
-- **`arrow`/`parquet` (Arrow IPC/Feather half) → a hand-rolled reader, in
-  progress (`arrow_ipc_support`).** The last remaining piece of this
+- **`arrow`/`parquet` (Arrow IPC/Feather half) → a hand-rolled reader
+  (`arrow_ipc_support`).** The last remaining piece of this
   campaign's original arrow/parquet roadmap: Arrow IPC needs a *second*,
   entirely independent general-purpose serialization framework -
   FlatBuffers - as its own foundation, the same way Parquet needed
@@ -5672,32 +5679,176 @@ this project could just implement directly rather than depend on:
   hand/`pyarrow`-verified expectation instead, for the two disclosed
   reasons above).
 
+  **The cutover (a later session): wiring both readers into the live CLI,
+  and moving `arrow`/`parquet` to `[dev-dependencies]`.** With every
+  behavior this project documents for Parquet/Arrow IPC matched and
+  verified across dozens of fixtures and several real-corpus sweeps
+  (the one exception being LZO - see below), `columns_from_parquet`/
+  `columns_from_arrow_ipc` were switched over in one deliberate step, the
+  same policy every earlier phase in this section already promised: both
+  functions now call straight into `parquet_support::profile_parquet_file`/
+  `arrow_ipc_support::profile_arrow_ipc_file`, and the old crate-based
+  implementation (`arrow_type_label`, `is_nested_arrow_type`,
+  `arrow_batch_to_json_rows`, `profile_arrow_batches`) was deleted
+  outright rather than kept dormant alongside the new path.
+
+  **The architecture turned out simpler than the old crate-based reader's
+  own two-path split** (a fast scalar path via `array_value_to_string`,
+  a slower JSON-bridge path via Arrow's own JSON writer for nested
+  columns only). Both hand-rolled readers already reconstruct *every*
+  top-level field - flat or nested - through the identical recursive
+  engine (`decode_row_group_nested` for Parquet, `read_arrow_ipc_file_rows`
+  for Arrow IPC), proven correct for flat fields too by
+  `nested_types.parquet`'s own mix of a flat `user_id` alongside a
+  struct/list/map back when nested reconstruction was first built - so
+  there was no need to keep a second, separate fast path around at all.
+  `profile_parquet_file`/`profile_arrow_ipc_file` each do exactly one new
+  thing per top-level field: decide whether it needs `profile_column`
+  (a flat scalar, with `current_type` from a new label function -
+  `parquet_leaf_type_label`/`arrow_ipc_type_label` - mirroring
+  `arrow_type_label`'s old vocabulary) or `profile_json_path` (anything
+  nested, which - now that every type this project supports actually
+  decodes - includes `RunEndEncoded`/`Union` whenever their own child
+  type happens to be nested too, not just `List`/`Struct`/`Map`
+  outright). Parquet decides this statically from the schema tree itself
+  (`SchemaNode::Primitive` that isn't `Repeated` - a repeated
+  *primitive* with no wrapping group, `repeated_no_annotation.parquet`'s
+  own real shape, is still a list from this reader's perspective even
+  though its `SchemaNode` variant is the same one a genuinely flat
+  column uses); Arrow IPC needs a small recursive check instead
+  (`arrow_data_type_is_nested`), since a `Union`/`RunEndEncoded` can
+  legally wrap an already-nested type in a way Parquet's own schema tree
+  never allows a bare primitive to. Both label functions give Time/
+  Duration/Interval/Union/RunEndEncoded their own clean names
+  (`"Time"`/`"Duration"`/`"Interval"`/`"Union"`/`"RunEndEncoded"`)
+  instead of perpetuating `arrow_type_label`'s old Debug-formatted
+  fallback for exactly these types - that fallback was never a
+  deliberate, documented design to begin with, just an acknowledged wart
+  from before this reader could decode them, so cutting over was the
+  right moment to give them a real label rather than carry the wart
+  forward unchanged.
+
+  **One real, deliberate, disclosed behavior change survived the
+  cutover, caught immediately by the existing test suite rather than
+  found later**: a Parquet Map column now always reconstructs as an
+  array of `{"key", "value"}` pairs (this reader's own design choice
+  from the nested-reconstruction phase, made specifically so a non-UTF8
+  map key - illegal for a native JSON object key - has somewhere to go)
+  rather than the old crate-based reader's native keyed JSON object via
+  Arrow's own JSON writer. `current_type` for such a column is now
+  `"Vec<object>"`, flattening into fixed `.key`/`.value` sub-columns,
+  instead of the old `"object"` current_type flattening into one
+  sub-column *per distinct map key*. This is a real trade-off, not free:
+  the old shape was more immediately readable for the common case (a
+  low-cardinality, string-keyed map, where one sub-column per key is
+  genuinely informative at a glance), while the new shape is less
+  immediately readable but handles every map correctly regardless of key
+  type - a Map with non-UTF8 keys (`edge_map_non_string_key.parquet`,
+  the exact shape that used to force the old reader's own per-column
+  isolation fallback, `current_type: "Map"` plus a disclosed "could not
+  be converted" note) now profiles completely normally, both its key and
+  value columns fully typed. `parquet_map_and_dictionary_columns_are_handled`
+  and `parquet_map_with_non_string_keys_is_profiled_normally` (renamed
+  from `..._does_not_sink_the_rest_of_the_file`, since there's no longer
+  anything for it to sink) lock the new, better behavior in.
+
+  **No equivalent to the old reader's per-column failure isolation was
+  built for either hand-rolled reader**, a real, disclosed narrowing
+  accepted deliberately rather than chased: the old isolation trick
+  (retry each nested column's JSON conversion independently so one
+  Arrow-JSON-writer limitation didn't cost every other column) doesn't
+  have a natural equivalent here, since both readers decode every leaf
+  of a row group through one shared cursor map built up front - a single
+  unsupported leaf (chiefly, Parquet's own disclosed LZO gap) now fails
+  the whole row group rather than degrading just its own column. This is
+  the same category of accepted, disclosed narrowing as LZO's own
+  "no fixture, no trust" boundary already documented above, not a new
+  kind of gap - a real file that happens to use LZO is already outside
+  what this project promises to read correctly, this just changes *how*
+  that shows up (a clean file-level error instead of one disclosed
+  placeholder column).
+
+  **Verified two ways before the cutover was trusted**: the full existing
+  test suite (`cargo test --features full` - every fixture, every
+  documented Parquet/Arrow IPC behavior from every phase above) passed
+  against the new code path with only the two intentional Map-related
+  assertion updates above, no other changes needed anywhere in either
+  reader; and a fresh real-world corpus sweep against the same 79-file
+  `apache/parquet-testing` corpus this campaign has swept repeatedly
+  (crash-safety only this time, not oracle value-matching, since
+  `decode_row_group_nested`'s own correctness was already exhaustively
+  proven against this exact corpus in the nested-reconstruction phase
+  above) - 77 of 79 files read successfully, the remaining 2 failing
+  with the same two long-documented, pre-existing limitations
+  (`alp_extended.zstd.parquet`'s unrecognized experimental encoding,
+  `dict-page-offset-zero.parquet`'s own page-header gap) rather than
+  anything new, and zero panics throughout.
+
+  **`arrow`/`parquet` moved to `[dev-dependencies]`** in the same commit,
+  the same "kept only as this project's own cross-verification oracle"
+  treatment every other replaced crate in this document's history
+  already got - confirmed structurally, not just assumed, via `cargo
+  tree --features full -e normal` (empty - neither crate appears in the
+  shipped build's dependency graph at all) versus `cargo tree --features
+  full -e normal,dev` (both present). Removing the module-level
+  `#[allow(dead_code)]` from `parquet_support`/`arrow_ipc_support` that
+  had covered their dormant period surfaced a real, if unglamorous, tail
+  of genuinely-unused code that lint alone had been masking: three
+  functions (`decode_column_chunk`/`interleave_present_values_with_nulls`
+  - the original flat-schema-only fast path, superseded by nested
+  reconstruction handling flat fields too, but kept `#[cfg(test)]` since
+  it's still a real, independent second implementation
+  `decode_column_chunk_matches_the_record_api` cross-checks against; and
+  `read_arrow_ipc_stream_rows`, kept `#[cfg(test)]` for the same reason
+  as always - this project's CLI never reads a raw Arrow stream file,
+  only the File format) and roughly a dozen individual struct/enum-
+  variant fields parsed for full fidelity to the real Thrift/FlatBuffers
+  schema but never actually consumed downstream (`FileMetaData.num_rows`,
+  deliberately unused since it's the exact field already documented
+  above as unreliable in real files; `ArrowDataType::Timestamp.timezone`,
+  unused because this reader's own Timestamp rendering is always a
+  naive, no-offset string; and several more of the same "parsed for
+  completeness, not currently needed" shape) - each given a narrow,
+  specific `#[allow(dead_code)]` with its own explanation, rather than
+  reintroducing a blanket module-level suppression that would hide any
+  *future* genuinely-dead code the same way the dormant-era attribute
+  had been hiding this backlog.
+
+  One disclosed cost of the move worth stating plainly, since it's
+  larger than any other crate this project has ever retired to dev-only
+  status: Cargo has no notion of an *optional* dev-dependency, so
+  `cargo test` now always compiles `arrow`+`parquet` regardless of which
+  `--features` are passed - a real addition to clean test-build time
+  given their own documented ~7-9 minute cold-cache weight, unlike every
+  lighter oracle crate this project has already accepted the identical
+  trade-off for. `cargo build`/`cargo build --release` (the shipped
+  binary, for any feature selection) are completely unaffected either
+  way, which is the property that actually matters for this project's
+  own stated dependency-weight concerns.
+
   **Still deliberately not started**: LZO, the one Parquet compression
   codec still not hand-rolled anywhere in this project (moot for Arrow
   IPC specifically either way, since its own `BodyCompression` union
   only ever offers `LZ4_FRAME`/`ZSTD` - there's no LZO or Brotli codec
-  value to ever add on this side regardless); and wiring either
-  `parquet_support` or `arrow_ipc_support` into `columns_from_parquet`/
-  `columns_from_arrow_ipc`. Both modules remain real but dormant
-  (`#[allow(dead_code)]`, exercised only by their own tests) and
-  `arrow`/`parquet` remain live runtime dependencies until every
-  behavior this project currently documents and tests for Parquet/Arrow
-  IPC is matched, verified, and cut over in one deliberate step - not
-  incrementally swapped out from under a working build.
+  value to ever add on this side regardless) - the sole remaining,
+  permanently disclosed gap in this entire multi-session hand-roll,
+  matching the same "no fixture, no trust" bar this project already
+  holds every other narrow scope boundary to.
 
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
-just above (in progress, not declined), `serde`/`serde_json` are meant to
-stay a dependency permanently. They're also the one that's always been
-more central than any of the others in this list: `serde_json::Value` is the
-literal bridge type seven different format readers (JSON, YAML, TOML,
-Avro, MessagePack, CBOR, XML) recurse through via `profile_json_path` -
-replacing it means writing and re-verifying a whole JSON value type,
-parser, and serializer, not swapping one call site at a time or
-hand-rolling a narrower, self-contained parser the way `csv`, `chrono`,
-`.xlsx`, `.ods`, `.xls`, `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`,
-`zstd`, `npyz`, `rmpv`, `toml`, `ciborium`, `regex`, `dbase`, `dta`,
-`apache-avro`, `rusqlite`, and now `sas7bdat` all still were, however
-real their own risk.
+just above - now fully cut over, the largest entry in this whole list -
+`serde`/`serde_json` are meant to stay a dependency permanently. They're
+also the one that's always been more central than any of the others in
+this list: `serde_json::Value` is the literal bridge type seven different
+format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML) recurse
+through via `profile_json_path` - replacing it means writing and
+re-verifying a whole JSON value type, parser, and serializer, not
+swapping one call site at a time or hand-rolling a narrower, self-
+contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`, `.xls`,
+`.xlsb`, `serde_norway`, `rust-ini`, `xmltree`, `zstd`, `npyz`, `rmpv`,
+`toml`, `ciborium`, `regex`, `dbase`, `dta`, `apache-avro`, `rusqlite`,
+`sas7bdat`, and now `arrow`/`parquet` all still were, however real their
+own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/
@@ -5719,23 +5870,27 @@ pulled in unless that specific `--features` flag is passed).
   `libduckdb-sys` also carries an HTTP+TLS client (`ureq`, `rustls`, ...)
   plus `tar`/`zip`/`xattr` as *unconditional* build-dependencies purely to
   support a download fallback the bundled path never uses, and `duckdb`
-  itself pulls in a second, different version of `arrow` as a plain runtime
-  dependency alongside the one this project already depends on for
-  Parquet/Arrow IPC - not deduped, just duplicated. ~40 extra crates and a
-  duplicate Arrow stack for one format was judged not worth it here; would
-  reconsider if the crate trims that footprint, or if there's a concrete
-  need for `.duckdb` files.
+  itself would pull in a full `arrow` stack as a plain runtime dependency
+  of its own - a real cost regardless of the fact that this project's own
+  `arrow`/`parquet` moved to `[dev-dependencies]` once Parquet/Arrow IPC
+  got their own hand-rolled readers (see the Dependency footprint section)
+  - there'd be nothing left in this project's own shipped build for
+  `duckdb`'s copy to dedupe against any more, making it a clean net
+  addition rather than a shared cost. ~40 extra crates plus a full Arrow
+  stack for one format was judged not worth it here; would reconsider if
+  the crate trims that footprint, or if there's a concrete need for
+  `.duckdb` files.
 - **No SPSS (`.sav`/`.zsav`).** Considered alongside Stata and SAS7BDAT,
-  and declined for the same duplicate-dependency reason as DuckDB, just at
+  and declined for the same dependency-weight reason as DuckDB, just at
   smaller scale. `ambers` is the only pure-Rust SPSS reader on crates.io,
   and its `Cargo.toml` depends on `arrow` v57 *unconditionally* - no
-  feature flag disables it - alongside the `arrow` v59.2 this project
-  already depends on for Parquet/Arrow IPC; not deduped, just duplicated
-  (~10-13 extra crates, though unlike DuckDB there's no HTTP client or
-  other unrelated baggage riding along). The only other option,
-  `polars-readstat-rs`, pulls in all of Polars instead, which is heavier
-  still. Would reconsider if `ambers` makes `arrow` optional, or if
-  there's a concrete need for `.sav` files.
+  feature flag disables it - which would be a real ~10-13-crate addition
+  to the shipped build today (though unlike DuckDB there's no HTTP client
+  or other unrelated baggage riding along), for the same "nothing left to
+  dedupe against" reason DuckDB's own entry above now states explicitly.
+  The only other option, `polars-readstat-rs`, pulls in all of Polars
+  instead, which is heavier still. Would reconsider if `ambers` makes
+  `arrow` optional, or if there's a concrete need for `.sav` files.
 - **Stata/SAS7BDAT variable/value labels aren't surfaced.** A `.dta` or
   `.sas7bdat` file can carry a human-authored description per variable (a
   "variable label") and, for Stata, a named mapping for coded values (a

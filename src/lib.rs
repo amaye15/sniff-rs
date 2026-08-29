@@ -6455,224 +6455,11 @@ fn columns_from_json(
 }
 
 // --- Parquet + Arrow IPC/Feather readers (opt-in via --features parquet) ---
-// Both are Arrow-ecosystem formats that decode to the same RecordBatch type,
-// so they share one batch-profiling function and differ only in how the
-// reader is opened.
-
-#[cfg(feature = "parquet")]
-fn arrow_type_label(dt: &arrow::datatypes::DataType) -> String {
-    use arrow::datatypes::DataType;
-    match dt {
-        DataType::Boolean => "bool".to_string(),
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64 => "i64".to_string(),
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => "f64".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "String".to_string(),
-        DataType::Date32 | DataType::Date64 => "Date".to_string(),
-        DataType::Timestamp(..) => "Timestamp".to_string(),
-        DataType::Decimal128(..) | DataType::Decimal256(..) => "Decimal".to_string(),
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) => {
-            "List".to_string()
-        }
-        DataType::Struct(_) => "Struct".to_string(),
-        DataType::Map(..) => "Map".to_string(),
-        // Dictionary encoding is a storage detail (a compact index into a
-        // value dictionary, typically for low-cardinality strings) - it
-        // hasn't lost or changed the logical type, so report the value
-        // type underneath rather than the encoding wrapping it.
-        DataType::Dictionary(_, value_type) => arrow_type_label(value_type),
-        other => format!("{other:?}"),
-    }
-}
-
-#[cfg(feature = "parquet")]
-fn is_nested_arrow_type(dt: &arrow::datatypes::DataType) -> bool {
-    use arrow::datatypes::DataType;
-    matches!(
-        dt,
-        DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(..)
-            | DataType::Struct(_)
-            | DataType::Map(..)
-    )
-}
-
-/// Profiles any stream of Arrow RecordBatches sharing one schema. Scalar
-/// columns are stringified directly (fast path); columns whose type is
-/// Struct/List get bridged to serde_json::Value via Arrow's own JSON writer
-/// and handed to the same recursive flattener used for JSON/Avro files, so
-/// nesting gets identical treatment regardless of source format.
-#[cfg(feature = "parquet")]
-/// Converts one batch's nested columns to per-row JSON via Arrow's own
-/// JSON writer. Tries the whole batch in one call first (the common, fast
-/// path); if that fails - a real, encountered case being a Map column
-/// with non-UTF8 keys, which the writer refuses outright regardless of
-/// what every other column in the file looks like - falls back to
-/// converting each nested column separately, so one column's conversion
-/// failure doesn't lose every other (perfectly convertible) column in the
-/// same file. A column that still fails even in isolation gets its error
-/// recorded in `col_errors` rather than silently losing the column or
-/// failing the whole read.
-fn arrow_batch_to_json_rows(
-    batch: &arrow::record_batch::RecordBatch,
-    schema: &arrow::datatypes::Schema,
-    nested: &[bool],
-    path: &Path,
-    col_errors: &mut [Option<String>],
-) -> Result<Vec<serde_json::Map<String, JsonValue>>> {
-    let mut writer = arrow::json::writer::ArrayWriter::new(Vec::new());
-    if writer.write(batch).and_then(|()| writer.finish()).is_ok() {
-        let buf = writer.into_inner();
-        return serde_json::from_slice(&buf)
-            .with_context(|| format!("failed parsing converted JSON for a batch in {path:?}"));
-    }
-
-    let mut rows: Vec<serde_json::Map<String, JsonValue>> =
-        vec![serde_json::Map::new(); batch.num_rows()];
-    for (col_idx, &is_nested) in nested.iter().enumerate() {
-        if !is_nested {
-            continue;
-        }
-        let field = schema.field(col_idx);
-        let single_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![field.clone()]));
-        let single_batch = arrow::record_batch::RecordBatch::try_new(
-            single_schema,
-            vec![batch.column(col_idx).clone()],
-        )
-        .with_context(|| format!("failed projecting column {col_idx} in {path:?}"))?;
-
-        let mut col_writer = arrow::json::writer::ArrayWriter::new(Vec::new());
-        match col_writer
-            .write(&single_batch)
-            .and_then(|()| col_writer.finish())
-        {
-            Ok(()) => {
-                let buf = col_writer.into_inner();
-                let col_rows: Vec<serde_json::Map<String, JsonValue>> =
-                    serde_json::from_slice(&buf).with_context(|| {
-                        format!("failed parsing converted JSON for a column in {path:?}")
-                    })?;
-                for (row, m) in rows.iter_mut().zip(col_rows) {
-                    if let Some(v) = m.get(field.name()) {
-                        row.insert(field.name().clone(), v.clone());
-                    }
-                }
-            }
-            Err(e) => col_errors[col_idx] = Some(e.to_string()),
-        }
-    }
-    Ok(rows)
-}
-
-#[cfg(feature = "parquet")]
-fn profile_arrow_batches(
-    path: &Path,
-    schema: &arrow::datatypes::Schema,
-    reader: impl Iterator<
-        Item = std::result::Result<arrow::record_batch::RecordBatch, arrow::error::ArrowError>,
-    >,
-    nrows: Option<usize>,
-    n_samples: usize,
-) -> Result<Vec<ColumnProfile>> {
-    use arrow::util::display::array_value_to_string;
-
-    let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-    let nested: Vec<bool> = schema
-        .fields()
-        .iter()
-        .map(|f| is_nested_arrow_type(f.data_type()))
-        .collect();
-    let type_labels: Vec<String> = schema
-        .fields()
-        .iter()
-        .map(|f| arrow_type_label(f.data_type()))
-        .collect();
-    let any_nested = nested.iter().any(|&n| n);
-
-    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
-    let mut nested_values: Vec<Vec<JsonValue>> = vec![Vec::new(); names.len()];
-    let mut col_errors: Vec<Option<String>> = vec![None; names.len()];
-    let mut rows_read = 0usize;
-
-    'batches: for batch_result in reader {
-        let batch =
-            batch_result.with_context(|| format!("failed reading a batch from {path:?}"))?;
-
-        let json_rows: Vec<serde_json::Map<String, JsonValue>> = if any_nested {
-            arrow_batch_to_json_rows(&batch, schema, &nested, path, &mut col_errors)?
-        } else {
-            Vec::new()
-        };
-
-        for row in 0..batch.num_rows() {
-            if nrows.is_some_and(|limit| rows_read >= limit) {
-                break 'batches;
-            }
-            for (col_idx, array) in batch.columns().iter().enumerate() {
-                if nested[col_idx] {
-                    let found = json_rows
-                        .get(row)
-                        .and_then(|m| m.get(&names[col_idx]))
-                        .filter(|v| !v.is_null());
-                    if let Some(v) = found {
-                        nested_values[col_idx].push(v.clone());
-                    }
-                } else {
-                    let value = if array.is_null(row) {
-                        None
-                    } else {
-                        Some(array_value_to_string(array, row).unwrap_or_default())
-                    };
-                    raw[col_idx].push(value);
-                }
-            }
-            rows_read += 1;
-        }
-    }
-
-    let mut out = Vec::new();
-    for (i, name) in names.into_iter().enumerate() {
-        if nested[i] {
-            if let Some(err) = &col_errors[i] {
-                // This column's nested content couldn't be converted to
-                // JSON even in isolation (e.g. a Map column with non-UTF8
-                // keys - a real Arrow JSON writer limitation, not
-                // something this project's own code decides) - disclosed
-                // rather than silently dropped or failing the whole file.
-                out.push(ColumnProfile {
-                    name,
-                    current_type: type_labels[i].clone(),
-                    ideal_type: "String".to_string(),
-                    description: String::new(),
-                    missing_pct: 0.0,
-                    sample_values: Vec::new(),
-                    notes: format!("nested content could not be converted for typing: {err}"),
-                });
-            } else {
-                let values: Vec<&JsonValue> = nested_values[i].iter().collect();
-                out.extend(profile_json_path(name, rows_read, values, n_samples));
-            }
-        } else {
-            let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
-            let col = ColumnInput {
-                name,
-                current_type: type_labels[i].clone(),
-                raw_values: non_null,
-                total: raw[i].len(),
-                skip_heuristics: false,
-            };
-            out.push(profile_column(col, n_samples));
-        }
-    }
-    Ok(out)
-}
+// Both are hand-rolled (parquet_support/arrow_ipc_support, further down in
+// this file) rather than reading through the arrow/parquet crates directly -
+// see CLAUDE.md's Dependency footprint section for the full writeup of why
+// and how each was verified. `arrow`/`parquet` remain dependencies only for
+// the two modules' own cross-verification oracle tests.
 
 #[cfg(feature = "parquet")]
 fn columns_from_parquet(
@@ -6680,17 +6467,7 @@ fn columns_from_parquet(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use std::fs::File;
-
-    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .with_context(|| format!("failed to read parquet metadata from {path:?}"))?;
-    let schema = builder.schema().clone();
-    let reader = builder
-        .build()
-        .with_context(|| format!("failed to build a reader for {path:?}"))?;
-    profile_arrow_batches(path, &schema, reader, nrows, n_samples)
+    parquet_support::profile_parquet_file(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "parquet"))]
@@ -6710,14 +6487,7 @@ fn columns_from_arrow_ipc(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    use arrow::ipc::reader::FileReader;
-    use std::fs::File;
-
-    let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let reader = FileReader::try_new(file, None)
-        .with_context(|| format!("failed to read Arrow IPC/Feather file {path:?}"))?;
-    let schema = reader.schema();
-    profile_arrow_batches(path, schema.as_ref(), reader, nrows, n_samples)
+    arrow_ipc_support::profile_arrow_ipc_file(path, nrows, n_samples)
 }
 
 #[cfg(not(feature = "parquet"))]
@@ -22204,7 +21974,6 @@ mod brotli_support {
 // project already holds itself to - there is no independent Parquet
 // specification document that isn't itself just prose describing what
 // that crate (the reference implementation) already does.
-#[allow(dead_code)]
 #[cfg(feature = "parquet")]
 mod parquet_support {
     use super::*;
@@ -22362,6 +22131,12 @@ mod parquet_support {
             Ok(self.read_byte()? as i8)
         }
 
+        // Kept for symmetry with `ThriftReader`'s other primitive readers
+        // even though nothing currently calls it - no Parquet metadata
+        // struct this reader decodes has a raw Thrift `double` field
+        // (DOUBLE-typed *column data* is PLAIN-encoded page bytes, not a
+        // Thrift field).
+        #[allow(dead_code)]
         fn read_double(&mut self) -> Result<f64> {
             let b = self.read_bytes(8)?;
             Ok(f64::from_le_bytes(b.try_into().unwrap()))
@@ -22613,6 +22388,22 @@ mod parquet_support {
         Nanos,
     }
 
+    // Several fields here are parsed for full fidelity to the real
+    // Thrift `LogicalType` union but never actually consumed downstream:
+    // `Decimal.precision` (converting a decimal's raw bytes to a string
+    // only needs `scale`, to know where the decimal point goes -
+    // `precision` would only matter for *validating* a value fits within
+    // a declared max digit count, which this reader doesn't do, the same
+    // "don't validate what isn't needed" boundary drawn throughout this
+    // project); both `Time`/`Timestamp`'s `is_adjusted_to_utc` (would
+    // only matter for resolving a *local*, non-UTC timestamp to an
+    // absolute instant, which this reader's own always-naive rendering
+    // doesn't attempt); and `Integer.bit_width`/`is_signed` (would only
+    // matter for narrowing `current_type` below `i64` - e.g. reporting a
+    // genuine `u8` column - which, like every other format in this
+    // project, is left to `ideal_type`'s own independent re-derivation
+    // from the actual values instead).
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) enum LogicalType {
         String,
@@ -22942,6 +22733,18 @@ mod parquet_support {
         }
     }
 
+    // `type_` (read only by the oracle-comparison test, not the live
+    // decode path - each page's own physical type comes from
+    // `ColumnDescriptor` instead) and `encodings`/`total_uncompressed_size`/
+    // `total_compressed_size` (parsed for full fidelity to the real
+    // Thrift struct, but this reader derives everything it needs -
+    // codec, page boundaries, decompressed sizes - from each page's own
+    // header instead of these column-chunk-level summaries) are never
+    // read at all. Kept as real fields rather than skipped at parse
+    // time, matching the field-skip machinery's own "unknown fields are
+    // safe to ignore" contract without needing to special-case which
+    // known fields are also currently unused.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) struct ColumnMetaData {
         pub(crate) type_: PhysicalType,
@@ -23012,6 +22815,12 @@ mod parquet_support {
         })
     }
 
+    // `file_path` names a genuinely rare, legacy Parquet feature (column
+    // data stored in a file separate from its own metadata) this reader
+    // never needs to act on - every column chunk it reads always lives
+    // in the same file its footer came from, so the field is parsed for
+    // completeness and never consulted.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) struct ColumnChunk {
         pub(crate) file_path: Option<String>,
@@ -23068,6 +22877,15 @@ mod parquet_support {
         })
     }
 
+    // `num_rows` (the file-level total) is deliberately never read by
+    // this reader's own decode path - it's the exact field documented
+    // elsewhere in this project as unreliable in real files (a stale `0`
+    // that disagrees with the real row-group-level total on at least one
+    // real corpus file), so every row count this reader actually uses
+    // comes from each `RowGroup`'s own `num_rows` instead. `created_by`
+    // is purely informational (which tool wrote the file) and never
+    // affects decoding.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) struct FileMetaData {
         pub(crate) schema: Vec<SchemaElement>,
@@ -23300,7 +23118,11 @@ mod parquet_support {
     /// decode its definition/repetition level streams - verified against
     /// the reference crate's own `build_tree`: `OPTIONAL` bumps the max
     /// definition level, `REPEATED` bumps both max definition *and* max
-    /// repetition level.
+    /// repetition level. `precision` is carried alongside `scale` for
+    /// full fidelity to `SchemaElement`'s own fields, but genuinely never
+    /// read - see `LogicalType`'s own doc comment for why converting a
+    /// decimal's bytes to a string only ever needs `scale`.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) struct ColumnDescriptor {
         pub(crate) path: Vec<String>,
@@ -23402,6 +23224,14 @@ mod parquet_support {
         }
     }
 
+    // `definition_level_encoding`/`repetition_level_encoding` are parsed
+    // but never checked - a Data Page V1's level streams are always the
+    // RLE/bit-packing hybrid encoding in every real file this reader has
+    // ever needed to read (confirmed against the reference crate's own
+    // decoder, which applies the same encoding unconditionally too), so
+    // this reader does the same rather than branching on a declared
+    // value that's never actually anything else in practice.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) struct DataPageHeaderV1 {
         pub(crate) num_values: i32,
@@ -23437,6 +23267,14 @@ mod parquet_support {
         })
     }
 
+    // `num_nulls`/`num_rows` are parsed but never read - this reader
+    // already gets the exact byte length of each level stream directly
+    // (`definition_levels_byte_length`/`repetition_levels_byte_length`,
+    // V2's whole reason for carrying explicit lengths instead of V1's
+    // own length-prefix-in-the-stream convention) and derives its own
+    // null count straight from the decoded definition levels, so neither
+    // summary field is ever needed.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) struct DataPageHeaderV2 {
         pub(crate) num_values: i32,
@@ -23484,6 +23322,12 @@ mod parquet_support {
         })
     }
 
+    // `encoding` is parsed but never checked - a dictionary page's own
+    // values are always decoded via plain, direct decoding regardless of
+    // what this field declares (the only two values Parquet's own spec
+    // ever allows here, `PLAIN` and the deprecated `PLAIN_DICTIONARY`,
+    // decode identically), so there's no real branch to make on it.
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     pub(crate) struct DictionaryPageHeader {
         pub(crate) num_values: i32,
@@ -24712,7 +24556,9 @@ mod parquet_support {
     /// interleaving step both Data Page V1 and V2 reduce to once their
     /// own, format-specific level/value decoding is done. Stops early
     /// once `values` reaches `want`, matching `decode_column_chunk`'s own
-    /// `max_values` early-exit contract.
+    /// `max_values` early-exit contract. `#[cfg(test)]` for the same
+    /// reason `decode_column_chunk` itself is - its only caller.
+    #[cfg(test)]
     fn interleave_present_values_with_nulls(
         def_levels: &[u64],
         max_def: i64,
@@ -24745,7 +24591,18 @@ mod parquet_support {
     /// with the chunk's own codec, decoding definition levels to find
     /// null positions, and decoding PLAIN or RLE_DICTIONARY-encoded
     /// values - rendered immediately to the same `Vec<Option<String>>`
-    /// shape every other reader in this project already produces.
+    /// shape every other reader in this project already produces. This
+    /// was the live flat-schema decode path through Phases B-E; once
+    /// nested reconstruction (`decode_row_group_nested`) proved itself
+    /// correct on flat schemas too - the same recursive engine now
+    /// handles both shapes uniformly, see `profile_parquet_file` - this
+    /// function's only remaining job is standing as a second, completely
+    /// independent implementation to keep checking `decode_column_chunk_
+    /// triples` against, the same role every other superseded-but-kept
+    /// hand-roll in this project's own dependency-footprint history
+    /// plays for its own replaced crate. `#[cfg(test)]` accordingly - it
+    /// has no caller outside `decode_column_chunk_matches_the_record_api`.
+    #[cfg(test)]
     pub(crate) fn decode_column_chunk(
         file_data: &[u8],
         chunk: &ColumnMetaData,
@@ -25727,6 +25584,197 @@ mod parquet_support {
             rows.push(JsonValue::Object(fields));
         }
         Ok(rows)
+    }
+
+    /// Maps a flat leaf column's own declared type to this project's
+    /// shared `current_type` vocabulary (`"bool"`/`"i64"`/`"f64"`/
+    /// `"String"`/`"Date"`/`"Time"`/`"Timestamp"`/`"Decimal"`), the
+    /// counterpart `arrow_type_label` played for the now-dormant Arrow-
+    /// crate-based reader - built fresh here rather than reused, since
+    /// that function is keyed on `arrow::datatypes::DataType`, a type
+    /// this reader's own `SchemaNode`/`ColumnDescriptor` never touches.
+    /// Branch order and conditions mirror `render_value_bytes`/
+    /// `render_value_json`'s own dispatch exactly (DECIMAL and INT96
+    /// checked unconditionally first, then LogicalType, then the older
+    /// ConvertedType annotations, then UTF8), so a column's *label* here
+    /// always agrees with how its *values* actually get rendered -
+    /// deliberately not reused as one shared function, since a label is
+    /// a per-column constant while rendering happens per value, and the
+    /// two dispatches diverge in exactly one place (Float16, which
+    /// renders as a JSON string for nested-value fidelity but is still
+    /// labeled `"f64"` here, matching `arrow_type_label`'s own treatment
+    /// of `DataType::Float16` - the label reflects what the value *is*,
+    /// not how this reader chose to encode it as JSON).
+    fn parquet_leaf_type_label(descriptor: &ColumnDescriptor) -> String {
+        if is_decimal(descriptor).is_some() {
+            return "Decimal".to_string();
+        }
+        if descriptor.physical_type == PhysicalType::Int96 {
+            return "Timestamp".to_string();
+        }
+        match descriptor.logical_type {
+            Some(LogicalType::Date) => return "Date".to_string(),
+            Some(LogicalType::Time { .. }) => return "Time".to_string(),
+            Some(LogicalType::Timestamp { .. }) => return "Timestamp".to_string(),
+            Some(LogicalType::Float16) => return "f64".to_string(),
+            _ => {}
+        }
+        match descriptor.converted_type {
+            Some(ConvertedType::Date) => return "Date".to_string(),
+            Some(ConvertedType::TimeMillis | ConvertedType::TimeMicros) => {
+                return "Time".to_string();
+            }
+            Some(ConvertedType::TimestampMillis | ConvertedType::TimestampMicros) => {
+                return "Timestamp".to_string();
+            }
+            _ => {}
+        }
+        if is_utf8(descriptor) {
+            return "String".to_string();
+        }
+        match descriptor.physical_type {
+            PhysicalType::Boolean => "bool".to_string(),
+            PhysicalType::Int32 | PhysicalType::Int64 => "i64".to_string(),
+            PhysicalType::Float | PhysicalType::Double => "f64".to_string(),
+            // INT96 is handled unconditionally above; ByteArray/
+            // FixedLenByteArray with no UTF8/DECIMAL/Float16 annotation
+            // renders as a hex dump (`render_value_bytes`'s own
+            // un-annotated-binary fallback) - "String" is what the value
+            // actually looks like once rendered, the same reasoning
+            // `arrow_type_label` doesn't get a chance to apply (it has
+            // no equivalent case at all, falling through to a raw Debug
+            // label for Arrow's own `Binary`/`FixedSizeBinary` today).
+            PhysicalType::Int96 | PhysicalType::ByteArray | PhysicalType::FixedLenByteArray => {
+                "String".to_string()
+            }
+        }
+    }
+
+    /// Converts one already-decoded flat scalar value back to the plain
+    /// string `profile_column`'s shared `suggest_ideal_type` heuristic
+    /// engine expects - the counterpart to `array_value_to_string` for
+    /// the now-dormant Arrow-crate-based reader. Never called on a
+    /// `Null` (every caller filters nulls out first, the same contract
+    /// `profile_json_path`'s own callers already honor) or on an
+    /// `Object`/`Array` (a flat leaf's `render_value_json` never
+    /// produces one). `pub(crate)` since `arrow_ipc_support` reuses it
+    /// unchanged for its own identical need, the same "shared, not
+    /// duplicated" treatment already given to `f16_bytes_to_f64`/
+    /// `lz4_block_decompress_core` - unlike Avro/CBOR's own duplicated
+    /// helpers, `parquet`/`arrow_ipc` aren't independently togglable
+    /// features (both live behind the one `parquet` feature flag), so
+    /// there's no build-configuration reason to keep two copies.
+    pub(crate) fn json_scalar_to_raw_string(v: &JsonValue) -> String {
+        match v {
+            JsonValue::String(s) => s.clone(),
+            JsonValue::Number(n) => n.to_string(),
+            JsonValue::Bool(b) => b.to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// This reader's own top-level entry point - the hand-rolled
+    /// counterpart to `profile_arrow_batches` for the (now-dormant)
+    /// Arrow-crate-based reader, but simpler: every top-level field,
+    /// flat or nested, decodes through the exact same `decode_row_group
+    /// _nested` reconstruction (verified correct for both shapes
+    /// already, via `nested_types.parquet`'s own mix of a flat `user_id`
+    /// alongside a struct/list/map), so there's no separate fast path to
+    /// keep in sync with the general one. A top-level field is "flat"
+    /// exactly when its own `SchemaNode` is a `Primitive` that isn't
+    /// itself `Repeated` - a repeated *primitive* with no wrapping group
+    /// (a real, legal shape - `repeated_no_annotation.parquet`, already
+    /// a committed fixture from the nested-reconstruction phase) is
+    /// still a list from this reader's own recursive-typing perspective,
+    /// not a scalar column, even though its `SchemaNode` variant is the
+    /// same `Primitive` a genuinely flat column uses.
+    ///
+    /// Deliberately no per-column failure isolation the way the old
+    /// Arrow-crate-based `arrow_batch_to_json_rows` had for a nested
+    /// column's JSON-writer conversion: every leaf here decodes through
+    /// one shared `leaves` map built once per row group, so a single
+    /// unsupported leaf (the disclosed LZO gap, chiefly) fails the whole
+    /// row group rather than degrading just its own column - a real,
+    /// disclosed narrowing from what the crate-based reader could do,
+    /// accepted the same way this project already accepts LZO itself as
+    /// a permanent gap.
+    pub(crate) fn profile_parquet_file(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let (file_data, meta) = read_footer(path)?;
+        let schema = build_schema(&meta.schema)?;
+        let SchemaNode::Group {
+            children: root_fields,
+            ..
+        } = &schema
+        else {
+            bail!("Parquet schema root must be a group type");
+        };
+        let leaves = schema_leaves(&schema);
+
+        let mut labels: HashMap<String, String> = HashMap::new();
+        let mut is_flat: HashMap<String, bool> = HashMap::new();
+        for field in root_fields {
+            let name = field.name().to_string();
+            match field {
+                SchemaNode::Primitive { repetition, .. } if *repetition != Repetition::Repeated => {
+                    let descriptor = leaves
+                        .iter()
+                        .find(|d| d.path == [name.clone()])
+                        .with_context(|| {
+                            format!("top-level field {name:?} missing its own leaf descriptor")
+                        })?;
+                    is_flat.insert(name.clone(), true);
+                    labels.insert(name, parquet_leaf_type_label(descriptor));
+                }
+                _ => {
+                    is_flat.insert(name, false);
+                }
+            }
+        }
+
+        let mut rows: Vec<JsonValue> = Vec::new();
+        'row_groups: for rg in &meta.row_groups {
+            for row in decode_row_group_nested(&file_data, &schema, rg)? {
+                if nrows.is_some_and(|limit| rows.len() >= limit) {
+                    break 'row_groups;
+                }
+                rows.push(row);
+            }
+        }
+
+        let total = rows.len();
+        let mut out = Vec::with_capacity(root_fields.len());
+        for field in root_fields {
+            let name = field.name().to_string();
+            if is_flat[&name] {
+                let raw_values: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.get(&name))
+                    .filter(|v| !v.is_null())
+                    .map(json_scalar_to_raw_string)
+                    .collect();
+                let col = ColumnInput {
+                    name: name.clone(),
+                    current_type: labels[&name].clone(),
+                    raw_values,
+                    total,
+                    skip_heuristics: false,
+                };
+                out.push(profile_column(col, n_samples));
+            } else {
+                let values: Vec<JsonValue> = rows
+                    .iter()
+                    .filter_map(|r| r.get(&name).cloned())
+                    .filter(|v| !v.is_null())
+                    .collect();
+                let refs: Vec<&JsonValue> = values.iter().collect();
+                out.extend(profile_json_path(name, total, refs, n_samples));
+            }
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -26776,7 +26824,6 @@ mod parquet_support {
 // wired into `columns_from_arrow_ipc`. That's the next phase, the same
 // "footer/schema first, then page/buffer data" order Parquet's own Phase
 // A/B split already used.
-#[allow(dead_code)]
 #[cfg(feature = "parquet")]
 mod arrow_ipc_support {
     use super::*;
@@ -27111,6 +27158,16 @@ mod arrow_ipc_support {
     /// every `arrow::datatypes::DataType` variant, since only the shapes
     /// this reader actually resolves into a rendering ever need a case
     /// here (matching `SchemaNode`'s own equivalent role for Parquet).
+    /// Three fields are parsed but never read: `Decimal.precision` (the
+    /// same "only `scale` matters for rendering" reasoning as Parquet's
+    /// own `LogicalType::Decimal`); `Timestamp.timezone` (this reader's
+    /// own rendering is always a naive, no-offset string - see the
+    /// oracle comparator's own tolerance for a timezone suffix the
+    /// oracle adds and this reader doesn't); and `Map.keys_sorted`
+    /// (whether the entries happen to be pre-sorted by key has no effect
+    /// on the array-of-pairs representation this reader always produces
+    /// for a Map, which preserves entry order regardless).
+    #[allow(dead_code)]
     #[derive(Clone, Debug)]
     enum ArrowDataType {
         Null,
@@ -27742,6 +27799,11 @@ mod arrow_ipc_support {
         None,
     }
 
+    // `body_length` is only ever needed by the Streaming format's own
+    // reader (`read_arrow_ipc_stream_rows`) - the File format instead
+    // gets its message bodies' exact offset/length from the footer's own
+    // `Block` structs, which is what `read_message_at` actually uses.
+    #[allow(dead_code)]
     struct ArrowMessage {
         header: ArrowMessageHeader,
         body_length: i64,
@@ -29200,6 +29262,173 @@ mod arrow_ipc_support {
         Ok(rows)
     }
 
+    /// Whether a field's own declared type needs `profile_json_path`
+    /// (an object/array-shaped value at some row) rather than a plain
+    /// scalar column - checked from the *static* schema type rather than
+    /// the decoded values themselves, unlike Parquet's own equivalent
+    /// check, specifically because an empty (zero-row or all-null)
+    /// nested column would otherwise have no Object/Array value to check
+    /// against at all. `RunEndEncoded`/`Union` recurse into their own child
+    /// type(s), since either can legally wrap an already-nested type
+    /// (a `Union` variant that's itself a `Struct`, for instance) - the
+    /// one place this reader's own type system doesn't fix "nested or
+    /// not" statically the way Parquet's `SchemaNode` tree already does.
+    fn arrow_data_type_is_nested(dt: &ArrowDataType) -> bool {
+        match dt {
+            ArrowDataType::List { .. }
+            | ArrowDataType::LargeList { .. }
+            | ArrowDataType::FixedSizeList { .. }
+            | ArrowDataType::ListView { .. }
+            | ArrowDataType::LargeListView { .. }
+            | ArrowDataType::Struct { .. }
+            | ArrowDataType::Map { .. } => true,
+            ArrowDataType::RunEndEncoded { values, .. } => {
+                arrow_data_type_is_nested(&values.data_type)
+            }
+            ArrowDataType::Union { children, .. } => children
+                .iter()
+                .any(|(_, f)| arrow_data_type_is_nested(&f.data_type)),
+            ArrowDataType::Null
+            | ArrowDataType::Int { .. }
+            | ArrowDataType::Float16
+            | ArrowDataType::Float32
+            | ArrowDataType::Float64
+            | ArrowDataType::Utf8
+            | ArrowDataType::LargeUtf8
+            | ArrowDataType::Utf8View
+            | ArrowDataType::Binary
+            | ArrowDataType::LargeBinary
+            | ArrowDataType::BinaryView
+            | ArrowDataType::FixedSizeBinary { .. }
+            | ArrowDataType::Bool
+            | ArrowDataType::Decimal { .. }
+            | ArrowDataType::Date { .. }
+            | ArrowDataType::Time { .. }
+            | ArrowDataType::Timestamp { .. }
+            | ArrowDataType::Duration { .. }
+            | ArrowDataType::Interval { .. }
+            | ArrowDataType::Other(_) => false,
+        }
+    }
+
+    /// Maps a flat field's own declared type to this project's shared
+    /// `current_type` vocabulary - the counterpart `arrow_type_label`
+    /// played for the now-dormant Arrow-crate-based reader (which is
+    /// keyed on `arrow::datatypes::DataType`, not this reader's own
+    /// `ArrowDataType`). Only ever called on a field
+    /// `arrow_data_type_is_nested` already said isn't nested, so List/
+    /// Struct/Map/RunEndEncoded/Union/`Other` never reach here in
+    /// practice - written out explicitly anyway (no wildcard arm) so a
+    /// future new `ArrowDataType` variant fails to compile here instead
+    /// of silently falling through to a wrong label. Time/Duration/
+    /// Interval/Union/RunEndEncoded get their own clean labels instead
+    /// of perpetuating `arrow_type_label`'s own Debug-formatted fallback
+    /// for these exact types (`"Duration(Millisecond)"` and friends) -
+    /// that fallback was never a deliberate, documented design, just an
+    /// acknowledged wart from before this reader could decode them at
+    /// all, so there's nothing to preserve by keeping it.
+    fn arrow_ipc_type_label(dt: &ArrowDataType) -> String {
+        match dt {
+            ArrowDataType::Null => "Null".to_string(),
+            ArrowDataType::Int { .. } => "i64".to_string(),
+            ArrowDataType::Float16 | ArrowDataType::Float32 | ArrowDataType::Float64 => {
+                "f64".to_string()
+            }
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+                "String".to_string()
+            }
+            // No un-annotated-binary/UTF8 split to make here the way
+            // Parquet's own label function needs - this reader always
+            // hex-dumps Binary/BinaryView/FixedSizeBinary (see
+            // `render_arrow_scalar`), so "String" is what the rendered
+            // value actually looks like, the same reasoning
+            // `parquet_leaf_type_label` already applies to its own
+            // un-annotated ByteArray case.
+            ArrowDataType::Binary
+            | ArrowDataType::LargeBinary
+            | ArrowDataType::BinaryView
+            | ArrowDataType::FixedSizeBinary { .. } => "String".to_string(),
+            ArrowDataType::Bool => "bool".to_string(),
+            ArrowDataType::Decimal { .. } => "Decimal".to_string(),
+            ArrowDataType::Date { .. } => "Date".to_string(),
+            ArrowDataType::Time { .. } => "Time".to_string(),
+            ArrowDataType::Timestamp { .. } => "Timestamp".to_string(),
+            ArrowDataType::Duration { .. } => "Duration".to_string(),
+            ArrowDataType::Interval { .. } => "Interval".to_string(),
+            ArrowDataType::List { .. }
+            | ArrowDataType::LargeList { .. }
+            | ArrowDataType::FixedSizeList { .. }
+            | ArrowDataType::ListView { .. }
+            | ArrowDataType::LargeListView { .. } => "List".to_string(),
+            ArrowDataType::Struct { .. } => "Struct".to_string(),
+            ArrowDataType::Map { .. } => "Map".to_string(),
+            ArrowDataType::RunEndEncoded { .. } => "RunEndEncoded".to_string(),
+            ArrowDataType::Union { .. } => "Union".to_string(),
+            ArrowDataType::Other(tag) => format!("Other({tag})"),
+        }
+    }
+
+    /// This reader's own top-level entry point for the Arrow IPC *File*
+    /// format (`.arrow`/`.feather`, the only shape `columns_from_arrow_ipc`
+    /// ever needs - the Streaming format's own `read_arrow_ipc_stream_rows`
+    /// exists purely for this hand-roll's own completeness/test coverage,
+    /// not because this project's CLI reads a raw Arrow stream file at
+    /// all). The hand-rolled counterpart to `profile_arrow_batches` for
+    /// the now-dormant Arrow-crate-based reader, structured exactly like
+    /// `parquet_support::profile_parquet_file`: every field, flat or
+    /// nested, decodes through the one shared `read_arrow_ipc_file_rows`
+    /// reconstruction, and `arrow_data_type_is_nested` alone decides
+    /// which of `profile_column`/`profile_json_path` a given field goes
+    /// through - no separate fast path, no per-field decode failure
+    /// isolation (a single unsupported field - Union/RunEndEncoded/View
+    /// nested inside something this reader can't yet resolve, or a
+    /// `BodyCompression` codec beyond `LZ4_FRAME`/`ZSTD` - fails the
+    /// whole file, the same accepted narrowing `profile_parquet_file`'s
+    /// own doc comment already discloses for Parquet's own LZO gap).
+    pub(crate) fn profile_arrow_ipc_file(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file_data = std::fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
+        let footer = read_footer(&file_data)?;
+        let mut rows = read_arrow_ipc_file_rows(&file_data)?;
+        if let Some(limit) = nrows {
+            rows.truncate(limit);
+        }
+        let total = rows.len();
+
+        let mut out = Vec::with_capacity(footer.schema.fields.len());
+        for field in &footer.schema.fields {
+            let name = field.name.clone();
+            if arrow_data_type_is_nested(&field.data_type) {
+                let values: Vec<JsonValue> = rows
+                    .iter()
+                    .filter_map(|r| r.get(&name).cloned())
+                    .filter(|v| !v.is_null())
+                    .collect();
+                let refs: Vec<&JsonValue> = values.iter().collect();
+                out.extend(profile_json_path(name, total, refs, n_samples));
+            } else {
+                let raw_values: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.get(&name))
+                    .filter(|v| !v.is_null())
+                    .map(super::parquet_support::json_scalar_to_raw_string)
+                    .collect();
+                let col = ColumnInput {
+                    name,
+                    current_type: arrow_ipc_type_label(&field.data_type),
+                    raw_values,
+                    total,
+                    skip_heuristics: false,
+                };
+                out.push(profile_column(col, n_samples));
+            }
+        }
+        Ok(out)
+    }
+
     /// Reads a complete Arrow IPC *Streaming* format byte sequence into
     /// row objects - the same message types as the File format (Schema,
     /// DictionaryBatch, RecordBatch), but with no leading/trailing
@@ -29208,7 +29437,13 @@ mod arrow_ipc_support {
     /// either a genuine end-of-stream marker (a zero-length message, see
     /// `parse_message`) or the input is exhausted. The very first message
     /// is always the schema itself (there's no footer to read it from up
-    /// front the way the File format has).
+    /// front the way the File format has). `#[cfg(test)]` because
+    /// `columns_from_arrow_ipc` only ever reads the File format
+    /// (`.arrow`/`.feather`) - this function exists purely for this
+    /// hand-roll's own completeness and test coverage of the Streaming
+    /// message-framing rules, not because the CLI reads a raw Arrow
+    /// stream file.
+    #[cfg(test)]
     fn read_arrow_ipc_stream_rows(data: &[u8]) -> Result<Vec<JsonValue>> {
         let mut pos = 0usize;
         let mut schema: Option<ArrowSchema> = None;

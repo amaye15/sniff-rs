@@ -5,8 +5,6 @@ edition = "2024"
 
 [dependencies]
 serde_json = "1.0.151"
-arrow = { version = "59.2.0", features = ["ipc", "ipc_compression", "chrono-tz"], optional = true }
-parquet = { version = "59.2.0", features = ["arrow", "json"], optional = true }
 # No "derive" feature - ColumnProfile's own Serialize impl is hand-written
 # (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
 # still needed for that impl's own `S: serde::Serializer` bound.
@@ -15,8 +13,13 @@ serde = "1.0.229"
 [features]
 default = []
 # parquet also covers Arrow IPC/Feather (.arrow/.feather) - both are Arrow-ecosystem
-# formats sharing the same `arrow` crate, so there's no separate compile cost to split them.
-parquet = ["dep:arrow", "dep:parquet"]
+# formats, and both now have their own hand-rolled reader (parquet_support/
+# arrow_ipc_support in src/lib.rs) rather than reading through the arrow/parquet
+# crates directly - see CLAUDE.md's Dependency footprint section for the full
+# writeup. No dep: entries needed here any more: this feature now gates only
+# this project's own code, the same shape every other hand-rolled format's
+# feature flag already has.
+parquet = []
 xlsx = []
 avro = []
 full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat"]
@@ -41,6 +44,22 @@ sas7bdat = []
 # section for why this is the one place this project reaches for a big,
 # full-featured crate instead of hand-rolling something leaner.
 criterion = { version = "0.8.2", features = ["html_reports"] }
+# Same dev-only treatment, same reason, at by far the largest scale of any
+# crate in this list: the `parquet` feature's own hand-rolled readers
+# (parquet_support/arrow_ipc_support in src/lib.rs - Thrift-encoded footer
+# metadata, every compression codec but LZO, every encoding, nested Struct/
+# List/Map/Union/RunEndEncoded reconstruction, and a from-scratch FlatBuffers
+# reader for Arrow IPC/Feather) replaced both at runtime; kept only as this
+# project's own cross-verification oracle across dozens of tests in both
+# modules' own `#[cfg(test)]` blocks. Unlike every other dev-only oracle in
+# this file, these two have no way to be made conditional on the `parquet`
+# feature the way the *runtime* dependency was - Cargo has no concept of an
+# optional dev-dependency - so `cargo test` now always compiles `arrow`/
+# `parquet` regardless of which --features are passed, a real, disclosed
+# cost given their own documented ~7-9 minute clean-build time (`cargo
+# build --release`, the shipped binary, is completely unaffected either way).
+arrow = { version = "59.2.0", features = ["ipc", "ipc_compression", "chrono-tz"] }
+parquet = { version = "59.2.0", features = ["arrow", "json"] }
 # calamine (and chrono, needed only by calamine's own `as_datetime()` API)
 # used to be a real, optional runtime dependency of the `xlsx` feature -
 # every format it covers (.xlsx/.ods/.xls/.xlsb) now has its own
