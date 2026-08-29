@@ -22,7 +22,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc"]
 sqlite = []
 msgpack = []
 toml = []
@@ -38,6 +38,7 @@ dbase = []
 stata = []
 sas7bdat = []
 spss = []
+orc = []
 
 [dev-dependencies]
 # Dev-only - never affects the shipped binary or a consumer's build, unlike
@@ -193,6 +194,25 @@ ambers = "0.4.2"
 # `ambers`'s own `RecordBatch` is built from, rather than reusing this
 # project's newer one.
 arrow57 = { package = "arrow", version = "57", default-features = false }
+# Same dev-only treatment, same reason: the `orc` feature's own hand-
+# rolled reader (`orc_support` in src/lib.rs - a from-scratch Protobuf
+# reader for PostScript/Footer/StripeFooter, plus RLEv1/RLEv2 integer
+# decoding) was built and verified directly against `orc-rust`'s own
+# source from the start, the same way SPSS went straight to a hand-roll
+# once `ambers` stopped being a runtime-weight concern (see that entry
+# above) - `orc-rust` was never a runtime dependency of this project's
+# `orc` feature either. Kept only for cross-verification in
+# `orc_reader_matches_the_orc_rust_crate_output_exactly`
+# (`#[cfg(all(test, feature = "orc"))]` in src/lib.rs). `default-features
+# = false` drops the crate's own `async` feature (tokio/futures/
+# async-trait) this project's synchronous, whole-file-at-a-time usage
+# never needs.
+orc-rust = { version = "0.8.0", default-features = false }
+# `orc-rust` itself pins `arrow` 58.4.0 - yet a third distinct version
+# from this project's own 59.2.0 (Parquet/Arrow IPC) and `ambers`'s 57.x
+# (SPSS) - so it needs its own explicitly-versioned, renamed handle for
+# the same reason `arrow57` does above.
+arrow58 = { package = "arrow", version = "58", default-features = false }
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

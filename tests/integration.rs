@@ -2889,6 +2889,182 @@ fn spss_format_recognized_via_extension_and_override() {
     assert_eq!(doc["format"], "spss");
 }
 
+#[cfg(feature = "orc")]
+#[test]
+fn orc_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.orc", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(column(cols, "signup_date")["current_type"], "Date");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_decodes_rle_v2_short_repeat_direct_and_delta_columns() {
+    // `constant_ish` (all one value) forces RLEv2's short-repeat
+    // sub-encoding, `scattered` (no useful structure) forces direct, and
+    // `increasing` (a plain 0..n range) forces delta - together these
+    // exercise three of RLEv2's four real sub-encodings through the full
+    // reader pipeline, not just the unit-level worked examples.
+    let doc = run_json("edge_orc_rle_v2_encodings.orc", &[]);
+    let cols = table(&doc, "edge_orc_rle_v2_encodings");
+    assert_eq!(
+        column(cols, "constant_ish")["sample_values"],
+        serde_json::json!(["42"])
+    );
+    assert_eq!(
+        column(cols, "scattered")["sample_values"],
+        serde_json::json!(["0", "7919", "15838"])
+    );
+    assert_eq!(
+        column(cols, "increasing")["sample_values"],
+        serde_json::json!(["0", "1", "2"])
+    );
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_excludes_null_values_via_the_present_stream() {
+    let doc = run_json("edge_orc_missing_values.orc", &[]);
+    let cols = table(&doc, "edge_orc_missing_values");
+    assert_eq!(column(cols, "score")["missing_pct"], 40.0);
+    assert_eq!(column(cols, "name")["missing_pct"], 40.0);
+    assert_eq!(
+        column(cols, "name")["sample_values"],
+        serde_json::json!(["alice", "carol", "dave"])
+    );
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_dictionary_encoded_strings_resolve_to_the_real_values() {
+    let doc = run_json("edge_orc_dictionary_strings.orc", &[]);
+    let cols = table(&doc, "edge_orc_dictionary_strings");
+    let category = column(cols, "category");
+    assert_eq!(category["ideal_type"], "enum / category");
+    let samples = category["sample_values"].as_array().unwrap();
+    for s in samples {
+        assert!(["red", "green", "blue"].contains(&s.as_str().unwrap()));
+    }
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_decodes_decimal_and_nanosecond_precision_timestamps() {
+    let doc = run_json("edge_orc_decimal_and_timestamp.orc", &[]);
+    let cols = table(&doc, "edge_orc_decimal_and_timestamp");
+    assert_eq!(
+        column(cols, "amount")["sample_values"],
+        serde_json::json!(["123.45", "-67.89", "0.00"])
+    );
+    assert_eq!(
+        column(cols, "ts")["sample_values"],
+        serde_json::json!([
+            "2024-01-15T10:30:00.123456789",
+            "2024-06-01T00:00:00.000000000",
+            "2024-06-01T12:00:00.500000000"
+        ])
+    );
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_decodes_binary_as_hex_and_boolean_columns() {
+    let doc = run_json("edge_orc_binary_and_bool.orc", &[]);
+    let cols = table(&doc, "edge_orc_binary_and_bool");
+    assert_eq!(column(cols, "flag")["current_type"], "bool");
+    assert_eq!(
+        column(cols, "blob")["sample_values"],
+        serde_json::json!(["0001ff", "68656c6c6f", ""])
+    );
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_every_compression_codec_reads_identically_to_uncompressed() {
+    // Same underlying data written with ZLIB/Snappy/Zstd/LZ4 and with no
+    // compression at all - proving each codec's own chunked-block framing
+    // is transparent, the same "compressed reads identically to
+    // uncompressed" contract this project's gzip/zstd/SPSS readers
+    // already get.
+    let uncompressed = run_json("edge_orc_compression_none.orc", &[]);
+    let uncompressed_cols = table(&uncompressed, "edge_orc_compression_none");
+    for codec in ["zlib", "snappy", "zstd", "lz4"] {
+        let fixture = format!("edge_orc_compression_{codec}.orc");
+        let table_name = format!("edge_orc_compression_{codec}");
+        let doc = run_json(&fixture, &[]);
+        let cols = table(&doc, &table_name);
+        assert_eq!(cols.len(), uncompressed_cols.len(), "codec {codec}");
+        for (c, u) in cols.iter().zip(uncompressed_cols.iter()) {
+            assert_eq!(c["name"], u["name"], "codec {codec}");
+            assert_eq!(c["current_type"], u["current_type"], "codec {codec}");
+            assert_eq!(c["ideal_type"], u["ideal_type"], "codec {codec}");
+            assert_eq!(c["sample_values"], u["sample_values"], "codec {codec}");
+        }
+    }
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_pre_epoch_fractional_timestamp_does_not_panic() {
+    // A genuinely adversarial-looking (but real, pyarrow-written) shape:
+    // a sub-second timestamp before 1970 that was found, via real-file
+    // testing, to trigger an integer-overflow panic in the trailing-
+    // zero-reconstruction step of this reader's nanosecond decoding
+    // before a `checked_mul` guard was added. This doesn't assert a
+    // specific "correct" rendered value - real ORC writers have
+    // historically disagreed on how to encode this exact shape (see
+    // ORC-763) - only that reading it never crashes the process.
+    let output = std::process::Command::new(bin())
+        .args([
+            fixture("edge_orc_pre_epoch_fractional_timestamp.orc")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked at"));
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_format_recognized_via_extension_content_sniffing_and_override() {
+    let doc = run_with_format("type_detection.orc", "json", &[]);
+    assert_eq!(doc["format"], "orc");
+    let doc = run_with_format("type_detection.orc", "json", &["--format", "orc"]);
+    assert_eq!(doc["format"], "orc");
+
+    // Content-based sniffing: an extensionless copy must still be
+    // recognized from the leading "ORC" magic plus the trailing
+    // postscript-length plausibility check.
+    let extensionless = fixture("type_detection.orc").with_extension("");
+    std::fs::copy(fixture("type_detection.orc"), &extensionless).unwrap();
+    let output = Command::new(bin())
+        .args([
+            extensionless.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    std::fs::remove_file(&extensionless).unwrap();
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["format"], "orc");
+}
+
 #[test]
 fn fixed_width_recognizes_uuid_email_ipv4_and_date_columns() {
     let doc = run_with_format(
@@ -3267,6 +3443,12 @@ fn malformed_sas7bdat_fails_cleanly() {
 #[test]
 fn malformed_spss_fails_cleanly() {
     assert_fails_without_panicking("malformed_garbage.sav");
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn malformed_orc_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.orc");
 }
 
 // --- Format-level edge-case tests --------------------------------------

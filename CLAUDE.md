@@ -5,9 +5,9 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, and SPSS — any of them
-gzip- or zstd-compressed too — and writes Markdown, this tool's own rich
-JSON, or json-schema.org-standard JSON.
+logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, and ORC — any of
+them gzip- or zstd-compressed too — and writes Markdown, this tool's own
+rich JSON, or json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -61,6 +61,7 @@ every format. See "Testing" below.
 | Stata | `.dta` | `--features stata` | every DTA release (102-119); Stata's own missing markers become missing values, not literal strings |
 | SAS7BDAT | `.sas7bdat` | `--features sas7bdat` | `current_type` from the file's own declared type; SAS stores nearly all numerics as doubles, so `ideal_type` often narrows further |
 | SPSS | `.sav`, `.zsav` | `--features spss` | a native SPSS date/time/datetime variable is stored as a plain numeric offset, so `current_type` stays `f64` while `ideal_type` narrows to a real date once it's rendered; `.zsav` (zlib-compressed) is a disclosed, not-yet-supported error - see below |
+| ORC | `.orc` | `--features orc` | one section per top-level column; a nested Struct/List/Map/Union column is a disclosed placeholder (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -376,6 +377,33 @@ principle Stata's own `.`-through-`.z` missing markers already get.
 Variable/value labels aren't surfaced (same considered non-surfacing
 decision as Stata's/SAS7BDAT's). A `.zsav` file's own zlib compression
 layer isn't implemented yet - see Known limitations.
+
+ORC (`columns_from_orc`, via `orc_support` - a hand-rolled reader from the
+start, see the Dependency footprint section) is architecturally different
+from every reader above it: rather than `ColumnInput` -> `profile_column`,
+it builds one `Vec<Option<String>>` accumulator per top-level column and
+fills it stripe by stripe, since a real ORC file's rows are split across
+many independent stripes (each with its own compressed byte ranges) rather
+than being available as one flat pass over the whole file the way CSV/
+Excel/fixed-width text are. Every top-level column that's a plain scalar
+type (Boolean/Byte/Short/Int/Long/Float/Double/String/Varchar/Char/Binary/
+Decimal/Date/Timestamp/TimestampInstant) is decoded fully; a Struct/List/
+Map/Union column is a disclosed placeholder note instead (the same
+"isolate what fails/isn't supported, profile the rest of the file
+normally" treatment this project's Parquet reader already gives an
+unconvertible nested column, and `.npz` gives an unreadable array) - full
+nested-type support is a real, scoped-out gap here, not yet attempted the
+way it eventually was for Parquet's own multi-phase campaign. A native
+ORC date/timestamp column has the identical declared-type-vs-real-value
+gap SPSS/dBase/SAS7BDAT already demonstrate in their own formats: stored
+as a plain numeric offset (days since the Unix epoch for `DATE`, a
+seconds-plus-nanoseconds pair since ORC's own 2015-01-01 epoch for
+`TIMESTAMP`), rendered into a real ISO string via this project's existing
+`EpochDate`/`EpochDateTime` machinery. Missing values are tracked by a
+per-column, optional PRESENT stream (a Boolean-RLE-encoded null bitmap) -
+absent entirely when a stripe has no nulls in that column at all, the
+same "the common case costs nothing" convention RLE encoding schemes
+generally favor.
 
 Common/Combined Log Format also land here (`columns_from_weblog`, via
 `weblog_support` - a hand-rolled parser now, see the Dependency footprint
@@ -1623,7 +1651,18 @@ discrete and range, on top of SYSMIS), its "very long string"
 reconstruction across a real segment boundary, its bytecode compression
 reading identically to an uncompressed equivalent, and its `.zsav`
 (zlib-compressed) files failing with a clean, actionable error rather
-than a guess, and that Markdown output never has a trailing blank line.
+than a guess, ORC's own current-vs-ideal-type gap on a native date column,
+its RLEv2 short-repeat/direct/delta sub-encodings all reading correctly
+through the full pipeline (not just their own unit-level worked
+examples), its declared-missing-value exclusion via the PRESENT stream,
+its dictionary-encoded strings resolving to their real values, its
+decimal and nanosecond-precision timestamp decoding, every one of its
+five real compression codecs (none/ZLIB/Snappy/Zstd/LZ4) reading
+identically to each other, and a genuinely adversarial-shaped pre-1970
+fractional timestamp failing to crash (even though this project can't
+assert one particular "correct" rendered value for it - see that
+fixture's own test for why), and that Markdown output never has a
+trailing blank line.
 
 **Every format also has at least one test proving a precise-grammar
 semantic type (UUID/Email/IPv4/date, not just a bare scalar shape) survives
@@ -5894,8 +5933,8 @@ this project could just implement directly rather than depend on:
   trusted" bar this entire hand-roll campaign has held itself to
   without exception. LZO is accordingly the sole remaining, permanently
   disclosed gap in this entire multi-session hand-roll, retired to the
-  same category as "No ORC"/"No DuckDB" in the Known Limitations section
-  below - not a weaker case than those, a stronger one, since it's not
+  same category as "No DuckDB" in the Known Limitations section below -
+  not a weaker case than that one, a stronger one, since it's not
   even a dependency-weight tradeoff to reconsider
   later, just nothing real anywhere to verify against. Moot for Arrow
   IPC specifically either way, since its own `BodyCompression` union
@@ -6011,6 +6050,203 @@ this project could just implement directly rather than depend on:
   to keep the comparison meaningful rather than either loosening this
   project's own reader or weakening the test's assertions.
 
+- **`orc-rust` → a hand-rolled reader (`orc_support`), never a runtime
+  dependency to begin with - the third general-purpose serialization
+  framework this project has hand-rolled a reader for**, after Thrift's
+  compact protocol (Parquet) and FlatBuffers (Arrow IPC). Unlike those
+  two, ORC's own metadata format - Protocol Buffers (proto2) - had a
+  genuine advantage the other two didn't: the Apache ORC project
+  publishes its own canonical, versioned specification
+  (`apache/orc-format`'s `ORCv1.md` plus the `.proto` file it's generated
+  from, both Apache-2.0) as a real document, not just "read the reference
+  crate's source and treat that as the spec" the way most of this
+  project's other hand-rolls have had to. Both were fetched and read
+  directly before writing a line of code, and `orc-rust` (Apache-2.0,
+  the `datafusion-contrib` project's ORC reader, kept as a dev-only
+  cross-verification oracle - `default-features = false` drops its own
+  `async`/tokio machinery this project's synchronous, whole-file-at-a-
+  time usage never needs) was used only to resolve the handful of
+  genuine ambiguities the spec's prose alone left open, not as the
+  primary source of truth.
+
+  The wire format itself needed a from-scratch minimal Protobuf reader
+  (`ProtoReader`, scoped to exactly the messages ORC's file tail uses -
+  `PostScript`/`Footer`/`Type`/`StripeInformation`/`StripeFooter`/
+  `Stream`/`ColumnEncoding` - never the statistics/row-index/bloom-
+  filter/encryption messages this project's own full-table-scan usage
+  has no need for) - genuinely simpler than Thrift's compact protocol,
+  since every field is just a varint header (`(field_number << 3) |
+  wire_type`) followed by a payload shaped purely by that wire type, with
+  no compact-protocol-style delta-encoded field IDs or packed-boolean
+  tricks to account for. An unrecognized field is always safe to skip
+  once its wire type is known - the same "unknown fields are forward-
+  compatible, always skippable" contract every other self-describing
+  format in this project already relies on.
+
+  File structure follows the spec's own three-part layout: a literal
+  3-byte `"ORC"` header, a body of independent stripes (each with its own
+  index/data/footer sections), and a tail (Metadata/Footer/PostScript/
+  a 1-byte PostScript-length) read backward from the end of the file the
+  same way the spec itself describes real readers working - seek to the
+  last byte for the PostScript's own length, read the PostScript
+  (never compressed, unlike everything else in the file), then use its
+  declared `footer_length` to locate and decompress the real Footer.
+  Stream byte offsets within a stripe have no explicit offset field of
+  their own at all - the spec states outright that the `StripeFooter`'s
+  own `streams` list, walked in order with a single running byte cursor
+  starting at the stripe's own file offset, "is the single source of
+  truth" for where each stream actually lives - confirmed directly
+  against `orc-rust`'s own `Stripe::new`, which does exactly this same
+  sequential walk rather than anything more clever.
+
+  Compression needed no new codec work at all: ORC's own chunked framing
+  (a 3-byte little-endian header per chunk, `(length << 1) |
+  is_original`, mirrored almost exactly from `ORCv1.md`'s own worked
+  example) wraps four codecs this project had already hand-rolled for
+  other formats - ZLIB (confirmed, not assumed, to be raw DEFLATE with no
+  zlib container, via `orc-rust`'s own use of `flate2::read::
+  DeflateDecoder` rather than `ZlibDecoder` - reuses this project's
+  `inflate` directly), Snappy and Zstd (reuse `snappy_support`/
+  `zstd_support` directly, both widened to a third/fourth independent
+  feature gate the same way they already serve `avro`/`parquet`), and LZ4
+  (raw block format, identical to Parquet's own convention - this is what
+  motivated pulling `lz4_block_decompress_core` out of `parquet_support`
+  into its own `lz4_support` module shared by `any(parquet, orc)`, rather
+  than a third independent copy, since the algorithm itself has zero
+  format-specific behavior to diverge on). LZO is the one codec left
+  unimplemented - see the Known limitations section for why, a
+  genuinely different (weaker) reason than Parquet's own LZO gap: the
+  framing here is fully specified and a real Rust LZO1X crate exists
+  (`lzokay-native`), there's just no real ORC file left in the wild that
+  still uses it to verify a hand-roll against.
+
+  Run-length encoding is the part of this format with real algorithmic
+  weight: RLEv1 (byte-oriented runs/literals, borrowed from Hive 0.11)
+  and RLEv2 (four sub-encodings - short-repeat, direct, patched-base, and
+  delta - each with its own bit-packed header). `ORCv1.md` is unusually
+  generous here: it gives a fully-worked byte-level example for every
+  single sub-encoding (byte RLE, boolean RLE, RLEv1's run and literal
+  forms, and all four RLEv2 sub-encodings), which this project used
+  directly as permanent unit tests (`orc_support`'s own `#[cfg(test)]`
+  block) rather than only trusting a real fixture - the same
+  "byte-exact worked example, not just a real file that happens to pass"
+  verification rigor this project's zstd/Brotli hand-rolls already used
+  for their own hardest algorithmic pieces. This discipline caught two
+  real bugs before either ever reached a real file:
+    1. **RLEv1's own run byte order was backwards in the first draft.**
+       `ORCv1.md`'s own worked example - "100 instances of 7 ... encoding
+       would start with 100 - 3, followed by a delta of 0, and a varint
+       of 7... `[0x61, 0x00, 0x07]`" - states the byte order plainly
+       (header, delta, *then* the base varint), confirmed independently
+       against `orc-rust`'s own `EncodingType::from_header` (which reads
+       the delta byte immediately after the header, before the base
+       value is ever read). The first draft read the base varint first
+       and the delta byte second - a plausible-looking but backwards
+       ordering that happened to still compile and run without erroring
+       (both fields are just bytes/varints, so there's no type-level
+       tell), silently producing a completely wrong sequence. Caught
+       immediately by `rle_v1_decodes_a_zero_delta_run` and
+       `rle_v1_decodes_a_negative_delta_run` failing against the spec's
+       own two worked numbers, not by any real-file testing - real
+       `.orc` files this project could generate for testing (via
+       `pyarrow.orc`) all use RLEv2, never RLEv1, so this bug would have
+       shipped invisibly without the worked-example tests catching it.
+    2. **The RLEv2 width field's bit position was wrong across all three
+       of Direct/Patched-Base/Delta**, found the same way. Each of these
+       sub-encodings packs a 2-bit encoding-type tag, a 5-bit width
+       field, and 1 bit of a 9-bit run length into one header byte - the
+       width field sits at bits 1-5, requiring a `(header >> 1) & 0x1f`
+       extraction, but a first draft used `header & 0x1f` directly
+       (bits 0-4, off by one bit position - silently absorbing the run
+       length's own high bit into what should have been the width field
+       instead). Verified independently against `orc-rust`'s own
+       `read_direct_values`/`read_patched_base`/`read_delta_values`,
+       which all use the same `(header >> 1) & 0x1f` extraction - not a
+       coincidence, since the header layout is shared across all three
+       sub-encodings. This one *did* eventually surface on a real
+       `pyarrow`-written file too (a genuinely huge integer-overflow
+       panic while decoding a Timestamp column's own SECONDARY stream,
+       see below) - but the worked-example unit tests for Direct/Delta
+       already had it pinned down before that real-file debugging
+       session even started, since `rle_v2_direct_matches_the_spec_
+       worked_example` and `rle_v2_delta_matches_the_spec_worked_example`
+       exercise this exact bit-extraction path directly. The Patched
+       Base worked example - by a comfortable margin the most intricate
+       single encoding in this whole reader, combining a signed-MSB-
+       convention base value, a bit-packed data-value list, and a
+       gap-encoded sparse patch list applied via shift-and-OR - was
+       traced through by hand against `ORCv1.md`'s own 20-value example
+       digit-by-digit before being trusted, the same "hand-verify the
+       hardest single piece against the spec's own numbers" discipline
+       this project's zstd FSE-table and Brotli ring-buffer work already
+       needed for their own hardest pieces.
+
+  Real-file testing (against `pyarrow.orc`-generated fixtures, covering
+  every scalar type, all five working compression codecs, dictionary and
+  direct string encoding, and RLEv2's short-repeat/direct/delta sub-
+  encodings through the full pipeline) surfaced two more genuine bugs the
+  worked-example tests couldn't have caught on their own, since both
+  needed a real multi-column, real-writer-produced file to surface:
+    1. **A decimal value's zigzag decode was off by one in the negative
+       direction** - `format_decimal`'s own unscaled-integer input came
+       from `read_unbounded_varint`, whose first draft computed a
+       negative value's magnitude as plain `raw >> 1` rather than
+       `(raw >> 1) + 1`. The standard `(v >> 1) ^ -(v & 1)` XOR-based
+       zigzag decode (used correctly everywhere *else* in this reader,
+       via the shared `zigzag_decode` helper) folds this `+1` in
+       implicitly, since XORing with an all-ones bit pattern is a
+       bitwise NOT (`-(x) - 1`), not a plain negation - but decimal's own
+       *unbounded* varint (needing up to 128 bits, past what a fixed-
+       width XOR trick can cleanly operate on) uses a separate plain
+       if/else instead, and that version's first draft simply forgot the
+       `+1` term. The symptom was subtle rather than a crash: a
+       genuinely-written `-67.89` decoded as `-67.88` - wrong by one part
+       in the last place, exactly the kind of silent, plausible-looking
+       error this project's whole design-philosophy section warns
+       against trusting without real-value verification. Found by
+       generating a real decimal fixture with `pyarrow` and reading the
+       actual rendered value by eye rather than only checking that
+       decoding didn't error - `format_decimal_inserts_the_decimal_point_
+       and_preserves_sign` and `read_unbounded_varint_zigzag_decodes_
+       correctly_including_the_off_by_one_case` lock the fix in.
+    2. **A genuinely negative-looking encoded value in a Timestamp
+       column's SECONDARY (nanosecond) stream overflowed a raw
+       multiplication and panicked the process** - found on a
+       deliberately-adversarial fixture pairing a sub-second timestamp
+       with a date before 1970 (real, if rare: ORC's own bug tracker
+       documents this exact shape under "ORC-763" as a case real writers
+       have historically disagreed on how to encode). `decode_timestamp_
+       nanos`'s trailing-zero-reconstruction step
+       (`nanos *= 10^(zeros+1)`) assumes its input is the small,
+       non-negative value the format's own spec declares the stream to
+       hold - a reasonable assumption for every ordinary timestamp, but
+       one a real writer's own edge-case encoding violated for this
+       specific input, producing a value that (misread as an enormous
+       unsigned magnitude) overflowed the multiplication outright. Fixed
+       with `checked_mul` and a graceful "leave it unscaled" fallback
+       instead of trusting the multiply to always succeed - the same
+       "never panic on real-world input, even input that looks
+       malformed" contract every other hand-rolled reader in this
+       project already holds itself to, applied here to a genuinely
+       new failure mode this reader hadn't needed to consider before
+       real-file testing found it. `edge_orc_pre_epoch_fractional_
+       timestamp.orc` and its own integration test lock in the "doesn't
+       crash" guarantee without asserting a specific "correct" value the
+       format itself doesn't cleanly define one for.
+
+  Scope is deliberately narrower than Parquet's own eventual multi-phase
+  campaign: only a flat, top-level `STRUCT`-of-scalars schema is fully
+  decoded. A Struct/List/Map/Union column - at the top level or nested -
+  is a disclosed placeholder rather than a guess, matching this project's
+  established "isolate what one column can't do, don't sink the whole
+  file over it" treatment (Parquet's own unconvertible-nested-column
+  fallback, `.npz`'s per-array isolation). Variable/value labels have no
+  equivalent in ORC at all (it has no comparable metadata concept), and
+  row indexes/bloom filters/column statistics/encryption are never read,
+  matching the same "only ever do a full, unfiltered sequential scan, no
+  index lookups" scope boundary this project's own SQLite reader already
+  draws for an analogous reason.
+
 **What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
 just above - now fully cut over, the largest entry in this whole list -
 `serde`/`serde_json` are meant to stay a dependency permanently. They're
@@ -6023,8 +6259,8 @@ swapping one call site at a time or hand-rolling a narrower, self-
 contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`, `.xls`,
 `.xlsb`, `serde_norway`, `rust-ini`, `xmltree`, `zstd`, `npyz`, `rmpv`,
 `toml`, `ciborium`, `regex`, `dbase`, `dta`, `apache-avro`, `rusqlite`,
-`sas7bdat`, `ambers`, and now `arrow`/`parquet` all still were, however
-real their own risk.
+`sas7bdat`, `ambers`, `orc-rust`, and now `arrow`/`parquet` all still were,
+however real their own risk.
 That's still a real, non-mechanical rewrite - the risk itself is why
 it's still deliberately a dependency, the same reasoning that applied to
 every other entry in this list right up until it didn't. `serde`/
@@ -6051,10 +6287,21 @@ pulled in unless that specific `--features` flag is passed).
   full research trail - the LZO1X algorithm itself is well-published and
   tractable, but Parquet's own framing around it has nothing real
   anywhere to verify a guess against.
-- **No ORC.** Deliberately skipped — Rust ecosystem support is weak enough
-  that it wasn't worth the dependency risk.
-- **No DuckDB.** Considered and deliberately skipped for the same reason as
-  ORC: dependency weight. `duckdb`'s `bundled` feature compiles its C++
+- **ORC's own LZO compression codec isn't supported.** Unlike every other
+  real ORC compression codec (NONE/ZLIB/SNAPPY/ZSTD/LZ4, all hand-rolled -
+  see the Dependency footprint section), LZO is a disclosed, not-yet-
+  implemented gap: ORC's own chunked compression framing is fully
+  specified (unlike Parquet's own undocumented LZO framing, a genuinely
+  unverifiable gap - see that entry above) and a real Rust LZO1X
+  implementation exists (`lzokay-native`, used by the `orc-rust` crate
+  this project's own reader is cross-verified against), but no current
+  ORC writer this project could find (Hive, Trino, `pyarrow`) actually
+  still produces LZO-compressed files - it was Hive's original codec
+  before Snappy/Zstd effectively replaced it - so there was no real file
+  to verify a hand-rolled decoder against. Would reconsider given a
+  concrete `.orc` file that actually needs it.
+- **No DuckDB.** Considered and deliberately skipped for dependency
+  weight. `duckdb`'s `bundled` feature compiles its C++
   engine from a tarball shipped in the crate (no network fetch, same trust
   model as `rusqlite`'s own `bundled` feature) - that part is fine. But
   `libduckdb-sys` also carries an HTTP+TLS client (`ureq`, `rustls`, ...)

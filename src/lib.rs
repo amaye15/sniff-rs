@@ -7207,6 +7207,2090 @@ fn columns_from_spss(
     )
 }
 
+// --- ORC reader ---
+//
+// Apache ORC's own file layout - PostScript, Footer, StripeFooter, all
+// encoded with Protocol Buffers (proto2) - is the third general-purpose
+// serialization framework this project has hand-rolled a minimal reader
+// for (after Thrift's compact protocol for Parquet, and FlatBuffers for
+// Arrow IPC). Every message field ID, enum discriminant, and stream/
+// encoding rule below was read directly from the Apache ORC project's own
+// canonical `orc_proto.proto` (Apache-2.0, `apache/orc-format`'s
+// `src/main/proto/orc/proto/orc_proto.proto`) and its accompanying
+// `ORCv1.md` specification - the same "the reference project's own
+// canonical source is the real spec" discipline this project's whole
+// hand-roll campaign already holds itself to, here pointed at the actual
+// upstream spec document rather than a third-party implementation's own
+// interpretation of it, since ORC (unlike, say, NumPy or SQLite) happens
+// to have one. Cross-checked against the `orc-rust` crate's own source
+// (Apache-2.0, `datafusion-contrib/orc-rust`, kept as a dev-only
+// cross-verification oracle - see Cargo.toml) wherever the spec's prose
+// left a genuine ambiguity (the RLEv2 patched-base patch-application
+// algorithm, the ORC-763 negative-timestamp adjustment, and which codecs
+// use which underlying compressed-block convention).
+#[cfg(feature = "orc")]
+mod orc_support {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    // ---------------------------------------------------------------
+    // Minimal Protocol Buffers (proto2) wire-format reader, scoped to
+    // exactly the messages ORC's own file tail actually uses. Protobuf's
+    // wire format needs no per-field lookup table the way Thrift's
+    // compact protocol does (see `parquet_support`) - every field is a
+    // varint header `(field_number << 3) | wire_type` followed by a
+    // payload shaped purely by `wire_type` (0 = varint, 1 = 8 bytes,
+    // 2 = length-delimited, 5 = 4 bytes) - so an unrecognized field
+    // number is always safe to skip once its wire type is known, with no
+    // separate "does this type carry a length" lookup needed at all.
+    // ---------------------------------------------------------------
+
+    const WIRE_VARINT: u64 = 0;
+    const WIRE_64BIT: u64 = 1;
+    const WIRE_LENGTH_DELIMITED: u64 = 2;
+    const WIRE_32BIT: u64 = 5;
+
+    /// A sanity cap on any length-delimited field's own declared byte
+    /// length (a message, string, or bytes value) - checked before
+    /// slicing it out of the buffer, the same "cap an untrusted length
+    /// before trusting it" guard every other hand-rolled binary reader in
+    /// this project already applies to its own untrusted length fields.
+    const MAX_PROTO_FIELD_LEN: usize = 512 * 1024 * 1024;
+
+    struct ProtoReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> ProtoReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            ProtoReader { data, pos: 0 }
+        }
+
+        fn read_varint(&mut self) -> Result<u64> {
+            let mut result = 0u64;
+            let mut shift = 0u32;
+            loop {
+                if shift >= 64 {
+                    bail!("ORC protobuf varint is too long (more than 10 bytes)");
+                }
+                let byte = *self
+                    .data
+                    .get(self.pos)
+                    .context("truncated ORC protobuf varint")?;
+                self.pos += 1;
+                result |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return Ok(result);
+                }
+                shift += 7;
+            }
+        }
+
+        /// Returns `Some((field_number, wire_type))` for the next field's
+        /// header, or `None` once every byte has been consumed.
+        fn next_field(&mut self) -> Result<Option<(u32, u64)>> {
+            if self.pos >= self.data.len() {
+                return Ok(None);
+            }
+            let header = self.read_varint()?;
+            let field_number = u32::try_from(header >> 3)
+                .context("ORC protobuf field number exceeds u32 range")?;
+            Ok(Some((field_number, header & 0x7)))
+        }
+
+        fn read_length_delimited(&mut self) -> Result<&'a [u8]> {
+            let len = self.read_varint()? as usize;
+            if len > MAX_PROTO_FIELD_LEN {
+                bail!("ORC protobuf field declares an implausible {len}-byte length");
+            }
+            let bytes = self
+                .data
+                .get(self.pos..self.pos + len)
+                .context("truncated ORC protobuf length-delimited field")?;
+            self.pos += len;
+            Ok(bytes)
+        }
+
+        fn read_32bit(&mut self) -> Result<[u8; 4]> {
+            let bytes = self
+                .data
+                .get(self.pos..self.pos + 4)
+                .context("truncated ORC protobuf 32-bit field")?;
+            self.pos += 4;
+            Ok(bytes.try_into().unwrap())
+        }
+
+        fn read_64bit(&mut self) -> Result<[u8; 8]> {
+            let bytes = self
+                .data
+                .get(self.pos..self.pos + 8)
+                .context("truncated ORC protobuf 64-bit field")?;
+            self.pos += 8;
+            Ok(bytes.try_into().unwrap())
+        }
+
+        /// Skips a field's own payload once its wire type is known -
+        /// every unrecognized field number in every message this reader
+        /// parses goes through this, the same "unknown fields are safe to
+        /// ignore" contract this project's Thrift/FlatBuffers readers
+        /// already rely on for the same reason (forward compatibility
+        /// with fields a future ORC version might add that this reader
+        /// has no use for - row indexes, bloom filters, statistics,
+        /// encryption, and more).
+        fn skip_field(&mut self, wire_type: u64) -> Result<()> {
+            match wire_type {
+                WIRE_VARINT => {
+                    self.read_varint()?;
+                }
+                WIRE_64BIT => {
+                    self.read_64bit()?;
+                }
+                WIRE_LENGTH_DELIMITED => {
+                    self.read_length_delimited()?;
+                }
+                WIRE_32BIT => {
+                    self.read_32bit()?;
+                }
+                other => bail!("ORC protobuf field has an unrecognized wire type {other}"),
+            }
+            Ok(())
+        }
+    }
+
+    /// Protobuf's zigzag encoding for `sint32`/`sint64` fields - unused by
+    /// any field this reader actually consumes (every ORC message field
+    /// this reader reads is a plain `uint32`/`uint64`/`string`/`bytes`/
+    /// nested message), kept only because RLEv1/RLEv2's own *data-stream*
+    /// zigzag convention (a completely separate, ORC-specific scheme,
+    /// see `zigzag_decode` below) coincidentally uses the identical
+    /// bit-level trick - noted here so the two are never conflated.
+    #[allow(dead_code)]
+    const PROTO_ZIGZAG_NOTE: () = ();
+
+    /// ORC's own (not Protobuf message-field) zigzag convention, used by
+    /// every RLEv1/RLEv2 signed integer stream: `(val << 1) ^ (val >> 63)`
+    /// per `ORCv1.md`'s own "Run Length Encoding" section - bit-for-bit
+    /// the same trick Protobuf's `sint64` uses, verified directly rather
+    /// than assumed identical, since getting this wrong silently produces
+    /// a plausible-looking but wrong integer for every negative value in
+    /// a column.
+    fn zigzag_decode(v: u64) -> i64 {
+        ((v >> 1) as i64) ^ -((v & 1) as i64)
+    }
+
+    // ---------------------------------------------------------------
+    // PostScript / Footer / Type / StripeInformation / StripeFooter /
+    // Stream / ColumnEncoding - the handful of `orc_proto.proto` messages
+    // this reader actually needs, each parsed with the identical
+    // "loop over fields, dispatch on field number, skip anything else"
+    // shape.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum OrcCompressionKind {
+        None,
+        Zlib,
+        Snappy,
+        Lzo,
+        Lz4,
+        Zstd,
+    }
+
+    struct PostScript {
+        footer_length: u64,
+        compression: OrcCompressionKind,
+        // Parsed for full fidelity to the real PostScript layout, but
+        // never consumed: this reader's own chunked-compression walker
+        // (`decompress_orc_bytes`) discovers each chunk's real length
+        // directly from its own 3-byte header rather than needing an
+        // upper bound in advance - the same "parse it, but don't
+        // actually need it" treatment SPSS's own `weight_index`/`ncases`
+        // already get.
+        #[allow(dead_code)]
+        compression_block_size: u64,
+    }
+
+    fn parse_postscript(bytes: &[u8]) -> Result<PostScript> {
+        let mut r = ProtoReader::new(bytes);
+        let mut footer_length = 0u64;
+        let mut compression = OrcCompressionKind::None;
+        let mut compression_block_size = 256 * 1024u64;
+        while let Some((field, wire)) = r.next_field()? {
+            match field {
+                1 if wire == WIRE_VARINT => footer_length = r.read_varint()?,
+                2 if wire == WIRE_VARINT => {
+                    compression = match r.read_varint()? {
+                        0 => OrcCompressionKind::None,
+                        1 => OrcCompressionKind::Zlib,
+                        2 => OrcCompressionKind::Snappy,
+                        3 => OrcCompressionKind::Lzo,
+                        4 => OrcCompressionKind::Lz4,
+                        5 => OrcCompressionKind::Zstd,
+                        other => bail!("ORC file uses an unrecognized compression kind {other}"),
+                    };
+                }
+                3 if wire == WIRE_VARINT => compression_block_size = r.read_varint()?,
+                _ => r.skip_field(wire)?,
+            }
+        }
+        Ok(PostScript {
+            footer_length,
+            compression,
+            compression_block_size,
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum OrcTypeKind {
+        Boolean,
+        Byte,
+        Short,
+        Int,
+        Long,
+        Float,
+        Double,
+        String,
+        Binary,
+        Timestamp,
+        List,
+        Map,
+        Struct,
+        Union,
+        Decimal,
+        Date,
+        Varchar,
+        Char,
+        TimestampInstant,
+        /// A future ORC type this reader doesn't recognize (e.g. the newer
+        /// Geometry/Geography types) - a disclosed placeholder, not a
+        /// guess, the same treatment given to Struct/List/Map/Union.
+        Other(u32),
+    }
+
+    impl OrcTypeKind {
+        fn from_proto(v: u64) -> Self {
+            match v {
+                0 => OrcTypeKind::Boolean,
+                1 => OrcTypeKind::Byte,
+                2 => OrcTypeKind::Short,
+                3 => OrcTypeKind::Int,
+                4 => OrcTypeKind::Long,
+                5 => OrcTypeKind::Float,
+                6 => OrcTypeKind::Double,
+                7 => OrcTypeKind::String,
+                8 => OrcTypeKind::Binary,
+                9 => OrcTypeKind::Timestamp,
+                10 => OrcTypeKind::List,
+                11 => OrcTypeKind::Map,
+                12 => OrcTypeKind::Struct,
+                13 => OrcTypeKind::Union,
+                14 => OrcTypeKind::Decimal,
+                15 => OrcTypeKind::Date,
+                16 => OrcTypeKind::Varchar,
+                17 => OrcTypeKind::Char,
+                18 => OrcTypeKind::TimestampInstant,
+                other => OrcTypeKind::Other(other as u32),
+            }
+        }
+
+        fn is_compound(self) -> bool {
+            matches!(
+                self,
+                OrcTypeKind::List | OrcTypeKind::Map | OrcTypeKind::Struct | OrcTypeKind::Union
+            )
+        }
+    }
+
+    struct OrcType {
+        kind: OrcTypeKind,
+        subtypes: Vec<u32>,
+        field_names: Vec<String>,
+        precision: Option<u32>,
+        scale: Option<u32>,
+    }
+
+    fn parse_type(bytes: &[u8]) -> Result<OrcType> {
+        let mut r = ProtoReader::new(bytes);
+        let mut kind = OrcTypeKind::Struct;
+        let mut subtypes = Vec::new();
+        let mut field_names = Vec::new();
+        let mut precision = None;
+        let mut scale = None;
+        while let Some((field, wire)) = r.next_field()? {
+            match field {
+                1 if wire == WIRE_VARINT => kind = OrcTypeKind::from_proto(r.read_varint()?),
+                2 if wire == WIRE_LENGTH_DELIMITED => {
+                    // `[packed = true]` repeated uint32: a length-prefixed
+                    // run of concatenated varints, not one field per value.
+                    let packed = r.read_length_delimited()?;
+                    let mut pr = ProtoReader::new(packed);
+                    while pr.pos < pr.data.len() {
+                        subtypes.push(
+                            u32::try_from(pr.read_varint()?)
+                                .context("ORC subtype id exceeds u32 range")?,
+                        );
+                    }
+                }
+                2 if wire == WIRE_VARINT => {
+                    // A writer that didn't pack a single-element repeated
+                    // field - legal protobuf, just less common.
+                    subtypes.push(
+                        u32::try_from(r.read_varint()?)
+                            .context("ORC subtype id exceeds u32 range")?,
+                    );
+                }
+                3 if wire == WIRE_LENGTH_DELIMITED => {
+                    let name = r.read_length_delimited()?;
+                    field_names.push(
+                        String::from_utf8(name.to_vec())
+                            .context("ORC type field name is not valid UTF-8")?,
+                    );
+                }
+                5 if wire == WIRE_VARINT => precision = Some(r.read_varint()? as u32),
+                6 if wire == WIRE_VARINT => scale = Some(r.read_varint()? as u32),
+                _ => r.skip_field(wire)?,
+            }
+        }
+        Ok(OrcType {
+            kind,
+            subtypes,
+            field_names,
+            precision,
+            scale,
+        })
+    }
+
+    struct StripeInformation {
+        offset: u64,
+        index_length: u64,
+        data_length: u64,
+        footer_length: u64,
+        number_of_rows: u64,
+    }
+
+    fn parse_stripe_information(bytes: &[u8]) -> Result<StripeInformation> {
+        let mut r = ProtoReader::new(bytes);
+        let mut offset = 0u64;
+        let mut index_length = 0u64;
+        let mut data_length = 0u64;
+        let mut footer_length = 0u64;
+        let mut number_of_rows = 0u64;
+        while let Some((field, wire)) = r.next_field()? {
+            match field {
+                1 if wire == WIRE_VARINT => offset = r.read_varint()?,
+                2 if wire == WIRE_VARINT => index_length = r.read_varint()?,
+                3 if wire == WIRE_VARINT => data_length = r.read_varint()?,
+                4 if wire == WIRE_VARINT => footer_length = r.read_varint()?,
+                5 if wire == WIRE_VARINT => number_of_rows = r.read_varint()?,
+                _ => r.skip_field(wire)?,
+            }
+        }
+        Ok(StripeInformation {
+            offset,
+            index_length,
+            data_length,
+            footer_length,
+            number_of_rows,
+        })
+    }
+
+    struct OrcFooter {
+        types: Vec<OrcType>,
+        stripes: Vec<StripeInformation>,
+    }
+
+    /// A sanity cap on the number of stripes/types a Footer can declare -
+    /// each is individually bounded by protobuf's own varint-length
+    /// framing already, but a corrupted/adversarial footer could still
+    /// declare millions of tiny ones; this caps the `Vec` growth before
+    /// it becomes a real allocation concern, the same guard class as
+    /// `MAX_PROTO_FIELD_LEN` above.
+    const MAX_STRIPES_OR_TYPES: usize = 1_000_000;
+
+    fn parse_footer(bytes: &[u8]) -> Result<OrcFooter> {
+        let mut r = ProtoReader::new(bytes);
+        let mut types = Vec::new();
+        let mut stripes = Vec::new();
+        while let Some((field, wire)) = r.next_field()? {
+            match field {
+                3 if wire == WIRE_LENGTH_DELIMITED => {
+                    if stripes.len() >= MAX_STRIPES_OR_TYPES {
+                        bail!("ORC footer declares an implausible number of stripes");
+                    }
+                    stripes.push(parse_stripe_information(r.read_length_delimited()?)?);
+                }
+                4 if wire == WIRE_LENGTH_DELIMITED => {
+                    if types.len() >= MAX_STRIPES_OR_TYPES {
+                        bail!("ORC footer declares an implausible number of types");
+                    }
+                    types.push(parse_type(r.read_length_delimited()?)?);
+                }
+                _ => r.skip_field(wire)?,
+            }
+        }
+        Ok(OrcFooter { types, stripes })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum OrcStreamKind {
+        Present,
+        Data,
+        Length,
+        DictionaryData,
+        Secondary,
+        /// Every other declared stream kind (dictionary count, row index,
+        /// bloom filters, encrypted/statistics streams) - this reader
+        /// only ever needs to know a byte range exists so it can advance
+        /// past it; it never actually reads one.
+        Other,
+    }
+
+    struct StreamInfo {
+        kind: OrcStreamKind,
+        column: u32,
+        length: u64,
+    }
+
+    fn parse_stream(bytes: &[u8]) -> Result<StreamInfo> {
+        let mut r = ProtoReader::new(bytes);
+        let mut kind = OrcStreamKind::Other;
+        let mut column = 0u32;
+        let mut length = 0u64;
+        while let Some((field, wire)) = r.next_field()? {
+            match field {
+                1 if wire == WIRE_VARINT => {
+                    kind = match r.read_varint()? {
+                        0 => OrcStreamKind::Present,
+                        1 => OrcStreamKind::Data,
+                        2 => OrcStreamKind::Length,
+                        3 => OrcStreamKind::DictionaryData,
+                        5 => OrcStreamKind::Secondary,
+                        _ => OrcStreamKind::Other,
+                    };
+                }
+                2 if wire == WIRE_VARINT => {
+                    column = u32::try_from(r.read_varint()?)
+                        .context("ORC column id exceeds u32 range")?
+                }
+                3 if wire == WIRE_VARINT => length = r.read_varint()?,
+                _ => r.skip_field(wire)?,
+            }
+        }
+        Ok(StreamInfo {
+            kind,
+            column,
+            length,
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ColumnEncodingKind {
+        Direct,
+        Dictionary,
+        DirectV2,
+        DictionaryV2,
+    }
+
+    impl ColumnEncodingKind {
+        fn is_v2(self) -> bool {
+            matches!(
+                self,
+                ColumnEncodingKind::DirectV2 | ColumnEncodingKind::DictionaryV2
+            )
+        }
+
+        fn is_dictionary(self) -> bool {
+            matches!(
+                self,
+                ColumnEncodingKind::Dictionary | ColumnEncodingKind::DictionaryV2
+            )
+        }
+    }
+
+    struct ColumnEncodingInfo {
+        kind: ColumnEncodingKind,
+        dictionary_size: u32,
+    }
+
+    fn parse_column_encoding(bytes: &[u8]) -> Result<ColumnEncodingInfo> {
+        let mut r = ProtoReader::new(bytes);
+        let mut kind = ColumnEncodingKind::Direct;
+        let mut dictionary_size = 0u32;
+        while let Some((field, wire)) = r.next_field()? {
+            match field {
+                1 if wire == WIRE_VARINT => {
+                    kind = match r.read_varint()? {
+                        0 => ColumnEncodingKind::Direct,
+                        1 => ColumnEncodingKind::Dictionary,
+                        2 => ColumnEncodingKind::DirectV2,
+                        3 => ColumnEncodingKind::DictionaryV2,
+                        other => bail!("ORC column encoding has an unrecognized kind {other}"),
+                    };
+                }
+                2 if wire == WIRE_VARINT => dictionary_size = r.read_varint()? as u32,
+                _ => r.skip_field(wire)?,
+            }
+        }
+        Ok(ColumnEncodingInfo {
+            kind,
+            dictionary_size,
+        })
+    }
+
+    struct StripeFooter {
+        streams: Vec<StreamInfo>,
+        columns: Vec<ColumnEncodingInfo>,
+    }
+
+    fn parse_stripe_footer(bytes: &[u8]) -> Result<StripeFooter> {
+        let mut r = ProtoReader::new(bytes);
+        let mut streams = Vec::new();
+        let mut columns = Vec::new();
+        while let Some((field, wire)) = r.next_field()? {
+            match field {
+                1 if wire == WIRE_LENGTH_DELIMITED => {
+                    streams.push(parse_stream(r.read_length_delimited()?)?);
+                }
+                2 if wire == WIRE_LENGTH_DELIMITED => {
+                    columns.push(parse_column_encoding(r.read_length_delimited()?)?);
+                }
+                _ => r.skip_field(wire)?,
+            }
+        }
+        Ok(StripeFooter { streams, columns })
+    }
+
+    // ---------------------------------------------------------------
+    // Compression: ORC wraps every part of the file except the leading
+    // "ORC" magic and the PostScript itself in a chunked framing that's
+    // identical regardless of which underlying codec is chosen (verified
+    // directly against `ORCv1.md`'s own "Compression" section) - a 3-byte
+    // little-endian header per chunk, `(length << 1) | is_original`,
+    // followed by that many bytes: either `length` bytes of raw
+    // (incompressible) data if `is_original`, or a codec-compressed block
+    // that decompresses to at most the file's own declared
+    // `compression_block_size`. Chunks are concatenated until the
+    // stream's own declared on-disk byte range is exhausted.
+    // ---------------------------------------------------------------
+
+    fn decompress_orc_bytes(compression: OrcCompressionKind, raw: &[u8]) -> Result<Vec<u8>> {
+        if compression == OrcCompressionKind::None {
+            return Ok(raw.to_vec());
+        }
+        let mut out = Vec::with_capacity(raw.len());
+        let mut pos = 0usize;
+        while pos < raw.len() {
+            let header = raw
+                .get(pos..pos + 3)
+                .context("truncated ORC compression chunk header")?;
+            let packed =
+                u32::from(header[0]) | (u32::from(header[1]) << 8) | (u32::from(header[2]) << 16);
+            let is_original = packed & 1 == 1;
+            let length = (packed >> 1) as usize;
+            pos += 3;
+            let chunk = raw
+                .get(pos..pos + length)
+                .context("truncated ORC compression chunk body")?;
+            pos += length;
+            if is_original {
+                out.extend_from_slice(chunk);
+                continue;
+            }
+            match compression {
+                OrcCompressionKind::None => unreachable!("handled above"),
+                // ORC's own ZLIB codec is raw DEFLATE with no zlib
+                // container (verified against `orc-rust`'s own
+                // `compression.rs`, which decodes it with
+                // `flate2::read::DeflateDecoder`, not `ZlibDecoder`) -
+                // exactly what this project's own `inflate` (built for
+                // gzip's inner DEFLATE stream) already implements.
+                OrcCompressionKind::Zlib => {
+                    out.extend_from_slice(&inflate(chunk)?);
+                }
+                OrcCompressionKind::Snappy => {
+                    out.extend_from_slice(&snappy_support::snappy_decompress(chunk)?);
+                }
+                OrcCompressionKind::Lz4 => {
+                    out.extend_from_slice(&lz4_support::lz4_block_decompress_core(chunk)?);
+                }
+                OrcCompressionKind::Zstd => {
+                    out.extend_from_slice(&zstd_support::zstd_decompress(chunk)?);
+                }
+                OrcCompressionKind::Lzo => {
+                    bail!(
+                        "ORC's LZO compression codec isn't supported by this reader - \
+                         LZO is essentially unused by any current ORC writer (Snappy/Zstd/ \
+                         ZLIB have long since replaced it); rebuild the file with a \
+                         different compression codec"
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------
+    // Bit-level reader for RLEv2's fixed-width bit-packed runs (Direct,
+    // Patched Base's data/patch lists, Delta's magnitude list) - values
+    // are packed MSB-first within the bitstream (verified directly
+    // against `orc-rust`'s own `unrolled_unpack_*` functions and the
+    // worked byte examples in `ORCv1.md`'s own Direct/Patched Base/Delta
+    // sections), unlike this project's zstd/gzip bit readers, which are
+    // LSB-first - a genuinely different bit order this reader has to get
+    // right independently rather than reusing either existing bit
+    // reader.
+    // ---------------------------------------------------------------
+
+    struct MsbBitReader<'a> {
+        data: &'a [u8],
+        byte_pos: usize,
+        bit_pos: u32, // 0..8, bits already consumed from the current byte
+    }
+
+    impl<'a> MsbBitReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            MsbBitReader {
+                data,
+                byte_pos: 0,
+                bit_pos: 0,
+            }
+        }
+
+        fn read_bits(&mut self, n: u32) -> Result<u64> {
+            let mut result: u64 = 0;
+            let mut remaining = n;
+            while remaining > 0 {
+                let byte = *self
+                    .data
+                    .get(self.byte_pos)
+                    .context("truncated ORC bit-packed integer stream")?;
+                let bits_left_in_byte = 8 - self.bit_pos;
+                let take = remaining.min(bits_left_in_byte);
+                let shift = bits_left_in_byte - take;
+                let mask = if take == 8 { 0xff } else { (1u16 << take) - 1 } as u8;
+                let bits = (byte >> shift) & mask;
+                result = (result << take) | u64::from(bits);
+                self.bit_pos += take;
+                if self.bit_pos == 8 {
+                    self.bit_pos = 0;
+                    self.byte_pos += 1;
+                }
+                remaining -= take;
+            }
+            Ok(result)
+        }
+
+        /// Discards any partially-read byte, advancing to the next
+        /// byte boundary - needed between RLEv2 sub-fields that are each
+        /// independently byte-aligned per the spec (e.g. the bit-packed
+        /// data-value list in Direct/Patched Base is always padded to a
+        /// full byte before whatever (if anything) follows it).
+        fn align_to_byte(&mut self) {
+            if self.bit_pos != 0 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+        }
+
+        fn bytes_consumed(&self) -> usize {
+            self.byte_pos + usize::from(self.bit_pos != 0)
+        }
+    }
+
+    /// ORC's 5-bit encoded-width table (`ORCv1.md`'s "5 bit width encoding
+    /// table for RLEv2"), shared by Direct/Patched Base/Delta - verified
+    /// against `orc-rust`'s own `rle_v2_decode_bit_width`.
+    fn rle_v2_decode_bit_width(encoded: u8) -> u32 {
+        match encoded {
+            0..=23 => u32::from(encoded) + 1,
+            24 => 26,
+            25 => 28,
+            26 => 30,
+            27 => 32,
+            28 => 40,
+            29 => 48,
+            30 => 56,
+            31 => 64,
+            _ => unreachable!("encoded bit width is masked to 5 bits"),
+        }
+    }
+
+    /// The unsigned magnitude a `patch_bit_width + patch_gap_bit_width`
+    /// combined field is rounded up to before bit-unpacking the patch
+    /// list - verified against `orc-rust`'s own `get_closest_fixed_bits`.
+    fn closest_fixed_bits(n: u32) -> u32 {
+        match n {
+            0 => 1,
+            1..=24 => n,
+            25..=26 => 26,
+            27..=28 => 28,
+            29..=30 => 30,
+            31..=32 => 32,
+            33..=40 => 40,
+            41..=48 => 48,
+            49..=56 => 56,
+            _ => 64,
+        }
+    }
+
+    /// A single-value-at-a-time base-128 varint reader (Protobuf's own
+    /// varint grammar, reused here since RLEv1/RLEv2 explicitly say they
+    /// borrow it - `ORCv1.md`'s own "Base 128 Varint" section) over a
+    /// plain byte cursor, distinct from `ProtoReader::read_varint` only
+    /// in that it operates directly on a `(bytes, pos)` pair rather than
+    /// a `ProtoReader` (RLE decoding has no message-field structure to
+    /// track).
+    fn read_varint_at(data: &[u8], pos: &mut usize) -> Result<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            if shift >= 64 {
+                bail!("ORC RLE varint is too long (more than 10 bytes)");
+            }
+            let byte = *data.get(*pos).context("truncated ORC RLE varint")?;
+            *pos += 1;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+    }
+
+    fn read_signed_varint_at(data: &[u8], pos: &mut usize) -> Result<i64> {
+        Ok(zigzag_decode(read_varint_at(data, pos)?))
+    }
+
+    // ---------------------------------------------------------------
+    // Byte RLE (`ORCv1.md`'s "Byte Run Length Encoding") - the foundation
+    // for Boolean RLE and TinyInt/BYTE columns' own DATA stream.
+    // ---------------------------------------------------------------
+
+    /// Decodes exactly `count` byte-RLE values starting at `*pos`,
+    /// advancing `*pos` past everything consumed. A run/literal group
+    /// straddling the `count` boundary is only partially consumed from
+    /// the group's own values (the rest of that group's bytes are left
+    /// unread) - correct because PRESENT/BYTE streams are read
+    /// stripe-wide across several logical calls in this reader (one
+    /// count for `non_null_count`, e.g.), each needing to resume exactly
+    /// where the last one left off, the same incremental-cursor contract
+    /// every other RLE reader in this module already honors.
+    fn read_byte_rle(data: &[u8], pos: &mut usize, count: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(count);
+        while out.len() < count {
+            let header = *data.get(*pos).context("truncated ORC byte RLE stream")? as i8;
+            *pos += 1;
+            if header >= 0 {
+                let length = header as usize + 3;
+                let value = *data.get(*pos).context("truncated ORC byte RLE run value")?;
+                *pos += 1;
+                let take = length.min(count - out.len());
+                out.extend(std::iter::repeat_n(value, take));
+                // A run longer than what's still needed still has to be
+                // fully consumed from the byte cursor's perspective only
+                // if this call is the very last one for this stream - but
+                // since every caller here always asks for the stream's
+                // exact total count up front (never a partial read
+                // resumed later), under-consuming a run never happens in
+                // practice. Guard it anyway: advance nothing further,
+                // since `length` values were already fully described by
+                // the 2 bytes already read (a run has no more bytes to
+                // skip regardless of how many of its values are kept).
+            } else {
+                let length = (-header) as usize;
+                let literal = data
+                    .get(*pos..*pos + length)
+                    .context("truncated ORC byte RLE literal list")?;
+                *pos += length;
+                let take = length.min(count - out.len());
+                out.extend_from_slice(&literal[..take]);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Boolean RLE (`ORCv1.md`'s "Boolean Run Length Encoding"): bits
+    /// packed MSB-first within each byte, then that byte sequence is
+    /// itself byte-RLE encoded. Used for every PRESENT stream and for a
+    /// BOOLEAN column's own DATA stream.
+    fn read_boolean_rle(data: &[u8], pos: &mut usize, count: usize) -> Result<Vec<bool>> {
+        let n_bytes = count.div_ceil(8);
+        let bytes = read_byte_rle(data, pos, n_bytes)?;
+        let mut out = Vec::with_capacity(count);
+        for byte in bytes {
+            for bit in (0..8).rev() {
+                if out.len() == count {
+                    break;
+                }
+                out.push((byte >> bit) & 1 == 1);
+            }
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------
+    // Integer RLE v1 (`ORCv1.md`'s "Integer Run Length Encoding, version
+    // 1"): runs (fixed delta, base 128 varint) and literal lists (base
+    // 128 varints), zigzag-decoded only when the underlying stream is
+    // declared signed.
+    // ---------------------------------------------------------------
+
+    fn read_rle_v1(data: &[u8], pos: &mut usize, signed: bool, count: usize) -> Result<Vec<i64>> {
+        let mut out = Vec::with_capacity(count);
+        while out.len() < count {
+            let header = *data.get(*pos).context("truncated ORC RLEv1 stream")? as i8;
+            *pos += 1;
+            if header >= 0 {
+                let length = header as usize + 3;
+                // Byte order is header, delta, *then* the base varint -
+                // verified against `orc-rust`'s own `EncodingType::
+                // from_header` (which reads the delta byte immediately
+                // after the header, before `read_run` ever sees the
+                // stream) after a first draft had this backwards and
+                // failed this project's own worked-example unit test
+                // (`ORCv1.md`'s "100 instances of 7" -> `[0x61, 0x00,
+                // 0x07]`: delta `0x00` before base varint `0x07`).
+                let delta = *data.get(*pos).context("truncated ORC RLEv1 run delta")? as i8;
+                *pos += 1;
+                let mut base = if signed {
+                    read_signed_varint_at(data, pos)?
+                } else {
+                    read_varint_at(data, pos)? as i64
+                };
+                out.push(base);
+                for _ in 1..length {
+                    base = base.wrapping_add(i64::from(delta));
+                    if out.len() < count {
+                        out.push(base);
+                    }
+                }
+            } else {
+                let length = (-header) as usize;
+                for _ in 0..length {
+                    let v = if signed {
+                        read_signed_varint_at(data, pos)?
+                    } else {
+                        read_varint_at(data, pos)? as i64
+                    };
+                    if out.len() < count {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+        out.truncate(count);
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------
+    // Integer RLE v2 (`ORCv1.md`'s "Integer Run Length Encoding, version
+    // 2") - four sub-encodings selected by the header byte's top 2 bits.
+    // ---------------------------------------------------------------
+
+    fn read_rle_v2(data: &[u8], pos: &mut usize, signed: bool, count: usize) -> Result<Vec<i64>> {
+        let mut out = Vec::with_capacity(count);
+        while out.len() < count {
+            let header = *data.get(*pos).context("truncated ORC RLEv2 stream")?;
+            *pos += 1;
+            let sub_encoding = header >> 6;
+            match sub_encoding {
+                0 => read_rle_v2_short_repeat(data, pos, signed, header, &mut out)?,
+                1 => read_rle_v2_direct(data, pos, signed, header, &mut out)?,
+                2 => read_rle_v2_patched_base(data, pos, header, &mut out)?,
+                3 => read_rle_v2_delta(data, pos, signed, header, &mut out)?,
+                _ => unreachable!("sub_encoding is masked to 2 bits"),
+            }
+        }
+        out.truncate(count);
+        Ok(out)
+    }
+
+    fn read_rle_v2_short_repeat(
+        data: &[u8],
+        pos: &mut usize,
+        signed: bool,
+        header: u8,
+        out: &mut Vec<i64>,
+    ) -> Result<()> {
+        let byte_width = usize::from((header >> 3) & 0x07) + 1;
+        let run_length = usize::from(header & 0x07) + 3;
+        let bytes = data
+            .get(*pos..*pos + byte_width)
+            .context("truncated ORC RLEv2 short-repeat value")?;
+        *pos += byte_width;
+        let mut raw = 0u64;
+        for &b in bytes {
+            raw = (raw << 8) | u64::from(b);
+        }
+        let value = if signed {
+            zigzag_decode(raw)
+        } else {
+            raw as i64
+        };
+        out.extend(std::iter::repeat_n(value, run_length));
+        Ok(())
+    }
+
+    fn read_rle_v2_direct(
+        data: &[u8],
+        pos: &mut usize,
+        signed: bool,
+        header: u8,
+        out: &mut Vec<i64>,
+    ) -> Result<()> {
+        // Header layout (2 bytes total): [type:2][width:5][length_hi:1],
+        // [length_lo:8] - the width field sits in bits 1-5, not 0-4, so
+        // it has to be shifted right past the length's own high bit
+        // first (verified against `orc-rust`'s own direct-encoding
+        // decoder, which reads `(header >> 1) & 0x1f`).
+        let encoded_width = (header >> 1) & 0x1f;
+        let bit_width = rle_v2_decode_bit_width(encoded_width);
+        let second_byte = *data
+            .get(*pos)
+            .context("truncated ORC RLEv2 direct header")?;
+        *pos += 1;
+        let length = ((u32::from(header & 0x01) << 8) | u32::from(second_byte)) as usize + 1;
+        let mut reader = MsbBitReader::new(
+            data.get(*pos..)
+                .context("truncated ORC RLEv2 direct values")?,
+        );
+        for _ in 0..length {
+            let raw = reader.read_bits(bit_width)?;
+            let value = if signed {
+                zigzag_decode(raw)
+            } else {
+                raw as i64
+            };
+            out.push(value);
+        }
+        reader.align_to_byte();
+        *pos += reader.bytes_consumed();
+        Ok(())
+    }
+
+    fn read_rle_v2_patched_base(
+        data: &[u8],
+        pos: &mut usize,
+        header: u8,
+        out: &mut Vec<i64>,
+    ) -> Result<()> {
+        // Same header layout as Direct - see that function's own comment
+        // for why the width field needs the `>> 1` first.
+        let encoded_width = (header >> 1) & 0x1f;
+        let value_bit_width = rle_v2_decode_bit_width(encoded_width);
+        let second_byte = *data
+            .get(*pos)
+            .context("truncated ORC RLEv2 patched-base header")?;
+        *pos += 1;
+        let extra_bit = u32::from(header & 0x01);
+        let length = ((extra_bit << 8) | u32::from(second_byte)) as usize + 1;
+        let third_byte = *data
+            .get(*pos)
+            .context("truncated ORC RLEv2 patched-base header")?;
+        *pos += 1;
+        let fourth_byte = *data
+            .get(*pos)
+            .context("truncated ORC RLEv2 patched-base header")?;
+        *pos += 1;
+
+        let base_byte_width = usize::from((third_byte >> 5) & 0x07) + 1;
+        let patch_bit_width = rle_v2_decode_bit_width(third_byte & 0x1f);
+        let patch_gap_bit_width = u32::from((fourth_byte >> 5) & 0x07) + 1;
+        let patch_total_bit_width = patch_bit_width + patch_gap_bit_width;
+        if patch_total_bit_width > 64 {
+            bail!("ORC RLEv2 patched-base combined patch/gap width exceeds 64 bits");
+        }
+        let patch_list_length = usize::from(fourth_byte & 0x1f);
+
+        let base_bytes = data
+            .get(*pos..*pos + base_byte_width)
+            .context("truncated ORC RLEv2 patched-base base value")?;
+        *pos += base_byte_width;
+        let mut base_raw = 0u64;
+        for &b in base_bytes {
+            base_raw = (base_raw << 8) | u64::from(b);
+        }
+        // Base value uses MSB-sign convention (not zigzag): the top bit of
+        // the base_byte_width-byte big-endian value marks negative,
+        // per `ORCv1.md`'s own "Patched Base" section.
+        let msb_mask = 1u64 << (base_byte_width * 8 - 1);
+        let base_magnitude = (base_raw & !msb_mask) as i64;
+        let base = if base_raw & msb_mask != 0 {
+            -base_magnitude
+        } else {
+            base_magnitude
+        };
+
+        let mut reader = MsbBitReader::new(
+            data.get(*pos..)
+                .context("truncated ORC RLEv2 patched-base data")?,
+        );
+        let mut values: Vec<i64> = Vec::with_capacity(length);
+        for _ in 0..length {
+            values.push(reader.read_bits(value_bit_width)? as i64);
+        }
+        reader.align_to_byte();
+
+        let ceil_patch_width = closest_fixed_bits(patch_total_bit_width);
+        let mut patches: Vec<u64> = Vec::with_capacity(patch_list_length);
+        for _ in 0..patch_list_length {
+            patches.push(reader.read_bits(ceil_patch_width)?);
+        }
+        reader.align_to_byte();
+        *pos += reader.bytes_consumed();
+
+        // Apply patches: each patch entry packs a gap (distance from the
+        // previous patched index) and a patch value (extra high bits to
+        // OR into that position before adding the base) - verified
+        // against `orc-rust`'s own `read_patched_base`, including its gap
+        // = 255-with-zero-patch "skip more than 255" convention.
+        let patch_mask = (1u64 << patch_bit_width) - 1;
+        if !patches.is_empty() {
+            let mut patch_index = 0usize;
+            let mut current_gap = patches[patch_index] >> patch_bit_width;
+            let mut current_patch = patches[patch_index] & patch_mask;
+            let mut actual_gap = 0i64;
+            while current_gap == 255 && current_patch == 0 {
+                actual_gap += 255;
+                patch_index += 1;
+                current_gap = patches
+                    .get(patch_index)
+                    .copied()
+                    .context("ORC RLEv2 patched-base patch list ended mid-gap-chain")?
+                    >> patch_bit_width;
+                current_patch = patches[patch_index] & patch_mask;
+            }
+            actual_gap += current_gap as i64;
+
+            let mut idx = 0usize;
+            while idx < values.len() {
+                if idx as i64 == actual_gap {
+                    let patch_bits = current_patch << value_bit_width;
+                    values[idx] |= patch_bits as i64;
+                    patch_index += 1;
+                    if patch_index < patches.len() {
+                        current_gap = patches[patch_index] >> patch_bit_width;
+                        current_patch = patches[patch_index] & patch_mask;
+                        actual_gap = 0;
+                        while current_gap == 255 && current_patch == 0 {
+                            actual_gap += 255;
+                            patch_index += 1;
+                            current_gap =
+                                patches.get(patch_index).copied().context(
+                                    "ORC RLEv2 patched-base patch list ended mid-gap-chain",
+                                )? >> patch_bit_width;
+                            current_patch = patches[patch_index] & patch_mask;
+                        }
+                        actual_gap += current_gap as i64 + idx as i64;
+                    }
+                }
+                idx += 1;
+            }
+        }
+        for v in &mut values {
+            *v = v.wrapping_add(base);
+        }
+        out.extend(values);
+        Ok(())
+    }
+
+    fn read_rle_v2_delta(
+        data: &[u8],
+        pos: &mut usize,
+        signed: bool,
+        header: u8,
+        out: &mut Vec<i64>,
+    ) -> Result<()> {
+        // Same header layout as Direct/Patched Base - see Direct's own
+        // comment for why the width field needs the `>> 1` first.
+        let encoded_width = (header >> 1) & 0x1f;
+        // 0 is a genuine special case (fixed delta), not a lookup-table
+        // entry - per `ORCv1.md`'s own note this reuses the direct/
+        // patched-base table but special-cases width 0.
+        let delta_bit_width = if encoded_width == 0 {
+            0
+        } else {
+            rle_v2_decode_bit_width(encoded_width)
+        };
+        let second_byte = *data.get(*pos).context("truncated ORC RLEv2 delta header")?;
+        *pos += 1;
+        let extra_bit = u32::from(header & 0x01);
+        let length = ((extra_bit << 8) | u32::from(second_byte)) as usize + 1;
+
+        let base_value = if signed {
+            read_signed_varint_at(data, pos)?
+        } else {
+            read_varint_at(data, pos)? as i64
+        };
+        out.push(base_value);
+        // The first delta is always a signed varint (its sign says
+        // whether the sequence increases or decreases), regardless of
+        // whether the column's own values are signed.
+        let delta_base = read_signed_varint_at(data, pos)?;
+        let increasing = delta_base >= 0;
+        let delta_magnitude = delta_base.unsigned_abs();
+
+        if delta_bit_width == 0 {
+            // Fixed delta: every subsequent value is `base + k*delta`.
+            let mut acc = base_value;
+            for _ in 1..length {
+                acc = if increasing {
+                    acc.wrapping_add(delta_magnitude as i64)
+                } else {
+                    acc.wrapping_sub(delta_magnitude as i64)
+                };
+                out.push(acc);
+            }
+        } else {
+            let second_value = if increasing {
+                base_value.wrapping_add(delta_magnitude as i64)
+            } else {
+                base_value.wrapping_sub(delta_magnitude as i64)
+            };
+            out.push(second_value);
+            let remaining = length.saturating_sub(2);
+            let mut reader = MsbBitReader::new(
+                data.get(*pos..)
+                    .context("truncated ORC RLEv2 delta magnitudes")?,
+            );
+            let mut acc = second_value;
+            for _ in 0..remaining {
+                let magnitude = reader.read_bits(delta_bit_width)?;
+                acc = if increasing {
+                    acc.wrapping_add(magnitude as i64)
+                } else {
+                    acc.wrapping_sub(magnitude as i64)
+                };
+                out.push(acc);
+            }
+            reader.align_to_byte();
+            *pos += reader.bytes_consumed();
+        }
+        Ok(())
+    }
+
+    /// Dispatches to RLEv1 or RLEv2 based on the column's own declared
+    /// encoding - every integer-backed stream (DATA for numeric columns,
+    /// LENGTH, SECONDARY, and dictionary-mode DATA indices) goes through
+    /// this one function.
+    fn read_int_stream(
+        data: &[u8],
+        pos: &mut usize,
+        v2: bool,
+        signed: bool,
+        count: usize,
+    ) -> Result<Vec<i64>> {
+        if v2 {
+            read_rle_v2(data, pos, signed, count)
+        } else {
+            read_rle_v1(data, pos, signed, count)
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Per-column value decoding: for each scalar `Type::Kind`, read the
+    // column's own PRESENT stream (defaulting to "every row present" if
+    // omitted - a real, common case when a stripe has no nulls at all in
+    // that column), then decode exactly as many values from DATA (and
+    // SECONDARY/LENGTH/DICTIONARY_DATA where the type needs them) as
+    // there are present rows, and interleave `None` back in for every
+    // absent row.
+    // ---------------------------------------------------------------
+
+    /// ORC's own epoch for TIMESTAMP/TIMESTAMP_INSTANT: 2015-01-01
+    /// 00:00:00 UTC, 1,420,070,400 seconds after the Unix epoch -
+    /// verified directly against `orc-rust`'s own
+    /// `ORC_EPOCH_UTC_SECONDS_SINCE_UNIX_EPOCH`.
+    const ORC_TIMESTAMP_EPOCH_UNIX_SECONDS: i64 = 1_420_070_400;
+
+    fn decode_timestamp_nanos(encoded: i64) -> u32 {
+        // The low 3 bits count how many trailing decimal zeros were
+        // stripped from the real nanosecond value (0 means "none
+        // stripped, the full 9-digit value is stored as-is"; 1-7 mean
+        // "(value >> 3) * 10^(zeros+1)") - verified against `orc-rust`'s
+        // own `decode` in `encoding/timestamp.rs`. `encoded` is spec'd as
+        // a non-negative value (the SECONDARY stream is declared an
+        // *unsigned* integer RLE stream), but a real writer's own
+        // handling of a sub-second timestamp before 1970 (a documented,
+        // genuinely tricky edge case - see ORC-763, already accounted
+        // for below in the caller) has been observed producing values
+        // outside that range - `checked_mul` (rather than a raw `*=`
+        // that would panic on overflow) turns that into a best-effort
+        // "at least don't crash" fallback instead, the same "never panic
+        // on real-world input, even input that looks malformed" contract
+        // every other hand-rolled reader in this project already holds.
+        let nanos = (encoded as u64) >> 3;
+        let zeros = (encoded as u64) & 0x7;
+        let scaled = if zeros != 0 {
+            nanos
+                .checked_mul(10u64.pow(zeros as u32 + 1))
+                .unwrap_or(nanos)
+        } else {
+            nanos
+        };
+        (scaled % 1_000_000_000) as u32
+    }
+
+    fn format_float(v: f32) -> String {
+        if v.fract() == 0.0 && v.abs() < 1e7 {
+            format!("{v:.0}")
+        } else {
+            v.to_string()
+        }
+    }
+
+    fn format_double(v: f64) -> String {
+        if v.fract() == 0.0 && v.abs() < 1e15 {
+            format!("{v:.0}")
+        } else {
+            v.to_string()
+        }
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// Converts an unscaled `i128` integer plus a `scale` (digits after
+    /// the decimal point) into its decimal string form - the same "just
+    /// insert a decimal point at the right digit position" final step
+    /// this project's Avro/Parquet decimal renderers already share,
+    /// simplified here since the unscaled value is already a plain
+    /// integer (no raw two's-complement-byte long division needed the
+    /// way an arbitrary-width byte buffer would require).
+    fn format_decimal(unscaled: i128, scale: u32) -> String {
+        let negative = unscaled < 0;
+        let magnitude = unscaled.unsigned_abs().to_string();
+        let scale = scale as usize;
+        let padded = if magnitude.len() <= scale {
+            format!("{:0>width$}", magnitude, width = scale + 1)
+        } else {
+            magnitude
+        };
+        let split_at = padded.len() - scale;
+        let mut result = String::new();
+        if negative {
+            result.push('-');
+        }
+        result.push_str(&padded[..split_at]);
+        if scale > 0 {
+            result.push('.');
+            result.push_str(&padded[split_at..]);
+        }
+        result
+    }
+
+    struct ColumnStreams<'a> {
+        present: Option<&'a [u8]>,
+        data: Option<&'a [u8]>,
+        length: Option<&'a [u8]>,
+        secondary: Option<&'a [u8]>,
+        dictionary_data: Option<&'a [u8]>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_scalar_column(
+        kind: OrcTypeKind,
+        encoding: &ColumnEncodingInfo,
+        streams: &ColumnStreams,
+        num_rows: usize,
+        precision: Option<u32>,
+        scale: Option<u32>,
+    ) -> Result<Vec<Option<String>>> {
+        let v2 = encoding.kind.is_v2();
+        let present: Vec<bool> = match streams.present {
+            Some(bytes) => {
+                let mut pos = 0usize;
+                read_boolean_rle(bytes, &mut pos, num_rows)?
+            }
+            None => vec![true; num_rows],
+        };
+        let non_null_count = present.iter().filter(|&&p| p).count();
+
+        let values: Vec<String> = match kind {
+            OrcTypeKind::Boolean => {
+                let bytes = streams.data.unwrap_or(&[]);
+                let mut pos = 0usize;
+                read_boolean_rle(bytes, &mut pos, non_null_count)?
+                    .into_iter()
+                    .map(|b| b.to_string())
+                    .collect()
+            }
+            OrcTypeKind::Byte => {
+                let bytes = streams.data.unwrap_or(&[]);
+                let mut pos = 0usize;
+                read_byte_rle(bytes, &mut pos, non_null_count)?
+                    .into_iter()
+                    .map(|b| (b as i8).to_string())
+                    .collect()
+            }
+            OrcTypeKind::Short | OrcTypeKind::Int | OrcTypeKind::Long | OrcTypeKind::Date => {
+                let bytes = streams.data.unwrap_or(&[]);
+                let mut pos = 0usize;
+                let ints = read_int_stream(bytes, &mut pos, v2, true, non_null_count)?;
+                if kind == OrcTypeKind::Date {
+                    ints.into_iter()
+                        .map(|days| {
+                            EpochDate::from_days(days)
+                                .map(|d| d.format_ymd())
+                                .unwrap_or_else(|| days.to_string())
+                        })
+                        .collect()
+                } else {
+                    ints.into_iter().map(|v| v.to_string()).collect()
+                }
+            }
+            OrcTypeKind::Float => {
+                let bytes = streams.data.unwrap_or(&[]);
+                (0..non_null_count)
+                    .map(|i| {
+                        let b = &bytes[i * 4..i * 4 + 4];
+                        format_float(f32::from_le_bytes(b.try_into().unwrap()))
+                    })
+                    .collect::<Vec<_>>()
+            }
+            OrcTypeKind::Double => {
+                let bytes = streams.data.unwrap_or(&[]);
+                (0..non_null_count)
+                    .map(|i| {
+                        let b = &bytes[i * 8..i * 8 + 8];
+                        format_double(f64::from_le_bytes(b.try_into().unwrap()))
+                    })
+                    .collect::<Vec<_>>()
+            }
+            OrcTypeKind::String | OrcTypeKind::Varchar | OrcTypeKind::Char => {
+                if encoding.kind.is_dictionary() {
+                    let dict_size = encoding.dictionary_size as usize;
+                    let length_bytes = streams.length.unwrap_or(&[]);
+                    let mut lp = 0usize;
+                    let lengths = read_int_stream(length_bytes, &mut lp, v2, false, dict_size)?;
+                    let dict_bytes = streams.dictionary_data.unwrap_or(&[]);
+                    let mut dict_pos = 0usize;
+                    let mut dictionary: Vec<String> = Vec::with_capacity(dict_size);
+                    for len in lengths {
+                        let len = len as usize;
+                        let slice = dict_bytes
+                            .get(dict_pos..dict_pos + len)
+                            .context("truncated ORC dictionary data stream")?;
+                        dictionary.push(String::from_utf8_lossy(slice).into_owned());
+                        dict_pos += len;
+                    }
+                    let data_bytes = streams.data.unwrap_or(&[]);
+                    let mut dp = 0usize;
+                    let indices = read_int_stream(data_bytes, &mut dp, v2, false, non_null_count)?;
+                    indices
+                        .into_iter()
+                        .map(|idx| dictionary.get(idx as usize).cloned().unwrap_or_default())
+                        .collect()
+                } else {
+                    let length_bytes = streams.length.unwrap_or(&[]);
+                    let mut lp = 0usize;
+                    let lengths =
+                        read_int_stream(length_bytes, &mut lp, v2, false, non_null_count)?;
+                    let data_bytes = streams.data.unwrap_or(&[]);
+                    let mut dp = 0usize;
+                    let mut out = Vec::with_capacity(non_null_count);
+                    for len in lengths {
+                        let len = len as usize;
+                        let slice = data_bytes
+                            .get(dp..dp + len)
+                            .context("truncated ORC string DATA stream")?;
+                        out.push(String::from_utf8_lossy(slice).into_owned());
+                        dp += len;
+                    }
+                    out
+                }
+            }
+            OrcTypeKind::Binary => {
+                let length_bytes = streams.length.unwrap_or(&[]);
+                let mut lp = 0usize;
+                let lengths = read_int_stream(length_bytes, &mut lp, v2, false, non_null_count)?;
+                let data_bytes = streams.data.unwrap_or(&[]);
+                let mut dp = 0usize;
+                let mut out = Vec::with_capacity(non_null_count);
+                for len in lengths {
+                    let len = len as usize;
+                    let slice = data_bytes
+                        .get(dp..dp + len)
+                        .context("truncated ORC binary DATA stream")?;
+                    out.push(hex_encode(slice));
+                    dp += len;
+                }
+                out
+            }
+            OrcTypeKind::Decimal => {
+                let precision = precision.unwrap_or(38);
+                let scale = scale.unwrap_or(0);
+                if precision == 0 {
+                    bail!("ORC decimal column declares zero precision");
+                }
+                let data_bytes = streams.data.unwrap_or(&[]);
+                let mut dp = 0usize;
+                let secondary_bytes = streams.secondary.unwrap_or(&[]);
+                let mut sp = 0usize;
+                let mut out = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    // The unscaled value is stored as an "unbounded"
+                    // zigzag varint (up to 38 digits fits comfortably in
+                    // i128) - decoded the same way any other zigzagged
+                    // varint is, just not through the fixed-width RLE
+                    // machinery, since decimal DATA is a raw sequence of
+                    // varints with no run-length framing at all.
+                    let raw = read_unbounded_varint(data_bytes, &mut dp)?;
+                    out.push(format_decimal(raw, scale));
+                    let _ = read_signed_varint_at(secondary_bytes, &mut sp); // scale stream, already known from schema
+                }
+                out
+            }
+            OrcTypeKind::Timestamp | OrcTypeKind::TimestampInstant => {
+                let data_bytes = streams.data.unwrap_or(&[]);
+                let mut dp = 0usize;
+                let seconds = read_int_stream(data_bytes, &mut dp, v2, true, non_null_count)?;
+                let secondary_bytes = streams.secondary.unwrap_or(&[]);
+                let mut sp = 0usize;
+                let nanos_encoded =
+                    read_int_stream(secondary_bytes, &mut sp, v2, false, non_null_count)?;
+                seconds
+                    .into_iter()
+                    .zip(nanos_encoded)
+                    .map(|(secs_since_orc_epoch, nanos_encoded)| {
+                        let nanos = decode_timestamp_nanos(nanos_encoded);
+                        let mut total_secs =
+                            ORC_TIMESTAMP_EPOCH_UNIX_SECONDS + secs_since_orc_epoch;
+                        // ORC-763: a pre-1970 timestamp with a real
+                        // sub-second component needs one second
+                        // subtracted, since ORC stores seconds truncated
+                        // toward the epoch rather than toward negative
+                        // infinity - verified against `orc-rust`'s own
+                        // `decode` in `encoding/timestamp.rs`.
+                        if total_secs < 0 && nanos > 999_999 {
+                            total_secs -= 1;
+                        }
+                        EpochDateTime::from_unix_seconds(total_secs, nanos)
+                            .map(|dt| dt.format_t_frac(9))
+                            .unwrap_or_else(|| format!("{total_secs}.{nanos:09}"))
+                    })
+                    .collect()
+            }
+            OrcTypeKind::Struct
+            | OrcTypeKind::List
+            | OrcTypeKind::Map
+            | OrcTypeKind::Union
+            | OrcTypeKind::Other(_) => {
+                unreachable!("compound/unrecognized types never reach read_scalar_column")
+            }
+        };
+
+        let mut values_iter = values.into_iter();
+        Ok(present
+            .into_iter()
+            .map(|p| if p { values_iter.next() } else { None })
+            .collect())
+    }
+
+    /// A plain (non-RLE-framed) zigzagged base-128 varint, decoded
+    /// straight to `i128` - used only by DECIMAL's own DATA stream, which
+    /// (per `ORCv1.md`'s own "Decimal Columns" section) stores each
+    /// value as a bare varint with no run-length wrapper around it at
+    /// all, unlike every other integer-backed stream in this reader.
+    fn read_unbounded_varint(data: &[u8], pos: &mut usize) -> Result<i128> {
+        let mut result: u128 = 0;
+        let mut shift = 0u32;
+        loop {
+            if shift >= 128 {
+                bail!("ORC decimal varint is too long (exceeds 128 bits)");
+            }
+            let byte = *data
+                .get(*pos)
+                .context("truncated ORC decimal DATA stream")?;
+            *pos += 1;
+            result |= u128::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        // Zigzag decode: for an odd (negative-tagged) value the true
+        // magnitude is `(result >> 1) + 1`, not just `result >> 1` - the
+        // standard `(v >> 1) ^ -(v & 1)` two's-complement XOR trick
+        // `zigzag_decode` uses elsewhere in this module folds this `+1`
+        // in implicitly (XORing with all-ones bits is a bitwise NOT,
+        // i.e. `-(x) - 1`, not `-(x)`); this function's own plain
+        // if/else needs the `+1` spelled out explicitly instead. A prior
+        // draft omitted it, silently rounding every decoded negative
+        // decimal value one part in the last place too high (e.g.
+        // `-67.89` decoding as `-67.88`) - found via real-file testing,
+        // not caught in review, which is exactly why every hand-rolled
+        // reader in this project gets tested against a real generated
+        // fixture before being trusted.
+        let is_negative = result & 1 == 1;
+        let magnitude = if is_negative {
+            (result >> 1) as i128 + 1
+        } else {
+            (result >> 1) as i128
+        };
+        Ok(if is_negative { -magnitude } else { magnitude })
+    }
+
+    // ---------------------------------------------------------------
+    // File-level reading: PostScript -> Footer -> per-stripe streams.
+    // ---------------------------------------------------------------
+
+    const ORC_MAGIC: &[u8; 3] = b"ORC";
+
+    /// A sanity cap on the PostScript's own declared length (the format's
+    /// own hard limit - `ORCv1.md`: "Serialized length must be less that
+    /// 255 bytes") plus the Footer/StripeFooter lengths this reader
+    /// trusts before allocating a buffer sized from them - real files
+    /// never come close to this; it exists purely to bound a corrupted
+    /// or adversarial file's claimed section sizes.
+    const MAX_SECTION_LEN: u64 = 1024 * 1024 * 1024;
+
+    pub(crate) fn columns_from_orc(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let mut file =
+            std::fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let file_len = file
+            .metadata()
+            .context("failed to read ORC file metadata")?
+            .len();
+        if file_len < 4 {
+            bail!("not a valid ORC file (too short to contain a header and postscript)");
+        }
+
+        let mut magic = [0u8; 3];
+        file.read_exact(&mut magic)
+            .context("failed to read ORC file header")?;
+        if &magic != ORC_MAGIC {
+            bail!(
+                "not an ORC file - expected magic \"ORC\", found {:?}",
+                String::from_utf8_lossy(&magic)
+            );
+        }
+
+        // The PostScript's own length is the file's very last byte; the
+        // PostScript itself (never compressed) sits immediately before
+        // it.
+        file.seek(SeekFrom::End(-1))
+            .context("failed to seek to ORC postscript length byte")?;
+        let mut ps_len_byte = [0u8; 1];
+        file.read_exact(&mut ps_len_byte)
+            .context("failed to read ORC postscript length")?;
+        let ps_len = u64::from(ps_len_byte[0]);
+        if ps_len == 0 || ps_len > 255 {
+            bail!("ORC postscript length ({ps_len}) is out of the format's own 1-255 byte range");
+        }
+        if file_len < 4 + ps_len + 1 {
+            bail!("ORC file is too short to contain its own declared postscript");
+        }
+        file.seek(SeekFrom::End(-1 - ps_len as i64))
+            .context("failed to seek to ORC postscript")?;
+        let mut ps_bytes = vec![0u8; ps_len as usize];
+        file.read_exact(&mut ps_bytes)
+            .context("failed to read ORC postscript")?;
+        let postscript = parse_postscript(&ps_bytes)?;
+        if postscript.footer_length > MAX_SECTION_LEN {
+            bail!("ORC postscript declares an implausible footer length");
+        }
+
+        let footer_start = file_len - 1 - ps_len - postscript.footer_length;
+        file.seek(SeekFrom::Start(footer_start))
+            .context("failed to seek to ORC footer")?;
+        let mut footer_compressed = vec![0u8; postscript.footer_length as usize];
+        file.read_exact(&mut footer_compressed)
+            .context("failed to read ORC footer")?;
+        let footer_bytes = decompress_orc_bytes(postscript.compression, &footer_compressed)?;
+        let footer = parse_footer(&footer_bytes)?;
+
+        if footer.types.is_empty() {
+            bail!("ORC file declares no types at all");
+        }
+        let root = &footer.types[0];
+        if root.kind != OrcTypeKind::Struct {
+            bail!(
+                "ORC file's root type is not a struct (found {:?}) - every real ORC file's \
+                 root represents the table's own columns as a struct",
+                root.kind
+            );
+        }
+
+        struct TopLevelColumn {
+            name: String,
+            column_id: u32,
+            kind: OrcTypeKind,
+            precision: Option<u32>,
+            scale: Option<u32>,
+        }
+        let mut top_level: Vec<TopLevelColumn> = Vec::with_capacity(root.subtypes.len());
+        for (i, &column_id) in root.subtypes.iter().enumerate() {
+            let name = root
+                .field_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("column_{i}"));
+            let ty = footer
+                .types
+                .get(column_id as usize)
+                .context("ORC schema references a type id past the end of the type list")?;
+            top_level.push(TopLevelColumn {
+                name,
+                column_id,
+                kind: ty.kind,
+                precision: ty.precision,
+                scale: ty.scale,
+            });
+        }
+
+        // One `Vec<Option<String>>` accumulator per top-level column,
+        // filled stripe by stripe.
+        let mut accumulated: Vec<Vec<Option<String>>> =
+            top_level.iter().map(|_| Vec::new()).collect();
+        let mut placeholder_notes: Vec<Option<String>> = top_level.iter().map(|_| None).collect();
+
+        'stripes: for stripe_info in &footer.stripes {
+            if nrows.is_some_and(|limit| accumulated.first().is_none_or(|c| c.len() >= limit)) {
+                break;
+            }
+            if stripe_info.footer_length > MAX_SECTION_LEN {
+                bail!("ORC stripe declares an implausible footer length");
+            }
+            let footer_offset =
+                stripe_info.offset + stripe_info.index_length + stripe_info.data_length;
+            file.seek(SeekFrom::Start(footer_offset))
+                .context("failed to seek to ORC stripe footer")?;
+            let mut stripe_footer_compressed = vec![0u8; stripe_info.footer_length as usize];
+            file.read_exact(&mut stripe_footer_compressed)
+                .context("failed to read ORC stripe footer")?;
+            let stripe_footer_bytes =
+                decompress_orc_bytes(postscript.compression, &stripe_footer_compressed)?;
+            let stripe_footer = parse_stripe_footer(&stripe_footer_bytes)?;
+
+            // Walk the stream list in order, laying each one out
+            // sequentially starting at the stripe's own file offset -
+            // `ORCv1.md`'s own "Stripe Footer" section states the
+            // streams field is "the single source of truth" for a
+            // stream's location, precisely because there's no separate
+            // offset field on `Stream` itself.
+            let mut stream_offset = stripe_info.offset;
+            let mut raw_streams: HashMap<(u32, OrcStreamKind), Vec<u8>> = HashMap::new();
+            for stream in &stripe_footer.streams {
+                if stream.length > MAX_SECTION_LEN {
+                    bail!("ORC stripe declares an implausible stream length");
+                }
+                let wanted = top_level.iter().any(|c| c.column_id == stream.column)
+                    && !stream.kind.eq(&OrcStreamKind::Other);
+                if wanted {
+                    file.seek(SeekFrom::Start(stream_offset))
+                        .context("failed to seek to ORC stream")?;
+                    let mut raw = vec![0u8; stream.length as usize];
+                    file.read_exact(&mut raw)
+                        .context("failed to read ORC stream")?;
+                    let decompressed = decompress_orc_bytes(postscript.compression, &raw)?;
+                    raw_streams.insert((stream.column, stream.kind), decompressed);
+                }
+                stream_offset += stream.length;
+            }
+
+            let num_rows = stripe_info.number_of_rows as usize;
+            for (idx, col) in top_level.iter().enumerate() {
+                if col.kind.is_compound() {
+                    placeholder_notes[idx] = Some(match col.kind {
+                        OrcTypeKind::Struct => {
+                            "nested Struct column - not yet supported, consider flattening upstream"
+                                .to_string()
+                        }
+                        OrcTypeKind::List => {
+                            "nested List column - not yet supported, consider flattening upstream"
+                                .to_string()
+                        }
+                        OrcTypeKind::Map => {
+                            "nested Map column - not yet supported, consider flattening upstream"
+                                .to_string()
+                        }
+                        OrcTypeKind::Union => {
+                            "nested Union column - not yet supported, consider flattening upstream"
+                                .to_string()
+                        }
+                        _ => unreachable!("is_compound() only true for the four kinds above"),
+                    });
+                    accumulated[idx].extend(std::iter::repeat_n(None, num_rows));
+                    continue;
+                }
+                if matches!(col.kind, OrcTypeKind::Other(_)) {
+                    placeholder_notes[idx] =
+                        Some("unrecognized ORC column type - not supported".to_string());
+                    accumulated[idx].extend(std::iter::repeat_n(None, num_rows));
+                    continue;
+                }
+                let encoding = stripe_footer
+                    .columns
+                    .get(col.column_id as usize)
+                    .context("ORC stripe footer is missing a column encoding entry")?;
+                let streams = ColumnStreams {
+                    present: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Present))
+                        .map(Vec::as_slice),
+                    data: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Data))
+                        .map(Vec::as_slice),
+                    length: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Length))
+                        .map(Vec::as_slice),
+                    secondary: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Secondary))
+                        .map(Vec::as_slice),
+                    dictionary_data: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::DictionaryData))
+                        .map(Vec::as_slice),
+                };
+                let values = read_scalar_column(
+                    col.kind,
+                    encoding,
+                    &streams,
+                    num_rows,
+                    col.precision,
+                    col.scale,
+                )?;
+                accumulated[idx].extend(values);
+            }
+
+            if nrows.is_some_and(|limit| accumulated.first().is_none_or(|c| c.len() >= limit)) {
+                break 'stripes;
+            }
+        }
+
+        let mut out = Vec::with_capacity(top_level.len());
+        for ((col, values), note) in top_level
+            .into_iter()
+            .zip(accumulated)
+            .zip(placeholder_notes)
+        {
+            let total = values.len();
+            if let Some(note) = note {
+                out.push(ColumnProfile {
+                    name: col.name,
+                    current_type: format!("{:?}", col.kind),
+                    ideal_type: "String".to_string(),
+                    description: String::new(),
+                    missing_pct: 0.0,
+                    sample_values: Vec::new(),
+                    notes: note,
+                });
+                continue;
+            }
+            let current_type = match col.kind {
+                OrcTypeKind::Boolean => "bool",
+                OrcTypeKind::Byte | OrcTypeKind::Short | OrcTypeKind::Int | OrcTypeKind::Long => {
+                    "i64"
+                }
+                OrcTypeKind::Float | OrcTypeKind::Double => "f64",
+                OrcTypeKind::String
+                | OrcTypeKind::Varchar
+                | OrcTypeKind::Char
+                | OrcTypeKind::Binary => "String",
+                OrcTypeKind::Decimal => "Decimal",
+                OrcTypeKind::Date => "Date",
+                OrcTypeKind::Timestamp | OrcTypeKind::TimestampInstant => "Timestamp",
+                OrcTypeKind::Struct
+                | OrcTypeKind::List
+                | OrcTypeKind::Map
+                | OrcTypeKind::Union
+                | OrcTypeKind::Other(_) => {
+                    unreachable!("handled above")
+                }
+            };
+            let raw_values: Vec<String> = values.into_iter().flatten().collect();
+            out.push(profile_column(
+                ColumnInput {
+                    name: col.name,
+                    current_type: current_type.to_string(),
+                    raw_values,
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            ));
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Every RLE test below reproduces a worked byte-level example
+        // directly from `ORCv1.md`'s own "Run Length Encoding" section
+        // (quoted in each test's own doc comment) - the same discipline
+        // this project applies to every hand-rolled binary codec: proven
+        // against the format's own reference numbers before being
+        // trusted against a real file.
+
+        /// "a hundred 0's is encoded as [0x61, 0x00]"
+        #[test]
+        fn byte_rle_decodes_a_run() {
+            let data = [0x61, 0x00];
+            let mut pos = 0;
+            let out = read_byte_rle(&data, &mut pos, 100).unwrap();
+            assert_eq!(out, vec![0u8; 100]);
+        }
+
+        /// "the sequence 0x44, 0x45 would be encoded as [0xfe, 0x44, 0x45]"
+        #[test]
+        fn byte_rle_decodes_a_literal_list() {
+            let data = [0xfe, 0x44, 0x45];
+            let mut pos = 0;
+            let out = read_byte_rle(&data, &mut pos, 2).unwrap();
+            assert_eq!(out, vec![0x44, 0x45]);
+        }
+
+        /// "the byte sequence [0xff, 0x80] would be one true followed by
+        /// seven false values"
+        #[test]
+        fn boolean_rle_unpacks_bits_msb_first() {
+            let data = [0xff, 0x80];
+            let mut pos = 0;
+            let out = read_boolean_rle(&data, &mut pos, 8).unwrap();
+            assert_eq!(
+                out,
+                vec![true, false, false, false, false, false, false, false]
+            );
+        }
+
+        /// "100 instances of 7 ... [0x61, 0x00, 0x07]"
+        #[test]
+        fn rle_v1_decodes_a_zero_delta_run() {
+            let data = [0x61, 0x00, 0x07];
+            let mut pos = 0;
+            let out = read_rle_v1(&data, &mut pos, false, 100).unwrap();
+            assert_eq!(out, vec![7i64; 100]);
+        }
+
+        /// "the sequence of numbers running from 100 to 1 ... [0x61, 0xff, 0x64]"
+        #[test]
+        fn rle_v1_decodes_a_negative_delta_run() {
+            let data = [0x61, 0xff, 0x64];
+            let mut pos = 0;
+            let out = read_rle_v1(&data, &mut pos, false, 100).unwrap();
+            let expected: Vec<i64> = (1..=100).rev().collect();
+            assert_eq!(out, expected);
+        }
+
+        /// "Numbers [2, 3, 6, 7, 11] would be encoded as
+        /// [0xfb, 0x02, 0x03, 0x06, 0x07, 0x0b]"
+        #[test]
+        fn rle_v1_decodes_a_literal_list() {
+            let data = [0xfb, 0x02, 0x03, 0x06, 0x07, 0x0b];
+            let mut pos = 0;
+            let out = read_rle_v1(&data, &mut pos, false, 5).unwrap();
+            assert_eq!(out, vec![2, 3, 6, 7, 11]);
+        }
+
+        /// "The unsigned sequence of [10000, 10000, 10000, 10000, 10000]
+        /// would be serialized with short repeat encoding (0), a width
+        /// of 2 bytes (1), and repeat count of 5 (2) as [0x0a, 0x27, 0x10]"
+        #[test]
+        fn rle_v2_short_repeat_matches_the_spec_worked_example() {
+            let data = [0x0a, 0x27, 0x10];
+            let mut pos = 0;
+            let out = read_rle_v2(&data, &mut pos, false, 5).unwrap();
+            assert_eq!(out, vec![10000; 5]);
+        }
+
+        /// "The unsigned sequence of [23713, 43806, 57005, 48879] would be
+        /// serialized with direct encoding (1), a width of 16 bits (15),
+        /// and length of 4 (3) as
+        /// [0x5e, 0x03, 0x5c, 0xa1, 0xab, 0x1e, 0xde, 0xad, 0xbe, 0xef]"
+        #[test]
+        fn rle_v2_direct_matches_the_spec_worked_example() {
+            let data = [0x5e, 0x03, 0x5c, 0xa1, 0xab, 0x1e, 0xde, 0xad, 0xbe, 0xef];
+            let mut pos = 0;
+            let out = read_rle_v2(&data, &mut pos, false, 4).unwrap();
+            assert_eq!(out, vec![23713, 43806, 57005, 48879]);
+        }
+
+        /// The unsigned sequence [2030, 2000, 2020, 1000000, 2040, 2050,
+        /// 2060, 2070, 2080, 2090, 2100, 2110, 2120, 2130, 2140, 2150,
+        /// 2160, 2170, 2180, 2190] - `ORCv1.md`'s own "Patched Base"
+        /// worked example, chosen specifically because it's the single
+        /// most intricate sub-encoding in this file (outlier compression
+        /// via a base value plus a sparse patch list).
+        #[test]
+        fn rle_v2_patched_base_matches_the_spec_worked_example() {
+            let data = [
+                0x8e, 0x13, 0x2b, 0x21, 0x07, 0xd0, 0x1e, 0x00, 0x14, 0x70, 0x28, 0x32, 0x3c, 0x46,
+                0x50, 0x5a, 0x64, 0x6e, 0x78, 0x82, 0x8c, 0x96, 0xa0, 0xaa, 0xb4, 0xbe, 0xfc, 0xe8,
+            ];
+            let mut pos = 0;
+            let out = read_rle_v2(&data, &mut pos, false, 20).unwrap();
+            let expected = vec![
+                2030, 2000, 2020, 1000000, 2040, 2050, 2060, 2070, 2080, 2090, 2100, 2110, 2120,
+                2130, 2140, 2150, 2160, 2170, 2180, 2190,
+            ];
+            assert_eq!(out, expected);
+        }
+
+        /// "The unsigned sequence of [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+        /// would be serialized with delta encoding (3), a width of 4 bits
+        /// (3), length of 10 (9), a base of 2 (2), and first delta of 1
+        /// (2). The resulting sequence is
+        /// [0xc6, 0x09, 0x02, 0x02, 0x22, 0x42, 0x42, 0x46]"
+        #[test]
+        fn rle_v2_delta_matches_the_spec_worked_example() {
+            let data = [0xc6, 0x09, 0x02, 0x02, 0x22, 0x42, 0x42, 0x46];
+            let mut pos = 0;
+            let out = read_rle_v2(&data, &mut pos, false, 10).unwrap();
+            assert_eq!(out, vec![2, 3, 5, 7, 11, 13, 17, 19, 23, 29]);
+        }
+
+        #[test]
+        fn rle_v2_delta_handles_a_decreasing_fixed_delta_sequence() {
+            // A fixed (zero-bit-width) delta run isn't covered by the
+            // spec's own worked example (which uses a varying delta) -
+            // exercised here directly instead: base 100, delta -1, 5
+            // values.
+            // header: type=3 (delta), width_encoded=0 (fixed delta),
+            // length_hi=0 -> 0b11_00000_0 = 0xc0; second byte: length-1=4
+            // (5 values); base value 100 as a plain (non-zigzagged)
+            // varint (an *unsigned*-column call); first delta -1, always
+            // signed zigzag regardless of the column's own signedness:
+            // zigzag(-1) = 1.
+            let data = [0xc0u8, 4, 100, 1];
+            let mut pos = 0;
+            let out = read_rle_v2(&data, &mut pos, false, 5).unwrap();
+            assert_eq!(out, vec![100, 99, 98, 97, 96]);
+        }
+
+        #[test]
+        fn decode_timestamp_nanos_reconstructs_stripped_trailing_zeros() {
+            // 1000 nanoseconds -> encoded 0x0a, 100000 -> encoded 0x0c,
+            // per `ORCv1.md`'s own "Timestamp Columns" section.
+            assert_eq!(decode_timestamp_nanos(0x0a), 1000);
+            assert_eq!(decode_timestamp_nanos(0x0c), 100_000);
+        }
+
+        #[test]
+        fn decode_timestamp_nanos_leaves_a_zero_field_unscaled() {
+            // zeros=0 means "no trailing zeros were stripped" - the
+            // full 9-digit value is already present, shifted left by 3.
+            assert_eq!(decode_timestamp_nanos(123_456_789 << 3), 123_456_789);
+        }
+
+        #[test]
+        fn decode_timestamp_nanos_never_panics_on_an_out_of_range_encoding() {
+            // A real, previously-crashing input (see the git history for
+            // this function): a negative `encoded` value reinterpreted
+            // as an enormous `u64` magnitude overflows a naive
+            // `nanos *= 10^(zeros+1)` - `checked_mul` must degrade
+            // gracefully instead of panicking.
+            let _ = decode_timestamp_nanos(-33);
+            let _ = decode_timestamp_nanos(i64::MIN);
+            let _ = decode_timestamp_nanos(i64::MAX);
+        }
+
+        #[test]
+        fn format_decimal_inserts_the_decimal_point_and_preserves_sign() {
+            assert_eq!(format_decimal(12345, 2), "123.45");
+            assert_eq!(format_decimal(-6789, 2), "-67.89");
+            assert_eq!(format_decimal(0, 2), "0.00");
+            assert_eq!(format_decimal(5, 0), "5");
+            assert_eq!(format_decimal(5, 4), "0.0005");
+        }
+
+        #[test]
+        fn read_unbounded_varint_zigzag_decodes_correctly_including_the_off_by_one_case() {
+            // -6789 zigzag-encodes to 13577 (2*6789 - 1) - a plain varint
+            // of a two-byte value: 13577 = 0b11010100001001, low 7 bits
+            // 0x49 with continuation bit set, then the remaining 7 bits.
+            let mut buf = Vec::new();
+            let mut v = 13577u64;
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    buf.push(byte);
+                    break;
+                }
+                buf.push(byte | 0x80);
+            }
+            let mut pos = 0;
+            let decoded = read_unbounded_varint(&buf, &mut pos).unwrap();
+            assert_eq!(decoded, -6789);
+        }
+
+        #[test]
+        fn postscript_parses_footer_length_and_compression_kind() {
+            // field 1 (footer_length, varint) = 42, field 2 (compression,
+            // varint) = 1 (ZLIB).
+            let bytes = [0x08, 42, 0x10, 1];
+            let ps = parse_postscript(&bytes).unwrap();
+            assert_eq!(ps.footer_length, 42);
+            assert_eq!(ps.compression, OrcCompressionKind::Zlib);
+        }
+
+        #[test]
+        fn proto_reader_skips_an_unrecognized_field_by_wire_type() {
+            // field 99 (length-delimited, 3 bytes of garbage) followed by
+            // field 1 (varint) = 7 - the unknown field must be skipped
+            // cleanly so the real field after it still parses. Field 99's
+            // own tag, (99 << 3) | 2 = 794, doesn't fit in one varint
+            // byte (needs the continuation bit set): 0x9a, 0x06.
+            let bytes = [0x9a, 0x06, 3, b'x', b'y', b'z', (1 << 3), 7];
+            let mut r = ProtoReader::new(&bytes);
+            let (field, wire) = r.next_field().unwrap().unwrap();
+            assert_eq!(field, 99);
+            r.skip_field(wire).unwrap();
+            let (field, wire) = r.next_field().unwrap().unwrap();
+            assert_eq!(field, 1);
+            assert_eq!(wire, WIRE_VARINT);
+            assert_eq!(r.read_varint().unwrap(), 7);
+        }
+
+        #[test]
+        fn compression_chunk_framing_handles_an_original_and_a_zlib_chunk() {
+            // An "original" (incompressible) chunk: length 3, is_original
+            // flag set -> header = (3 << 1) | 1 = 7.
+            let mut data = vec![7, 0, 0, b'a', b'b', b'c'];
+            let out = decompress_orc_bytes(OrcCompressionKind::Zlib, &data).unwrap();
+            assert_eq!(out, b"abc");
+
+            // Two original chunks concatenated - proves the walker
+            // correctly resumes at the next chunk header rather than
+            // assuming a single chunk fills the whole stream.
+            data.extend([5, 0, 0, b'x', b'y']);
+            let out = decompress_orc_bytes(OrcCompressionKind::Zlib, &data).unwrap();
+            assert_eq!(out, b"abcxy");
+        }
+    }
+} // mod orc_support
+
+#[cfg(feature = "orc")]
+fn columns_from_orc(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    orc_support::columns_from_orc(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "orc"))]
+fn columns_from_orc(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "ORC support isn't compiled in - rebuild with `cargo build --release --features orc` (or --features full)"
+    )
+}
+
 // --- JSON / JSON Lines reader ---
 // Nesting is never force-fit into one opaque row: objects are flattened into
 // dot-notation sub-columns (recursively), and array elements are pooled
@@ -23075,6 +25159,100 @@ mod brotli_support {
 // project already holds itself to - there is no independent Parquet
 // specification document that isn't itself just prose describing what
 // that crate (the reference implementation) already does.
+// Shared by Parquet/Arrow IPC's own LZ4 codecs (`parquet_support`,
+// gated behind `feature = "parquet"`) and ORC's own LZ4 codec
+// (`orc_support`, gated behind `feature = "orc"`) - the raw LZ4 block
+// algorithm itself has no format-specific behavior at all (same
+// literal/match token grammar regardless of which container framing
+// wraps it), so this is the same "one hand-rolled implementation,
+// several independently-toggleable feature gates" shape
+// `snappy_support`/`zip_support`/`zstd_support` already use, rather than
+// a third independent copy the way Avro/CBOR's own decimal/float16
+// helpers are deliberately duplicated (those genuinely can't share a
+// gate; this one already doesn't need to avoid one).
+#[cfg(any(feature = "parquet", feature = "orc"))]
+mod lz4_support {
+    use super::*;
+
+    /// Reads LZ4's "linear small integer code" (LSIC): a run of `0xFF`
+    /// bytes, each contributing 255, terminated by (and including) the
+    /// first byte under 255 - verified directly against `lz4_flex`'s own
+    /// `read_integer` (`block/decompress_safe.rs`), the exact function
+    /// name and doc comment it uses for this.
+    fn lz4_read_lsic(data: &[u8], pos: &mut usize) -> Result<usize> {
+        let mut n = 0usize;
+        loop {
+            let b = *data.get(*pos).context("truncated LZ4 length byte")?;
+            *pos += 1;
+            n += usize::from(b);
+            if b != 0xFF {
+                return Ok(n);
+            }
+        }
+    }
+
+    /// Decodes a raw LZ4 block (RFC-less, but a small, stable, widely
+    /// implemented format - LZ4_Block_format.md in the reference `lz4`
+    /// project) until the input is exhausted, which is how a decoder
+    /// recognizes the final, match-free sequence (there's no separate end
+    /// marker) - the core loop shared by Parquet's `LZ4`/`LZ4_RAW`/Hadoop-
+    /// framed pages and Arrow IPC's `LZ4_FRAME` body compression (which
+    /// only know where a block's compressed bytes end, not its
+    /// decompressed size, until the block is actually decoded) and ORC's
+    /// own `LZ4` compression codec (which, like Parquet, always knows the
+    /// exact decompressed size up front - from ORC's own chunk header -
+    /// and validates against it). Verified directly against `lz4_flex`'s
+    /// own safe decoder (`block/decompress_safe.rs::decompress_internal`,
+    /// the exact function this project's own `parquet`/`arrow` dependency
+    /// already uses for this at runtime) rather than assumed from a
+    /// general description: a sequence of "sequences" - [token byte: high
+    /// nibble literal length, low nibble match length - 4, either half
+    /// `0xF` meaning "read more via LSIC"] [literal bytes] [if any input
+    /// remains: 2-byte little-endian match offset (never 0), then a
+    /// match-length copy from `output[pos-offset..]` copied byte-by-byte
+    /// so an offset smaller than the match length still produces the
+    /// correct RLE-style repeat].
+    pub(crate) fn lz4_block_decompress_core(input: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut pos = 0usize;
+        loop {
+            let token = *input.get(pos).context("truncated LZ4 token")?;
+            pos += 1;
+            let mut literal_len = usize::from(token >> 4);
+            if literal_len == 15 {
+                literal_len += lz4_read_lsic(input, &mut pos)?;
+            }
+            let literal = input
+                .get(pos..pos + literal_len)
+                .context("truncated LZ4 literal")?;
+            out.extend_from_slice(literal);
+            pos += literal_len;
+
+            if pos >= input.len() {
+                break;
+            }
+            let offset_bytes = input
+                .get(pos..pos + 2)
+                .context("truncated LZ4 match offset")?;
+            let offset = usize::from(u16::from_le_bytes(offset_bytes.try_into().unwrap()));
+            pos += 2;
+            if offset == 0 || offset > out.len() {
+                bail!("LZ4 match offset out of bounds");
+            }
+            let mut match_len = 4 + usize::from(token & 0x0F);
+            if match_len == 19 {
+                match_len += lz4_read_lsic(input, &mut pos)?;
+            }
+            let start = out.len() - offset;
+            for i in 0..match_len {
+                let byte = out[start + i];
+                out.push(byte);
+            }
+        }
+        Ok(out)
+    }
+} // mod lz4_support
+
 #[cfg(feature = "parquet")]
 mod parquet_support {
     use super::*;
@@ -25326,88 +27504,9 @@ mod parquet_support {
     /// footer could still claim an enormous page.
     const LZ4_MAX_ALLOC: usize = 512 * 1024 * 1024;
 
-    /// Reads LZ4's "linear small integer code" (LSIC): a run of `0xFF`
-    /// bytes, each contributing 255, terminated by (and including) the
-    /// first byte under 255 - verified directly against `lz4_flex`'s own
-    /// `read_integer` (`block/decompress_safe.rs`), the exact function
-    /// name and doc comment it uses for this.
-    fn lz4_read_lsic(data: &[u8], pos: &mut usize) -> Result<usize> {
-        let mut n = 0usize;
-        loop {
-            let b = *data.get(*pos).context("truncated LZ4 length byte")?;
-            *pos += 1;
-            n += usize::from(b);
-            if b != 0xFF {
-                return Ok(n);
-            }
-        }
-    }
-
-    /// Decodes a raw LZ4 block (RFC-less, but a small, stable, widely
-    /// implemented format - LZ4_Block_format.md in the reference `lz4`
-    /// project) until the input is exhausted, which is how a decoder
-    /// recognizes the final, match-free sequence (there's no separate end
-    /// marker) - the core loop shared by Parquet's `LZ4`/`LZ4_RAW`/Hadoop-
-    /// framed pages (which always know the exact decompressed size up
-    /// front from the page header, and validate against it - see
-    /// `lz4_block_decompress` below, the thin wrapper that does that) and
-    /// Arrow IPC's `LZ4_FRAME` body compression (`arrow_ipc_support`'s own
-    /// frame decoder), which only knows where a block's compressed bytes
-    /// end, not its decompressed size, until the block is actually
-    /// decoded. Verified directly against `lz4_flex`'s own safe decoder
-    /// (`block/decompress_safe.rs::decompress_internal`, the exact
-    /// function this project's own `parquet`/`arrow` dependency already
-    /// uses for this at runtime) rather than assumed from a general
-    /// description: a sequence of "sequences" - [token byte: high nibble
-    /// literal length, low nibble match length - 4, either half `0xF`
-    /// meaning "read more via LSIC"] [literal bytes] [if any input
-    /// remains: 2-byte little-endian match offset (never 0), then a
-    /// match-length copy from `output[pos-offset..]` copied byte-by-byte
-    /// so an offset smaller than the match length still produces the
-    /// correct RLE-style repeat].
-    pub(crate) fn lz4_block_decompress_core(input: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(input.len());
-        let mut pos = 0usize;
-        loop {
-            let token = *input.get(pos).context("truncated LZ4 token")?;
-            pos += 1;
-            let mut literal_len = usize::from(token >> 4);
-            if literal_len == 15 {
-                literal_len += lz4_read_lsic(input, &mut pos)?;
-            }
-            let literal = input
-                .get(pos..pos + literal_len)
-                .context("truncated LZ4 literal")?;
-            out.extend_from_slice(literal);
-            pos += literal_len;
-
-            if pos >= input.len() {
-                break;
-            }
-            let offset_bytes = input
-                .get(pos..pos + 2)
-                .context("truncated LZ4 match offset")?;
-            let offset = usize::from(u16::from_le_bytes(offset_bytes.try_into().unwrap()));
-            pos += 2;
-            if offset == 0 || offset > out.len() {
-                bail!("LZ4 match offset out of bounds");
-            }
-            let mut match_len = 4 + usize::from(token & 0x0F);
-            if match_len == 19 {
-                match_len += lz4_read_lsic(input, &mut pos)?;
-            }
-            let start = out.len() - offset;
-            for i in 0..match_len {
-                let byte = out[start + i];
-                out.push(byte);
-            }
-        }
-        Ok(out)
-    }
-
     /// Decodes a raw LZ4 block into exactly `uncompressed_size` bytes - a
-    /// thin wrapper around `lz4_block_decompress_core` adding the
-    /// allocation-size sanity check and the final length validation
+    /// thin wrapper around `lz4_support::lz4_block_decompress_core` adding
+    /// the allocation-size sanity check and the final length validation
     /// Parquet's own LZ4 pages need (their page header always states the
     /// target size up front, unlike Arrow IPC's `LZ4_FRAME` blocks - see
     /// that function's own doc comment).
@@ -25415,7 +27514,7 @@ mod parquet_support {
         if uncompressed_size > LZ4_MAX_ALLOC {
             bail!("LZ4 page claims an implausibly large decompressed size");
         }
-        let out = lz4_block_decompress_core(input)?;
+        let out = lz4_support::lz4_block_decompress_core(input)?;
         if out.len() != uncompressed_size {
             bail!(
                 "LZ4 block decompressed to {} bytes, expected {uncompressed_size}",
@@ -29076,9 +31175,9 @@ mod arrow_ipc_support {
     /// own `compression.rs`), a meaningfully different envelope from
     /// Parquet's own raw-block/Hadoop-framed LZ4 conventions this project
     /// already hand-rolled - only the innermost block-decode algorithm
-    /// (`lz4_block_decompress_core`, refactored out of `parquet_support`'s
-    /// own `lz4_block_decompress` specifically for this reuse - see that
-    /// function's own doc comment) is actually shared between the two.
+    /// (`lz4_support::lz4_block_decompress_core`, its own shared module -
+    /// see that function's own doc comment) is actually shared between the
+    /// two.
     /// Verified directly against the reference LZ4 Frame Format spec
     /// (github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md): a 4-byte
     /// magic, a frame descriptor (FLG byte - version/block-independence/
@@ -29152,7 +31251,7 @@ mod arrow_ipc_support {
             if is_uncompressed {
                 out.extend_from_slice(block);
             } else {
-                out.extend_from_slice(&super::parquet_support::lz4_block_decompress_core(block)?);
+                out.extend_from_slice(&super::lz4_support::lz4_block_decompress_core(block)?);
             }
             if block_checksum_flag {
                 pos += 4;
@@ -38355,6 +40454,7 @@ enum InputFormat {
     Stata,
     Sas7bdat,
     Spss,
+    Orc,
 }
 
 impl InputFormat {
@@ -38385,6 +40485,7 @@ impl InputFormat {
             InputFormat::Stata => "stata",
             InputFormat::Sas7bdat => "sas7bdat",
             InputFormat::Spss => "spss",
+            InputFormat::Orc => "orc",
         }
     }
 }
@@ -38481,6 +40582,34 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
             // PARQUET_MAGIC_ENCR_FOOTER in file/mod.rs).
             if &tail == b"PAR1" || &tail == b"PARE" {
                 return Some(InputFormat::Parquet);
+            }
+        }
+    }
+
+    // --- ORC: the file's own header is the literal 3-byte ASCII string
+    // "ORC" (`ORCv1.md`'s own "Footer" section: "The Header consists of
+    // the bytes 'ORC' to support tools that want to scan the front of
+    // the file to determine the type of the file") - a much shorter,
+    // weaker fixed prefix than this function's other magic numbers (3
+    // bytes of plain ASCII could plausibly open an unrelated text file),
+    // so it's paired with a second, corroborating check on the *other*
+    // end of the file rather than trusted alone: ORC's own trailing byte
+    // is always the PostScript's serialized length (1-255, per the
+    // format's own hard limit - "Serialized length must be less that 255
+    // bytes"), and that many bytes must actually fit before the file's
+    // own footer. A random file that happens to start with "ORC" would
+    // also have to end with a byte whose value, read as a length, stays
+    // within the file's own remaining size - not a full protobuf parse
+    // (which would need the `orc` feature's own reader, unavailable to
+    // this always-compiled sniffing function), but enough to rule out
+    // the common false-positive shape of a short text file that merely
+    // opens with the word "ORC" and ends with ordinary prose.
+    if head.starts_with(b"ORC") && file_len >= 12 {
+        let mut ps_len_byte = [0u8; 1];
+        if file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut ps_len_byte).is_ok() {
+            let ps_len = u64::from(ps_len_byte[0]);
+            if ps_len >= 1 && ps_len + 4 <= file_len {
+                return Some(InputFormat::Orc);
             }
         }
     }
@@ -38615,9 +40744,10 @@ fn detect_format(
             "stata" | "dta" => Ok(InputFormat::Stata),
             "sas7bdat" | "sas" => Ok(InputFormat::Sas7bdat),
             "spss" | "sav" | "zsav" => Ok(InputFormat::Spss),
+            "orc" => Ok(InputFormat::Orc),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, or spss)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, or orc)"
                 )
             }
         };
@@ -38648,6 +40778,7 @@ fn detect_format(
         "dta" => Ok(InputFormat::Stata),
         "sas7bdat" => Ok(InputFormat::Sas7bdat),
         "sav" | "zsav" => Ok(InputFormat::Spss),
+        "orc" => Ok(InputFormat::Orc),
         // The extension alone doesn't tell us - either there isn't one, or
         // it's not one of the above. Before giving up, try the file's own
         // bytes: fixed-width text and the four log formats have no magic
@@ -38659,7 +40790,7 @@ fn detect_format(
                 return Ok(format);
             }
             bail!(
-                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss explicitly"
+                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss|orc explicitly"
             )
         }
     }
@@ -41975,12 +44106,14 @@ mod xlsx_support {
 /// A hand-rolled decoder for Snappy's *raw* block format (not the higher-
 /// level "frame" format), shared by `avro_support` (Avro's own Snappy
 /// codec, which appends an extra trailing CRC32 this module knows nothing
-/// about - that framing is Avro's own concern, handled by its caller) and
+/// about - that framing is Avro's own concern, handled by its caller),
 /// `parquet_support` (Parquet's SNAPPY page-compression codec, which uses
-/// the raw block with no extra framing at all) - one decoder serving two
-/// independent features, the same "one hand-rolled implementation, several
-/// gates" shape `zip_support`/`zstd_support` already use.
-#[cfg(any(feature = "avro", feature = "parquet"))]
+/// the raw block with no extra framing at all), and `orc_support` (ORC's
+/// own SNAPPY compression codec, same raw-block convention) - one decoder
+/// serving three independent features, the same "one hand-rolled
+/// implementation, several gates" shape `zip_support`/`zstd_support`
+/// already use.
+#[cfg(any(feature = "avro", feature = "parquet", feature = "orc"))]
 mod snappy_support {
     use super::*;
 
@@ -42114,14 +44247,20 @@ mod snappy_support {
     }
 } // mod snappy_support
 
-/// Gated on `any(zstd, avro, parquet)`, not just `zstd`: the `avro`
+/// Gated on `any(zstd, avro, parquet, orc)`, not just `zstd`: the `avro`
 /// feature's own hand-rolled reader (`avro_support`) reuses
 /// `zstd_decompress` directly for Avro's Zstandard codec, the same way
-/// it reuses `inflate` for Avro's Deflate codec, and `parquet_support`
-/// reuses it too for Parquet's own ZSTD page-compression codec - one
-/// decoder serving three independent features, exactly like `zip_support`
+/// it reuses `inflate` for Avro's Deflate codec, `parquet_support` reuses
+/// it too for Parquet's own ZSTD page-compression codec, and
+/// `orc_support` reuses it for ORC's own ZSTD compression codec - one
+/// decoder serving four independent features, exactly like `zip_support`
 /// already serves both `xlsx` and `npy`.
-#[cfg(any(feature = "zstd", feature = "avro", feature = "parquet"))]
+#[cfg(any(
+    feature = "zstd",
+    feature = "avro",
+    feature = "parquet",
+    feature = "orc"
+))]
 mod zstd_support {
     use super::*;
 
@@ -43691,6 +45830,7 @@ pub fn run() -> Result<()> {
             InputFormat::Stata => columns_from_stata(&read_path, args.nrows, args.samples)?,
             InputFormat::Sas7bdat => columns_from_sas7bdat(&read_path, args.nrows, args.samples)?,
             InputFormat::Spss => columns_from_spss(&read_path, args.nrows, args.samples)?,
+            InputFormat::Orc => columns_from_orc(&read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
@@ -46483,6 +48623,26 @@ mod tests {
 
         sniff_matches(b"$FL2rest of a real SPSS header...", "spss");
         sniff_matches(b"$FL3rest of a real SPSS header (zsav)...", "spss");
+
+        // ORC's own header magic ("ORC") plus a plausible trailing
+        // postscript-length byte that actually fits within the file.
+        let mut orc = b"ORC".to_vec();
+        orc.extend_from_slice(&[0u8; 20]);
+        orc.push(5); // postscript length: 5 + 4 <= file_len (28)
+        sniff_matches(&orc, "orc");
+    }
+
+    #[test]
+    fn sniff_format_does_not_match_orc_on_header_alone() {
+        // "ORC" opens the buffer, but the trailing byte - read as a
+        // postscript length - claims more bytes than the file actually
+        // has left, the exact false-positive shape (ordinary text that
+        // happens to start with "ORC") this two-ended check exists to
+        // rule out.
+        let mut not_orc = b"ORC just three letters, not a real file".to_vec();
+        let last = not_orc.len() - 1;
+        not_orc[last] = 255; // 255 + 4 far exceeds this short buffer's length
+        assert_ne!(sniff_bytes(&not_orc).map(|f| f.as_str()), Some("orc"));
     }
 
     #[test]
@@ -48538,6 +50698,198 @@ mod tests {
         let path = Path::new("tests/fixtures/malformed_garbage.sav");
         let mine = spss_support::columns_from_spss(path, None, 100);
         let theirs = columns_from_spss_via_ambers_crate(path, 100);
+        assert_eq!(mine.is_ok(), theirs.is_ok());
+    }
+
+    /// Test-only: `orc-rust` is a dev-dependency that was never a runtime
+    /// dependency of this project's own `orc` feature to begin with (see
+    /// Cargo.toml) - `orc_support`'s own hand-rolled reader was built and
+    /// verified directly against `orc-rust`'s own source (plus the
+    /// official `apache/orc-format` specification) from the start, the
+    /// same "went straight to a hand-roll, never shipped the real crate
+    /// first" story SPSS/`ambers` already tell. This function's only job
+    /// is producing the "expected" side of
+    /// `orc_reader_matches_the_orc_rust_crate_output_exactly` by reading
+    /// the same file through `orc-rust`'s real, independent Arrow-based
+    /// decoder.
+    #[cfg(all(test, feature = "orc"))]
+    fn columns_from_orc_via_orc_rust_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        use arrow58::array::Float32Array;
+        use arrow58::array::Float64Array;
+        use arrow58::datatypes::DataType;
+
+        let file = std::fs::File::open(path).context("failed to open ORC fixture")?;
+        let builder = orc_rust::ArrowReaderBuilder::try_new(file)
+            .map_err(|e| Error::from(std::io::Error::other(e.to_string())))?;
+        let schema = builder.schema();
+        let reader = builder.build();
+
+        let n = schema.fields().len();
+        let mut current_types: Vec<&'static str> = Vec::with_capacity(n);
+        for field in schema.fields() {
+            let t = match field.data_type() {
+                DataType::Boolean => "bool",
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "i64",
+                DataType::Float32 | DataType::Float64 => "f64",
+                DataType::Utf8 | DataType::Binary => "String",
+                DataType::Decimal128(..) => "Decimal",
+                DataType::Date32 => "Date",
+                DataType::Timestamp(..) => "Timestamp",
+                other => bail!("orc-rust oracle: unhandled Arrow data type {other:?}"),
+            };
+            current_types.push(t);
+        }
+        let mut raw_values: Vec<Vec<String>> = vec![Vec::new(); n];
+        let mut total = 0usize;
+
+        for batch in reader {
+            let batch = batch.map_err(|e| Error::from(std::io::Error::other(e.to_string())))?;
+            total += batch.num_rows();
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..n {
+                let array = batch.column(i);
+                let plain_f64 = array.as_any().downcast_ref::<Float64Array>();
+                let plain_f32 = array.as_any().downcast_ref::<Float32Array>();
+                for row in 0..array.len() {
+                    if array.is_null(row) {
+                        continue;
+                    }
+                    // Arrow's own `Display` for a plain float always
+                    // keeps a trailing decimal point (`"1.0"`), unlike
+                    // this project's own established convention - the
+                    // same oracle-specific quirk the SPSS/`ambers` oracle
+                    // above already had to normalize away, for the
+                    // identical reason.
+                    let s = if let Some(floats) = plain_f64 {
+                        let v = floats.value(row);
+                        if v.fract() == 0.0 && v.abs() < 1e15 {
+                            format!("{v:.0}")
+                        } else {
+                            v.to_string()
+                        }
+                    } else if let Some(floats) = plain_f32 {
+                        let v = floats.value(row);
+                        if v.fract() == 0.0 && v.abs() < 1e7 {
+                            format!("{v:.0}")
+                        } else {
+                            v.to_string()
+                        }
+                    } else if matches!(array.data_type(), DataType::Binary) {
+                        let bin = array
+                            .as_any()
+                            .downcast_ref::<arrow58::array::BinaryArray>()
+                            .context("orc-rust oracle: expected a BinaryArray")?;
+                        bin.value(row).iter().map(|b| format!("{b:02x}")).collect()
+                    } else if let Some(ts) = array
+                        .as_any()
+                        .downcast_ref::<arrow58::array::TimestampNanosecondArray>()
+                    {
+                        // Arrow's own `Display` for a timestamp trims
+                        // trailing-zero fractional digits (and omits the
+                        // fraction entirely for an exact whole second),
+                        // unlike this project's own fixed 9-digit
+                        // nanosecond rendering - both represent the
+                        // identical instant, so this re-derives the
+                        // string through this project's own formatter
+                        // for an apples-to-apples comparison, the same
+                        // "don't trust the oracle's own rendering
+                        // verbatim" treatment every other oracle in this
+                        // file already needs somewhere.
+                        let nanos_since_epoch = ts.value(row);
+                        EpochDateTime::from_unix_seconds(
+                            nanos_since_epoch.div_euclid(1_000_000_000),
+                            nanos_since_epoch.rem_euclid(1_000_000_000) as u32,
+                        )
+                        .map(|dt| dt.format_t_frac(9))
+                        .context("orc-rust oracle: timestamp out of representable range")?
+                    } else {
+                        arrow58::util::display::array_value_to_string(array, row)
+                            .context("orc-rust oracle: failed to stringify a cell")?
+                    };
+                    raw_values[i].push(s);
+                }
+            }
+        }
+
+        let mut columns = Vec::with_capacity(n);
+        for (i, field) in schema.fields().iter().enumerate() {
+            columns.push(profile_column(
+                ColumnInput {
+                    name: field.name().clone(),
+                    current_type: current_types[i].to_string(),
+                    raw_values: std::mem::take(&mut raw_values[i]),
+                    total,
+                    skip_heuristics: false,
+                },
+                n_samples,
+            ));
+        }
+        Ok(columns)
+    }
+
+    /// Cross-verification oracle for the hand-rolled ORC reader
+    /// (`orc_support` - see Cargo.toml) against the real `orc-rust`
+    /// crate, kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "orc")]
+    #[test]
+    fn orc_reader_matches_the_orc_rust_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/type_detection.orc",
+            "tests/fixtures/edge_orc_rle_v2_encodings.orc",
+            "tests/fixtures/edge_orc_missing_values.orc",
+            "tests/fixtures/edge_orc_dictionary_strings.orc",
+            "tests/fixtures/edge_orc_binary_and_bool.orc",
+            "tests/fixtures/edge_orc_compression_none.orc",
+            "tests/fixtures/edge_orc_compression_zlib.orc",
+            "tests/fixtures/edge_orc_compression_snappy.orc",
+            "tests/fixtures/edge_orc_compression_zstd.orc",
+            "tests/fixtures/edge_orc_compression_lz4.orc",
+            "tests/fixtures/edge_orc_decimal_and_timestamp.orc",
+        ] {
+            let path = Path::new(f);
+            let mine = orc_support::columns_from_orc(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_orc_via_orc_rust_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: orc-rust-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.missing_pct, t.missing_pct,
+                    "{f} col '{}': missing_pct",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Both readers must agree on success/failure for genuinely bad
+    /// input - real-fixture comparisons are the assertion above; this one
+    /// covers `malformed_garbage.orc` separately since a clean rejection
+    /// has no field-by-field output to compare.
+    #[cfg(feature = "orc")]
+    #[test]
+    fn orc_reader_agrees_with_the_orc_rust_crate_on_malformed_input() {
+        let path = Path::new("tests/fixtures/malformed_garbage.orc");
+        let mine = orc_support::columns_from_orc(path, None, 100);
+        let theirs = columns_from_orc_via_orc_rust_crate(path, 100);
         assert_eq!(mine.is_ok(), theirs.is_ok());
     }
 }
