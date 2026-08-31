@@ -2437,6 +2437,92 @@ hot paths:
   reported as an in-process heuristic-engine number rather than an
   end-to-end one.
 
+A fourth pass took a different approach from the first three: rather than
+reading hot-path code and forming a hypothesis, it used a real sampling
+profiler (`samply`, with `dsymutil`-generated debug symbols and `atos` for
+address-to-symbol resolution) against this project's own release build
+processing a real 400,000-row JSON file, to find out empirically where
+time was actually going rather than guessing. This surfaced two real
+findings the first three passes hadn't - and, just as instructively, one
+promising-looking lead that turned out not to hold up once measured
+properly, kept here as a record of why it was reverted rather than
+quietly dropped.
+
+**A genuine hazard of profiling heavily-optimized/inlined Rust code
+surfaced immediately and shaped how the rest of this pass was read**:
+`atos` resolves an address to the *nearest* preceding symbol, and
+identical-code-folding across structurally-similar functions (here,
+`profile_column`'s and `profile_json_path`'s own near-identical
+`ColumnProfile { ... }`-construction-and-return epilogues) means a
+symbol name in the profiler's output isn't always the function actually
+executing. Caught by cross-checking self-time findings against their
+*full call stack*, not just the leaf symbol - a sample attributed to
+`profile_column` (a CSV/Excel/fixed-width-only function) whose own
+caller chain read `columns_from_json -> profile_json_records ->
+profile_json_path` could only mean the real code executing was
+`profile_json_path`'s own epilogue, not `profile_column`'s. Every
+finding below was confirmed this way before being trusted, including
+one case (`gzip_decompress`/`HuffmanTable::decode` appearing to consume
+real self-time while reading a plain, uncompressed `.jsonl` file) that
+turned out to be pure symbol-folding noise once the call stack was
+checked - correctly ignored rather than "fixed."
+
+- **`profile_json_path` cloned every string value in a column, only to
+  drop every one of those clones again when the function returned.** A
+  `JsonValue::String`'s own data already lives as long as the caller's
+  `values`/`pool` borrow does - there was nothing to preserve by cloning
+  instead of borrowing. Changed `scalar_raw` from `Vec<String>` to
+  `Vec<Cow<str>>`: a string value now borrows directly (`Cow::Borrowed`),
+  a bool needs no allocation at all (there are only ever two possible
+  values, `"true"`/`"false"`), and only a number genuinely needs a fresh
+  owned allocation (there's no pre-existing string form to borrow from).
+- **`json_support`'s own JSON-object parser started every object's `Map`
+  at zero capacity**, so a real-world object with more than a couple of
+  fields paid for several small `Vec` reallocations via `Map::insert`'s
+  own growth - a cost that repeats independently for every single object
+  in a file, unlike an array's own one-time, amortized growth to its
+  final size. Changed to `Map::with_capacity(8)` - a plain guess at "big
+  enough for most objects, small enough not to waste memory on tiny
+  ones," not tuned against a specific corpus, since `Vec::with_capacity`
+  degrades gracefully (one more real reallocation, no different from
+  before) for any object wider than this.
+- **The lead that didn't hold up**: `ColumnProfile::to_json`'s own field
+  clones (`self.name.clone()`, etc.) looked like a plausible next target,
+  reached ~300 times for a file with many columns - so it was fixed to
+  consume `self` by value instead (renamed to `into_json` per Rust's own
+  naming convention, threading an owned `BTreeMap` through `render_json`
+  and reordering `run()`'s own status-line computation to happen first).
+  It compiled clean, passed every test, and produced byte-identical
+  output - but a controlled, alternating-binary comparison (old and new
+  binaries run back-to-back, several times each, specifically to rule
+  out the thermal-drift noise this pass's own benchmarking kept running
+  into) on a real file with 301 columns showed *no measurable
+  difference* at all. `ColumnProfile::to_json` is called once per
+  *column*, not once per row - even a wide file rarely has more than a
+  few hundred of those, dwarfed by however many thousands or millions of
+  rows drive everything else this project measures. Reverted rather than
+  kept as unproven complexity, per this project's own "verify, don't
+  assume" discipline applied to itself - a change that adds real
+  structural churn (a renamed method, a restructured caller, two
+  changed function signatures) needs to earn its place with a measured
+  result, not just a plausible-sounding argument.
+
+Verified the same way as every pass before it: full test suite (307
+unit + 206 integration tests) unchanged and passing, clippy/fmt clean,
+and - specifically because this pass's own early `cargo bench`
+comparisons kept producing inconsistent "regressed"/"improved" labels
+against a `target/criterion`-stored prior run affected by exactly the
+thermal-drift/background-load noise this file's own header already
+warns about - a controlled alternating-binary comparison instead:
+building an "old" and "new" binary once each, then running them
+back-to-back several times apiece on the same real/synthetic files,
+so any one binary's runs are never all clustered together at one
+thermal extreme. On a real 400,000-row JSON file, this showed a clean,
+reproducible ~24-28% improvement (0.83-0.94s down to 0.65-0.67s); on a
+`benches/end_to_end.rs`-shaped synthetic fixture at 200,000 rows, a
+clean ~30% improvement (0.34s down to 0.23-0.24s) - both confirmed
+byte-identical to the pre-fix output via `diff`.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

@@ -1044,7 +1044,20 @@ mod json_support {
         fn parse_object(&mut self) -> std::result::Result<Value, ParseError> {
             self.enter()?;
             self.pos += 1; // consume '{'
-            let mut map = Map::new();
+            // A small non-zero starting capacity rather than `Map::new()`
+            // (0 capacity) - found via real profiling (`samply`/`atos`
+            // against this project's own release build) that `Map::
+            // insert`'s own `Vec` growth was a genuine, repeated cost
+            // here: real-world JSON objects overwhelmingly have more than
+            // one or two fields, so starting at 0 and doubling up through
+            // several small reallocations per object adds up once a file
+            // has hundreds of thousands of records. 8 is a plain guess at
+            // "big enough for most objects, small enough not to waste
+            // memory on tiny ones" - not tuned against a specific corpus,
+            // since `Vec::with_capacity` still degrades gracefully (one
+            // more real reallocation, no different from today) for any
+            // object wider than this.
+            let mut map = Map::with_capacity(8);
             self.skip_whitespace();
             if self.peek() == Some(b'}') {
                 self.pos += 1;
@@ -11683,7 +11696,18 @@ fn profile_json_path(
     };
 
     let mut kind_counts: HashMap<JsonKind, usize> = HashMap::new();
-    let mut scalar_raw: Vec<String> = Vec::new();
+    // `Cow` rather than `String`: a `JsonValue::String` already owns its
+    // data for as long as the caller's own `values`/`pool` borrow lives
+    // (found via real profiling - `samply` plus `atos` symbolication
+    // against this project's own hand-rolled release build - to be a
+    // genuine hot spot: cloning every string value here, only to drop
+    // every one of those clones again at the end of this same function
+    // call, was real, measurable, wasted allocator traffic for exactly
+    // the common case of a plain string-typed column). Only `Number`
+    // genuinely needs a fresh owned allocation (there's no pre-existing
+    // string form to borrow); `Bool` needs none at all, since there are
+    // only ever two possible values.
+    let mut scalar_raw: Vec<Cow<str>> = Vec::new();
     let mut object_maps: Vec<&json_support::Map> = Vec::new();
 
     for v in &pool {
@@ -11694,7 +11718,7 @@ fn profile_json_path(
             }
             JsonValue::Bool(b) => {
                 *kind_counts.entry(JsonKind::Bool).or_insert(0) += 1;
-                scalar_raw.push(b.to_string());
+                scalar_raw.push(Cow::Borrowed(if *b { "true" } else { "false" }));
             }
             JsonValue::Number(n) => {
                 let k = if n.is_i64() || n.is_u64() {
@@ -11703,11 +11727,11 @@ fn profile_json_path(
                     JsonKind::Float
                 };
                 *kind_counts.entry(k).or_insert(0) += 1;
-                scalar_raw.push(n.to_string());
+                scalar_raw.push(Cow::Owned(n.to_string()));
             }
             JsonValue::String(s) => {
                 *kind_counts.entry(JsonKind::Str).or_insert(0) += 1;
-                scalar_raw.push(s.clone());
+                scalar_raw.push(Cow::Borrowed(s.as_str()));
             }
             JsonValue::Null | JsonValue::Array(_) => {
                 unreachable!("unwrap_arrays already removed these")
@@ -11730,7 +11754,7 @@ fn profile_json_path(
         )
     } else if !scalar_raw.is_empty() && object_maps.is_empty() {
         let base_current = describe_kinds(&kind_counts);
-        let refs: Vec<&str> = scalar_raw.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = scalar_raw.iter().map(|s| s.as_ref()).collect();
         let (ideal, note) = suggest_ideal_type(&refs, &base_current);
         (wrap(&base_current), wrap(&ideal), note)
     } else {
@@ -11764,8 +11788,8 @@ fn profile_json_path(
             if samples.len() >= n_samples {
                 break;
             }
-            if !samples.contains(v) {
-                samples.push(v.clone());
+            if !samples.iter().any(|s| s == v.as_ref()) {
+                samples.push(v.clone().into_owned());
             }
         }
     } else {

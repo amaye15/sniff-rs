@@ -33,6 +33,53 @@ re-run.
 
 ---
 
+## 2026-08-31 (follow-up 3) — `09831a0`+perf pass 4 (Darwin arm64, Apple M4)
+
+A fourth optimization pass, the first to use a real sampling profiler
+(`samply` + `atos`) against the release binary instead of reading hot-path
+code and forming a hypothesis - see CLAUDE.md's own "Performance" section
+for the full writeup, including a real identical-code-folding
+symbolication hazard this method surfaced and how it was worked around
+(cross-checking full call stacks, not trusting a leaf symbol alone), and
+one promising-looking lead (`ColumnProfile::to_json`'s own field clones)
+that measured out to *no difference at all* and was reverted rather than
+kept.
+
+**Methodology note, not just a result**: this pass's own early `cargo
+bench` comparisons against `target/criterion`'s stored history produced
+inconsistent "regressed"/"improved" labels from run to run - exactly the
+thermal-state/background-load noise this file's own header already
+warns about, and worse than in prior passes because this session had by
+then run many back-to-back `cargo build`/`cargo bench` invocations in a
+row. The numbers below use a controlled alternating-binary comparison
+instead: build an "old" and "new" binary once each, then run them
+back-to-back several times apiece (never all of one binary's runs
+clustered together at one thermal extreme), reporting `user` time from
+each individual run rather than a single aggregate.
+
+**Real file** (a 400,000-row, 8-column JSONL file - a realistic mix of
+an id, free-text name, email, date, float amount, bool, and UUID column):
+
+| Binary | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Before this pass | 0.92s | 0.94s | 0.83s |
+| After this pass | 0.65s | 0.65s | 0.67s |
+
+A clean, reproducible **~24-28%** improvement.
+
+**Synthetic fixture** (the same shape `benches/end_to_end.rs`'s own JSON
+generator produces, at 200,000 rows, run with `--output-format json`):
+
+| Binary | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Before this pass | 0.34s | 0.34s | 0.34s |
+| After this pass | 0.23s | 0.23s | 0.24s |
+
+A clean, reproducible **~30%** improvement. Both compared with `diff`
+against the pre-fix output and confirmed byte-identical in every case.
+
+---
+
 ## 2026-08-31 (follow-up 2) — `8d0b9ec`+perf pass 3 (Darwin arm64, Apple M4)
 
 A third optimization pass in the same session, another "continue to
