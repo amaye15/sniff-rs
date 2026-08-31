@@ -2310,6 +2310,89 @@ should be faster" reasoning. `BENCHMARKS.md` carries the full numbers as
 a permanent, dated entry, the same discipline every other performance-
 relevant change is supposed to leave behind per that file's own header.
 
+A second pass, prompted by an explicit "continue to optimize" follow-up
+rather than a specific reported problem, found three more real
+allocation-heavy patterns using the same discipline - read the hot path,
+form a hypothesis about what's wasteful, then actually measure before
+trusting it:
+
+- **`profile_json_path`'s own sample-value collection cloned an entire
+  column's worth of data just to keep a handful of examples.**
+  `sample_values` is capped at `n_samples` (typically single digits), but
+  the old code built `sample_pool` by cloning *every* raw value in the
+  column up front (`scalar_raw.clone()`) - or, worse, for an object-typed
+  column, deep-cloning *every object* (`JsonValue::Object((*m).clone())`)
+  just to call `.to_string()` on the clone and immediately discard it.
+  `profile_column` (the equivalent function for CSV/Excel/fixed-width/
+  every other flat reader) already got this right - iterating the
+  original values directly and only cloning the ones actually kept - so
+  this was a real, pre-existing inconsistency between the two engines,
+  not a new mistake. Fixed by iterating lazily with an early break once
+  `n_samples` distinct values are found, and by adding
+  `json_support::write_compact_object` (a `&Map`-consuming sibling of the
+  existing `Value`-consuming `write_compact`) so an object can be
+  stringified for sampling without first cloning it into an owned
+  `Value::Object` wrapper. A synthetic 200,000-row file with a nested
+  three-field object column went from 1.20s to 0.64s (user time) with
+  this fix - object columns are exactly where the old code's per-row
+  `Map` clone was most expensive, since cloning a `Map` recursively
+  clones every value inside it, not just a flat byte copy the way cloning
+  a `String` is.
+- **`normalize_numeric_str` always allocated a new `String`, even for a
+  value that needed none of its own transformations.** This runs once
+  per value for every column that reaches `suggest_ideal_type`'s i64/f64
+  branch - one of the most common shapes in real data (plain
+  `"123"`/`"45.67"`-style values, already clean, are the overwhelming
+  common case, not the currency-symbol/thousands-separator/parenthesized-
+  negative/percentage cases this function exists to handle) - but
+  `String::replace` always builds and returns a new owned `String`,
+  match or not. Changed the return type from `String` to `Cow<'_, str>`
+  and added a fast path that borrows the input directly when none of the
+  four transformations actually apply, falling through to the original
+  allocating logic only when something genuinely needs stripping/
+  reformatting. The rewrite needed real care in one spot, not just a
+  mechanical `Cow` swap: stripping a currency symbol can change what a
+  value's own *first* character is (`"$-123"` doesn't start with `-`
+  until the `$` is gone), so the fast path's own "does this already
+  start with `-`" check is only valid to run directly against the
+  *pre-stripping* string when there was nothing to strip in the first
+  place - getting this wrong would silently double a parenthesized
+  negative's sign (`"($-1,234.56)"` → `"--1234.56"` instead of
+  `"-1234.56"`). Caught by reasoning through the interaction before
+  shipping it, then locked in as a permanent test
+  (`normalize_numeric_str_does_not_double_the_sign_when_a_symbol_
+  precedes_a_literal_minus`) rather than left as a one-off check. A
+  500,000-row purely-numeric CSV went from 0.37s to 0.31s (user time)
+  with this fix alone.
+- **`is_iban` made three allocations per call where one would do.**
+  `.chars().filter(...).collect::<String>()` (strip spaces),
+  `.to_ascii_uppercase()` (a second full-string copy), and
+  `format!("{}{}", ...)` (a third, to rearrange the string for the
+  checksum) - all three unconditional, on every value that reaches this
+  check (any alphanumeric ID-shaped column that failed every earlier,
+  cheaper check). The uppercase step turned out to be unnecessary
+  entirely: `is_ascii_alphabetic`/`is_ascii_digit`/`is_ascii_alphanumeric`
+  already match both cases' byte ranges by construction, so only the
+  checksum's own letter-to-digit arithmetic (`c as u32 - 'A' as u32`)
+  actually needs uppercase - folded lazily per character during the
+  checksum loop instead. The rearrangement step disappeared too, by
+  chaining the two character slices directly (`cleaned[4..].chars()
+  .chain(cleaned[0..4].chars())`) rather than physically building the
+  reordered string first. Down to one allocation (the initial
+  space-stripping copy) from three, plus an early, allocation-free length
+  check (`s.len() < 15`) that rejects an obviously-too-short candidate
+  before touching the heap at all.
+
+Combined with the CSV/JSON fixes above, `benches/end_to_end.rs`'s own
+JSON numbers - which exercise the sample-collection fix directly, since
+every column in that fixture calls it - improved further still: 10,000
+rows went from the already-improved 17.8ms down to 14.7ms, and 200,000
+rows from 545ms (the original, pre-any-of-this-work baseline) down to
+~375-416ms. Verified the same way as the first pass: full test suite
+(306 unit + 206 integration tests now, three new), clippy/fmt clean, and
+real before/after timings on real and synthetic data with byte-identical
+output confirmed via `diff` in every case.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

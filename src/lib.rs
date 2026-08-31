@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -645,19 +646,27 @@ mod json_support {
                 }
                 out.push(']');
             }
-            Value::Object(map) => {
-                out.push('{');
-                for (i, (k, v)) in map.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    write_escaped_string(out, k);
-                    out.push(':');
-                    write_compact(out, v);
-                }
-                out.push('}');
-            }
+            Value::Object(map) => write_compact_object(out, map),
         }
+    }
+
+    /// Renders a `&Map` in the same compact-JSON shape `write_compact`'s
+    /// own `Value::Object` arm does, without needing to own the map (that
+    /// arm delegates here) - `pub(crate)` so a caller that only has a
+    /// `&Map` on hand (e.g. a set of sample values it doesn't want to
+    /// take ownership of) can stringify it directly, rather than first
+    /// cloning into an owned `Value::Object` just to call `.to_string()`.
+    pub(crate) fn write_compact_object(out: &mut String, map: &Map) {
+        out.push('{');
+        for (i, (k, v)) in map.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_escaped_string(out, k);
+            out.push(':');
+            write_compact(out, v);
+        }
+        out.push('}');
     }
 
     impl std::fmt::Display for Value {
@@ -3276,7 +3285,23 @@ fn is_cidr(s: &str) -> bool {
 /// percentage changes the value's actual meaning (45% is not the number
 /// 45), unlike currency/thousands-separator noise, so it earns its own note
 /// rather than being silently folded into "numeric strings".
-fn normalize_numeric_str(s: &str) -> (String, bool) {
+///
+/// Returns `Cow<str>` rather than an owned `String` because this runs
+/// once per value for every column that reaches the i64/f64 branch of
+/// `suggest_ideal_type` - one of the most common shapes in real data -
+/// and `String::replace` always allocates a full copy, match or not.
+/// The overwhelming common case is a value that needs *none* of these
+/// transformations at all (a plain `"123"`/`"45.67"`, already clean), so
+/// that case is checked first and borrows `body` directly with zero
+/// allocation; only a value that actually needs stripping/reformatting
+/// pays for an owned copy. The `!has_symbols` branch deliberately
+/// recomputes `is_percent`/the parenthesized-negative check against
+/// `body` rather than reusing logic shaped around a post-stripping
+/// `cleaned` string - stripping a symbol can change what the *first*
+/// character of the value is (e.g. `"$-123"` only starts with `-` once
+/// the `$` is gone), so that check is only valid to run directly against
+/// `body` when there was nothing to strip in the first place.
+fn normalize_numeric_str(s: &str) -> (Cow<'_, str>, bool) {
     let trimmed = s.trim();
     let (body, parenthesized) =
         if trimmed.len() >= 2 && trimmed.starts_with('(') && trimmed.ends_with(')') {
@@ -3284,6 +3309,21 @@ fn normalize_numeric_str(s: &str) -> (String, bool) {
         } else {
             (trimmed, false)
         };
+
+    if !body.contains([',', '$', '€', '£', '¥']) {
+        let is_percent = body.ends_with('%');
+        if !is_percent && (!parenthesized || body.starts_with('-')) {
+            return (Cow::Borrowed(body), false);
+        }
+        let mut cleaned = body.to_string();
+        if is_percent {
+            cleaned.pop();
+        }
+        if parenthesized && !cleaned.starts_with('-') {
+            cleaned = format!("-{cleaned}");
+        }
+        return (Cow::Owned(cleaned), is_percent);
+    }
 
     let mut cleaned = body.replace([',', '$', '€', '£', '¥'], "");
     let is_percent = cleaned.ends_with('%');
@@ -3293,7 +3333,7 @@ fn normalize_numeric_str(s: &str) -> (String, bool) {
     if parenthesized && !cleaned.starts_with('-') {
         cleaned = format!("-{cleaned}");
     }
-    (cleaned, is_percent)
+    (Cow::Owned(cleaned), is_percent)
 }
 
 /// A bare integer literal (optional single leading '-', otherwise all ASCII
@@ -3368,11 +3408,24 @@ fn is_mac_address(s: &str) -> bool {
 /// real IBANs (GB/DE/FR, including FR's letter-containing BBAN) and one
 /// deliberately-corrupted checksum before being relied on.
 fn is_iban(s: &str) -> bool {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| *c != ' ')
-        .collect::<String>()
-        .to_ascii_uppercase();
+    // Removing spaces can only shorten the string, so anything already
+    // too short to reach the valid post-cleaning range can be rejected
+    // before allocating anything at all.
+    if s.len() < 15 {
+        return false;
+    }
+    // A single allocation (filtering spaces) instead of the three this
+    // function used to make: `is_ascii_alphabetic`/`is_ascii_digit`/
+    // `is_ascii_alphanumeric` are already case-insensitive by
+    // construction (they match both cases' byte ranges), so there's no
+    // need to uppercase the whole string just to run those checks - only
+    // the checksum's own letter-to-digit arithmetic (`c as u32 - 'A' as
+    // u32`) actually requires uppercase, folded lazily per character
+    // below instead of via a second whole-string allocation. The
+    // checksum also no longer builds a separate `rearranged` string -
+    // chaining the two character slices directly visits the same
+    // characters in the same order.
+    let cleaned: String = s.chars().filter(|c| *c != ' ').collect();
     let len = cleaned.len();
     if !(15..=34).contains(&len) {
         return false;
@@ -3389,9 +3442,9 @@ fn is_iban(s: &str) -> bool {
         return false;
     }
 
-    let rearranged = format!("{}{}", &cleaned[4..], &cleaned[0..4]);
     let mut remainder: u64 = 0;
-    for c in rearranged.chars() {
+    for c in cleaned[4..].chars().chain(cleaned[0..4].chars()) {
+        let c = c.to_ascii_uppercase();
         let value = if c.is_ascii_digit() {
             u64::from(c.to_digit(10).unwrap())
         } else {
@@ -4095,9 +4148,10 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         );
     }
 
-    let normalized: Vec<(String, bool)> = values.iter().map(|v| normalize_numeric_str(v)).collect();
+    let normalized: Vec<(Cow<str>, bool)> =
+        values.iter().map(|v| normalize_numeric_str(v)).collect();
     let any_percent = normalized.iter().any(|(_, pct)| *pct);
-    let cleaned_refs: Vec<&str> = normalized.iter().map(|(s, _)| s.as_str()).collect();
+    let cleaned_refs: Vec<&str> = normalized.iter().map(|(s, _)| s.as_ref()).collect();
 
     if cleaned_refs.iter().all(|v| v.parse::<i64>().is_ok()) {
         return ("i64".to_string(), numeric_note(current, "i64", any_percent));
@@ -11679,21 +11733,34 @@ fn profile_json_path(
         };
     }
 
-    let sample_pool: Vec<String> = if !scalar_raw.is_empty() {
-        scalar_raw.clone()
-    } else {
-        object_maps
-            .iter()
-            .map(|m| JsonValue::Object((*m).clone()).to_string())
-            .collect()
-    };
-    let mut seen = HashSet::new();
-    let mut samples = Vec::new();
-    for v in &sample_pool {
-        if seen.insert(v.clone()) {
-            samples.push(v.clone());
+    // Built lazily, one candidate at a time, rather than first
+    // materializing every value (or - worse, for the object case -
+    // deep-cloning every object just to stringify it) into a full
+    // `sample_pool` up front: `n_samples` is typically single digits, so
+    // a column with thousands or millions of values used to pay for a
+    // full clone of all of them purely to keep a handful. `samples`
+    // itself (bounded to `n_samples`) is small enough that a linear
+    // `.contains()` scan for de-duplication is cheaper than hashing, so
+    // there's no `HashSet` here either.
+    let mut samples: Vec<String> = Vec::new();
+    if !scalar_raw.is_empty() {
+        for v in &scalar_raw {
             if samples.len() >= n_samples {
                 break;
+            }
+            if !samples.contains(v) {
+                samples.push(v.clone());
+            }
+        }
+    } else {
+        for m in &object_maps {
+            if samples.len() >= n_samples {
+                break;
+            }
+            let mut s = String::new();
+            json_support::write_compact_object(&mut s, m);
+            if !samples.contains(&s) {
+                samples.push(s);
             }
         }
     }
@@ -49848,15 +49915,43 @@ mod tests {
     fn normalize_numeric_str_handles_parens_negative_percent_and_currency() {
         assert_eq!(
             normalize_numeric_str("(123.45)"),
-            ("-123.45".to_string(), false)
+            (Cow::Borrowed("-123.45"), false)
         );
-        assert_eq!(normalize_numeric_str("45%"), ("45".to_string(), true));
+        assert_eq!(normalize_numeric_str("45%"), (Cow::Borrowed("45"), true));
         assert_eq!(
             normalize_numeric_str("€1,250.50"),
-            ("1250.50".to_string(), false)
+            (Cow::Borrowed("1250.50"), false)
         );
-        assert_eq!(normalize_numeric_str("  42  "), ("42".to_string(), false));
-        assert_eq!(normalize_numeric_str("(8%)"), ("-8".to_string(), true));
+        assert_eq!(
+            normalize_numeric_str("  42  "),
+            (Cow::Borrowed("42"), false)
+        );
+        assert_eq!(normalize_numeric_str("(8%)"), (Cow::Borrowed("-8"), true));
+    }
+
+    /// A genuine correctness pitfall the `Cow`-returning rewrite of this
+    /// function (see its own doc comment) could have introduced: stripping
+    /// a currency symbol can change what the value's own *first*
+    /// character is. `"$-123"` doesn't start with `-` before the `$` is
+    /// stripped, but does afterward - so a fast path that decided
+    /// "already starts with `-`, no need to prepend one" by checking the
+    /// *pre-stripping* string would wrongly conclude a parenthesized
+    /// `"($-1,234.56)"` still needs a `-` prepended after its symbols are
+    /// stripped, producing the doubled sign `"--1234.56"` instead of the
+    /// correct `"-1234.56"`. Locked in directly, not just reasoned
+    /// through, since this is exactly the kind of subtle sign-handling
+    /// bug this project's own adversarial-testing discipline exists to
+    /// catch before it ships.
+    #[test]
+    fn normalize_numeric_str_does_not_double_the_sign_when_a_symbol_precedes_a_literal_minus() {
+        assert_eq!(
+            normalize_numeric_str("$-123"),
+            (Cow::Borrowed("-123"), false)
+        );
+        assert_eq!(
+            normalize_numeric_str("($-1,234.56)"),
+            (Cow::Borrowed("-1234.56"), false)
+        );
     }
 
     #[test]

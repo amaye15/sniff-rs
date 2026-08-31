@@ -33,6 +33,59 @@ re-run.
 
 ---
 
+## 2026-08-31 (follow-up) — `f2cba62`+perf pass 2 (Darwin arm64, Apple M4)
+
+A second optimization pass in the same session, prompted by a follow-up
+"continue to optimize" request rather than a new reported problem - see
+CLAUDE.md's own "Performance" section for the full writeup of the three
+fixes this found (`profile_json_path`'s sample-collection cloning an
+entire column just to keep a handful of examples, `normalize_numeric_str`
+always allocating even for an already-clean value, `is_iban` making three
+allocations where one suffices).
+
+**End-to-end** (full binary via `Command`, CSV/JSON, rows → time) -
+against the *original*, pre-any-of-this-session's-work baseline
+(2026-08-23 entry below), not just the first perf-pass entry above it:
+
+| Format | Rows | Original | Now | Change |
+|---|---|---|---|---|
+| CSV | 10,000 | 25.7 ms | 18.3 ms | **-28.8%** |
+| CSV | 200,000 | 545 ms | 375 ms | **-31.3%** |
+| JSON | 10,000 | 19.5 ms | 14.7 ms | **-24.3%** |
+| JSON | 200,000 | 563 ms | 416 ms | -26.2%† |
+
+(†This row's own confidence interval was wide (~371-468ms) even after
+several re-runs - some background load on the machine during this
+specific benchmark, not something this pass's own code changes caused;
+treat the point estimate as approximate, not precise, the same "a few
+percent is noise" caution this file's own header already gives.) The
+JSON row's improvement is larger than the first pass's own entry showed
+specifically because the sample-collection fix applies to *every*
+column in this benchmark's fixture (all six are scalar columns, each
+paying for the old code's full-column clone before this pass), not just
+to nested-object columns the way the first pass's `bucket_object_fields`
+fix was.
+
+Two more findings only show up on shapes `benches/end_to_end.rs`'s own
+fixture doesn't exercise (a flat, non-object, moderately-sized row
+shape), so they're recorded here as one-off measurements on
+uncommitted synthetic fixtures rather than as permanent benchmark
+targets - the same treatment the first pass's own 300-field fixture got:
+
+- A 200,000-row JSONL file with a small nested object column (3 fields:
+  a nested user object, a tag array, a meta object) went from 1.20s to
+  0.64s (user time) - the sample-collection fix's own worst case, since
+  cloning a `Map` recursively clones everything inside it, not just a
+  flat byte copy.
+- A 500,000-row, purely-numeric 3-column CSV (no formatting noise at
+  all - plain integers and decimals) went from 0.37s to 0.31s (user
+  time) via the `normalize_numeric_str` `Cow` fix alone.
+
+Both compared with `diff` against the pre-fix output and confirmed
+byte-identical.
+
+---
+
 ## 2026-08-31 — `25d2cbc`+perf pass (Darwin arm64, Apple M4)
 
 A dedicated optimization pass (see CLAUDE.md's own "Performance" section
