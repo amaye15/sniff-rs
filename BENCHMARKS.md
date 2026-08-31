@@ -33,6 +33,36 @@ re-run.
 
 ---
 
+## 2026-09-01 — `d9e82be`+perf pass 9 (Darwin arm64, Apple M4)
+
+A ninth optimization pass, moving from the shared CSV/JSON engine
+(already covered by passes 1/5-8, and inherited for free by every
+format built on top of it - see CLAUDE.md's own writeup) to a format
+reader's own code: SQLite's `describe_sql_kinds`, which turned out to
+have the exact same `HashMap<&'static str, usize>`-with-default-hasher
+per-value tally shape as pass 7's `JsonKind`/`kind_counts` fix, just
+never touched because it lives in `sqlite_support` rather than the
+shared JSON engine. Replaced with the identical fix: `SqlKind` (a
+4-variant enum) plus `SqlKindCounts` (a plain `[usize; 4]` array) -
+no hashing at all.
+
+**Controlled alternating-binary comparison** (8 rounds, a synthetic
+1,000,000-row SQLite database with several low-cardinality `TEXT`
+columns, generated via Python's `sqlite3` module):
+
+| Binary | Avg user time |
+|---|---|
+| Before this pass | 0.859s |
+| After this pass | 0.826s |
+
+A clean, reproducible **~3.8%** improvement, baseline above the fix in
+every round - a cleaner measurement window than pass 8 had, and closer
+in magnitude to passes 6/7's own JSON-side findings since this
+synthetic table's column mix skews more heavily low-cardinality than a
+typical real file. Byte-identical output confirmed via `diff` across
+six SQLite fixtures in all three output formats, full test suite
+(including the `rusqlite` oracle comparison) passing, clippy/fmt clean.
+
 ## 2026-09-01 — `1b7313c`+perf pass 8 (Darwin arm64, Apple M4)
 
 An eighth optimization pass, moving the profiler onto a wide, diverse

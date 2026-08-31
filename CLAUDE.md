@@ -2779,6 +2779,54 @@ the primary evidence and the wall-clock numbers as corroborating rather
 than definitive, rather than waiting indefinitely for a quiet machine
 or overstating a number the noisy majority of runs couldn't support.
 
+A ninth pass moved from the two default, always-on formats to the
+optional readers, on the theory that the shared engine both CSV and
+JSON ultimately route through (`profile_column`, `profile_json_path` -
+see the Architecture section) already carries passes 6-8's fixes into
+every format built on top of it (Parquet's scalar columns, Excel,
+fixed-width, NumPy, dBase, Stata, SAS7BDAT, SPSS, ORC via
+`profile_column`; Avro, MessagePack, CBOR, TOML, YAML, XML, and
+Parquet/Arrow IPC's own nested columns via `profile_json_path`) without
+any further work - so the next real opportunity, if one existed, had to
+be in a format reader's *own* code, outside that shared engine.
+`describe_sql_kinds` (SQLite's per-value storage-class tally, tracking
+which of INTEGER/REAL/TEXT/BLOB each value in a column actually is -
+SQLite's own dynamic typing means a column declared one way can still
+hold another, the same "declared type is a hint" gap Parquet/dBase/
+Stata/SAS7BDAT/SPSS/ORC all separately demonstrate in their own formats)
+turned out to be exactly this: a `HashMap<&'static str, usize>`
+incremented once per value of every column of every SQLite table this
+tool reads, using the default SipHash hasher, never touched by any
+prior pass - the *exact* shape of the `JsonKind`/`kind_counts` fix from
+the seventh pass, just in SQLite's own reader instead of the shared
+JSON engine. Fixed the identical way: `SqlKind` (a 4-variant enum -
+Integer/Real/Text/Blob) plus `SqlKindCounts` (a plain `[usize; 4]`
+array indexed by discriminant) replace the `HashMap` entirely, no
+hashing or probing needed at all.
+
+Verified the same way as every pass before it: the full test suite
+(including `sqlite_reader_matches_the_rusqlite_crate_output_exactly`,
+whose own test-only oracle-comparison code shares this same pattern and
+needed the identical mechanical update) unchanged and passing, clippy/
+fmt clean, and byte-identical output confirmed via `diff` against the
+pre-fix binary across six SQLite fixtures in all three output formats -
+including `type_detection.sqlite`/`sample.sqlite`, whose own committed
+Northwind-derived `mixed(String: 1, f64: 2)`-style type-affinity output
+(see the real-world-corpus-validation section above) is exactly the
+code path `describe_sql_kinds` renders, confirmed unchanged including
+its sorted-label ordering. A controlled alternating-binary comparison
+on a synthetic 1,000,000-row SQLite database with several low-
+cardinality `TEXT` columns (generated via Python's own `sqlite3`
+module, since this project has no SQLite *writer* of its own) showed a
+clean, reproducible **~3.8%** user-time improvement (avg 0.859s down to
+avg 0.826s across 8 rounds, baseline above the fix in every single
+round) - a cleaner, less contended measurement window than the eighth
+pass had, and closer in magnitude to the sixth/seventh passes' own
+JSON-side findings than the eighth pass's own diluted CSV result, since
+(unlike a real-world CSV, which usually mixes high- and low-cardinality
+columns) this synthetic table's own column mix skews more heavily
+toward the exact shape the bug needs to matter.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

@@ -41806,12 +41806,77 @@ fn columns_from_xlsx(
 // type exactly like an inconsistent JSON field would.
 
 #[cfg(feature = "sqlite")]
-fn describe_sql_kinds(counts: &HashMap<&'static str, usize>) -> String {
-    if counts.len() == 1 {
-        return (*counts.keys().next().unwrap()).to_string();
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum SqlKind {
+    Integer = 0,
+    Real = 1,
+    Text = 2,
+    Blob = 3,
+}
+
+/// Every `SqlKind` variant, in discriminant order - mirrors
+/// `ALL_JSON_KINDS`/`JsonKindCounts` (see that pair's own doc comment
+/// for the profiler finding both are built for): a per-value storage-
+/// class tally, incremented once per value of every column of every
+/// SQLite table this tool reads, is exactly the same shape of hot loop
+/// that made a `HashMap<JsonKind, usize>` worth replacing with a plain
+/// array there - SQLite's own storage classes are an equally small,
+/// fixed, closed set, so the identical fix applies here too.
+#[cfg(feature = "sqlite")]
+const ALL_SQL_KINDS: [SqlKind; 4] = [
+    SqlKind::Integer,
+    SqlKind::Real,
+    SqlKind::Text,
+    SqlKind::Blob,
+];
+
+#[cfg(feature = "sqlite")]
+fn sql_kind_label(k: SqlKind) -> &'static str {
+    match k {
+        SqlKind::Integer => "i64",
+        SqlKind::Real => "f64",
+        SqlKind::Text => "String",
+        SqlKind::Blob => "Blob",
     }
-    let mut parts: Vec<(&str, usize)> = counts.iter().map(|(k, c)| (*k, *c)).collect();
-    parts.sort_by(|a, b| a.0.cmp(b.0));
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Default, Clone, Copy)]
+struct SqlKindCounts([usize; 4]);
+
+#[cfg(feature = "sqlite")]
+impl SqlKindCounts {
+    fn increment(&mut self, k: SqlKind) {
+        self.0[k as usize] += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|&c| c == 0)
+    }
+
+    fn observed(&self) -> impl Iterator<Item = (SqlKind, usize)> + '_ {
+        ALL_SQL_KINDS
+            .into_iter()
+            .zip(self.0)
+            .filter(|(_, c)| *c > 0)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn describe_sql_kinds(counts: &SqlKindCounts) -> String {
+    let mut observed = counts.observed();
+    let Some(first) = observed.next() else {
+        return String::new();
+    };
+    let Some(second) = observed.next() else {
+        return sql_kind_label(first.0).to_string();
+    };
+    let mut parts: Vec<(String, usize)> = std::iter::once(first)
+        .chain(std::iter::once(second))
+        .chain(observed)
+        .map(|(k, c)| (sql_kind_label(k).to_string(), c))
+        .collect();
+    parts.sort_by(|a, b| a.0.cmp(&b.0));
     let inner = parts
         .iter()
         .map(|(label, count)| format!("{label}: {count}"))
@@ -41860,26 +41925,23 @@ mod sqlite_support {
         Blob(usize), // length only - all this reader ever renders is "<blob: N bytes>"
     }
 
-    fn value_to_string(
-        value: &Value,
-        kind_counts: &mut HashMap<&'static str, usize>,
-    ) -> Option<String> {
+    fn value_to_string(value: &Value, kind_counts: &mut SqlKindCounts) -> Option<String> {
         match value {
             Value::Null => None,
             Value::Integer(n) => {
-                *kind_counts.entry("i64").or_insert(0) += 1;
+                kind_counts.increment(SqlKind::Integer);
                 Some(n.to_string())
             }
             Value::Real(f) => {
-                *kind_counts.entry("f64").or_insert(0) += 1;
+                kind_counts.increment(SqlKind::Real);
                 Some(f.to_string())
             }
             Value::Text(s) => {
-                *kind_counts.entry("String").or_insert(0) += 1;
+                kind_counts.increment(SqlKind::Text);
                 Some(s.clone())
             }
             Value::Blob(len) => {
-                *kind_counts.entry("Blob").or_insert(0) += 1;
+                kind_counts.increment(SqlKind::Blob);
                 Some(format!("<blob: {len} bytes>"))
             }
         }
@@ -42826,7 +42888,7 @@ mod sqlite_support {
 
         let n_cols = parsed.columns.len();
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
-        let mut kind_counts: Vec<HashMap<&'static str, usize>> = vec![HashMap::new(); n_cols];
+        let mut kind_counts: Vec<SqlKindCounts> = vec![SqlKindCounts::default(); n_cols];
 
         for (rowid, payload) in rows {
             let values = decode_record(&payload)?;
@@ -53002,7 +53064,7 @@ mod tests {
             let n_cols = col_names.len();
 
             let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
-            let mut kind_counts: Vec<HashMap<&'static str, usize>> = vec![HashMap::new(); n_cols];
+            let mut kind_counts: Vec<SqlKindCounts> = vec![SqlKindCounts::default(); n_cols];
 
             let mut rows = stmt
                 .query([])
@@ -53018,19 +53080,19 @@ mod tests {
                     let value = match value_ref {
                         ValueRef::Null => None,
                         ValueRef::Integer(v) => {
-                            *kind_counts[i].entry("i64").or_insert(0) += 1;
+                            kind_counts[i].increment(SqlKind::Integer);
                             Some(v.to_string())
                         }
                         ValueRef::Real(v) => {
-                            *kind_counts[i].entry("f64").or_insert(0) += 1;
+                            kind_counts[i].increment(SqlKind::Real);
                             Some(v.to_string())
                         }
                         ValueRef::Text(t) => {
-                            *kind_counts[i].entry("String").or_insert(0) += 1;
+                            kind_counts[i].increment(SqlKind::Text);
                             Some(String::from_utf8_lossy(t).into_owned())
                         }
                         ValueRef::Blob(b) => {
-                            *kind_counts[i].entry("Blob").or_insert(0) += 1;
+                            kind_counts[i].increment(SqlKind::Blob);
                             Some(format!("<blob: {} bytes>", b.len()))
                         }
                     };
