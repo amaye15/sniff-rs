@@ -33,6 +33,36 @@ re-run.
 
 ---
 
+## 2026-09-01 — `e6bd76d`+perf pass 5 (Darwin arm64, Apple M4)
+
+A fifth optimization pass, continuing the fourth's real-profiler
+methodology (`samply`/`atos`) against a large real CSV file this time.
+See CLAUDE.md's own "Performance" section for the full writeup,
+including two profiler leads confirmed to be identical-code-folding
+noise rather than real costs (not fixed, since there was nothing there).
+
+`parse_csv`'s `InField`/`InQuotedField` states used to append one
+already-decoded `char` at a time (`field.push(c)`); rewritten to track a
+byte cursor and scan forward for the next delimiter/terminator/closing-
+quote, `push_str`-ing the whole span at once - the same fix
+`json_support::Parser::parse_string` already used for JSON strings,
+applied to CSV.
+
+**Controlled alternating-binary comparison** (a real 500,000-row,
+8-column CSV file - id/name/email/date/amount/bool/uuid/description):
+
+| Binary | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Before this pass | 1.23s | 1.31s | 1.24s |
+| After this pass | 0.99s | 1.01s | 0.97s |
+
+A clean, reproducible **~20-24%** improvement, confirmed byte-identical
+output via `diff`, including a manual multi-byte-UTF-8 spot check
+(café/中文/emoji, embedded newlines and commas inside quoted fields)
+beyond the automated suite.
+
+---
+
 ## 2026-08-31 (follow-up 3) — `09831a0`+perf pass 4 (Darwin arm64, Apple M4)
 
 A fourth optimization pass, the first to use a real sampling profiler

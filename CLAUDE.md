@@ -2523,6 +2523,68 @@ reproducible ~24-28% improvement (0.83-0.94s down to 0.65-0.67s); on a
 clean ~30% improvement (0.34s down to 0.23-0.24s) - both confirmed
 byte-identical to the pre-fix output via `diff`.
 
+A fifth pass profiled a large real CSV file the same way and found
+`parse_csv`'s own `field.push(c)` - appending one already-decoded `char`
+at a time in the `InField`/`InQuotedField` states - to be the single
+largest cluster of self-time in the whole reader, split across several
+adjacent lines in the profile in a way that made clear it was the loop
+body itself, not a misattributed neighbor (unlike a couple of red
+herrings this same profiling method surfaced and ruled out - see below).
+Every ordinary character was paying for a UTF-8 decode (advancing the
+`chars()` iterator) and a separate re-encode (`String::push`'s own
+per-call overhead), instead of one bulk copy for the whole run of
+ordinary characters between two delimiters - the same class of fix
+`json_support::Parser::parse_string` already used successfully for JSON
+string values, just not yet carried over to CSV's own parser.
+
+Rewrote `InField`/`InQuotedField` to track a byte cursor and scan
+forward over raw bytes for the next delimiter/terminator/closing-quote,
+`push_str`-ing the whole span at once instead of one `char` per loop
+iteration. This is safe with multi-byte UTF-8 content despite operating
+below the `char` level: the delimiter, `'\r'`, `'\n'`, and `'"'` are all
+single-byte ASCII values, and a UTF-8 continuation byte always falls in
+`0x80..=0xBF` - strictly above the ASCII range - so a byte-for-byte scan
+for any of these four values can never mistake a byte in the *middle*
+of a multi-byte character for a real delimiter; every position the scan
+stops at is guaranteed to already be a valid `char` boundary.
+`StartRecord`/`StartField`/`InDoubleEscapedQuote` are pure single-
+character decision points (never a "run" worth batching), so they still
+decode exactly one `char` per step and advance the byte cursor by that
+character's own UTF-8 length - functionally identical to one step of
+the old `for c in content.chars()` loop, just addressed by byte offset
+instead of iterator position, so none of the state machine's own
+transition logic needed to change (only the two "keep consuming
+ordinary characters" states did) - lower risk than the CSV parser's
+first hand-roll pass, which had to restructure the state machine itself
+to remove a `Peekable`.
+
+Verified against the same discipline as every pass before it: the full
+test suite (all 6 of `parse_csv`'s own dedicated edge-case tests -
+embedded newlines in quoted fields, content after a closing quote,
+CRLF/bare-CR/bare-LF equivalence, blank-line skipping, BOM stripping,
+unterminated quotes - plus every other unit and integration test)
+unchanged and passing, clippy/fmt clean, and a manual multi-byte-UTF-8
+spot check (café, 中文, emoji, embedded newlines and commas inside
+quoted fields) confirmed byte-identical against the pre-fix binary in
+addition to the automated suite. A controlled alternating-binary
+comparison on a real 500,000-row, 8-column CSV file (the same
+methodology the fourth pass adopted, for the same thermal-drift
+reasons) showed a clean, reproducible **~20-24%** improvement
+(1.23-1.31s down to 0.97-1.01s), confirmed byte-identical output via
+`diff`.
+
+This same profiling pass also confirmed two more suspected hot spots
+from the profiler's raw output were *not* real, exactly the kind of
+identical-code-folding false lead the fourth pass's own writeup already
+flagged as a hazard of this method: self-time attributed to
+`gzip_decompress`/`HuffmanTable::decode` while reading a plain,
+uncompressed `.csv` file, and to `run()` at its `decompress_if_needed`
+call site for the same file - neither of which could genuinely execute
+for uncompressed input. Confirmed as folding artifacts (not fixed,
+since there was nothing there to fix) by the same method as before:
+checking that no code path reaching them was actually possible for this
+input, rather than trusting the leaf symbol alone.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

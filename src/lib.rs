@@ -4346,76 +4346,119 @@ fn parse_csv(content: &str, delimiter: u8) -> Vec<Vec<String>> {
         }
     }
 
-    // A single forward pass over `content.chars()` - not a `Vec<char>`
-    // collected up front. The old whole-file `Vec<char>` materialized 4
-    // bytes per character regardless of the source encoding, so a large
-    // ASCII-heavy CSV (the overwhelmingly common case) paid for a
-    // ~4x-oversized buffer, plus a full linear copy pass, before the
-    // state machine even started - a real, measurable regression versus
-    // the `csv`-crate-based reader this replaced (see CLAUDE.md's
-    // Dependency footprint section), caught by re-running this project's
-    // own `cargo bench` rather than assumed away. A first attempt at this
-    // fix used `Peekable` instead (needed because `State::StartRecord`'s
-    // non-terminator branch used to defer to `State::StartField` *without*
-    // consuming the character, relying on the old indexed loop's ability
-    // to re-inspect the same position under a new state) - that avoided
-    // the big allocation but added enough per-character `Option`-wrapping
-    // overhead of its own to regress the 10,000-row benchmark even while
-    // improving the 200,000-row one, confirmed by actually re-running
-    // `cargo bench` rather than assumed. Factoring the shared behavior
-    // into `start_field` above instead removes the deferral entirely -
-    // `StartRecord` now calls it inline for that same character rather
-    // than re-examining it next iteration - so a plain `for` loop over
-    // `chars()` (no `Vec<char>`, no `Peekable`) can consume every
-    // character exactly once, matching the original semantics exactly.
+    // A single forward pass over the underlying bytes, tracking a byte
+    // cursor (`pos`) rather than iterating `content.chars()` one
+    // character at a time - the old whole-file `Vec<char>` materialized 4
+    // bytes per character regardless of the source encoding (a real,
+    // measurable regression versus the `csv`-crate-based reader this
+    // replaced, see CLAUDE.md's Dependency footprint section), and even
+    // after that was fixed, a real profiling pass (`samply`/`atos`
+    // against this project's own release build) found `field.push(c)` -
+    // appending one already-decoded `char` at a time while `InField`/
+    // `InQuotedField` - to be a genuine hot spot in its own right on a
+    // large real CSV: every ordinary character paid for a UTF-8 decode
+    // (advancing the old `chars()` iterator) and a separate re-encode
+    // (`String::push`'s own per-char cost), instead of one bulk copy for
+    // the whole run of ordinary characters between two delimiters.
+    //
+    // `InField`/`InQuotedField` now scan forward over raw bytes for the
+    // next delimiter/terminator/closing-quote and `push_str` the whole
+    // span at once. This is safe with multi-byte UTF-8 content despite
+    // operating below the `char` level: `delimiter`, `'\r'`, `'\n'`, and
+    // `'"'` are all single-byte ASCII values, and a UTF-8 continuation
+    // byte is always in `0x80..=0xBF` - strictly above the ASCII range -
+    // so a byte-for-byte scan for any of these four values can never
+    // mistake a byte in the *middle* of a multi-byte character for a
+    // real boundary; every position this scan stops at is guaranteed to
+    // already be a valid `char` boundary. `StartRecord`/`StartField`/
+    // `InDoubleEscapedQuote` are pure single-character decision points
+    // (never a "run" to batch), so they still decode exactly one `char`
+    // per step via `content[pos..].chars().next()` and advance `pos` by
+    // that character's own UTF-8 length - functionally identical to one
+    // step of the old `for c in content.chars()` loop, just addressed by
+    // byte offset instead of iterator position.
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
     let mut records: Vec<Vec<String>> = Vec::new();
     let mut record: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut state = State::StartRecord;
 
-    for c in content.chars() {
+    while pos < len {
         match state {
-            State::StartRecord => {
-                if !is_term(c) {
-                    state = start_field(c, delimiter, &mut field, &mut record, &mut records);
-                }
-            }
-            State::StartField => {
-                state = start_field(c, delimiter, &mut field, &mut record, &mut records);
-            }
             State::InField => {
-                if c == delimiter {
+                let start = pos;
+                while pos < len {
+                    let b = bytes[pos];
+                    if b == delimiter as u8 || b == b'\r' || b == b'\n' {
+                        break;
+                    }
+                    pos += 1;
+                }
+                if pos > start {
+                    field.push_str(&content[start..pos]);
+                }
+                if pos >= len {
+                    break;
+                }
+                if bytes[pos] == delimiter as u8 {
                     record.push(std::mem::take(&mut field));
                     state = State::StartField;
-                } else if is_term(c) {
+                } else {
                     record.push(std::mem::take(&mut field));
                     records.push(std::mem::take(&mut record));
                     state = State::StartRecord;
-                } else {
-                    field.push(c);
                 }
+                pos += 1;
             }
             State::InQuotedField => {
-                if c == '"' {
-                    state = State::InDoubleEscapedQuote;
-                } else {
-                    field.push(c);
+                let start = pos;
+                while pos < len && bytes[pos] != b'"' {
+                    pos += 1;
                 }
+                if pos > start {
+                    field.push_str(&content[start..pos]);
+                }
+                if pos >= len {
+                    break;
+                }
+                state = State::InDoubleEscapedQuote;
+                pos += 1;
             }
-            State::InDoubleEscapedQuote => {
-                if c == '"' {
-                    field.push('"');
-                    state = State::InQuotedField;
-                } else if c == delimiter {
-                    record.push(std::mem::take(&mut field));
-                    state = State::StartField;
-                } else if is_term(c) {
-                    record.push(std::mem::take(&mut field));
-                    records.push(std::mem::take(&mut record));
-                    state = State::StartRecord;
-                } else {
-                    field.push(c);
-                    state = State::InField;
+            State::StartRecord | State::StartField | State::InDoubleEscapedQuote => {
+                let c = content[pos..]
+                    .chars()
+                    .next()
+                    .expect("pos < len on a str's own byte boundary always has a next char");
+                pos += c.len_utf8();
+                match state {
+                    State::StartRecord => {
+                        if !is_term(c) {
+                            state =
+                                start_field(c, delimiter, &mut field, &mut record, &mut records);
+                        }
+                    }
+                    State::StartField => {
+                        state = start_field(c, delimiter, &mut field, &mut record, &mut records);
+                    }
+                    State::InDoubleEscapedQuote => {
+                        if c == '"' {
+                            field.push('"');
+                            state = State::InQuotedField;
+                        } else if c == delimiter {
+                            record.push(std::mem::take(&mut field));
+                            state = State::StartField;
+                        } else if is_term(c) {
+                            record.push(std::mem::take(&mut field));
+                            records.push(std::mem::take(&mut record));
+                            state = State::StartRecord;
+                        } else {
+                            field.push(c);
+                            state = State::InField;
+                        }
+                    }
+                    State::InField | State::InQuotedField => unreachable!("handled above"),
                 }
             }
         }
