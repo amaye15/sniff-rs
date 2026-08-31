@@ -43329,14 +43329,26 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         };
     }
 
-    let mut seen = HashSet::new();
-    let mut samples = Vec::new();
+    // Linear scan against `samples` itself, not a `HashSet` - `n_samples`
+    // is typically single digits, so this is cheaper than hashing (the
+    // same choice `profile_json_path`'s own sample collection already
+    // makes, for the same reason - see that function's own comment).
+    // The `HashSet` version this replaced only reached its early exit
+    // once `n_samples` distinct values were found - for a column with
+    // *fewer* distinct values than `n_samples` (a boolean, a constant
+    // column, a small status/category enum - all real, common shapes),
+    // that count is never reached, so the old loop - and every hash it
+    // did - ran across the *entire* column instead of stopping early.
+    // Confirmed via real `samply` profiling on exactly such a column
+    // (a boolean field in a 500,000-row file): a genuine, measurable
+    // hot spot, not a theoretical one.
+    let mut samples: Vec<String> = Vec::new();
     for v in non_null {
-        if seen.insert(v.as_str()) {
+        if samples.len() >= n_samples {
+            break;
+        }
+        if !samples.iter().any(|s| s == v) {
             samples.push(v.clone());
-            if samples.len() >= n_samples {
-                break;
-            }
         }
     }
 

@@ -2728,6 +2728,57 @@ reproducible **~5%** further user-time improvement on top of the sixth
 pass's own gain (≈0.93s down to ≈0.89s in the two clean batches, baseline
 above the fix in every single comparable round).
 
+An eighth pass moved the profiler from JSON onto a wide, diverse CSV
+file (many real semantic-type columns - UUID/email/IPv4/date/amount/
+free-text/category) to check whether the CSV-only path had anything
+left after passes 1 and 5's own CSV work. It did: `profile_column`'s
+own sample-value collection (the CSV/Excel/fixed-width equivalent of
+`profile_json_path`'s already-fixed sample loop, see the second-pass
+entry above) still used a `HashSet<&str>` for de-duplication, with the
+default SipHash hasher never touched by the sixth pass's `FxHasher`
+work either. Traced via a full call-stack walk (leaf frame
+`hash_one`/`sip::Hasher::write` up through `hashbrown::map::HashMap::
+insert` up through `profile_column` itself) rather than just the leaf
+symbol, confirming the source unambiguously before touching anything.
+
+The bug shape is the exact one this project has now found twice before
+(the sixth pass's `suggest_ideal_type` unique-count, the seventh pass's
+`kind_counts`): the loop only reaches its early exit once `n_samples`
+*distinct* values have been collected, which for a column with *fewer*
+distinct values than `n_samples` (the CLI's own default is 3 - so any
+boolean, constant, or small 2-3-value status/category column, all real
+and common shapes) never happens, so the loop - and every hash it did -
+ran across the column's *entire* length instead of stopping early.
+Fixed by replacing the `HashSet` with the identical linear-scan-against-
+`samples`-itself approach `profile_json_path` already uses (and already
+justifies in its own comment): `n_samples` is small enough that a
+linear scan beats hashing outright, so this isn't even a `FxHasher`
+case the way the sixth/seventh passes' fixes were - there's no hash
+computation needed here at all any more.
+
+Verified the same way as every pass before it: full test suite
+unchanged and passing, clippy/fmt clean, and byte-identical output
+confirmed via `diff` against the pre-fix binary across six fixtures
+(three CSV fixtures in all three output formats, plus the wide
+synthetic CSV and a purpose-built low-cardinality-heavy CSV in
+Markdown). A fresh profile of the fixed binary confirmed the mechanism
+directly: the `sip::Hasher`/`hash_one` self-time cluster this pass
+targeted is completely gone. Wall-clock measurement was genuinely
+harder to pin down this pass than any before it - `ps`/`uptime` showed
+sustained (not transient) background contention from an unrelated
+`mediaanalysisd` process for most of this pass's measurement window,
+degrading several attempted alternating-binary batches into unusable
+noise (individual runs swinging 1.4s-3.5s with no consistent direction).
+The batches captured *before* that contention set in showed the
+expected direction and a modest magnitude consistent with the profiled
+cost share: ~1.6% on a CSV dominated by low-cardinality columns, ~0.9%
+on the wide 10-column fixture (where only 3 of 10 columns are narrow
+enough to trigger the old full-column-scan behavior, diluting the
+effect). Reported honestly, with the profiler-confirmed mechanism as
+the primary evidence and the wall-clock numbers as corroborating rather
+than definitive, rather than waiting indefinitely for a quiet machine
+or overstating a number the noisy majority of runs couldn't support.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

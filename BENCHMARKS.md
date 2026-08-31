@@ -33,6 +33,39 @@ re-run.
 
 ---
 
+## 2026-09-01 — `1b7313c`+perf pass 8 (Darwin arm64, Apple M4)
+
+An eighth optimization pass, moving the profiler onto a wide, diverse
+CSV file (UUID/email/IPv4/date/amount/free-text/category columns,
+500,000 rows) to check the CSV-only path after passes 1/5's own work
+there. See CLAUDE.md's own "Performance" section for the full writeup.
+
+Found `profile_column`'s own sample-collection `HashSet<&str>` (still
+using the default SipHash, never touched by pass 6's `FxHasher` work)
+had the same "never reaches its early exit on a low-cardinality column"
+shape as passes 6 and 7's own findings - any column with fewer distinct
+values than `n_samples` (default 3: booleans, small status/category
+enums) scans its *entire* length hashing every value. Fixed by
+replacing it with `profile_json_path`'s own already-proven linear-scan-
+against-`samples` approach - no hashing needed at all for this one.
+
+**Measurement note**: sustained background contention from an unrelated
+`mediaanalysisd` process degraded most of this pass's alternating-binary
+batches into unusable noise (`ps`/`uptime` confirmed it, individual runs
+swinging 1.4s-3.5s with no consistent direction). A fresh profile of the
+fixed binary confirmed the mechanism directly regardless (the targeted
+`sip::Hasher`/`hash_one` self-time cluster is completely gone). The
+batches captured before contention set in:
+
+| Fixture | Before (user) | After (user) | Delta |
+|---|---|---|---|
+| Low-cardinality-heavy CSV (4 cols, 2M rows) | avg 1.42s | avg 1.40s | ~1.6% |
+| Wide 10-column CSV (500k rows, only 3 cols low-card) | avg 1.31s | avg 1.30s | ~0.9% |
+
+Reported honestly as a real but modest, column-mix-dependent win, with
+the profiler-confirmed mechanism as the primary evidence rather than
+the noisy majority of wall-clock batches.
+
 ## 2026-09-01 — `e4c9138`+perf pass 7 (Darwin arm64, Apple M4)
 
 A seventh optimization pass, re-profiling the same 300,000-row nested
