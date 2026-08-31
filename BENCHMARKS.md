@@ -33,6 +33,56 @@ re-run.
 
 ---
 
+## 2026-08-31 (follow-up 2) — `8d0b9ec`+perf pass 3 (Darwin arm64, Apple M4)
+
+A third optimization pass in the same session, another "continue to
+optimize" follow-up - see CLAUDE.md's own "Performance" section for the
+full writeup. The single largest individual win of the whole effort:
+`suggest_ideal_type`'s own unique-value counting (backing category vs.
+plain-`String` detection) used to always build the *complete* `HashSet`
+of a column's distinct values, even after the count had already passed
+the 50-value cutoff the category branch requires - at which point no
+further insertion can change the outcome. Fixed with an early exit the
+moment the count exceeds 50.
+
+**Heuristic engine** (`suggest_ideal_type`, in-process, values → time) -
+`free_text_worst_case` (the shape this fix directly targets) against the
+*original* 2026-08-23 baseline:
+
+| Size | Original | Now | Change |
+|---|---|---|---|
+| 10 | 2.52 µs | 1.92-1.99 µs | -23.8% |
+| 1,000 | 87.4 µs | 37.7-38.1 µs | **-56.5%** |
+| 100,000 | 11.5 ms | 3.83-3.86 ms | **-66.6%** |
+
+A column that never exceeds 50 distinct values (the genuine "enum /
+category" case) does the identical full scan as before and sees no
+change - this fix only ever removes work for the high-cardinality case.
+End-to-end impact on a real file is smaller and varies with column
+composition: a 300,000-row CSV with one high-cardinality free-text
+column (parsing/other-column overhead dominates) improved only
+~8% end-to-end, while the isolated heuristic itself improved by the
+percentages above - reported as an in-process number for exactly that
+reason, the same way `heuristic_engine.rs`'s own numbers always have
+been.
+
+Also worth recording: re-running the full `heuristic_engine` suite
+after this fix showed the `integer` shape's own numbers (1,000/100,000
+values) far below every prior entry in this log (9.7µs/1.19ms versus
+~43µs/~5.15ms) - this is *not* a new effect of this pass's own fix
+(integer values resolve via the `i64`/`f64` parse check, never reaching
+the unique-counting code this pass touched at all), but a delayed, clean
+measurement of the second pass's own `normalize_numeric_str` `Cow` fix,
+which runs on every value before that parse check and was never
+re-benchmarked for the `integer` shape specifically in isolation after
+landing (the one `heuristic_engine` re-run in that pass's own write-up
+happened on a machine under incidental background load and wasn't
+trusted for exactly this reason). Recorded here rather than silently
+folded into this pass's own numbers, since attributing it to the wrong
+fix would make a future comparison against *this* entry misleading.
+
+---
+
 ## 2026-08-31 (follow-up) — `f2cba62`+perf pass 2 (Darwin arm64, Apple M4)
 
 A second optimization pass in the same session, prompted by a follow-up

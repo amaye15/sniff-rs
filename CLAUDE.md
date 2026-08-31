@@ -2393,6 +2393,50 @@ rows from 545ms (the original, pre-any-of-this-work baseline) down to
 real before/after timings on real and synthetic data with byte-identical
 output confirmed via `diff` in every case.
 
+A third pass (another "continue to optimize" follow-up) found the single
+largest individual win of the whole effort, in `suggest_ideal_type`
+itself rather than in a specific format reader - which is why it benefits
+every column of every format this tool reads, not just CSV/JSON's own
+hot paths:
+
+- **The unique-value count backing category detection (`"enum /
+  category"` vs plain `"String"`) always built the *complete* `HashSet`
+  of every distinct value in a column, even once it had already grown
+  past the 50-value cutoff the category branch requires.** Once
+  `unique.len()` exceeds 50, the `unique.len() <= 50 && ratio < 0.05`
+  check can never fire again for the rest of that column - unique counts
+  only grow, never shrink, as more values are inserted - so continuing
+  to hash every remaining value into the set was pure wasted work for
+  precisely the case this project's own benchmark suite calls out as the
+  worst case: a high-cardinality free-text column, which by definition
+  drives the unique count well past 50 almost immediately. Fixed by
+  breaking out of the counting loop the moment the count exceeds 50 and
+  returning `"String"` directly, rather than finishing the scan just to
+  reach the same conclusion. A column that stays at or under 50 distinct
+  values for its entire length (the genuine "enum/category" case) is
+  completely unaffected - it still needs, and still does, the same full
+  scan as before, since the accurate ratio calculation genuinely
+  requires knowing exactly how many distinct values there are in that
+  case. Locked in as a permanent regression test using a 100,000-row
+  column where the 51st distinct value appears only in the very last
+  row rather than clustered at the start (`suggest_ideal_type_finds_a_
+  late_appearing_51st_unique_value`) - proving the early exit is safe
+  regardless of *when* the threshold is crossed, not just in the
+  already-existing boundary test's own clustered-at-the-start shape.
+
+  The result, measured directly via `benches/heuristic_engine.rs`'s own
+  `free_text_worst_case` shape (in-process, no I/O noise, exactly the
+  case this fix targets): 100,000 values went from the original
+  2026-08-23 baseline's 11.5ms down to **3.84ms**, a 66.6% reduction: at
+  1,000 values, 87.4µs down to 38.0µs (-56.5%). End-to-end impact on a
+  real file varies with how much of that file's total column set is
+  genuinely high-cardinality free text relative to everything else (I/O,
+  CSV/JSON parsing, other columns' own heuristics) - a file dominated by
+  a few such columns sees a much larger share of this win than one where
+  they're a small fraction of the total work, which is why this is
+  reported as an in-process heuristic-engine number rather than an
+  end-to-end one.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

@@ -4193,7 +4193,23 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         return ("f64".to_string(), note);
     }
 
-    let unique: HashSet<&str> = values.iter().copied().collect();
+    // Built incrementally with an early exit once the count passes 50,
+    // rather than an unconditional `values.iter().collect()` - the
+    // category check below can only ever fire when `unique.len() <= 50`,
+    // so once that's no longer true, no further insertion can change the
+    // outcome and the remaining values (which can genuinely be the
+    // overwhelming majority of a large, high-cardinality column - this is
+    // exactly `suggest_ideal_type`'s own documented free-text worst case)
+    // never need to be hashed at all. A column that stays at or under 50
+    // distinct values for its entire length still does the same full
+    // scan as before - this only ever removes work, never adds any.
+    let mut unique: HashSet<&str> = HashSet::new();
+    for v in values.iter().copied() {
+        unique.insert(v);
+        if unique.len() > 50 {
+            return ("String".to_string(), String::new());
+        }
+    }
     // A single unique value is a degenerate case the ratio check below can
     // never catch on a small file (10 rows / 1 unique value = 10%
     // cardinality, already past the 5% bar) - constant is constant
@@ -4205,7 +4221,7 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         );
     }
     let ratio = unique.len() as f64 / values.len() as f64;
-    if unique.len() <= 50 && ratio < 0.05 {
+    if ratio < 0.05 {
         return (
             "enum / category".to_string(),
             format!("low cardinality ({} unique values)", unique.len()),
@@ -50800,6 +50816,27 @@ mod tests {
         let refs: Vec<&str> = at_51.iter().map(String::as_str).collect();
         let (ideal, _) = suggest_ideal_type(&refs, "String");
         assert_eq!(ideal, "String"); // one past the limit, even though the ratio is still tiny
+    }
+
+    /// The unique-value count now breaks out of its own scanning loop as
+    /// soon as it passes 50 (see that loop's own comment for why -
+    /// avoiding a full `O(n)` hash of every remaining value once the
+    /// category-detection branch can no longer fire regardless), rather
+    /// than always scanning every value. That's only a safe optimization
+    /// if *when* the 51st distinct value is found doesn't matter - this
+    /// proves it doesn't, using a genuinely large column (100,000 rows)
+    /// where the 51st distinct value only appears in the very last row,
+    /// not clustered at the start the way `at_51` above happens to have
+    /// it. A regression back to an early-exit that fires too eagerly (or
+    /// a hand-rolled version that miscounts) would most likely surface
+    /// as exactly this shape failing while `at_51` above still passes.
+    #[test]
+    fn suggest_ideal_type_finds_a_late_appearing_51st_unique_value() {
+        let mut values: Vec<String> = (0..99_999).map(|i| format!("v{}", i % 50)).collect();
+        values.push("a-genuinely-new-value".to_string());
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let (ideal, _) = suggest_ideal_type(&refs, "String");
+        assert_eq!(ideal, "String");
     }
 
     #[test]
