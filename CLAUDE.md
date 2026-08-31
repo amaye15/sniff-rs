@@ -6247,29 +6247,201 @@ this project could just implement directly rather than depend on:
   index lookups" scope boundary this project's own SQLite reader already
   draws for an analogous reason.
 
-**What's deliberately not being hand-rolled**: unlike `arrow`/`parquet`
-just above - now fully cut over, the largest entry in this whole list -
-`serde`/`serde_json` are meant to stay a dependency permanently. They're
-also the one that's always been more central than any of the others in
-this list: `serde_json::Value` is the literal bridge type seven different
-format readers (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML) recurse
-through via `profile_json_path` - replacing it means writing and
-re-verifying a whole JSON value type, parser, and serializer, not
-swapping one call site at a time or hand-rolling a narrower, self-
-contained parser the way `csv`, `chrono`, `.xlsx`, `.ods`, `.xls`,
-`.xlsb`, `serde_norway`, `rust-ini`, `xmltree`, `zstd`, `npyz`, `rmpv`,
-`toml`, `ciborium`, `regex`, `dbase`, `dta`, `apache-avro`, `rusqlite`,
-`sas7bdat`, `ambers`, `orc-rust`, and now `arrow`/`parquet` all still were,
-however real their own risk.
-That's still a real, non-mechanical rewrite - the risk itself is why
-it's still deliberately a dependency, the same reasoning that applied to
-every other entry in this list right up until it didn't. `serde`/
-`serde_json` are the *only* dependency of any kind - direct or
-transitive - in the default build (`cargo build` with no `--features`
-compiles CSV/TSV/JSON/JSONL support from those two crates plus `std`
-alone; every optional format's own additional dependencies are exactly
-as documented in the format table at the top of this file, none of them
-pulled in unless that specific `--features` flag is passed).
+- **`serde`/`serde_json` → a hand-rolled `Value`/`Number`/`Map`, JSON
+  parser, and pretty-printer (`json_support`) - the very last two
+  dependencies of any kind, direct or transitive, and the ones this file
+  used to say were "meant to stay a dependency permanently."** They were
+  always more central than anything else in this list: `serde_json::Value`
+  is the literal bridge type seven different format readers (JSON, YAML,
+  TOML, Avro, MessagePack, CBOR, XML) recurse through via
+  `profile_json_path`, and the closing argument for keeping them was that
+  replacing `Value` meant writing and re-verifying a whole JSON value
+  type, parser, and serializer at once - not swapping one call site at a
+  time - while `serde`'s own `Serializer` trait (~45 methods, 7 associated
+  types) looked disproportionate to reimplement for the ~6 real calls that
+  ever used it. Both turned out to be surmountable, not permanent: the
+  bridge-type problem is exactly what this project's own "flip one
+  crate-wide type alias, let the compiler enumerate every remaining
+  reference as a literal checklist" cutover technique (already used for
+  `anyhow` → hand-rolled `Error`) was built for, and the `Serializer`
+  concern dissolved once it was clear only two real call sites
+  (`ColumnProfile`, a local `DataDictionary` wrapper) ever implemented the
+  trait - both replaced with a plain inherent `to_json(&self) -> Value`
+  method instead of a second general-purpose trait implementation.
+
+  **Float formatting - expected going in to be this rewrite's hardest
+  single piece, comparable to zstd/Brotli's own algorithmic hand-rolls -
+  turned out to need no custom algorithm at all.** `serde_json` renders
+  floats via `zmij`, a shortest-round-trippable (Schubfach-based) decimal
+  formatter - replicating that from scratch looked like real, dedicated
+  algorithmic work. Verified directly rather than assumed: a probe built
+  against the real `zmij` crate and cross-checked byte-for-byte against
+  Rust's own `f64` `Debug` output across an adversarial set (`1.0`, `0.1`,
+  `1.0/3.0`, 2^53, `f64::MIN_POSITIVE`, the smallest subnormal, `f64::MAX`,
+  `-0.0`, π, e, plus the small-magnitude scientific-notation threshold)
+  showed `format!("{v:?}")` already produces the identical digit sequence
+  `zmij` does in every case tested - the only differences (no `+` on a
+  positive exponent; a one-order-of-magnitude difference in exactly where
+  scientific notation kicks in) are purely cosmetic and never affect JSON
+  validity or round-trip correctness, confirmed against the fact that no
+  test in this project ever pinned down exact float text to begin with
+  (every JSON-mode test parses output back through a real JSON parser
+  before asserting anything structural). `Number`'s `Display` for the
+  float case is accordingly just `write!(f, "{v:?}")`.
+
+  `Value`/`Number` mirror `serde_json`'s own real internal shapes exactly,
+  the same "proven design, don't deviate" discipline as every other
+  hand-roll in this file: `Number` is `enum N { PosInt(u64), NegInt(i64)
+  /* always < 0 */, Float(f64) /* always finite, from_f64 rejects NaN/
+  infinity */ }`, read directly from `serde_json`'s own `number.rs` -
+  including preserving a real, deliberate quirk of its accessor API rather
+  than "fixing" it: any integer `0..=i64::MAX` stored as a single `PosInt`
+  answers `true` to *both* `is_i64()`/`as_i64()` *and*
+  `is_u64()`/`as_u64()` simultaneously, which `profile_json_path`'s own
+  existing `n.is_i64() || n.is_u64()` check already relies on being
+  redundant-but-harmless in exactly that range. `PartialEq for Number` is
+  same-variant-only (a `Number` parsed from `"40"` is *not* `==` one built
+  via `from_f64(40.0)`, even though both convert to `40.0` via `as_f64()`)
+  - matching upstream's real, if counterintuitive, behavior; `Value`'s own
+  numeric `PartialEq` is what makes `assert_eq!(v, 40.0)`-style comparisons
+  keep working regardless of which variant backs a given `Number`.
+
+  **`Object`/`Map` switching from alphabetical to insertion order is a
+  deliberate, disclosed behavior change, not an incidental side effect of
+  the rewrite - and it was the one open design decision only the user
+  could make, not something to infer from the code.** `serde_json::Map`
+  in this project's build is `BTreeMap`-backed (confirmed: no
+  `preserve_order`/`indexmap` anywhere in the resolved dependency graph
+  for `serde_json`), meaning every JSON object's keys have always come out
+  alphabetically sorted - directly contradicting a stale doc comment
+  elsewhere in this project that already claimed "first-seen order." Given
+  the choice between replicating that alphabetical behavior exactly (zero
+  visible change) or fixing it as part of the rewrite, the user chose to
+  fix it: the new `Map` is a plain `Vec<(String, Value)>` with linear-scan
+  `get`/`insert` (rows/records in this tool's own domain are a handful to
+  a few dozen fields, not huge flat dictionaries needing an indexed lookup
+  structure - the "up to 14,703 flattened columns" scale this project's
+  own real-world testing has hit comes from *accumulating* many small
+  objects' worth of dot-notation column names across a deeply nested
+  document, never from one single `Object` with that many direct sibling
+  keys), and `insert` on an existing key overwrites the value **in place
+  at its existing position** rather than moving it to the end, matching
+  `indexmap::IndexMap::insert`'s own documented contract. This means
+  nested JSON/YAML/TOML/Avro/MessagePack/CBOR/XML output now surfaces
+  columns - both top-level and inside a stringified `sample_values` entry
+  for a nested object - in their natural source order instead of always
+  alphabetized, confirmed by hand against `tests/fixtures/sample.toml`'s
+  own `[owner]`/`[[servers]]` field order surviving unchanged into both
+  `--output-format json` and `--output-format json-schema`.
+
+  `PartialEq for Map` is deliberately **order-independent** despite the
+  type itself now tracking real insertion order for iteration/display -
+  same length, and every `(k, v)` in `self` has an equal `v` in
+  `other.get(k)`, not derived positional `Vec` equality. This isn't
+  optional polish: dozens of existing `assert_eq!(v, json!({...}))`
+  whole-tree comparisons throughout this project's own test suite compare
+  a parsed document against a hand-typed literal with no guaranteed
+  relationship between the source's real key order and the order the test
+  author happened to type the literal in - today's `BTreeMap`-backed
+  equality was *already* order-independent in exactly this sense (a
+  `BTreeMap` has no concept of insertion order at all), so this preserves
+  that property rather than introducing a new source of test flakiness.
+
+  **The parser is a single recursive-descent function over `&str`** (no
+  `Deserializer`/`Visitor` machinery - every real call site in this
+  project targets `Value` directly, never a derived struct), verified
+  field-by-field against `serde_json`'s own `de.rs`: leading-zero
+  rejection, bare `.5`/trailing `5.` rejection, `-0` (no decimal point or
+  exponent) parsing as `Float(-0.0)` rather than an integer (a genuine,
+  replicated upstream quirk), an integer literal too large for `u64`
+  falling back to `f64`, the standard eight string escapes plus `\uXXXX`
+  with strict lone-surrogate rejection as a hard parse error (never silent
+  `U+FFFD` substitution), duplicate-key-overwrite falling naturally out of
+  `Map::insert`'s own contract with no special parser logic needed, and
+  trailing non-whitespace after a complete top-level value as a hard
+  error - the exact property `read_json_values`'s own single-document-vs-
+  JSON-Lines fallback already depends on. A **128-level recursion limit**,
+  enforced via an explicit depth counter rather than relying on the call
+  stack, is a genuine safety requirement here and not just fidelity to
+  upstream: two real call sites (`is_embedded_json`, `is_jwt`) run this
+  parser directly on untrusted text (a CSV cell's content, a base64url-
+  decoded JWT segment), so an unbounded native recursion would risk an
+  uncatchable stack-overflow abort rather than a clean, disclosed error -
+  the same class of gap this project's own XML/MessagePack/TOML/CBOR depth
+  guards were each added to close in their own hand-rolls.
+
+  **One genuine logic rewrite, not a drop-in swap**: `read_json_values`'s
+  top-level-array branch used to deserialize directly into `Vec<JsonValue>`
+  via serde's generic `Vec<T>` support - since the new parser only ever
+  returns a single `Value`, this became parse-to-`Value` then
+  `match Ok(Value::Array(items)) => Ok(items)`, with the same treatment
+  applied to two of this project's own `#[cfg(test)]` oracle functions
+  (Parquet's and Arrow IPC's own `arrow::json::writer::ArrayWriter`
+  comparisons) that parsed a real JSON array of rows the identical way.
+
+  **The `json!` macro is a direct port of the real `json_internal!`
+  tt-muncher** (read in full from the vendored `serde_json-1.0.151/src/
+  macros.rs` before adapting it), self-contained enough that every arm
+  except the final catch-all carries over completely unchanged - the one
+  substantive change is that arm going through `Value::from($other)`
+  instead of upstream's `to_value(&$other).unwrap()`, since this project
+  deliberately doesn't reimplement `Serialize` (covered instead by the
+  `From<T>` impls for every concrete type this codebase's ~65 real
+  `json!(...)` call sites actually interpolate, plus one addition upstream
+  doesn't need: a blanket `impl<T: Copy> From<&T> for Value` covering a
+  confirmed `k: &i64` interpolation site). Every internal recursive call
+  is fully `$crate`-qualified, matching upstream's own robust convention,
+  so `json!(...)` resolves correctly regardless of where in this ~52,000-
+  line file it's invoked from.
+
+  **A real, live, previously-untested bug was found and fixed along the
+  way, the same "verify against real behavior before trusting it"
+  discipline every hand-roll in this file follows**: `yaml_support`'s
+  handling of a bare `.inf`/`-.inf` YAML scalar called
+  `serde_json::Number::from_f64(f64::INFINITY).unwrap()`, which panics
+  with the *real* `serde_json` crate too - `from_f64` returns `None` for
+  any non-finite input, confirmed directly rather than assumed, so any
+  real YAML file containing a bare `.inf`/`-.inf` scalar would have
+  crashed this tool outright. Fixed by falling back to the literal source
+  string, matching the adjacent `.nan` arm's own already-correct
+  treatment (`Number` can't losslessly represent infinity or NaN at all -
+  the same "can't losslessly represent this" treatment this project
+  already gives Avro's `Duration` logical type).
+
+  Verified two ways, the same discipline as every other hand-roll in this
+  file: a dedicated `#[cfg(test)] mod oracle_tests` inside `json_support`
+  itself cross-checks this parser against real `serde_json::from_str`
+  (kept as a dev-only oracle, the same treatment every other replaced
+  crate in this document already gets) on a representative adversarial
+  corpus and every committed `.json`/`.jsonl` fixture, via a
+  `structurally_equal` helper explicit that "matches exactly" means
+  structurally - object key order is the one deliberate, disclosed
+  divergence documented above, not a bug. And `tests/integration.rs` was
+  deliberately left completely untouched, rather than rewritten against
+  the new in-house type - it keeps parsing this tool's own JSON output
+  through the real, unmodified `serde_json` parser, which is the
+  *stronger* correctness check: a genuinely independent reference parser
+  agreeing with this tool's hand-rolled output is real proof of standards
+  conformance, where rewriting ~200 tests against the new type would only
+  prove the new parser agrees with itself. This did surface one further,
+  narrower divergence worth recording: `toml_reader_matches_the_toml_
+  crate_output_exactly`'s own oracle (the real `toml` crate's `Table`,
+  also plain-`BTreeMap`-backed without its own `preserve_order` feature)
+  now legitimately disagrees with this project's own insertion-ordered
+  output on column *order* - fixed by sorting both sides' column-name
+  lists before comparing and matching columns by name rather than
+  position, the same order-independent-on-objects principle applied one
+  level up, plus a small helper that re-parses a stringified nested-object
+  `sample_values` entry on both sides before comparing, since a plain
+  string comparison would otherwise still see the two sides' key order
+  diverge one level down.
+
+  `serde`/`serde_json` remain unconditional dev-dependencies (JSON was
+  never behind a `--features` flag, so there's no way to make them
+  optional even in the test build) - confirmed via `cargo tree --features
+  full -e normal` (empty of both) versus `-e normal,dev` (both present),
+  the same structural verification every other crate in this document's
+  history got before being trusted as truly moved.
 
 ## Known limitations / roadmap
 

@@ -3,13 +3,6 @@ name = "sniff-rs"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-serde_json = "1.0.151"
-# No "derive" feature - ColumnProfile's own Serialize impl is hand-written
-# (see src/lib.rs) rather than #[derive(Serialize)]; the plain trait is
-# still needed for that impl's own `S: serde::Serializer` bound.
-serde = "1.0.229"
-
 [features]
 default = []
 # parquet also covers Arrow IPC/Feather (.arrow/.feather) - both are Arrow-ecosystem
@@ -41,6 +34,43 @@ spss = []
 orc = []
 
 [dev-dependencies]
+# Unlike every other entry in this list, `serde`/`serde_json` used to be
+# this project's last two *unconditional* runtime dependencies - the ones
+# CLAUDE.md long documented as "meant to stay a dependency permanently",
+# specifically because `serde_json::Value` is the shared recursive bridge
+# type seven different format readers (JSON, YAML, TOML, Avro, MessagePack,
+# CBOR, XML) all flatten through, and because reimplementing the full
+# `Serializer` trait surface looked disproportionate to the ~6 real calls
+# that ever used it. Both claims turned out not to hold: `json_support` in
+# src/lib.rs is a hand-rolled `Value`/`Number`/`Map`, a from-scratch
+# recursive-descent parser, and a pretty-printer, all built the same
+# "read the real crate's source as the spec" way as every other hand-roll
+# in this list - and the two hand-written `impl serde::Serialize` blocks
+# (`ColumnProfile`, a local `DataDictionary` wrapper) became plain inherent
+# `to_json(&self) -> Value` methods instead, so `serde`'s own `Serializer`
+# trait was never actually needed. Kept only as this project's own
+# cross-verification oracle now: `tests/integration.rs` still parses this
+# tool's JSON output through the real, independent `serde_json` parser
+# (a genuinely stronger conformance proof than re-parsing with the same
+# hand-rolled reader that produced the output), and
+# `json_reader_matches_the_serde_json_crate_output_exactly` /
+# `pretty_output_round_trips_through_real_serde_json` in src/lib.rs's own
+# `#[cfg(test)]` blocks compare directly against it. One deliberate,
+# disclosed behavior change came out of this rewrite: the new `Map` is
+# insertion-ordered (a `Vec<(String, Value)>`), not `BTreeMap`-backed like
+# `serde_json::Map` without its own `preserve_order` feature - so nested
+# JSON/YAML/TOML/Avro/MessagePack/CBOR/XML output now surfaces columns in
+# their natural source order instead of always alphabetized, a real fix to
+# a long-standing accidental side effect a nearby doc comment already
+# claimed shouldn't have been happening. The rewrite also caught a real,
+# live, previously-untested bug along the way: `yaml_support`'s handling of
+# a bare `.inf`/`-.inf` YAML scalar called
+# `serde_json::Number::from_f64(f64::INFINITY).unwrap()`, which panics
+# with the real crate too (`from_f64` returns `None` for non-finite input)
+# - fixed to fall back to the literal string, matching the adjacent `.nan`
+# arm's own already-correct treatment.
+serde_json = "1.0.151"
+serde = "1.0.229"
 # Dev-only - never affects the shipped binary or a consumer's build, unlike
 # every other dependency decision in this file. See CLAUDE.md's benchmarking
 # section for why this is the one place this project reaches for a big,

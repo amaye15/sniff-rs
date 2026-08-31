@@ -3,8 +3,8 @@ use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use serde_json::Value as JsonValue;
-use serde_json::json;
+use json_support::Value as JsonValue;
+use json_support::json;
 
 // --- Hand-rolled stand-in for `anyhow` (see CLAUDE.md's Dependency
 // footprint section) ---
@@ -128,6 +128,2031 @@ macro_rules! anyhow {
         $crate::Error::msg(format!($($arg)*))
     };
 }
+
+// --- Hand-rolled JSON value model, parser, and serializer (see CLAUDE.md's
+// Dependency footprint section) ---
+//
+// `serde`/`serde_json` used to be this project's last two runtime
+// dependencies, deliberately kept - CLAUDE.md used to say "meant to stay
+// a dependency permanently" - specifically because `serde_json::Value` is
+// the shared bridge type seven different format readers (JSON, YAML,
+// TOML, Avro, MessagePack, CBOR, XML) recurse through via
+// `profile_json_path`, and because reimplementing `serde::Serializer`'s
+// own trait surface looked disproportionate. Neither turned out to be
+// true once actually attempted: only two small hand-written
+// `impl serde::Serialize` blocks existed in the whole file (both
+// `SerializeStruct`-only), and `Value`/`Number`/`Map` themselves are a
+// small, well-specified data model - the real reference crate's own
+// source (`serde_json`, `serde_core`) was read directly as the spec, the
+// same "read the real crate's source, then hand-roll an independent
+// implementation, verify against real behavior" discipline every other
+// hand-roll in this project already follows.
+//
+// This module is unconditional (not gated behind any `--features` flag)
+// unlike every other `_support` module in this file - JSON is one of the
+// two always-on default formats, not an optional one.
+mod json_support {
+    // -----------------------------------------------------------------
+    // Value
+    // -----------------------------------------------------------------
+
+    /// The same six variants `serde_json::Value` has, in the same names -
+    /// this is what let the ~117 existing match/construction call sites
+    /// across every format reader keep compiling with minimal edits once
+    /// the crate-wide `JsonValue` alias was repointed here.
+    #[derive(Clone, Debug)]
+    pub(crate) enum Value {
+        Null,
+        Bool(bool),
+        Number(Number),
+        String(String),
+        Array(Vec<Value>),
+        Object(Map),
+    }
+
+    impl Value {
+        pub(crate) fn is_null(&self) -> bool {
+            matches!(self, Value::Null)
+        }
+
+        pub(crate) fn is_object(&self) -> bool {
+            matches!(self, Value::Object(_))
+        }
+
+        // Only called from feature-gated readers (e.g. Avro's schema
+        // parser) - unused in a plain default build, same as several
+        // other accessors on this type kept for API parity.
+        #[allow(dead_code)]
+        pub(crate) fn as_object(&self) -> Option<&Map> {
+            match self {
+                Value::Object(m) => Some(m),
+                _ => None,
+            }
+        }
+
+        /// Convenience wrapper matching `serde_json::Value::get`'s own
+        /// by-key lookup (a non-object, or a missing key, both just give
+        /// `None` - no panic, matching upstream). Only called from
+        /// feature-gated readers today.
+        #[allow(dead_code)]
+        pub(crate) fn get(&self, key: &str) -> Option<&Value> {
+            match self {
+                Value::Object(m) => m.get(key),
+                _ => None,
+            }
+        }
+
+        // API parity with `serde_json::Value` - no known call site needs
+        // this on `Value` directly today (every real use goes through an
+        // already-matched `&Vec<Value>` or `as_array`).
+        #[allow(dead_code)]
+        pub(crate) fn is_array(&self) -> bool {
+            matches!(self, Value::Array(_))
+        }
+
+        // Only called from feature-gated readers - unused in a plain
+        // default build.
+        #[allow(dead_code)]
+        pub(crate) fn as_array(&self) -> Option<&Vec<Value>> {
+            match self {
+                Value::Array(a) => Some(a),
+                _ => None,
+            }
+        }
+
+        pub(crate) fn as_str(&self) -> Option<&str> {
+            match self {
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            }
+        }
+
+        pub(crate) fn as_f64(&self) -> Option<f64> {
+            match self {
+                Value::Number(n) => n.as_f64(),
+                _ => None,
+            }
+        }
+
+        // Thin forwarders for API parity with `serde_json::Value` - no
+        // known call site needs these on `Value` directly today (every
+        // real use goes through an already-matched `&Number`), but
+        // they're free and match upstream's own surface.
+        #[allow(dead_code)]
+        pub(crate) fn as_i64(&self) -> Option<i64> {
+            match self {
+                Value::Number(n) => n.as_i64(),
+                _ => None,
+            }
+        }
+
+        #[allow(dead_code)]
+        pub(crate) fn as_u64(&self) -> Option<u64> {
+            match self {
+                Value::Number(n) => n.as_u64(),
+                _ => None,
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Number
+    // -----------------------------------------------------------------
+
+    /// Mirrors `serde_json::Number`'s real internal representation
+    /// exactly (verified directly against its own `number.rs`) - a
+    /// proven design, not worth deviating from: every non-
+    /// `arbitrary_precision` `Number` is in exactly one of these three
+    /// states, never a hybrid.
+    #[derive(Clone, Copy, Debug)]
+    enum N {
+        /// A non-negative integer, up to the full range of `u64`.
+        PosInt(u64),
+        /// A negative integer - always strictly less than zero (a
+        /// non-negative value is always represented as `PosInt` instead,
+        /// matching upstream's own invariant).
+        NegInt(i64),
+        /// A floating-point value - always finite (`from_f64` rejects
+        /// NaN/infinity at construction, matching upstream exactly).
+        Float(f64),
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Number(N);
+
+    impl Number {
+        /// A real, deliberate quirk of `serde_json::Number`'s own accessor
+        /// API, preserved here rather than "fixed": any integer in
+        /// `0..=i64::MAX` is stored as a single `PosInt`, but answers
+        /// `true` to *both* `is_i64()`/`as_i64()` *and*
+        /// `is_u64()`/`as_u64()` simultaneously - there's no ambiguity in
+        /// the underlying storage (it's still one value), just a
+        /// deliberately double-classifying accessor surface. This
+        /// project's own `profile_json_path` already relies on
+        /// `n.is_i64() || n.is_u64()` being redundant-but-harmless in
+        /// exactly this range.
+        pub(crate) fn is_i64(&self) -> bool {
+            match self.0 {
+                N::PosInt(v) => v <= i64::MAX as u64,
+                N::NegInt(_) => true,
+                N::Float(_) => false,
+            }
+        }
+
+        pub(crate) fn is_u64(&self) -> bool {
+            matches!(self.0, N::PosInt(_))
+        }
+
+        #[allow(dead_code)]
+        pub(crate) fn is_f64(&self) -> bool {
+            matches!(self.0, N::Float(_))
+        }
+
+        pub(crate) fn as_i64(&self) -> Option<i64> {
+            match self.0 {
+                N::PosInt(v) if v <= i64::MAX as u64 => Some(v as i64),
+                N::NegInt(v) => Some(v),
+                _ => None,
+            }
+        }
+
+        pub(crate) fn as_u64(&self) -> Option<u64> {
+            match self.0 {
+                N::PosInt(v) => Some(v),
+                _ => None,
+            }
+        }
+
+        pub(crate) fn as_f64(&self) -> Option<f64> {
+            match self.0 {
+                N::PosInt(v) => Some(v as f64),
+                N::NegInt(v) => Some(v as f64),
+                N::Float(v) => Some(v),
+            }
+        }
+
+        /// `None` iff `f` is NaN or infinite - the exact gate upstream's
+        /// own `Number::from_f64` uses (`number.rs`, confirmed directly:
+        /// `if f.is_finite() { Some(..) } else { None }`).
+        pub(crate) fn from_f64(f: f64) -> Option<Number> {
+            if f.is_finite() {
+                Some(Number(N::Float(f)))
+            } else {
+                None
+            }
+        }
+    }
+
+    macro_rules! number_from_signed {
+        ($($ty:ty),* $(,)?) => {
+            $(
+                impl From<$ty> for Number {
+                    fn from(v: $ty) -> Self {
+                        let v = v as i64;
+                        if v < 0 {
+                            Number(N::NegInt(v))
+                        } else {
+                            Number(N::PosInt(v as u64))
+                        }
+                    }
+                }
+            )*
+        };
+    }
+    macro_rules! number_from_unsigned {
+        ($($ty:ty),* $(,)?) => {
+            $(
+                impl From<$ty> for Number {
+                    fn from(v: $ty) -> Self {
+                        Number(N::PosInt(v as u64))
+                    }
+                }
+            )*
+        };
+    }
+    number_from_signed!(i8, i16, i32, i64, isize);
+    number_from_unsigned!(u8, u16, u32, u64, usize);
+
+    impl std::fmt::Display for Number {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0 {
+                N::PosInt(v) => write!(f, "{v}"),
+                N::NegInt(v) => write!(f, "{v}"),
+                // Verified directly (probe against the real `zmij` crate
+                // this project's own `serde_json` dependency actually
+                // used for float formatting, cross-checked byte-for-byte
+                // against `f64`'s own `Debug` output across an
+                // adversarial set including subnormals, `f64::MAX`,
+                // `-0.0`, and the hardest shortest-round-trip cases):
+                // Rust's own `{:?}` formatting for `f64` already produces
+                // the identical shortest-round-trippable digit sequence,
+                // always containing a `.` or `e` (so a whole-number float
+                // like `40.0` never collides textually with the integer
+                // `40`). The only differences from `zmij`'s own output
+                // are purely cosmetic (no `+` on a positive exponent; a
+                // one-order-of-magnitude difference in the small-value
+                // scientific-notation threshold) and never affect JSON
+                // validity or round-trip correctness - not worth chasing,
+                // since no test in this project pins down exact float
+                // text (every JSON-mode test parses output back through a
+                // real JSON parser before asserting anything).
+                N::Float(v) => write!(f, "{v:?}"),
+            }
+        }
+    }
+
+    impl PartialEq for Number {
+        // Same-variant-only, matching upstream's own manual impl exactly:
+        // a `Number` parsed from the text "40" (`PosInt(40)`) is *not*
+        // `==` a `Number` built via `Number::from_f64(40.0)`
+        // (`Float(40.0)`), even though both convert to `40.0` via
+        // `as_f64()`. This is upstream's real, documented behavior, not a
+        // bug to "fix" - `Value`'s own numeric `PartialEq` (below) is
+        // what makes `assert_eq!(v, 40.0)`-style comparisons work
+        // regardless of which variant backs a given `Number`.
+        fn eq(&self, other: &Self) -> bool {
+            match (self.0, other.0) {
+                (N::PosInt(a), N::PosInt(b)) => a == b,
+                (N::NegInt(a), N::NegInt(b)) => a == b,
+                (N::Float(a), N::Float(b)) => a == b,
+                _ => false,
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Map (insertion-ordered - see CLAUDE.md for why this deliberately
+    // diverges from `serde_json::Map`'s own `BTreeMap`-backed, always-
+    // alphabetical behavior)
+    // -----------------------------------------------------------------
+
+    /// An ordered map from `String` to `Value`, backed by a plain
+    /// `Vec<(String, Value)>` with linear-scan lookups - realistic object
+    /// sizes in this tool's domain are rows/records (a handful to a few
+    /// dozen fields), not huge flat dictionaries, so an indexed/hashed
+    /// lookup structure would be real added complexity for no measurable
+    /// benefit (the "up to 14,703 flattened columns" scale this project's
+    /// own real-world testing has hit comes from *accumulating* many
+    /// small objects' worth of dot-notation column names across a deeply
+    /// nested document, never from one single `Object` with that many
+    /// direct sibling keys).
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Map {
+        entries: Vec<(String, Value)>,
+    }
+
+    impl Map {
+        pub(crate) fn new() -> Self {
+            Map {
+                entries: Vec::new(),
+            }
+        }
+
+        pub(crate) fn with_capacity(cap: usize) -> Self {
+            Map {
+                entries: Vec::with_capacity(cap),
+            }
+        }
+
+        /// If `key` already exists, overwrites its value **in place at
+        /// its existing position** and returns the old value - the
+        /// conventional "ordered dict" contract (matching
+        /// `indexmap::IndexMap::insert`'s own documented behavior).
+        /// Otherwise appends `(key, value)` at the end and returns
+        /// `None`.
+        pub(crate) fn insert(&mut self, key: String, value: Value) -> Option<Value> {
+            if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+                Some(std::mem::replace(&mut slot.1, value))
+            } else {
+                self.entries.push((key, value));
+                None
+            }
+        }
+
+        pub(crate) fn get(&self, key: &str) -> Option<&Value> {
+            self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        }
+
+        // Only called from feature-gated readers (INI's duplicate-key
+        // pooling) - unused in a plain default build.
+        #[allow(dead_code)]
+        pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+            self.entries
+                .iter_mut()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+        }
+
+        // Only exercised from `#[cfg(test)]` code today (an oracle
+        // comparison's own key-shape check) - real API parity with
+        // `serde_json::Map`, not dead weight.
+        #[allow(dead_code)]
+        pub(crate) fn contains_key(&self, key: &str) -> bool {
+            self.entries.iter().any(|(k, _)| k == key)
+        }
+
+        pub(crate) fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            self.entries.is_empty()
+        }
+
+        pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+            self.entries.iter().map(|(k, _)| k)
+        }
+
+        pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+            self.entries.iter().map(|(k, v)| (k, v))
+        }
+    }
+
+    impl FromIterator<(String, Value)> for Map {
+        fn from_iter<I: IntoIterator<Item = (String, Value)>>(iter: I) -> Self {
+            let mut map = Map::new();
+            for (k, v) in iter {
+                map.insert(k, v);
+            }
+            map
+        }
+    }
+
+    impl IntoIterator for Map {
+        type Item = (String, Value);
+        type IntoIter = std::vec::IntoIter<(String, Value)>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.entries.into_iter()
+        }
+    }
+
+    impl<'a> IntoIterator for &'a Map {
+        type Item = (&'a String, &'a Value);
+        type IntoIter = std::iter::Map<
+            std::slice::Iter<'a, (String, Value)>,
+            fn(&'a (String, Value)) -> (&'a String, &'a Value),
+        >;
+        fn into_iter(self) -> Self::IntoIter {
+            self.entries.iter().map(|(k, v)| (k, v))
+        }
+    }
+
+    impl PartialEq for Map {
+        // Deliberately order-independent (map/set semantics: same
+        // length, and every (k, v) in `self` has an equal `v` in
+        // `other.get(k)`) - NOT the derived positional `Vec` equality.
+        // This isn't optional polish: dozens of existing
+        // `assert_eq!(v, json!({...}))` whole-tree comparisons in this
+        // project's own test suite compare a parsed document against a
+        // hand-typed literal with no guaranteed relationship between the
+        // source's real key order and the order the test author typed
+        // the literal in - today's `BTreeMap`-backed equality is
+        // *already* order-independent in exactly this sense (a
+        // `BTreeMap` has no concept of insertion order at all), so this
+        // preserves that property even though the new `Map` itself now
+        // *does* track order (for iteration/display purposes only).
+        fn eq(&self, other: &Self) -> bool {
+            self.len() == other.len() && self.entries.iter().all(|(k, v)| other.get(k) == Some(v))
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Index - matching `serde_json::Value`'s real panic-free contract
+    // exactly: a static `Null` sentinel for anything that doesn't
+    // resolve (missing key, non-object indexed by string, out-of-bounds
+    // index, non-array indexed by usize). No `IndexMut` - confirmed no
+    // mutation-via-index exists anywhere in this project's own code.
+    // -----------------------------------------------------------------
+
+    static NULL: Value = Value::Null;
+
+    impl std::ops::Index<&str> for Value {
+        type Output = Value;
+        fn index(&self, key: &str) -> &Value {
+            match self {
+                Value::Object(m) => m.get(key).unwrap_or(&NULL),
+                _ => &NULL,
+            }
+        }
+    }
+
+    impl std::ops::Index<usize> for Value {
+        type Output = Value;
+        fn index(&self, idx: usize) -> &Value {
+            match self {
+                Value::Array(a) => a.get(idx).unwrap_or(&NULL),
+                _ => &NULL,
+            }
+        }
+    }
+
+    /// Same panic-free contract as `Value`'s own `Index<&str>` above -
+    /// matches `serde_json::Map`'s real `Index` impl, which a handful of
+    /// call sites index into directly (`&o["value"]`) rather than going
+    /// through `Value::Object(..)` first.
+    impl std::ops::Index<&str> for Map {
+        type Output = Value;
+        fn index(&self, key: &str) -> &Value {
+            self.get(key).unwrap_or(&NULL)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Display (compact JSON) - shared string-escaping with the
+    // pretty-printer (json_support::ser, added in a later phase) rather
+    // than duplicated.
+    // -----------------------------------------------------------------
+
+    pub(crate) fn write_escaped_string(out: &mut String, s: &str) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0C}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+
+    fn write_compact(out: &mut String, v: &Value) {
+        match v {
+            Value::Null => out.push_str("null"),
+            Value::Bool(true) => out.push_str("true"),
+            Value::Bool(false) => out.push_str("false"),
+            Value::Number(n) => out.push_str(&n.to_string()),
+            Value::String(s) => write_escaped_string(out, s),
+            Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_compact(out, item);
+                }
+                out.push(']');
+            }
+            Value::Object(map) => {
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_escaped_string(out, k);
+                    out.push(':');
+                    write_compact(out, v);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    impl std::fmt::Display for Value {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let mut s = String::new();
+            write_compact(&mut s, self);
+            f.write_str(&s)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // PartialEq - full ergonomic surface, matching `serde_json::Value`'s
+    // real one (`value/partial_eq.rs`, read directly) rather than a
+    // guessed-at subset, since getting this wrong silently breaks a
+    // specific comparison *direction* rather than failing to compile.
+    // -----------------------------------------------------------------
+
+    impl PartialEq for Value {
+        fn eq(&self, other: &Self) -> bool {
+            match (self, other) {
+                (Value::Null, Value::Null) => true,
+                (Value::Bool(a), Value::Bool(b)) => a == b,
+                (Value::Number(a), Value::Number(b)) => a == b,
+                (Value::String(a), Value::String(b)) => a == b,
+                (Value::Array(a), Value::Array(b)) => a == b,
+                (Value::Object(a), Value::Object(b)) => a == b,
+                _ => false,
+            }
+        }
+    }
+
+    macro_rules! partialeq_str {
+        ($($ty:ty),* $(,)?) => {
+            $(
+                impl PartialEq<$ty> for Value {
+                    fn eq(&self, other: &$ty) -> bool {
+                        self.as_str() == Some(other as &str)
+                    }
+                }
+                impl PartialEq<Value> for $ty {
+                    fn eq(&self, other: &Value) -> bool {
+                        other.as_str() == Some(self as &str)
+                    }
+                }
+                impl<'a> PartialEq<$ty> for &'a Value {
+                    fn eq(&self, other: &$ty) -> bool {
+                        self.as_str() == Some(other as &str)
+                    }
+                }
+            )*
+        };
+    }
+    partialeq_str!(str, String);
+    impl PartialEq<&str> for Value {
+        fn eq(&self, other: &&str) -> bool {
+            self.as_str() == Some(*other)
+        }
+    }
+    impl PartialEq<Value> for &str {
+        fn eq(&self, other: &Value) -> bool {
+            other.as_str() == Some(*self)
+        }
+    }
+    // No explicit `impl PartialEq<&str> for &Value`: core's own blanket
+    // `impl<A, B> PartialEq<&B> for &A where A: PartialEq<B>` already
+    // derives it from `Value: PartialEq<str>` (via `partialeq_str!`
+    // above) - writing it by hand would conflict with that blanket impl.
+
+    macro_rules! partialeq_numeric {
+        ($($ty:ty, $conv:ident, $cmp:ty);* $(;)?) => {
+            $(
+                impl PartialEq<$ty> for Value {
+                    fn eq(&self, other: &$ty) -> bool {
+                        self.$conv().is_some_and(|v| v == *other as $cmp)
+                    }
+                }
+                impl PartialEq<Value> for $ty {
+                    fn eq(&self, other: &Value) -> bool {
+                        other.$conv().is_some_and(|v| v == *self as $cmp)
+                    }
+                }
+                impl<'a> PartialEq<$ty> for &'a Value {
+                    fn eq(&self, other: &$ty) -> bool {
+                        self.$conv().is_some_and(|v| v == *other as $cmp)
+                    }
+                }
+            )*
+        };
+    }
+    partialeq_numeric! {
+        i8, as_i64, i64; i16, as_i64, i64; i32, as_i64, i64; i64, as_i64, i64; isize, as_i64, i64;
+        u8, as_u64, u64; u16, as_u64, u64; u32, as_u64, u64; u64, as_u64, u64; usize, as_u64, u64;
+        f32, as_f64, f64; f64, as_f64, f64;
+    }
+
+    impl PartialEq<bool> for Value {
+        fn eq(&self, other: &bool) -> bool {
+            matches!(self, Value::Bool(b) if b == other)
+        }
+    }
+    impl PartialEq<Value> for bool {
+        fn eq(&self, other: &Value) -> bool {
+            matches!(other, Value::Bool(b) if b == self)
+        }
+    }
+    impl PartialEq<bool> for &Value {
+        fn eq(&self, other: &bool) -> bool {
+            matches!(self, Value::Bool(b) if b == other)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // From<T>
+    // -----------------------------------------------------------------
+
+    impl From<bool> for Value {
+        fn from(b: bool) -> Self {
+            Value::Bool(b)
+        }
+    }
+
+    macro_rules! value_from_integer {
+        ($($ty:ty),* $(,)?) => {
+            $(
+                impl From<$ty> for Value {
+                    fn from(v: $ty) -> Self {
+                        Value::Number(Number::from(v))
+                    }
+                }
+            )*
+        };
+    }
+    value_from_integer!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+    impl From<f32> for Value {
+        fn from(f: f32) -> Self {
+            Number::from_f64(f as f64).map_or(Value::Null, Value::Number)
+        }
+    }
+    impl From<f64> for Value {
+        fn from(f: f64) -> Self {
+            Number::from_f64(f).map_or(Value::Null, Value::Number)
+        }
+    }
+    impl From<String> for Value {
+        fn from(s: String) -> Self {
+            Value::String(s)
+        }
+    }
+    impl From<&str> for Value {
+        fn from(s: &str) -> Self {
+            Value::String(s.to_string())
+        }
+    }
+    impl From<Number> for Value {
+        fn from(n: Number) -> Self {
+            Value::Number(n)
+        }
+    }
+    impl From<Map> for Value {
+        fn from(m: Map) -> Self {
+            Value::Object(m)
+        }
+    }
+    impl<T: Into<Value>> From<Vec<T>> for Value {
+        fn from(v: Vec<T>) -> Self {
+            Value::Array(v.into_iter().map(Into::into).collect())
+        }
+    }
+
+    // A real addition beyond `serde_json::Value`'s own `From` surface:
+    // this codebase's `json!` macro fallback arm interpolates a few
+    // borrowed values directly (e.g. `k: &i64` from a `.iter()` over
+    // `&[i64]`) - upstream handles this generically via `Serialize`,
+    // which this project deliberately doesn't reimplement (see CLAUDE.md).
+    // A single blanket impl over `Copy` types covers every such site in
+    // one shot with no coherence conflict (it can never overlap the
+    // reflexive `impl<T> From<T> for T`, since `Value` itself isn't
+    // `Copy`).
+    impl<T: Copy> From<&T> for Value
+    where
+        Value: From<T>,
+    {
+        fn from(v: &T) -> Self {
+            Value::from(*v)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Parser
+    // -----------------------------------------------------------------
+    //
+    // A recursive-descent parser over `&str` - this project already
+    // reads whole files into memory for every other format, so streaming
+    // isn't a real requirement. Every grammar edge case below was
+    // verified directly against `serde_json`'s own `de.rs`/`read.rs`
+    // before being trusted, the same "read the real crate's source as
+    // the spec" discipline every other hand-roll in this project follows
+    // - this parser also runs on genuinely untrusted arbitrary text at
+    // two real call sites (`is_embedded_json` on raw CSV cell contents,
+    // `is_jwt` on base64url-decoded JWT segments), so correctness and
+    // panic-freedom on malformed/adversarial input is a real requirement,
+    // not just fidelity to well-formed files this tool would itself
+    // produce.
+
+    /// A recursion/nesting-depth guard matching `serde_json`'s own
+    /// confirmed constant exactly (128 levels of nested `[`/`{`) - a real
+    /// safety requirement, not just fidelity: two call sites run this
+    /// parser on untrusted text, so an unbounded native recursion risks
+    /// an uncatchable stack-overflow process abort rather than a clean
+    /// parse error.
+    const MAX_DEPTH: u32 = 128;
+
+    #[derive(Debug)]
+    pub(crate) struct ParseError {
+        message: String,
+        line: usize,
+        column: usize,
+    }
+
+    impl std::fmt::Display for ParseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{} at line {} column {}",
+                self.message, self.line, self.column
+            )
+        }
+    }
+
+    impl std::error::Error for ParseError {}
+
+    struct Parser<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+        depth: u32,
+    }
+
+    impl<'a> Parser<'a> {
+        fn new(s: &'a str) -> Self {
+            Parser {
+                bytes: s.as_bytes(),
+                pos: 0,
+                depth: 0,
+            }
+        }
+
+        /// One-based line/column at the current byte offset - computed
+        /// on demand (only ever needed once, at the point an error is
+        /// raised), by scanning from the start. This project's own hand-
+        /// rolled CSV/TOML/YAML parsers all take the identical "just
+        /// rescan for the error message, don't track it on every byte"
+        /// approach.
+        fn error_at(&self, pos: usize, message: impl Into<String>) -> ParseError {
+            let mut line = 1;
+            let mut col = 1;
+            for &b in &self.bytes[..pos.min(self.bytes.len())] {
+                if b == b'\n' {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
+            }
+            ParseError {
+                message: message.into(),
+                line,
+                column: col,
+            }
+        }
+
+        fn error(&self, message: impl Into<String>) -> ParseError {
+            self.error_at(self.pos, message)
+        }
+
+        fn peek(&self) -> Option<u8> {
+            self.bytes.get(self.pos).copied()
+        }
+
+        fn bump(&mut self) -> Option<u8> {
+            let b = self.peek()?;
+            self.pos += 1;
+            Some(b)
+        }
+
+        /// Exactly `' ' | '\t' | '\n' | '\r'` - `serde_json`'s own real
+        /// whitespace set, verified directly against `de.rs` (nothing
+        /// else: no form feed, no vertical tab, no Unicode whitespace).
+        fn skip_whitespace(&mut self) {
+            while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.pos += 1;
+            }
+        }
+
+        fn expect(&mut self, byte: u8) -> std::result::Result<(), ParseError> {
+            if self.peek() == Some(byte) {
+                self.pos += 1;
+                Ok(())
+            } else {
+                Err(self.error(format!(
+                    "expected {:?}, found {:?}",
+                    byte as char,
+                    self.peek().map(|b| b as char)
+                )))
+            }
+        }
+
+        fn parse_value(&mut self) -> std::result::Result<Value, ParseError> {
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b'n') => self.parse_literal("null", Value::Null),
+                Some(b't') => self.parse_literal("true", Value::Bool(true)),
+                Some(b'f') => self.parse_literal("false", Value::Bool(false)),
+                Some(b'"') => self.parse_string().map(Value::String),
+                Some(b'[') => self.parse_array(),
+                Some(b'{') => self.parse_object(),
+                Some(b'-' | b'0'..=b'9') => self.parse_number(),
+                Some(other) => Err(self.error(format!("unexpected character {:?}", other as char))),
+                None => Err(self.error("unexpected end of input")),
+            }
+        }
+
+        fn parse_literal(
+            &mut self,
+            lit: &str,
+            value: Value,
+        ) -> std::result::Result<Value, ParseError> {
+            let start = self.pos;
+            if self.bytes[start..].starts_with(lit.as_bytes()) {
+                self.pos += lit.len();
+                Ok(value)
+            } else {
+                Err(self.error(format!("expected literal {lit:?}")))
+            }
+        }
+
+        fn enter(&mut self) -> std::result::Result<(), ParseError> {
+            self.depth += 1;
+            if self.depth > MAX_DEPTH {
+                return Err(
+                    self.error("recursion limit exceeded (128 levels of nested arrays/objects)")
+                );
+            }
+            Ok(())
+        }
+
+        fn parse_array(&mut self) -> std::result::Result<Value, ParseError> {
+            self.enter()?;
+            self.pos += 1; // consume '['
+            let mut items = Vec::new();
+            self.skip_whitespace();
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                self.depth -= 1;
+                return Ok(Value::Array(items));
+            }
+            loop {
+                items.push(self.parse_value()?);
+                self.skip_whitespace();
+                match self.peek() {
+                    Some(b',') => {
+                        self.pos += 1;
+                    }
+                    Some(b']') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => return Err(self.error("expected ',' or ']' in array")),
+                }
+            }
+            self.depth -= 1;
+            Ok(Value::Array(items))
+        }
+
+        fn parse_object(&mut self) -> std::result::Result<Value, ParseError> {
+            self.enter()?;
+            self.pos += 1; // consume '{'
+            let mut map = Map::new();
+            self.skip_whitespace();
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                self.depth -= 1;
+                return Ok(Value::Object(map));
+            }
+            loop {
+                self.skip_whitespace();
+                if self.peek() != Some(b'"') {
+                    return Err(self.error("expected a string key in object"));
+                }
+                let key = self.parse_string()?;
+                self.skip_whitespace();
+                self.expect(b':')?;
+                let value = self.parse_value()?;
+                // Last value wins on a duplicate key - falls out of
+                // `Map::insert`'s own overwrite behavior, matching
+                // `serde_json`'s own confirmed "last value silently
+                // wins" duplicate-key convention. No special-casing
+                // needed here beyond calling `insert` once per key in
+                // encounter order.
+                map.insert(key, value);
+                self.skip_whitespace();
+                match self.peek() {
+                    Some(b',') => {
+                        self.pos += 1;
+                    }
+                    Some(b'}') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => return Err(self.error("expected ',' or '}' in object")),
+                }
+            }
+            self.depth -= 1;
+            Ok(Value::Object(map))
+        }
+
+        /// Parses a JSON string literal (the opening `"` must still be
+        /// the current byte) into a `String`. Handles the standard 8
+        /// escapes plus `\uXXXX`, with strict UTF-16 surrogate-pair
+        /// handling verified directly against `serde_json`'s own
+        /// `read.rs`: a lone leading surrogate not immediately followed
+        /// by a valid trailing surrogate, or a lone trailing surrogate on
+        /// its own, is a hard parse error - never a silent `U+FFFD`
+        /// substitution.
+        fn parse_string(&mut self) -> std::result::Result<String, ParseError> {
+            self.pos += 1; // consume opening '"'
+            let mut out = String::new();
+            loop {
+                let start = self.pos;
+                while let Some(b) = self.peek() {
+                    if b == b'"' || b == b'\\' || b < 0x20 {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                // Bytes `start..self.pos` are plain UTF-8 content with no
+                // escapes or control characters - this project's own
+                // `&str` input is already valid UTF-8, so this slice is
+                // guaranteed valid UTF-8 too (it never splits a
+                // multi-byte sequence, since none of the three stop
+                // conditions above can occur mid-sequence: continuation
+                // bytes are always >= 0x80).
+                out.push_str(std::str::from_utf8(&self.bytes[start..self.pos]).unwrap());
+                match self.peek() {
+                    Some(b'"') => {
+                        self.pos += 1;
+                        return Ok(out);
+                    }
+                    Some(b'\\') => {
+                        self.pos += 1;
+                        self.parse_escape(&mut out)?;
+                    }
+                    Some(b) if b < 0x20 => {
+                        return Err(self.error(format!(
+                            "control character {b:#04x} must be escaped in a JSON string"
+                        )));
+                    }
+                    _ => return Err(self.error("unterminated string")),
+                }
+            }
+        }
+
+        fn parse_escape(&mut self, out: &mut String) -> std::result::Result<(), ParseError> {
+            let esc = self
+                .bump()
+                .ok_or_else(|| self.error("unterminated escape"))?;
+            match esc {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'b' => out.push('\u{08}'),
+                b'f' => out.push('\u{0C}'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'u' => {
+                    let cp = self.parse_hex4()?;
+                    if (0xD800..=0xDBFF).contains(&cp) {
+                        // A leading surrogate must be immediately
+                        // followed by a `\u` trailing surrogate.
+                        if self.peek() != Some(b'\\') {
+                            return Err(self.error("unpaired UTF-16 surrogate in \\u escape"));
+                        }
+                        self.pos += 1;
+                        if self.peek() != Some(b'u') {
+                            return Err(self.error("unpaired UTF-16 surrogate in \\u escape"));
+                        }
+                        self.pos += 1;
+                        let low = self.parse_hex4()?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return Err(self.error("invalid low surrogate in \\u escape pair"));
+                        }
+                        let combined = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        let c = char::from_u32(combined)
+                            .ok_or_else(|| self.error("invalid surrogate pair codepoint"))?;
+                        out.push(c);
+                    } else if (0xDC00..=0xDFFF).contains(&cp) {
+                        // A lone trailing surrogate with no preceding
+                        // leading surrogate is always an error.
+                        return Err(self.error("lone trailing UTF-16 surrogate in \\u escape"));
+                    } else {
+                        let c = char::from_u32(cp)
+                            .ok_or_else(|| self.error("invalid \\u escape codepoint"))?;
+                        out.push(c);
+                    }
+                }
+                other => {
+                    return Err(self.error(format!("invalid escape character {:?}", other as char)));
+                }
+            }
+            Ok(())
+        }
+
+        fn parse_hex4(&mut self) -> std::result::Result<u32, ParseError> {
+            let mut cp = 0u32;
+            for _ in 0..4 {
+                let b = self
+                    .bump()
+                    .ok_or_else(|| self.error("unterminated \\u escape"))?;
+                let digit = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => return Err(self.error("invalid hex digit in \\u escape")),
+                };
+                cp = (cp << 4) | u32::from(digit);
+            }
+            Ok(cp)
+        }
+
+        /// Numbers: `-? int frac? exp?`. Leading zeros (other than a
+        /// bare `0`) are rejected; a digit is required on both sides of
+        /// a decimal point; an integer literal too large for `u64` falls
+        /// back to `f64` (only erroring if even `f64` overflows to
+        /// infinity); `-0` with no fraction/exponent is a `Float(-0.0)`,
+        /// not an integer - all verified directly against `serde_json`'s
+        /// own `de.rs` rather than assumed from RFC 8259 alone.
+        fn parse_number(&mut self) -> std::result::Result<Value, ParseError> {
+            let start = self.pos;
+            let negative = self.peek() == Some(b'-');
+            if negative {
+                self.pos += 1;
+            }
+            let int_start = self.pos;
+            match self.peek() {
+                Some(b'0') => {
+                    self.pos += 1;
+                    if matches!(self.peek(), Some(b'0'..=b'9')) {
+                        return Err(self.error("invalid number: leading zero"));
+                    }
+                }
+                Some(b'1'..=b'9') => {
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                }
+                _ => return Err(self.error("invalid number: expected a digit")),
+            }
+            let int_end = self.pos;
+            let mut is_float = false;
+            if self.peek() == Some(b'.') {
+                is_float = true;
+                self.pos += 1;
+                let frac_start = self.pos;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+                if self.pos == frac_start {
+                    return Err(self.error("invalid number: expected a digit after '.'"));
+                }
+            }
+            if matches!(self.peek(), Some(b'e' | b'E')) {
+                is_float = true;
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'+' | b'-')) {
+                    self.pos += 1;
+                }
+                let exp_start = self.pos;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+                if self.pos == exp_start {
+                    return Err(self.error("invalid number: expected a digit in exponent"));
+                }
+            }
+            let text = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap();
+
+            // `-0` with no fraction/exponent is a genuine `serde_json`
+            // quirk: it parses as `Float(-0.0)`, not as the integer 0 -
+            // replicated exactly rather than "fixed", since real files
+            // and this project's own oracle test both need to agree with
+            // it.
+            if !is_float && negative && int_end - int_start == 1 && self.bytes[int_start] == b'0' {
+                return Ok(Value::Number(Number(N::Float(-0.0))));
+            }
+
+            if !is_float {
+                // Plain integer literal - try to fit it into i64/u64
+                // exactly first; only fall back to f64 (matching
+                // `serde_json`'s own overflow behavior) if it doesn't.
+                let digits = &text[if negative { 1 } else { 0 }..];
+                if let Ok(u) = digits.parse::<u64>() {
+                    return Ok(Value::Number(if negative {
+                        if u == 0 {
+                            Number(N::PosInt(0))
+                        } else if u <= (i64::MAX as u64) + 1 {
+                            Number(N::NegInt((-(u as i128)) as i64))
+                        } else {
+                            // Too negative even for i64::MIN - fall
+                            // through to f64 below.
+                            return self.number_as_f64(text);
+                        }
+                    } else {
+                        Number(N::PosInt(u))
+                    }));
+                }
+                return self.number_as_f64(text);
+            }
+            self.number_as_f64(text)
+        }
+
+        fn number_as_f64(&self, text: &str) -> std::result::Result<Value, ParseError> {
+            let f: f64 = text
+                .parse()
+                .map_err(|_| self.error("invalid number literal"))?;
+            if f.is_infinite() {
+                return Err(self.error("number out of range"));
+            }
+            Ok(Value::Number(Number(N::Float(f))))
+        }
+    }
+
+    /// Parses `s` into a `Value`. Requires the entire input (aside from
+    /// trailing whitespace) to be consumed - trailing non-whitespace
+    /// content after a complete top-level value is a hard error,
+    /// matching `serde_json`'s own confirmed behavior and exactly what
+    /// this project's own `read_json_values` single-document-vs-JSON-
+    /// Lines fallback logic already depends on.
+    pub(crate) fn from_str(s: &str) -> std::result::Result<Value, ParseError> {
+        let mut parser = Parser::new(s);
+        let value = parser.parse_value()?;
+        parser.skip_whitespace();
+        if parser.pos != parser.bytes.len() {
+            return Err(parser.error("trailing characters after a complete JSON value"));
+        }
+        Ok(value)
+    }
+
+    // Only called from feature-gated readers (Avro's schema bytes, and
+    // several oracle tests) - unused in a plain default build.
+    #[allow(dead_code)]
+    pub(crate) fn from_slice(bytes: &[u8]) -> std::result::Result<Value, ParseError> {
+        let s = std::str::from_utf8(bytes).map_err(|e| ParseError {
+            message: format!("invalid UTF-8: {e}"),
+            line: 0,
+            column: 0,
+        })?;
+        from_str(s)
+    }
+
+    #[cfg(test)]
+    mod parser_tests {
+        use super::*;
+
+        #[test]
+        fn parses_every_literal_and_container_shape() {
+            assert_eq!(from_str("null").unwrap(), Value::Null);
+            assert_eq!(from_str("true").unwrap(), Value::Bool(true));
+            assert_eq!(from_str("false").unwrap(), Value::Bool(false));
+            assert_eq!(
+                from_str(r#""hi""#).unwrap(),
+                Value::String("hi".to_string())
+            );
+            assert_eq!(from_str("[]").unwrap(), Value::Array(vec![]));
+            assert_eq!(from_str("{}").unwrap(), Value::Object(Map::new()));
+            assert_eq!(
+                from_str("[1, 2, 3]").unwrap(),
+                Value::Array(vec![
+                    Value::from(1i64),
+                    Value::from(2i64),
+                    Value::from(3i64)
+                ])
+            );
+        }
+
+        #[test]
+        fn whitespace_is_exactly_the_four_json_characters() {
+            assert!(from_str(" \t\n\r{ \t\n\r} \t\n\r").is_ok());
+            // Vertical tab is not valid JSON whitespace - must fail.
+            assert!(from_str("{\u{0B}}").is_err());
+        }
+
+        #[test]
+        fn leading_zero_is_rejected_but_zero_alone_is_fine() {
+            assert!(from_str("01").is_err());
+            assert!(from_str("00").is_err());
+            assert!(from_str("0").is_ok());
+            assert!(from_str("0.5").is_ok());
+            assert!(from_str("0e1").is_ok());
+        }
+
+        #[test]
+        fn bare_dot_five_and_trailing_dot_are_both_rejected() {
+            assert!(from_str(".5").is_err());
+            assert!(from_str("5.").is_err());
+        }
+
+        #[test]
+        fn negative_zero_parses_as_a_float() {
+            let v = from_str("-0").unwrap();
+            match v {
+                Value::Number(n) => assert!(!n.is_i64() && !n.is_u64()),
+                other => panic!("expected a Number, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn u64_range_integer_beyond_i64_max_parses_as_posint() {
+            let v = from_str("18446744073709551615").unwrap();
+            match v {
+                Value::Number(n) => {
+                    assert!(n.is_u64());
+                    assert!(!n.is_i64());
+                    assert_eq!(n.to_string(), "18446744073709551615");
+                }
+                other => panic!("expected a Number, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn absurdly_long_digit_run_overflowing_even_f64_is_a_clean_error() {
+            let huge = "1".to_string() + &"0".repeat(400);
+            assert!(from_str(&huge).is_err());
+        }
+
+        #[test]
+        fn lone_surrogates_are_hard_errors_but_a_real_pair_decodes() {
+            assert!(from_str(r#""\ud800""#).is_err());
+            assert!(from_str(r#""\udc00""#).is_err());
+            // A real surrogate pair (U+1F600, 😀).
+            assert_eq!(
+                from_str(r#""\ud83d\ude00""#).unwrap(),
+                Value::String("\u{1F600}".to_string())
+            );
+        }
+
+        #[test]
+        fn a_129_level_deep_nested_array_is_a_clean_error_not_a_stack_overflow() {
+            let deep = "[".repeat(129) + &"]".repeat(129);
+            assert!(from_str(&deep).is_err());
+            let shallow = "[".repeat(127) + &"]".repeat(127);
+            assert!(from_str(&shallow).is_ok());
+        }
+
+        #[test]
+        fn duplicate_object_keys_overwrite_not_append() {
+            let v = from_str(r#"{"a":1,"a":2}"#).unwrap();
+            match &v {
+                Value::Object(m) => {
+                    assert_eq!(m.len(), 1);
+                    assert_eq!(m.get("a"), Some(&Value::from(2i64)));
+                }
+                other => panic!("expected an Object, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn trailing_content_after_a_complete_value_is_a_hard_error() {
+            assert!(from_str("1 2").is_err());
+            assert!(from_str("{} garbage").is_err());
+            assert!(from_str("1   ").is_ok()); // trailing whitespace is fine
+        }
+
+        #[test]
+        fn no_bom_handling_of_any_kind() {
+            // A leading UTF-8 BOM is just invalid input - neither
+            // stripped nor accepted, matching `serde_json`'s own
+            // behavior exactly.
+            assert!(from_str("\u{FEFF}{}").is_err());
+        }
+
+        #[test]
+        fn floats_round_trip_through_from_f64_display_and_reparse() {
+            for f in [
+                0.1,
+                1.0 / 3.0,
+                f64::MIN_POSITIVE,
+                5e-324,
+                f64::MAX,
+                -0.0,
+                40.0,
+            ] {
+                let n = Number::from_f64(f).unwrap();
+                let text = n.to_string();
+                let reparsed = from_str(&text).unwrap();
+                assert_eq!(
+                    reparsed.as_f64(),
+                    Some(f),
+                    "round-trip failed for {f} via {text:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_input_never_panics() {
+            // A small adversarial corpus covering the two genuinely
+            // untrusted-input call sites (`is_embedded_json`, `is_jwt`) -
+            // panic-freedom matters more here than exact error text.
+            let corpus: &[&str] = &[
+                "",
+                "{",
+                "[",
+                "\"",
+                "\\",
+                "{\"a\"",
+                "{\"a\":",
+                "-",
+                "-.",
+                "1.",
+                ".1",
+                "01",
+                "1e",
+                "1e+",
+                "{,}",
+                "[,]",
+                "{\"a\":1,}",
+                "[1,]",
+                "nul",
+                "tru",
+                "fals",
+                "\"\\u\"",
+                "\"\\uZZZZ\"",
+                "\"\\",
+                "\u{0}",
+                "\u{1}",
+            ];
+            for s in corpus {
+                let _ = from_str(s); // must not panic, result value not asserted
+            }
+            // Non-UTF-8 bytes, via from_slice.
+            let _ = from_slice(&[0xff, 0xfe, 0x00, 0x01]);
+            // A long run of open brackets with no closes at all.
+            let _ = from_str(&"[".repeat(10_000));
+        }
+    }
+
+    /// Cross-verification oracle for this hand-rolled JSON parser against
+    /// the real `serde_json` crate - the same "verify against a real,
+    /// independent implementation before trusting it" discipline every
+    /// other hand-roll in this project already follows. `serde_json` is
+    /// still a normal (non-dev) dependency at this point in the
+    /// migration, so this comparator can run from the moment the parser
+    /// exists rather than being deferred to after the final cutover.
+    /// "Matches exactly" means *structurally* - object key order is a
+    /// deliberate, disclosed divergence (this project's own `Map` is
+    /// insertion-ordered; `serde_json::Map` is `BTreeMap`-backed and
+    /// always alphabetical), not a bug to chase - so object comparison is
+    /// order-independent by design, exactly like `Map`'s own `PartialEq`.
+    #[cfg(test)]
+    mod oracle_tests {
+        use super::*;
+
+        fn structurally_equal(ours: &Value, theirs: &serde_json::Value) -> bool {
+            match (ours, theirs) {
+                (Value::Null, serde_json::Value::Null) => true,
+                (Value::Bool(a), serde_json::Value::Bool(b)) => a == b,
+                (Value::String(a), serde_json::Value::String(b)) => a == b,
+                (Value::Number(a), serde_json::Value::Number(b)) => {
+                    // Compare via the widest lossless representation
+                    // available on both sides, matching real serde_json
+                    // Number's own same-variant-only PartialEq spirit -
+                    // both readers must agree on integer-vs-float
+                    // classification, not just the final f64 value.
+                    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+                        return x == y;
+                    }
+                    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+                        return x == y;
+                    }
+                    a.as_f64() == b.as_f64()
+                }
+                (Value::Array(a), serde_json::Value::Array(b)) => {
+                    a.len() == b.len()
+                        && a.iter()
+                            .zip(b.iter())
+                            .all(|(x, y)| structurally_equal(x, y))
+                }
+                (Value::Object(a), serde_json::Value::Object(b)) => {
+                    a.len() == b.len()
+                        && a.iter()
+                            .all(|(k, v)| b.get(k).is_some_and(|bv| structurally_equal(v, bv)))
+                }
+                _ => false,
+            }
+        }
+
+        fn assert_parses_like_real_serde_json(text: &str) {
+            let ours = from_str(text);
+            let theirs: std::result::Result<serde_json::Value, _> = serde_json::from_str(text);
+            match (ours, theirs) {
+                (Ok(a), Ok(b)) => assert!(
+                    structurally_equal(&a, &b),
+                    "structural mismatch on {text:?}: ours={a:?}"
+                ),
+                (Err(_), Err(_)) => {} // both correctly reject - exact error text needn't match
+                (a, b) => panic!(
+                    "disagreement on {text:?}: ours={:?} theirs={:?}",
+                    a.is_ok(),
+                    b.is_ok()
+                ),
+            }
+        }
+
+        #[test]
+        fn matches_real_serde_json_on_a_representative_corpus() {
+            let corpus = [
+                "null",
+                "true",
+                "false",
+                "0",
+                "-0",
+                "42",
+                "-42",
+                "3.14",
+                "-3.14",
+                "1e10",
+                "1E10",
+                "1e+10",
+                "1e-10",
+                "0.001",
+                r#""hello""#,
+                r#""with \"escapes\" \\ \/ \n \t""#,
+                r#""é""#,
+                r#""😀""#,
+                "[]",
+                "{}",
+                "[1,2,3]",
+                r#"{"a":1,"b":2}"#,
+                r#"{"nested":{"a":[1,2,{"b":true}]}}"#,
+                "18446744073709551615",
+                "-9223372036854775808",
+                "9223372036854775807",
+                "  42  ",
+                "01",
+                ".5",
+                "5.",
+                "{",
+                "[",
+                r#"{"a":}"#,
+                "nul",
+                "",
+            ];
+            for text in corpus {
+                assert_parses_like_real_serde_json(text);
+            }
+        }
+
+        #[test]
+        fn matches_real_serde_json_on_every_committed_json_fixture() {
+            let fixtures_dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+            let Ok(entries) = std::fs::read_dir(&fixtures_dir) else {
+                return; // no fixtures directory in this checkout - nothing to compare
+            };
+            let mut checked = 0;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str());
+                if !matches!(ext, Some("json") | Some("jsonl") | Some("ndjson")) {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Try the whole file as one document first (matching
+                // this project's own `read_json_values` convention);
+                // fall back to line-by-line for a genuine JSON-Lines
+                // file.
+                if from_str(&content).is_ok()
+                    && serde_json::from_str::<serde_json::Value>(&content).is_ok()
+                {
+                    assert_parses_like_real_serde_json(&content);
+                    checked += 1;
+                    continue;
+                }
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+                        assert_parses_like_real_serde_json(line);
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(
+                checked > 0,
+                "expected at least one committed .json/.jsonl fixture to check against"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn value_index_returns_null_sentinel_for_anything_missing() {
+            let v = Value::Object(Map::new());
+            assert_eq!(v["missing"], Value::Null);
+            let a = Value::Array(vec![]);
+            assert_eq!(a[0], Value::Null);
+            assert_eq!(Value::Null["anything"], Value::Null);
+            assert_eq!(Value::Bool(true)[0], Value::Null);
+        }
+
+        #[test]
+        fn map_insert_overwrites_in_place_and_preserves_order() {
+            let mut m = Map::new();
+            m.insert("a".to_string(), Value::from(1i64));
+            m.insert("b".to_string(), Value::from(2i64));
+            m.insert("a".to_string(), Value::from(99i64));
+            let keys: Vec<&String> = m.keys().collect();
+            assert_eq!(keys, vec!["a", "b"]);
+            assert_eq!(m.get("a"), Some(&Value::from(99i64)));
+        }
+
+        #[test]
+        fn map_partial_eq_is_order_independent() {
+            let mut a = Map::new();
+            a.insert("x".to_string(), Value::from(1i64));
+            a.insert("y".to_string(), Value::from(2i64));
+            let mut b = Map::new();
+            b.insert("y".to_string(), Value::from(2i64));
+            b.insert("x".to_string(), Value::from(1i64));
+            assert_eq!(Value::Object(a), Value::Object(b));
+        }
+
+        #[test]
+        fn number_double_classification_matches_upstream_quirk() {
+            let n = Number::from(40i64);
+            assert!(n.is_i64());
+            assert!(n.is_u64());
+            let n = Number::from(-1i64);
+            assert!(n.is_i64());
+            assert!(!n.is_u64());
+            let n = Number(N::PosInt(u64::MAX));
+            assert!(!n.is_i64());
+            assert!(n.is_u64());
+        }
+
+        #[test]
+        fn number_from_f64_rejects_non_finite() {
+            assert!(Number::from_f64(f64::NAN).is_none());
+            assert!(Number::from_f64(f64::INFINITY).is_none());
+            assert!(Number::from_f64(f64::NEG_INFINITY).is_none());
+            assert!(Number::from_f64(0.0).is_some());
+        }
+
+        #[test]
+        fn number_partial_eq_is_variant_sensitive() {
+            // A real upstream quirk, preserved deliberately: same
+            // numeric value, different variant, not equal to each other
+            // as `Number`s (though both equal `40.0` via `Value`'s own
+            // numeric `PartialEq`, tested separately).
+            let a = Number::from(40i64);
+            let b = Number::from_f64(40.0).unwrap();
+            assert_ne!(a, b);
+            assert_eq!(Value::Number(a), 40.0);
+            assert_eq!(Value::Number(b), 40.0);
+        }
+
+        #[test]
+        fn u64_max_round_trips_exactly_through_display() {
+            let n = Number::from(u64::MAX);
+            assert_eq!(n.to_string(), "18446744073709551615");
+        }
+
+        #[test]
+        fn value_partial_eq_against_literals() {
+            let v = Value::from("i64".to_string());
+            assert_eq!(v, "i64");
+            assert_eq!(v, "i64".to_string());
+            let f = Value::from(40.0);
+            assert_eq!(f, 40.0);
+            // A `Number::Float`, even a whole-number one, never
+            // satisfies `as_i64()` - matching real serde_json's own
+            // stricter semantics (verified directly against its source):
+            // `as_i64()` only ever returns `Some` for a `PosInt`/`NegInt`
+            // variant, never by truncating/converting a `Float`.
+            assert_ne!(f, 40i64);
+            let i = Value::from(40i64);
+            assert_eq!(i, 40i64);
+            assert_eq!(i, 40.0); // the reverse direction *does* widen via as_f64()
+            let b = Value::from(true);
+            assert_eq!(b, true);
+        }
+
+        #[test]
+        fn display_produces_valid_compact_json() {
+            let mut m = Map::new();
+            m.insert("name".to_string(), Value::from("zip_code".to_string()));
+            m.insert("missing_pct".to_string(), Value::from(0.0));
+            let v = Value::Object(m);
+            assert_eq!(v.to_string(), r#"{"name":"zip_code","missing_pct":0.0}"#);
+        }
+
+        #[test]
+        fn display_escapes_control_characters_and_quotes() {
+            let v = Value::from("a\"b\\c\nd\te".to_string());
+            assert_eq!(v.to_string(), r#""a\"b\\c\nd\te""#);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Serializer (pretty-printer)
+    // -----------------------------------------------------------------
+    //
+    // Matches `serde_json::to_string_pretty`'s own real formatting
+    // (verified directly against its `ser.rs`): 2-space indent, `,\n`
+    // between array/object elements, one space after `:`, an empty
+    // `[]`/`{}` collapsed to one line, no trailing newline on the whole
+    // output. No test in this project asserts on exact JSON-mode output
+    // bytes (every JSON-mode test round-trips through a real JSON parser
+    // before asserting anything structural), so this has real freedom to
+    // differ from `serde_json`'s own choices in ways that don't affect
+    // validity - but it doesn't take that freedom anywhere it isn't
+    // needed, since matching a well-understood, already-familiar output
+    // shape costs nothing extra here.
+
+    fn write_pretty(out: &mut String, v: &Value, indent: usize) {
+        const STEP: usize = 2;
+        match v {
+            Value::Null => out.push_str("null"),
+            Value::Bool(true) => out.push_str("true"),
+            Value::Bool(false) => out.push_str("false"),
+            Value::Number(n) => out.push_str(&n.to_string()),
+            Value::String(s) => write_escaped_string(out, s),
+            Value::Array(items) => {
+                if items.is_empty() {
+                    out.push_str("[]");
+                    return;
+                }
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    out.push_str(if i == 0 { "\n" } else { ",\n" });
+                    out.push_str(&" ".repeat(indent + STEP));
+                    write_pretty(out, item, indent + STEP);
+                }
+                out.push('\n');
+                out.push_str(&" ".repeat(indent));
+                out.push(']');
+            }
+            Value::Object(map) => {
+                if map.is_empty() {
+                    out.push_str("{}");
+                    return;
+                }
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    out.push_str(if i == 0 { "\n" } else { ",\n" });
+                    out.push_str(&" ".repeat(indent + STEP));
+                    write_escaped_string(out, k);
+                    out.push_str(": ");
+                    write_pretty(out, v, indent + STEP);
+                }
+                out.push('\n');
+                out.push_str(&" ".repeat(indent));
+                out.push('}');
+            }
+        }
+    }
+
+    /// Renders `v` as pretty-printed JSON text - the hand-rolled
+    /// replacement for `serde_json::to_string_pretty`. Never fails (a
+    /// `Value` tree, once built, always serializes successfully - there's
+    /// no `Serialize`-can-error case the way an arbitrary `T: Serialize`
+    /// could have had), unlike the old `serde_json`-based call sites,
+    /// which is why the two real call sites (`render_json`,
+    /// `render_json_schema`) can drop the `Result`/`.context(...)`
+    /// wrapping that used to surround this step.
+    pub(crate) fn to_pretty_string(v: &Value) -> String {
+        let mut out = String::new();
+        write_pretty(&mut out, v, 0);
+        out
+    }
+
+    // -----------------------------------------------------------------
+    // The `json!` macro
+    // -----------------------------------------------------------------
+    //
+    // A direct port of the real `serde_json::json!`/`json_internal!`
+    // tt-muncher (`macros.rs` in the vendored crate, read in full before
+    // adapting) - it's a self-contained `macro_rules!` with no external
+    // dependency beyond the `Value`/`Map` types it constructs, so every
+    // arm except the final catch-all carries over completely unchanged.
+    // The one substantive change: the catch-all "any other expression"
+    // arm goes through `Value::from($other)` instead of upstream's
+    // `to_value(&$other).unwrap()`, since this project deliberately
+    // doesn't reimplement `serde::Serialize` (see CLAUDE.md) - covered by
+    // the `From<T>` impls above for every concrete type this codebase's
+    // own ~65 `json!(...)` call sites actually interpolate.
+    //
+    // `pub(crate) use ...;` re-exports both macros so the crate root can
+    // `use json_support::json;` exactly parallel to the old
+    // `use serde_json::json;`, keeping every existing bare `json!(...)`
+    // call site working unchanged after the cutover.
+    macro_rules! json_internal {
+        //////////////////////////////////////////////////////////////
+        // TT muncher for the inside of an array [...].
+        //////////////////////////////////////////////////////////////
+        (@array [$($elems:expr,)*]) => {
+            vec![$($elems,)*]
+        };
+        (@array [$($elems:expr),*]) => {
+            vec![$($elems),*]
+        };
+        (@array [$($elems:expr,)*] null $($rest:tt)*) => {
+            $crate::json_support::json_internal!(@array [$($elems,)* $crate::json_support::json_internal!(null)] $($rest)*)
+        };
+        (@array [$($elems:expr,)*] true $($rest:tt)*) => {
+            $crate::json_support::json_internal!(@array [$($elems,)* $crate::json_support::json_internal!(true)] $($rest)*)
+        };
+        (@array [$($elems:expr,)*] false $($rest:tt)*) => {
+            $crate::json_support::json_internal!(@array [$($elems,)* $crate::json_support::json_internal!(false)] $($rest)*)
+        };
+        (@array [$($elems:expr,)*] [$($array:tt)*] $($rest:tt)*) => {
+            $crate::json_support::json_internal!(@array [$($elems,)* $crate::json_support::json_internal!([$($array)*])] $($rest)*)
+        };
+        (@array [$($elems:expr,)*] {$($map:tt)*} $($rest:tt)*) => {
+            $crate::json_support::json_internal!(@array [$($elems,)* $crate::json_support::json_internal!({$($map)*})] $($rest)*)
+        };
+        (@array [$($elems:expr,)*] $next:expr, $($rest:tt)*) => {
+            $crate::json_support::json_internal!(@array [$($elems,)* $crate::json_support::json_internal!($next),] $($rest)*)
+        };
+        (@array [$($elems:expr,)*] $last:expr) => {
+            $crate::json_support::json_internal!(@array [$($elems,)* $crate::json_support::json_internal!($last)])
+        };
+        (@array [$($elems:expr),*] , $($rest:tt)*) => {
+            $crate::json_support::json_internal!(@array [$($elems,)*] $($rest)*)
+        };
+        (@array [$($elems:expr),*] $unexpected:tt $($rest:tt)*) => {
+            $crate::json_support::json_unexpected!($unexpected)
+        };
+
+        //////////////////////////////////////////////////////////////
+        // TT muncher for the inside of an object {...}.
+        //////////////////////////////////////////////////////////////
+        (@object $object:ident () () ()) => {};
+        (@object $object:ident [$($key:tt)+] ($value:expr) , $($rest:tt)*) => {
+            let _ = $object.insert(($($key)+).into(), $value);
+            $crate::json_support::json_internal!(@object $object () ($($rest)*) ($($rest)*));
+        };
+        (@object $object:ident [$($key:tt)+] ($value:expr) $unexpected:tt $($rest:tt)*) => {
+            $crate::json_support::json_unexpected!($unexpected);
+        };
+        (@object $object:ident [$($key:tt)+] ($value:expr)) => {
+            let _ = $object.insert(($($key)+).into(), $value);
+        };
+        (@object $object:ident ($($key:tt)+) (: null $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object [$($key)+] ($crate::json_support::json_internal!(null)) $($rest)*);
+        };
+        (@object $object:ident ($($key:tt)+) (: true $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object [$($key)+] ($crate::json_support::json_internal!(true)) $($rest)*);
+        };
+        (@object $object:ident ($($key:tt)+) (: false $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object [$($key)+] ($crate::json_support::json_internal!(false)) $($rest)*);
+        };
+        (@object $object:ident ($($key:tt)+) (: [$($array:tt)*] $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object [$($key)+] ($crate::json_support::json_internal!([$($array)*])) $($rest)*);
+        };
+        (@object $object:ident ($($key:tt)+) (: {$($map:tt)*} $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object [$($key)+] ($crate::json_support::json_internal!({$($map)*})) $($rest)*);
+        };
+        (@object $object:ident ($($key:tt)+) (: $value:expr , $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object [$($key)+] ($crate::json_support::json_internal!($value)) , $($rest)*);
+        };
+        (@object $object:ident ($($key:tt)+) (: $value:expr) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object [$($key)+] ($crate::json_support::json_internal!($value)));
+        };
+        (@object $object:ident ($($key:tt)+) (:) $copy:tt) => {
+            $crate::json_support::json_internal!();
+        };
+        (@object $object:ident ($($key:tt)+) () $copy:tt) => {
+            $crate::json_support::json_internal!();
+        };
+        (@object $object:ident () (: $($rest:tt)*) ($colon:tt $($copy:tt)*)) => {
+            $crate::json_support::json_unexpected!($colon);
+        };
+        (@object $object:ident ($($key:tt)*) (, $($rest:tt)*) ($comma:tt $($copy:tt)*)) => {
+            $crate::json_support::json_unexpected!($comma);
+        };
+        (@object $object:ident () (($key:expr) : $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object ($key) (: $($rest)*) (: $($rest)*));
+        };
+        (@object $object:ident ($($key:tt)*) (: $($unexpected:tt)+) $copy:tt) => {
+            $crate::json_support::json_expect_expr_comma!($($unexpected)+);
+        };
+        (@object $object:ident ($($key:tt)*) ($tt:tt $($rest:tt)*) $copy:tt) => {
+            $crate::json_support::json_internal!(@object $object ($($key)* $tt) ($($rest)*) ($($rest)*));
+        };
+
+        //////////////////////////////////////////////////////////////
+        // The main implementation.
+        //////////////////////////////////////////////////////////////
+        (null) => {
+            $crate::json_support::Value::Null
+        };
+        (true) => {
+            $crate::json_support::Value::Bool(true)
+        };
+        (false) => {
+            $crate::json_support::Value::Bool(false)
+        };
+        ([]) => {
+            $crate::json_support::Value::Array(vec![])
+        };
+        ([ $($tt:tt)+ ]) => {
+            $crate::json_support::Value::Array($crate::json_support::json_internal!(@array [] $($tt)+))
+        };
+        ({}) => {
+            $crate::json_support::Value::Object($crate::json_support::Map::new())
+        };
+        ({ $($tt:tt)+ }) => {
+            $crate::json_support::Value::Object({
+                let mut object = $crate::json_support::Map::new();
+                $crate::json_support::json_internal!(@object object () ($($tt)+) ($($tt)+));
+                object
+            })
+        };
+        // Any other expression - covered by the `From<T>` impls above
+        // for every concrete type this codebase's own call sites
+        // interpolate (this is the one arm that genuinely diverges from
+        // upstream, which routes through `Serialize` instead).
+        ($other:expr) => {
+            $crate::json_support::Value::from($other)
+        };
+    }
+
+    #[allow(unused_macros)]
+    macro_rules! json_unexpected {
+        () => {};
+    }
+
+    #[allow(unused_macros)]
+    macro_rules! json_expect_expr_comma {
+        ($e:expr , $($tt:tt)*) => {};
+    }
+
+    macro_rules! json {
+        ($($json:tt)+) => {
+            $crate::json_support::json_internal!($($json)+)
+        };
+    }
+
+    pub(crate) use json;
+    #[allow(unused_imports)]
+    pub(crate) use json_expect_expr_comma;
+    #[allow(unused_imports)]
+    pub(crate) use json_internal;
+    #[allow(unused_imports)]
+    pub(crate) use json_unexpected;
+
+    #[cfg(test)]
+    mod json_macro_tests {
+        use super::{Map, Value};
+
+        #[test]
+        fn literals_and_containers() {
+            assert_eq!(json!(null), Value::Null);
+            assert_eq!(json!(true), Value::Bool(true));
+            assert_eq!(json!(false), Value::Bool(false));
+            assert_eq!(json!([]), Value::Array(vec![]));
+            assert_eq!(json!({}), Value::Object(Map::new()));
+            assert_eq!(
+                json!([1, 2, 3]),
+                Value::Array(vec![
+                    Value::from(1i64),
+                    Value::from(2i64),
+                    Value::from(3i64)
+                ])
+            );
+        }
+
+        #[test]
+        fn nested_object_literal_matches_the_real_macros_shape() {
+            let v = json!({
+                "code": 200,
+                "success": true,
+                "payload": {
+                    "features": ["serde", "json"],
+                    "homepage": null
+                }
+            });
+            let expected_via_parse = super::from_str(
+                r#"{"code":200,"success":true,"payload":{"features":["serde","json"],"homepage":null}}"#,
+            )
+            .unwrap();
+            assert_eq!(v, expected_via_parse);
+        }
+
+        #[test]
+        fn interpolates_variables_and_expressions() {
+            let code = 200;
+            let features = ["serde", "json"];
+            let v = json!({
+                "code": code,
+                "success": code == 200,
+                "payload": {
+                    features[0]: features[1]
+                }
+            });
+            assert_eq!(v["code"], 200);
+            assert_eq!(v["success"], true);
+            assert_eq!(v["payload"]["serde"], "json");
+        }
+
+        #[test]
+        fn trailing_commas_are_allowed() {
+            let v = json!(["a", "b", "c",]);
+            assert_eq!(
+                v,
+                Value::Array(vec![Value::from("a"), Value::from("b"), Value::from("c")])
+            );
+            let v = json!({"a": 1, "b": 2,});
+            assert_eq!(v["a"], 1);
+            assert_eq!(v["b"], 2);
+        }
+
+        #[test]
+        fn interpolates_a_borrowed_reference_via_the_copy_blanket_impl() {
+            // Mirrors the confirmed real call site: `.map(|k: &i64| json!({"key": k, "value": null}))`.
+            let keys: Vec<i64> = vec![1, 2, 3];
+            let v: Vec<Value> = keys
+                .iter()
+                .map(|k| json!({"key": k, "value": null}))
+                .collect();
+            assert_eq!(v[0]["key"], 1);
+            assert_eq!(v[1]["key"], 2);
+        }
+
+        #[test]
+        fn interpolates_an_already_built_value() {
+            let inner = json!({"a": 1});
+            let v = json!({"outer": inner});
+            assert_eq!(v["outer"]["a"], 1);
+        }
+    }
+
+    #[cfg(test)]
+    mod ser_tests {
+        use super::*;
+
+        #[test]
+        fn empty_array_and_object_collapse_to_one_line() {
+            assert_eq!(to_pretty_string(&Value::Array(vec![])), "[]");
+            assert_eq!(to_pretty_string(&Value::Object(Map::new())), "{}");
+        }
+
+        #[test]
+        fn pretty_output_has_no_trailing_newline() {
+            let s = to_pretty_string(&Value::from(1i64));
+            assert!(!s.ends_with('\n'));
+        }
+
+        #[test]
+        fn pretty_output_matches_the_documented_shape() {
+            let mut m = Map::new();
+            m.insert("name".to_string(), Value::from("zip_code".to_string()));
+            m.insert("missing_pct".to_string(), Value::from(0.0));
+            let expected = "{\n  \"name\": \"zip_code\",\n  \"missing_pct\": 0.0\n}";
+            assert_eq!(to_pretty_string(&Value::Object(m)), expected);
+        }
+
+        #[test]
+        fn pretty_output_round_trips_through_real_serde_json() {
+            let mut inner = Map::new();
+            inner.insert("a".to_string(), Value::from(1i64));
+            inner.insert(
+                "b".to_string(),
+                Value::Array(vec![Value::from(1.5), Value::Null, Value::from(true)]),
+            );
+            let mut outer = Map::new();
+            outer.insert("nested".to_string(), Value::Object(inner));
+            let v = Value::Object(outer);
+            let text = to_pretty_string(&v);
+            // Prove it's valid, standards-conformant JSON via a
+            // genuinely independent parser this project never wrote.
+            serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|e| {
+                panic!("hand-rolled pretty-printer produced invalid JSON: {e}\n{text}")
+            });
+            // And prove no information was lost, via this project's own
+            // parser (already independently oracle-tested above) plus
+            // `Value`'s own order-independent-on-objects `PartialEq`.
+            let reparsed = from_str(&text).unwrap();
+            assert_eq!(reparsed, v);
+        }
+    }
+} // mod json_support
 
 /// Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 /// Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
@@ -969,33 +2994,115 @@ struct ColumnProfile {
     notes: String,
 }
 
-// Hand-rolled stand-in for `#[derive(serde::Serialize)]` - this project's
-// own `serde` dependency skips the `derive` feature entirely (see
-// Cargo.toml). Deliberately a manual `SerializeStruct` impl rather than
-// building a `serde_json::Value`/`Map` by hand: `serde_json::Map` is
-// backed by a plain `BTreeMap` unless the `preserve_order` feature is
-// enabled (which would pull in `indexmap`, the wrong direction for this
-// exercise), so any Value/`json!`-based construction silently re-sorts
-// fields alphabetically - confirmed by hitting exactly that regression
-// (name/current_type/... coming out as current_type/description/...)
-// before switching to this approach. `serialize_struct` writes fields
-// directly to the output in the order given here, matching the documented
-// JSON shape in CLAUDE.md exactly, with no intermediate unordered map.
-impl serde::Serialize for ColumnProfile {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ColumnProfile", 7)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("current_type", &self.current_type)?;
-        state.serialize_field("ideal_type", &self.ideal_type)?;
-        state.serialize_field("description", &self.description)?;
-        state.serialize_field("missing_pct", &self.missing_pct)?;
-        state.serialize_field("sample_values", &self.sample_values)?;
-        state.serialize_field("notes", &self.notes)?;
-        state.end()
+// This project used to have a hand-rolled `impl serde::Serialize for
+// ColumnProfile` here, deliberately a manual `SerializeStruct` impl
+// rather than building a `serde_json::Value`/`Map` by hand: the *old*
+// `serde_json::Map` was backed by a plain `BTreeMap` unless the
+// `preserve_order` feature was enabled (which would have pulled in
+// `indexmap`, the wrong direction at the time), so any Value/`json!`-
+// based construction silently re-sorted fields alphabetically -
+// confirmed by hitting exactly that regression (name/current_type/...
+// coming out as current_type/description/...) before switching to that
+// approach. Now that `serde`/`serde_json` are gone and the hand-rolled
+// `json_support::Map` is insertion-ordered instead, `insert`-in-declared-
+// order below is itself sufficient to guarantee field order - the entire
+// reason that workaround existed has evaporated, so `to_json` builds the
+// `Value` tree directly instead.
+impl ColumnProfile {
+    fn to_json(&self) -> json_support::Value {
+        use json_support::{Map, Value};
+        let mut obj = Map::with_capacity(7);
+        obj.insert("name".to_string(), Value::from(self.name.clone()));
+        obj.insert(
+            "current_type".to_string(),
+            Value::from(self.current_type.clone()),
+        );
+        obj.insert(
+            "ideal_type".to_string(),
+            Value::from(self.ideal_type.clone()),
+        );
+        obj.insert(
+            "description".to_string(),
+            Value::from(self.description.clone()),
+        );
+        obj.insert("missing_pct".to_string(), Value::from(self.missing_pct));
+        obj.insert(
+            "sample_values".to_string(),
+            Value::Array(
+                self.sample_values
+                    .iter()
+                    .cloned()
+                    .map(Value::from)
+                    .collect(),
+            ),
+        );
+        obj.insert("notes".to_string(), Value::from(self.notes.clone()));
+        Value::Object(obj)
+    }
+}
+
+#[cfg(test)]
+mod column_profile_to_json_tests {
+    use super::*;
+
+    #[test]
+    fn to_json_preserves_declared_field_order() {
+        let p = ColumnProfile {
+            name: "zip_code".to_string(),
+            current_type: "i64".to_string(),
+            ideal_type: "String".to_string(),
+            description: String::new(),
+            missing_pct: 0.0,
+            sample_values: vec!["02134".to_string(), "90210".to_string()],
+            notes: "leading zeros".to_string(),
+        };
+        let json_support::Value::Object(obj) = p.to_json() else {
+            panic!("expected an Object");
+        };
+        let keys: Vec<&String> = obj.keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "name",
+                "current_type",
+                "ideal_type",
+                "description",
+                "missing_pct",
+                "sample_values",
+                "notes"
+            ]
+        );
+        assert_eq!(
+            obj.get("name"),
+            Some(&json_support::Value::from("zip_code".to_string()))
+        );
+        assert_eq!(
+            obj.get("missing_pct"),
+            Some(&json_support::Value::from(0.0))
+        );
+    }
+
+    #[test]
+    fn to_json_produces_valid_json_via_real_serde_json() {
+        let p = ColumnProfile {
+            name: "signup_date".to_string(),
+            current_type: "String".to_string(),
+            ideal_type: "NaiveDate / DateTime".to_string(),
+            description: String::new(),
+            missing_pct: 40.0,
+            sample_values: vec!["2024-01-15".to_string()],
+            notes: "".to_string(),
+        };
+        // `to_json()` rendered through the hand-rolled pretty-printer,
+        // then parsed by a genuinely independent reference implementation
+        // (real serde_json, kept as a dev-only oracle) to prove it's
+        // valid, standards-conformant JSON with the expected fields.
+        let text = json_support::to_pretty_string(&p.to_json());
+        let via_real: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(via_real["name"], "signup_date");
+        assert_eq!(via_real["missing_pct"], 40.0);
+        assert_eq!(via_real["sample_values"][0], "2024-01-15");
+        assert_eq!(via_real["description"], "");
     }
 }
 
@@ -1426,7 +3533,7 @@ fn is_semver(s: &str) -> bool {
 /// fires on the case those can't already explain.
 fn is_embedded_json(s: &str) -> bool {
     matches!(
-        serde_json::from_str::<JsonValue>(s),
+        json_support::from_str(s),
         Ok(JsonValue::Object(_) | JsonValue::Array(_))
     )
 }
@@ -1487,7 +3594,7 @@ fn is_jwt(s: &str) -> bool {
         let Ok(text) = std::str::from_utf8(&bytes) else {
             return false;
         };
-        match serde_json::from_str::<JsonValue>(text) {
+        match json_support::from_str(text) {
             Ok(JsonValue::Object(_)) => {}
             _ => return false,
         }
@@ -9377,8 +11484,16 @@ fn read_json_values(path: &Path) -> Result<Vec<JsonValue>> {
     let trimmed = content.trim_start();
 
     if trimmed.starts_with('[') {
-        return serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse {path:?} as a JSON array"));
+        // The hand-rolled parser only ever returns a single top-level
+        // `Value`, never a generically-`Deserialize`d `Vec<T>` the way
+        // `serde`'s blanket `Vec<T>` impl let the old `serde_json`-based
+        // version do directly - unwrap the top-level array by hand
+        // instead.
+        return match json_support::from_str(&content) {
+            Ok(JsonValue::Array(items)) => Ok(items),
+            Ok(_) => unreachable!("content starts with '[' so a successful parse must be an array"),
+            Err(e) => Err(e).with_context(|| format!("failed to parse {path:?} as a JSON array")),
+        };
     }
 
     // A single JSON document - most commonly a pretty-printed object, the
@@ -9387,12 +11502,12 @@ fn read_json_values(path: &Path) -> Result<Vec<JsonValue>> {
     // left over. Try that first, the same "whole document = one record"
     // choice TOML and YAML's single-mapping mode already make for their
     // own single-document shapes. A genuine multi-record JSON Lines
-    // stream fails this: serde_json::from_str rejects trailing content
-    // after a complete value ("trailing characters", confirmed directly
-    // rather than assumed), so it falls through to per-line parsing below
-    // exactly as before - this is a pure additive fallback, not a
-    // replacement for JSON Lines detection.
-    if let Ok(v) = serde_json::from_str::<JsonValue>(&content) {
+    // stream fails this: the parser rejects trailing content after a
+    // complete value ("trailing characters", confirmed directly against
+    // real serde_json's own behavior rather than assumed), so it falls
+    // through to per-line parsing below exactly as before - this is a
+    // pure additive fallback, not a replacement for JSON Lines detection.
+    if let Ok(v) = json_support::from_str(&content) {
         return Ok(vec![v]);
     }
 
@@ -9400,7 +11515,7 @@ fn read_json_values(path: &Path) -> Result<Vec<JsonValue>> {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
-            serde_json::from_str(line)
+            json_support::from_str(line)
                 .with_context(|| format!("failed to parse a line of {path:?} as JSON"))
         })
         .collect()
@@ -9447,7 +11562,7 @@ fn profile_json_path(
 
     let mut kind_counts: HashMap<JsonKind, usize> = HashMap::new();
     let mut scalar_raw: Vec<String> = Vec::new();
-    let mut object_maps: Vec<&serde_json::Map<String, JsonValue>> = Vec::new();
+    let mut object_maps: Vec<&json_support::Map> = Vec::new();
 
     for v in &pool {
         match v {
@@ -9573,10 +11688,7 @@ fn profile_json_path(
 /// Shared by any format that decodes to a list of named-field records
 /// (JSON files today, Avro below) - extracts top-level columns in
 /// first-seen order and profiles each, recursing into nested content.
-fn profile_json_records(
-    records: &[serde_json::Map<String, JsonValue>],
-    n_samples: usize,
-) -> Vec<ColumnProfile> {
+fn profile_json_records(records: &[json_support::Map], n_samples: usize) -> Vec<ColumnProfile> {
     let total = records.len();
     let mut order: Vec<String> = Vec::new();
     let mut seen_keys = HashSet::new();
@@ -9611,7 +11723,7 @@ fn columns_from_json(
     }
 
     if values.iter().all(JsonValue::is_object) {
-        let records: Vec<serde_json::Map<String, JsonValue>> = values
+        let records: Vec<json_support::Map> = values
             .into_iter()
             .map(|v| match v {
                 JsonValue::Object(m) => m,
@@ -27484,7 +29596,7 @@ mod parquet_support {
                 .unwrap_or(JsonValue::String(s)),
             PhysicalType::Float | PhysicalType::Double => {
                 let f: f64 = s.parse().unwrap_or(f64::NAN);
-                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
             }
             // Un-annotated BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY (already a hex
             // dump string from `render_value_bytes`) and INT96 (already
@@ -28501,7 +30613,7 @@ mod parquet_support {
                     }
                 }
                 ReaderNode::Group(def_level, children) => {
-                    let mut map = serde_json::Map::with_capacity(children.len());
+                    let mut map = json_support::Map::with_capacity(children.len());
                     for (name, repetition, child) in children {
                         let present = *repetition != Repetition::Optional
                             || child.current_def_level(leaves) > *def_level;
@@ -28777,7 +30889,7 @@ mod parquet_support {
             usize::try_from(row_group.num_rows).context("negative Parquet row group num_rows")?;
         let mut rows = Vec::with_capacity(num_rows);
         for _ in 0..num_rows {
-            let mut fields = serde_json::Map::with_capacity(top_level.len());
+            let mut fields = json_support::Map::with_capacity(top_level.len());
             for (name, reader) in &top_level {
                 fields.insert(name.clone(), reader.read_field(&mut leaves)?);
             }
@@ -29004,22 +31116,22 @@ mod parquet_support {
                 rows.extend(decode_row_group_nested(&file_data, &schema, rg).unwrap());
             }
             let expected: Vec<JsonValue> = vec![
-                serde_json::json!({
+                json!({
                     "user_id": "U1", "category": "gold", "tags": ["a", "b"],
                     "info": {"age": 34, "active": true},
                     "attributes": [{"key": "color", "value": "red"}, {"key": "size", "value": "M"}]
                 }),
-                serde_json::json!({
+                json!({
                     "user_id": "U2", "category": "silver", "tags": ["c"],
                     "info": {"age": 29, "active": false},
                     "attributes": [{"key": "color", "value": "blue"}]
                 }),
-                serde_json::json!({
+                json!({
                     "user_id": "U3", "category": "gold", "tags": [],
                     "info": {"age": 45, "active": true},
                     "attributes": []
                 }),
-                serde_json::json!({
+                json!({
                     "user_id": "U4", "category": "bronze", "tags": ["d", "e", "f"],
                     "info": null,
                     "attributes": [{"key": "color", "value": "green"}, {"key": "size", "value": "L"}]
@@ -29506,8 +31618,8 @@ mod parquet_support {
                     let mut keys: std::collections::BTreeSet<&String> = a.keys().collect();
                     keys.extend(b.keys());
                     keys.iter().all(|k| {
-                        let av = a.get(*k).unwrap_or(&JsonValue::Null);
-                        let bv = b.get(*k).unwrap_or(&JsonValue::Null);
+                        let av = a.get(k).unwrap_or(&JsonValue::Null);
+                        let bv = b.get(k).unwrap_or(&JsonValue::Null);
                         nested_json_values_match(av, bv)
                     })
                 }
@@ -29601,8 +31713,14 @@ mod parquet_support {
                     .and_then(|()| writer.finish())
                     .unwrap_or_else(|e| panic!("{path}: oracle JSON writer failed: {e}"));
                 let buf = writer.into_inner();
-                let rows: Vec<JsonValue> = serde_json::from_slice(&buf)
-                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"));
+                let rows: Vec<JsonValue> = match json_support::from_slice(&buf)
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"))
+                {
+                    JsonValue::Array(items) => items,
+                    other => panic!(
+                        "{path}: expected a top-level JSON array from the oracle writer, got {other}"
+                    ),
+                };
                 oracle_rows.extend(rows);
             }
 
@@ -29672,18 +31790,18 @@ mod parquet_support {
             let pairs = |keys: &[i64]| -> JsonValue {
                 JsonValue::Array(
                     keys.iter()
-                        .map(|k| serde_json::json!({"key": k, "value": null}))
+                        .map(|k| json!({"key": k, "value": null}))
                         .collect(),
                 )
             };
             let expected: Vec<JsonValue> = vec![
-                serde_json::json!({
+                json!({
                     "my_map": pairs(&[1, 2, 3]), "my_map_no_v": [1, 2, 3], "my_list": [1, 2, 3]
                 }),
-                serde_json::json!({
+                json!({
                     "my_map": pairs(&[4, 5, 6]), "my_map_no_v": [4, 5, 6], "my_list": [4, 5, 6]
                 }),
-                serde_json::json!({
+                json!({
                     "my_map": pairs(&[7, 8, 9]), "my_map_no_v": [7, 8, 9], "my_list": [7, 8, 9]
                 }),
             ];
@@ -29714,16 +31832,16 @@ mod parquet_support {
                 rows.extend(decode_row_group_nested(&file_data, &schema, rg).unwrap());
             }
             let expected: Vec<JsonValue> = vec![
-                serde_json::json!({"id": 1, "phoneNumbers": null}),
-                serde_json::json!({"id": 2, "phoneNumbers": null}),
-                serde_json::json!({"id": 3, "phoneNumbers": {"phone": []}}),
-                serde_json::json!({"id": 4, "phoneNumbers": {"phone": [
+                json!({"id": 1, "phoneNumbers": null}),
+                json!({"id": 2, "phoneNumbers": null}),
+                json!({"id": 3, "phoneNumbers": {"phone": []}}),
+                json!({"id": 4, "phoneNumbers": {"phone": [
                     {"number": 5555555555_i64, "kind": null}
                 ]}}),
-                serde_json::json!({"id": 5, "phoneNumbers": {"phone": [
+                json!({"id": 5, "phoneNumbers": {"phone": [
                     {"number": 1111111111_i64, "kind": "home"}
                 ]}}),
-                serde_json::json!({"id": 6, "phoneNumbers": {"phone": [
+                json!({"id": 6, "phoneNumbers": {"phone": [
                     {"number": 1111111111_i64, "kind": "home"},
                     {"number": 2222222222_i64, "kind": null},
                     {"number": 3333333333_i64, "kind": "mobile"}
@@ -31512,7 +33630,7 @@ mod arrow_ipc_support {
             },
             ArrowDataType::Float16 => {
                 let f = super::parquet_support::f16_bytes_to_f64(bytes);
-                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
             }
             ArrowDataType::Float32 => {
                 let f = f32::from_le_bytes(
@@ -31520,7 +33638,7 @@ mod arrow_ipc_support {
                         .try_into()
                         .context("Float32 value has the wrong width")?,
                 );
-                serde_json::Number::from_f64(f64::from(f))
+                json_support::Number::from_f64(f64::from(f))
                     .map_or(JsonValue::Null, JsonValue::Number)
             }
             ArrowDataType::Float64 => {
@@ -31529,7 +33647,7 @@ mod arrow_ipc_support {
                         .try_into()
                         .context("Float64 value has the wrong width")?,
                 );
-                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
             }
             ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
                 JsonValue::String(String::from_utf8_lossy(bytes).into_owned())
@@ -31557,7 +33675,7 @@ mod arrow_ipc_support {
                 be.reverse();
                 let s = super::parquet_support::decimal_bytes_to_string(&be, *scale);
                 let f: f64 = s.parse().unwrap_or(f64::NAN);
-                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
             }
             ArrowDataType::Date {
                 unit_is_millisecond,
@@ -31920,7 +34038,7 @@ mod arrow_ipc_support {
                         // renders as a genuine JSON object (last-key-wins
                         // on a duplicate key, the same as any JSON object
                         // literal), not an array of {key, value} pairs.
-                        let mut obj = serde_json::Map::new();
+                        let mut obj = json_support::Map::new();
                         for entry in slice {
                             if let JsonValue::Object(pair) = entry
                                 && let Some(JsonValue::String(k)) = pair.get("key")
@@ -31994,7 +34112,7 @@ mod arrow_ipc_support {
                     if !bitmap_get(validity, i) {
                         return Ok(JsonValue::Null);
                     }
-                    let mut obj = serde_json::Map::new();
+                    let mut obj = json_support::Map::new();
                     for (name, col) in &child_columns {
                         obj.insert(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
                     }
@@ -32362,7 +34480,7 @@ mod arrow_ipc_support {
         let row_count = usize::try_from(meta.length).unwrap_or(0);
         Ok((0..row_count)
             .map(|i| {
-                let mut obj = serde_json::Map::new();
+                let mut obj = json_support::Map::new();
                 for (name, col) in &columns {
                     obj.insert(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
                 }
@@ -32958,8 +35076,14 @@ mod arrow_ipc_support {
                     .and_then(|()| writer.finish())
                     .unwrap_or_else(|e| panic!("{path}: oracle JSON writer failed: {e}"));
                 let buf = writer.into_inner();
-                let rows: Vec<JsonValue> = serde_json::from_slice(&buf)
-                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"));
+                let rows: Vec<JsonValue> = match json_support::from_slice(&buf)
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"))
+                {
+                    JsonValue::Array(items) => items,
+                    other => panic!(
+                        "{path}: expected a top-level JSON array from the oracle writer, got {other}"
+                    ),
+                };
                 oracle_rows.extend(rows);
             }
 
@@ -33038,8 +35162,14 @@ mod arrow_ipc_support {
                     .and_then(|()| writer.finish())
                     .unwrap_or_else(|e| panic!("{path}: oracle JSON writer failed: {e}"));
                 let buf = writer.into_inner();
-                let rows: Vec<JsonValue> = serde_json::from_slice(&buf)
-                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"));
+                let rows: Vec<JsonValue> = match json_support::from_slice(&buf)
+                    .unwrap_or_else(|e| panic!("{path}: oracle JSON parse failed: {e}"))
+                {
+                    JsonValue::Array(items) => items,
+                    other => panic!(
+                        "{path}: expected a top-level JSON array from the oracle writer, got {other}"
+                    ),
+                };
                 oracle_rows.extend(rows);
             }
 
@@ -33559,7 +35689,7 @@ mod avro_support {
         }
     }
 
-    fn json_str<'a>(obj: &'a serde_json::Map<String, JsonValue>, key: &str) -> Option<&'a str> {
+    fn json_str<'a>(obj: &'a json_support::Map, key: &str) -> Option<&'a str> {
         obj.get(key).and_then(JsonValue::as_str)
     }
 
@@ -33598,7 +35728,7 @@ mod avro_support {
     }
 
     fn parse_schema_object(
-        obj: &serde_json::Map<String, JsonValue>,
+        obj: &json_support::Map,
         names: &mut HashMap<String, Schema>,
         enclosing_namespace: Option<&str>,
     ) -> Result<Schema> {
@@ -33888,13 +36018,13 @@ mod avro_support {
             Schema::Float => {
                 let bytes = read_exact_vec(r, 4)?;
                 let f = f32::from_le_bytes(bytes.try_into().unwrap());
-                serde_json::Number::from_f64(f64::from(f))
+                json_support::Number::from_f64(f64::from(f))
                     .map_or(JsonValue::Null, JsonValue::Number)
             }
             Schema::Double => {
                 let bytes = read_exact_vec(r, 8)?;
                 let f = f64::from_le_bytes(bytes.try_into().unwrap());
-                serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
             }
             Schema::Bytes => {
                 let b = read_length_prefixed(r)?;
@@ -33929,7 +36059,7 @@ mod avro_support {
                 JsonValue::Array(out)
             }
             Schema::Map(values) => {
-                let mut out = serde_json::Map::new();
+                let mut out = json_support::Map::new();
                 loop {
                     let raw_count = read_zigzag(r)?;
                     let count = match raw_count.cmp(&0) {
@@ -33961,7 +36091,7 @@ mod avro_support {
                 decode_to_json(r, variant, names)?
             }
             Schema::Record(fields) => {
-                let mut out = serde_json::Map::with_capacity(fields.len());
+                let mut out = json_support::Map::with_capacity(fields.len());
                 for (name, field_schema) in fields {
                     let value = decode_to_json(r, field_schema, names)?;
                     out.insert(name.clone(), value);
@@ -34132,7 +36262,7 @@ mod avro_support {
         let schema_bytes = metadata
             .get("avro.schema")
             .with_context(|| format!("{path:?} has no avro.schema in its header"))?;
-        let schema_json: JsonValue = serde_json::from_slice(schema_bytes)
+        let schema_json: JsonValue = json_support::from_slice(schema_bytes)
             .with_context(|| format!("failed parsing the Avro schema in {path:?}"))?;
         let mut names: HashMap<String, Schema> = HashMap::new();
         let schema = parse_schema(&schema_json, &mut names, None)
@@ -34180,7 +36310,7 @@ mod avro_support {
         // JSON/YAML/MessagePack/CBOR readers already use for their own
         // analogous case applies here too.
         if values.iter().all(JsonValue::is_object) {
-            let records: Vec<serde_json::Map<String, JsonValue>> = values
+            let records: Vec<json_support::Map> = values
                 .into_iter()
                 .map(|v| match v {
                     JsonValue::Object(m) => m,
@@ -34523,10 +36653,10 @@ mod msgpack_support {
             Value::Bool(b) => JsonValue::Bool(*b),
             Value::Int(i) => JsonValue::from(*i),
             Value::UInt(u) => JsonValue::from(*u),
-            Value::F32(f) => serde_json::Number::from_f64(f64::from(*f))
+            Value::F32(f) => json_support::Number::from_f64(f64::from(*f))
                 .map_or(JsonValue::Null, JsonValue::Number),
             Value::F64(f) => {
-                serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
             }
             Value::Str(Ok(s)) => JsonValue::String(s.clone()),
             Value::Str(Err(bytes)) => {
@@ -34599,7 +36729,7 @@ mod msgpack_support {
         // Same fallback the JSON/YAML/Avro readers already use for their own
         // analogous case, found the same way: real-world testing.
         if values.iter().all(JsonValue::is_object) {
-            let records: Vec<serde_json::Map<String, JsonValue>> = values
+            let records: Vec<json_support::Map> = values
                 .into_iter()
                 .map(|v| match v {
                     JsonValue::Object(m) => m,
@@ -35460,7 +37590,7 @@ mod toml_support {
     }
 
     fn f64_to_json(f: f64) -> JsonValue {
-        serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+        json_support::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
     }
 
     fn valid_underscored_digits(s: &str, digit_ok: impl Fn(char) -> bool) -> Option<String> {
@@ -36370,7 +38500,7 @@ mod yaml_support {
     }
 
     fn parse_block_mapping(lines: &[YLine], pos: &mut usize, indent: usize) -> Result<JsonValue> {
-        let mut map = serde_json::Map::new();
+        let mut map = json_support::Map::new();
         loop {
             skip_blank_and_comment_lines(lines, pos);
             let Some(line) = lines.get(*pos) else { break };
@@ -36661,7 +38791,7 @@ mod yaml_support {
 
     fn parse_flow_mapping(s: &str, cursor: &mut usize) -> Result<JsonValue> {
         *cursor += 1;
-        let mut map = serde_json::Map::new();
+        let mut map = json_support::Map::new();
         loop {
             skip_flow_ws(s, cursor);
             match s[*cursor..].chars().next() {
@@ -36845,7 +38975,7 @@ mod yaml_support {
             return text
                 .parse::<f64>()
                 .ok()
-                .and_then(serde_json::Number::from_f64)
+                .and_then(json_support::Number::from_f64)
                 .map(JsonValue::Number)
                 .ok_or_else(|| anyhow!("invalid !!float YAML scalar: {rest:?}"));
         }
@@ -36888,28 +39018,33 @@ mod yaml_support {
         if let Some(b) = parse_plain_bool(s) {
             return Ok(JsonValue::Bool(b));
         }
-        if matches!(s, ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF") {
-            return Ok(JsonValue::Number(
-                serde_json::Number::from_f64(f64::INFINITY).unwrap(),
-            ));
-        }
-        if matches!(s, "-.inf" | "-.Inf" | "-.INF") {
-            return Ok(JsonValue::Number(
-                serde_json::Number::from_f64(f64::NEG_INFINITY).unwrap(),
-            ));
+        // `Number` can't represent infinity or NaN at all (`from_f64`
+        // rejects any non-finite value) - both fall back to the literal
+        // source string, the same "can't losslessly represent this"
+        // treatment this project already gives a handful of other edge
+        // values (compare Avro's Duration logical type). A prior version
+        // of this code called `.unwrap()` on `from_f64(f64::INFINITY)`
+        // for the `.inf`/`-.inf` cases specifically, which - since
+        // `from_f64` returns `None` for exactly this input - panicked on
+        // any real YAML file containing a bare `.inf`/`-.inf` scalar, a
+        // real, live, previously-untested bug found while auditing every
+        // `Number`-producing call site during this project's own
+        // `serde`/`serde_json` hand-roll (see CLAUDE.md's Dependency
+        // footprint section).
+        if matches!(
+            s,
+            ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" | "-.inf" | "-.Inf" | "-.INF"
+        ) {
+            return Ok(JsonValue::String(s.to_string()));
         }
         if matches!(s, ".nan" | ".NaN" | ".NAN") {
-            // serde_json::Number can't represent NaN at all - left as the
-            // literal string, the same "can't losslessly represent this"
-            // treatment this project already gives a handful of other
-            // edge values (compare Avro's Duration logical type).
             return Ok(JsonValue::String(s.to_string()));
         }
         if let Some(n) = parse_plain_int(s) {
             return Ok(n);
         }
         if let Ok(f) = s.parse::<f64>()
-            && let Some(num) = serde_json::Number::from_f64(f)
+            && let Some(num) = json_support::Number::from_f64(f)
         {
             return Ok(JsonValue::Number(num));
         }
@@ -36992,7 +39127,7 @@ fn columns_from_yaml(
     // through the same recursive engine a nested array-of-scalars
     // sub-column goes through, rather than a "must be a mapping" error.
     if values.iter().all(JsonValue::is_object) {
-        let records: Vec<serde_json::Map<String, JsonValue>> = values
+        let records: Vec<json_support::Map> = values
             .into_iter()
             .map(|v| match v {
                 JsonValue::Object(m) => m,
@@ -37396,7 +39531,7 @@ mod cbor_support {
                 .map(JsonValue::from)
                 .unwrap_or_else(|_| JsonValue::String(i.to_string())),
             Value::Float(f) => {
-                serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
             }
             Value::Text(s) => JsonValue::String(s.clone()),
             Value::Bytes(b) => {
@@ -37414,7 +39549,7 @@ mod cbor_support {
             // rather than silently dropping it, same choice as YAML's
             // `!Tag` handling.
             Value::Tag(tag, inner) => {
-                let mut obj = serde_json::Map::new();
+                let mut obj = json_support::Map::new();
                 obj.insert(format!("tag({tag})"), value_to_json(inner));
                 JsonValue::Object(obj)
             }
@@ -37471,7 +39606,7 @@ mod cbor_support {
         // has no field names to extract, but is still a genuine single
         // column, not an error.
         if values.iter().all(JsonValue::is_object) {
-            let records: Vec<serde_json::Map<String, JsonValue>> = values
+            let records: Vec<json_support::Map> = values
                 .into_iter()
                 .map(|v| match v {
                     JsonValue::Object(m) => m,
@@ -37710,7 +39845,7 @@ fn columns_from_ini(path: &Path, n_samples: usize) -> Result<Vec<(String, Vec<Co
         if props.is_empty() {
             continue; // e.g. no general section before the first [header]
         }
-        let mut record = serde_json::Map::new();
+        let mut record = json_support::Map::new();
         for (k, v) in props {
             match record.get_mut(&k) {
                 Some(JsonValue::Array(values)) => values.push(JsonValue::String(v)),
@@ -38063,7 +40198,7 @@ mod xml_support {
     }
 
     fn xml_element_to_json(el: &XmlElement) -> JsonValue {
-        let mut obj = serde_json::Map::new();
+        let mut obj = json_support::Map::new();
         for (k, v) in &el.attrs {
             obj.insert(format!("@{k}"), JsonValue::String(v.clone()));
         }
@@ -38128,13 +40263,13 @@ mod xml_support {
                 .iter()
                 .all(|e| e.name == root.children[0].name);
 
-        let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+        let mut records: Vec<json_support::Map> = Vec::new();
         if homogeneous {
             for el in &root.children {
                 match xml_element_to_json(el) {
                     JsonValue::Object(m) => records.push(m),
                     other => {
-                        let mut m = serde_json::Map::new();
+                        let mut m = json_support::Map::new();
                         m.insert("#text".to_string(), other);
                         records.push(m);
                     }
@@ -40883,36 +43018,30 @@ fn render_json(
     format: &InputFormat,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
 ) -> Result<String> {
-    // A plain struct (not a derive target - see ColumnProfile's own
-    // Serialize impl above for why) so `file`/`format`/`tables` come out
-    // in this declared order rather than an unordered map's sorted keys.
-    // `tables` itself serializes fine through serde's blanket BTreeMap
-    // impl once ColumnProfile: Serialize - a table-name-sorted JSON object
-    // is exactly the shape already documented in CLAUDE.md.
-    struct DataDictionary<'a> {
-        file: &'a str,
-        format: &'a str,
-        tables: &'a BTreeMap<String, Vec<ColumnProfile>>,
+    // `file`/`format`/`tables` inserted in this declared order into an
+    // insertion-ordered `json_support::Map` is now itself sufficient to
+    // guarantee output field order - the old hand-written `Serialize`
+    // impl this replaced only ever existed to route around the previous
+    // `Map`'s `BTreeMap`-backed alphabetizing (see CLAUDE.md's
+    // Dependency footprint section). `tables` itself is still a real
+    // `BTreeMap<String, Vec<ColumnProfile>>` for a different, still-valid
+    // reason - table-name sorting in a multi-table file's output - so its
+    // own key order is deliberately unchanged.
+    let mut doc = json_support::Map::with_capacity(3);
+    doc.insert("file".to_string(), JsonValue::from(file_name.to_string()));
+    doc.insert(
+        "format".to_string(),
+        JsonValue::from(format.as_str().to_string()),
+    );
+    let mut tables_obj = json_support::Map::with_capacity(tables.len());
+    for (table_name, profiles) in tables {
+        tables_obj.insert(
+            table_name.clone(),
+            JsonValue::Array(profiles.iter().map(ColumnProfile::to_json).collect()),
+        );
     }
-    impl serde::Serialize for DataDictionary<'_> {
-        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-        where
-            S: serde::Serializer,
-        {
-            use serde::ser::SerializeStruct;
-            let mut state = serializer.serialize_struct("DataDictionary", 3)?;
-            state.serialize_field("file", &self.file)?;
-            state.serialize_field("format", &self.format)?;
-            state.serialize_field("tables", &self.tables)?;
-            state.end()
-        }
-    }
-    let doc = DataDictionary {
-        file: file_name,
-        format: format.as_str(),
-        tables,
-    };
-    serde_json::to_string_pretty(&doc).context("failed to serialize JSON output")
+    doc.insert("tables".to_string(), JsonValue::Object(tables_obj));
+    Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
 }
 
 // --- JSON-Schema-standard output (--output-format json-schema) ---
@@ -41004,9 +43133,9 @@ fn render_json_schema(
     file_name: &str,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
 ) -> Result<String> {
-    let mut table_schemas = serde_json::Map::new();
+    let mut table_schemas = json_support::Map::new();
     for (table_name, profiles) in tables {
-        let mut properties = serde_json::Map::new();
+        let mut properties = json_support::Map::new();
         let mut required = Vec::new();
         for p in profiles {
             properties.insert(p.name.clone(), json_schema_property(p));
@@ -41014,7 +43143,7 @@ fn render_json_schema(
                 required.push(JsonValue::String(p.name.clone()));
             }
         }
-        let mut schema = serde_json::Map::new();
+        let mut schema = json_support::Map::new();
         schema.insert("type".to_string(), json!("object"));
         schema.insert("properties".to_string(), JsonValue::Object(properties));
         if !required.is_empty() {
@@ -41028,7 +43157,7 @@ fn render_json_schema(
         "file": file_name,
         "tables": table_schemas,
     });
-    serde_json::to_string_pretty(&doc).context("failed to serialize JSON Schema output")
+    Ok(json_support::to_pretty_string(&doc))
 }
 
 // --- Hand-rolled DEFLATE (RFC 1951) + gzip (RFC 1952) decoder ---
@@ -46468,7 +48597,7 @@ mod tests {
         use xmltree::XMLNode;
 
         fn to_json(el: &xmltree::Element) -> JsonValue {
-            let mut obj = serde_json::Map::new();
+            let mut obj = json_support::Map::new();
             for (k, v) in &el.attributes {
                 obj.insert(format!("@{k}"), JsonValue::String(v.clone()));
             }
@@ -46528,13 +48657,13 @@ mod tests {
                 .iter()
                 .all(|e| e.name == child_elements[0].name);
 
-        let mut records: Vec<serde_json::Map<String, JsonValue>> = Vec::new();
+        let mut records: Vec<json_support::Map> = Vec::new();
         if homogeneous {
             for el in child_elements {
                 match to_json(el) {
                     JsonValue::Object(m) => records.push(m),
                     other => {
-                        let mut m = serde_json::Map::new();
+                        let mut m = json_support::Map::new();
                         m.insert("#text".to_string(), other);
                         records.push(m);
                     }
@@ -46888,7 +49017,7 @@ mod tests {
         // start with '[') and then failed line-by-line, since "{" alone
         // isn't valid JSON on its own line.
         let values = read_values("{\n  \"a\": \"b\"\n}");
-        assert_eq!(values, vec![serde_json::json!({"a": "b"})]);
+        assert_eq!(values, vec![json!({"a": "b"})]);
     }
 
     #[test]
@@ -46897,23 +49026,13 @@ mod tests {
         // data - serde_json rejects trailing content after a complete
         // value, so this correctly falls through to per-line parsing.
         let values = read_values("{\"a\":1}\n{\"a\":2}\n");
-        assert_eq!(
-            values,
-            vec![serde_json::json!({"a": 1}), serde_json::json!({"a": 2})]
-        );
+        assert_eq!(values, vec![json!({"a": 1}), json!({"a": 2})]);
     }
 
     #[test]
     fn read_json_values_accepts_a_top_level_array_of_scalars() {
         let values = read_values("[1, 2, 3]");
-        assert_eq!(
-            values,
-            vec![
-                serde_json::json!(1),
-                serde_json::json!(2),
-                serde_json::json!(3)
-            ]
-        );
+        assert_eq!(values, vec![json!(1), json!(2), json!(3)]);
     }
 
     #[test]
@@ -46941,7 +49060,7 @@ mod tests {
 
     #[test]
     fn profile_json_path_types_a_plain_array_of_scalars_precisely() {
-        let uuids = serde_json::json!([
+        let uuids = json!([
             "a4d1e6b0-1111-4a1a-9a1a-000000000001",
             "a4d1e6b0-1111-4a1a-9a1a-000000000002"
         ]);
@@ -46953,7 +49072,7 @@ mod tests {
 
     #[test]
     fn profile_json_path_types_every_field_of_an_array_of_objects() {
-        let events = serde_json::json!([
+        let events = json!([
             {"user_email": "alice@example.com", "amount": 50},
             {"user_email": "bob@example.com", "amount": 75}
         ]);
@@ -46975,7 +49094,7 @@ mod tests {
     #[test]
     fn profile_json_path_resolves_a_leaf_three_levels_deep() {
         // object -> object -> array of objects -> leaf
-        let deep = serde_json::json!({"outer": {"inner_list": [{"score": 1}, {"score": 2}]}});
+        let deep = json!({"outer": {"inner_list": [{"score": 1}, {"score": 2}]}});
         let profiles = profile_json_path("deep".to_string(), 1, vec![&deep], 3);
 
         let score = profiles
@@ -46994,7 +49113,7 @@ mod tests {
         // already apply everywhere else in this file (e.g. a "mostly
         // UUID" column isn't a trustworthy UUID column) - not a gap. The
         // object portion is still recursed into and typed normally.
-        let mixed = serde_json::json!([1, 2, {"x": 1}]);
+        let mixed = json!([1, 2, {"x": 1}]);
         let profiles = profile_json_path("mixed_list".to_string(), 1, vec![&mixed], 3);
 
         let root = &profiles[0];
@@ -47175,7 +49294,7 @@ mod tests {
     #[test]
     fn yaml_parser_handles_nested_block_mappings_and_sequences() {
         let v = yaml_doc("a:\n  b:\n    - 1\n    - 2\n  c: 3\n");
-        assert_eq!(v, serde_json::json!({"a": {"b": [1, 2], "c": 3}}));
+        assert_eq!(v, json!({"a": {"b": [1, 2], "c": 3}}));
     }
 
     #[cfg(feature = "yaml")]
@@ -47184,7 +49303,7 @@ mod tests {
         let v = yaml_doc("- name: Alice\n  age: 30\n- name: Bob\n  age: 25\n");
         assert_eq!(
             v,
-            serde_json::json!([{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}])
+            json!([{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}])
         );
     }
 
@@ -47200,7 +49319,7 @@ mod tests {
         let v = yaml_doc("containers:\n- name: nginx\n  image: nginx:1.14.2\n");
         assert_eq!(
             v,
-            serde_json::json!({"containers": [{"name": "nginx", "image": "nginx:1.14.2"}]})
+            json!({"containers": [{"name": "nginx", "image": "nginx:1.14.2"}]})
         );
     }
 
@@ -47208,10 +49327,10 @@ mod tests {
     #[test]
     fn yaml_parser_handles_flow_collections_including_multi_line() {
         let v = yaml_doc("a: {b: 1, c: [1, 2, 3]}\n");
-        assert_eq!(v, serde_json::json!({"a": {"b": 1, "c": [1, 2, 3]}}));
+        assert_eq!(v, json!({"a": {"b": 1, "c": [1, 2, 3]}}));
 
         let v = yaml_doc("a: [1, 2,\n    3, 4]\n");
-        assert_eq!(v, serde_json::json!({"a": [1, 2, 3, 4]}));
+        assert_eq!(v, json!({"a": [1, 2, 3, 4]}));
     }
 
     /// A real bug found the same way: the block scalar's own body
@@ -47225,7 +49344,7 @@ mod tests {
         let v = yaml_doc("a: |\n  line one\n  line two\nb: >\n  folded one\n  folded two\n");
         assert_eq!(
             v,
-            serde_json::json!({"a": "line one\nline two\n", "b": "folded one folded two\n"})
+            json!({"a": "line one\nline two\n", "b": "folded one folded two\n"})
         );
     }
 
@@ -47233,14 +49352,14 @@ mod tests {
     #[test]
     fn yaml_parser_handles_double_quoted_escapes() {
         let v = yaml_doc(r#"a: "hi\nthere\t\u00e9""#);
-        assert_eq!(v, serde_json::json!({"a": "hi\nthere\t\u{e9}"}));
+        assert_eq!(v, json!({"a": "hi\nthere\t\u{e9}"}));
     }
 
     #[cfg(feature = "yaml")]
     #[test]
     fn yaml_parser_strips_comments_outside_quotes() {
         let v = yaml_doc("a: 1 # comment\nb: 2\n");
-        assert_eq!(v, serde_json::json!({"a": 1, "b": 2}));
+        assert_eq!(v, json!({"a": 1, "b": 2}));
     }
 
     #[cfg(feature = "yaml")]
@@ -47249,7 +49368,7 @@ mod tests {
         let v = yaml_doc("a: this is a very long\n  plain scalar continuing\nb: 2\n");
         assert_eq!(
             v,
-            serde_json::json!({"a": "this is a very long plain scalar continuing", "b": 2})
+            json!({"a": "this is a very long plain scalar continuing", "b": 2})
         );
     }
 
@@ -47257,17 +49376,14 @@ mod tests {
     #[test]
     fn yaml_parser_honors_core_tags_including_on_a_quoted_scalar() {
         let v = yaml_doc("a: !!str 123\nb: !!int \"45\"\n");
-        assert_eq!(v, serde_json::json!({"a": "123", "b": 45}));
+        assert_eq!(v, json!({"a": "123", "b": 45}));
     }
 
     #[cfg(feature = "yaml")]
     #[test]
     fn yaml_parser_handles_arbitrary_nesting_depth() {
         let v = yaml_doc("a:\n  b:\n    c:\n      d: 1\n      e: [1, {f: 2}]\n");
-        assert_eq!(
-            v,
-            serde_json::json!({"a": {"b": {"c": {"d": 1, "e": [1, {"f": 2}]}}}})
-        );
+        assert_eq!(v, json!({"a": {"b": {"c": {"d": 1, "e": [1, {"f": 2}]}}}}));
     }
 
     /// YAML 1.1's `yes`/`no`/`on`/`off` boolean words are deliberately
@@ -47293,10 +49409,7 @@ mod tests {
     #[test]
     fn yaml_parser_reads_an_anchored_values_own_content_correctly() {
         let v = yaml_doc("defaults: &defaults\n  timeout: 30\nname: myapp\n");
-        assert_eq!(
-            v,
-            serde_json::json!({"defaults": {"timeout": 30}, "name": "myapp"})
-        );
+        assert_eq!(v, json!({"defaults": {"timeout": 30}, "name": "myapp"}));
     }
 
     #[cfg(feature = "yaml")]
@@ -47313,10 +49426,7 @@ mod tests {
     #[test]
     fn yaml_parser_does_not_coerce_on_off_yes_no_to_booleans() {
         let v = yaml_doc("a: on\nb: off\nc: yes\nd: no\n");
-        assert_eq!(
-            v,
-            serde_json::json!({"a": "on", "b": "off", "c": "yes", "d": "no"})
-        );
+        assert_eq!(v, json!({"a": "on", "b": "off", "c": "yes", "d": "no"}));
     }
 
     #[test]
@@ -49124,10 +51234,10 @@ mod tests {
                     .map(JsonValue::from)
                     .or_else(|| i.as_u64().map(JsonValue::from))
                     .unwrap_or(JsonValue::Null),
-                MpValue::F32(f) => serde_json::Number::from_f64(f64::from(*f))
+                MpValue::F32(f) => json_support::Number::from_f64(f64::from(*f))
                     .map_or(JsonValue::Null, JsonValue::Number),
                 MpValue::F64(f) => {
-                    serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                    json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
                 }
                 MpValue::String(s) => JsonValue::String(match s.as_str() {
                     Some(s) => s.to_string(),
@@ -49168,7 +51278,7 @@ mod tests {
         let values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
 
         if values.iter().all(JsonValue::is_object) {
-            let records: Vec<serde_json::Map<String, JsonValue>> = values
+            let records: Vec<json_support::Map> = values
                 .into_iter()
                 .map(|v| match v {
                     JsonValue::Object(m) => m,
@@ -49249,7 +51359,7 @@ mod tests {
                 toml::Value::String(s) => JsonValue::String(s.clone()),
                 toml::Value::Integer(i) => JsonValue::from(*i),
                 toml::Value::Float(f) => {
-                    serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                    json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
                 }
                 toml::Value::Boolean(b) => JsonValue::Bool(*b),
                 toml::Value::Datetime(dt) => JsonValue::String(dt.to_string()),
@@ -49292,12 +51402,26 @@ mod tests {
             let theirs = columns_from_toml_via_toml_crate(path, 100)
                 .unwrap_or_else(|e| panic!("{f}: toml-crate-based oracle failed: {e:?}"));
 
-            assert_eq!(
-                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
-                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
-                "{f}: column names differ"
-            );
-            for (m, t) in mine.iter().zip(theirs.iter()) {
+            // Column *order* is deliberately not compared: this reader's
+            // own `Map` is insertion-ordered (see CLAUDE.md's Dependency
+            // footprint section on `serde`/`serde_json`), while the real
+            // `toml` crate's `Table` stays `BTreeMap`-backed (alphabetical)
+            // without its own `preserve_order` feature - a real, disclosed
+            // divergence, not a bug. Sorting both name lists first proves
+            // the two readers still agree on *which* columns exist and
+            // what each one's values resolve to, matching by name rather
+            // than position.
+            let mut mine_names: Vec<&String> = mine.iter().map(|c| &c.name).collect();
+            let mut their_names: Vec<&String> = theirs.iter().map(|c| &c.name).collect();
+            mine_names.sort();
+            their_names.sort();
+            assert_eq!(mine_names, their_names, "{f}: column names differ");
+
+            for m in &mine {
+                let t = theirs
+                    .iter()
+                    .find(|t| t.name == m.name)
+                    .unwrap_or_else(|| panic!("{f}: column '{}' missing from oracle", m.name));
                 assert_eq!(
                     m.current_type, t.current_type,
                     "{f} col '{}': current_type",
@@ -49309,11 +51433,42 @@ mod tests {
                     m.name
                 );
                 assert_eq!(
-                    m.sample_values, t.sample_values,
-                    "{f} col '{}': sample_values",
+                    m.sample_values.len(),
+                    t.sample_values.len(),
+                    "{f} col '{}': sample_values count",
                     m.name
                 );
+                for (ms, ts) in m.sample_values.iter().zip(t.sample_values.iter()) {
+                    assert!(
+                        sample_values_structurally_match(ms, ts),
+                        "{f} col '{}': sample_values differ: mine={ms:?} oracle={ts:?}",
+                        m.name
+                    );
+                }
             }
+        }
+    }
+
+    /// A `sample_values` entry is either a plain scalar string or a
+    /// compact-JSON-stringified nested object/array (`profile_json_path`'s
+    /// own rendering of a `Vec<T>`/object-typed sample). Plain string
+    /// equality is too strict once `Map` is insertion-ordered (see
+    /// CLAUDE.md's Dependency footprint section): this reader's own
+    /// `Display` for `Value::Object` renders keys in source order, while
+    /// the real `toml` crate's `Table` stays `BTreeMap`-backed
+    /// (alphabetical) without its own `preserve_order` feature - a real,
+    /// disclosed divergence in *rendering*, not in the underlying data.
+    /// Parsing both sides back through this project's own JSON reader and
+    /// comparing via `Value`'s already-order-independent-on-objects
+    /// `PartialEq` proves the values themselves still agree; falling back
+    /// to plain string equality covers the (far more common) case where
+    /// the sample is a bare scalar, which isn't valid standalone JSON
+    /// text to begin with (an unquoted `alpha` isn't a JSON string).
+    #[cfg(feature = "toml")]
+    fn sample_values_structurally_match(mine: &str, theirs: &str) -> bool {
+        match (json_support::from_str(mine), json_support::from_str(theirs)) {
+            (Ok(m), Ok(t)) => m == t,
+            _ => mine == theirs,
         }
     }
 
@@ -49346,7 +51501,7 @@ mod tests {
                     .map(JsonValue::from)
                     .unwrap_or_else(|_| JsonValue::String(i128::from(*i).to_string())),
                 CborValue::Float(f) => {
-                    serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                    json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
                 }
                 CborValue::Text(s) => JsonValue::String(s.clone()),
                 CborValue::Bytes(b) => {
@@ -49362,7 +51517,7 @@ mod tests {
                         .collect(),
                 ),
                 CborValue::Tag(tag, inner) => {
-                    let mut obj = serde_json::Map::new();
+                    let mut obj = json_support::Map::new();
                     obj.insert(format!("tag({tag})"), value_to_json(inner));
                     JsonValue::Object(obj)
                 }
@@ -49389,7 +51544,7 @@ mod tests {
         let values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
 
         if values.iter().all(JsonValue::is_object) {
-            let records: Vec<serde_json::Map<String, JsonValue>> = values
+            let records: Vec<json_support::Map> = values
                 .into_iter()
                 .map(|v| match v {
                     JsonValue::Object(m) => m,
@@ -50025,10 +52180,10 @@ mod tests {
             AvroValue::Boolean(b) => JsonValue::Bool(*b),
             AvroValue::Int(i) => JsonValue::Number((*i).into()),
             AvroValue::Long(i) => JsonValue::Number((*i).into()),
-            AvroValue::Float(f) => serde_json::Number::from_f64(f64::from(*f))
+            AvroValue::Float(f) => json_support::Number::from_f64(f64::from(*f))
                 .map_or(JsonValue::Null, JsonValue::Number),
             AvroValue::Double(f) => {
-                serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+                json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
             }
             AvroValue::String(s) | AvroValue::Enum(_, s) => JsonValue::String(s.clone()),
             AvroValue::Bytes(b) | AvroValue::Fixed(_, b) => {
@@ -50153,7 +52308,7 @@ mod tests {
         }
 
         if values.iter().all(JsonValue::is_object) {
-            let records: Vec<serde_json::Map<String, JsonValue>> = values
+            let records: Vec<json_support::Map> = values
                 .into_iter()
                 .map(|v| match v {
                     JsonValue::Object(m) => m,
