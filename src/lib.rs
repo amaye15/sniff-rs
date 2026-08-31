@@ -11673,14 +11673,25 @@ fn columns_from_orc(
 // (unwrapping nested arrays) so the pool's real type(s) get reported and,
 // if the pool holds objects, those get flattened too.
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum JsonKind {
-    Integer,
-    Float,
-    Str,
-    Bool,
-    Object,
+    Integer = 0,
+    Float = 1,
+    Str = 2,
+    Bool = 3,
+    Object = 4,
 }
+
+/// Every `JsonKind` variant, in the same order as its own discriminant -
+/// lets `JsonKindCounts` (below) iterate "every kind, in a fixed order"
+/// without needing `Hash`/a `HashMap` at all.
+const ALL_JSON_KINDS: [JsonKind; 5] = [
+    JsonKind::Integer,
+    JsonKind::Float,
+    JsonKind::Str,
+    JsonKind::Bool,
+    JsonKind::Object,
+];
 
 fn kind_label(k: JsonKind) -> &'static str {
     match k {
@@ -11692,17 +11703,49 @@ fn kind_label(k: JsonKind) -> &'static str {
     }
 }
 
+/// A per-kind count, one call site per value of a JSON column - found via
+/// real `samply` profiling to be a genuine hot loop (called once per
+/// value of every column of every nested/bridged format this tool
+/// reads). `JsonKind` is a small, fixed, closed set of 5 variants, so a
+/// plain `[usize; 5]` array indexed by discriminant is both simpler and
+/// strictly cheaper than a `HashMap<JsonKind, usize>` ever could be - no
+/// hashing, no probing, just a direct array index. `Hash` was dropped
+/// from `JsonKind`'s own derive entirely once nothing needed it any more.
+#[derive(Default, Clone, Copy)]
+struct JsonKindCounts([usize; 5]);
+
+impl JsonKindCounts {
+    fn increment(&mut self, k: JsonKind) {
+        self.0[k as usize] += 1;
+    }
+
+    /// Every kind actually observed (count > 0), in `ALL_JSON_KINDS`
+    /// order - the array itself can't distinguish "never seen" from "seen
+    /// zero times" any other way, since every slot starts at 0.
+    fn observed(&self) -> impl Iterator<Item = (JsonKind, usize)> + '_ {
+        ALL_JSON_KINDS
+            .into_iter()
+            .zip(self.0)
+            .filter(|(_, c)| *c > 0)
+    }
+}
+
 /// current_type label for a pool of observed kinds: the single kind if
 /// consistent, otherwise every observed kind with its count, e.g.
 /// "mixed(String: 1, i64: 2)" - so an inconsistency is never just flagged,
 /// it's fully enumerated.
-fn describe_kinds(counts: &HashMap<JsonKind, usize>) -> String {
-    if counts.len() == 1 {
-        return kind_label(*counts.keys().next().unwrap()).to_string();
-    }
-    let mut parts: Vec<(String, usize)> = counts
-        .iter()
-        .map(|(k, c)| (kind_label(*k).to_string(), *c))
+fn describe_kinds(counts: &JsonKindCounts) -> String {
+    let mut observed = counts.observed();
+    let Some(first) = observed.next() else {
+        return String::new();
+    };
+    let Some(second) = observed.next() else {
+        return kind_label(first.0).to_string();
+    };
+    let mut parts: Vec<(String, usize)> = std::iter::once(first)
+        .chain(std::iter::once(second))
+        .chain(observed)
+        .map(|(k, c)| (kind_label(k).to_string(), c))
         .collect();
     parts.sort_by(|a, b| a.0.cmp(&b.0));
     let inner = parts
@@ -11829,7 +11872,7 @@ fn profile_json_path(
         }
     };
 
-    let mut kind_counts: HashMap<JsonKind, usize> = HashMap::new();
+    let mut kind_counts = JsonKindCounts::default();
     // `Cow` rather than `String`: a `JsonValue::String` already owns its
     // data for as long as the caller's own `values`/`pool` borrow lives
     // (found via real profiling - `samply` plus `atos` symbolication
@@ -11847,11 +11890,11 @@ fn profile_json_path(
     for v in &pool {
         match v {
             JsonValue::Object(m) => {
-                *kind_counts.entry(JsonKind::Object).or_insert(0) += 1;
+                kind_counts.increment(JsonKind::Object);
                 object_maps.push(m);
             }
             JsonValue::Bool(b) => {
-                *kind_counts.entry(JsonKind::Bool).or_insert(0) += 1;
+                kind_counts.increment(JsonKind::Bool);
                 scalar_raw.push(Cow::Borrowed(if *b { "true" } else { "false" }));
             }
             JsonValue::Number(n) => {
@@ -11860,11 +11903,11 @@ fn profile_json_path(
                 } else {
                     JsonKind::Float
                 };
-                *kind_counts.entry(k).or_insert(0) += 1;
+                kind_counts.increment(k);
                 scalar_raw.push(Cow::Owned(n.to_string()));
             }
             JsonValue::String(s) => {
-                *kind_counts.entry(JsonKind::Str).or_insert(0) += 1;
+                kind_counts.increment(JsonKind::Str);
                 scalar_raw.push(Cow::Borrowed(s.as_str()));
             }
             JsonValue::Null | JsonValue::Array(_) => {
@@ -49363,16 +49406,19 @@ mod tests {
 
     #[test]
     fn describe_kinds_reports_a_single_kind_plainly() {
-        let mut counts = HashMap::new();
-        counts.insert(JsonKind::Str, 3);
+        let mut counts = JsonKindCounts::default();
+        counts.increment(JsonKind::Str);
+        counts.increment(JsonKind::Str);
+        counts.increment(JsonKind::Str);
         assert_eq!(describe_kinds(&counts), "String");
     }
 
     #[test]
     fn describe_kinds_reports_mixed_kinds_with_sorted_counts() {
-        let mut counts = HashMap::new();
-        counts.insert(JsonKind::Str, 2);
-        counts.insert(JsonKind::Bool, 1);
+        let mut counts = JsonKindCounts::default();
+        counts.increment(JsonKind::Str);
+        counts.increment(JsonKind::Str);
+        counts.increment(JsonKind::Bool);
         assert_eq!(describe_kinds(&counts), "mixed(String: 2, bool: 1)");
     }
 

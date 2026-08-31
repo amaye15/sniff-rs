@@ -33,6 +33,39 @@ re-run.
 
 ---
 
+## 2026-09-01 — `e4c9138`+perf pass 7 (Darwin arm64, Apple M4)
+
+A seventh optimization pass, re-profiling the same 300,000-row nested
+JSON fixture after pass 6's hasher fix. See CLAUDE.md's own
+"Performance" section for the full writeup, including a stale-profile
+methodology mistake this pass caught and fixed (always regenerate the
+profile + dSYM immediately before symbolicating, never reuse one across
+a rebuild), and two ideas considered and explicitly declined
+(`unsafe`-based UTF-8 revalidation removal; reverting
+`bucket_object_fields` to a linear scan).
+
+Found `profile_json_path`'s own `kind_counts: HashMap<JsonKind, usize>`
+- one insert per value of every column, same shape as pass 6's finding,
+just hashing a 5-variant enum instead of a `&str`. Replaced with a
+plain `[usize; 5]` array indexed by discriminant (`JsonKindCounts`) -
+no hashing or probing at all, not even `FxHash`, since the key space is
+tiny and fixed.
+
+**Controlled alternating-binary comparison** (14 usable rounds across
+two batches; a middle batch was discarded after `ps`/`uptime` showed a
+load average over 7 from unrelated background processes mid-run):
+
+| Binary | Batch A (6 rounds, user) | Batch B (8 rounds, user) |
+|---|---|---|
+| Before this pass (`sniff-rs-after-clean`, pass 6's binary) | avg 0.953s | avg 0.930s |
+| After this pass | avg 0.900s | avg 0.886s |
+
+A clean, reproducible **~5%** further user-time improvement on top of
+pass 6's own gain, baseline above the fix in every comparable round in
+both clean batches. Byte-identical output confirmed via `diff` across
+three nested/mixed-kind fixtures (`mixed_types.jsonl`,
+`nested_typed.jsonl`, `nested.jsonl`) in all three output formats.
+
 ## 2026-09-01 — `0124c74`+perf pass 6 (Darwin arm64, Apple M4)
 
 A sixth optimization pass, moving the `samply`/`atos` profiler off CSV

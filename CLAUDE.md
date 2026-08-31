@@ -2660,6 +2660,74 @@ for the hasher choice to matter there. Reported honestly as a
 JSON/nested-format-specific win rather than a general one, per this
 project's own "measure, don't assume" discipline.
 
+A seventh pass re-profiled the same fixture after the sixth pass's fix
+(a fresh profile immediately before analysis this time, after an
+earlier stale-profile mistake this same pass caught and corrected: a
+profile recorded against one build, then symbol-resolved against a
+*rebuilt* binary from several `cargo build`/`git stash` cycles later,
+produced obvious nonsense - self-time attributed to `columns_from_csv`/
+`render_markdown`/Parquet's own footer parser while reading a plain
+`.jsonl` file with `--output-format json`, none of which that code path
+could possibly reach. Not an ICF false lead this time, just addresses
+resolved against the wrong binary entirely - fixed by always
+regenerating the profile and its `dsymutil` bundle back-to-back,
+immediately before running `atos`, never reusing one across a rebuild).
+
+The fresh profile surfaced `profile_json_path`'s own
+`kind_counts: HashMap<JsonKind, usize>` as a real, if smaller, sibling
+of the sixth pass's finding: one hashmap insert per value of every
+column of every nested/bridged format, same as before, just hashing a
+5-variant enum instead of a `&str`. Since `JsonKind` is a small, fixed,
+closed set (`Integer`/`Float`/`Str`/`Bool`/`Object`), there was no need
+to reach for `FxHasher` again here - a plain `[usize; 5]` array indexed
+by the enum's own discriminant (`JsonKindCounts`, wrapping the array
+with an `increment`/`observed` API) is both simpler and strictly
+cheaper than any `HashMap` could be, hashed or not: no hashing, no
+probing, just a direct array index. `Hash` was dropped from `JsonKind`'s
+own derive entirely once nothing needed it.
+
+This pass also considered, and explicitly declined, two further ideas
+the same profile raised: eliminating the redundant `std::str::from_utf8`
+re-validation in `json_support::Parser::parse_string`/`parse_number`
+(both call sites already carry a comment proving the slice is always
+valid UTF-8 by construction, so the check is provably dead work) would
+need `unsafe { from_utf8_unchecked(...) }` to actually remove - and this
+project has never once reached for `unsafe` anywhere, including in
+every other hand-rolled binary decoder in this file (zstd's bit-level
+FSE tables, Brotli's Huffman decode, Parquet's Thrift varint reader),
+despite plenty of equally-tempting opportunities. Introducing the
+project's first `unsafe` block for a single-digit-percent win broke
+with that consistent, deliberate precedent, so the idea was reverted
+rather than kept - a modest performance gain isn't reason enough to
+spend the project's first exception to a house style this consistent.
+Separately, replacing `bucket_object_fields`'s `HashMap` with a plain
+linear-scan `Vec` (now that `FxHash` makes the hashing itself cheap,
+`hashbrown`'s own SIMD probing overhead is the largest remaining cost
+in that function) was worked through on paper rather than measured: a
+linear scan's cost scales with *distinct key count* per lookup, which
+stays small and bounded for a realistic schema (a handful to a few
+dozen fields) but grows without bound for the genuinely wide-object
+case (300 fields) this project's own history already measured a
+HashMap fixing at ~2x - reverting to linear scan would trade a small,
+uncertain win on the common case for a real, previously-measured
+regression on a documented worst case, so it was left alone.
+
+Verified the same way as every pass before it: full test suite
+unchanged and passing (including both existing `describe_kinds` unit
+tests, rewritten against the new `JsonKindCounts` API rather than a
+raw `HashMap`), clippy/fmt clean, and byte-identical output confirmed
+via `diff` against the pre-fix binary across three different nested/
+mixed-kind fixtures (`mixed_types.jsonl`, `nested_typed.jsonl`,
+`nested.jsonl`) in all three output formats (`md`/`json`/`json-schema`),
+not just the one synthetic fixture used to find and measure the issue.
+A controlled alternating-binary comparison (14 usable rounds across two
+batches, discarding a middle batch visibly contaminated by unrelated
+background CPU load on the machine - `ps`/`uptime` confirmed a load
+average over 7 mid-run, not this project's own code) showed a clean,
+reproducible **~5%** further user-time improvement on top of the sixth
+pass's own gain (≈0.93s down to ≈0.89s in the two clean batches, baseline
+above the fix in every single comparable round).
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no
