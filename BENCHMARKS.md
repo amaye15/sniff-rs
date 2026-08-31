@@ -33,6 +33,46 @@ re-run.
 
 ---
 
+## 2026-09-01 — `0124c74`+perf pass 6 (Darwin arm64, Apple M4)
+
+A sixth optimization pass, moving the `samply`/`atos` profiler off CSV
+(covered by passes 4-5) and onto a synthetic 300,000-row nested JSON
+file. See CLAUDE.md's own "Performance" section for the full writeup.
+
+Found `std`'s default SipHash-1-3 hasher dominating the profile (~1/5
+of total samples) via two hot loops hashing the same handful of short,
+trusted keys millions of times over: `bucket_object_fields`'s
+`HashMap<&str, usize>` (one lookup per `(object, field)` pair, for
+every nested object any bridged format produces) and
+`suggest_ideal_type`'s unique-value-count `HashSet<&str>` (one insert
+per value, for every value of a column that stays under the 50-unique
+category-detection cutoff). Switched both to a hand-rolled `FxHasher`
+(the well-known "multiply, rotate, xor" construction rustc/Firefox use
+internally for this same reason) via a `FxBuildHasher` type alias -
+scoped to just these two containers, not a blanket change, since
+neither is ever fed attacker-controlled keys.
+
+**Controlled alternating-binary comparison** (6 rounds, the 300,000-row
+nested JSON fixture, `--output-format json`):
+
+| Binary | R1 | R2 | R3 | R4 | R5 | R6 |
+|---|---|---|---|---|---|---|
+| Before this pass (user) | 1.00s | 1.00s | 1.06s | 1.00s | 0.96s | 0.96s |
+| After this pass (user) | 0.94s | 0.93s | 0.95s | 0.91s | 0.92s | 0.91s |
+
+A clean, reproducible **~7%** user-time improvement, consistent in
+every round with no overlap between the two groups, confirmed
+byte-identical `--output-format json` output via `diff`. A re-profile
+of the fixed binary confirmed the mechanism directly: the
+`sip::Hasher`-related self-time clusters from the original profile are
+gone, leaving only a small residual `hash_one` cost (the genuinely-
+necessary `FxHash` computation itself). A parallel check on a
+1,000,000-row CSV file with several low-cardinality columns showed no
+clear improvement - this fix's real benefit is concentrated in nested/
+bridged-format workloads through `bucket_object_fields`, not CSV (which
+never calls that function and isn't hash-bound enough on its own
+category-detection path for the hasher choice to matter there).
+
 ## 2026-09-01 — `e6bd76d`+perf pass 5 (Darwin arm64, Apple M4)
 
 A fifth optimization pass, continuing the fourth's real-profiler

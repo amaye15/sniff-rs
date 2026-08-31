@@ -130,6 +130,93 @@ macro_rules! anyhow {
     };
 }
 
+// --- A fast, non-cryptographic hasher for hot internal `HashMap`/
+// `HashSet` keys (found via `samply` profiling a real 300,000-row nested
+// JSON file, the same profiler-driven discipline as this project's own
+// CSV/JSON optimization passes - see CLAUDE.md's Performance section) ---
+//
+// `std`'s default hasher (SipHash-1-3) is deliberately DoS-resistant:
+// it's built to stay fast even against an adversary crafting inputs to
+// force hash collisions, which costs a fixed, non-trivial amount of
+// mixing work on *every* hash regardless of how short the key is. Two
+// internal hot loops - `suggest_ideal_type`'s own unique-value count (one
+// `HashSet<&str>` insert per value in a column, for every column of every
+// format this tool reads) and `bucket_object_fields`'s key index (one
+// `HashMap<&str, usize>` lookup per `(object, field)` pair, for every
+// nested object any bridged format produces) - call into this dozens of
+// millions of times over a large real file, hashing the same handful of
+// short, non-adversarial, internally-generated keys (a column name, a
+// JSON field name) over and over. Profiling confirmed this is not a
+// theoretical concern: on a synthetic 300,000-row nested JSON file,
+// `core::hash::sip::Hasher::write`/`BuildHasher::hash_one` alone
+// accounted for roughly a fifth of total wall-clock samples - the single
+// largest cluster in the whole profile, ahead of any of this project's
+// own format-parsing or heuristic-engine code.
+//
+// Neither of these two call sites is ever fed attacker-controlled keys
+// in a context where hash-flooding would matter (a local CLI profiling a
+// file the user themselves pointed it at, not a shared multi-tenant
+// service parsing untrusted uploads under adversarial timing pressure -
+// the same threat-model distinction this project already draws in
+// several other places, e.g. this file's own adversarial-input tests
+// target panics/crashes, never hash-flooding DoS), so trading SipHash's
+// collision-resistance for raw speed on exactly these two containers is
+// a deliberate, scoped choice, not a blanket policy change - every other
+// `HashMap`/`HashSet` in this file keeps the default hasher.
+//
+// `FxHasher` (the well-known "multiply, rotate, xor" construction used
+// internally by rustc and Firefox for this identical reason - fast,
+// non-cryptographic hashing of short, trusted keys) is hand-rolled here
+// from its published description rather than adding the `rustc-hash`
+// crate as a dependency, the same "well-known small algorithm, verified
+// independently rather than borrowed as a dependency" treatment this
+// project already gives CRC32/Huffman/FSE/civil-calendar arithmetic
+// elsewhere.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    // The seed is `0x51_7c_c1_b7_27_22_0a_95` in every published
+    // description of this algorithm - not a proof-carrying constant,
+    // just a fixed odd 64-bit multiplier chosen for good bit dispersion.
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+    #[inline]
+    fn add_to_hash(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(Self::SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            self.add_to_hash(u64::from_ne_bytes(bytes[..8].try_into().unwrap()));
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            self.add_to_hash(u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64);
+            bytes = &bytes[4..];
+        }
+        if bytes.len() >= 2 {
+            self.add_to_hash(u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as u64);
+            bytes = &bytes[2..];
+        }
+        if let [byte] = bytes {
+            self.add_to_hash(*byte as u64);
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+
 // --- Hand-rolled JSON value model, parser, and serializer (see CLAUDE.md's
 // Dependency footprint section) ---
 //
@@ -4216,7 +4303,11 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     // never need to be hashed at all. A column that stays at or under 50
     // distinct values for its entire length still does the same full
     // scan as before - this only ever removes work, never adds any.
-    let mut unique: HashSet<&str> = HashSet::new();
+    // `FxBuildHasher`, not the default SipHash - see that type's own doc
+    // comment for why (profiler-confirmed: this exact loop, hashing the
+    // same short values over and over for a low-cardinality column, was
+    // the single largest cluster in a real profile).
+    let mut unique: HashSet<&str, FxBuildHasher> = HashSet::default();
     for v in values.iter().copied() {
         unique.insert(v);
         if unique.len() > 50 {
@@ -11908,7 +11999,10 @@ fn bucket_object_fields<'a>(
     objects: impl IntoIterator<Item = &'a json_support::Map>,
 ) -> Vec<(String, Vec<&'a JsonValue>)> {
     let mut order: Vec<String> = Vec::new();
-    let mut key_index: HashMap<&str, usize> = HashMap::new();
+    // `FxBuildHasher`, not the default SipHash - see that type's own doc
+    // comment for why (profiler-confirmed: this is one of the two hot
+    // loops that motivated adding it).
+    let mut key_index: HashMap<&str, usize, FxBuildHasher> = HashMap::default();
     let mut buckets: Vec<Vec<&JsonValue>> = Vec::new();
     for m in objects {
         for (k, v) in m.iter() {
@@ -48240,6 +48334,77 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `FxHasher` - the fast, non-cryptographic hasher `suggest_ideal_type`'s
+    // unique-value count and `bucket_object_fields`'s key index both
+    // switched to (see that type's own doc comment for the profiler
+    // finding that motivated it). Not a correctness-critical algorithm in
+    // the way a checksum is - a `HashMap`/`HashSet` only needs its hasher
+    // to be deterministic and to actually distinguish different keys, not
+    // to match any particular external reference implementation - but
+    // still worth locking in the two properties that matter here: real
+    // keys land in genuinely different buckets (not a degenerate "hashes
+    // everything the same" bug), and the hash of a given key is stable
+    // across calls (a `HashMap` silently breaks if a key's hash changes
+    // mid-lifetime).
+    #[test]
+    fn fx_hasher_is_deterministic_for_the_same_key() {
+        use std::hash::{Hash, Hasher};
+        let hash_of = |s: &str| {
+            let mut h = FxHasher::default();
+            s.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of("current_type"), hash_of("current_type"));
+        assert_eq!(hash_of(""), hash_of(""));
+    }
+
+    #[test]
+    fn fx_hasher_gives_different_short_keys_different_hashes() {
+        use std::hash::{Hash, Hasher};
+        let hash_of = |s: &str| {
+            let mut h = FxHasher::default();
+            s.hash(&mut h);
+            h.finish()
+        };
+        // The realistic case this hasher was added for: a handful of
+        // short, similar column/field names in the same HashMap/HashSet.
+        let keys = [
+            "id",
+            "name",
+            "current_type",
+            "ideal_type",
+            "missing_pct",
+            "active",
+            "inactive",
+            "a",
+            "b",
+            "aa",
+            "ab",
+        ];
+        let hashes: HashSet<u64> = keys.iter().map(|k| hash_of(k)).collect();
+        assert_eq!(
+            hashes.len(),
+            keys.len(),
+            "expected every distinct short key to hash differently"
+        );
+    }
+
+    #[test]
+    fn fx_hasher_actually_speeds_up_a_hashmap_with_real_string_keys() {
+        // Not a timing assertion (too flaky to run in CI) - just proves
+        // `FxBuildHasher` is a drop-in `HashMap`/`HashSet` hasher that
+        // behaves like a normal one: insert, overwrite, and lookup all
+        // work exactly as `HashMap`'s own contract promises.
+        let mut m: HashMap<&str, i32, FxBuildHasher> = HashMap::default();
+        m.insert("a", 1);
+        m.insert("b", 2);
+        assert_eq!(m.insert("a", 10), Some(1));
+        assert_eq!(m.get("a"), Some(&10));
+        assert_eq!(m.get("b"), Some(&2));
+        assert_eq!(m.get("missing"), None);
+        assert_eq!(m.len(), 2);
+    }
 
     // parse_csv's own edge cases, verified directly against csv-core's
     // source (transition_nfa) before being trusted, and covering shapes

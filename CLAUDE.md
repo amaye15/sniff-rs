@@ -2585,6 +2585,81 @@ since there was nothing there to fix) by the same method as before:
 checking that no code path reaching them was actually possible for this
 input, rather than trusting the leaf symbol alone.
 
+A sixth pass moved the profiler off CSV (already the subject of two
+prior passes) and onto a synthetic 300,000-row nested JSON file
+instead, to check whether the serde/serde_json hand-roll (a separate,
+later effort - see the Dependency footprint section) had left anything
+worth optimizing in the code paths every non-native nested format
+(YAML/TOML/Avro/MessagePack/CBOR/XML, not just JSON itself) bridges
+through. It had: `core::hash::sip::Hasher::write`/
+`BuildHasher::hash_one` - `std`'s default SipHash-1-3 hasher - was the
+single largest cluster in the whole profile, well ahead of any of this
+project's own parsing or heuristic code, at roughly a fifth of total
+samples combined across its several call sites.
+
+The root cause traced to two hot loops, both calling into a `HashMap`/
+`HashSet` with the default hasher many times over the same handful of
+short, non-adversarial, internally-generated keys: `bucket_object_fields`
+(one `HashMap<&str, usize>` lookup per `(object, field)` pair, for
+*every* nested object any bridged format produces - so a 300,000-row
+file with a few nested sub-objects per row means millions of lookups
+against a key set of only a handful of distinct field names) and
+`suggest_ideal_type`'s own unique-value count (one `HashSet<&str>`
+insert per value in a column, including every value of a column that
+never exceeds the 50-unique category-detection cutoff - a boolean or
+low-cardinality enum-like column scans its *entire* length through the
+hash set, by design, since the early-exit added in an earlier pass only
+helps the high-cardinality case). SipHash is deliberately
+DoS-resistant - built to stay fast even against an adversary crafting
+inputs to force collisions - which costs a fixed, non-trivial amount of
+mixing work on every single hash regardless of how short the key is;
+paying that fixed cost millions of times over a handful of short,
+trusted, internally-generated strings is pure waste, not a security
+property this tool's own threat model needs (a local CLI profiling a
+file the user themselves pointed it at, not a shared service parsing
+untrusted uploads under adversarial timing pressure - the same
+distinction this project's own adversarial-input tests already draw:
+they target panics/crashes, never hash-flooding).
+
+`FxHasher` - the "multiply, rotate, xor" construction rustc and Firefox
+both use internally for exactly this reason (fast, non-cryptographic
+hashing of short, trusted keys) - was hand-rolled from its published
+description rather than adding the `rustc-hash` crate as a dependency,
+the same "well-known small algorithm, verified independently rather
+than borrowed as a dependency" treatment this project already gives
+CRC32/Huffman/FSE/civil-calendar arithmetic elsewhere. Wired in via a
+`FxBuildHasher` type alias (`BuildHasherDefault<FxHasher>`) on
+exactly the two hot containers above - deliberately scoped, not a
+blanket policy change: every other `HashMap`/`HashSet` in this file
+keeps the default hasher, since neither of these two call sites is ever
+fed attacker-controlled keys in a context where hash-flooding would
+actually matter.
+
+Verified the same way as every pass before it: the full test suite (an
+added `FxHasher` unit-test trio - determinism, real short keys hashing
+distinctly, and a `HashMap<_, _, FxBuildHasher>` behaving like a normal
+`HashMap` under insert/overwrite/lookup - plus everything else)
+unchanged and passing, clippy/fmt clean, and byte-identical
+`--output-format json` output confirmed via `diff` against the pre-fix
+binary on the 300,000-row fixture. A controlled alternating-binary
+comparison (6 rounds, the same nested-JSON fixture) showed a clean,
+reproducible **~7%** user-time improvement (≈1.00s down to ≈0.93s,
+consistent in every round with no overlap between the two groups), and
+a re-profile of the fixed binary confirmed the mechanism directly: the
+`sip::Hasher`-related self-time clusters that dominated the original
+profile are gone, with only a small residual `hash_one` cost remaining
+- the genuinely-necessary cost of computing `FxHash` itself, not
+SipHash's collision-resistance overhead. A parallel check on a
+1,000,000-row CSV file with several low-cardinality columns (the
+`suggest_ideal_type` half of this fix's own worst case) showed no
+clear improvement, confirming this fix's real benefit is concentrated
+in nested/bridged-format workloads that flow through
+`bucket_object_fields` - CSV never calls that function at all, and
+apparently isn't hash-bound enough on its own category-detection path
+for the hasher choice to matter there. Reported honestly as a
+JSON/nested-format-specific win rather than a general one, per this
+project's own "measure, don't assume" discipline.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no
