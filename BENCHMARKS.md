@@ -33,6 +33,79 @@ re-run.
 
 ---
 
+## 2026-08-31 — `25d2cbc`+perf pass (Darwin arm64, Apple M4)
+
+A dedicated optimization pass (see CLAUDE.md's own "Performance" section
+for the full writeup of what was found and how each fix was verified),
+not a response to a reported slowdown. Four fixes, all on the CSV reader
+and the recursive JSON-shaped flattener every non-native nested format
+bridges through: `parse_csv` no longer collects the whole file into a
+`Vec<char>` before parsing it; `is_missing_sentinel`/`is_bool_word` no
+longer heap-allocate a lowercased `String` per value; `columns_from_csv`
+no longer clones every cell twice on its way into a `ColumnInput`; and
+`profile_json_path`/`profile_json_records` bucket a set of objects'
+fields in one pass instead of rescanning every object once per distinct
+key. Numbers below are same-session, same-machine before/after pairs
+(the "before" runs were captured fresh, immediately before any code
+changed, specifically so this entry doesn't rely on comparing against
+the older 2026-08-23 snapshot below across ~a week of otherwise-unrelated
+changes) - `format_comparison` wasn't re-run for this entry: none of
+today's fixes touch the Parquet/SQLite/Excel readers it also exercises,
+and this session's one attempt at re-running it landed on a machine
+under incidental background load (a concurrent, unrelated `cargo bench`
+invocation from this environment's own tooling), so its numbers weren't
+trustworthy enough to record - the 2026-08-23 entry below remains the
+most recent clean snapshot for that target.
+
+**Heuristic engine** (`suggest_ideal_type`, in-process, values → time):
+
+| Shape | Size | Before | After | Change |
+|---|---|---|---|---|
+| UUID | 1,000 | 20.6 µs | 17.7 µs | -14.0% |
+| UUID | 100,000 | 2.76 ms | 1.72 ms | -37.6%* |
+| Free-text (worst case) | 10 | 2.28 µs | 2.22 µs | -2.7% |
+| Free-text (worst case) | 1,000 | 102 µs | 90.6 µs | -11.5% |
+| Free-text (worst case) | 100,000 | 13.6 ms | 11.4 ms | -15.7% |
+
+Free-text is the one shape with a clear, mechanistic explanation for the
+win (it's the only one of these four that reaches the `is_bool_word`
+check on every value, since it fails everything else first) - the UUID
+row's own improvement is real in this specific before/after pair but
+larger than any single fix here obviously accounts for, and is marked
+with `*` as more likely to include some session-level noise (thermal
+state, background load - see this file's own header) than the free-text
+numbers are; re-run before trusting the UUID figure specifically.
+Integer and email shapes moved by a few percent either way, within this
+file's own "treat a few percent as noise" guidance.
+
+**End-to-end** (full binary via `Command`, CSV/JSON, rows → time):
+
+| Format | Rows | Before | After | Change |
+|---|---|---|---|---|
+| CSV | 100 | 1.57 ms | 1.54 ms | -2.0%† |
+| CSV | 10,000 | 25.7 ms | 19.0 ms | **-26.0%** |
+| CSV | 200,000 | 545 ms | 397 ms | **-27.2%** |
+| JSON | 100 | 1.53 ms | 1.48 ms | -3.3%† |
+| JSON | 10,000 | 19.5 ms | 17.8 ms | -8.7% |
+| JSON | 200,000 | 563 ms | 515 ms | -8.6% |
+
+(†At 100 rows, subprocess spawn overhead dominates the actual parsing
+work being measured - CLAUDE.md's own Benchmarking section already notes
+this - so these two rows are closer to a process-startup measurement
+than a reader-performance one; the 10,000/200,000 rows are where the
+fixes actually show up.) This benchmark's own JSON fixture is a flat,
+six-field record shape, so it doesn't exercise the
+`profile_json_path`/`profile_json_records` bucketing fix's own worst
+case at all - a separate, uncommitted synthetic fixture (8,000 records,
+300 fields each, generated for this pass only) went from 2.42s to 1.25s,
+roughly 2x, with byte-identical output confirmed via `diff` before and
+after. Not repeated here as a permanent fixture since `benches/
+end_to_end.rs`'s existing shape already covers the "ordinary JSON" case
+this file's numbers above are about, and a dedicated wide-object
+regression test lives in `src/lib.rs`'s own test suite instead of here.
+
+---
+
 ## 2026-08-23 — `29d99ef` (Darwin arm64, Apple M4)
 
 First recorded snapshot - establishes the baseline this machine's future

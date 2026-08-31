@@ -499,6 +499,11 @@ mod json_support {
             self.entries.is_empty()
         }
 
+        // Only called from `#[cfg(test)]` code today (oracle-comparison
+        // key-set unions) - `profile_json_path`/`profile_json_records`
+        // switched to `.iter()` so they can bucket values in one pass
+        // instead of a second per-key lookup (see their own comments).
+        #[allow(dead_code)]
         pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
             self.entries.iter().map(|(k, _)| k)
         }
@@ -3129,14 +3134,28 @@ const MISSING_SENTINELS: &[&str] = &[
 ];
 
 fn is_missing_sentinel(s: &str) -> bool {
-    MISSING_SENTINELS.contains(&s.trim().to_ascii_lowercase().as_str())
+    // `eq_ignore_ascii_case` instead of `.to_ascii_lowercase().as_str()` -
+    // the latter heap-allocates a new `String` on *every* call, and this
+    // runs once per value read in the CSV/fixed-width readers (the two
+    // hottest paths in the whole tool). `MISSING_SENTINELS` is already
+    // all-lowercase, so a per-sentinel case-insensitive comparison gives
+    // the identical result with zero allocation - confirmed via this
+    // project's own `cargo bench` before trusting it as a real win, not
+    // just a plausible-looking one (see CLAUDE.md's Dependency footprint
+    // section for why every change like this here gets measured).
+    let trimmed = s.trim();
+    MISSING_SENTINELS
+        .iter()
+        .any(|sentinel| trimmed.eq_ignore_ascii_case(sentinel))
 }
 
 fn is_bool_word(s: &str) -> bool {
-    matches!(
-        s.to_ascii_lowercase().as_str(),
-        "true" | "false" | "yes" | "no" | "y" | "n" | "on" | "off"
-    )
+    // Same allocation-avoiding fix as `is_missing_sentinel` above, for the
+    // same reason: this runs once per value in every column `suggest_
+    // ideal_type` considers.
+    ["true", "false", "yes", "no", "y", "n", "on", "off"]
+        .iter()
+        .any(|w| s.eq_ignore_ascii_case(w))
 }
 
 fn matching_date_format(values: &[&str]) -> Option<&'static str> {
@@ -4212,54 +4231,85 @@ fn parse_csv(content: &str, delimiter: u8) -> Vec<Vec<String>> {
         c == '\r' || c == '\n'
     }
 
-    let chars: Vec<char> = content.chars().collect();
+    // Handles one character exactly the way `State::StartField` always
+    // has (quote begins a quoted field, a delimiter ends an empty field,
+    // a terminator ends an empty record, anything else starts a plain
+    // field) - factored out so it can also be called, inline, from
+    // `State::StartRecord`'s own "first real character of a record" case
+    // below. A plain fn (not a closure) because it's called from two
+    // different match arms that each already hold a `&mut` borrow of
+    // `state` for the surrounding match - passing `field`/`record`/
+    // `records` as explicit parameters sidesteps any borrow conflict a
+    // capturing closure would have here.
+    fn start_field(
+        c: char,
+        delimiter: char,
+        field: &mut String,
+        record: &mut Vec<String>,
+        records: &mut Vec<Vec<String>>,
+    ) -> State {
+        if c == '"' {
+            State::InQuotedField
+        } else if c == delimiter {
+            record.push(std::mem::take(field));
+            State::StartField
+        } else if is_term(c) {
+            record.push(std::mem::take(field));
+            records.push(std::mem::take(record));
+            State::StartRecord
+        } else {
+            field.push(c);
+            State::InField
+        }
+    }
+
+    // A single forward pass over `content.chars()` - not a `Vec<char>`
+    // collected up front. The old whole-file `Vec<char>` materialized 4
+    // bytes per character regardless of the source encoding, so a large
+    // ASCII-heavy CSV (the overwhelmingly common case) paid for a
+    // ~4x-oversized buffer, plus a full linear copy pass, before the
+    // state machine even started - a real, measurable regression versus
+    // the `csv`-crate-based reader this replaced (see CLAUDE.md's
+    // Dependency footprint section), caught by re-running this project's
+    // own `cargo bench` rather than assumed away. A first attempt at this
+    // fix used `Peekable` instead (needed because `State::StartRecord`'s
+    // non-terminator branch used to defer to `State::StartField` *without*
+    // consuming the character, relying on the old indexed loop's ability
+    // to re-inspect the same position under a new state) - that avoided
+    // the big allocation but added enough per-character `Option`-wrapping
+    // overhead of its own to regress the 10,000-row benchmark even while
+    // improving the 200,000-row one, confirmed by actually re-running
+    // `cargo bench` rather than assumed. Factoring the shared behavior
+    // into `start_field` above instead removes the deferral entirely -
+    // `StartRecord` now calls it inline for that same character rather
+    // than re-examining it next iteration - so a plain `for` loop over
+    // `chars()` (no `Vec<char>`, no `Peekable`) can consume every
+    // character exactly once, matching the original semantics exactly.
     let mut records: Vec<Vec<String>> = Vec::new();
     let mut record: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut state = State::StartRecord;
 
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    for c in content.chars() {
         match state {
             State::StartRecord => {
-                if is_term(c) {
-                    i += 1;
-                } else {
-                    state = State::StartField;
+                if !is_term(c) {
+                    state = start_field(c, delimiter, &mut field, &mut record, &mut records);
                 }
             }
             State::StartField => {
-                if c == '"' {
-                    state = State::InQuotedField;
-                    i += 1;
-                } else if c == delimiter {
-                    record.push(std::mem::take(&mut field));
-                    i += 1;
-                } else if is_term(c) {
-                    record.push(std::mem::take(&mut field));
-                    records.push(std::mem::take(&mut record));
-                    state = State::StartRecord;
-                    i += 1;
-                } else {
-                    field.push(c);
-                    state = State::InField;
-                    i += 1;
-                }
+                state = start_field(c, delimiter, &mut field, &mut record, &mut records);
             }
             State::InField => {
                 if c == delimiter {
                     record.push(std::mem::take(&mut field));
                     state = State::StartField;
-                    i += 1;
                 } else if is_term(c) {
                     record.push(std::mem::take(&mut field));
                     records.push(std::mem::take(&mut record));
                     state = State::StartRecord;
-                    i += 1;
                 } else {
                     field.push(c);
-                    i += 1;
                 }
             }
             State::InQuotedField => {
@@ -4268,26 +4318,21 @@ fn parse_csv(content: &str, delimiter: u8) -> Vec<Vec<String>> {
                 } else {
                     field.push(c);
                 }
-                i += 1;
             }
             State::InDoubleEscapedQuote => {
                 if c == '"' {
                     field.push('"');
                     state = State::InQuotedField;
-                    i += 1;
                 } else if c == delimiter {
                     record.push(std::mem::take(&mut field));
                     state = State::StartField;
-                    i += 1;
                 } else if is_term(c) {
                     record.push(std::mem::take(&mut field));
                     records.push(std::mem::take(&mut record));
                     state = State::StartRecord;
-                    i += 1;
                 } else {
                     field.push(c);
                     state = State::InField;
-                    i += 1;
                 }
             }
         }
@@ -4309,18 +4354,29 @@ fn columns_from_csv(
     skip_rows: usize,
 ) -> Result<Vec<ColumnInput>> {
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let records = parse_csv(&content, delimiter);
+    let mut records = parse_csv(&content, delimiter);
 
     // If the file has fewer than skip_rows+1 rows, there's no header to
     // read at all - headers stays empty and the loop below produces zero
     // columns, the same silent-empty-result behavior this function has
     // always had for that case (never an error - skip_rows past the end
-    // of a short file isn't itself a malformed-input signal).
-    let headers: Vec<String> = records.get(skip_rows).cloned().unwrap_or_default();
-    let data_rows: &[Vec<String>] = records.get(skip_rows + 1..).unwrap_or(&[]);
+    // of a short file isn't itself a malformed-input signal). Moved out
+    // (`mem::take`/`split_off`) rather than `.cloned()`/a borrowed slice -
+    // every cell in a real CSV used to get copied twice before reaching
+    // `ColumnInput` (once building `raw` from a borrowed `data_rows`, once
+    // more building `non_null` from `raw` itself); since nothing reads
+    // `records` again after this point, there's nothing to preserve by
+    // cloning instead of moving.
+    let headers: Vec<String> = if skip_rows < records.len() {
+        std::mem::take(&mut records[skip_rows])
+    } else {
+        Vec::new()
+    };
+    let split_at = (skip_rows + 1).min(records.len());
+    let data_rows: Vec<Vec<String>> = records.split_off(split_at);
 
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-    for (i, record) in data_rows.iter().enumerate() {
+    for (i, record) in data_rows.into_iter().enumerate() {
         if nrows.is_some_and(|limit| i >= limit) {
             break;
         }
@@ -4331,21 +4387,17 @@ fn columns_from_csv(
                 headers.len()
             );
         }
-        for (col_idx, field) in record.iter().enumerate() {
+        for (col_idx, field) in record.into_iter().enumerate() {
             let trimmed = field.trim();
-            let value = if trimmed.is_empty() || is_missing_sentinel(trimmed) {
-                None
-            } else {
-                Some(field.clone())
-            };
-            raw[col_idx].push(value);
+            let missing = trimmed.is_empty() || is_missing_sentinel(trimmed);
+            raw[col_idx].push(if missing { None } else { Some(field) });
         }
     }
 
     let mut columns = Vec::new();
-    for (col_idx, name) in headers.into_iter().enumerate() {
-        let total = raw[col_idx].len();
-        let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+    for (name, col_raw) in headers.into_iter().zip(raw) {
+        let total = col_raw.len();
+        let non_null: Vec<String> = col_raw.into_iter().flatten().collect();
         let current_type = if non_null.is_empty() {
             "String".to_string()
         } else {
@@ -11657,22 +11709,8 @@ fn profile_json_path(
     }];
 
     if !object_maps.is_empty() {
-        let mut order: Vec<String> = Vec::new();
-        let mut seen_keys = HashSet::new();
-        for m in &object_maps {
-            for k in m.keys() {
-                if seen_keys.insert(k.clone()) {
-                    order.push(k.clone());
-                }
-            }
-        }
         let child_total = object_maps.len();
-        for key in order {
-            let child_values: Vec<&JsonValue> = object_maps
-                .iter()
-                .filter_map(|m| m.get(&key))
-                .filter(|v| !v.is_null())
-                .collect();
+        for (key, child_values) in bucket_object_fields(object_maps.iter().copied()) {
             result.extend(profile_json_path(
                 format!("{name}.{key}"),
                 child_total,
@@ -11685,28 +11723,69 @@ fn profile_json_path(
     result
 }
 
+/// Groups every `(key, value)` pair across a set of objects by key,
+/// preserving first-seen key order, in a single pass over each object's
+/// own entries - shared by `profile_json_path` (a nested object's own
+/// fields) and `profile_json_records` (a file's top-level columns), the
+/// two places this project extracts named columns from a set of JSON
+/// objects. A naive "for each distinct key, re-scan every object via
+/// `Map::get`" loop costs `O(distinct_keys * objects * fields_per_object)`,
+/// since `Map` is a linear-scan `Vec` under the hood (see json_support's
+/// own doc comment on why) and that repeats an `O(fields)` scan once per
+/// already-seen key - roughly quadratic in field count rather than linear.
+/// A real, measured cost, not a theoretical one: nearly 2x slower at 300
+/// fields than this version, confirmed via this project's own `cargo
+/// bench` (see CLAUDE.md's Dependency footprint section).
+///
+/// A single `HashMap<&str, usize>` tracks *both* "have I seen this key
+/// before" and "which index in `order`/the returned buckets does it map
+/// to" - one hash lookup per `(object, field)` pair, not two. An earlier
+/// draft kept a separate `HashSet<String>` for key-order tracking
+/// alongside a second `HashMap` for value bucketing; on a real end-to-end
+/// benchmark of ordinary, narrow (six-field) JSON records, paying for
+/// *two* hash computations per field measurably regressed the common
+/// case (a linear scan over half a dozen short keys is genuinely cheaper
+/// than hashing them) even though it was a clear win on wide objects -
+/// found by re-running `cargo bench` after the fact rather than assumed
+/// safe, and fixed by merging the two hashmaps into one.
+///
+/// A key present but always null across every object still gets an
+/// entry here (with an empty bucket) - matching `profile_json_path`'s own
+/// "column is empty/all null" `ColumnProfile` for that case, rather than
+/// the column silently vanishing from the output because every value
+/// happened to be filtered out before the key was ever recorded.
+fn bucket_object_fields<'a>(
+    objects: impl IntoIterator<Item = &'a json_support::Map>,
+) -> Vec<(String, Vec<&'a JsonValue>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut key_index: HashMap<&str, usize> = HashMap::new();
+    let mut buckets: Vec<Vec<&JsonValue>> = Vec::new();
+    for m in objects {
+        for (k, v) in m.iter() {
+            let idx = *key_index.entry(k.as_str()).or_insert_with(|| {
+                order.push(k.clone());
+                buckets.push(Vec::new());
+                order.len() - 1
+            });
+            if !v.is_null() {
+                buckets[idx].push(v);
+            }
+        }
+    }
+    order.into_iter().zip(buckets).collect()
+}
+
 /// Shared by any format that decodes to a list of named-field records
 /// (JSON files today, Avro below) - extracts top-level columns in
 /// first-seen order and profiles each, recursing into nested content.
 fn profile_json_records(records: &[json_support::Map], n_samples: usize) -> Vec<ColumnProfile> {
     let total = records.len();
-    let mut order: Vec<String> = Vec::new();
-    let mut seen_keys = HashSet::new();
-    for rec in records {
-        for k in rec.keys() {
-            if seen_keys.insert(k.clone()) {
-                order.push(k.clone());
-            }
-        }
-    }
-
+    // Top-level column extraction for every JSON/JSONL file this tool
+    // reads (one of only two default, always-on formats) - see
+    // `bucket_object_fields`'s own doc comment for why this is a single
+    // pass rather than a per-key rescan.
     let mut out = Vec::new();
-    for name in order {
-        let values: Vec<&JsonValue> = records
-            .iter()
-            .filter_map(|r| r.get(&name))
-            .filter(|v| !v.is_null())
-            .collect();
+    for (name, values) in bucket_object_fields(records) {
         out.extend(profile_json_path(name, total, values, n_samples));
     }
     out
@@ -49125,6 +49204,88 @@ mod tests {
             .find(|c| c.name == "mixed_list.x")
             .expect("mixed_list.x column missing");
         assert_eq!(x.ideal_type, "i64");
+    }
+
+    /// `bucket_object_fields` (shared by `profile_json_path`'s own nested-
+    /// object recursion and `profile_json_records`'s top-level column
+    /// extraction - see its own doc comment for the performance history
+    /// behind why it exists) groups every object's fields by key in one
+    /// pass rather than one pass per key. Locks in the two things that
+    /// pass has to get right that a naive "for each key, rescan every
+    /// object" loop already got right by construction: first-seen key
+    /// order across objects with *different* key sets (not just
+    /// identical ones - `b` only appears starting from the second
+    /// object), and a key present but always null across every object
+    /// still producing a real (if empty) entry rather than silently
+    /// disappearing.
+    #[test]
+    fn bucket_object_fields_preserves_order_across_differing_keys_and_keeps_always_null_columns() {
+        let a = json!({"a": 1, "c": null});
+        let b = json!({"b": 2, "a": 3, "c": null});
+        let JsonValue::Object(oa) = &a else {
+            unreachable!()
+        };
+        let JsonValue::Object(ob) = &b else {
+            unreachable!()
+        };
+        let buckets = bucket_object_fields([oa, ob]);
+        let names: Vec<&str> = buckets.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["a", "c", "b"]);
+
+        let a_values = &buckets.iter().find(|(k, _)| k == "a").unwrap().1;
+        assert_eq!(a_values.len(), 2);
+        let c_values = &buckets.iter().find(|(k, _)| k == "c").unwrap().1;
+        assert!(
+            c_values.is_empty(),
+            "an always-null key should still get an entry, just with an empty bucket"
+        );
+        let b_values = &buckets.iter().find(|(k, _)| k == "b").unwrap().1;
+        assert_eq!(b_values.len(), 1);
+    }
+
+    /// The actual real-world finding this function exists to fix (see
+    /// CLAUDE.md's "Performance" section): a naive per-key rescan costs
+    /// `O(distinct_keys * objects * fields_per_object)`, which stays fast
+    /// enough to not notice at a handful of fields but gets measurably
+    /// worse as field count grows. This doesn't re-litigate the timing
+    /// (that's what `cargo bench` and BENCHMARKS.md are for, not a unit
+    /// test) - it proves correctness holds at a field count wide enough
+    /// that a regression back to the quadratic version would be a real,
+    /// user-visible problem, not just a micro-benchmark curiosity.
+    #[test]
+    fn bucket_object_fields_is_correct_on_a_wide_object() {
+        let objects: Vec<JsonValue> = (0..20)
+            .map(|row| {
+                let mut m = json_support::Map::new();
+                for field in 0..50 {
+                    m.insert(
+                        format!("f{field}"),
+                        JsonValue::from((row * 50 + field) as i64),
+                    );
+                }
+                JsonValue::Object(m)
+            })
+            .collect();
+        let maps: Vec<&json_support::Map> = objects
+            .iter()
+            .map(|v| match v {
+                JsonValue::Object(m) => m,
+                _ => unreachable!(),
+            })
+            .collect();
+        let buckets = bucket_object_fields(maps);
+        assert_eq!(buckets.len(), 50);
+        for (field, (name, values)) in buckets.iter().enumerate() {
+            assert_eq!(*name, format!("f{field}"));
+            assert_eq!(
+                values.len(),
+                20,
+                "field {name} should have one value per row"
+            );
+            for (row, v) in values.iter().enumerate() {
+                assert_eq!(**v, (row * 50 + field) as i64);
+            }
+        }
     }
 
     // xml_support's own recursive-descent parser carries an explicit depth
