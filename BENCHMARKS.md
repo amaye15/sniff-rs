@@ -33,6 +33,39 @@ re-run.
 
 ---
 
+## 2026-09-01 — `04ce309`+perf pass 10 (Darwin arm64, Apple M4)
+
+A tenth optimization pass, profiling Parquet's own nested-reconstruction
+engine (`decode_row_group_nested`/`ReaderNode`) on a real 500,000-row
+file with a struct and a list column. Found the single largest cost
+cluster of this entire series: `sip::Hasher::write` over 10% of *total*
+profiled samples, from `ReaderNode::Primitive` storing each leaf's full
+dotted schema path (`Vec<String>`) as the key into a
+`HashMap<Vec<String>, LeafCursor>`, re-hashed on every one of several
+per-leaf-per-row operations. Fixed by resolving each leaf's path to a
+plain `usize` index once, at tree-build time (via a small `leaf_index`
+map built once per row group), and replacing the `HashMap` with a plain
+`Vec<LeafCursor>` indexed directly - no hashing at read time at all.
+See CLAUDE.md's own "Performance" section for the full writeup.
+
+**Controlled alternating-binary comparison** (10 rounds, the same
+500,000-row nested Parquet file; an earlier noisy batch under severe,
+unrelated system contention was discarded):
+
+| Binary | Avg user time |
+|---|---|
+| Before this pass | 1.513s |
+| After this pass | 1.128s |
+
+A clean, reproducible **~25%** improvement, zero overlap between the
+two groups across every round - by a wide margin the largest single win
+of this optimization series, since this is a genuine algorithmic fix
+(removing a cost that scaled with rows × leaves × operations-per-leaf)
+rather than a cheaper-hasher swap. Byte-identical output confirmed via
+`diff` across all 19 committed Parquet fixtures in all three output
+formats, full test suite (including the Arrow-oracle comparison for
+this exact code path) passing, clippy/fmt clean.
+
 ## 2026-09-01 — `d9e82be`+perf pass 9 (Darwin arm64, Apple M4)
 
 A ninth optimization pass, moving from the shared CSV/JSON engine

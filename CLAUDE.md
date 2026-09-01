@@ -2827,6 +2827,70 @@ JSON-side findings than the eighth pass's own diluted CSV result, since
 columns) this synthetic table's own column mix skews more heavily
 toward the exact shape the bug needs to matter.
 
+A tenth pass moved to Parquet specifically, profiling a real nested
+file (a struct and a list column, 500,000 rows, generated with
+`pyarrow`) to check the hand-rolled reader's own Dremel record-assembly
+engine (`decode_row_group_nested`/`ReaderNode`, see the Architecture
+section's own Parquet writeup) rather than another per-value tally.
+This found the single largest cost cluster of any pass in this whole
+series: `sip::Hasher::write` alone was over 10% of *total* profiled
+samples (not just of this project's own code - ahead of every one of
+its own parsing/heuristic functions individually), traced to
+`ReaderNode::Primitive`'s own stored key: the leaf's full dotted schema
+path (`Vec<String>`, e.g. `["user", "profile", "email"]`), looked up in
+a `HashMap<Vec<String>, LeafCursor>` on *every* `has_next`/
+`current_def_level`/`current_rep_level`/`advance_columns`/`read_field`
+call - several times per leaf per row, for every row in a row group.
+Unlike the sixth/seventh/ninth passes' findings, this isn't primarily a
+"wrong hasher" problem: hashing a multi-segment `Vec<String>` means
+hashing every one of its strings, a meaningfully more expensive
+operation per call than hashing one short `&str`, repeated at a scale
+(rows × leaves × operations-per-leaf) none of this project's other
+per-value hash tallies reach.
+
+The real fix here isn't a faster hasher, it's removing the hash
+entirely: the set of leaf paths is fixed by the schema and fully known
+before a single row is read, so there's no reason to re-resolve a
+path to its cursor on every call at all. `ReaderNode::Primitive` now
+stores a plain `usize` (the leaf's position in `schema_leaves`'s own
+output) instead of its `Vec<String>` path; `build_reader_tree` resolves
+that index exactly once per leaf, at tree-build time, via a small
+`leaf_index: HashMap<Vec<String>, usize>` built once per row group (a
+one-time, schema-sized cost, not a per-row one); and `leaves` itself
+became a plain `Vec<LeafCursor>` indexed directly by that integer,
+replacing every `leaves[path]`/`leaves.get_mut(path)` call with
+`leaves[idx]` - no hashing, no probing, just a direct array index.
+Threading the new `leaf_index` parameter through `build_reader_tree`'s
+five recursive call sites (LIST/MAP/repeated-group/plain-group, each
+already covered by this reader's own reference-verified Dremel logic -
+see that function's own doc comment on why matching the reference
+step-for-step matters here specifically) was the only structural
+change needed; the tree-building and record-assembly algorithm itself
+is untouched.
+
+Verified with the same care its own reference-matching discipline
+already demands: the full test suite (`decode_row_group_nested_matches_
+arrow_on_real_fixtures`, the direct Arrow-oracle comparison for this
+exact code path, included) unchanged and passing, clippy/fmt clean,
+and byte-identical output confirmed via `diff` against the pre-fix
+binary across *every* committed Parquet fixture (all 19 - every
+compression codec, every encoding, both Map shapes, the non-string-key
+Map, the no-value Map, the no-annotation repeated group, the impala
+nullable-struct case) plus the large nested fixture this pass's own
+profiling used, in all three output formats. A controlled alternating-
+binary comparison (10 rounds on the same 500,000-row nested file, after
+an initial noisy batch under severe, unrelated system contention -
+`ps`/`uptime` showed a load average over 20 at one point, later
+confirmed to include another concurrent build of this same project -
+was discarded in favor of a later, cleaner window) showed a clean,
+reproducible **~25%** user-time improvement (avg 1.513s down to avg
+1.128s, zero overlap between the two groups across every round) - by a
+wide margin the single largest win of this entire optimization series,
+consistent with the mechanism: this fix removes a cost that scaled with
+rows × leaves × operations-per-leaf, not just rows, and Parquet's own
+nested reconstruction is exactly the code path in this project doing
+the most per-row work of any format reader.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

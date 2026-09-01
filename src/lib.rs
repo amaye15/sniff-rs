@@ -30875,12 +30875,22 @@ mod parquet_support {
     /// on purpose, since this reader has no need to *look up* a map value
     /// by key, only to type and profile whatever values a map contains.
     enum ReaderNode {
-        /// The leaf's own dotted schema path - looked up in the row
-        /// group's `leaves: &HashMap<Vec<String>, LeafCursor>` map on
-        /// every call, rather than holding a direct reference, since many
-        /// `ReaderNode`s are built once per row group but every row's
-        /// worth of reads needs its own mutable cursor state.
-        Primitive(Vec<String>),
+        /// The leaf's own index into the row group's `leaves: &[LeafCursor]`
+        /// slice (its position in `schema_leaves`'s own output) - looked
+        /// up on every call, rather than holding a direct reference,
+        /// since many `ReaderNode`s are built once per row group but
+        /// every row's worth of reads needs its own mutable cursor state.
+        /// A plain index rather than the leaf's own dotted path
+        /// (`Vec<String>`, this field's original type): the path is only
+        /// ever needed once, to resolve this index at tree-build time
+        /// (see `build_reader_tree`'s own `leaf_index` parameter) - per-
+        /// row lookups by a multi-segment string path, hashing every
+        /// segment on every single call, were a real, measured hot spot
+        /// (confirmed via `samply` profiling a real nested Parquet file:
+        /// `sip::Hasher::write` alone was over 10% of total samples,
+        /// the single largest cluster in the whole profile), and a fixed
+        /// integer index needs no hashing at all.
+        Primitive(usize),
         /// Wraps a reader whose value may be entirely absent at the
         /// current row - `i16` is the definition-level threshold *below*
         /// which the wrapped value counts as absent (`Null`).
@@ -30900,9 +30910,9 @@ mod parquet_support {
     }
 
     impl ReaderNode {
-        fn has_next(&self, leaves: &HashMap<Vec<String>, LeafCursor>) -> bool {
+        fn has_next(&self, leaves: &[LeafCursor]) -> bool {
             match self {
-                ReaderNode::Primitive(path) => leaves[path].has_next(),
+                ReaderNode::Primitive(idx) => leaves[*idx].has_next(),
                 ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
                     inner.has_next(leaves)
                 }
@@ -30910,9 +30920,9 @@ mod parquet_support {
             }
         }
 
-        fn current_def_level(&self, leaves: &HashMap<Vec<String>, LeafCursor>) -> i16 {
+        fn current_def_level(&self, leaves: &[LeafCursor]) -> i16 {
             match self {
-                ReaderNode::Primitive(path) => leaves[path].current_def_level(),
+                ReaderNode::Primitive(idx) => leaves[*idx].current_def_level(),
                 ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
                     inner.current_def_level(leaves)
                 }
@@ -30920,9 +30930,9 @@ mod parquet_support {
             }
         }
 
-        fn current_rep_level(&self, leaves: &HashMap<Vec<String>, LeafCursor>) -> i16 {
+        fn current_rep_level(&self, leaves: &[LeafCursor]) -> i16 {
             match self {
-                ReaderNode::Primitive(path) => leaves[path].current_rep_level(),
+                ReaderNode::Primitive(idx) => leaves[*idx].current_rep_level(),
                 ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
                     inner.current_rep_level(leaves)
                 }
@@ -30930,13 +30940,10 @@ mod parquet_support {
             }
         }
 
-        fn advance_columns(&self, leaves: &mut HashMap<Vec<String>, LeafCursor>) -> Result<()> {
+        fn advance_columns(&self, leaves: &mut [LeafCursor]) -> Result<()> {
             match self {
-                ReaderNode::Primitive(path) => {
-                    leaves
-                        .get_mut(path)
-                        .context("Parquet nested reader: leaf cursor missing")?
-                        .advance();
+                ReaderNode::Primitive(idx) => {
+                    leaves[*idx].advance();
                     Ok(())
                 }
                 ReaderNode::Option(_, inner) | ReaderNode::Repeated(_, _, inner) => {
@@ -30954,12 +30961,10 @@ mod parquet_support {
         /// Reads and advances past exactly one value at the current row
         /// position - the direct translation of the reference's own
         /// `Reader::read_field`.
-        fn read_field(&self, leaves: &mut HashMap<Vec<String>, LeafCursor>) -> Result<JsonValue> {
+        fn read_field(&self, leaves: &mut [LeafCursor]) -> Result<JsonValue> {
             match self {
-                ReaderNode::Primitive(path) => {
-                    let cursor = leaves
-                        .get_mut(path)
-                        .context("Parquet nested reader: leaf cursor missing")?;
+                ReaderNode::Primitive(idx) => {
+                    let cursor = &mut leaves[*idx];
                     if !cursor.has_next() {
                         bail!("unexpected end of Parquet column data");
                     }
@@ -31025,14 +31030,19 @@ mod parquet_support {
     /// match `collect_leaves`'s own path convention exactly (every
     /// intermediate group name included, LIST/MAP wrapper groups too -
     /// confirmed directly against that function, which pushes every
-    /// node's name uniformly with no special-casing for a wrapper group)
-    /// so `ReaderNode::Primitive`'s stored path is a valid key into the
-    /// leaves map built from `schema_leaves`.
+    /// node's name uniformly with no special-casing for a wrapper group),
+    /// since `leaf_index` (built by the caller from `schema_leaves`'s own
+    /// output, mapping each leaf's dotted path to its position) is what
+    /// resolves a `Primitive` leaf's stored path down to a plain `usize`,
+    /// looked up here once per leaf at tree-build time rather than once
+    /// per row at read time (see `ReaderNode::Primitive`'s own doc
+    /// comment for why that distinction is worth making).
     fn build_reader_tree(
         node: &SchemaNode,
         path: &mut Vec<String>,
         mut curr_def_level: i16,
         mut curr_rep_level: i16,
+        leaf_index: &HashMap<Vec<String>, usize>,
     ) -> Result<ReaderNode> {
         let repetition = node.repetition().unwrap_or(Repetition::Required);
         match repetition {
@@ -31047,7 +31057,10 @@ mod parquet_support {
 
         let reader = match node {
             SchemaNode::Primitive { .. } => {
-                let leaf = ReaderNode::Primitive(path.clone());
+                let idx = *leaf_index
+                    .get(path.as_slice())
+                    .context("Parquet nested reader: leaf cursor missing")?;
+                let leaf = ReaderNode::Primitive(idx);
                 if repetition == Repetition::Repeated {
                     ReaderNode::Repeated(curr_def_level - 1, curr_rep_level - 1, Box::new(leaf))
                 } else {
@@ -31083,8 +31096,13 @@ mod parquet_support {
                         );
                     }
                     path.push(wrapper.name().to_string());
-                    let child_reader =
-                        build_reader_tree(element, path, curr_def_level + 1, curr_rep_level + 1)?;
+                    let child_reader = build_reader_tree(
+                        element,
+                        path,
+                        curr_def_level + 1,
+                        curr_rep_level + 1,
+                        leaf_index,
+                    )?;
                     path.pop();
                     ReaderNode::Repeated(curr_def_level, curr_rep_level, Box::new(child_reader))
                 }
@@ -31122,6 +31140,7 @@ mod parquet_support {
                             path,
                             curr_def_level + 1,
                             curr_rep_level + 1,
+                            leaf_index,
                         )?
                     } else {
                         let mut field_readers = Vec::with_capacity(2);
@@ -31133,6 +31152,7 @@ mod parquet_support {
                                 path,
                                 curr_def_level + 1,
                                 curr_rep_level + 1,
+                                leaf_index,
                             )?;
                             field_readers.push((
                                 child.name().to_string(),
@@ -31157,8 +31177,13 @@ mod parquet_support {
                     let mut field_readers = Vec::with_capacity(children.len());
                     for child in children {
                         let child_repetition = child.repetition().unwrap_or(Repetition::Required);
-                        let reader =
-                            build_reader_tree(child, path, curr_def_level, curr_rep_level)?;
+                        let reader = build_reader_tree(
+                            child,
+                            path,
+                            curr_def_level,
+                            curr_rep_level,
+                            leaf_index,
+                        )?;
                         field_readers.push((child.name().to_string(), child_repetition, reader));
                     }
                     let synthetic_group = ReaderNode::Group(curr_def_level, field_readers);
@@ -31172,8 +31197,13 @@ mod parquet_support {
                     let mut field_readers = Vec::with_capacity(children.len());
                     for child in children {
                         let child_repetition = child.repetition().unwrap_or(Repetition::Required);
-                        let reader =
-                            build_reader_tree(child, path, curr_def_level, curr_rep_level)?;
+                        let reader = build_reader_tree(
+                            child,
+                            path,
+                            curr_def_level,
+                            curr_rep_level,
+                            leaf_index,
+                        )?;
                         field_readers.push((child.name().to_string(), child_repetition, reader));
                     }
                     ReaderNode::Group(curr_def_level, field_readers)
@@ -31220,11 +31250,21 @@ mod parquet_support {
         };
         let leaf_descriptors = schema_leaves(schema);
 
+        // Maps each leaf's dotted path to its position in `leaf_descriptors`
+        // - built once, up front, purely so `build_reader_tree` can resolve
+        // a `Primitive` leaf's path down to a plain `usize` at tree-build
+        // time (see `ReaderNode::Primitive`'s own doc comment for why this
+        // is a one-time cost rather than a per-row one).
+        let leaf_index: HashMap<Vec<String>, usize> = leaf_descriptors
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.path.clone(), i))
+            .collect();
+
         let mut top_level: Vec<(String, ReaderNode)> = Vec::with_capacity(root_fields.len());
-        let mut leaves: HashMap<Vec<String>, LeafCursor> = HashMap::new();
         for field in root_fields {
             let mut path = Vec::new();
-            let reader = build_reader_tree(field, &mut path, 0, 0)?;
+            let reader = build_reader_tree(field, &mut path, 0, 0, &leaf_index)?;
             top_level.push((field.name().to_string(), reader));
         }
 
@@ -31247,9 +31287,14 @@ mod parquet_support {
             let triples = decode_column_chunk_triples(file_data, chunk, descriptor)?;
             all_triples.push((descriptor.path.clone(), descriptor.max_def_level, triples));
         }
-        for (path, max_def_level, triples) in &all_triples {
-            leaves.insert(path.clone(), LeafCursor::new(triples, *max_def_level));
-        }
+        // Built in the exact same order `leaf_index` was (both iterate
+        // `leaf_descriptors` start to finish with nothing reordered in
+        // between), so `leaves[i]` is always the cursor `leaf_index`'s own
+        // index `i` promises it to be.
+        let mut leaves: Vec<LeafCursor> = all_triples
+            .iter()
+            .map(|(_, max_def_level, triples)| LeafCursor::new(triples, *max_def_level))
+            .collect();
 
         let num_rows =
             usize::try_from(row_group.num_rows).context("negative Parquet row group num_rows")?;
