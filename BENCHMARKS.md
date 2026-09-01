@@ -33,6 +33,45 @@ re-run.
 
 ---
 
+## 2026-09-01 — `fa0520e`+perf pass 11 (Darwin arm64, Apple M4)
+
+An eleventh optimization pass, after a sweep of Arrow IPC/Avro/
+MessagePack/ORC/flat-Parquet/boolean-dense-Parquet found nothing
+further (all already clean). Tested against a real downloaded dataset
+instead of synthetic data: the official NYC TLC yellow-taxi trip record
+for January 2024 (2,964,624 rows, 19 flat columns,
+`nyc.gov/site/tlc/about/tlc-trip-record-data.page`). Found
+`profile_parquet_file`'s own column-extraction step calling
+`Map::get` (a deliberate linear scan) once per `(row, column)` pair -
+O(rows * columns) calls to an O(columns) function, i.e. O(rows *
+columns^2) total - invisible on this project's own narrow fixtures.
+Fixed by inverting the loop: one pass over `rows`, distributing each
+row's own fields into per-column accumulators via an
+`HashMap<&str, usize, FxBuildHasher>` name-to-index lookup instead of
+a per-row full-object scan, bringing this back to O(rows * columns).
+See CLAUDE.md's own "Performance" section for the full writeup,
+including a real self-correction: an initial profiling snapshot
+overestimated this fix's impact by roughly 3x due to transient system
+noise at that specific measurement.
+
+**Controlled alternating-binary comparison**, three files chosen to
+isolate the columns^2 term directly:
+
+| File | Columns | Rows | Before (user) | After (user) | Improvement |
+|---|---|---|---|---|---|
+| Real NYC taxi data | 19 | 2,964,624 | avg 24.8s (3 rounds) | avg 22.3s (3 rounds) | ~10% |
+| Synthetic | 100 | 300,000 | 18.26s | 15.99s | ~12% |
+| Synthetic | 500 | 100,000 | avg 71.2s (2 rounds) | avg 43.5s (2 rounds) | ~39% |
+
+The improvement growing with column count, not staying flat, is the
+real confirmation this is a genuine complexity-class fix rather than a
+one-file fluke - it protects any wide real-world schema (feature
+tables, survey data, sensor telemetry) from a cost the 19-column real
+file only hinted at. Byte-identical output confirmed via `diff` across
+all 19 committed Parquet fixtures plus all four files above (real and
+synthetic) in every output format, full test suite passing, clippy/fmt
+clean.
+
 ## 2026-09-01 — `04ce309`+perf pass 10 (Darwin arm64, Apple M4)
 
 A tenth optimization pass, profiling Parquet's own nested-reconstruction

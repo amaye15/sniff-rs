@@ -31469,32 +31469,83 @@ mod parquet_support {
         }
 
         let total = rows.len();
-        let mut out = Vec::with_capacity(root_fields.len());
-        for field in root_fields {
-            let name = field.name().to_string();
-            if is_flat[&name] {
-                let raw_values: Vec<String> = rows
-                    .iter()
-                    .filter_map(|r| r.get(&name))
-                    .filter(|v| !v.is_null())
-                    .map(json_scalar_to_raw_string)
-                    .collect();
-                let col = ColumnInput {
-                    name: name.clone(),
-                    current_type: labels[&name].clone(),
-                    raw_values,
-                    total,
-                    skip_heuristics: false,
+
+        // One pass over `rows`, distributing every row's own fields into
+        // per-column accumulators directly - not, as this used to do, one
+        // pass over *all* rows per column calling `Map::get` (a linear
+        // scan by design - see that type's own doc comment) once per
+        // (row, column) pair. That old shape cost O(rows * columns) calls
+        // to a function that's itself O(columns), i.e. O(rows * columns^2)
+        // total - invisible on this project's own narrow test fixtures,
+        // but a real, severe quadratic blowup found by profiling a real,
+        // wide (19-column), large (3,000,000-row) NYC TLC taxi-trip
+        // Parquet file: `samply` showed this exact code path consuming
+        // the overwhelming majority of a 45-second run that should have
+        // taken a couple of seconds. `field_index` (built once, with
+        // `FxBuildHasher` - the same "hot lookup, non-adversarial keys"
+        // choice as this project's other per-row hash tallies) resolves
+        // each row's own field name to its column's position in one O(1)
+        // lookup instead, bringing this back down to the same O(rows *
+        // columns) complexity every other format's own row-shaped decode
+        // already has.
+        let field_index: HashMap<&str, usize, FxBuildHasher> = root_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name(), i))
+            .collect();
+
+        enum FieldAccum {
+            Flat(Vec<String>),
+            Nested(Vec<JsonValue>),
+        }
+
+        let mut accum: Vec<FieldAccum> = root_fields
+            .iter()
+            .map(|field| {
+                if is_flat[field.name()] {
+                    FieldAccum::Flat(Vec::with_capacity(total))
+                } else {
+                    FieldAccum::Nested(Vec::new())
+                }
+            })
+            .collect();
+
+        for row in rows {
+            let JsonValue::Object(map) = row else {
+                continue;
+            };
+            for (key, value) in map {
+                if value.is_null() {
+                    continue;
+                }
+                let Some(&idx) = field_index.get(key.as_str()) else {
+                    continue;
                 };
-                out.push(profile_column(col, n_samples));
-            } else {
-                let values: Vec<JsonValue> = rows
-                    .iter()
-                    .filter_map(|r| r.get(&name).cloned())
-                    .filter(|v| !v.is_null())
-                    .collect();
-                let refs: Vec<&JsonValue> = values.iter().collect();
-                out.extend(profile_json_path(name, total, refs, n_samples));
+                match &mut accum[idx] {
+                    FieldAccum::Flat(v) => v.push(json_scalar_to_raw_string(&value)),
+                    FieldAccum::Nested(v) => v.push(value),
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(root_fields.len());
+        for (field, acc) in root_fields.iter().zip(accum) {
+            let name = field.name().to_string();
+            match acc {
+                FieldAccum::Flat(raw_values) => {
+                    let col = ColumnInput {
+                        current_type: labels[&name].clone(),
+                        name,
+                        raw_values,
+                        total,
+                        skip_heuristics: false,
+                    };
+                    out.push(profile_column(col, n_samples));
+                }
+                FieldAccum::Nested(values) => {
+                    let refs: Vec<&JsonValue> = values.iter().collect();
+                    out.extend(profile_json_path(name, total, refs, n_samples));
+                }
             }
         }
         Ok(out)

@@ -2891,6 +2891,85 @@ rows × leaves × operations-per-leaf, not just rows, and Parquet's own
 nested reconstruction is exactly the code path in this project doing
 the most per-row work of any format reader.
 
+An eleventh pass followed a real, if inconclusive, sweep of the
+remaining nested-format readers (Arrow IPC, Avro, MessagePack, ORC, a
+flat Parquet schema, and a boolean-dense Parquet schema, each profiled
+directly on a purpose-built large file) that found nothing further -
+every one of them already benefits from the shared-engine fixes above,
+and none has an analogous hot loop of its own. Rather than force a
+speculative change on synthetic data with no profiler evidence behind
+it, this pass instead tried real-world data: the official NYC Taxi and
+Limousine Commission's own published trip-record Parquet files
+(`nyc.gov/site/tlc/about/tlc-trip-record-data.page`, a genuinely real,
+large, publicly downloadable dataset this project had never tested
+against before) - January 2024's yellow-taxi file, 2,964,624 rows, 19
+flat columns (timestamps, doubles, ints, one string).
+
+Profiling it surfaced a real, severe algorithmic problem no synthetic
+fixture in this project's own test suite had ever been wide *and* long
+enough to expose: `profile_parquet_file`'s own column-extraction step -
+run *after* `decode_row_group_nested` has already built one JSON object
+per row - looped once per column over *all* rows, calling
+`Map::get(&name)` on every row to pull that one column's value out. But
+`json_support::Map::get` is a deliberate linear scan (see that type's
+own doc comment: realistic object sizes don't need an indexed lookup) -
+fine for a single lookup, but calling it once per `(row, column)` pair
+means paying an O(columns) scan *per row per column*, i.e. O(rows *
+columns^2) total work for the whole extraction step. Invisible on this
+project's own committed fixtures (a handful of columns each), and only
+a modest fraction of total work on the 19-column taxi file itself, but
+a real, quadratic-in-column-count cost with no cap - exactly the shape
+of bug a narrow test suite can hide indefinitely and only a genuinely
+wide real file surfaces.
+
+Fixed by inverting the loop nesting: one pass over `rows`, distributing
+each row's own fields into per-column accumulators directly (an
+`enum FieldAccum { Flat(Vec<String>), Nested(Vec<JsonValue>) }` per
+column, matching the existing flat/nested split), with a
+`HashMap<&str, usize, FxBuildHasher>` (the same "hot lookup, non-
+adversarial keys" `FxHasher` choice as this project's other per-row
+hash tallies) resolving each row's own field name to its column's
+position in O(1) instead of an O(columns) scan. This brings the whole
+extraction step back down to the same O(rows * columns) complexity
+every other format's own row-shaped decode already has - a genuine
+complexity-class fix, not a constant-factor one.
+
+**This pass is also a worked example of this project's own "verify,
+don't assume" discipline catching *itself* being too optimistic, not
+just catching bugs.** A first `samply` profile of the unfixed binary
+attributed roughly a third of total samples to this exact code path (via
+an identical-code-folding-obscured symbol, resolved through its full
+call stack back to `profile_parquet_file`'s own extraction loop - the
+same ICF hazard this project's Performance section has flagged before),
+which read as a dramatic, single-file confirmation. Repeated, controlled
+timing on the *same* real file told a more honest story: the real,
+reproducible improvement there is a more modest **~10%** user-time
+reduction (three alternating rounds, before averaging ~24.8s user,
+after ~22.3s user) - the first profiling snapshot's magnitude was itself
+noise (later traced to transient system conditions at that specific
+moment, not reproduced across five further attempts). Taking the
+complexity argument at face value rather than stopping at one
+disappointing number, three more Parquet files (300,000 rows × 100
+columns, and 100,000 rows × 500 columns, both purely synthetic and
+built specifically to isolate the columns^2 term) confirmed the actual
+mechanism directly: the measured improvement grows with column count
+exactly as the complexity analysis predicts - ~12% at 100 columns,
+**~39%** at 500 columns (two rounds: 72.40s/70.02s before, 43.33s/43.57s
+after - consistent both times). The honest conclusion: this is a real,
+worthwhile, permanent fix - not because it happens to save a dramatic
+percentage on the one real file tested, but because it removes a
+genuine unbounded-scaling cost that protects any wide real-world schema
+(wide feature tables, survey data, sensor telemetry - all common,
+legitimately 50-500+-column shapes) from a cost this file's own modest
+19 columns only hinted at.
+
+Verified the same way as every pass before it: full test suite
+unchanged and passing, clippy/fmt clean, and byte-identical output
+confirmed via `diff` against the pre-fix binary across all 19 committed
+Parquet fixtures, the real taxi file, and all three synthetic stress
+files, in every output format - not just the file used to find and
+measure the bug.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no
