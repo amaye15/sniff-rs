@@ -1151,6 +1151,62 @@ fn yaml_handles_a_block_sequence_indented_the_same_as_its_own_key() {
     assert_eq!(port["ideal_type"], "i64");
 }
 
+// Locks in a real, severe O(n^2) bug found via real-world-scale testing
+// (a synthetic 60,000-record file with this exact shape took over 50
+// seconds before the fix, ~700x slower than after): `parse_inline_value`
+// (the hand-rolled YAML parser's own handling of `- key: value`, the
+// single most common real-world "array of objects" shape) used to build a
+// fresh `Vec` holding a full copy of every remaining line in the document
+// on every call - once per record. This fixture is small (correctness
+// only; the large-file timing evidence lives in CLAUDE.md/BENCHMARKS.md),
+// but exercises the exact code path the bug lived in.
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_inline_sequence_mapping_items_resolve_correctly() {
+    let doc = run_json("edge_yaml_inline_sequence_mapping.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_inline_sequence_mapping");
+    let id = column(cols, "id");
+    assert_eq!(id["ideal_type"], "i64");
+    let name = column(cols, "name");
+    assert_eq!(
+        name["sample_values"],
+        serde_json::json!(["alpha", "beta", "gamma"])
+    );
+    let active = column(cols, "active");
+    assert_eq!(active["ideal_type"], "bool");
+}
+
+// Locks in a second, independent O(n^2) bug found in the same real-world-
+// scale investigation as the inline-sequence-mapping fix above:
+// `parse_flow_from_lines` (an inline `[...]`/`{...}` flow collection, at
+// any nesting depth) used to join *every remaining line in the document*
+// into one string before attempting to parse anything, regardless of how
+// small the actual flow value was - a `tags: [a, b, c]` field closing on
+// its own line still paid for concatenating the entire rest of the file.
+// This is a genuinely separate bug from the inline-mapping one above (a
+// file with only plain scalar values never reaches this code path at
+// all), found only because a more realistic test file happened to nest a
+// flow collection inside an already-fixed inline-mapping record.
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_inline_flow_collections_resolve_correctly() {
+    let doc = run_json("edge_yaml_inline_flow_collection.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_inline_flow_collection");
+    let tags = column(cols, "tags");
+    assert_eq!(tags["current_type"], "Vec<String>");
+    assert_eq!(
+        tags["sample_values"],
+        serde_json::json!(["red", "green", "blue"])
+    );
+    let owner = column(cols, "meta.owner");
+    assert_eq!(
+        owner["sample_values"],
+        serde_json::json!(["alice", "bob", "carol"])
+    );
+    let priority = column(cols, "meta.priority");
+    assert_eq!(priority["ideal_type"], "i64");
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn excel_writer_silently_mangling_a_zip_code_gets_caught() {

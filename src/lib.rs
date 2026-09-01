@@ -38968,13 +38968,13 @@ mod yaml_support {
                 i += 1;
             }
             let mut pos = 0usize;
-            let value = parse_document(&doc_lines, &mut pos)?;
+            let value = parse_document(&mut doc_lines, &mut pos)?;
             docs.push(value);
         }
         Ok(docs)
     }
 
-    fn parse_document(lines: &[YLine], pos: &mut usize) -> Result<JsonValue> {
+    fn parse_document(lines: &mut [YLine], pos: &mut usize) -> Result<JsonValue> {
         skip_blank_and_comment_lines(lines, pos);
         if *pos >= lines.len() {
             return Ok(JsonValue::Null);
@@ -38994,13 +38994,13 @@ mod yaml_support {
     /// (what YAML's own multi-line-scalar rules actually measure against
     /// - see `parse_inline_value`, where the two are first split apart).
     fn parse_block_node(
-        lines: &[YLine],
+        lines: &mut [YLine],
         pos: &mut usize,
         indent: usize,
         parent_indent: usize,
     ) -> Result<JsonValue> {
         skip_blank_and_comment_lines(lines, pos);
-        let Some(line) = lines.get(*pos) else {
+        let Some(line) = lines.get(*pos).copied() else {
             return Ok(JsonValue::Null);
         };
         if line.indent < indent {
@@ -39040,31 +39040,57 @@ mod yaml_support {
     /// see `parse_block_node`'s own doc comment for why the two must
     /// stay separate). Returns the parsed value and how many *real*
     /// lines (starting at `at`) were consumed.
+    ///
+    /// A real, severe O(n^2) bug used to live here: this is called once
+    /// per inline sequence item/mapping value (`- key: value`/`key:
+    /// value`), i.e. once per record for the single most common real-
+    /// world "array of objects" YAML shape - and the old implementation
+    /// built a *fresh* `Vec` holding the synthetic line plus a full copy
+    /// of every remaining line in the document (`sub_lines.extend_from_
+    /// slice(&lines[at + 1..])`) on every single call. For a flat,
+    /// N-record top-level sequence, that's a copy whose size shrinks
+    /// linearly across N calls - O(N^2) total, invisible on this
+    /// project's own small fixtures (a few dozen lines) but severe on a
+    /// real-sized file: a synthetic 60,000-record file (3.4MB) took over
+    /// 50 seconds before this fix, most of it in page-fault-heavy
+    /// allocator syscalls from repeatedly growing large `Vec<YLine>`
+    /// buffers, not CPU-bound parsing work. `YLine` being `Copy` (and
+    /// its own `raw: &'a str` already borrowing the *original source
+    /// text*, not `lines` itself) makes the zero-copy fix straightforward:
+    /// overwrite `lines[at]` in place with the synthetic line, then
+    /// recurse on `&mut lines[at..]` - a plain re-slice, not a copy.
+    /// Position 0 of that re-slice is `lines[at]` (now holding the
+    /// synthetic content), and every later position is a genuine,
+    /// unmoved original line - identical semantics to the old `sub_lines`
+    /// Vec, just without ever materializing it.
     fn parse_inline_value<'a>(
-        lines: &[YLine<'a>],
+        lines: &mut [YLine<'a>],
         at: usize,
         inline: &'a str,
         value_col: usize,
         parent_indent: usize,
     ) -> Result<(JsonValue, usize)> {
-        let synthetic = YLine {
+        lines[at] = YLine {
             indent: value_col,
             raw: inline,
             num: lines[at].num,
         };
-        let mut sub_lines: Vec<YLine<'a>> = Vec::with_capacity(1 + lines.len() - at - 1);
-        sub_lines.push(synthetic);
-        sub_lines.extend_from_slice(&lines[at + 1..]);
         let mut sub_pos = 0usize;
-        let value = parse_block_node(&sub_lines, &mut sub_pos, value_col, parent_indent)?;
+        let value = parse_block_node(&mut lines[at..], &mut sub_pos, value_col, parent_indent)?;
         Ok((value, sub_pos.max(1)))
     }
 
-    fn parse_block_sequence(lines: &[YLine], pos: &mut usize, indent: usize) -> Result<JsonValue> {
+    fn parse_block_sequence(
+        lines: &mut [YLine],
+        pos: &mut usize,
+        indent: usize,
+    ) -> Result<JsonValue> {
         let mut items = Vec::new();
         loop {
             skip_blank_and_comment_lines(lines, pos);
-            let Some(line) = lines.get(*pos) else { break };
+            let Some(line) = lines.get(*pos).copied() else {
+                break;
+            };
             if line.indent != indent {
                 break;
             }
@@ -39079,8 +39105,8 @@ mod yaml_support {
             if after_dash.is_empty() {
                 *pos += 1;
                 skip_blank_and_comment_lines(lines, pos);
-                match lines.get(*pos) {
-                    Some(l) if is_nested_value_line(l, indent) => {
+                match lines.get(*pos).copied() {
+                    Some(l) if is_nested_value_line(&l, indent) => {
                         let child_indent = l.indent;
                         items.push(parse_block_node(lines, pos, child_indent, child_indent)?);
                     }
@@ -39096,11 +39122,17 @@ mod yaml_support {
         Ok(JsonValue::Array(items))
     }
 
-    fn parse_block_mapping(lines: &[YLine], pos: &mut usize, indent: usize) -> Result<JsonValue> {
+    fn parse_block_mapping(
+        lines: &mut [YLine],
+        pos: &mut usize,
+        indent: usize,
+    ) -> Result<JsonValue> {
         let mut map = json_support::Map::new();
         loop {
             skip_blank_and_comment_lines(lines, pos);
-            let Some(line) = lines.get(*pos) else { break };
+            let Some(line) = lines.get(*pos).copied() else {
+                break;
+            };
             if line.indent != indent {
                 break;
             }
@@ -39116,8 +39148,8 @@ mod yaml_support {
             if after_colon.is_empty() {
                 *pos += 1;
                 skip_blank_and_comment_lines(lines, pos);
-                match lines.get(*pos) {
-                    Some(l) if is_nested_value_line(l, indent) => {
+                match lines.get(*pos).copied() {
+                    Some(l) if is_nested_value_line(&l, indent) => {
                         let child_indent = l.indent;
                         let value = parse_block_node(lines, pos, child_indent, child_indent)?;
                         map.insert(key, value);
@@ -39282,26 +39314,65 @@ mod yaml_support {
         out
     }
 
-    /// Joins every remaining line in this document (raw, unstripped -
-    /// the flow parser below understands `#` comments itself) starting
-    /// at `*pos`, parses one flow value from the front of it, then
-    /// figures out how many whole lines that consumed by counting
-    /// newlines in the consumed prefix - flow collections aren't
-    /// indentation-sensitive, so they're free to span physical lines.
+    /// Joins as many lines starting at `*pos` as are actually needed to
+    /// close one balanced flow value (raw, unstripped - the flow parser
+    /// below understands `#` comments itself), then figures out how many
+    /// whole lines were consumed by counting newlines in the consumed
+    /// prefix - flow collections aren't indentation-sensitive, so they're
+    /// free to span physical lines.
+    ///
+    /// A real, severe O(n^2) bug used to live here too (a second,
+    /// independent instance of the same class of bug `parse_inline_value`
+    /// had - see that function's own doc comment): the old code eagerly
+    /// joined *every remaining line in the document* into one string
+    /// before ever attempting to parse anything, regardless of how small
+    /// the actual flow value was - a `tags: [a, b, c]` field closing on
+    /// its own line still paid for concatenating the entire rest of the
+    /// file, once per occurrence. Since this is called once per inline
+    /// flow value (a real, common shape - any inline `[...]`/`{...}`
+    /// anywhere in a document, at any nesting depth), a file with one
+    /// such field per record was quadratic in record count even after
+    /// `parse_inline_value`'s own fix. Fixed by growing `joined` one line
+    /// at a time and attempting `parse_flow_value` after each line -
+    /// every leaf of the flow grammar already reports "unterminated"/
+    /// "unexpected end of input" rather than silently succeeding on
+    /// truncated input (confirmed directly in `parse_flow_sequence`/
+    /// `parse_flow_mapping`'s own `None => bail!(...)` arms and the
+    /// quoted-string parsers), so retrying with one more line on any
+    /// parse failure is exactly equivalent to the old eager-join
+    /// behavior for a well-formed value - it just stops as soon as the
+    /// real closing bracket is found instead of continuing to scan the
+    /// rest of the file. A genuinely malformed/unterminated flow value
+    /// still falls all the way through to end-of-input and surfaces the
+    /// same real error message as before, at the same (much rarer,
+    /// error-path-only) cost.
     fn parse_flow_from_lines(lines: &[YLine], pos: &mut usize) -> Result<JsonValue> {
         let start = *pos;
         let mut joined = String::new();
-        for l in &lines[start..] {
+        let mut end = start;
+        loop {
+            let Some(l) = lines.get(end) else {
+                // Out of lines - one final attempt, so a genuinely
+                // malformed/unterminated value still surfaces its real
+                // error instead of looping forever.
+                let mut cursor = 0usize;
+                let value = parse_flow_value(&joined, &mut cursor)?;
+                let consumed_lines = joined[..cursor].matches('\n').count();
+                *pos = start + consumed_lines + 1;
+                return Ok(value);
+            };
             if !joined.is_empty() {
                 joined.push('\n');
             }
             joined.push_str(l.raw);
+            end += 1;
+            let mut cursor = 0usize;
+            if let Ok(value) = parse_flow_value(&joined, &mut cursor) {
+                let consumed_lines = joined[..cursor].matches('\n').count();
+                *pos = start + consumed_lines + 1;
+                return Ok(value);
+            }
         }
-        let mut cursor = 0usize;
-        let value = parse_flow_value(&joined, &mut cursor)?;
-        let consumed_lines = joined[..cursor].matches('\n').count();
-        *pos = start + consumed_lines + 1;
-        Ok(value)
     }
 
     fn skip_flow_ws(s: &str, cursor: &mut usize) {

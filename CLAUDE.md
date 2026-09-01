@@ -3231,6 +3231,112 @@ project until it was fixed in the same session, found by the same
 "test with a realistically-sized file, not just small fixtures"
 discipline this document's entire history is built on.
 
+A fifteenth pass moved from grep-driven hunting to direct measurement:
+rather than searching for another instance of an already-known bug
+shape, it profiled the hand-rolled YAML reader against a realistically-
+sized synthetic file (60,000 flat records, 3.4MB) and simply timed it -
+**56.72 seconds**, for a file this project's own committed fixtures
+(a few dozen lines each) would suggest should take a few milliseconds.
+`/usr/bin/time -l` showed 48.2 *billion* instructions retired for a
+20,000-record run of the same shape - three to four orders of magnitude
+more work than parsing 1.1MB of text should ever need - immediately
+ruling out "just slow" in favor of a real algorithmic blowup, the same
+diagnostic signal that motivated every complexity-class fix earlier in
+this document.
+
+Reading `yaml_support`'s own recursive-descent parser top to bottom
+(rather than trusting the profiler's own symbol attribution, which -
+per this project's own established caution about identical-code-
+folding - can mislead for heavily-generic/inlined code) found the real
+cause directly: `parse_inline_value` (the handler for `- key: value`/
+`key: value`, i.e. any inline sequence-item or mapping value - the
+single most common real-world YAML "array of objects" shape) built a
+**fresh `Vec` holding a full copy of every remaining line in the
+document** on every single call, in order to re-anchor the inline text
+as a synthetic line ahead of the genuine subsequent lines before
+recursing. Called once per record for a flat top-level sequence, this
+is a copy whose size shrinks linearly across N calls - textbook
+O(N^2), invisible on this project's own fixtures (a handful of lines)
+but severe at real scale. `YLine` already being `Copy`, with its own
+`raw: &'a str` field borrowing the *original source text* rather than
+the `lines` slice itself, made the zero-copy fix straightforward
+without changing what any single line actually contains: overwrite
+`lines[at]` in place with the synthetic content, then recurse on `&mut
+lines[at..]` - a plain re-slice, not a copy, with position 0 now
+*being* the (just-overwritten) original line and every later position
+a genuine, untouched original line - identical semantics to the old
+`sub_lines` Vec, just never materialized. This meant threading `&mut
+[YLine]` through the five functions in the recursive call chain
+(`parse_yaml_documents` -> `parse_document` -> `parse_block_node` ->
+`parse_block_sequence`/`parse_block_mapping` -> `parse_inline_value`)
+instead of `&[YLine]`; every other function in the module
+(`skip_blank_and_comment_lines`, `parse_scalar_or_flow`, `parse_block_
+scalar`, `parse_flow_from_lines`) never writes through `lines` and
+needed no signature change at all, relying on Rust's own implicit
+reborrow of a `&mut [T]` as `&[T]` at a call site expecting a shared
+reference. Every place that used to hold a `&YLine` reference into the
+slice (`let Some(line) = lines.get(*pos) ...`) was changed to `.get(*pos)
+.copied()` - a free operation since `YLine` is `Copy` - specifically so
+no shared borrow of `lines` could still be alive by the time a later
+statement in the same function needed to reborrow it mutably.
+
+Fixing this exposed - and, checked directly rather than assumed fixed
+by association, did *not* fully explain - a second, independent O(n^2)
+bug in the exact same family: a synthetic file mixing inline flow
+collections into otherwise-already-fixed inline-mapping records (a
+realistic shape: a nested `tags: [a, b, c]` field alongside plain
+scalar fields) still showed clearly quadratic scaling after the fix
+above (10,000 records: 1.40s; 20,000: 5.86s; 40,000: 24.01s - each
+doubling costing ~4x, not ~2x). `parse_flow_from_lines` (parsing an
+inline `[...]`/`{...}` flow collection, legal at any nesting depth, not
+just top-level) turned out to have the identical root shape as
+`parse_inline_value`'s own bug, just never touched by that fix: it
+eagerly joined *every remaining line in the document* into one string
+before attempting to parse anything at all, regardless of how small the
+actual flow value was - a `tags: [a, b, c]` value closing on its own
+line still paid for concatenating the entire rest of the file every
+time it appeared. Fixed by growing the joined buffer one line at a time
+and attempting `parse_flow_value` after each addition, stopping as soon
+as it succeeds - safe specifically because every leaf of the flow
+grammar (`parse_flow_sequence`/`parse_flow_mapping`'s own `None =>
+bail!(...)` arms, and the quoted-string parsers) already reports a
+clean "unterminated"/"unexpected end of input" error rather than
+silently succeeding on truncated text, confirmed by reading each one
+directly rather than assumed, so retrying with one more line on any
+parse failure is provably equivalent to the old eager-join behavior for
+a well-formed value - it just stops the instant the real closing
+bracket is found instead of continuing to scan the rest of the file
+regardless. A genuinely malformed/unterminated flow value still falls
+through to end-of-input and surfaces the identical error as before, at
+the same (much rarer, error-path-only) cost - this fix only removes
+wasted work from the common, well-formed case, the same asymmetry this
+project's error-path/happy-path tradeoffs have always favored elsewhere.
+
+**Measured on synthetic files** (both fixes together; two distinct real
+shapes, since each bug required the other's own fixture to isolate):
+
+- Flat records, `- id: N` / `name: word` / `score: 0.x` / `active:
+  bool` (no flow collections, isolating `parse_inline_value`'s own
+  fix): 60,000 records went from **56.72s to 0.08s** - a ~700x
+  speedup - with scaling now confirmed linear (30,000: 0.04s; 60,000:
+  0.08s, almost exactly 2x for 2x records).
+- Nested records with an inline flow sequence, a nested mapping, and a
+  literal block scalar per record (isolating `parse_flow_from_lines`'s
+  own fix on top of the first): 40,000 records went from 24.01s to
+  **0.10s** - a ~240x speedup - with the same confirmed-linear scaling
+  (10,000: 0.04s; 20,000: 0.05s; 40,000: 0.10s).
+
+Verified the same way as every pass before it: full test suite (311
+unit + 208 integration tests, two new) unchanged and passing, clippy/
+fmt clean on both builds, and byte-identical output confirmed via
+`diff` against the pre-fix binary across every committed `.yaml`
+fixture plus all five synthetic stress files used to find and measure
+both bugs. `tests/fixtures/edge_yaml_inline_sequence_mapping.yaml` and
+`edge_yaml_inline_flow_collection.yaml` (both small, hand-authored -
+correctness fixtures, not performance ones; the large-file timing
+evidence above doesn't need to be a committed, `cargo test`-run
+artifact) lock in both fixes as permanent regression tests.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

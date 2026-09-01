@@ -33,6 +33,47 @@ re-run.
 
 ---
 
+## 2026-09-01 — `4d13917`+perf pass 15 (Darwin arm64, Apple M4)
+
+A fifteenth pass switched from grep-driven hunting to direct
+measurement: profiled the hand-rolled YAML reader against a
+realistically-sized synthetic file and just timed it, rather than
+searching for another instance of an already-known bug shape. Found
+two independent, severe O(n^2) bugs in `yaml_support`'s recursive-
+descent parser - see CLAUDE.md's own "Performance" section for the
+full root-cause writeup of both. `parse_inline_value` (handling `-
+key: value`/`key: value`, the single most common real-world "array of
+objects" shape) built a fresh `Vec` copying every remaining line in
+the document on every call; `parse_flow_from_lines` (an inline
+`[...]`/`{...}` flow collection at any nesting depth) eagerly joined
+every remaining line into one string before attempting to parse
+anything, regardless of how small the actual value was. Fixed by
+threading `&mut [YLine]` through the recursive call chain so
+`parse_inline_value` can overwrite one line in place and re-slice
+instead of copying, and by growing `parse_flow_from_lines`'s joined
+buffer one line at a time, stopping as soon as the flow value parses
+successfully.
+
+**Controlled alternating-binary comparison** (synthetic files, since
+both bugs needed a shape this project's own small committed fixtures
+never had reason to reach):
+
+| File | Before | After | Change |
+|---|---|---|---|
+| Flat records, 30,000 rows | 6.17s user | 0.04s | **~150x faster** |
+| Flat records, 60,000 rows | n/a (56.72s real) | 0.08s | **~700x faster** |
+| Nested + flow collection, 20,000 rows | 5.86s user | 0.05s | **~117x faster** |
+| Nested + flow collection, 40,000 rows | 24.01s user | 0.10s | **~240x faster** |
+
+Scaling is now confirmed linear at every size tested for both shapes
+(2x rows -> ~2x time), replacing what was clearly superlinear before
+(2x rows -> 4-9x time, worsening at larger sizes - the signature of a
+real algorithmic blowup, not just a slow constant factor). Byte-
+identical output confirmed via `diff` against the pre-fix binary
+across every committed `.yaml` fixture plus five synthetic stress
+files, full test suite (311 unit + 208 integration tests, two new)
+passing, clippy/fmt clean on both builds.
+
 ## 2026-09-01 — `2e58031`+perf pass 14 (Darwin arm64, Apple M4)
 
 A fourteenth pass, following up on pass 13's own dBase finding with a
