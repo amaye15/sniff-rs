@@ -33,6 +33,44 @@ re-run.
 
 ---
 
+## 2026-09-01 — `b416688`+perf pass 16 (Darwin arm64, Apple M4)
+
+A sixteenth pass followed up pass 15's YAML fixes by checking the
+project's other two hand-rolled text parsers (TOML, XML) against
+equally realistic synthetic files - both clean (40,000-record TOML at
+0.06s, 40,000-record XML at 0.13s, genuinely linear). A large-scale INI
+file did surface a third real bug, this time in shared JSON-rendering
+code rather than a format-specific reader: `render_json`/`render_json_
+schema` built the top-level output's own `tables` object with one
+`Map::insert` call per table while iterating a `BTreeMap` (whose keys
+are already guaranteed unique) - `Map::insert`'s own existing-key
+linear scan made this O(tables^2) for information the `BTreeMap`
+itself had already proven unnecessary. See CLAUDE.md's own
+"Performance" section for the full write-up, including the profiler
+numbers (`Map::insert` alone was 31.3% of self-time on an 80,000-
+section file). Fixed by adding `Map::push_unique` - an unconditional
+append with no existing-key scan, reserved for call sites that already
+know the key is new - and switching both render functions' per-table
+loops to it.
+
+**Controlled alternating-binary comparison** (synthetic INI files, since
+INI's own one-section-per-table convention is what makes a real file
+with tens of thousands of tables realistic):
+
+| File | Before | After | Change |
+|---|---|---|---|
+| 10,000 sections | n/a | 0.07s | - |
+| 20,000 sections | 0.31s | 0.12s | **-61%** |
+| 80,000 sections | 5.07s | 0.47s | **~10.8x faster** |
+
+Scaling is now linear (roughly proportional to section count at every
+size), replacing clearly quadratic growth before (20,000 -> 80,000, a
+4x input increase, cost 16.4x more time). Byte-identical output
+confirmed via `diff` against the pre-fix binary across every committed
+INI/SQLite/`.npz`/spreadsheet fixture (every multi-table format) in
+both `json` and `json-schema` output, full test suite (312 unit + 208
+integration tests, one new) passing, clippy/fmt clean.
+
 ## 2026-09-01 — `4d13917`+perf pass 15 (Darwin arm64, Apple M4)
 
 A fifteenth pass switched from grep-driven hunting to direct

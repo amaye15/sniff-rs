@@ -3337,6 +3337,67 @@ correctness fixtures, not performance ones; the large-file timing
 evidence above doesn't need to be a committed, `cargo test`-run
 artifact) lock in both fixes as permanent regression tests.
 
+Having just found two severe bugs in one hand-rolled recursive-descent
+parser this way, the same pass checked the *other* two hand-rolled
+text parsers with a similar shape (TOML, XML) against equally
+realistically-sized synthetic files, specifically to see whether either
+shared an analogous mistake rather than assuming a clean bill of
+health from the YAML finding alone. Both were clean: a 40,000-record
+TOML array-of-tables file profiled at 0.06s, and a 40,000-record XML
+file (homogeneous `<item>` siblings under one root) at 0.13s - both
+genuinely linear, no further fix needed.
+
+A large-scale INI file (tens of thousands of sections - each becoming
+its own table, per this project's own documented one-section-per-table
+convention) did surface one more real bug, though - not in `ini_
+support`'s own parsing (already confirmed fast), but in `render_json`/
+`render_json_schema`'s shared final-assembly step. Both build the
+top-level JSON output's own `tables` object with one `Map::insert` call
+per table while iterating a `BTreeMap<String, Vec<ColumnProfile>>` -
+whose keys are already guaranteed unique by construction, since a
+`BTreeMap` cannot hold two entries under the same key in the first
+place. But `Map::insert` unconditionally does its own existing-key
+linear scan before ever appending (see its own doc comment - the
+correct, necessary behavior for `Map`'s documented "at most one entry
+per key, overwrite in place" contract when a genuine duplicate is
+actually possible), so this cost O(tables) work per table inserted -
+O(tables^2) total for information the `BTreeMap` itself had already
+proven wasn't needed. Profiling an 80,000-section synthetic INI file
+confirmed `Map::insert` alone was 31.3% of total self-time, with
+another 12.2% in the `memcmp` its own key comparison calls - both
+disappearing entirely from a re-profile after the fix.
+
+Fixed by adding `Map::push_unique` - a plain, unconditional append with
+no existing-key scan at all, reserved specifically for call sites that
+already know the key can't be present (documented on the method itself
+as unsafe to use otherwise, since it would silently create a genuine
+duplicate entry, the exact invariant `insert`'s own scan exists to
+protect). `render_json`'s `tables_obj.insert(table_name.clone(), ...)`
+and `render_json_schema`'s `table_schemas.insert(table_name.clone(),
+...)` - both iterating the same guaranteed-unique `BTreeMap` - are the
+two calls switched over; `render_json_schema`'s own inner `properties`
+Map (one entry per *column*, not per table - bounded by a table's own
+column count, not by how many tables a file has, so nowhere near the
+same severity) was left using `insert`, plus both functions' `Map::
+with_capacity` calls were sized to their now-known final length instead
+of growing via repeated reallocation.
+
+**Measured on the same synthetic INI files** (`ini_support`'s own
+parsing already confirmed clean, isolating this fix to the render step):
+80,000 sections went from 5.07s to **0.47s** - a **~10.8x** speedup -
+with scaling now confirmed linear (10,000: 0.07s; 20,000: 0.12s;
+80,000: 0.47s, each roughly proportional to section count) in place of
+the clearly quadratic growth before (20,000 -> 80,000, a 4x input
+increase, cost 16.4x more time). Verified the same way as every pass
+before it: full test suite (312 unit + 208 integration tests, one new)
+unchanged and passing, clippy/fmt clean on both builds, and byte-
+identical output confirmed via `diff` against the pre-fix binary across
+every committed INI/SQLite/`.npz`/spreadsheet fixture (every format
+that produces more than one table) in both `json` and `json-schema`
+output formats, not just INI's own fixtures - since `push_unique` is
+shared final-assembly code every multi-table format's output already
+passes through.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no
