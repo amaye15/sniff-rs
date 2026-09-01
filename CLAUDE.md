@@ -2970,6 +2970,60 @@ Parquet fixtures, the real taxi file, and all three synthetic stress
 files, in every output format - not just the file used to find and
 measure the bug.
 
+A twelfth pass extended the same real dataset to every other format
+this tool can encode it as, specifically to find out whether the
+Parquet reader's own bug had a sibling anywhere else - the same real
+NYC taxi trip data (2,964,624 rows, 19 columns), re-encoded via
+`pyarrow`/`pandas` into a genuine CSV (321 MB), a genuine JSONL (1
+million rows, the full 19 fields per record - kept to a subset purely
+for file size, still fully real content), a genuine SQLite database
+(via `pandas.DataFrame.to_sql`), and a genuine XLSX (capped at 500,000
+rows, Excel's own hard row limit) - not synthetic restatements of the
+schema, the *actual* values (real fares, real timestamps, real
+passenger counts) run through each format's own real writer.
+
+CSV, JSON, and SQLite all checked out clean - profiling each showed no
+hash-related, quadratic, or otherwise anomalous cost; each scaled
+consistent with this project's own already-optimized expectations (CSV
+in particular matched a direct extrapolation from an earlier synthetic
+benchmark to within a few percent, confirming the earlier synthetic
+work was already representative for this path). SQLite in particular
+was confirmed architecturally immune to the Parquet-shaped bug by
+construction: its own row-decoding loop (`profile_table` in
+`sqlite_support`) already indexes each row's own positional value list
+directly (`values.get(i)`, an O(1) array index by position) rather than
+searching for a column by name the way Parquet's old code did - there
+was never a `Map`-shaped lookup in that path to begin with.
+
+Excel was the one exception, and a smaller, different one than
+Parquet's: `columns_from_xlsx_ooxml`'s own row-distribution loop
+(shared, in the same shape, across all four spreadsheet variants -
+`.xlsx`/`.xls`/`.xlsb`/`.ods` each have their own copy) cloned every
+cell's `String` value out of `row.get(col_idx)` even though `row` -
+already moved out of the parsed sheet's own `Vec<Vec<Option<String>>>`
+via `.into_iter()` - was fully owned and could have moved the value
+directly instead. Not the same O(columns) blowup Parquet had (indexing
+by position here is already O(1), not a linear name search), just an
+avoidable allocation on every cell of every row. Fixed by `resize`-ing
+each row to the declared header count first (preserving the exact
+short-row-pads-with-`None`/long-row-gets-truncated behavior the old
+`.get(col_idx)` fallback already had) and then moving cells directly
+via `zip` instead of cloning them.
+
+Verified the same way as every pass before it: full test suite
+(including all six of this project's own `*_matches_calamine_output_
+exactly` oracle-comparison tests, since this touches all four
+spreadsheet-format readers at once) unchanged and passing, clippy/fmt
+clean, and byte-identical output confirmed via `diff` against the
+pre-fix binary across all 19 committed spreadsheet fixtures (spanning
+all four variants) plus the real taxi `.xlsx` file, in every output
+format. A controlled alternating-binary comparison on the real file (2
+rounds) showed a small, consistent, reproducible **~3.3%** user-time
+improvement (avg 21.28s down to avg 20.57s) - real, but honestly a
+constant-factor cleanup rather than a complexity-class fix, and
+reported at that more modest scale rather than overstated to match
+Parquet's own much larger win.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

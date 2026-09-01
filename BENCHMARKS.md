@@ -33,6 +33,43 @@ re-run.
 
 ---
 
+## 2026-09-01 — `644679d`+perf pass 12 (Darwin arm64, Apple M4)
+
+A twelfth optimization pass, extending pass 11's real NYC taxi dataset
+to every other format it could be re-encoded into (via `pyarrow`/
+`pandas`, real values throughout, not synthetic restatements): a
+genuine CSV (321 MB), JSONL (1M rows, real content), SQLite database,
+and XLSX (500,000 rows, well under Excel's own 1,048,576-row ceiling,
+kept smaller purely for file size). See CLAUDE.md's own "Performance"
+section for the full writeup.
+
+CSV, JSON, and SQLite all profiled clean - no hash-related or
+quadratic anomalies, each scaling consistent with this project's own
+already-optimized expectations. SQLite in particular is architecturally
+immune to Parquet's own bug by construction (its row-decode already
+indexes by position, `O(1)`, never by name). Excel was the one
+exception: `columns_from_xlsx_ooxml`'s row-distribution loop (shared
+across all four spreadsheet variants) cloned every cell's `String` even
+though the source row was already fully owned and movable. Fixed via
+`resize` + `zip` instead of `.get(col_idx).cloned()`.
+
+**Controlled alternating-binary comparison** (2 rounds, the real
+500,000-row taxi `.xlsx` file):
+
+| Binary | Round 1 (user) | Round 2 (user) |
+|---|---|---|
+| Before this pass | 21.25s | 21.31s |
+| After this pass | 20.60s | 20.54s |
+
+A small, consistent, reproducible **~3.3%** improvement (avg 21.28s ->
+avg 20.57s) - a real constant-factor cleanup, not a complexity-class
+fix like pass 11's Parquet finding, and reported at that honest, more
+modest scale. Byte-identical output confirmed via `diff` across all 19
+committed spreadsheet fixtures (all four variants) plus the real
+`.xlsx` file in every output format, full test suite (including all
+six `*_matches_calamine_output_exactly` oracle tests) passing, clippy/
+fmt clean.
+
 ## 2026-09-01 — `fa0520e`+perf pass 11 (Darwin arm64, Apple M4)
 
 An eleventh optimization pass, after a sweep of Arrow IPC/Avro/
