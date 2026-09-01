@@ -33,6 +33,71 @@ re-run.
 
 ---
 
+## 2026-09-01 — `dcb349c`+perf pass 13 (Darwin arm64, Apple M4)
+
+A thirteenth pass, started from a source-level sweep of every `.clone()`
+call site in `src/lib.rs` (131 at the start) rather than a profiler run
+- sorted into genuinely-needed (a shared lookup table, a `#[cfg(test)]`
+oracle function) versus avoidable (cloned only because the owner was
+borrowed rather than moved, with nothing left to preserve afterward).
+See CLAUDE.md's own "Performance" section for the full writeup,
+including the dBase HashMap-removal finding and the XLSX text-ownership
+rewrite's own honest (mostly negative) measurement.
+
+Three fixes: (1) the `raw[i].iter().filter_map(|v| v.clone()).collect()`
+pattern - already fixed once for `columns_from_csv` in an earlier pass,
+but never carried over - repeated identically across nine more flat
+readers (fixed-width, weblog, syslog, SAS7BDAT, SQLite's `profile_table`,
+and all four spreadsheet readers), fixed via `std::mem::take(&mut
+raw[i]).into_iter().flatten().collect()` in each. (2) `columns_from_
+dbase` decoded every record into its own `HashMap<String, Value>`,
+cloning each field's name into the map key on every row, then re-looked-
+up every column by name across every row afterward - the same O(rows *
+columns) antipattern Parquet's and JSON's own readers were already fixed
+for in earlier passes. Replaced with positional `Vec<Vec<Option<
+String>>>` accumulation during the same decode pass, using the field
+table's own fixed order instead of hashing a name on every cell. (3)
+`xlsx_parse_sheet`/`xlsx_parse_shared_strings` cloned every cell's/
+shared-string-table-entry's text out of a parsed `XmlElement` tree
+that's never read again afterward - fixed by adding `into_child`/
+`into_children_named` (consuming counterparts of the existing borrowing
+`child`/`children_named`) and walking the tree by value.
+
+**dBase, controlled alternating-binary comparison** (synthetic files via
+the `dbf` Python package, since this project has no DBF writer):
+
+| File | Before (avg user) | After (avg user) | Change |
+|---|---|---|---|
+| 100,000 rows x 20 cols (5 rounds) | 0.738s | 0.248s | **-66.4%** |
+| 30,000 rows x 60 cols (3 rounds) | 0.597s | 0.190s | **-68.2%** |
+
+A clean, reproducible ~3x speedup at two different row/column ratios -
+a real complexity-class fix, not a one-file coincidence, confirmed the
+same way the Parquet column-extraction fix's own scaling was confirmed.
+
+**XLSX, controlled alternating-binary comparison** (synthetic files via
+`openpyxl`):
+
+| File | Before (avg user) | After (avg user) | Change |
+|---|---|---|---|
+| 150,000 rows x 12 cols, short values (6 rounds) | 4.232s | 4.260s | no measurable difference |
+| 60,000 rows x 8 cols, long text values (4 rounds) | 1.390s | 1.360s | **~2.2%**, after faster in every round |
+
+Kept despite the first file showing no win (profiling traced the
+dominant cost to XML-tree construction and DEFLATE decompression, which
+this fix doesn't touch) - the second file confirms a real, if modest,
+mechanism-consistent improvement (a clone's cost scales with string
+length; the fixed per-cell parsing overhead this fix doesn't touch
+doesn't), and the fix adds no meaningful complexity, so it clears this
+project's own "earn its place" bar without needing a dramatic number.
+
+Verified the same way as every pass before it: full test suite (206
+`--features full` integration tests, every oracle-comparison test
+touching an affected reader) unchanged and passing, clippy/fmt clean on
+both builds, byte-identical output confirmed via `diff` against the
+pre-fix binary across every committed CSV/dBase/Stata/SQLite/XLSX/ODS/
+XLS/XLSB/log fixture plus all four synthetic stress files.
+
 ## 2026-09-01 — `644679d`+perf pass 12 (Darwin arm64, Apple M4)
 
 A twelfth optimization pass, extending pass 11's real NYC taxi dataset

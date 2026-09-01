@@ -4801,7 +4801,10 @@ fn columns_from_fixed_width(
     let mut columns = Vec::new();
     for (col_idx, name) in headers.into_iter().enumerate() {
         let total = raw[col_idx].len();
-        let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+        let non_null: Vec<String> = std::mem::take(&mut raw[col_idx])
+            .into_iter()
+            .flatten()
+            .collect();
         let current_type = if non_null.is_empty() {
             "String".to_string()
         } else {
@@ -5049,7 +5052,10 @@ mod weblog_support {
 
         let mut columns = Vec::new();
         for (col_idx, name) in names.into_iter().enumerate() {
-            let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+            let non_null: Vec<String> = std::mem::take(&mut raw[col_idx])
+                .into_iter()
+                .flatten()
+                .collect();
             let current_type = if non_null.is_empty() {
                 "String".to_string()
             } else {
@@ -5512,7 +5518,10 @@ mod syslog_support {
 
         let mut columns = Vec::new();
         for (col_idx, name) in names.into_iter().enumerate() {
-            let non_null: Vec<String> = raw[col_idx].iter().filter_map(|v| v.clone()).collect();
+            let non_null: Vec<String> = std::mem::take(&mut raw[col_idx])
+                .into_iter()
+                .flatten()
+                .collect();
             let current_type = if non_null.is_empty() {
                 "String".to_string()
             } else {
@@ -5564,7 +5573,6 @@ fn columns_from_syslog(
 #[cfg(feature = "dbase")]
 mod dbase_support {
     use super::*;
-    use std::collections::HashMap;
     use std::fs::File;
     use std::io::{BufReader, Read, Seek, SeekFrom};
 
@@ -6009,9 +6017,25 @@ mod dbase_support {
         // `open_dbase`'s own `record_size` recomputation exactly.
         let record_data_len: usize = fields.iter().map(|f| f.field_length as usize).sum();
 
-        let mut records: Vec<HashMap<String, Value>> = Vec::new();
+        // One `Vec<Option<String>>` accumulator per field, filled
+        // positionally as each record is decoded - not one `HashMap<String,
+        // Value>` per row keyed by field name. The HashMap shape used to
+        // clone every field's name once per row just to build the map key
+        // (`f.name.clone()`), then re-hash that same name once per row per
+        // *column* in the profiling pass below (`records.iter().filter_map(
+        // |r| r.get(&f.name)...)`) - genuinely O(rows * columns) string
+        // clones and hash lookups for information the field table already
+        // gives for free, since `fields` is a fixed-order list decided once
+        // up front. This is the exact same class of fix already applied to
+        // Parquet's own `profile_parquet_file` and JSON's
+        // `bucket_object_fields` (see CLAUDE.md's Performance section) -
+        // positional indexing instead of a per-row name lookup.
+        let n_fields = fields.len();
+        let mut raw: Vec<Vec<Option<String>>> =
+            vec![Vec::with_capacity(header.num_records as usize); n_fields];
         let mut deletion_flag = [0u8; 1];
         let mut record_buf = vec![0u8; record_data_len];
+        let mut total = 0usize;
         for _ in 0..header.num_records {
             r.read_exact(&mut deletion_flag)
                 .context("failed reading a dBase record's deletion flag")?;
@@ -6023,30 +6047,36 @@ mod dbase_support {
             r.read_exact(&mut record_buf)
                 .context("failed reading a dBase record")?;
 
-            let mut map = HashMap::with_capacity(fields.len());
             let mut pos = 0usize;
-            for f in &fields {
+            for (col_idx, f) in fields.iter().enumerate() {
                 let field_bytes = &record_buf[pos..pos + f.field_length as usize];
                 pos += f.field_length as usize;
                 let value = read_field_value(f, field_bytes, text_mode)?;
-                map.insert(f.name.clone(), value);
+                raw[col_idx].push(value_to_string(&value));
             }
-            records.push(map);
+            total += 1;
         }
+        // Matches the old `records.truncate(n)`'s own behavior exactly:
+        // every non-deleted record is still read and decoded regardless of
+        // `nrows` (so a malformed record past the cutoff still surfaces as
+        // an error, same as before), only the *kept* representation is
+        // capped.
         if let Some(n) = nrows {
-            records.truncate(n);
+            total = total.min(n);
+            for col in &mut raw {
+                col.truncate(n);
+            }
         }
-        let total = records.len();
 
         let mut columns = Vec::new();
-        for f in &fields {
-            let raw_values: Vec<String> = records
-                .iter()
-                .filter_map(|r| r.get(&f.name).and_then(value_to_string))
+        for (col_idx, f) in fields.into_iter().enumerate() {
+            let raw_values: Vec<String> = std::mem::take(&mut raw[col_idx])
+                .into_iter()
+                .flatten()
                 .collect();
             columns.push(profile_column(
                 ColumnInput {
-                    name: f.name.clone(),
+                    name: f.name,
                     current_type: field_type_label(f.field_type).to_string(),
                     raw_values,
                     total,
@@ -8448,12 +8478,13 @@ mod sas7bdat_support {
 
         let mut profiles = Vec::new();
         for (i, name) in names.into_iter().enumerate() {
-            let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+            let total = raw[i].len();
+            let non_null: Vec<String> = std::mem::take(&mut raw[i]).into_iter().flatten().collect();
             let col = ColumnInput {
                 name,
                 current_type: logical_type_label(logical_types[i]).to_string(),
                 raw_values: non_null,
-                total: raw[i].len(),
+                total,
                 skip_heuristics: false,
             };
             profiles.push(profile_column(col, n_samples));
@@ -43007,7 +43038,8 @@ mod sqlite_support {
 
         let mut profiles = Vec::new();
         for (i, name) in parsed.columns.into_iter().enumerate() {
-            let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+            let total = raw[i].len();
+            let non_null: Vec<String> = std::mem::take(&mut raw[i]).into_iter().flatten().collect();
             let current_type = if kind_counts[i].is_empty() {
                 "null".to_string()
             } else {
@@ -43017,7 +43049,7 @@ mod sqlite_support {
                 name,
                 current_type,
                 raw_values: non_null,
-                total: raw[i].len(),
+                total,
                 skip_heuristics: false,
             };
             profiles.push(profile_column(col, n_samples));
@@ -44391,6 +44423,29 @@ mod xlsx_support {
         ) -> impl Iterator<Item = &'a XmlElement> {
             self.children.iter().filter(move |c| c.name == name)
         }
+
+        /// Moves a matching child out of `self` instead of cloning its
+        /// `text`/sub-tree - the reader's own tree (`root`, built fresh per
+        /// sheet/shared-strings-table by `xml_parse`) is never read again
+        /// after the values are extracted from it, so there's nothing to
+        /// preserve by borrowing-then-cloning here. `swap_remove` reorders
+        /// whatever siblings are left, which is fine: every call site either
+        /// discards the rest of `self` immediately afterward or never
+        /// revisits sibling order.
+        pub(crate) fn into_child(mut self, name: &str) -> Option<XmlElement> {
+            let idx = self.children.iter().position(|c| c.name == name)?;
+            Some(self.children.swap_remove(idx))
+        }
+
+        /// Owned counterpart to `children_named` - moves every matching
+        /// child out of `self` rather than yielding borrowed references,
+        /// for the same reason `into_child` does.
+        pub(crate) fn into_children_named<'a>(
+            self,
+            name: &'a str,
+        ) -> impl Iterator<Item = XmlElement> + 'a {
+            self.children.into_iter().filter(move |c| c.name == name)
+        }
     }
 
     fn xml_decode_entities(s: &str) -> String {
@@ -44748,11 +44803,15 @@ mod xlsx_support {
 
     fn xlsx_parse_shared_strings(xml: &str) -> Result<Vec<String>> {
         let root = xml_parse(xml)?;
+        // `root` is never read again after this, so every `<si>` entry's
+        // own `text` is moved out via `into_child` rather than cloned - a
+        // real, hot allocation for a table that holds one entry per unique
+        // string value in the whole workbook.
         Ok(root
-            .children_named("si")
+            .into_children_named("si")
             .map(|si| {
-                if let Some(t) = si.child("t") {
-                    t.text.clone()
+                if si.child("t").is_some() {
+                    si.into_child("t").map(|t| t.text).unwrap_or_default()
                 } else {
                     si.children_named("r")
                         .filter_map(|r| r.child("t"))
@@ -44804,14 +44863,22 @@ mod xlsx_support {
         is_date_format: &[bool],
     ) -> Result<Vec<Vec<Option<String>>>> {
         let root = xml_parse(xml)?;
-        let Some(sheet_data) = root.child("sheetData") else {
+        // `root` (and everything under it) is never read again after this
+        // function builds its output grid, so the whole tree is walked by
+        // value from here down - `into_child`/`into_children_named` move
+        // each cell's own `<v>`/`<is>` text out directly instead of
+        // cloning it, which matters here specifically because this is a
+        // per-cell cost paid for every cell in the sheet, numeric cells
+        // (OOXML's own default type) included - the single most common
+        // cell shape in a real data file.
+        let Some(sheet_data) = root.into_child("sheetData") else {
             return Ok(Vec::new());
         };
 
         let mut sparse_rows: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
         let mut max_row = 0usize;
         let mut max_col = 0usize;
-        for row_el in sheet_data.children_named("row") {
+        for row_el in sheet_data.into_children_named("row") {
             let row_num: usize = row_el
                 .attr("r")
                 .and_then(|r| r.parse().ok())
@@ -44819,19 +44886,28 @@ mod xlsx_support {
             max_row = max_row.max(row_num);
 
             let mut cells = Vec::new();
-            for c in row_el.children_named("c") {
+            for c in row_el.into_children_named("c") {
                 let Some(col_idx) = c.attr("r").and_then(xlsx_cell_ref_to_col) else {
                     continue;
                 };
                 max_col = max_col.max(col_idx + 1);
 
+                // `style_idx` is read from `c.attrs` up front, before the
+                // match below moves pieces out of `c` in some arms -
+                // reading it after would try to borrow `c` after part of
+                // it has already been moved. `cell_type` stays a plain
+                // `&str` borrow of `c.attrs`: it's used only as the match
+                // scrutinee, so that borrow is provably dead before any
+                // arm body runs and never actually conflicts with an arm
+                // moving `c`.
                 let cell_type = c.attr("t").unwrap_or("n");
+                let style_idx: usize = c.attr("s").and_then(|s| s.parse().ok()).unwrap_or(0);
                 let value = match cell_type {
                     "inlineStr" => c
-                        .child("is")
+                        .into_child("is")
                         .map(|is| {
-                            if let Some(t) = is.child("t") {
-                                t.text.clone()
+                            if is.child("t").is_some() {
+                                is.into_child("t").map(|t| t.text).unwrap_or_default()
                             } else {
                                 is.children_named("r")
                                     .filter_map(|r| r.child("t"))
@@ -44849,7 +44925,7 @@ mod xlsx_support {
                             .unwrap_or(0);
                         shared_strings.get(idx).cloned().unwrap_or_default()
                     }
-                    "str" | "e" => c.child("v").map(|v| v.text.clone()).unwrap_or_default(),
+                    "str" | "e" => c.into_child("v").map(|v| v.text).unwrap_or_default(),
                     "b" => {
                         let raw = c.child("v").map(|v| v.text.as_str()).unwrap_or("0");
                         (raw.trim() == "1").to_string()
@@ -44868,9 +44944,7 @@ mod xlsx_support {
                         // the ODS reader's own calamine-comparison test,
                         // then confirmed to be a real, pre-existing xlsx
                         // behavior too, not ODS-specific.
-                        let raw = c.child("v").map(|v| v.text.clone()).unwrap_or_default();
-                        let style_idx: usize =
-                            c.attr("s").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let raw = c.into_child("v").map(|v| v.text).unwrap_or_default();
                         match raw.parse::<f64>() {
                             Ok(n) if is_date_format.get(style_idx).copied().unwrap_or(false) => {
                                 xlsx_format_serial(n)
@@ -45015,7 +45089,8 @@ mod xlsx_support {
             let mut profiles = Vec::new();
             for (i, name) in headers.into_iter().enumerate() {
                 let total = raw[i].len();
-                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let non_null: Vec<String> =
+                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
                 let current_type = if non_null.is_empty() {
                     "String".to_string()
                 } else {
@@ -45231,7 +45306,8 @@ mod xlsx_support {
             let mut profiles = Vec::new();
             for (i, name) in headers.into_iter().enumerate() {
                 let total = raw[i].len();
-                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let non_null: Vec<String> =
+                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
                 let current_type = if non_null.is_empty() {
                     "String".to_string()
                 } else {
@@ -46272,7 +46348,8 @@ mod xlsx_support {
             let mut profiles = Vec::new();
             for (i, name) in headers.into_iter().enumerate() {
                 let total = raw[i].len();
-                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let non_null: Vec<String> =
+                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
                 let current_type = if non_null.is_empty() {
                     "String".to_string()
                 } else {
@@ -46788,7 +46865,8 @@ mod xlsx_support {
             let mut profiles = Vec::new();
             for (i, name) in headers.into_iter().enumerate() {
                 let total = raw[i].len();
-                let non_null: Vec<String> = raw[i].iter().filter_map(|v| v.clone()).collect();
+                let non_null: Vec<String> =
+                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
                 let current_type = if non_null.is_empty() {
                     "String".to_string()
                 } else {
