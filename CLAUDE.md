@@ -3158,6 +3158,79 @@ across every committed CSV/dBase/Stata/SQLite/XLSX/ODS/XLS/XLSB/log
 fixture in the repository plus all four synthetic stress files, not
 just the ones used to find and measure each fix.
 
+A fourteenth pass followed up on the same "look for anything shaped
+like the clone/HashMap antipatterns already fixed" instruction with a
+direct, targeted search this time - `grep`-ing for `.get(&` across the
+whole file and reading each hit in context - rather than another full
+sweep, since the thirteenth pass's own dBase finding suggested other
+readers might share the identical O(rows * columns) shape Parquet's own
+`profile_parquet_file` and JSON's own `bucket_object_fields` were
+already fixed for. It found one: `profile_arrow_ipc_file` - the hand-
+rolled Arrow IPC reader's own top-level entry point - looped once per
+column over *every* row, calling `JsonValue::get(&name)` (which
+delegates to `Map::get`, a deliberate linear scan - see that type's own
+doc comment) on each one. This is actually *worse* than Parquet's own
+pre-fix shape: Parquet's old code called into a real `HashMap`
+(O(rows * columns) total, since a hash lookup is O(1) amortized), while
+Arrow IPC's `Map::get` is a linear scan, making this genuinely
+O(rows * columns^2) - the same complexity class this project's own
+`json_support::Map` was deliberately designed to accept for typical
+row-shaped objects (a handful to a few dozen fields), never anticipating
+being called from inside a per-column outer loop like this.
+
+Fixed with the exact same restructuring `profile_parquet_file` already
+uses: one pass over `rows`, distributing each row's own fields into
+per-column accumulators (`enum FieldAccum { Flat(Vec<String>),
+Nested(Vec<JsonValue>) }`) via a `field_index: HashMap<&str, usize,
+FxBuildHasher>` built once up front, resolving a row's own field name to
+its column's position in O(1) instead of an O(columns) scan repeated
+per row per column. This is a complete duplication of `profile_parquet_
+file`'s own logic rather than a shared helper - the two readers'
+surrounding context differs just enough (Parquet's `is_flat` map keyed
+off its own schema tree, Arrow IPC's `arrow_data_type_is_nested` check
+against its own `ArrowDataType`) that factoring out a shared function
+would need its own generic abstraction over "how do I know if this
+field is nested," which isn't worth it for two call sites - the same
+"controlled duplication rather than force a shared abstraction" judgment
+this project already makes elsewhere (e.g. the two independently-scoped
+XML parsers, or Avro/Parquet's duplicated decimal-string helper).
+
+**Measured on synthetic `pyarrow`-generated `.arrow` files** (via
+`pyarrow.feather.write_feather(..., compression="uncompressed")`, to
+isolate this fix from the unrelated LZ4 multi-block bug found in the
+same pass - see the Dependency footprint section's own Arrow IPC
+write-up for that fix), confirming the complexity-class nature of the
+fix the same way the Parquet column-extraction fix's own scaling was
+confirmed:
+
+- 300,000 rows x 20 columns (5 rounds): 1.954s -> 1.616s user time,
+  **~17.3%** reduction.
+- 60,000 rows x 100 columns (3 rounds): 3.053s -> 2.057s user time,
+  **~32.6%** reduction - a noticeably larger relative win at 5x the
+  column count, consistent with the mechanism (the removed cost scales
+  with columns squared, not linearly).
+
+Verified the same way as every pass before it: full test suite (311
+unit + 206 integration tests, including every Arrow IPC oracle-
+comparison test) unchanged and passing, clippy/fmt clean on both
+builds, and byte-identical output confirmed via `diff` against the
+pre-fix binary across every committed `.arrow`/`.arrows` fixture plus
+both synthetic stress files.
+
+A further, opportunistic finding from the same pass, unrelated to
+performance: benchmarking needed a large synthetic `.arrow` file, and
+the first attempt (`pyarrow`'s own default LZ4-compressed Feather V2
+output) failed outright with "LZ4 match offset out of bounds" on *both*
+the pre-fix and post-fix binaries - a real, pre-existing correctness bug
+in `lz4_frame_decompress`, not a regression from this pass's own change.
+See the Dependency footprint section's own Arrow IPC write-up for the
+full root-cause and fix - real multi-block LZ4-compressed Arrow files
+(which is to say, most real ones past a few thousand rows, since LZ4 is
+`pyarrow`'s own default Feather V2 compression) were unreadable by this
+project until it was fixed in the same session, found by the same
+"test with a realistically-sized file, not just small fixtures"
+discipline this document's entire history is built on.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no
@@ -6426,6 +6499,51 @@ this project could just implement directly rather than depend on:
   "`--features parquet`-only build must not need the other module"
   constraint standing in the way here the way there is for Avro/Parquet
   or CBOR/Parquet's own duplicated helpers.
+
+  **A real, later-discovered bug in that original design**: decoding
+  each frame block through the shared core independently (a fresh
+  `Vec<u8>` per block, then `out.extend_from_slice(...)`) is only
+  correct for the LZ4 Frame format's "independent blocks" mode. Its
+  default - and far more common - mode is "linked blocks", where a
+  block's own matches can reference up to 64KB of already-decoded bytes
+  from a *previous* block in the same frame, exactly the way a single
+  LZ4 block's own matches reference its own earlier output. This
+  project's only committed LZ4-frame fixture at the time
+  (`edge_arrow_lz4_compressed.arrow`, 200 rows) never had a chance to
+  catch this - it's small enough that `pyarrow`'s own writer never
+  splits it into more than one block, so there was never a second block
+  whose matches could reference the first. Found via real-world-scale
+  testing rather than reasoned about in advance (see the "further
+  real-world/opportunistic passes" entry below): every genuinely
+  multi-block LZ4-compressed `.arrow`/`.feather` file - which is to say,
+  any real file past a few thousand rows, since LZ4 is `pyarrow`'s own
+  *default* Feather V2 compression - failed outright with "LZ4 match
+  offset out of bounds". Fixed by giving `lz4_block_decompress_core`'s
+  own block-decode loop a second, `pub(crate)` entry point,
+  `lz4_block_decompress_into(input, out: &mut Vec<u8>)`, that appends
+  into a caller-supplied buffer instead of always starting from an empty
+  one; `lz4_block_decompress_core` itself is now a one-line wrapper
+  around it. `lz4_frame_decompress` decodes every block in the frame
+  into one persistent, frame-wide `out` this way, rather than resetting
+  to empty per block - correct for linked blocks (a later block's
+  matches can now see everything decoded so far in the frame), and
+  harmless for independent blocks too (a valid encoder never emits a
+  backward reference past what it declared, so accepting more history
+  than a strict "independent" mode requires never produces a wrong
+  answer - and this project has no independent-blocks fixture to
+  justify a second, narrower code path anyway). Parquet's and ORC's own
+  callers of the shared LZ4 block decoder (`lz4_block_decompress_core`,
+  each page/chunk genuinely self-contained with no cross-block window in
+  either of those formats) are completely unaffected, since each of
+  their calls still gets its own fresh buffer exactly as before.
+  `tests/fixtures/edge_arrow_lz4_multi_block.arrow` (10,000 rows,
+  generated with `pyarrow`'s own `compression="lz4"` - confirmed to
+  reliably force multiple linked blocks, unlike anything smaller) and
+  `decodes_a_multi_block_lz4_frame_with_cross_block_back_references_
+  matching_the_arrow_oracle` lock the fix in as a permanent regression
+  test, verified the same way every other Arrow IPC decode test in this
+  project already is: byte-for-byte against the real `arrow` crate's own
+  independent reader plus its JSON writer, not just "doesn't error."
 
   **The Streaming IPC format** (`read_arrow_ipc_stream_rows`) shares
   every message-parsing/decode function already built for the File

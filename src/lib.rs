@@ -27723,6 +27723,22 @@ mod lz4_support {
     /// correct RLE-style repeat].
     pub(crate) fn lz4_block_decompress_core(input: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(input.len());
+        lz4_block_decompress_into(input, &mut out)?;
+        Ok(out)
+    }
+
+    /// Same block decoder as `lz4_block_decompress_core`, but appends into
+    /// a caller-supplied buffer instead of always starting from an empty
+    /// one - needed by the LZ4 Frame format's own "linked blocks" mode
+    /// (block independence flag unset in the frame descriptor, the LZ4
+    /// CLI/library's own default), where a block's matches can reference
+    /// up to 64KB of history from *previous* blocks in the same frame, not
+    /// just its own already-decoded bytes. `lz4_block_decompress_core`
+    /// (Parquet's/ORC's own per-page/per-chunk callers, where each block
+    /// really is standalone with no cross-block window) is unaffected -
+    /// it's now just this function starting from an empty `out`, the same
+    /// behavior it always had.
+    pub(crate) fn lz4_block_decompress_into(input: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let mut pos = 0usize;
         loop {
             let token = *input.get(pos).context("truncated LZ4 token")?;
@@ -27758,7 +27774,7 @@ mod lz4_support {
                 out.push(byte);
             }
         }
-        Ok(out)
+        Ok(())
     }
 } // mod lz4_support
 
@@ -33786,9 +33802,25 @@ mod arrow_ipc_support {
     /// own `compression.rs`), a meaningfully different envelope from
     /// Parquet's own raw-block/Hadoop-framed LZ4 conventions this project
     /// already hand-rolled - only the innermost block-decode algorithm
-    /// (`lz4_support::lz4_block_decompress_core`, its own shared module -
+    /// (`lz4_support::lz4_block_decompress_into`, its own shared module -
     /// see that function's own doc comment) is actually shared between the
-    /// two.
+    /// two. Every block is decoded into one persistent, frame-wide buffer
+    /// rather than its own throwaway one - real, found via testing rather
+    /// than reasoned about in advance: a real `pyarrow`-written multi-
+    /// block LZ4 feather file (anything past a few thousand rows) failed
+    /// outright with "LZ4 match offset out of bounds", because the LZ4
+    /// Frame format's default "linked blocks" mode lets a block's own
+    /// matches reference up to 64KB of *already-decoded bytes from a
+    /// previous block* in the same frame - a real, common, spec-legal
+    /// shape this project's own small, single-block committed fixture
+    /// never exercised. Decoding every block into a single, ever-growing
+    /// buffer (rather than resetting to empty per block) handles this
+    /// correctly regardless of whether the frame declared itself
+    /// independent or linked - a valid encoder never emits a backward
+    /// reference past what it declared, so accepting more than a strict
+    /// "independent" mode requires is harmless in practice, and this
+    /// project has no independent-blocks fixture to justify a second,
+    /// narrower code path.
     /// Verified directly against the reference LZ4 Frame Format spec
     /// (github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md): a 4-byte
     /// magic, a frame descriptor (FLG byte - version/block-independence/
@@ -33862,7 +33894,7 @@ mod arrow_ipc_support {
             if is_uncompressed {
                 out.extend_from_slice(block);
             } else {
-                out.extend_from_slice(&super::lz4_support::lz4_block_decompress_core(block)?);
+                super::lz4_support::lz4_block_decompress_into(block, &mut out)?;
             }
             if block_checksum_flag {
                 pos += 4;
@@ -35209,32 +35241,83 @@ mod arrow_ipc_support {
         }
         let total = rows.len();
 
-        let mut out = Vec::with_capacity(footer.schema.fields.len());
-        for field in &footer.schema.fields {
-            let name = field.name.clone();
-            if arrow_data_type_is_nested(&field.data_type) {
-                let values: Vec<JsonValue> = rows
-                    .iter()
-                    .filter_map(|r| r.get(&name).cloned())
-                    .filter(|v| !v.is_null())
-                    .collect();
-                let refs: Vec<&JsonValue> = values.iter().collect();
-                out.extend(profile_json_path(name, total, refs, n_samples));
-            } else {
-                let raw_values: Vec<String> = rows
-                    .iter()
-                    .filter_map(|r| r.get(&name))
-                    .filter(|v| !v.is_null())
-                    .map(super::parquet_support::json_scalar_to_raw_string)
-                    .collect();
-                let col = ColumnInput {
-                    name,
-                    current_type: arrow_ipc_type_label(&field.data_type),
-                    raw_values,
-                    total,
-                    skip_heuristics: false,
+        // One pass over `rows`, distributing every row's own fields into
+        // per-column accumulators directly - not, as this used to do, one
+        // pass over *all* rows per column calling `JsonValue::get` (which
+        // delegates to `Map::get`, a linear scan by design - see that
+        // type's own doc comment). That old shape cost O(rows * columns)
+        // calls to a function that's itself O(columns), i.e. O(rows *
+        // columns^2) total - the exact same shape `profile_parquet_file`
+        // was already found and fixed for on a real, wide, large Parquet
+        // file (see that function's own doc comment). `field_index`
+        // (built once, `FxBuildHasher` for the same "hot lookup,
+        // non-adversarial keys" reason as every other per-row hash tally
+        // in this project) resolves each row's own field name to its
+        // column's position in one O(1) lookup instead.
+        let field_index: HashMap<&str, usize, FxBuildHasher> = footer
+            .schema
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+
+        enum FieldAccum {
+            Flat(Vec<String>),
+            Nested(Vec<JsonValue>),
+        }
+
+        let mut accum: Vec<FieldAccum> = footer
+            .schema
+            .fields
+            .iter()
+            .map(|field| {
+                if arrow_data_type_is_nested(&field.data_type) {
+                    FieldAccum::Nested(Vec::new())
+                } else {
+                    FieldAccum::Flat(Vec::with_capacity(total))
+                }
+            })
+            .collect();
+
+        for row in rows {
+            let JsonValue::Object(map) = row else {
+                continue;
+            };
+            for (key, value) in map {
+                if value.is_null() {
+                    continue;
+                }
+                let Some(&idx) = field_index.get(key.as_str()) else {
+                    continue;
                 };
-                out.push(profile_column(col, n_samples));
+                match &mut accum[idx] {
+                    FieldAccum::Flat(v) => {
+                        v.push(super::parquet_support::json_scalar_to_raw_string(&value));
+                    }
+                    FieldAccum::Nested(v) => v.push(value),
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(footer.schema.fields.len());
+        for (field, acc) in footer.schema.fields.iter().zip(accum) {
+            let name = field.name.clone();
+            match acc {
+                FieldAccum::Flat(raw_values) => {
+                    let col = ColumnInput {
+                        name,
+                        current_type: arrow_ipc_type_label(&field.data_type),
+                        raw_values,
+                        total,
+                        skip_heuristics: false,
+                    };
+                    out.push(profile_column(col, n_samples));
+                }
+                FieldAccum::Nested(values) => {
+                    let refs: Vec<&JsonValue> = values.iter().collect();
+                    out.extend(profile_json_path(name, total, refs, n_samples));
+                }
             }
         }
         Ok(out)
@@ -35628,6 +35711,27 @@ mod arrow_ipc_support {
         #[test]
         fn decodes_an_lz4_frame_compressed_batch_matching_the_arrow_oracle() {
             read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_lz4_compressed.arrow");
+        }
+
+        /// A real, genuine bug this project's own small `edge_arrow_lz4_
+        /// compressed.arrow` fixture (200 rows, one LZ4 block) never had
+        /// any chance to catch: 10,000 rows is enough for `pyarrow`'s own
+        /// writer to split the body into *multiple* LZ4 blocks, and the
+        /// LZ4 Frame format's default "linked blocks" mode lets a later
+        /// block's own matches reference up to 64KB of already-decoded
+        /// bytes from an *earlier* block in the same frame - a real,
+        /// common, spec-legal shape, not an edge case. Found via testing a
+        /// realistically-sized synthetic file rather than reasoned about
+        /// in advance: every real multi-block LZ4-compressed `.arrow`/
+        /// `.feather` file (anything past a few thousand rows, since LZ4
+        /// is `pyarrow`'s own *default* Feather V2 compression) failed
+        /// outright with "LZ4 match offset out of bounds" before
+        /// `lz4_frame_decompress` was fixed to decode every block into one
+        /// persistent, frame-wide buffer instead of a fresh one per block.
+        #[test]
+        fn decodes_a_multi_block_lz4_frame_with_cross_block_back_references_matching_the_arrow_oracle()
+         {
+            read_file_and_compare_to_oracle("tests/fixtures/edge_arrow_lz4_multi_block.arrow");
         }
 
         /// Generated with `pyarrow` (`IpcWriteOptions(compression="zstd")`) -

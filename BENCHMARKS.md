@@ -33,6 +33,40 @@ re-run.
 
 ---
 
+## 2026-09-01 — `2e58031`+perf pass 14 (Darwin arm64, Apple M4)
+
+A fourteenth pass, following up on pass 13's own dBase finding with a
+targeted `grep` for `.get(&` across `src/lib.rs` rather than another
+full sweep - looking specifically for the same O(rows * columns)
+per-row-per-column-lookup shape Parquet's and JSON's own readers were
+already fixed for. Found it in `profile_arrow_ipc_file` (the hand-
+rolled Arrow IPC reader): one `JsonValue::get(&name)` call per (row,
+column) pair, delegating to `Map::get`'s own deliberate linear scan -
+genuinely O(rows * columns^2), worse than Parquet's pre-fix O(rows *
+columns) shape (a real `HashMap`, not a linear-scan `Map`). Fixed with
+the identical restructuring `profile_parquet_file` already uses: one
+pass over `rows`, a `field_index: HashMap<&str, usize, FxBuildHasher>`
+built once, and per-column accumulators filled in a single O(rows *
+columns) pass. See CLAUDE.md's own "Performance" section for the full
+writeup, including a real, unrelated LZ4 multi-block decoding bug found
+and fixed in the same pass while generating a benchmark file.
+
+**Controlled alternating-binary comparison** (synthetic files via
+`pyarrow.feather.write_feather(..., compression="uncompressed")`, to
+isolate this fix from the LZ4 bug):
+
+| File | Before (avg user) | After (avg user) | Change |
+|---|---|---|---|
+| 300,000 rows x 20 cols (5 rounds) | 1.954s | 1.616s | **-17.3%** |
+| 60,000 rows x 100 cols (3 rounds) | 3.053s | 2.057s | **-32.6%** |
+
+A clean, reproducible complexity-class fix - the relative win grows
+with column count, exactly as expected from removing a cost that scaled
+quadratically in columns. Byte-identical output confirmed via `diff`
+against the pre-fix binary across every committed `.arrow`/`.arrows`
+fixture plus both synthetic stress files, full test suite (311 unit +
+206 integration tests) passing, clippy/fmt clean.
+
 ## 2026-09-01 — `dcb349c`+perf pass 13 (Darwin arm64, Apple M4)
 
 A thirteenth pass, started from a source-level sweep of every `.clone()`
