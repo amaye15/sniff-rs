@@ -3398,6 +3398,59 @@ output formats, not just INI's own fixtures - since `push_unique` is
 shared final-assembly code every multi-table format's output already
 passes through.
 
+A seventeenth pass swept every remaining format this project reads
+(Avro, MessagePack, CBOR, Stata, SPSS, ORC, NumPy) against realistically
+-sized synthetic files generated the same way as every format checked so
+far - all seven scaled cleanly, no fix needed. `.npz` (NumPy's own
+zip-of-named-arrays format) surfaced one more real, if smaller-scale,
+sibling of the INI/`Map::insert` bug above: a large `.npz` file (tens of
+thousands of named arrays - a real shape for per-layer model weights or
+many dataset splits/features, not a contrived case) showed clearly
+superlinear scaling (10,000 arrays: 0.28s; 40,000: 1.72s - a 4x input
+increase costing 6.1x more time) even *after* the `push_unique` render
+fix above, which meant a second, independent cause.
+
+`zip_support::ZipArchive::read` - shared by `.xlsx`/`.ods`/`.xlsb`
+(a handful of fixed, known part names, looked up once each) and `.npz`
+(one lookup per array in the archive) - found its target entry via
+`entries.iter().find(|e| e.name == name)`, a linear scan over *every*
+entry in the archive on every single call. Harmless at the handful-of-
+parts scale a real spreadsheet file has, but genuinely O(archive
+entries^2) for `.npz`, called once per array against an archive that
+can hold thousands of them. Fixed the same way as every other "known-
+unique-key, still paying for a lookup that could be O(1)" bug in this
+document: `name_index: HashMap<String, usize, FxBuildHasher>`, built
+once in `ZipArchive::open` right after `entries` itself, resolves a
+name to its entry's index in one O(1) lookup instead. `xlsx`/`ods`/
+`xlsb` are unaffected either way (their own entry counts never made the
+old linear scan matter), confirmed by the existing `zip_archive_reads_
+and_verifies_real_xlsx_entries` test (already reading several entries
+by name from a real file and verifying exact CRC32/size) continuing to
+pass unchanged - a pure performance fix with no new code path, so no
+new fixture was needed to lock in correctness.
+
+**Measured on synthetic `.npz` files** (`np.savez` with many small
+named arrays): 40,000 arrays went from **1.72s to 0.87s** (~2x faster,
+confirmed via a controlled alternating-binary comparison, consistent
+across repeated rounds), with the scaling ratio itself improving (4x
+input from 10,000 to 40,000 arrays cost 6.1x more time before the fix,
+4.1x after - closer to linear, though not perfectly so at this scale,
+since real per-array decode work still legitimately scales with array
+count regardless of lookup cost). A further 80,000-array file hit a
+real, disclosed, pre-existing and unrelated limit instead - the
+resulting archive exceeds the plain (non-Zip64) format's own 32-bit
+size fields, and this project's Zip64 support is a known, disclosed
+gap (see the Known limitations section) - so this pass's own measured
+range tops out at 40,000 arrays, still enough to clearly demonstrate
+both the bug and the fix. Verified the same way as every pass before
+it: full test suite unchanged and passing under every affected feature
+combination (`--features xlsx`, `--features npy`, `--features full`,
+and the default build) individually, not just the usual two endpoints,
+clippy/fmt clean throughout, and byte-identical output confirmed via
+`diff` against the pre-fix binary across every committed `.xlsx`/
+`.ods`/`.xls`/`.xlsb`/`.npz` fixture plus both synthetic `.npz` stress
+files.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

@@ -44471,6 +44471,10 @@ mod zip_support {
     pub(crate) struct ZipArchive {
         data: Vec<u8>,
         pub(crate) entries: Vec<ZipEntry>,
+        // Built once in `open`, used by `read` for an O(1) lookup instead
+        // of a linear scan over `entries` - see `read`'s own doc comment
+        // for the real bug this fixes.
+        name_index: HashMap<String, usize, FxBuildHasher>,
     }
 
     impl ZipArchive {
@@ -44520,7 +44524,16 @@ mod zip_support {
                 pos = name_start + name_len + extra_len + comment_len;
             }
 
-            Ok(ZipArchive { data, entries })
+            let name_index = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.name.clone(), i))
+                .collect();
+            Ok(ZipArchive {
+                data,
+                entries,
+                name_index,
+            })
         }
 
         /// The end-of-central-directory record's signature must be searched
@@ -44541,11 +44554,22 @@ mod zip_support {
             self.entries.iter().map(|e| e.name.as_str())
         }
 
+        /// A real, if smaller-scale, sibling of `json_support::Map::
+        /// insert`'s own O(tables^2) rendering bug: this used to find an
+        /// entry via `entries.iter().find(...)`, a linear scan over every
+        /// entry in the archive, on *every* call. Fine for `.xlsx`/`.ods`/
+        /// `.xlsb` (a handful of fixed, known part names looked up once
+        /// each), but `.npz` calls this once per array in the archive -
+        /// and a real `.npz` file can hold thousands of named arrays
+        /// (per-layer model weights, many dataset splits/features), so
+        /// this was genuinely O(archives entries^2) for that format.
+        /// `name_index` (built once in `open`) resolves this to one O(1)
+        /// lookup per call instead.
         pub(crate) fn read(&self, name: &str) -> Result<Vec<u8>> {
             let entry = self
-                .entries
-                .iter()
-                .find(|e| e.name == name)
+                .name_index
+                .get(name)
+                .map(|&i| &self.entries[i])
                 .ok_or_else(|| anyhow!("zip archive has no entry named '{name}'"))?;
 
             let pos = entry.local_header_offset as usize;

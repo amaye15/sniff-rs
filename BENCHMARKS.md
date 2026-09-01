@@ -33,6 +33,41 @@ re-run.
 
 ---
 
+## 2026-09-01 — `33cbc42`+perf pass 17 (Darwin arm64, Apple M4)
+
+A seventeenth pass swept every remaining format this project reads
+(Avro, MessagePack, CBOR, Stata, SPSS, ORC, NumPy `.npy`) against
+realistically-sized synthetic files - all clean, no fix needed. A large
+`.npz` file (NumPy's zip-of-named-arrays format, tens of thousands of
+arrays) surfaced one more real bug: `zip_support::ZipArchive::read` -
+shared by `.xlsx`/`.ods`/`.xlsb` and `.npz` - found its target entry via
+a linear scan over every entry in the archive on every call. Harmless
+at the handful-of-parts scale a spreadsheet file has, but O(archive
+entries^2) for `.npz`, called once per array. Fixed with `name_index:
+HashMap<String, usize, FxBuildHasher>`, built once in `ZipArchive::open`,
+resolving a name to its index in O(1) instead. See CLAUDE.md's own
+"Performance" section for the full write-up.
+
+**Controlled alternating-binary comparison** (synthetic `.npz` files,
+many small named arrays via `np.savez`):
+
+| File | Before (user) | After (user) | Change |
+|---|---|---|---|
+| 10,000 arrays | 0.28s | 0.21s | -25% |
+| 40,000 arrays | 1.72s | 0.87s | **~2x faster** |
+
+The scaling ratio itself improved too (4x input from 10,000 to 40,000
+arrays cost 6.1x more time before, 4.1x after - closer to linear,
+though real per-array decode cost means it's not perfectly flat even
+after the fix). An 80,000-array file hit an unrelated, pre-existing,
+disclosed limit instead (exceeds the plain, non-Zip64 zip format's own
+size fields), so this pass's measured range tops out at 40,000. Byte-
+identical output confirmed via `diff` against the pre-fix binary across
+every committed `.xlsx`/`.ods`/`.xls`/`.xlsb`/`.npz` fixture plus both
+synthetic stress files, full test suite passing under every affected
+feature combination (`--features xlsx`, `--features npy`, `--features
+full`, default) individually, clippy/fmt clean throughout.
+
 ## 2026-09-01 — `b416688`+perf pass 16 (Darwin arm64, Apple M4)
 
 A sixteenth pass followed up pass 15's YAML fixes by checking the
