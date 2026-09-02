@@ -31213,7 +31213,12 @@ mod parquet_support {
                             child.advance_columns(leaves)?;
                             JsonValue::Null
                         };
-                        map.insert(name.clone(), value);
+                        // Field names within a Parquet schema group are
+                        // unique by the format's own structure, so
+                        // `push_unique` (a plain append) is correct here -
+                        // `insert`'s per-key linear dup scan would make
+                        // assembling a K-field struct O(K^2) per instance.
+                        map.push_unique(name.clone(), value);
                     }
                     Ok(JsonValue::Object(map))
                 }
@@ -31531,7 +31536,11 @@ mod parquet_support {
         for _ in 0..num_rows {
             let mut fields = json_support::Map::with_capacity(top_level.len());
             for (name, reader) in &top_level {
-                fields.insert(name.clone(), reader.read_field(&mut leaves)?);
+                // Top-level schema field names are unique by construction,
+                // so a plain append is correct - `insert`'s per-key dup
+                // scan made this O(columns^2) *per row*, i.e. quadratic in
+                // width across the whole file.
+                fields.push_unique(name.clone(), reader.read_field(&mut leaves)?);
             }
             rows.push(JsonValue::Object(fields));
         }
@@ -34819,9 +34828,15 @@ mod arrow_ipc_support {
                     if !bitmap_get(validity, i) {
                         return Ok(JsonValue::Null);
                     }
-                    let mut obj = json_support::Map::new();
+                    let mut obj = json_support::Map::with_capacity(child_columns.len());
                     for (name, col) in &child_columns {
-                        obj.insert(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
+                        // Arrow struct child names are unique by the
+                        // schema's own structure - plain append, not
+                        // `insert`'s per-key O(children) dup scan.
+                        obj.push_unique(
+                            name.clone(),
+                            col.get(i).cloned().unwrap_or(JsonValue::Null),
+                        );
                     }
                     Ok(JsonValue::Object(obj))
                 })
@@ -35187,9 +35202,13 @@ mod arrow_ipc_support {
         let row_count = usize::try_from(meta.length).unwrap_or(0);
         Ok((0..row_count)
             .map(|i| {
-                let mut obj = json_support::Map::new();
+                let mut obj = json_support::Map::with_capacity(columns.len());
                 for (name, col) in &columns {
-                    obj.insert(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
+                    // Top-level Arrow field names are unique by
+                    // construction - plain append, not `insert`'s per-key
+                    // dup scan (which made row assembly O(columns^2) per
+                    // row).
+                    obj.push_unique(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
                 }
                 JsonValue::Object(obj)
             })
