@@ -12001,7 +12001,7 @@ fn describe_kinds(counts: &JsonKindCounts) -> String {
 /// case - a column with no arrays at all - hands the same `Vec` straight
 /// back with no second allocation (the recursive walk is only needed
 /// when there's actually an array to flatten).
-fn unwrap_arrays<'a>(values: Vec<&'a JsonValue>) -> (Vec<&'a JsonValue>, bool) {
+fn unwrap_arrays(values: Vec<&JsonValue>) -> (Vec<&JsonValue>, bool) {
     if !values.iter().any(|v| matches!(v, JsonValue::Array(_))) {
         return (values, false);
     }
@@ -31530,9 +31530,9 @@ mod parquet_support {
     /// caller can build borrowing `LeafCursor`s from them). `num_rows`
     /// comes back too since it's read from the same `row_group`.
     #[allow(clippy::type_complexity)]
-    fn build_row_group_decode_state<'a>(
+    fn build_row_group_decode_state(
         file_data: &[u8],
-        schema: &'a SchemaNode,
+        schema: &SchemaNode,
         row_group: &RowGroup,
     ) -> Result<(
         Vec<(String, ReaderNode)>,
