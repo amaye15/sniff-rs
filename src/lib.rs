@@ -33858,6 +33858,11 @@ mod arrow_ipc_support {
 
     #[derive(Clone, Debug)]
     struct ArrowRecordBatchMeta {
+        // Row count of the batch - parsed always, but only read by the
+        // row-object path (`decode_record_batch`, test-only) now that
+        // `profile_arrow_ipc_file` is column-oriented; the column path
+        // gets its length from the decoded column vectors themselves.
+        #[allow(dead_code)]
         length: i64,
         nodes: Vec<ArrowFieldNode>,
         buffers: Vec<ArrowBufferRegion>,
@@ -35303,12 +35308,17 @@ mod arrow_ipc_support {
     /// reader's cross-verification oracle - renders a batch), given the
     /// schema and the message's own body bytes plus already-resolved
     /// dictionaries.
-    fn decode_record_batch(
+    /// Decodes one `RecordBatch` column-major: one `(name, values)` per
+    /// top-level schema field, in schema order, each `values` vector
+    /// `meta.length` long (`Null` where absent). This is the natural
+    /// shape - transposing to row objects (`decode_record_batch`) is
+    /// only for the row-consuming callers (the streaming reader, tests).
+    fn decode_record_batch_columns(
         schema: &ArrowSchema,
         meta: &ArrowRecordBatchMeta,
         body: &[u8],
         dictionaries: &HashMap<i64, Vec<JsonValue>>,
-    ) -> Result<Vec<JsonValue>> {
+    ) -> Result<Vec<(String, Vec<JsonValue>)>> {
         let buffers: Vec<Vec<u8>> = meta
             .buffers
             .iter()
@@ -35324,6 +35334,21 @@ mod arrow_ipc_support {
         for field in &schema.fields {
             columns.push((field.name.clone(), decoder.decode_field(field)?));
         }
+        Ok(columns)
+    }
+
+    /// Row-object form of `decode_record_batch_columns` - only the
+    /// row-consuming callers need it now (`read_arrow_ipc_stream_rows`
+    /// and the tests); `profile_arrow_ipc_file` itself is column-oriented
+    /// end to end.
+    #[cfg(test)]
+    fn decode_record_batch(
+        schema: &ArrowSchema,
+        meta: &ArrowRecordBatchMeta,
+        body: &[u8],
+        dictionaries: &HashMap<i64, Vec<JsonValue>>,
+    ) -> Result<Vec<JsonValue>> {
+        let columns = decode_record_batch_columns(schema, meta, body, dictionaries)?;
         let row_count = usize::try_from(meta.length).unwrap_or(0);
         Ok((0..row_count)
             .map(|i| {
@@ -35371,7 +35396,12 @@ mod arrow_ipc_support {
     /// than replaces, its id's existing values - the IPC spec's own
     /// "streaming dictionary" mechanism for a dictionary that grows across
     /// a file), then decode every `RecordBatch` in file order.
-    fn read_arrow_ipc_file_rows(file_data: &[u8]) -> Result<Vec<JsonValue>> {
+    /// Reads the footer and resolves every `DictionaryBatch` (a delta
+    /// batch appends to its id's existing values) - the shared front half
+    /// of both `read_arrow_ipc_file_rows` and `read_arrow_ipc_file_columns`.
+    fn read_arrow_ipc_footer_and_dicts(
+        file_data: &[u8],
+    ) -> Result<(ArrowFileFooter, HashMap<i64, Vec<JsonValue>>)> {
         let footer = read_footer(file_data)?;
         let mut dict_field_by_id = HashMap::new();
         for field in &footer.schema.fields {
@@ -35406,7 +35436,14 @@ mod arrow_ipc_support {
                 dictionaries.insert(dict_meta.id, values);
             }
         }
+        Ok((footer, dictionaries))
+    }
 
+    /// Row-object form of `read_arrow_ipc_file_columns` - test-only now
+    /// (`profile_arrow_ipc_file` is column-oriented end to end).
+    #[cfg(test)]
+    fn read_arrow_ipc_file_rows(file_data: &[u8]) -> Result<Vec<JsonValue>> {
+        let (footer, dictionaries) = read_arrow_ipc_footer_and_dicts(file_data)?;
         let mut rows = Vec::new();
         for block in &footer.record_batches {
             let (header, body) = read_message_at(
@@ -35429,6 +35466,41 @@ mod arrow_ipc_support {
             )?);
         }
         Ok(rows)
+    }
+
+    /// The column-oriented counterpart to `read_arrow_ipc_file_rows`:
+    /// every `RecordBatch` is already decoded column-major internally
+    /// (`decode_record_batch_columns`), so this concatenates those
+    /// per-column vectors across batches directly rather than
+    /// transposing to row objects and letting `profile_arrow_ipc_file`
+    /// transpose them straight back. One `Vec<JsonValue>` per top-level
+    /// schema field, in schema order.
+    fn read_arrow_ipc_file_columns(
+        file_data: &[u8],
+    ) -> Result<(ArrowFileFooter, Vec<Vec<JsonValue>>)> {
+        let (footer, dictionaries) = read_arrow_ipc_footer_and_dicts(file_data)?;
+        let mut columns: Vec<Vec<JsonValue>> =
+            footer.schema.fields.iter().map(|_| Vec::new()).collect();
+        for block in &footer.record_batches {
+            let (header, body) = read_message_at(
+                file_data,
+                block.offset,
+                block.meta_data_length,
+                block.body_length,
+            )?;
+            let ArrowMessageHeader::RecordBatch(batch_meta) = header else {
+                bail!(
+                    "Arrow IPC footer's own recordBatches list points at a non-RecordBatch \
+                     message"
+                );
+            };
+            let batch_cols =
+                decode_record_batch_columns(&footer.schema, &batch_meta, body, &dictionaries)?;
+            for (acc, (_, vals)) in columns.iter_mut().zip(batch_cols) {
+                acc.extend(vals);
+            }
+        }
+        Ok((footer, columns))
     }
 
     /// Whether a field's own declared type needs `profile_json_path`
@@ -35560,90 +35632,41 @@ mod arrow_ipc_support {
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
         let file_data = std::fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
-        let footer = read_footer(&file_data)?;
-        let mut rows = read_arrow_ipc_file_rows(&file_data)?;
+        // Column-oriented from end to end: every RecordBatch is decoded
+        // column-major already, so this reads the file straight into one
+        // `Vec<JsonValue>` per field rather than building row objects
+        // (re-cloning every field name into every row) only to transpose
+        // them straight back to columns. Fields line up with
+        // `footer.schema.fields` by position, so no name lookup is
+        // needed at all.
+        let (footer, mut columns) = read_arrow_ipc_file_columns(&file_data)?;
         if let Some(limit) = nrows {
-            rows.truncate(limit);
-        }
-        let total = rows.len();
-
-        // One pass over `rows`, distributing every row's own fields into
-        // per-column accumulators directly - not, as this used to do, one
-        // pass over *all* rows per column calling `JsonValue::get` (which
-        // delegates to `Map::get`, a linear scan by design - see that
-        // type's own doc comment). That old shape cost O(rows * columns)
-        // calls to a function that's itself O(columns), i.e. O(rows *
-        // columns^2) total - the exact same shape `profile_parquet_file`
-        // was already found and fixed for on a real, wide, large Parquet
-        // file (see that function's own doc comment). `field_index`
-        // (built once, `FxBuildHasher` for the same "hot lookup,
-        // non-adversarial keys" reason as every other per-row hash tally
-        // in this project) resolves each row's own field name to its
-        // column's position in one O(1) lookup instead.
-        let field_index: HashMap<&str, usize, FxBuildHasher> = footer
-            .schema
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.name.as_str(), i))
-            .collect();
-
-        enum FieldAccum {
-            Flat(Vec<String>),
-            Nested(Vec<JsonValue>),
-        }
-
-        let mut accum: Vec<FieldAccum> = footer
-            .schema
-            .fields
-            .iter()
-            .map(|field| {
-                if arrow_data_type_is_nested(&field.data_type) {
-                    FieldAccum::Nested(Vec::new())
-                } else {
-                    FieldAccum::Flat(Vec::with_capacity(total))
-                }
-            })
-            .collect();
-
-        for row in rows {
-            let JsonValue::Object(map) = row else {
-                continue;
-            };
-            for (key, value) in map {
-                if value.is_null() {
-                    continue;
-                }
-                let Some(&idx) = field_index.get(key.as_str()) else {
-                    continue;
-                };
-                match &mut accum[idx] {
-                    FieldAccum::Flat(v) => {
-                        v.push(super::parquet_support::json_scalar_to_raw_string(&value));
-                    }
-                    FieldAccum::Nested(v) => v.push(value),
-                }
+            for col in &mut columns {
+                col.truncate(limit);
             }
         }
+        let total = columns.first().map_or(0, Vec::len);
 
         let mut out = Vec::with_capacity(footer.schema.fields.len());
-        for (field, acc) in footer.schema.fields.iter().zip(accum) {
+        for (field, values) in footer.schema.fields.iter().zip(columns) {
             let name = field.name.clone();
-            match acc {
-                FieldAccum::Flat(raw_values) => {
-                    let col = ColumnInput {
-                        name,
-                        current_type: arrow_ipc_type_label(&field.data_type),
-                        raw_values,
-                        total,
-                        skip_heuristics: false,
-                    };
-                    out.push(profile_column(col, n_samples));
-                }
-                FieldAccum::Nested(values) => {
-                    let refs: Vec<&JsonValue> = values.iter().collect();
-                    out.extend(profile_json_path(name, total, refs, n_samples));
-                }
+            if arrow_data_type_is_nested(&field.data_type) {
+                let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
+                out.extend(profile_json_path(name, total, refs, n_samples));
+            } else {
+                let raw_values: Vec<String> = values
+                    .iter()
+                    .filter(|v| !v.is_null())
+                    .map(super::parquet_support::json_scalar_to_raw_string)
+                    .collect();
+                let col = ColumnInput {
+                    name,
+                    current_type: arrow_ipc_type_label(&field.data_type),
+                    raw_values,
+                    total,
+                    skip_heuristics: false,
+                };
+                out.push(profile_column(col, n_samples));
             }
         }
         Ok(out)
