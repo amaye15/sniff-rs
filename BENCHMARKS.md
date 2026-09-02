@@ -33,6 +33,78 @@ re-run.
 
 ---
 
+## 2026-09-02 — `perf/orc-quadratic-and-lz-backcopy` @ `8ecd1ba` (Darwin arm64, Apple M4)
+
+An 18-commit branch pass. The theme is quadratic and redundant-work
+removal on the wide-data / nested-format paths, plus a few clear
+constant-factor wins. Headline items (see CLAUDE.md's Performance
+section and the branch commits for the full write-ups):
+
+- `detect_preamble_rows` re-read and fully re-parsed the entire CSV
+  just to look at its first 6 rows, on top of `columns_from_csv`'s own
+  parse - now a 256 KiB prefix.
+- A systemic `O(fields^2)` in `json_support::Map::insert` (a linear
+  duplicate scan per key) while building every nested record - fixed in
+  the JSON parser, `Map::from_iter` (MessagePack/CBOR/TOML/json-schema
+  render), Avro records, both Arrow row builders, the Parquet nested
+  reconstructor, `xml_element_to_json`, and INI.
+- `suggest_ideal_type` built two N-length `Vec`s and normalized every
+  value before the numeric branches even for non-numeric columns - now
+  gated on `values[0]`.
+- Both hand-rolled XML parsers materialized the whole document as a
+  `Vec<char>` (4 bytes/char + a copy) - now a byte cursor.
+- Arrow IPC and all-flat Parquet now stay column-oriented instead of
+  building per-row objects and transposing back.
+
+**Heuristic engine** (`suggest_ideal_type`, in-process, values → time;
+Criterion point estimate):
+
+| Shape | 10 | 1,000 | 100,000 |
+|---|---|---|---|
+| UUID | 822 ns | 17.8 µs | 1.74 ms |
+| Integer | 639 ns | 10.4 µs | 1.29 ms |
+| Email | 669 ns | 27.7 µs | 2.89 ms |
+| Free-text (worst case) | 1.37 µs | **2.33 µs** | **83.0 µs** |
+
+vs the prior snapshot on this machine: free-text worst case is down
+**~94% at 1,000 values and ~98% at 100,000** (the `values[0]` gate
+skips the two N-length allocations and N `normalize_numeric_str` calls
+for a column that isn't numeric). UUID/integer/email moved within
+±5% run-to-run (noise - a re-run flipped several signs); no real
+change there, which is expected since those shapes return before the
+numeric branch.
+
+**End-to-end** (full binary via `Command`, CSV/JSON, rows → time):
+
+| Format | 100 | 10,000 | 200,000 |
+|---|---|---|---|
+| CSV | 1.55 ms | 11.3 ms | 197 ms |
+| JSON | 2.58 ms | 12.7 ms | 294 ms |
+
+vs the prior snapshot: CSV **−38% at 10k rows, −47% at 200k** (mostly
+the preamble double-parse fix, plus the `suggest_ideal_type` gate and
+dropping the per-cell `Option<String>` layer); JSON **−17% to −19% at
+10k/200k** (the parser's `O(fields^2)` fix and `bucket_object_fields`).
+The `json/100` case printed a "regressed" label but at n=100 with wide
+CIs it's not a trustworthy signal.
+
+**`format_comparison` not re-run this pass** (its stored baseline
+predates a laptop change; a fresh run would only compare to itself).
+
+Ad-hoc `/usr/bin/time` on real/synthetic files, `main` → branch tip,
+best-of-3 user seconds (not Criterion - listed for the paths the
+benches above don't cover):
+
+| workload | main | branch |
+|---|---|---|
+| Parquet, 20k rows × 800 cols | ~18.7s | **~7.7s** |
+| dict-encoded Parquet, 2M rows | 1.57s | **0.85s** |
+| Arrow IPC, 500 cols × 15k rows | ~2.0s | **~1.2s** |
+| JSONL, 20k × 400 fields | 3.6s | **1.8s** |
+| MessagePack / CBOR, 15k × 400 | ~3.4s | **~1.6s** |
+| XML, 8k × 350 fields (50 MB) | ~3.7s | **~0.87s** |
+| `.csv.gz`, 400k rows | 0.67s | **0.44s** |
+
 ## 2026-09-01 — `33cbc42`+perf pass 17 (Darwin arm64, Apple M4)
 
 A seventeenth pass swept every remaining format this project reads
