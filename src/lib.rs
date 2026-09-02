@@ -11296,6 +11296,18 @@ mod orc_support {
             top_level.iter().map(|_| Vec::new()).collect();
         let mut placeholder_notes: Vec<Option<String>> = top_level.iter().map(|_| None).collect();
 
+        // The set of column ids this reader actually cares about is fixed
+        // by the schema and never changes stripe to stripe - resolve it to
+        // an O(1) lookup once here, rather than an O(top-level-columns)
+        // `top_level.iter().any(...)` scan repeated for *every* stream of
+        // *every* stripe (a wide ORC file has O(columns) streams per
+        // stripe, so that scan was O(stripes * columns^2) overall - the
+        // same lookup-in-a-loop shape already fixed for Parquet's and
+        // Arrow IPC's own per-row/per-column extraction). `FxBuildHasher`
+        // for the same "hot lookup, trusted keys" reason as those.
+        let wanted_column_ids: HashSet<u32, FxBuildHasher> =
+            top_level.iter().map(|c| c.column_id).collect();
+
         'stripes: for stripe_info in &footer.stripes {
             if nrows.is_some_and(|limit| accumulated.first().is_none_or(|c| c.len() >= limit)) {
                 break;
@@ -11326,7 +11338,7 @@ mod orc_support {
                 if stream.length > MAX_SECTION_LEN {
                     bail!("ORC stripe declares an implausible stream length");
                 }
-                let wanted = top_level.iter().any(|c| c.column_id == stream.column)
+                let wanted = wanted_column_ids.contains(&stream.column)
                     && !stream.kind.eq(&OrcStreamKind::Other);
                 if wanted {
                     file.seek(SeekFrom::Start(stream_offset))
@@ -27530,14 +27542,11 @@ mod brotli_support {
                 *dist_rb_idx += 1;
                 let len = usize::try_from(copy_length)
                     .context("negative Brotli back-reference copy length")?;
-                let start = output
-                    .len()
-                    .checked_sub(resolved_distance as usize)
-                    .context("Brotli back-reference distance exceeds the current output")?;
-                for i in 0..len {
-                    let b = output[start + i];
-                    output.push(b);
-                }
+                // This branch is only entered when `0 < resolved_distance
+                // <= max_distance <= output.len()`, so the cast and the
+                // `lz_back_copy` precondition (`1 <= dist <= out.len()`)
+                // are both already guaranteed by the `if` condition above.
+                lz_back_copy(output, resolved_distance as usize, len);
                 remaining -= len as i64;
             }
 
@@ -27802,11 +27811,7 @@ mod lz4_support {
             if match_len == 19 {
                 match_len += lz4_read_lsic(input, &mut pos)?;
             }
-            let start = out.len() - offset;
-            for i in 0..match_len {
-                let byte = out[start + i];
-                out.push(byte);
-            }
+            lz_back_copy(out, offset, match_len);
         }
         Ok(())
     }
@@ -44109,6 +44114,42 @@ const CLEN_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
+/// The LZ77 back-reference copy every hand-rolled decompressor in this
+/// file performs: append `len` bytes to `out`, each taken `dist` bytes
+/// back from the current end (DEFLATE/zip, LZ4, Snappy, Brotli and zstd
+/// all do exactly this, previously each as its own
+/// `for i in 0..len { out.push(out[start + i]); }` loop - one bounds
+/// check *and* one capacity check per byte).
+///
+/// The overwhelmingly common case is a *non-overlapping* reference
+/// (`dist >= len`): that's a single `memcpy` via `extend_from_within`,
+/// no per-byte work at all. A genuinely overlapping RLE-style run
+/// (`dist < len`, e.g. `dist == 1` repeating one byte to fill a zero/
+/// whitespace run) is still done with `memcpy`, just in `dist`-sized
+/// chunks - each chunk lengthens the already-materialized region the
+/// next chunk copies from, so the whole run costs `ceil(len / dist)`
+/// `memcpy`s rather than `len` byte pushes.
+///
+/// The caller must have already validated `1 <= dist <= out.len()`
+/// (every existing call site does, with its own format-specific error
+/// message); this function does not re-check.
+fn lz_back_copy(out: &mut Vec<u8>, dist: usize, len: usize) {
+    debug_assert!(dist >= 1 && dist <= out.len());
+    let start = out.len() - dist;
+    if dist >= len {
+        out.extend_from_within(start..start + len);
+        return;
+    }
+    out.reserve(len);
+    let mut copied = 0;
+    while copied < len {
+        let chunk = dist.min(len - copied);
+        let from = start + copied;
+        out.extend_from_within(from..from + chunk);
+        copied += chunk;
+    }
+}
+
 /// Decodes one compressed block's symbol stream (shared by fixed and
 /// dynamic Huffman blocks - they differ only in which tables they hand
 /// in) directly into `out`, stopping at the end-of-block symbol (256).
@@ -44144,11 +44185,7 @@ fn inflate_block<R: std::io::Read>(
                     "invalid DEFLATE stream: distance {dist} goes further back than any output produced so far"
                 );
             }
-            let start = out.len() - dist;
-            out.reserve(length);
-            for i in 0..length {
-                out.push(out[start + i]);
-            }
+            lz_back_copy(out, dist, length);
         }
     }
 }
@@ -47268,8 +47305,9 @@ mod snappy_support {
     /// Appends `len` bytes to `out`, each copied from `offset` bytes
     /// before the current end - a back-reference that may legitimately
     /// overlap itself (e.g. offset 1, len 10 repeats the last byte 10
-    /// times), so this must copy one byte at a time rather than via a
-    /// single slice copy.
+    /// times). `lz_back_copy` handles both the non-overlapping case (a
+    /// single `memcpy`) and the overlapping RLE case (`memcpy` in
+    /// `offset`-sized chunks) after this function's own bounds check.
     fn copy_from_offset(out: &mut Vec<u8>, offset: usize, len: usize) -> Result<()> {
         if offset == 0 || offset > out.len() {
             bail!(
@@ -47277,11 +47315,7 @@ mod snappy_support {
                 out.len()
             );
         }
-        let start = out.len() - offset;
-        for i in 0..len {
-            let byte = out[start + i];
-            out.push(byte);
-        }
+        lz_back_copy(out, offset, len);
         Ok(())
     }
 } // mod snappy_support
@@ -48426,12 +48460,7 @@ mod zstd_support {
                         "malformed zstd sequence: back-reference offset {offset} is out of range"
                     );
                 }
-                let start = self.window.len() - offset as usize;
-                self.window.reserve(match_length as usize);
-                for i in 0..match_length as usize {
-                    let b = self.window[start + i];
-                    self.window.push(b);
-                }
+                lz_back_copy(&mut self.window, offset as usize, match_length as usize);
 
                 let is_last = seq_idx + 1 == n_seq;
                 if !is_last {
@@ -48921,6 +48950,47 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `lz_back_copy` - the shared LZ77 back-reference copy every hand-rolled
+    // decompressor in this file (DEFLATE/zip, LZ4, Snappy, Brotli, zstd)
+    // uses. The correctness-critical property is that it produces exactly
+    // the same bytes the old per-byte `for i in 0..len { out.push(out[start
+    // + i]) }` loop did, in both the non-overlapping (`memcpy`) and the
+    // overlapping RLE (`memcpy` in `dist`-sized chunks) cases.
+    fn lz_back_copy_reference(out: &mut Vec<u8>, dist: usize, len: usize) {
+        let start = out.len() - dist;
+        for i in 0..len {
+            out.push(out[start + i]);
+        }
+    }
+
+    #[test]
+    fn lz_back_copy_matches_the_byte_at_a_time_reference() {
+        // A spread of (history, dist, len) shapes: non-overlapping copies,
+        // dist == len exactly, single-byte RLE runs (dist == 1), short-
+        // period RLE runs whose length isn't a multiple of the period,
+        // and a zero-length match.
+        let cases = [
+            (16usize, 16usize, 8usize),
+            (16, 8, 8),
+            (16, 8, 3),
+            (16, 1, 10),
+            (16, 3, 10),
+            (16, 5, 17),
+            (16, 16, 0),
+            (200, 130, 400),
+            (200, 7, 999),
+        ];
+        for (hist, dist, len) in cases {
+            let seed: Vec<u8> = (0..hist as u32).map(|i| (i * 37 + 11) as u8).collect();
+            let mut a = seed.clone();
+            let mut b = seed.clone();
+            lz_back_copy(&mut a, dist, len);
+            lz_back_copy_reference(&mut b, dist, len);
+            assert_eq!(a, b, "mismatch for hist={hist} dist={dist} len={len}");
+            assert_eq!(a.len(), hist + len);
+        }
+    }
 
     // `FxHasher` - the fast, non-cryptographic hasher `suggest_ideal_type`'s
     // unique-value count and `bucket_object_fields`'s key index both
