@@ -31420,6 +31420,21 @@ mod parquet_support {
             top_level.push((field.name().to_string(), reader));
         }
 
+        // Resolve each row-group column chunk by its dotted schema path
+        // once, up front. The old code scanned `row_group.columns` for
+        // every leaf *and* allocated a fresh `path_in_schema.join(".")`
+        // String inside that inner scan - O(leaves * columns) string
+        // allocations per row group, i.e. quadratic in column count for a
+        // flat schema. Same blowup shape as the one `profile_parquet_file`
+        // already fixed in its own per-column accumulation loop.
+        let mut chunk_by_path: HashMap<String, &ColumnMetaData> =
+            HashMap::with_capacity(row_group.columns.len());
+        for c in &row_group.columns {
+            if let Some(m) = c.meta_data.as_ref() {
+                chunk_by_path.insert(m.path_in_schema.join("."), m);
+            }
+        }
+
         // `LeafCursor` borrows its `LeafTriples`, so every leaf's triples
         // must outlive the cursors referencing them - decoded up front
         // into a stable `Vec` rather than inline in the loop above.
@@ -31427,14 +31442,9 @@ mod parquet_support {
             Vec::with_capacity(leaf_descriptors.len());
         for descriptor in &leaf_descriptors {
             let col_name = descriptor.path.join(".");
-            let chunk = row_group
-                .columns
-                .iter()
-                .find_map(|c| {
-                    c.meta_data
-                        .as_ref()
-                        .filter(|m| m.path_in_schema.join(".") == col_name)
-                })
+            let chunk = chunk_by_path
+                .get(col_name.as_str())
+                .copied()
                 .with_context(|| format!("column {col_name:?} missing from a row group"))?;
             let triples = decode_column_chunk_triples(file_data, chunk, descriptor)?;
             all_triples.push((descriptor.path.clone(), descriptor.max_def_level, triples));
