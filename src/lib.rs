@@ -1015,6 +1015,17 @@ mod json_support {
         depth: u32,
     }
 
+    /// Non-cryptographic hash of an object key, used only to short-
+    /// circuit `Map::insert`'s per-key linear duplicate scan while
+    /// parsing (see `parse_object`). A collision is harmless here - it
+    /// just routes that one key through the full checked `insert`.
+    fn hash_object_key(key: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = crate::FxHasher::default();
+        key.hash(&mut h);
+        h.finish()
+    }
+
     impl<'a> Parser<'a> {
         fn new(s: &'a str) -> Self {
             Parser {
@@ -1168,6 +1179,20 @@ mod json_support {
             // more real reallocation, no different from today) for any
             // object wider than this.
             let mut map = Map::with_capacity(8);
+            // `Map::insert`'s duplicate-key check is a linear scan of
+            // everything inserted so far, so calling it once per key
+            // makes parsing a K-field object O(K^2) - a real, measured
+            // ~2x on a file of wide (few-hundred-field) flat objects.
+            // A key whose hash has never been seen in this object is
+            // provably new, so it can skip that scan entirely; only a
+            // hash *collision* (astronomically rare for short keys in
+            // one object) or a genuine duplicate key falls back to the
+            // full checked `insert`, which still does exactly the right
+            // thing in both cases (overwrite in place / append). The set
+            // stays empty (no allocation) for the common one-or-two-key
+            // object.
+            let mut seen_key_hashes: std::collections::HashSet<u64, crate::FxBuildHasher> =
+                std::collections::HashSet::default();
             self.skip_whitespace();
             if self.peek() == Some(b'}') {
                 self.pos += 1;
@@ -1186,10 +1211,12 @@ mod json_support {
                 // Last value wins on a duplicate key - falls out of
                 // `Map::insert`'s own overwrite behavior, matching
                 // `serde_json`'s own confirmed "last value silently
-                // wins" duplicate-key convention. No special-casing
-                // needed here beyond calling `insert` once per key in
-                // encounter order.
-                map.insert(key, value);
+                // wins" duplicate-key convention.
+                if seen_key_hashes.insert(hash_object_key(&key)) {
+                    map.push_unique(key, value);
+                } else {
+                    map.insert(key, value);
+                }
                 self.skip_whitespace();
                 match self.peek() {
                     Some(b',') => {
@@ -1554,6 +1581,26 @@ mod json_support {
                 }
                 other => panic!("expected an Object, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn duplicate_keys_still_dedup_in_a_wide_object_past_the_hash_fast_path() {
+            // Wide enough that the hash-set fast path is doing the work,
+            // with a duplicate key both early and late in the object -
+            // last value must still win, and no phantom extra entry.
+            let mut s = String::from("{");
+            for i in 0..500 {
+                s.push_str(&format!(r#""k{i}":{i},"#));
+            }
+            s.push_str(r#""k7":9001,"k499":9002}"#);
+            let v = from_str(&s).unwrap();
+            let Value::Object(m) = &v else {
+                panic!("expected an Object");
+            };
+            assert_eq!(m.len(), 500);
+            assert_eq!(m.get("k7"), Some(&Value::from(9001i64)));
+            assert_eq!(m.get("k499"), Some(&Value::from(9002i64)));
+            assert_eq!(m.get("k123"), Some(&Value::from(123i64)));
         }
 
         #[test]
