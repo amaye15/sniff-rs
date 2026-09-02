@@ -626,9 +626,22 @@ mod json_support {
 
     impl FromIterator<(String, Value)> for Map {
         fn from_iter<I: IntoIterator<Item = (String, Value)>>(iter: I) -> Self {
-            let mut map = Map::new();
+            let iter = iter.into_iter();
+            let mut map = Map::with_capacity(iter.size_hint().0);
+            // Same trick `parse_object` uses: a key whose hash is new is
+            // provably not a duplicate, so it skips `insert`'s per-key
+            // linear scan (which would make collecting a K-pair map
+            // O(K^2) - real on a wide MessagePack/CBOR record). Only a
+            // hash collision or a genuine duplicate key falls through to
+            // the checked `insert`, which keeps "last value wins".
+            let mut seen: std::collections::HashSet<u64, crate::FxBuildHasher> =
+                std::collections::HashSet::default();
             for (k, v) in iter {
-                map.insert(k, v);
+                if seen.insert(hash_object_key(&k)) {
+                    map.push_unique(k, v);
+                } else {
+                    map.insert(k, v);
+                }
             }
             map
         }
@@ -36892,7 +36905,11 @@ mod avro_support {
                 let mut out = json_support::Map::with_capacity(fields.len());
                 for (name, field_schema) in fields {
                     let value = decode_to_json(r, field_schema, names)?;
-                    out.insert(name.clone(), value);
+                    // Avro record field names are unique by the spec
+                    // (schema parsing rejects a duplicate), so a plain
+                    // append is correct - `insert`'s per-key dup scan
+                    // would make decoding a K-field record O(K^2).
+                    out.push_unique(name.clone(), value);
                 }
                 JsonValue::Object(out)
             }
