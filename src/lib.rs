@@ -29424,16 +29424,45 @@ mod parquet_support {
     /// correctness (verified against real decoded values, not raw
     /// throughput) is what this project's own CLI use case needs.
     fn read_bits(data: &[u8], bit_offset: &mut usize, n: u32) -> Result<u64> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let start = *bit_offset;
+        let end_bit = start + n as usize;
+        let byte_start = start / 8;
+        let byte_end = end_bit.div_ceil(8);
+        let span = byte_end - byte_start;
+        // `n` here is a Parquet bit width: a level stream's
+        // `num_required_bits` (<= 16) or a dictionary page's own leading
+        // bit-width byte (<= 32, since indices are `u32`). Together with a
+        // <= 7-bit within-byte start offset the value spans at most 5
+        // bytes, so a single little-endian `u64` load + shift + mask
+        // replaces the old bit-at-a-time loop (which also bounds-checked
+        // every bit) - a real win for a dictionary-encoded column, the
+        // common low-cardinality shape. The `> 8` guard keeps the old
+        // path for any pathological width, though a real file never hits
+        // it.
+        if span <= 8 && n <= 57 {
+            let bytes = data
+                .get(byte_start..byte_end)
+                .context("truncated bit-packed value in RLE/bit-packed hybrid stream")?;
+            let mut buf = [0u8; 8];
+            buf[..span].copy_from_slice(bytes);
+            let word = u64::from_le_bytes(buf) >> (start % 8);
+            let mask = (1u64 << n) - 1;
+            *bit_offset = end_bit;
+            return Ok(word & mask);
+        }
         let mut result = 0u64;
         for i in 0..n {
-            let bit_idx = *bit_offset + i as usize;
+            let bit_idx = start + i as usize;
             let byte = *data
                 .get(bit_idx / 8)
                 .context("truncated bit-packed value in RLE/bit-packed hybrid stream")?;
             let bit = (byte >> (bit_idx % 8)) & 1;
             result |= u64::from(bit) << i;
         }
-        *bit_offset += n as usize;
+        *bit_offset = end_bit;
         Ok(result)
     }
 
@@ -41033,25 +41062,39 @@ mod xml_support {
         }
     }
 
-    fn xml_skip_ws(chars: &[char], pos: &mut usize) {
-        while chars.get(*pos).is_some_and(|c| c.is_whitespace()) {
+    // The parser scans `input.as_bytes()` with a byte cursor rather than
+    // first materializing a `Vec<char>` (4 bytes per char, plus a full
+    // copy of the whole document, before parsing even begins - the exact
+    // bug `parse_csv` was already fixed for). Every structural character
+    // XML markup cares about (`<`, `>`, `/`, `=`, quotes, ASCII
+    // whitespace, and the `<!--`/`]]>`/`<![CDATA[`/... delimiters) is
+    // single-byte ASCII, and a UTF-8 continuation byte is always
+    // `>= 0x80`, so a byte scan can never stop mid-character - every
+    // cursor position a span is sliced at is a valid `&str` boundary, so
+    // `&input[start..pos]` is always sound. (XML's own significant-
+    // whitespace set in markup is ASCII-only - `#x20 #x9 #xD #xA` - so
+    // `is_ascii_whitespace` is the right test, not `char::is_whitespace`.)
+
+    fn xml_skip_ws(bytes: &[u8], pos: &mut usize) {
+        while bytes.get(*pos).is_some_and(u8::is_ascii_whitespace) {
             *pos += 1;
         }
     }
 
-    fn xml_starts_with(chars: &[char], pos: usize, needle: &str) -> bool {
-        let needle: Vec<char> = needle.chars().collect();
-        chars.len() >= pos + needle.len() && chars[pos..pos + needle.len()] == needle[..]
+    fn xml_starts_with(bytes: &[u8], pos: usize, needle: &str) -> bool {
+        bytes
+            .get(pos..)
+            .is_some_and(|rest| rest.starts_with(needle.as_bytes()))
     }
 
-    fn xml_skip_until(chars: &[char], pos: &mut usize, needle: &str) -> Result<()> {
-        while !xml_starts_with(chars, *pos, needle) {
-            if *pos >= chars.len() {
+    fn xml_skip_until(bytes: &[u8], pos: &mut usize, needle: &str) -> Result<()> {
+        while !xml_starts_with(bytes, *pos, needle) {
+            if *pos >= bytes.len() {
                 bail!("unterminated XML construct (expected {needle:?})");
             }
             *pos += 1;
         }
-        *pos += needle.chars().count();
+        *pos += needle.len();
         Ok(())
     }
 
@@ -41062,83 +41105,85 @@ mod xml_support {
     /// `]`-then-`>` skip rather than a naive skip-to-first-`>`, since the
     /// internal subset's own declarations can themselves contain `>`
     /// characters well before the DOCTYPE's real closing one.
-    fn xml_skip_misc(chars: &[char], pos: &mut usize) -> Result<()> {
+    fn xml_skip_misc(bytes: &[u8], pos: &mut usize) -> Result<()> {
         loop {
-            xml_skip_ws(chars, pos);
-            if xml_starts_with(chars, *pos, "<!--") {
-                xml_skip_until(chars, pos, "-->")?;
-            } else if xml_starts_with(chars, *pos, "<?") {
-                xml_skip_until(chars, pos, "?>")?;
-            } else if xml_starts_with(chars, *pos, "<!") {
+            xml_skip_ws(bytes, pos);
+            if xml_starts_with(bytes, *pos, "<!--") {
+                xml_skip_until(bytes, pos, "-->")?;
+            } else if xml_starts_with(bytes, *pos, "<?") {
+                xml_skip_until(bytes, pos, "?>")?;
+            } else if xml_starts_with(bytes, *pos, "<!") {
                 let has_internal_subset = {
                     let mut p = *pos;
-                    while chars.get(p).is_some_and(|&c| c != '>' && c != '[') {
+                    while bytes.get(p).is_some_and(|&b| b != b'>' && b != b'[') {
                         p += 1;
                     }
-                    chars.get(p) == Some(&'[')
+                    bytes.get(p) == Some(&b'[')
                 };
                 if has_internal_subset {
-                    xml_skip_until(chars, pos, "]")?;
-                    xml_skip_ws(chars, pos);
+                    xml_skip_until(bytes, pos, "]")?;
+                    xml_skip_ws(bytes, pos);
                 }
-                xml_skip_until(chars, pos, ">")?;
+                xml_skip_until(bytes, pos, ">")?;
             } else {
                 return Ok(());
             }
         }
     }
 
-    fn xml_parse_name(chars: &[char], pos: &mut usize) -> Result<String> {
+    fn xml_parse_name<'a>(input: &'a str, pos: &mut usize) -> Result<&'a str> {
+        let bytes = input.as_bytes();
         let start = *pos;
-        while chars
+        while bytes
             .get(*pos)
-            .is_some_and(|&c| !c.is_whitespace() && c != '>' && c != '/' && c != '=')
+            .is_some_and(|&b| !b.is_ascii_whitespace() && b != b'>' && b != b'/' && b != b'=')
         {
             *pos += 1;
         }
         if *pos == start {
             bail!("expected an XML name");
         }
-        Ok(chars[start..*pos].iter().collect())
+        Ok(&input[start..*pos])
     }
 
     /// Parses attributes, stripping a namespace prefix from each name
     /// and dropping `xmlns`/`xmlns:*` declarations entirely (they're
     /// namespace bindings, not regular attribute data - see this
     /// module's own doc comment).
-    fn xml_parse_attrs(chars: &[char], pos: &mut usize) -> Result<Vec<(String, String)>> {
+    fn xml_parse_attrs(input: &str, pos: &mut usize) -> Result<Vec<(String, String)>> {
+        let bytes = input.as_bytes();
         let mut attrs = Vec::new();
         loop {
-            xml_skip_ws(chars, pos);
-            match chars.get(*pos) {
-                Some('/') | Some('>') | None => return Ok(attrs),
+            xml_skip_ws(bytes, pos);
+            match bytes.get(*pos) {
+                Some(b'/') | Some(b'>') | None => return Ok(attrs),
                 _ => {}
             }
-            let name = xml_parse_name(chars, pos)?;
-            xml_skip_ws(chars, pos);
-            if chars.get(*pos) != Some(&'=') {
+            let name = xml_parse_name(input, pos)?;
+            xml_skip_ws(bytes, pos);
+            if bytes.get(*pos) != Some(&b'=') {
                 bail!("expected '=' after attribute name '{name}'");
             }
             *pos += 1;
-            xml_skip_ws(chars, pos);
-            let quote = match chars.get(*pos) {
-                Some(&q @ ('"' | '\'')) => q,
+            xml_skip_ws(bytes, pos);
+            let quote = match bytes.get(*pos) {
+                Some(&q @ (b'"' | b'\'')) => q,
                 _ => bail!("expected a quoted attribute value for '{name}'"),
             };
             *pos += 1;
             let start = *pos;
-            while chars.get(*pos).is_some_and(|&c| c != quote) {
+            while bytes.get(*pos).is_some_and(|&b| b != quote) {
                 *pos += 1;
             }
-            if *pos >= chars.len() {
+            if *pos >= bytes.len() {
                 bail!("unterminated attribute value for '{name}'");
             }
-            let raw: String = chars[start..*pos].iter().collect();
+            let raw = &input[start..*pos];
             *pos += 1; // closing quote
             if name == "xmlns" || name.starts_with("xmlns:") {
                 continue;
             }
-            attrs.push((xml_strip_prefix(name), xml_decode_entities(&raw)));
+            attrs.push((xml_strip_prefix(name.to_string()), xml_decode_entities(raw)));
         }
     }
 
@@ -41147,19 +41192,20 @@ mod xml_support {
     /// exceeding `MAX_XML_DEPTH` bails cleanly before recursing further,
     /// the structural depth guard this module's own doc comment
     /// describes.
-    fn xml_parse_element(chars: &[char], pos: &mut usize, depth: usize) -> Result<XmlElement> {
+    fn xml_parse_element(input: &str, pos: &mut usize, depth: usize) -> Result<XmlElement> {
         if depth > MAX_XML_DEPTH {
             bail!("more than {MAX_XML_DEPTH} levels of nested XML elements");
         }
-        if chars.get(*pos) != Some(&'<') {
+        let bytes = input.as_bytes();
+        if bytes.get(*pos) != Some(&b'<') {
             bail!("expected '<' to start an element");
         }
         *pos += 1;
-        let name = xml_strip_prefix(xml_parse_name(chars, pos)?);
-        let attrs = xml_parse_attrs(chars, pos)?;
-        xml_skip_ws(chars, pos);
+        let name = xml_strip_prefix(xml_parse_name(input, pos)?.to_string());
+        let attrs = xml_parse_attrs(input, pos)?;
+        xml_skip_ws(bytes, pos);
 
-        if xml_starts_with(chars, *pos, "/>") {
+        if xml_starts_with(bytes, *pos, "/>") {
             *pos += 2;
             return Ok(XmlElement {
                 name,
@@ -41168,7 +41214,7 @@ mod xml_support {
                 text: String::new(),
             });
         }
-        if chars.get(*pos) != Some(&'>') {
+        if bytes.get(*pos) != Some(&b'>') {
             bail!("expected '>' or '/>' to close the start tag for '{name}'");
         }
         *pos += 1;
@@ -41176,28 +41222,29 @@ mod xml_support {
         let mut children = Vec::new();
         let mut text = String::new();
         loop {
-            if *pos >= chars.len() {
+            if *pos >= bytes.len() {
                 bail!("unexpected end of XML inside element '{name}'");
             }
-            if xml_starts_with(chars, *pos, "<![CDATA[") {
+            if xml_starts_with(bytes, *pos, "<![CDATA[") {
                 *pos += "<![CDATA[".len();
                 let start = *pos;
-                xml_skip_until(chars, pos, "]]>")?;
+                xml_skip_until(bytes, pos, "]]>")?;
                 let end = *pos - "]]>".len();
-                text.push_str(&chars[start..end].iter().collect::<String>());
-            } else if xml_starts_with(chars, *pos, "<!--") {
-                xml_skip_until(chars, pos, "-->")?;
-            } else if xml_starts_with(chars, *pos, "<?") {
-                xml_skip_until(chars, pos, "?>")?;
-            } else if xml_starts_with(chars, *pos, "</") {
+                text.push_str(&input[start..end]);
+            } else if xml_starts_with(bytes, *pos, "<!--") {
+                xml_skip_until(bytes, pos, "-->")?;
+            } else if xml_starts_with(bytes, *pos, "<?") {
+                xml_skip_until(bytes, pos, "?>")?;
+            } else if xml_starts_with(bytes, *pos, "</") {
                 *pos += 2;
-                let close_name = xml_parse_name(chars, pos)?;
-                xml_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&'>') {
+                let close_name = xml_parse_name(input, pos)?;
+                let close_matches = xml_strip_prefix(close_name.to_string()) == name;
+                xml_skip_ws(bytes, pos);
+                if bytes.get(*pos) != Some(&b'>') {
                     bail!("expected '>' to close end tag '</{close_name}>'");
                 }
                 *pos += 1;
-                if xml_strip_prefix(close_name.clone()) != name {
+                if !close_matches {
                     bail!("mismatched XML tags: '<{name}>' closed by '</{close_name}>'");
                 }
                 return Ok(XmlElement {
@@ -41206,25 +41253,24 @@ mod xml_support {
                     children,
                     text,
                 });
-            } else if chars[*pos] == '<' {
-                children.push(xml_parse_element(chars, pos, depth + 1)?);
+            } else if bytes[*pos] == b'<' {
+                children.push(xml_parse_element(input, pos, depth + 1)?);
             } else {
                 let start = *pos;
-                while chars.get(*pos).is_some_and(|&c| c != '<') {
+                while bytes.get(*pos).is_some_and(|&b| b != b'<') {
                     *pos += 1;
                 }
-                let raw: String = chars[start..*pos].iter().collect();
-                text.push_str(&xml_decode_entities(&raw));
+                text.push_str(&xml_decode_entities(&input[start..*pos]));
             }
         }
     }
 
     fn xml_parse(input: &str) -> Result<XmlElement> {
-        let chars: Vec<char> = input.chars().collect();
+        let bytes = input.as_bytes();
         let mut pos = 0;
-        xml_skip_misc(&chars, &mut pos)?;
-        let root = xml_parse_element(&chars, &mut pos, 1)?;
-        xml_skip_misc(&chars, &mut pos)?;
+        xml_skip_misc(bytes, &mut pos)?;
+        let root = xml_parse_element(input, &mut pos, 1)?;
+        xml_skip_misc(bytes, &mut pos)?;
         Ok(root)
     }
 
@@ -45105,25 +45151,34 @@ mod xlsx_support {
         out
     }
 
-    fn xml_skip_ws(chars: &[char], pos: &mut usize) {
-        while chars.get(*pos).is_some_and(|c| c.is_whitespace()) {
+    // Scans `input.as_bytes()` with a byte cursor rather than first
+    // materializing a `Vec<char>` (4 bytes per char plus a whole-document
+    // copy before parsing starts - the same bug `parse_csv` and the
+    // `xml` feature's own parser were already fixed for). Safe because
+    // every structural character is single-byte ASCII and a UTF-8
+    // continuation byte is always `>= 0x80`, so `&input[start..pos]` at
+    // any cursor stop is always a valid `&str` slice.
+
+    fn xml_skip_ws(bytes: &[u8], pos: &mut usize) {
+        while bytes.get(*pos).is_some_and(u8::is_ascii_whitespace) {
             *pos += 1;
         }
     }
 
-    fn xml_starts_with(chars: &[char], pos: usize, needle: &str) -> bool {
-        let needle: Vec<char> = needle.chars().collect();
-        chars.len() >= pos + needle.len() && chars[pos..pos + needle.len()] == needle[..]
+    fn xml_starts_with(bytes: &[u8], pos: usize, needle: &str) -> bool {
+        bytes
+            .get(pos..)
+            .is_some_and(|rest| rest.starts_with(needle.as_bytes()))
     }
 
-    fn xml_skip_until(chars: &[char], pos: &mut usize, needle: &str) -> Result<()> {
-        while !xml_starts_with(chars, *pos, needle) {
-            if *pos >= chars.len() {
+    fn xml_skip_until(bytes: &[u8], pos: &mut usize, needle: &str) -> Result<()> {
+        while !xml_starts_with(bytes, *pos, needle) {
+            if *pos >= bytes.len() {
                 bail!("unterminated XML construct (expected {needle:?})");
             }
             *pos += 1;
         }
-        *pos += needle.chars().count();
+        *pos += needle.len();
         Ok(())
     }
 
@@ -45131,79 +45186,82 @@ mod xlsx_support {
     /// leading `<?xml ... ?>` declaration), and DOCTYPE declarations - only
     /// a naive skip-to-`>` for DOCTYPE, since OOXML/ODF documents never
     /// carry an internal subset that itself contains a `>` character.
-    fn xml_skip_misc(chars: &[char], pos: &mut usize) -> Result<()> {
+    fn xml_skip_misc(bytes: &[u8], pos: &mut usize) -> Result<()> {
         loop {
-            xml_skip_ws(chars, pos);
-            if xml_starts_with(chars, *pos, "<!--") {
-                xml_skip_until(chars, pos, "-->")?;
-            } else if xml_starts_with(chars, *pos, "<?") {
-                xml_skip_until(chars, pos, "?>")?;
-            } else if xml_starts_with(chars, *pos, "<!") {
-                xml_skip_until(chars, pos, ">")?;
+            xml_skip_ws(bytes, pos);
+            if xml_starts_with(bytes, *pos, "<!--") {
+                xml_skip_until(bytes, pos, "-->")?;
+            } else if xml_starts_with(bytes, *pos, "<?") {
+                xml_skip_until(bytes, pos, "?>")?;
+            } else if xml_starts_with(bytes, *pos, "<!") {
+                xml_skip_until(bytes, pos, ">")?;
             } else {
                 return Ok(());
             }
         }
     }
 
-    fn xml_parse_name(chars: &[char], pos: &mut usize) -> Result<String> {
+    fn xml_parse_name<'a>(input: &'a str, pos: &mut usize) -> Result<&'a str> {
+        let bytes = input.as_bytes();
         let start = *pos;
-        while chars
+        while bytes
             .get(*pos)
-            .is_some_and(|&c| !c.is_whitespace() && c != '>' && c != '/' && c != '=')
+            .is_some_and(|&b| !b.is_ascii_whitespace() && b != b'>' && b != b'/' && b != b'=')
         {
             *pos += 1;
         }
         if *pos == start {
             bail!("expected an XML name");
         }
-        Ok(chars[start..*pos].iter().collect())
+        Ok(&input[start..*pos])
     }
 
-    fn xml_parse_attrs(chars: &[char], pos: &mut usize) -> Result<Vec<(String, String)>> {
+    fn xml_parse_attrs(input: &str, pos: &mut usize) -> Result<Vec<(String, String)>> {
+        let bytes = input.as_bytes();
         let mut attrs = Vec::new();
         loop {
-            xml_skip_ws(chars, pos);
-            match chars.get(*pos) {
-                Some('/') | Some('>') | None => return Ok(attrs),
+            xml_skip_ws(bytes, pos);
+            match bytes.get(*pos) {
+                Some(b'/') | Some(b'>') | None => return Ok(attrs),
                 _ => {}
             }
-            let name = xml_parse_name(chars, pos)?;
-            xml_skip_ws(chars, pos);
-            if chars.get(*pos) != Some(&'=') {
+            let name = xml_parse_name(input, pos)?;
+            xml_skip_ws(bytes, pos);
+            if bytes.get(*pos) != Some(&b'=') {
                 bail!("expected '=' after attribute name '{name}'");
             }
             *pos += 1;
-            xml_skip_ws(chars, pos);
-            let quote = match chars.get(*pos) {
-                Some(&q @ ('"' | '\'')) => q,
+            xml_skip_ws(bytes, pos);
+            let quote = match bytes.get(*pos) {
+                Some(&q @ (b'"' | b'\'')) => q,
                 _ => bail!("expected a quoted attribute value for '{name}'"),
             };
             *pos += 1;
             let start = *pos;
-            while chars.get(*pos).is_some_and(|&c| c != quote) {
+            while bytes.get(*pos).is_some_and(|&b| b != quote) {
                 *pos += 1;
             }
-            if *pos >= chars.len() {
+            if *pos >= bytes.len() {
                 bail!("unterminated attribute value for '{name}'");
             }
-            let raw: String = chars[start..*pos].iter().collect();
+            let raw = &input[start..*pos];
             *pos += 1; // closing quote
-            attrs.push((name, xml_decode_entities(&raw)));
+            attrs.push((name.to_string(), xml_decode_entities(raw)));
         }
     }
 
     /// Parses one element (and everything nested inside it) starting at `<`.
-    fn xml_parse_element(chars: &[char], pos: &mut usize) -> Result<XmlElement> {
-        if chars.get(*pos) != Some(&'<') {
+    fn xml_parse_element(input: &str, pos: &mut usize) -> Result<XmlElement> {
+        let bytes = input.as_bytes();
+        if bytes.get(*pos) != Some(&b'<') {
             bail!("expected '<' to start an element");
         }
         *pos += 1;
-        let name = xml_parse_name(chars, pos)?;
-        let attrs = xml_parse_attrs(chars, pos)?;
-        xml_skip_ws(chars, pos);
+        let name = xml_parse_name(input, pos)?.to_string();
+        let attrs = xml_parse_attrs(input, pos)?;
+        xml_skip_ws(bytes, pos);
 
-        if xml_starts_with(chars, *pos, "/>") {
+        if xml_starts_with(bytes, *pos, "/>") {
             *pos += 2;
             return Ok(XmlElement {
                 name,
@@ -45212,7 +45270,7 @@ mod xlsx_support {
                 text: String::new(),
             });
         }
-        if chars.get(*pos) != Some(&'>') {
+        if bytes.get(*pos) != Some(&b'>') {
             bail!("expected '>' or '/>' to close the start tag for '{name}'");
         }
         *pos += 1;
@@ -45220,26 +45278,27 @@ mod xlsx_support {
         let mut children = Vec::new();
         let mut text = String::new();
         loop {
-            if *pos >= chars.len() {
+            if *pos >= bytes.len() {
                 bail!("unexpected end of XML inside element '{name}'");
             }
-            if xml_starts_with(chars, *pos, "<![CDATA[") {
+            if xml_starts_with(bytes, *pos, "<![CDATA[") {
                 *pos += "<![CDATA[".len();
                 let start = *pos;
-                xml_skip_until(chars, pos, "]]>")?;
+                xml_skip_until(bytes, pos, "]]>")?;
                 let end = *pos - "]]>".len();
-                text.push_str(&chars[start..end].iter().collect::<String>());
-            } else if xml_starts_with(chars, *pos, "<!--") {
-                xml_skip_until(chars, pos, "-->")?;
-            } else if xml_starts_with(chars, *pos, "</") {
+                text.push_str(&input[start..end]);
+            } else if xml_starts_with(bytes, *pos, "<!--") {
+                xml_skip_until(bytes, pos, "-->")?;
+            } else if xml_starts_with(bytes, *pos, "</") {
                 *pos += 2;
-                let close_name = xml_parse_name(chars, pos)?;
-                xml_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&'>') {
+                let close_name = xml_parse_name(input, pos)?;
+                let close_matches = close_name == name;
+                xml_skip_ws(bytes, pos);
+                if bytes.get(*pos) != Some(&b'>') {
                     bail!("expected '>' to close end tag '</{close_name}>'");
                 }
                 *pos += 1;
-                if close_name != name {
+                if !close_matches {
                     bail!("mismatched XML tags: '<{name}>' closed by '</{close_name}>'");
                 }
                 return Ok(XmlElement {
@@ -45248,25 +45307,24 @@ mod xlsx_support {
                     children,
                     text,
                 });
-            } else if chars[*pos] == '<' {
-                children.push(xml_parse_element(chars, pos)?);
+            } else if bytes[*pos] == b'<' {
+                children.push(xml_parse_element(input, pos)?);
             } else {
                 let start = *pos;
-                while chars.get(*pos).is_some_and(|&c| c != '<') {
+                while bytes.get(*pos).is_some_and(|&b| b != b'<') {
                     *pos += 1;
                 }
-                let raw: String = chars[start..*pos].iter().collect();
-                text.push_str(&xml_decode_entities(&raw));
+                text.push_str(&xml_decode_entities(&input[start..*pos]));
             }
         }
     }
 
     pub(crate) fn xml_parse(input: &str) -> Result<XmlElement> {
-        let chars: Vec<char> = input.chars().collect();
+        let bytes = input.as_bytes();
         let mut pos = 0;
-        xml_skip_misc(&chars, &mut pos)?;
-        let root = xml_parse_element(&chars, &mut pos)?;
-        xml_skip_misc(&chars, &mut pos)?;
+        xml_skip_misc(bytes, &mut pos)?;
+        let root = xml_parse_element(input, &mut pos)?;
+        xml_skip_misc(bytes, &mut pos)?;
         Ok(root)
     }
 
