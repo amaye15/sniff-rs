@@ -45547,17 +45547,121 @@ mod xlsx_support {
         Ok(result)
     }
 
-    /// Parses one worksheet's `<sheetData>` into a dense `row x column` grid
-    /// (`None` for a cell that's absent from the XML entirely - Excel only
-    /// ever writes non-empty cells, so gaps are the normal case, not an
-    /// error), padded to the widest row's column count and to every row
-    /// number seen (a fully-blank row still occupies a real vertical
-    /// position, the same as calamine's own `Range` type represents it).
+    /// A worksheet reduced to just what column profiling needs, without
+    /// ever materializing a dense `max_row x max_col` grid: the header
+    /// row, only the data rows that actually hold a value, and the true
+    /// data-row count (blank rows included, so `missing_pct` still
+    /// reflects real gaps). A stray cell far outside a sheet's real data
+    /// used to force a `vec![vec![None; max_col]; max_row]` allocation -
+    /// tens of MB for one misplaced value, and an OOM if it was also far
+    /// to the right. All four spreadsheet readers now build one of these
+    /// instead, and share `into_column_inputs`.
+    struct SheetGrid {
+        /// The header row's cells, positional, `n_cols` wide. Empty iff
+        /// the sheet had no cells at all (the "skip this sheet" signal).
+        header: Vec<Option<String>>,
+        /// `(0-based data-row index, [(col, value)])` for every data row
+        /// with at least one value, in ascending row order.
+        data_rows: Vec<(usize, Vec<(usize, String)>)>,
+        /// Total data rows including blank ones (`sheet rows - 1`).
+        n_data_rows: usize,
+    }
+
+    impl SheetGrid {
+        /// `cells` yields `(0-based row, 0-based col, value)`; row 0 is
+        /// the header. `n_rows`/`n_cols` are the sheet's used-range
+        /// dimensions (each the max index seen + 1), i.e. exactly what
+        /// the dense grid this replaces was sized to.
+        fn from_cells(
+            cells: impl IntoIterator<Item = (usize, usize, String)>,
+            n_rows: usize,
+            n_cols: usize,
+        ) -> SheetGrid {
+            let mut header = vec![None; n_cols];
+            let mut by_row: BTreeMap<usize, Vec<(usize, String)>> = BTreeMap::new();
+            for (row, col, value) in cells {
+                if row == 0 {
+                    if col < n_cols {
+                        header[col] = Some(value);
+                    }
+                } else {
+                    by_row.entry(row - 1).or_default().push((col, value));
+                }
+            }
+            SheetGrid {
+                header,
+                data_rows: by_row.into_iter().collect(),
+                n_data_rows: n_rows.saturating_sub(1),
+            }
+        }
+
+        fn empty() -> SheetGrid {
+            SheetGrid {
+                header: Vec::new(),
+                data_rows: Vec::new(),
+                n_data_rows: 0,
+            }
+        }
+
+        fn is_empty_sheet(&self) -> bool {
+            self.header.is_empty()
+        }
+
+        /// One `ColumnInput` per header column - `raw_values` holds only
+        /// the non-null values (a blank cell/row contributes nothing but
+        /// still counts toward `total`), matching what the old dense-grid
+        /// path produced after its own flatten, byte for byte.
+        fn into_column_inputs(self, nrows: Option<usize>) -> Vec<ColumnInput> {
+            let headers: Vec<String> = self
+                .header
+                .into_iter()
+                .map(Option::unwrap_or_default)
+                .collect();
+            let ncol = headers.len();
+            let total = nrows.map_or(self.n_data_rows, |limit| limit.min(self.n_data_rows));
+            let mut per_col: Vec<Vec<String>> = vec![Vec::new(); ncol];
+            for (idx, row_cells) in self.data_rows {
+                if nrows.is_some_and(|limit| idx >= limit) {
+                    break;
+                }
+                for (col, value) in row_cells {
+                    if col < ncol {
+                        per_col[col].push(value);
+                    }
+                }
+            }
+            headers
+                .into_iter()
+                .zip(per_col)
+                .map(|(name, non_null)| {
+                    let current_type = if non_null.is_empty() {
+                        "String".to_string()
+                    } else {
+                        let refs: Vec<&str> = non_null.iter().map(String::as_str).collect();
+                        naive_current_type(&refs).to_string()
+                    };
+                    ColumnInput {
+                        name,
+                        current_type,
+                        raw_values: non_null,
+                        total,
+                        skip_heuristics: false,
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// Parses one worksheet's `<sheetData>` into a `SheetGrid` (see there
+    /// for why this isn't a dense `row x column` grid). `None` cells are
+    /// simply absent - Excel only ever writes non-empty cells - and a
+    /// fully-blank row still counts toward the data-row total, the same
+    /// as calamine's own `Range` type represents it.
     fn xlsx_parse_sheet(
         xml: &str,
         shared_strings: &[String],
         is_date_format: &[bool],
-    ) -> Result<Vec<Vec<Option<String>>>> {
+    ) -> Result<SheetGrid> {
         let root = xml_parse(xml)?;
         // `root` (and everything under it) is never read again after this
         // function builds its output grid, so the whole tree is walked by
@@ -45568,7 +45672,7 @@ mod xlsx_support {
         // (OOXML's own default type) included - the single most common
         // cell shape in a real data file.
         let Some(sheet_data) = root.into_child("sheetData") else {
-            return Ok(Vec::new());
+            return Ok(SheetGrid::empty());
         };
 
         let mut sparse_rows: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
@@ -45655,15 +45759,15 @@ mod xlsx_support {
             sparse_rows.push((row_num, cells));
         }
 
-        let mut grid: Vec<Vec<Option<String>>> = vec![vec![None; max_col]; max_row];
-        for (row_num, cells) in sparse_rows {
-            for (col_idx, value) in cells {
-                if !value.is_empty() {
-                    grid[row_num - 1][col_idx] = Some(value);
-                }
-            }
-        }
-        Ok(grid)
+        // `max_row` is the largest 1-based row number seen (so also the
+        // row count); `max_col` is already a count. Row 0 is the header.
+        let cells = sparse_rows.into_iter().flat_map(|(row_num, cells)| {
+            cells
+                .into_iter()
+                .filter(|(_, value)| !value.is_empty())
+                .map(move |(col_idx, value)| (row_num - 1, col_idx, value))
+        });
+        Ok(SheetGrid::from_cells(cells, max_row, max_col))
     }
 
     /// A workbook's own `xl/workbook.xml` names sheets by a relationship id
@@ -45748,60 +45852,14 @@ mod xlsx_support {
             let sheet_xml = String::from_utf8(sheet_bytes)
                 .with_context(|| format!("sheet '{sheet_name}' is not valid UTF-8"))?;
             let grid = xlsx_parse_sheet(&sheet_xml, &shared_strings, &is_date_format)?;
-
-            let mut rows = grid.into_iter();
-            let Some(header_row) = rows.next() else {
-                continue; // empty sheet - no header row, contributes no table
-            };
-            let headers: Vec<String> = header_row
-                .iter()
-                .map(|c| c.clone().unwrap_or_default())
+            if grid.is_empty_sheet() {
+                continue; // no cells at all - contributes no table
+            }
+            let profiles: Vec<ColumnProfile> = grid
+                .into_column_inputs(nrows)
+                .into_iter()
+                .map(|c| profile_column(c, n_samples))
                 .collect();
-
-            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-            for (i, mut row) in rows.enumerate() {
-                if nrows.is_some_and(|limit| i >= limit) {
-                    break;
-                }
-                // `row` is already owned here (moved out of `grid` via
-                // `.into_iter()` above), so each cell can move directly
-                // into its own column instead of being cloned - found via
-                // real-world profiling (a real, wide 19-column, 500,000-
-                // row spreadsheet showed this exact loop's `String`
-                // clones as a genuine, if modest, share of total time).
-                // `resize` first so a short row (a real, legal shape - a
-                // trailing run of empty cells is often omitted entirely)
-                // pads out to every declared column with `None` exactly
-                // like the old `.get(col_idx)` fallback did, and a
-                // longer-than-declared row is truncated to it - `zip`
-                // alone, with no resize, would otherwise silently
-                // misalign every column after a short row's own length.
-                row.resize(headers.len(), None);
-                for (col, cell) in raw.iter_mut().zip(row) {
-                    col.push(cell);
-                }
-            }
-
-            let mut profiles = Vec::new();
-            for (i, name) in headers.into_iter().enumerate() {
-                let total = raw[i].len();
-                let non_null: Vec<String> =
-                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
-                let current_type = if non_null.is_empty() {
-                    "String".to_string()
-                } else {
-                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-                    naive_current_type(&refs).to_string()
-                };
-                let col = ColumnInput {
-                    name,
-                    current_type,
-                    raw_values: non_null,
-                    total,
-                    skip_heuristics: false,
-                };
-                profiles.push(profile_column(col, n_samples));
-            }
             out.push((sheet_name, profiles));
         }
 
@@ -45892,7 +45950,7 @@ mod xlsx_support {
         None
     }
 
-    fn ods_parse_sheet(table: &XmlElement) -> Vec<Vec<Option<String>>> {
+    fn ods_parse_sheet(table: &XmlElement) -> SheetGrid {
         let mut sparse: Vec<(usize, usize, String)> = Vec::new();
         let mut max_row = 0usize;
         let mut max_col = 0usize;
@@ -45936,11 +45994,8 @@ mod xlsx_support {
             row_pos += row_repeat;
         }
 
-        let mut grid: Vec<Vec<Option<String>>> = vec![vec![None; max_col + 1]; max_row + 1];
-        for (r, c, v) in sparse {
-            grid[r][c] = Some(v);
-        }
-        grid
+        // `max_row`/`max_col` are 0-based maxima; row 0 is the header.
+        SheetGrid::from_cells(sparse, max_row + 1, max_col + 1)
     }
 
     pub(crate) fn columns_from_ods(
@@ -45965,60 +46020,14 @@ mod xlsx_support {
         for table in spreadsheet.children_named("table:table") {
             let sheet_name = table.attr("table:name").unwrap_or("Sheet1").to_string();
             let grid = ods_parse_sheet(table);
-
-            let mut rows = grid.into_iter();
-            let Some(header_row) = rows.next() else {
+            if grid.is_empty_sheet() {
                 continue;
-            };
-            let headers: Vec<String> = header_row
-                .iter()
-                .map(|c| c.clone().unwrap_or_default())
+            }
+            let profiles: Vec<ColumnProfile> = grid
+                .into_column_inputs(nrows)
+                .into_iter()
+                .map(|c| profile_column(c, n_samples))
                 .collect();
-
-            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-            for (i, mut row) in rows.enumerate() {
-                if nrows.is_some_and(|limit| i >= limit) {
-                    break;
-                }
-                // `row` is already owned here (moved out of `grid` via
-                // `.into_iter()` above), so each cell can move directly
-                // into its own column instead of being cloned - found via
-                // real-world profiling (a real, wide 19-column, 500,000-
-                // row spreadsheet showed this exact loop's `String`
-                // clones as a genuine, if modest, share of total time).
-                // `resize` first so a short row (a real, legal shape - a
-                // trailing run of empty cells is often omitted entirely)
-                // pads out to every declared column with `None` exactly
-                // like the old `.get(col_idx)` fallback did, and a
-                // longer-than-declared row is truncated to it - `zip`
-                // alone, with no resize, would otherwise silently
-                // misalign every column after a short row's own length.
-                row.resize(headers.len(), None);
-                for (col, cell) in raw.iter_mut().zip(row) {
-                    col.push(cell);
-                }
-            }
-
-            let mut profiles = Vec::new();
-            for (i, name) in headers.into_iter().enumerate() {
-                let total = raw[i].len();
-                let non_null: Vec<String> =
-                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
-                let current_type = if non_null.is_empty() {
-                    "String".to_string()
-                } else {
-                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-                    naive_current_type(&refs).to_string()
-                };
-                let col = ColumnInput {
-                    name,
-                    current_type,
-                    raw_values: non_null,
-                    total,
-                    skip_heuristics: false,
-                };
-                profiles.push(profile_column(col, n_samples));
-            }
             out.push((sheet_name, profiles));
         }
 
@@ -46901,11 +46910,7 @@ mod xlsx_support {
     /// cache says "the real value is a string", the STRING record
     /// immediately following supplies it (`fmla_pos` tracks which cell
     /// that belongs to, since STRING carries no row/col of its own).
-    fn xls_parse_sheet(
-        stream: &[u8],
-        sst: &[String],
-        is_date_by_xf: &[bool],
-    ) -> Result<Vec<Vec<Option<String>>>> {
+    fn xls_parse_sheet(stream: &[u8], sst: &[String], is_date_by_xf: &[bool]) -> Result<SheetGrid> {
         let mut sparse: Vec<(u32, u32, String)> = Vec::new();
         let mut max_row: i64 = -1;
         let mut max_col: i64 = -1;
@@ -46971,14 +46976,16 @@ mod xlsx_support {
         }
 
         if max_row < 0 || max_col < 0 {
-            return Ok(Vec::new());
+            return Ok(SheetGrid::empty());
         }
-        let mut grid: Vec<Vec<Option<String>>> =
-            vec![vec![None; (max_col + 1) as usize]; (max_row + 1) as usize];
-        for (row, col, val) in sparse {
-            grid[row as usize][col as usize] = Some(val);
-        }
-        Ok(grid)
+        let cells = sparse
+            .into_iter()
+            .map(|(r, c, v)| (r as usize, c as usize, v));
+        Ok(SheetGrid::from_cells(
+            cells,
+            (max_row + 1) as usize,
+            (max_col + 1) as usize,
+        ))
     }
 
     pub(crate) fn columns_from_xls(
@@ -47007,60 +47014,14 @@ mod xlsx_support {
                 .get(pos..)
                 .context("BOUNDSHEET8 position past the end of the Workbook stream")?;
             let grid = xls_parse_sheet(sheet_stream, &sst, &is_date_by_xf)?;
-
-            let mut rows = grid.into_iter();
-            let Some(header_row) = rows.next() else {
-                continue; // empty sheet (or a non-tabular one, e.g. a chart) - contributes no table
-            };
-            let headers: Vec<String> = header_row
-                .iter()
-                .map(|c| c.clone().unwrap_or_default())
+            if grid.is_empty_sheet() {
+                continue; // empty sheet (or a non-tabular one, e.g. a chart)
+            }
+            let profiles: Vec<ColumnProfile> = grid
+                .into_column_inputs(nrows)
+                .into_iter()
+                .map(|c| profile_column(c, n_samples))
                 .collect();
-
-            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-            for (i, mut row) in rows.enumerate() {
-                if nrows.is_some_and(|limit| i >= limit) {
-                    break;
-                }
-                // `row` is already owned here (moved out of `grid` via
-                // `.into_iter()` above), so each cell can move directly
-                // into its own column instead of being cloned - found via
-                // real-world profiling (a real, wide 19-column, 500,000-
-                // row spreadsheet showed this exact loop's `String`
-                // clones as a genuine, if modest, share of total time).
-                // `resize` first so a short row (a real, legal shape - a
-                // trailing run of empty cells is often omitted entirely)
-                // pads out to every declared column with `None` exactly
-                // like the old `.get(col_idx)` fallback did, and a
-                // longer-than-declared row is truncated to it - `zip`
-                // alone, with no resize, would otherwise silently
-                // misalign every column after a short row's own length.
-                row.resize(headers.len(), None);
-                for (col, cell) in raw.iter_mut().zip(row) {
-                    col.push(cell);
-                }
-            }
-
-            let mut profiles = Vec::new();
-            for (i, name) in headers.into_iter().enumerate() {
-                let total = raw[i].len();
-                let non_null: Vec<String> =
-                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
-                let current_type = if non_null.is_empty() {
-                    "String".to_string()
-                } else {
-                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-                    naive_current_type(&refs).to_string()
-                };
-                let col = ColumnInput {
-                    name,
-                    current_type,
-                    raw_values: non_null,
-                    total,
-                    skip_heuristics: false,
-                };
-                profiles.push(profile_column(col, n_samples));
-            }
             out.push((sheet_name, profiles));
         }
 
@@ -47393,11 +47354,7 @@ mod xlsx_support {
     /// scope. `BrtCellBlank` (an explicitly-blank cell) is silently
     /// skipped, the same "absent = missing" convention every other
     /// reader in this project already uses.
-    fn xlsb_parse_sheet(
-        data: &[u8],
-        sst: &[String],
-        is_date_by_xf: &[bool],
-    ) -> Result<Vec<Vec<Option<String>>>> {
+    fn xlsb_parse_sheet(data: &[u8], sst: &[String], is_date_by_xf: &[bool]) -> Result<SheetGrid> {
         let mut sparse: Vec<(u32, u32, String)> = Vec::new();
         let mut max_row: i64 = -1;
         let mut max_col: i64 = -1;
@@ -47482,14 +47439,16 @@ mod xlsx_support {
         }
 
         if max_row < 0 || max_col < 0 {
-            return Ok(Vec::new());
+            return Ok(SheetGrid::empty());
         }
-        let mut grid: Vec<Vec<Option<String>>> =
-            vec![vec![None; (max_col + 1) as usize]; (max_row + 1) as usize];
-        for (r, c, v) in sparse {
-            grid[r as usize][c as usize] = Some(v);
-        }
-        Ok(grid)
+        let cells = sparse
+            .into_iter()
+            .map(|(r, c, v)| (r as usize, c as usize, v));
+        Ok(SheetGrid::from_cells(
+            cells,
+            (max_row + 1) as usize,
+            (max_col + 1) as usize,
+        ))
     }
 
     pub(crate) fn columns_from_xlsb(
@@ -47524,60 +47483,14 @@ mod xlsx_support {
                 .read(&entry.part_path)
                 .with_context(|| format!("failed to read sheet '{}' in {path:?}", entry.name))?;
             let grid = xlsb_parse_sheet(&sheet_bytes, &sst, &is_date_by_xf)?;
-
-            let mut rows = grid.into_iter();
-            let Some(header_row) = rows.next() else {
-                continue; // empty sheet (or a non-tabular one, e.g. a chart) - contributes no table
-            };
-            let headers: Vec<String> = header_row
-                .iter()
-                .map(|c| c.clone().unwrap_or_default())
+            if grid.is_empty_sheet() {
+                continue; // empty sheet (or a non-tabular one, e.g. a chart)
+            }
+            let profiles: Vec<ColumnProfile> = grid
+                .into_column_inputs(nrows)
+                .into_iter()
+                .map(|c| profile_column(c, n_samples))
                 .collect();
-
-            let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-            for (i, mut row) in rows.enumerate() {
-                if nrows.is_some_and(|limit| i >= limit) {
-                    break;
-                }
-                // `row` is already owned here (moved out of `grid` via
-                // `.into_iter()` above), so each cell can move directly
-                // into its own column instead of being cloned - found via
-                // real-world profiling (a real, wide 19-column, 500,000-
-                // row spreadsheet showed this exact loop's `String`
-                // clones as a genuine, if modest, share of total time).
-                // `resize` first so a short row (a real, legal shape - a
-                // trailing run of empty cells is often omitted entirely)
-                // pads out to every declared column with `None` exactly
-                // like the old `.get(col_idx)` fallback did, and a
-                // longer-than-declared row is truncated to it - `zip`
-                // alone, with no resize, would otherwise silently
-                // misalign every column after a short row's own length.
-                row.resize(headers.len(), None);
-                for (col, cell) in raw.iter_mut().zip(row) {
-                    col.push(cell);
-                }
-            }
-
-            let mut profiles = Vec::new();
-            for (i, name) in headers.into_iter().enumerate() {
-                let total = raw[i].len();
-                let non_null: Vec<String> =
-                    std::mem::take(&mut raw[i]).into_iter().flatten().collect();
-                let current_type = if non_null.is_empty() {
-                    "String".to_string()
-                } else {
-                    let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-                    naive_current_type(&refs).to_string()
-                };
-                let col = ColumnInput {
-                    name,
-                    current_type,
-                    raw_values: non_null,
-                    total,
-                    skip_heuristics: false,
-                };
-                profiles.push(profile_column(col, n_samples));
-            }
             out.push((entry.name, profiles));
         }
 

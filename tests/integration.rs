@@ -1274,6 +1274,30 @@ fn ods_is_auto_detected_from_content_when_extensionless() {
 
 #[cfg(feature = "xlsx")]
 #[test]
+fn xlsx_with_a_stray_cell_near_the_max_row_does_not_allocate_a_dense_grid() {
+    // One value at C1048570 (near Excel's 1,048,576-row limit) on top of
+    // 3 real data rows. The old dense `vec![vec![None; max_col];
+    // max_row]` path allocated a ~1M-tall grid for this (~150 MB RSS
+    // even at 3 columns; an OOM if the stray cell were also far to the
+    // right). The reader now builds only what the populated cells need.
+    // The real columns still profile correctly and the phantom rows
+    // still count toward `missing_pct`, exactly as before.
+    let doc = run_json("edge_xlsx_stray_far_cell.xlsx", &[]);
+    let cols = table(&doc, "Sheet1");
+    assert_eq!(
+        column(cols, "id")["sample_values"],
+        serde_json::json!(["1", "2", "3"])
+    );
+    assert_eq!(
+        column(cols, "name")["sample_values"],
+        serde_json::json!(["alice", "bob", "carol"])
+    );
+    // 3 values out of ~1,048,569 data rows -> rounds to 100.0.
+    assert_eq!(column(cols, "id")["missing_pct"].as_f64().unwrap(), 100.0);
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
 fn ods_handles_a_real_scale_repeated_empty_row_block_without_hanging() {
     // table:number-rows-repeated at ODF's own max dimensions
     // (1,048,573 rows x 16,384 columns) - a real LibreOffice padding
