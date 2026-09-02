@@ -11990,8 +11990,14 @@ fn describe_kinds(counts: &JsonKindCounts) -> String {
 
 /// Recursively unwraps arrays of any depth into a flat pool of non-array,
 /// non-null leaf values (scalars and/or objects), noting whether an array
-/// was seen anywhere along the way.
-fn unwrap_arrays<'a>(values: &[&'a JsonValue]) -> (Vec<&'a JsonValue>, bool) {
+/// was seen anywhere along the way. Takes `values` by value so the common
+/// case - a column with no arrays at all - hands the same `Vec` straight
+/// back with no second allocation (the recursive walk is only needed
+/// when there's actually an array to flatten).
+fn unwrap_arrays<'a>(values: Vec<&'a JsonValue>) -> (Vec<&'a JsonValue>, bool) {
+    if !values.iter().any(|v| matches!(v, JsonValue::Array(_))) {
+        return (values, false);
+    }
     fn walk<'a>(v: &'a JsonValue, pool: &mut Vec<&'a JsonValue>, saw_array: &mut bool) {
         match v {
             JsonValue::Array(items) => {
@@ -12005,9 +12011,9 @@ fn unwrap_arrays<'a>(values: &[&'a JsonValue]) -> (Vec<&'a JsonValue>, bool) {
             _ => pool.push(v),
         }
     }
-    let mut pool = Vec::new();
+    let mut pool = Vec::with_capacity(values.len());
     let mut saw_array = false;
-    for v in values {
+    for v in &values {
         walk(v, &mut pool, &mut saw_array);
     }
     (pool, saw_array)
@@ -12095,7 +12101,7 @@ fn profile_json_path(
         }];
     }
 
-    let (pool, saw_array) = unwrap_arrays(&values);
+    let (pool, saw_array) = unwrap_arrays(values);
     let wrap = |s: &str| {
         if saw_array {
             format!("Vec<{s}>")
