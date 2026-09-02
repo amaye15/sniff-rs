@@ -4727,9 +4727,16 @@ fn columns_from_csv(
     let split_at = (skip_rows + 1).min(records.len());
     let data_rows: Vec<Vec<String>> = records.split_off(split_at);
 
-    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); headers.len()];
-    for (i, record) in data_rows.into_iter().enumerate() {
-        if nrows.is_some_and(|limit| i >= limit) {
+    // One `Vec<String>` per column holding only the non-null values,
+    // plus a running row count - rather than a `Vec<Vec<Option<String>>>`
+    // (an `Option` slot per cell, cols x rows of them) that then has to
+    // be flattened per column. `profile_column` reconstructs
+    // `missing_pct` from `total` minus the value count, so the `None`
+    // slots were never needed.
+    let mut col_values: Vec<Vec<String>> = vec![Vec::new(); headers.len()];
+    let mut total = 0usize;
+    for record in data_rows {
+        if nrows.is_some_and(|limit| total >= limit) {
             break;
         }
         if record.len() != headers.len() {
@@ -4741,15 +4748,15 @@ fn columns_from_csv(
         }
         for (col_idx, field) in record.into_iter().enumerate() {
             let trimmed = field.trim();
-            let missing = trimmed.is_empty() || is_missing_sentinel(trimmed);
-            raw[col_idx].push(if missing { None } else { Some(field) });
+            if !(trimmed.is_empty() || is_missing_sentinel(trimmed)) {
+                col_values[col_idx].push(field);
+            }
         }
+        total += 1;
     }
 
     let mut columns = Vec::new();
-    for (name, col_raw) in headers.into_iter().zip(raw) {
-        let total = col_raw.len();
-        let non_null: Vec<String> = col_raw.into_iter().flatten().collect();
+    for (name, non_null) in headers.into_iter().zip(col_values) {
         let current_type = if non_null.is_empty() {
             "String".to_string()
         } else {
