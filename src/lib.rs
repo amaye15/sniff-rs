@@ -41084,46 +41084,53 @@ mod xml_support {
     }
 
     fn xml_element_to_json(el: &XmlElement) -> JsonValue {
-        let mut obj = json_support::Map::new();
+        // Build the field list in one pass with an `&str -> index` map so
+        // repeated same-name children pool into an array in O(1) each,
+        // rather than the old `HashMap<String, Vec<_>>` + separate
+        // order-tracking `Vec` + two `child.name.clone()`s per child, then
+        // an O(distinct^2) run of `Map::insert`s. The map keys borrow
+        // `el.children`, never `fields`, so there's no borrow conflict
+        // with mutating `fields[i]`.
+        let mut fields: Vec<(String, JsonValue)> = Vec::new();
+        let mut index: HashMap<&str, usize, FxBuildHasher> = HashMap::default();
+
         for (k, v) in &el.attrs {
-            obj.insert(format!("@{k}"), JsonValue::String(v.clone()));
+            fields.push((format!("@{k}"), JsonValue::String(v.clone())));
         }
 
-        let mut text = String::new();
-        let mut child_order: Vec<String> = Vec::new();
-        let mut child_values: HashMap<String, Vec<JsonValue>> = HashMap::new();
         for child in &el.children {
-            child_values
-                .entry(child.name.clone())
-                .or_insert_with(|| {
-                    child_order.push(child.name.clone());
-                    Vec::new()
-                })
-                .push(xml_element_to_json(child));
-        }
-        text.push_str(&el.text);
-        for name in child_order {
-            let mut values = child_values.remove(&name).unwrap();
-            let value = if values.len() == 1 {
-                values.pop().unwrap()
-            } else {
-                JsonValue::Array(values)
-            };
-            obj.insert(name, value);
+            let cv = xml_element_to_json(child);
+            match index.get(child.name.as_str()) {
+                Some(&i) => match &mut fields[i].1 {
+                    JsonValue::Array(arr) => arr.push(cv),
+                    slot => {
+                        let first = std::mem::replace(slot, JsonValue::Null);
+                        *slot = JsonValue::Array(vec![first, cv]);
+                    }
+                },
+                None => {
+                    index.insert(child.name.as_str(), fields.len());
+                    fields.push((child.name.clone(), cv));
+                }
+            }
         }
 
-        let text = text.trim();
+        let text = el.text.trim();
         if !text.is_empty() {
-            if obj.is_empty() {
+            if fields.is_empty() {
                 return JsonValue::String(text.to_string());
             }
-            obj.insert("#text".to_string(), JsonValue::String(text.to_string()));
+            fields.push(("#text".to_string(), JsonValue::String(text.to_string())));
         }
 
-        if obj.is_empty() {
+        if fields.is_empty() {
             JsonValue::Null
         } else {
-            JsonValue::Object(obj)
+            // `FromIterator for Map` de-dups last-wins (only relevant for
+            // malformed input - a repeated attribute, or a child tag
+            // literally named like an `@attr`); the common case is all
+            // unique and just appends.
+            JsonValue::Object(fields.into_iter().collect())
         }
     }
 
