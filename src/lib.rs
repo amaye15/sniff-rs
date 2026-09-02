@@ -4301,49 +4301,60 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
         );
     }
 
-    let normalized: Vec<(Cow<str>, bool)> =
-        values.iter().map(|v| normalize_numeric_str(v)).collect();
-    let any_percent = normalized.iter().any(|(_, pct)| *pct);
-    let cleaned_refs: Vec<&str> = normalized.iter().map(|(s, _)| s.as_ref()).collect();
+    // Both the i64 and the f64 branch require *every* value to parse, so
+    // if the very first value doesn't even parse as f64 (the looser of
+    // the two) the column can't be either - skip normalizing every value
+    // and building the two full-length `Vec`s those branches need. A
+    // plain free-text or category-label column (a common shape, and
+    // `suggest_ideal_type`'s own documented worst case) takes this path.
+    let first_parses_numeric = values
+        .first()
+        .is_some_and(|v| normalize_numeric_str(v).0.parse::<f64>().is_ok());
+    if first_parses_numeric {
+        let normalized: Vec<(Cow<str>, bool)> =
+            values.iter().map(|v| normalize_numeric_str(v)).collect();
+        let any_percent = normalized.iter().any(|(_, pct)| *pct);
+        let cleaned_refs: Vec<&str> = normalized.iter().map(|(s, _)| s.as_ref()).collect();
 
-    if cleaned_refs.iter().all(|v| v.parse::<i64>().is_ok()) {
-        return ("i64".to_string(), numeric_note(current, "i64", any_percent));
-    }
-    if cleaned_refs.iter().all(|v| v.parse::<f64>().is_ok()) {
-        let mut note = numeric_note(current, "f64", any_percent);
-        // Rust's f64 parser accepts "inf"/"infinity"/"nan" (any case, signed)
-        // as legitimate values - real IEEE-754 special values, not a parse
-        // error - so a stray "Infinity" typed into an otherwise-clean numeric
-        // column sails through silently unless flagged explicitly here.
-        if cleaned_refs
-            .iter()
-            .any(|v| v.parse::<f64>().is_ok_and(|f| !f.is_finite()))
-        {
-            let extra = "contains a non-finite value (Infinity/NaN) - verify this isn't a data-quality sentinel before trusting downstream arithmetic";
-            note = if note.is_empty() {
-                extra.to_string()
-            } else {
-                format!("{note}; {extra}")
-            };
+        if cleaned_refs.iter().all(|v| v.parse::<i64>().is_ok()) {
+            return ("i64".to_string(), numeric_note(current, "i64", any_percent));
         }
-        // A value that's itself a plain integer literal but individually
-        // failed i64 parsing (as opposed to merely being outvoted by some
-        // other, differently-shaped value in the same column, like the
-        // "infinity" case just above) is, by construction, already too
-        // large to represent exactly as f64 either - see
-        // is_plain_integer_literal's doc comment.
-        if cleaned_refs
-            .iter()
-            .any(|v| is_plain_integer_literal(v) && v.parse::<i64>().is_err())
-        {
-            let extra = "value(s) exceed i64's range and f64's exact-integer range (~2^53) - representing as float silently loses precision";
-            note = if note.is_empty() {
-                extra.to_string()
-            } else {
-                format!("{note}; {extra}")
-            };
+        if cleaned_refs.iter().all(|v| v.parse::<f64>().is_ok()) {
+            let mut note = numeric_note(current, "f64", any_percent);
+            // Rust's f64 parser accepts "inf"/"infinity"/"nan" (any case, signed)
+            // as legitimate values - real IEEE-754 special values, not a parse
+            // error - so a stray "Infinity" typed into an otherwise-clean numeric
+            // column sails through silently unless flagged explicitly here.
+            if cleaned_refs
+                .iter()
+                .any(|v| v.parse::<f64>().is_ok_and(|f| !f.is_finite()))
+            {
+                let extra = "contains a non-finite value (Infinity/NaN) - verify this isn't a data-quality sentinel before trusting downstream arithmetic";
+                note = if note.is_empty() {
+                    extra.to_string()
+                } else {
+                    format!("{note}; {extra}")
+                };
+            }
+            // A value that's itself a plain integer literal but individually
+            // failed i64 parsing (as opposed to merely being outvoted by some
+            // other, differently-shaped value in the same column, like the
+            // "infinity" case just above) is, by construction, already too
+            // large to represent exactly as f64 either - see
+            // is_plain_integer_literal's doc comment.
+            if cleaned_refs
+                .iter()
+                .any(|v| is_plain_integer_literal(v) && v.parse::<i64>().is_err())
+            {
+                let extra = "value(s) exceed i64's range and f64's exact-integer range (~2^53) - representing as float silently loses precision";
+                note = if note.is_empty() {
+                    extra.to_string()
+                } else {
+                    format!("{note}; {extra}")
+                };
+            }
+            return ("f64".to_string(), note);
         }
-        return ("f64".to_string(), note);
     }
 
     // Built incrementally with an early exit once the count passes 50,
@@ -4388,8 +4399,17 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
     ("String".to_string(), String::new())
 }
 
-fn escape_md(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', " ")
+/// Escapes the two characters that would break a Markdown table cell.
+/// Returns `Cow::Borrowed` untouched for the overwhelmingly common case
+/// of a value with neither - `str::replace` otherwise allocates a fresh
+/// `String` (here, twice) on every call regardless, and this runs ~7
+/// times per column in `render_markdown`.
+fn escape_md(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b == b'|' || b == b'\n') {
+        Cow::Owned(s.replace('|', "\\|").replace('\n', " "))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 /// Round to 1 decimal place so JSON output shows 66.7, not 66.66666666666667.
