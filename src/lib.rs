@@ -584,8 +584,10 @@ mod json_support {
             self.entries.push((key, value));
         }
 
-        // Only called from feature-gated readers (INI's duplicate-key
-        // pooling) - unused in a plain default build.
+        // Currently unused (its last caller, INI's duplicate-key
+        // pooling, was rewritten to a one-pass `&str -> index` map to
+        // drop its per-key linear scan) - kept as the natural mutable
+        // counterpart to `get`.
         #[allow(dead_code)]
         pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
             self.entries
