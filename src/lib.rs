@@ -31649,10 +31649,9 @@ mod parquet_support {
         for (col_idx, (_name, reader)) in top_level.iter().enumerate() {
             for _ in 0..num_rows {
                 let value = reader.read_field(&mut leaves)?;
-                columns[col_idx].push(if value.is_null() {
-                    None
-                } else {
-                    Some(json_scalar_to_raw_string(&value))
+                columns[col_idx].push(match value {
+                    JsonValue::Null => None,
+                    v => Some(json_scalar_into_raw_string(v)),
                 });
             }
         }
@@ -31737,9 +31736,13 @@ mod parquet_support {
     /// helpers, `parquet`/`arrow_ipc` aren't independently togglable
     /// features (both live behind the one `parquet` feature flag), so
     /// there's no build-configuration reason to keep two copies.
-    pub(crate) fn json_scalar_to_raw_string(v: &JsonValue) -> String {
+    /// Consumes the value - every caller has an owned `JsonValue` it
+    /// discards immediately after, so a string column's value moves out
+    /// rather than being cloned (a real saving for a long-text or
+    /// dictionary-encoded column: one memcpy per cell avoided).
+    pub(crate) fn json_scalar_into_raw_string(v: JsonValue) -> String {
         match v {
-            JsonValue::String(s) => s.clone(),
+            JsonValue::String(s) => s,
             JsonValue::Number(n) => n.to_string(),
             JsonValue::Bool(b) => b.to_string(),
             other => other.to_string(),
@@ -31913,7 +31916,7 @@ mod parquet_support {
                     continue;
                 };
                 match &mut accum[idx] {
-                    FieldAccum::Flat(v) => v.push(json_scalar_to_raw_string(&value)),
+                    FieldAccum::Flat(v) => v.push(json_scalar_into_raw_string(value)),
                     FieldAccum::Nested(v) => v.push(value),
                 }
             }
@@ -35691,9 +35694,9 @@ mod arrow_ipc_support {
                 out.extend(profile_json_path(name, total, refs, n_samples));
             } else {
                 let raw_values: Vec<String> = values
-                    .iter()
+                    .into_iter()
                     .filter(|v| !v.is_null())
-                    .map(super::parquet_support::json_scalar_to_raw_string)
+                    .map(super::parquet_support::json_scalar_into_raw_string)
                     .collect();
                 let col = ColumnInput {
                     name,
