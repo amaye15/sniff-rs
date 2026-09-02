@@ -4937,14 +4937,17 @@ fn resolve_skip_rows(explicit: Option<usize>, path: &Path, delimiter: u8) -> usi
 /// Slices one line into `widths.len()` fields by character count (not byte
 /// count, so multi-byte UTF-8 doesn't split a field mid-character), padding
 /// with empty fields if the line is shorter than the declared widths.
-fn slice_fixed_width(line: &str, widths: &[usize]) -> Vec<String> {
-    let chars: Vec<char> = line.chars().collect();
+/// `scratch` is a caller-owned `Vec<char>` reused across lines so a large
+/// fixed-width file doesn't allocate (and free) one per row.
+fn slice_fixed_width(line: &str, widths: &[usize], scratch: &mut Vec<char>) -> Vec<String> {
+    scratch.clear();
+    scratch.extend(line.chars());
     let mut pos = 0;
     let mut fields = Vec::with_capacity(widths.len());
     for &w in widths {
-        let end = (pos + w).min(chars.len());
-        let field: String = if pos < chars.len() {
-            chars[pos..end].iter().collect()
+        let end = (pos + w).min(scratch.len());
+        let field = if pos < scratch.len() {
+            scratch[pos..end].iter().collect::<String>()
         } else {
             String::new()
         };
@@ -4962,7 +4965,8 @@ fn columns_from_fixed_width(
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
     let mut lines = content.lines();
     let header_line = lines.next().ok_or_else(|| anyhow!("{path:?} is empty"))?;
-    let headers = slice_fixed_width(header_line, widths);
+    let mut scratch: Vec<char> = Vec::new();
+    let headers = slice_fixed_width(header_line, widths, &mut scratch);
 
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); widths.len()];
     let mut i = 0;
@@ -4973,7 +4977,10 @@ fn columns_from_fixed_width(
         if nrows.is_some_and(|limit| i >= limit) {
             break;
         }
-        for (col_idx, field) in slice_fixed_width(line, widths).into_iter().enumerate() {
+        for (col_idx, field) in slice_fixed_width(line, widths, &mut scratch)
+            .into_iter()
+            .enumerate()
+        {
             let missing = field.is_empty() || is_missing_sentinel(&field);
             raw[col_idx].push(if missing { None } else { Some(field) });
         }
