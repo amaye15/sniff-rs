@@ -34767,17 +34767,25 @@ mod arrow_ipc_support {
                         // renders as a genuine JSON object (last-key-wins
                         // on a duplicate key, the same as any JSON object
                         // literal), not an array of {key, value} pairs.
-                        let mut obj = json_support::Map::new();
-                        for entry in slice {
-                            if let JsonValue::Object(pair) = entry
-                                && let Some(JsonValue::String(k)) = pair.get("key")
-                            {
-                                obj.insert(
+                        // `.collect()` -> `Map::from_iter`, whose hash-set
+                        // fast path keeps this O(entries) rather than
+                        // `insert`'s O(entries^2); a duplicate key still
+                        // resolves last-wins, same as a JSON object literal.
+                        let obj: json_support::Map = slice
+                            .iter()
+                            .filter_map(|entry| {
+                                let JsonValue::Object(pair) = entry else {
+                                    return None;
+                                };
+                                let Some(JsonValue::String(k)) = pair.get("key") else {
+                                    return None;
+                                };
+                                Some((
                                     k.clone(),
                                     pair.get("value").cloned().unwrap_or(JsonValue::Null),
-                                );
-                            }
-                        }
+                                ))
+                            })
+                            .collect();
                         Ok(JsonValue::Object(obj))
                     } else {
                         Ok(JsonValue::Array(slice.to_vec()))
@@ -40731,19 +40739,29 @@ fn columns_from_ini(path: &Path, n_samples: usize) -> Result<Vec<(String, Vec<Co
         if props.is_empty() {
             continue; // e.g. no general section before the first [header]
         }
-        let mut record = json_support::Map::new();
-        for (k, v) in props {
-            match record.get_mut(&k) {
-                Some(JsonValue::Array(values)) => values.push(JsonValue::String(v)),
-                Some(existing) => {
-                    let first = existing.clone();
-                    *existing = JsonValue::Array(vec![first, JsonValue::String(v)]);
-                }
+        // One pass with an `&str -> index` map (keys borrow `props`, not
+        // `fields`), so a repeated key pools into an array in O(1) rather
+        // than the old `record.get_mut` linear scan per key - O(keys^2)
+        // for a wide section (php.ini's `[PHP]` block is ~200 directives).
+        let mut fields: Vec<(String, JsonValue)> = Vec::with_capacity(props.len());
+        let mut index: HashMap<&str, usize, FxBuildHasher> = HashMap::default();
+        for (k, v) in &props {
+            let sv = JsonValue::String(v.clone());
+            match index.get(k.as_str()) {
+                Some(&i) => match &mut fields[i].1 {
+                    JsonValue::Array(values) => values.push(sv),
+                    slot => {
+                        let first = std::mem::replace(slot, JsonValue::Null);
+                        *slot = JsonValue::Array(vec![first, sv]);
+                    }
+                },
                 None => {
-                    record.insert(k, JsonValue::String(v));
+                    index.insert(k.as_str(), fields.len());
+                    fields.push((k.clone(), sv));
                 }
             }
         }
+        let record: json_support::Map = fields.into_iter().collect();
         let name = section_name.unwrap_or_else(|| "(default)".to_string());
         out.push((name, profile_json_records(&[record], n_samples)));
     }
@@ -44107,14 +44125,21 @@ fn render_json_schema(
 ) -> Result<String> {
     let mut table_schemas = json_support::Map::with_capacity(tables.len());
     for (table_name, profiles) in tables {
-        let mut properties = json_support::Map::with_capacity(profiles.len());
-        let mut required = Vec::new();
-        for p in profiles {
-            properties.insert(p.name.clone(), json_schema_property(p));
-            if p.missing_pct == 0.0 {
-                required.push(JsonValue::String(p.name.clone()));
-            }
-        }
+        // `.collect()` goes through `Map::from_iter`, whose hash-set fast
+        // path keeps this O(columns) instead of O(columns^2) - a table
+        // can legitimately be very wide, and column names aren't
+        // guaranteed unique (duplicate CSV headers), so `insert`'s
+        // last-wins dedup still has to be honored, which `from_iter`
+        // does.
+        let properties: json_support::Map = profiles
+            .iter()
+            .map(|p| (p.name.clone(), json_schema_property(p)))
+            .collect();
+        let required: Vec<JsonValue> = profiles
+            .iter()
+            .filter(|p| p.missing_pct == 0.0)
+            .map(|p| JsonValue::String(p.name.clone()))
+            .collect();
         let mut schema = json_support::Map::new();
         schema.insert("type".to_string(), json!("object"));
         schema.insert("properties".to_string(), JsonValue::Object(properties));
