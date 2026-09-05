@@ -33,6 +33,30 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/incremental-xlsx` branch (Darwin arm64)
+
+Excel converted. All four spreadsheet readers: `SheetGrid::into_column_inputs`
+(one `Vec<String>` per column + `profile_column`) -> `into_column_profiles`
+(fold each cell into a `ColumnAccumulatorState`, the value-inferred
+`into_profile` path). On its own ~2% - `SheetGrid.data_rows` and the
+whole-sheet XML DOM dominate. So the OOXML reader also got
+`xlsx_parse_sheet_profiles`: streams `<sheetData>` one `<row>` subtree
+at a time (parsed via the existing `xml_parse_element`, cells extracted
+by the unchanged `xlsx_extract_row`, folded, dropped) - the whole
+sheet's XML is never one tree, no `SheetGrid` built. `.ods`/`.xls`/`.xlsb`
+still build a `SheetGrid` (inputs already fully resident).
+
+Measured on a real 300,000-row, 6-column `.xlsx` (~16 MB): maxRSS
+2.24-2.30 GB -> ~155-205 MB (~91-93%), peak footprint ~2.27 GB ->
+~145-196 MB (~91-94%), 3 rounds. Residual is the sheet XML `String`
+(`ZipArchive::read` still returns the whole decompressed entry) plus
+shared strings. Byte-identical output across the full 359-file corpus in
+all three formats with `--nrows` unset/1/2/5 (4,308 combinations) plus a
+120-iteration `.xlsx` fuzz; all four `*_matches_calamine_output_exactly`
+oracle tests unchanged.
+
+---
+
 ## 2026-09-06 — `feat/incremental-msgpack-cbor` branch (Darwin arm64)
 
 MessagePack and CBOR wired through the incremental JSON-path engine

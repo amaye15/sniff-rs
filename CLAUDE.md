@@ -5163,19 +5163,66 @@ concatenated-records, top-level-array, malformed, and deeply-nested
 tests for both), clippy/fmt clean across default/`msgpack`/`cbor`/
 `full`, established baselines.
 
-**Deliberately not done yet**: the remaining `profile_json_records`-based
-readers still materialize their whole record set (TOML, YAML, XML,
-Parquet/Arrow's nested columns, and JSON's own top-level-array and
-single-multi-line-document shapes). A YAML `---`-multi-document stream
-is genuinely streamable (one document at a time); the rest are
-inherently whole-buffer (a single TOML/YAML document, a top-level JSON
-or XML tree - no record boundary to stream on). The streamable one still
-wants its own real-file measurement. Excel still needs its own larger
-`SheetGrid` restructuring (see above) rather than the drop-in bypass the
-eight `profile_column` conversions shared. Per-entry streaming
-decompression inside `ZipArchive::read` itself remains a real,
-disclosed, separately-scoped remaining gap, not folded into any phase
-here.
+**Excel (`.xlsx`/OOXML) went next - the `SheetGrid` restructuring this
+section kept deferring.** All four spreadsheet readers first got the
+small shared step: `SheetGrid::into_column_inputs` (which built one
+`Vec<String>` per column, then `profile_column` over each) became
+`into_column_profiles`, folding each cell straight into a
+`ColumnAccumulatorState` (Excel's `current_type` is value-inferred, the
+`into_profile`/`NaiveTypeAccumulator` path CSV and fixed-width already
+use). On its own that only removed the per-column `Vec` copy - a real
+~2% on the file measured, because `SheetGrid.data_rows` (every non-empty
+cell) and, for OOXML, the whole-sheet XML DOM `xml_parse` builds before
+`SheetGrid` is even populated, are what actually dominate.
+
+So the OOXML reader got the real change: `xlsx_parse_sheet_profiles`
+streams `<sheetData>` one `<row>` subtree at a time - each row's own
+small DOM is parsed via the existing `xml_parse_element`, its cells
+extracted by the unchanged per-cell value logic (factored into
+`xlsx_extract_row`), folded into the per-column accumulators, then
+dropped. The whole sheet's XML is never one tree, and no `SheetGrid` or
+`Vec<Vec<String>>` of values is built. Output is byte-identical to the
+old DOM-then-`SheetGrid` path: the header is the row numbered 1,
+`n_data_rows` is `(largest 1-based row number seen) - 1` (blank rows
+counted for `missing_pct`), a data row's index is `row_num - 2`, the
+per-column accumulator vector grows as wider rows appear, and an empty
+value or a cell past the header width contributes nothing. `.ods`/`.xls`/
+`.xlsb` still build a `SheetGrid` (their inputs - a decompressed zip
+entry, the OLE2 `Workbook` stream - are already fully resident, so
+per-row streaming there saves far less) but share `into_column_profiles`.
+
+Measured on a real 300,000-row, 6-column `.xlsx` (id/name/email/amount/a
+12-word free-text description/a 4-value category, ~16 MB on disk):
+maxRSS 2.24-2.30 GB -> ~155-205 MB (~91-93%), peak footprint ~2.27 GB ->
+~145-196 MB (~91-94%), 3 rounds. The residual ~150-200 MB is the sheet
+XML `String` itself (`ZipArchive::read` still returns the whole
+decompressed entry - the per-entry-streaming-decompression gap below)
+plus any shared-strings table. Output confirmed byte-identical via
+`diff` against the pre-change binary across the entire 359-file fixture
+corpus in all three output formats with `--nrows` unset/1/2/5 (4,308
+combinations), plus a 120-iteration `.xlsx` fuzz (row gaps, sparse
+cells, stray wide cells, blank rows, multi-sheet, empty header cells,
+mixed types) crossed with `--nrows`/`--samples`/output format - zero
+mismatches. Full test suite unchanged (all four
+`*_matches_calamine_output_exactly` oracle tests, the stray-cell
+no-dense-grid test, hidden/empty sheets, multi-sheet dates), clippy/fmt
+clean across default/`xlsx`/`full`, established baselines.
+
+**Deliberately not done yet**: `.ods`/`.xls`/`.xlsb` still build a
+`SheetGrid` (a smaller concern - see above), and the remaining
+`profile_json_records`-based readers still materialize their whole
+record set (TOML, YAML, XML, Parquet/Arrow's nested columns, and JSON's
+own top-level-array and single-multi-line-document shapes). A YAML
+`---`-multi-document stream is genuinely streamable (one document at a
+time); the rest are inherently whole-buffer - a single TOML/YAML/JSON
+document, a top-level JSON array, or an XML tree is one value with no
+record boundary to stream on, and their hand-rolled parsers are all
+`&str`-buffer parsers with no pull mode, so getting them below one file
+copy would need a from-scratch streaming-parser rewrite of exactly the
+most carefully-verified code, for shapes rarely large enough to matter -
+disproportionate, and out of scope. Per-entry streaming decompression
+inside `ZipArchive::read` itself remains a real, disclosed,
+separately-scoped remaining gap, not folded into any phase here.
 
 ## Cloud-platform file compatibility
 

@@ -4804,13 +4804,12 @@ fn round1(x: f64) -> f64 {
 
 // --- CSV / TSV reader ---
 
-/// No longer called by CSV or fixed-width text (both now use the
-/// incremental `NaiveTypeAccumulator` instead, fed one value at a time as
-/// `ColumnAccumulatorState`'s own `push`) - genuinely unused in the bare
-/// default build, hence `#[allow(dead_code)]`, but still the whole-slice
-/// current-type source for `weblog_support`/`syslog_support`'s own
-/// readers and the hand-rolled `.xls` reader, none of which are compiled
-/// into that build.
+/// No longer called by CSV, fixed-width text, or any of the four
+/// spreadsheet readers (all now use the incremental `NaiveTypeAccumulator`
+/// instead, fed one value at a time via `ColumnAccumulatorState::push`) -
+/// genuinely unused in the bare default build, hence `#[allow(dead_code)]`,
+/// but still the whole-slice current-type source for `weblog_support`/
+/// `syslog_support`'s own readers, which aren't compiled into that build.
 #[allow(dead_code)]
 fn naive_current_type(values: &[&str]) -> &'static str {
     if values
@@ -47388,7 +47387,7 @@ mod xlsx_support {
     /// used to force a `vec![vec![None; max_col]; max_row]` allocation -
     /// tens of MB for one misplaced value, and an OOM if it was also far
     /// to the right. All four spreadsheet readers now build one of these
-    /// instead, and share `into_column_inputs`.
+    /// instead, and share `into_column_profiles`.
     struct SheetGrid {
         /// The header row's cells, positional, `n_cols` wide. Empty iff
         /// the sheet had no cells at all (the "skip this sheet" signal).
@@ -47440,11 +47439,20 @@ mod xlsx_support {
             self.header.is_empty()
         }
 
-        /// One `ColumnInput` per header column - `raw_values` holds only
-        /// the non-null values (a blank cell/row contributes nothing but
-        /// still counts toward `total`), matching what the old dense-grid
-        /// path produced after its own flatten, byte for byte.
-        fn into_column_inputs(self, nrows: Option<usize>) -> Vec<ColumnInput> {
+        /// One `ColumnProfile` per header column, folding each cell value
+        /// straight into a shared `ColumnAccumulatorState` rather than
+        /// first collecting every column's values into a
+        /// `Vec<Vec<String>>` and running `profile_column` over that.
+        /// Excel's `current_type` is inferred from the values themselves
+        /// (`NaiveTypeAccumulator`, the `into_profile` path), so this
+        /// matches CSV's/fixed-width's own Tier 2 conversion byte for
+        /// byte. A blank cell/row contributes nothing but still counts
+        /// toward `total` (the row-count passed to `into_profile`).
+        fn into_column_profiles(
+            self,
+            nrows: Option<usize>,
+            n_samples: usize,
+        ) -> Vec<ColumnProfile> {
             let headers: Vec<String> = self
                 .header
                 .into_iter()
@@ -47452,155 +47460,246 @@ mod xlsx_support {
                 .collect();
             let ncol = headers.len();
             let total = nrows.map_or(self.n_data_rows, |limit| limit.min(self.n_data_rows));
-            let mut per_col: Vec<Vec<String>> = vec![Vec::new(); ncol];
+            let mut states: Vec<ColumnAccumulatorState> =
+                (0..ncol).map(|_| ColumnAccumulatorState::new()).collect();
             for (idx, row_cells) in self.data_rows {
                 if nrows.is_some_and(|limit| idx >= limit) {
                     break;
                 }
                 for (col, value) in row_cells {
                     if col < ncol {
-                        per_col[col].push(value);
+                        states[col].push(value, n_samples);
                     }
                 }
             }
             headers
                 .into_iter()
-                .zip(per_col)
-                .map(|(name, non_null)| {
-                    let current_type = if non_null.is_empty() {
-                        "String".to_string()
-                    } else {
-                        let refs: Vec<&str> = non_null.iter().map(String::as_str).collect();
-                        naive_current_type(&refs).to_string()
-                    };
-                    ColumnInput {
-                        name,
-                        current_type,
-                        raw_values: non_null,
-                        total,
-                        skip_heuristics: false,
-                    }
-                })
+                .zip(states)
+                .map(|(name, state)| state.into_profile(name, total))
                 .collect()
         }
     }
 
-    /// Parses one worksheet's `<sheetData>` into a `SheetGrid` (see there
-    /// for why this isn't a dense `row x column` grid). `None` cells are
-    /// simply absent - Excel only ever writes non-empty cells - and a
-    /// fully-blank row still counts toward the data-row total, the same
-    /// as calamine's own `Range` type represents it.
-    fn xlsx_parse_sheet(
+    /// Extracts one already-parsed `<row>` element's `(1-based row number,
+    /// [(col, value)])` - the per-cell value logic, unchanged, factored
+    /// out so the streaming driver below can call it one `<row>` subtree
+    /// at a time. `positional_fallback` is the row number to assume when a
+    /// row carries no `r=` attribute (its position in file order).
+    fn xlsx_extract_row(
+        row_el: XmlElement,
+        shared_strings: &[String],
+        is_date_format: &[bool],
+        positional_fallback: usize,
+    ) -> (usize, Vec<(usize, String)>) {
+        let row_num: usize = row_el
+            .attr("r")
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(positional_fallback);
+        let mut cells = Vec::new();
+        for c in row_el.into_children_named("c") {
+            let Some(col_idx) = c.attr("r").and_then(xlsx_cell_ref_to_col) else {
+                continue;
+            };
+            // `style_idx` is read from `c.attrs` up front, before the
+            // match below moves pieces out of `c` in some arms - reading
+            // it after would try to borrow `c` after part of it has
+            // already been moved. `cell_type` stays a plain `&str` borrow
+            // of `c.attrs`: it's used only as the match scrutinee, so that
+            // borrow is provably dead before any arm body runs and never
+            // actually conflicts with an arm moving `c`.
+            let cell_type = c.attr("t").unwrap_or("n");
+            let style_idx: usize = c.attr("s").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let value = match cell_type {
+                "inlineStr" => c
+                    .into_child("is")
+                    .map(|is| {
+                        if is.child("t").is_some() {
+                            is.into_child("t").map(|t| t.text).unwrap_or_default()
+                        } else {
+                            is.children_named("r")
+                                .filter_map(|r| r.child("t"))
+                                .map(|t| t.text.as_str())
+                                .collect()
+                        }
+                    })
+                    .unwrap_or_default(),
+                "s" => {
+                    let idx: usize = c
+                        .child("v")
+                        .map(|v| v.text.as_str())
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
+                    shared_strings.get(idx).cloned().unwrap_or_default()
+                }
+                "str" | "e" => c.into_child("v").map(|v| v.text).unwrap_or_default(),
+                "b" => {
+                    let raw = c.child("v").map(|v| v.text.as_str()).unwrap_or("0");
+                    (raw.trim() == "1").to_string()
+                }
+                _ => {
+                    // "n" (numeric), or absent - OOXML's own default
+                    // type. Parsed and re-stringified through f64 rather
+                    // than passed through as the raw XML text verbatim -
+                    // matching calamine's own fast_float2::parse-then-
+                    // Display round trip (confirmed directly against its
+                    // xlsx.rs source), which silently normalizes away a
+                    // written trailing ".0" on a whole number (e.g.
+                    // "30.0" in the XML becomes the displayed value
+                    // "30") - found via exactly this mismatch surfacing
+                    // in the ODS reader's own calamine-comparison test,
+                    // then confirmed to be a real, pre-existing xlsx
+                    // behavior too, not ODS-specific.
+                    let raw = c.into_child("v").map(|v| v.text).unwrap_or_default();
+                    match raw.parse::<f64>() {
+                        Ok(n) if is_date_format.get(style_idx).copied().unwrap_or(false) => {
+                            xlsx_format_serial(n)
+                        }
+                        Ok(n) => n.to_string(),
+                        Err(_) => raw,
+                    }
+                }
+            };
+            cells.push((col_idx, value));
+        }
+        (row_num, cells)
+    }
+
+    /// Streams a worksheet's `<sheetData>` one `<row>` subtree at a time -
+    /// each row's own small DOM is parsed, folded into the per-column
+    /// `ColumnAccumulatorState`s, then dropped - so the whole sheet's XML
+    /// is never materialized as one tree the way `xml_parse` would, and
+    /// no `SheetGrid`/`Vec<Vec<String>>` of values is ever built. Output
+    /// is byte-identical to the old "parse the whole DOM into a
+    /// `SheetGrid`, then `into_column_profiles`" path: the header is the
+    /// row numbered 1, `n_data_rows` is `(largest 1-based row number seen)
+    /// - 1` (blank rows counted, so `missing_pct` still reflects real
+    /// gaps), a data row's index is `row_num - 2`, and an empty value or a
+    /// cell past the header width contributes nothing. Returns `None` for
+    /// a sheet with no cells at all (the "skip this sheet" signal).
+    fn xlsx_parse_sheet_profiles(
         xml: &str,
         shared_strings: &[String],
         is_date_format: &[bool],
-    ) -> Result<SheetGrid> {
-        let root = xml_parse(xml)?;
-        // `root` (and everything under it) is never read again after this
-        // function builds its output grid, so the whole tree is walked by
-        // value from here down - `into_child`/`into_children_named` move
-        // each cell's own `<v>`/`<is>` text out directly instead of
-        // cloning it, which matters here specifically because this is a
-        // per-cell cost paid for every cell in the sheet, numeric cells
-        // (OOXML's own default type) included - the single most common
-        // cell shape in a real data file.
-        let Some(sheet_data) = root.into_child("sheetData") else {
-            return Ok(SheetGrid::empty());
-        };
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Option<Vec<ColumnProfile>>> {
+        let bytes = xml.as_bytes();
+        let mut pos = 0usize;
+        xml_skip_misc(bytes, &mut pos)?;
+        // Root <worksheet ...> start tag.
+        if bytes.get(pos) != Some(&b'<') {
+            bail!("expected the worksheet root element");
+        }
+        pos += 1;
+        let _root_name = xml_parse_name(xml, &mut pos)?;
+        let _root_attrs = xml_parse_attrs(xml, &mut pos)?;
+        xml_skip_ws(bytes, &mut pos);
+        if xml_starts_with(bytes, pos, "/>") {
+            return Ok(None); // <worksheet/> - nothing at all
+        }
+        if bytes.get(pos) != Some(&b'>') {
+            bail!("expected '>' after the worksheet start tag");
+        }
+        pos += 1;
 
-        let mut sparse_rows: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
-        let mut max_row = 0usize;
-        let mut max_col = 0usize;
-        for row_el in sheet_data.into_children_named("row") {
-            let row_num: usize = row_el
-                .attr("r")
-                .and_then(|r| r.parse().ok())
-                .unwrap_or(sparse_rows.len() + 1);
-            max_row = max_row.max(row_num);
-
-            let mut cells = Vec::new();
-            for c in row_el.into_children_named("c") {
-                let Some(col_idx) = c.attr("r").and_then(xlsx_cell_ref_to_col) else {
-                    continue;
-                };
-                max_col = max_col.max(col_idx + 1);
-
-                // `style_idx` is read from `c.attrs` up front, before the
-                // match below moves pieces out of `c` in some arms -
-                // reading it after would try to borrow `c` after part of
-                // it has already been moved. `cell_type` stays a plain
-                // `&str` borrow of `c.attrs`: it's used only as the match
-                // scrutinee, so that borrow is provably dead before any
-                // arm body runs and never actually conflicts with an arm
-                // moving `c`.
-                let cell_type = c.attr("t").unwrap_or("n");
-                let style_idx: usize = c.attr("s").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let value = match cell_type {
-                    "inlineStr" => c
-                        .into_child("is")
-                        .map(|is| {
-                            if is.child("t").is_some() {
-                                is.into_child("t").map(|t| t.text).unwrap_or_default()
-                            } else {
-                                is.children_named("r")
-                                    .filter_map(|r| r.child("t"))
-                                    .map(|t| t.text.as_str())
-                                    .collect()
-                            }
-                        })
-                        .unwrap_or_default(),
-                    "s" => {
-                        let idx: usize = c
-                            .child("v")
-                            .map(|v| v.text.as_str())
-                            .unwrap_or("0")
-                            .parse()
-                            .unwrap_or(0);
-                        shared_strings.get(idx).cloned().unwrap_or_default()
-                    }
-                    "str" | "e" => c.into_child("v").map(|v| v.text).unwrap_or_default(),
-                    "b" => {
-                        let raw = c.child("v").map(|v| v.text.as_str()).unwrap_or("0");
-                        (raw.trim() == "1").to_string()
-                    }
-                    _ => {
-                        // "n" (numeric), or absent - OOXML's own default
-                        // type. Parsed and re-stringified through f64
-                        // rather than passed through as the raw XML text
-                        // verbatim - matching calamine's own
-                        // fast_float2::parse-then-Display round trip
-                        // (confirmed directly against its xlsx.rs source),
-                        // which silently normalizes away a written
-                        // trailing ".0" on a whole number (e.g. "30.0" in
-                        // the XML becomes the displayed value "30") -
-                        // found via exactly this mismatch surfacing in
-                        // the ODS reader's own calamine-comparison test,
-                        // then confirmed to be a real, pre-existing xlsx
-                        // behavior too, not ODS-specific.
-                        let raw = c.into_child("v").map(|v| v.text).unwrap_or_default();
-                        match raw.parse::<f64>() {
-                            Ok(n) if is_date_format.get(style_idx).copied().unwrap_or(false) => {
-                                xlsx_format_serial(n)
-                            }
-                            Ok(n) => n.to_string(),
-                            Err(_) => raw,
-                        }
-                    }
-                };
-                cells.push((col_idx, value));
+        // Walk the worksheet's children, discarding everything (dimension,
+        // sheetViews, cols, ...) until <sheetData>.
+        let mut sheet_data_open = false;
+        loop {
+            xml_skip_misc(bytes, &mut pos)?;
+            if pos >= bytes.len() || xml_starts_with(bytes, pos, "</") {
+                break; // end of worksheet, no <sheetData>
             }
-            sparse_rows.push((row_num, cells));
+            if xml_starts_with(bytes, pos, "<sheetData") {
+                pos += "<sheetData".len();
+                let _attrs = xml_parse_attrs(xml, &mut pos)?;
+                xml_skip_ws(bytes, &mut pos);
+                if xml_starts_with(bytes, pos, "/>") {
+                    pos += 2;
+                } else if bytes.get(pos) == Some(&b'>') {
+                    pos += 1;
+                    sheet_data_open = true;
+                } else {
+                    bail!("expected '>' or '/>' after <sheetData");
+                }
+                break;
+            }
+            // Some other child element - parse and discard its subtree.
+            let _discard = xml_parse_element(xml, &mut pos)?;
         }
 
-        // `max_row` is the largest 1-based row number seen (so also the
-        // row count); `max_col` is already a count. Row 0 is the header.
-        let cells = sparse_rows.into_iter().flat_map(|(row_num, cells)| {
-            cells
+        let mut states: Vec<ColumnAccumulatorState> = Vec::new();
+        let mut header_cells: Vec<(usize, String)> = Vec::new();
+        let mut max_row = 0usize;
+        let mut max_col = 0usize;
+        let mut rows_seen = 0usize;
+
+        if sheet_data_open {
+            loop {
+                xml_skip_misc(bytes, &mut pos)?;
+                if pos >= bytes.len() || xml_starts_with(bytes, pos, "</sheetData>") {
+                    break;
+                }
+                if bytes.get(pos) != Some(&b'<') {
+                    // stray text between rows - not meaningful, skip a byte
+                    pos += 1;
+                    continue;
+                }
+                let el = xml_parse_element(xml, &mut pos)?;
+                if el.name != "row" {
+                    continue;
+                }
+                rows_seen += 1;
+                let (row_num, cells) =
+                    xlsx_extract_row(el, shared_strings, is_date_format, rows_seen);
+                max_row = max_row.max(row_num);
+                for (col_idx, _) in &cells {
+                    max_col = max_col.max(col_idx + 1);
+                }
+                if row_num == 1 {
+                    header_cells = cells;
+                    continue;
+                }
+                // Data row: index is row_num - 2 (row 1 is the header).
+                let data_idx = row_num - 2;
+                if nrows.is_some_and(|limit| data_idx >= limit) {
+                    continue; // still counted in max_row above, just not folded
+                }
+                for (col_idx, value) in cells {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    if col_idx >= states.len() {
+                        states.resize_with(col_idx + 1, ColumnAccumulatorState::new);
+                    }
+                    states[col_idx].push(value, n_samples);
+                }
+            }
+        }
+
+        if max_col == 0 {
+            return Ok(None); // no cells anywhere - skip this sheet
+        }
+
+        let ncol = max_col;
+        states.resize_with(ncol, ColumnAccumulatorState::new);
+        let mut headers: Vec<String> = vec![String::new(); ncol];
+        for (col, value) in header_cells {
+            if col < ncol {
+                headers[col] = value;
+            }
+        }
+        let n_data_rows = max_row.saturating_sub(1);
+        let total = nrows.map_or(n_data_rows, |limit| limit.min(n_data_rows));
+
+        Ok(Some(
+            headers
                 .into_iter()
-                .filter(|(_, value)| !value.is_empty())
-                .map(move |(col_idx, value)| (row_num - 1, col_idx, value))
-        });
-        Ok(SheetGrid::from_cells(cells, max_row, max_col))
+                .zip(states)
+                .map(|(name, state)| state.into_profile(name, total))
+                .collect(),
+        ))
     }
 
     /// A workbook's own `xl/workbook.xml` names sheets by a relationship id
@@ -47684,15 +47783,16 @@ mod xlsx_support {
                 .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
             let sheet_xml = String::from_utf8(sheet_bytes)
                 .with_context(|| format!("sheet '{sheet_name}' is not valid UTF-8"))?;
-            let grid = xlsx_parse_sheet(&sheet_xml, &shared_strings, &is_date_format)?;
-            if grid.is_empty_sheet() {
+            let Some(profiles) = xlsx_parse_sheet_profiles(
+                &sheet_xml,
+                &shared_strings,
+                &is_date_format,
+                nrows,
+                n_samples,
+            )?
+            else {
                 continue; // no cells at all - contributes no table
-            }
-            let profiles: Vec<ColumnProfile> = grid
-                .into_column_inputs(nrows)
-                .into_iter()
-                .map(|c| profile_column(c, n_samples))
-                .collect();
+            };
             out.push((sheet_name, profiles));
         }
 
@@ -47856,11 +47956,7 @@ mod xlsx_support {
             if grid.is_empty_sheet() {
                 continue;
             }
-            let profiles: Vec<ColumnProfile> = grid
-                .into_column_inputs(nrows)
-                .into_iter()
-                .map(|c| profile_column(c, n_samples))
-                .collect();
+            let profiles: Vec<ColumnProfile> = grid.into_column_profiles(nrows, n_samples);
             out.push((sheet_name, profiles));
         }
 
@@ -48879,11 +48975,7 @@ mod xlsx_support {
             if grid.is_empty_sheet() {
                 continue; // empty sheet (or a non-tabular one, e.g. a chart)
             }
-            let profiles: Vec<ColumnProfile> = grid
-                .into_column_inputs(nrows)
-                .into_iter()
-                .map(|c| profile_column(c, n_samples))
-                .collect();
+            let profiles: Vec<ColumnProfile> = grid.into_column_profiles(nrows, n_samples);
             out.push((sheet_name, profiles));
         }
 
@@ -49348,11 +49440,7 @@ mod xlsx_support {
             if grid.is_empty_sheet() {
                 continue; // empty sheet (or a non-tabular one, e.g. a chart)
             }
-            let profiles: Vec<ColumnProfile> = grid
-                .into_column_inputs(nrows)
-                .into_iter()
-                .map(|c| profile_column(c, n_samples))
-                .collect();
+            let profiles: Vec<ColumnProfile> = grid.into_column_profiles(nrows, n_samples);
             out.push((entry.name, profiles));
         }
 
