@@ -45246,34 +45246,42 @@ fn lz_back_copy(out: &mut Vec<u8>, dist: usize, len: usize) {
     }
 }
 
-/// Where a DEFLATE decoder's output actually goes - implemented once for
-/// a plain `Vec<u8>` (every existing caller of `inflate`/`inflate_to`
-/// that decompresses one already-bounded block/chunk/entry at a time:
-/// Avro's own deflate codec, ORC's ZLIB codec, ZIP archive entries) and
-/// once for `GzipStreamSink` (the top-level `.gz` *file* path, the one
-/// place a decompressed output could genuinely be too large to hold
-/// entirely in memory). `inflate_block`'s own decode loop is written
-/// once, generically, against this trait, rather than existing as two
-/// separately-maintained copies of the same Huffman-decode logic for
-/// the bounded and streaming cases.
-trait DeflateSink {
+/// Where an LZ77-family decoder's output actually goes - implemented
+/// once for a plain `Vec<u8>` (every existing caller of `inflate`/
+/// `inflate_to` that decompresses one already-bounded block/chunk/entry
+/// at a time: Avro's own deflate codec, ORC's ZLIB codec, ZIP archive
+/// entries) and once each for `GzipStreamSink`/`ZstdStreamSink` (the
+/// top-level `.gz`/`.zst` *file* paths, the two places a decompressed
+/// output could genuinely be too large to hold entirely in memory).
+/// `inflate_block`'s own DEFLATE decode loop and zstd's own sequence
+/// executor (`decode_sequences_section`) are each written once,
+/// generically, against this shared trait, rather than existing as
+/// separate copies of the same "append literals, copy a back-reference"
+/// logic for the bounded and streaming cases - genuinely shared, not
+/// just similarly named, since both formats need the exact same three
+/// operations (push a literal run, copy `len` bytes from `dist` back,
+/// ask how much history is available to copy from) even though they
+/// arrive at a back-reference through completely different entropy
+/// coding (Huffman vs. FSE).
+trait LzWindowSink {
     fn push_literal(&mut self, byte: u8) -> Result<()>;
     fn push_slice(&mut self, bytes: &[u8]) -> Result<()>;
     /// Copies `len` bytes starting `dist` bytes back from the current
     /// output position - the caller has already checked `dist <=
-    /// self.available_len()` via `inflate_block`'s own single shared
-    /// check, so an implementation doesn't need to repeat it.
+    /// self.available_len()` via the decoder's own single shared check,
+    /// so an implementation doesn't need to repeat it.
     fn back_copy(&mut self, dist: usize, len: usize) -> Result<()>;
     /// How many bytes are currently available to be referenced by a
     /// back-copy - the full cumulative output for a plain `Vec<u8>`
     /// sink, or a streaming sink's own bounded recent-history length.
-    /// Structurally equivalent once at least `DEFLATE_WINDOW` bytes have
-    /// been produced, since RFC 1951 caps every real back-reference
-    /// distance at exactly that many bytes.
+    /// Structurally equivalent once at least a full window's worth of
+    /// bytes have been produced, since both RFC 1951 (DEFLATE, a fixed
+    /// 32 KiB) and RFC 8878 (zstd, a per-frame declared `Window_Size`)
+    /// cap every real back-reference distance at their own window size.
     fn available_len(&self) -> usize;
 }
 
-impl DeflateSink for Vec<u8> {
+impl LzWindowSink for Vec<u8> {
     fn push_literal(&mut self, byte: u8) -> Result<()> {
         self.push(byte);
         Ok(())
@@ -45294,7 +45302,7 @@ impl DeflateSink for Vec<u8> {
 /// Decodes one compressed block's symbol stream (shared by fixed and
 /// dynamic Huffman blocks - they differ only in which tables they hand
 /// in) directly into `out`, stopping at the end-of-block symbol (256).
-fn inflate_block<R: std::io::Read, O: DeflateSink>(
+fn inflate_block<R: std::io::Read, O: LzWindowSink>(
     bits: &mut BitReader<R>,
     out: &mut O,
     lencode: &HuffmanTable,
@@ -45415,10 +45423,10 @@ fn inflate<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
 }
 
 /// The real DEFLATE decode loop `inflate` is a thin wrapper around -
-/// generic over `DeflateSink` so the exact same logic drives either the
+/// generic over `LzWindowSink` so the exact same logic drives either the
 /// simple in-memory case (`out: Vec<u8>`) or the streaming `.gz`-file
 /// case (`out: GzipStreamSink`, see that type's own doc comment).
-fn inflate_to<R: std::io::Read, O: DeflateSink>(input: R, out: &mut O) -> Result<()> {
+fn inflate_to<R: std::io::Read, O: LzWindowSink>(input: R, out: &mut O) -> Result<()> {
     let mut bits = BitReader::new(input);
     loop {
         let bfinal = bits.bits(1)?;
@@ -45538,7 +45546,7 @@ const DEFLATE_WINDOW: usize = 32 * 1024;
 /// a growable `Vec` across many pushes instead of paying it on every one.
 const DEFLATE_FLUSH_THRESHOLD: usize = DEFLATE_WINDOW * 4;
 
-/// A `DeflateSink` used only for the top-level `.gz` *file* decompression
+/// An `LzWindowSink` used only for the top-level `.gz` *file* decompression
 /// path (`decompress_if_needed`, via `gzip_decompress_to`) - every other
 /// caller of `inflate`/`inflate_to` (Avro's own deflate codec, ORC's
 /// ZLIB codec, ZIP archive entries) decompresses one already-bounded
@@ -45598,7 +45606,7 @@ impl<'a> GzipStreamSink<'a> {
     }
 }
 
-impl<'a> DeflateSink for GzipStreamSink<'a> {
+impl<'a> LzWindowSink for GzipStreamSink<'a> {
     fn push_literal(&mut self, byte: u8) -> Result<()> {
         self.window.push(byte);
         self.maybe_flush()
@@ -49045,7 +49053,20 @@ mod zstd_support {
             if weight_total == 0 {
                 bail!("malformed zstd Huffman table: all-zero weights");
             }
-            let max_bits = 32 - (weight_total - 1).leading_zeros();
+            // maxBits is highbit32(weightTotal) + 1 - i.e. bit_length(weight_total),
+            // *not* bit_length(weight_total - 1) - unconditionally, even when
+            // weight_total is itself an exact power of 2. Verified against zstd's
+            // own HUF_readStats (`tableLog = BIT_highbit32(weightTotal) + 1`, always
+            // one bit past weightTotal's own highest set bit): using
+            // bit_length(weight_total - 1) instead - a plausible-looking off-by-one,
+            // the same shape fse_read_ncount's own accuracy-log fix elsewhere in this
+            // file already had to correct once - silently computes maxBits one bit
+            // too small whenever weight_total lands exactly on a power of 2, which a
+            // real, common compressed literal alphabet does. Found via real-world
+            // testing (a real `zstd`-CLI-compressed 100MB CSV), not a synthetic
+            // fixture - every small fixture this project had committed happened not
+            // to hit this exact boundary.
+            let max_bits = 32 - weight_total.leading_zeros();
             let rest = (1u32 << max_bits) - weight_total;
             if rest == 0 || (rest & (rest - 1)) != 0 {
                 bail!("malformed zstd Huffman table: implied last weight isn't a clean power of 2");
@@ -49109,11 +49130,15 @@ mod zstd_support {
 
     // ---------------------------------------------------------------
     // XXH64 (for the optional Content_Checksum) - a stable, widely
-    // reproduced algorithm; verified below against several known
-    // reference digests (the empty string and short ASCII inputs, whose
-    // XXH64 values are widely published and cross-checked here against
-    // this project's own implementation before being trusted for real
-    // frame verification).
+    // reproduced algorithm; verified in this module's own #[cfg(test)]
+    // block against several known reference digests (generated via the
+    // independent `xxhash` Python package, not recalled from memory)
+    // before being trusted for real frame verification. `xxh64` itself
+    // (the one-shot, whole-buffer form) is `#[cfg(test)]`-only now - real
+    // decoding goes through `Xxh64Incremental` instead, since a
+    // streaming sink can never hand the checksum the complete frame
+    // content in one call - but it's kept as that type's own oracle,
+    // cross-checked against it at many different chunk-size boundaries.
     // ---------------------------------------------------------------
 
     const XXH_PRIME64_1: u64 = 0x9E3779B185EBCA87;
@@ -49144,6 +49169,7 @@ mod zstd_support {
         h
     }
 
+    #[cfg(test)]
     fn xxh64(data: &[u8], seed: u64) -> u64 {
         let len = data.len();
         let mut pos = 0usize;
@@ -49221,6 +49247,153 @@ mod zstd_support {
         xxh64_avalanche(h)
     }
 
+    /// Incremental XXH64 - mirrors xxHash's own streaming state machine
+    /// (`XXH64_reset`/`XXH64_update`/`XXH64_digest`) so `ZstdStreamSink`
+    /// can verify a frame's Content_Checksum against bytes it's already
+    /// flushed out and dropped from memory, the same role
+    /// `Crc32Incremental` plays for gzip's own trailer. `v1..v4` are the
+    /// same four running accumulators the one-shot `xxh64` above folds a
+    /// 32-byte-at-a-time main loop into; `buf`/`buf_len` hold whatever
+    /// tail (always fewer than 32 bytes) hasn't been folded in yet,
+    /// carried across `update` calls regardless of how the input happens
+    /// to be chunked - `total_len` tracks the true cumulative length
+    /// across every call, since it feeds directly into the final digest
+    /// the same way the one-shot function's own `len` does.
+    struct Xxh64Incremental {
+        seed: u64,
+        v1: u64,
+        v2: u64,
+        v3: u64,
+        v4: u64,
+        buf: [u8; 32],
+        buf_len: usize,
+        total_len: u64,
+    }
+
+    impl Xxh64Incremental {
+        fn new(seed: u64) -> Self {
+            Xxh64Incremental {
+                seed,
+                v1: seed.wrapping_add(XXH_PRIME64_1).wrapping_add(XXH_PRIME64_2),
+                v2: seed.wrapping_add(XXH_PRIME64_2),
+                v3: seed,
+                v4: seed.wrapping_sub(XXH_PRIME64_1),
+                buf: [0; 32],
+                buf_len: 0,
+                total_len: 0,
+            }
+        }
+
+        fn update(&mut self, mut data: &[u8]) {
+            self.total_len += data.len() as u64;
+
+            if self.buf_len + data.len() < 32 {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+
+            if self.buf_len > 0 {
+                let need = 32 - self.buf_len;
+                self.buf[self.buf_len..32].copy_from_slice(&data[..need]);
+                self.v1 = xxh64_round(
+                    self.v1,
+                    u64::from_le_bytes(self.buf[0..8].try_into().unwrap()),
+                );
+                self.v2 = xxh64_round(
+                    self.v2,
+                    u64::from_le_bytes(self.buf[8..16].try_into().unwrap()),
+                );
+                self.v3 = xxh64_round(
+                    self.v3,
+                    u64::from_le_bytes(self.buf[16..24].try_into().unwrap()),
+                );
+                self.v4 = xxh64_round(
+                    self.v4,
+                    u64::from_le_bytes(self.buf[24..32].try_into().unwrap()),
+                );
+                data = &data[need..];
+                self.buf_len = 0;
+            }
+
+            while data.len() >= 32 {
+                self.v1 = xxh64_round(self.v1, u64::from_le_bytes(data[0..8].try_into().unwrap()));
+                self.v2 = xxh64_round(self.v2, u64::from_le_bytes(data[8..16].try_into().unwrap()));
+                self.v3 = xxh64_round(
+                    self.v3,
+                    u64::from_le_bytes(data[16..24].try_into().unwrap()),
+                );
+                self.v4 = xxh64_round(
+                    self.v4,
+                    u64::from_le_bytes(data[24..32].try_into().unwrap()),
+                );
+                data = &data[32..];
+            }
+
+            if !data.is_empty() {
+                self.buf[..data.len()].copy_from_slice(data);
+                self.buf_len = data.len();
+            }
+        }
+
+        /// Matches the one-shot `xxh64`'s own tail handling exactly:
+        /// once total_len >= 32, fold v1..v4 the same way, add total_len,
+        /// then run the identical 8/4/1-byte tail loop over whatever's
+        /// left in `buf` (always fewer than 32 bytes, the same invariant
+        /// the one-shot function's own `data[pos..len]` remainder has).
+        fn finish(&self) -> u64 {
+            let mut h = if self.total_len >= 32 {
+                let mut h = self
+                    .v1
+                    .rotate_left(1)
+                    .wrapping_add(self.v2.rotate_left(7))
+                    .wrapping_add(self.v3.rotate_left(12))
+                    .wrapping_add(self.v4.rotate_left(18));
+                h = xxh64_merge_round(h, self.v1);
+                h = xxh64_merge_round(h, self.v2);
+                h = xxh64_merge_round(h, self.v3);
+                h = xxh64_merge_round(h, self.v4);
+                h
+            } else {
+                self.seed.wrapping_add(XXH_PRIME64_5)
+            };
+
+            h = h.wrapping_add(self.total_len);
+
+            let tail = &self.buf[..self.buf_len];
+            let len = tail.len();
+            let mut pos = 0usize;
+            while pos + 8 <= len {
+                let k1 = xxh64_round(
+                    0,
+                    u64::from_le_bytes(tail[pos..pos + 8].try_into().unwrap()),
+                );
+                h ^= k1;
+                h = h
+                    .rotate_left(27)
+                    .wrapping_mul(XXH_PRIME64_1)
+                    .wrapping_add(XXH_PRIME64_4);
+                pos += 8;
+            }
+            if pos + 4 <= len {
+                let k1 = u32::from_le_bytes(tail[pos..pos + 4].try_into().unwrap()) as u64;
+                h ^= k1.wrapping_mul(XXH_PRIME64_1);
+                h = h
+                    .rotate_left(23)
+                    .wrapping_mul(XXH_PRIME64_2)
+                    .wrapping_add(XXH_PRIME64_3);
+                pos += 4;
+            }
+            while pos < len {
+                h ^= (tail[pos] as u64).wrapping_mul(XXH_PRIME64_5);
+                h = h.rotate_left(11).wrapping_mul(XXH_PRIME64_1);
+                pos += 1;
+            }
+
+            xxh64_avalanche(h)
+        }
+    }
+
     // ---------------------------------------------------------------
     // Frame / block / literals / sequences
     // ---------------------------------------------------------------
@@ -49283,8 +49456,124 @@ mod zstd_support {
         }
     }
 
-    struct Decoder {
+    /// zstd's own default safety limit on how large a frame's declared
+    /// `Window_Size` is allowed to be before decoding it needs an
+    /// explicit opt-in - `1 << 27` (128 MiB), matching
+    /// `ZSTD_WINDOWLOG_LIMIT_DEFAULT` in the real zstd library's own
+    /// `zstd_decompress.c`. A frame declaring a larger window is
+    /// rejected with the same reasoning the real library applies by
+    /// default (`ZSTD_d_windowLogMax` must be raised explicitly to
+    /// decode one), rather than letting a maliciously - or just
+    /// unusually - large declared window force an allocation with no
+    /// upper bound before a single byte of real content is read.
+    const ZSTD_WINDOW_LIMIT: u64 = 1 << 27;
+
+    /// RFC 8878 3.1.1.1.2's Window_Descriptor formula: the top 5 bits are
+    /// an exponent, the bottom 3 a mantissa refining it - `Window_Size`
+    /// is never a bare power of two, it's `windowBase` plus a fraction of
+    /// it selected by the mantissa. This is a real per-frame value, not
+    /// a fixed protocol constant the way DEFLATE's 32 KiB is - a `zstd`
+    /// CLI run at a high compression level, or over a genuinely large
+    /// input, legitimately declares a window many times larger than
+    /// gzip's, which is exactly why the streaming sink below has to size
+    /// itself from this rather than reusing `DEFLATE_WINDOW` unchanged.
+    fn window_size_from_descriptor(byte: u8) -> u64 {
+        let exponent = (byte >> 3) as u32;
+        let mantissa = (byte & 0x7) as u64;
+        let window_log = exponent + 10;
+        let window_base = 1u64 << window_log;
+        let window_add = (window_base / 8) * mantissa;
+        window_base + window_add
+    }
+
+    /// A streaming `LzWindowSink` for zstd's own frame content, the
+    /// direct sibling of `GzipStreamSink` (see that type's own doc
+    /// comment for the shared rationale) - the one real difference being
+    /// that `window_size`/`flush_threshold` are resolved per *frame*
+    /// from that frame's own declared `Window_Size` rather than being a
+    /// single fixed constant, since RFC 8878 (unlike RFC 1951) lets each
+    /// frame declare its own back-reference bound. `checksum` is updated
+    /// the moment new bytes are appended to `window` - not deferred to
+    /// flush time - since zstd's own Content_Checksum covers the
+    /// *entire* frame's content regardless of how much of it has already
+    /// been flushed out and dropped, the same reason `GzipStreamSink`'s
+    /// own `crc`/`total_len` are threaded through its flush path instead
+    /// of computed once at the end.
+    struct ZstdStreamSink<'a> {
         window: Vec<u8>,
+        window_size: usize,
+        flush_threshold: usize,
+        sink: &'a mut dyn std::io::Write,
+        checksum: Xxh64Incremental,
+    }
+
+    impl<'a> ZstdStreamSink<'a> {
+        fn new(sink: &'a mut dyn std::io::Write, window_size: usize) -> Self {
+            // Batches the O(n) cost of draining old bytes the same way
+            // GzipStreamSink's own DEFLATE_FLUSH_THRESHOLD does, just
+            // scaled to this frame's own window instead of a fixed
+            // constant.
+            let flush_threshold = window_size.saturating_mul(4);
+            ZstdStreamSink {
+                window: Vec::new(),
+                window_size,
+                flush_threshold,
+                sink,
+                checksum: Xxh64Incremental::new(0),
+            }
+        }
+
+        fn maybe_flush(&mut self) -> Result<()> {
+            if self.window.len() > self.flush_threshold {
+                let keep_from = self.window.len() - self.window_size;
+                self.sink
+                    .write_all(&self.window[..keep_from])
+                    .context("failed to write decompressed data")?;
+                self.window.drain(..keep_from);
+            }
+            Ok(())
+        }
+
+        /// The frame's Content_Checksum computed so far over every byte
+        /// produced, whether still retained in `window` or already
+        /// flushed out - safe to call before `finish()`, since
+        /// `Xxh64Incremental::finish` only reads accumulated state.
+        fn content_checksum(&self) -> u32 {
+            self.checksum.finish() as u32
+        }
+
+        /// Flushes every remaining byte. Consumes `self` since nothing
+        /// more should ever be written through a sink once its frame is
+        /// declared finished.
+        fn finish(self) -> Result<()> {
+            self.sink
+                .write_all(&self.window)
+                .context("failed to write decompressed data")?;
+            Ok(())
+        }
+    }
+
+    impl<'a> LzWindowSink for ZstdStreamSink<'a> {
+        fn push_literal(&mut self, byte: u8) -> Result<()> {
+            self.push_slice(&[byte])
+        }
+        fn push_slice(&mut self, bytes: &[u8]) -> Result<()> {
+            self.checksum.update(bytes);
+            self.window.extend_from_slice(bytes);
+            self.maybe_flush()
+        }
+        fn back_copy(&mut self, dist: usize, len: usize) -> Result<()> {
+            let before = self.window.len();
+            lz_back_copy(&mut self.window, dist, len);
+            self.checksum.update(&self.window[before..]);
+            self.maybe_flush()
+        }
+        fn available_len(&self) -> usize {
+            self.window.len()
+        }
+    }
+
+    struct Decoder {
         huffman: Option<HuffmanTable>,
         ll_table: Option<FseTable>,
         of_table: Option<FseTable>,
@@ -49295,7 +49584,6 @@ mod zstd_support {
     impl Decoder {
         fn new() -> Self {
             Decoder {
-                window: Vec::new(),
                 huffman: None,
                 ll_table: None,
                 of_table: None,
@@ -49304,7 +49592,14 @@ mod zstd_support {
             }
         }
 
-        fn decode_frame(&mut self, data: &[u8]) -> Result<usize> {
+        /// Decodes one frame's content straight into `sink` (bounded to
+        /// that frame's own declared `Window_Size` worth of retained
+        /// history, per `ZstdStreamSink`'s own doc comment) rather than
+        /// building the whole decompressed frame in memory first -
+        /// returns how many bytes of `data` this frame consumed, so the
+        /// caller can advance past it in the (still fully-buffered)
+        /// compressed input.
+        fn decode_frame(&mut self, data: &[u8], out: &mut dyn std::io::Write) -> Result<usize> {
             let mut pos = 0usize;
             let read_u = |data: &[u8], pos: usize, n: usize| -> Result<u64> {
                 let bytes = data
@@ -49327,11 +49622,13 @@ mod zstd_support {
                 bail!("unsupported zstd frame: reserved header bit is set");
             }
 
+            let mut window_size_from_header = 0u64;
             if !single_segment {
-                pos += 1; // Window_Descriptor - only needed to size an allocation, irrelevant here
-                if pos > data.len() {
-                    bail!("truncated zstd frame header (window descriptor)");
-                }
+                let wd = *data
+                    .get(pos)
+                    .context("truncated zstd frame header (window descriptor)")?;
+                pos += 1;
+                window_size_from_header = window_size_from_descriptor(wd);
             }
 
             let did_len = match dict_id_flag {
@@ -49371,9 +49668,26 @@ mod zstd_support {
             } else {
                 None
             };
-            if let Some(size) = content_size {
-                self.window.reserve(size as usize);
+
+            // RFC 8878 3.1.1.1.2: "Whenever Single_Segment_flag is set,
+            // Window_Descriptor is not present... Window_Size is
+            // Frame_Content_Size" - and fcs_len's own match above already
+            // guarantees content_size is always Some(...) in that case
+            // (single_segment forces fcs_len >= 1 even under Frame_
+            // Content_Size_Flag 0).
+            let window_size = if single_segment {
+                content_size.context(
+                    "zstd frame requires Frame_Content_Size when Single_Segment_Flag is set",
+                )?
+            } else {
+                window_size_from_header
+            };
+            if window_size > ZSTD_WINDOW_LIMIT {
+                bail!(
+                    "zstd frame declares a {window_size}-byte window, exceeding this tool's {ZSTD_WINDOW_LIMIT}-byte safety limit (matching zstd's own default windowLogMax) - refusing to decode rather than risk an unbounded allocation"
+                );
             }
+            let mut sink = ZstdStreamSink::new(out, window_size.max(1) as usize);
 
             self.huffman = None;
             self.ll_table = None;
@@ -49396,19 +49710,23 @@ mod zstd_support {
                         let content = data
                             .get(pos..pos + block_size)
                             .context("truncated zstd raw block")?;
-                        self.window.extend_from_slice(content);
+                        sink.push_slice(content)?;
                         pos += block_size;
                     }
                     1 => {
                         let byte = *data.get(pos).context("truncated zstd RLE block")?;
                         pos += 1;
-                        self.window.resize(self.window.len() + block_size, byte);
+                        // block_size is capped at ZSTD_BLOCKSIZE_MAX (128
+                        // KiB) by the format itself, so a temporary
+                        // repeated-byte buffer here is always bounded
+                        // regardless of the frame's own overall size.
+                        sink.push_slice(&vec![byte; block_size])?;
                     }
                     2 => {
                         let content = data
                             .get(pos..pos + block_size)
                             .context("truncated zstd compressed block")?;
-                        self.decode_compressed_block(content)?;
+                        self.decode_compressed_block(content, &mut sink)?;
                         pos += block_size;
                     }
                     _ => bail!("unsupported zstd block: reserved block type"),
@@ -49422,7 +49740,7 @@ mod zstd_support {
             if content_checksum {
                 let stored = read_u(data, pos, 4)? as u32;
                 pos += 4;
-                let computed = xxh64(&self.window, 0) as u32;
+                let computed = sink.content_checksum();
                 if computed != stored {
                     bail!(
                         "zstd content checksum mismatch: expected {stored:#x}, computed {computed:#x}"
@@ -49430,12 +49748,17 @@ mod zstd_support {
                 }
             }
 
+            sink.finish()?;
             Ok(pos)
         }
 
-        fn decode_compressed_block(&mut self, data: &[u8]) -> Result<()> {
+        fn decode_compressed_block(
+            &mut self,
+            data: &[u8],
+            sink: &mut ZstdStreamSink,
+        ) -> Result<()> {
             let (literals, seq_start) = self.decode_literals_section(data)?;
-            self.decode_sequences_section(&data[seq_start..], &literals)
+            self.decode_sequences_section(&data[seq_start..], &literals, sink)
         }
 
         fn decode_literals_section(&mut self, data: &[u8]) -> Result<(Vec<u8>, usize)> {
@@ -49588,7 +49911,12 @@ mod zstd_support {
             Ok(out)
         }
 
-        fn decode_sequences_section(&mut self, data: &[u8], literals: &[u8]) -> Result<()> {
+        fn decode_sequences_section(
+            &mut self,
+            data: &[u8],
+            literals: &[u8],
+            sink: &mut ZstdStreamSink,
+        ) -> Result<()> {
             let b0 = *data.first().context("empty zstd sequences section")?;
             let (n_seq, hdr_len): (u32, usize) = if b0 == 0 {
                 (0, 1)
@@ -49608,7 +49936,7 @@ mod zstd_support {
                 if hdr_len != data.len() {
                     bail!("malformed zstd sequences section: extraneous data after zero sequences");
                 }
-                self.window.extend_from_slice(literals);
+                sink.push_slice(literals)?;
                 return Ok(());
             }
 
@@ -49683,15 +50011,15 @@ mod zstd_support {
                 let lits = literals.get(lit_pos..lit_end).context(
                     "malformed zstd sequence: literals length exceeds the literals section",
                 )?;
-                self.window.extend_from_slice(lits);
+                sink.push_slice(lits)?;
                 lit_pos = lit_end;
 
-                if offset == 0 || offset as usize > self.window.len() {
+                if offset == 0 || offset as usize > sink.available_len() {
                     bail!(
                         "malformed zstd sequence: back-reference offset {offset} is out of range"
                     );
                 }
-                lz_back_copy(&mut self.window, offset as usize, match_length as usize);
+                sink.back_copy(offset as usize, match_length as usize)?;
 
                 let is_last = seq_idx + 1 == n_seq;
                 if !is_last {
@@ -49709,7 +50037,7 @@ mod zstd_support {
                 bail!("malformed zstd sequences section: bitstream not fully consumed");
             }
             if lit_pos < literals.len() {
-                self.window.extend_from_slice(&literals[lit_pos..]);
+                sink.push_slice(&literals[lit_pos..])?;
             }
 
             Ok(())
@@ -49820,7 +50148,23 @@ mod zstd_support {
     /// decodes every frame in `input` (concatenated frames and skippable
     /// frames, both legal per RFC 8878 3.1/3.1.2) to the full decompressed
     /// byte stream.
-    pub(crate) fn zstd_decompress<R: std::io::Read>(mut input: R) -> Result<Vec<u8>> {
+    /// Decompresses a whole zstd stream (one or more concatenated
+    /// frames, skippable frames included) straight into `out`, bounded
+    /// to each frame's own declared `Window_Size` worth of retained
+    /// decompressed history (via `ZstdStreamSink`) rather than building
+    /// the complete decompressed output in memory first - the same
+    /// "stop double-buffering" win `gzip_decompress_to` already
+    /// delivers for gzip, just with a per-frame dynamic window instead
+    /// of DEFLATE's fixed 32 KiB one. The *compressed* input is still
+    /// read fully into memory up front (`all`) - deliberately out of
+    /// scope for this pass, since a compressed file is, by construction,
+    /// far smaller than its decompressed content; the win worth having
+    /// here is bounding the potentially-much-larger decompressed side,
+    /// not the input read itself.
+    pub(crate) fn zstd_decompress_to<R: std::io::Read>(
+        mut input: R,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
         let mut all = Vec::new();
         input
             .read_to_end(&mut all)
@@ -49833,7 +50177,6 @@ mod zstd_support {
             // is missing even the mandatory 4-byte magic number.
             bail!("not a valid zstd file (empty input)");
         }
-        let mut out = Vec::new();
         let mut pos = 0usize;
         while pos < all.len() {
             let magic = all
@@ -49853,12 +50196,93 @@ mod zstd_support {
             }
             pos += 4;
             let mut decoder = Decoder::new();
-            let before = decoder.window.len();
-            let consumed = decoder.decode_frame(&all[pos..])?;
+            let consumed = decoder.decode_frame(&all[pos..], out)?;
             pos += consumed;
-            out.extend_from_slice(&decoder.window[before..]);
         }
+        Ok(())
+    }
+
+    /// Decompresses a whole zstd stream into memory - a thin wrapper
+    /// around `zstd_decompress_to`, used by every caller that
+    /// decompresses one already-bounded block/chunk at a time (Parquet's
+    /// own Zstd codec, Arrow IPC's own `BodyCompression`, Avro's
+    /// `zstandard` codec, ORC's Zstd codec - each under its own feature
+    /// flag) or just wants an owned buffer (this module's own test
+    /// suite). `decompress_if_needed`'s top-level `.zst`-*file* path
+    /// calls `zstd_decompress_to` directly instead, the same split
+    /// `gzip_decompress`/`gzip_decompress_to` already established.
+    /// `#[allow(dead_code)]` for the same reason `inflate`/`crc32` need
+    /// it: `zstd_support` is shared by `zstd`/`avro`/`parquet`/`orc`, so
+    /// under `--features zstd` alone (no avro/parquet/orc, whose own
+    /// bounded-chunk decompression is this function's only other real
+    /// caller) this becomes genuinely unreachable from production code.
+    #[allow(dead_code)]
+    pub(crate) fn zstd_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        zstd_decompress_to(input, &mut out)?;
         Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Reference digests generated with the independent `xxhash`
+        // Python package (`xxhash.xxh64(data, seed=...).intdigest()`),
+        // not recalled from memory - the same "verify against a real,
+        // independent implementation before trusting it" discipline
+        // every other checksum/hash in this project already gets.
+        #[test]
+        fn xxh64_matches_known_reference_digests() {
+            assert_eq!(xxh64(b"", 0), 0xef46db3751d8e999);
+            assert_eq!(xxh64(b"a", 0), 0xd24ec4f1a98c6e5b);
+            assert_eq!(xxh64(b"abc", 0), 0x44bc2cf5ad770999);
+            assert_eq!(xxh64(b"abc", 42), 0x13c1d910702770e6);
+
+            // Long enough to exercise the 32-byte-at-a-time main loop,
+            // not just the short-input fallback path.
+            let sequential: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+            assert_eq!(xxh64(&sequential, 0), 0x1facbe8406cd904b);
+            assert_eq!(xxh64(&sequential, 123456789), 0x0aabee4a6c26d62b);
+
+            let repeated = b"The quick brown fox jumps over the lazy dog".repeat(50);
+            assert_eq!(xxh64(&repeated, 0), 0x96f312fc07a1823b);
+        }
+
+        // Xxh64Incremental backs ZstdStreamSink's own Content_Checksum
+        // verification, which by construction can never see a frame's
+        // complete content in one call the way the one-shot xxh64 above
+        // does - this proves it produces the exact same digest regardless
+        // of how the same input happens to be split across `update`
+        // calls, the same "boundary-position-independence" property
+        // csv_feed_chunk's own streaming rewrite was proven to have.
+        #[test]
+        fn xxh64_incremental_matches_the_one_shot_implementation_at_every_chunk_boundary() {
+            let data: Vec<u8> = (0..10_000u32)
+                .map(|i| (i.wrapping_mul(2654435761)) as u8)
+                .collect();
+            let expected = xxh64(&data, 0);
+
+            for chunk_size in [
+                1usize, 2, 3, 7, 8, 9, 16, 31, 32, 33, 64, 1000, 9999, 10_000,
+            ] {
+                let mut inc = Xxh64Incremental::new(0);
+                for chunk in data.chunks(chunk_size) {
+                    inc.update(chunk);
+                }
+                assert_eq!(
+                    inc.finish(),
+                    expected,
+                    "mismatch at chunk_size={chunk_size}"
+                );
+            }
+
+            // Empty input and a non-zero seed too.
+            assert_eq!(Xxh64Incremental::new(0).finish(), xxh64(&[], 0));
+            let mut inc42 = Xxh64Incremental::new(42);
+            inc42.update(&data);
+            assert_eq!(inc42.finish(), xxh64(&data, 42));
+        }
     }
 } // mod zstd_support
 
@@ -49892,12 +50316,17 @@ fn compression_from_extension(path: &Path) -> Option<Compression> {
 }
 
 #[cfg(feature = "zstd")]
-fn decompress_zstd(input: std::fs::File, path: &Path) -> Result<Vec<u8>> {
-    zstd_support::zstd_decompress(input).with_context(|| format!("failed to decompress {path:?}"))
+fn decompress_zstd(input: std::fs::File, out: &mut dyn std::io::Write, path: &Path) -> Result<()> {
+    zstd_support::zstd_decompress_to(input, out)
+        .with_context(|| format!("failed to decompress {path:?}"))
 }
 
 #[cfg(not(feature = "zstd"))]
-fn decompress_zstd(_input: std::fs::File, path: &Path) -> Result<Vec<u8>> {
+fn decompress_zstd(
+    _input: std::fs::File,
+    _out: &mut dyn std::io::Write,
+    path: &Path,
+) -> Result<()> {
     bail!(
         "zstd support isn't compiled in - rebuild with `cargo build --release --features zstd` (or --features full) to read {path:?}"
     )
@@ -49982,7 +50411,6 @@ impl Drop for TempFile {
 /// Non-compressed input passes through unchanged with no guard.
 fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFile>)> {
     use std::fs::File;
-    use std::io::Write;
 
     let Some(compression) = compression_from_extension(path) else {
         return Ok((path.to_path_buf(), path.to_path_buf(), None));
@@ -50004,10 +50432,12 @@ fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFil
                 .with_context(|| format!("failed to decompress {path:?}"))?;
         }
         Compression::Zstd => {
-            let bytes = decompress_zstd(input, path)?;
-            tmp.as_file_mut()
-                .write_all(&bytes)
-                .with_context(|| format!("failed to write decompressed data for {path:?}"))?;
+            // Streams straight into the temp file too, bounded to each
+            // frame's own declared Window_Size worth of memory rather
+            // than the file's total decompressed size - see
+            // ZstdStreamSink's own doc comment for why this needs a
+            // per-frame dynamic window instead of gzip's fixed one.
+            decompress_zstd(input, tmp.as_file_mut(), path)?;
         }
     }
 

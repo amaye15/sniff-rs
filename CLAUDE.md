@@ -3972,21 +3972,122 @@ own tests don't: `BufRead::lines()` validates one line at a time
 regardless of internal buffer size, so there's no risk of a malformed
 line past the cutoff landing in the same read-buffer chunk as row 0.
 
-**Deliberately not done yet, in order of likely next steps**: zstd's own
-compression layer, which needs meaningfully more care than gzip's - its
-maximum back-reference distance (`Window_Size`) is *declared in the
-frame header* rather than a fixed protocol constant, so a sliding window
-for it needs to be sized dynamically per file rather than a single fixed
-32 KiB constant; every other naturally-streamable or
-header-then-sequential-rows format (MessagePack/CBOR, Avro, dBase,
-Stata, SAS7BDAT, SPSS, NumPy); and, hardest and last, the formats that
-need the *tail* of the file before the body means anything at all
-(Parquet, Arrow IPC, ORC, SQLite, every ZIP-based format) - true
-streaming there means `Seek`-based random access replacing a single
-in-memory buffer throughout each decoder, a materially larger rewrite
-per format than anything done so far. The `suggest_ideal_type`
-incremental-accumulator rewrite (the deeper win described above) remains
-entirely unstarted, tracked as its own future
+**The zstd compression layer went sixth**, and needed real, distinct
+care beyond gzip's own sliding-window fix, per the reasoning already
+flagged above: RFC 8878's maximum back-reference distance
+(`Window_Size`) is declared per-*frame* in its own header rather than a
+fixed protocol constant, so the window has to be sized dynamically
+instead of reusing a single constant the way `DEFLATE_WINDOW` could.
+`LzWindowSink` (renamed from `DeflateSink`, since it's no longer
+DEFLATE-specific - see below) is the same trait gzip's own
+`GzipStreamSink` already implements, generalized so zstd's sequence
+executor (`decode_sequences_section`) can drive it too: `ZstdStreamSink`
+is `GzipStreamSink`'s direct sibling, just with `window_size`/
+`flush_threshold` resolved from that frame's own `Window_Descriptor`
+byte (`window_size_from_descriptor`, RFC 8878 3.1.1.1.2's exponent/
+mantissa formula) instead of a fixed constant - or, for a
+Single_Segment-flagged frame (RFC 8878's own "the whole content is one
+segment" mode, typically used for small one-shot buffers rather than
+large streamed files), from `Frame_Content_Size` directly, since the
+RFC defines Window_Size as exactly that in this mode. A frame declaring
+a window past `1 << 27` (128 MiB) is rejected outright
+(`ZSTD_WINDOW_LIMIT`), matching the real zstd library's own default
+`windowLogMax` safety limit rather than letting an unusually- or
+maliciously-large declared window force an unbounded allocation before
+a single real byte is decoded.
+
+The one piece with no DEFLATE/gzip equivalent to generalize: zstd's
+optional Content_Checksum (XXH64) is computed over the frame's *entire*
+content, not just whatever's still retained in the sliding window - the
+same problem gzip's own CRC32 trailer already had, solved the same way.
+`Xxh64Incremental` mirrors xxHash's own streaming state machine
+(`XXH64_reset`/`_update`/`_digest`) the same way `Crc32Incremental`
+already does for CRC32, verified two ways before being trusted: against
+several known reference digests generated with the independent
+`xxhash` Python package (not recalled from memory), and against the
+existing one-shot `xxh64` function (now `#[cfg(test)]`-only, kept
+specifically as this type's own oracle) at many different input-chunking
+boundaries - the same "boundary-position-independence" proof
+`csv_feed_chunk`'s own streaming rewrite already used. `ZstdStreamSink`
+updates this hash the instant new bytes are appended to its window -
+before any possible trim - rather than deferring to flush time, since
+the checksum has to reflect the complete frame regardless of how much
+of it has already been flushed out and dropped.
+
+**A real, pre-existing correctness bug was found while measuring this
+phase - not introduced by it - the same way several other bugs
+elsewhere in this file were found: by testing against a real, sizeable
+file rather than trusting the existing (small) fixture suite.** A
+100 MB real CSV compressed with the actual `zstd` CLI failed to decode
+at all, on `main`, before any streaming changes - `"malformed zstd
+Huffman table: implied last weight isn't a clean power of 2"`.
+`HuffmanTable::parse`'s `max_bits` formula
+(`32 - (weight_total - 1).leading_zeros()`) computes `ceil(log2(weight_
+total))` correctly whenever `weight_total` isn't itself an exact power
+of 2, but is silently one bit too small whenever it is - the correct
+formula, verified against zstd's own `HUF_readStats`
+(`tableLog = BIT_highbit32(weightTotal) + 1`), always adds one more bit
+regardless (`32 - weight_total.leading_zeros()`, dropping the erroneous
+`- 1`). This is the exact same *shape* of off-by-one this project's own
+zstd hand-roll already found and fixed once before, in a different
+function (`fse_read_ncount`'s own accuracy-log recompute) - a `bit_
+length(x - 1)` where `bit_length(x)` was needed, invisible on every
+small fixture because none happened to have a literals alphabet whose
+weight total landed exactly on a power of 2, and only found here because
+measuring this phase's own memory footprint required a real, much
+larger file than anything previously tested against. Bisecting row
+count against the pre-fix binary found a much smaller, permanent
+reproduction: `tests/fixtures/edge_zstd_huffman_power_of_two_weight_
+total.csv.zst` (4,500 rows, ~13 KB compressed) and its own integration
+test lock the fix in.
+
+Measured on the real 100 MB file (95.8 MB decompressed, one frame, a
+real `Window_Size` of 2 MiB from its own header) with the bug fixed on
+both sides of the comparison, to isolate the streaming rewrite's own
+effect from the correctness fix required just to read the file at all:
+the *full* pipeline (decompress + the already-streaming CSV reader)
+showed a real maxRSS improvement (699 MB -> 585 MB, ~16%) but, measured
+three times each, a small, consistent, honestly-reported *increase* in
+macOS's own separate "peak memory footprint" metric (481 MB -> 515 MB) -
+because for this file the *downstream* CSV column-typing phase (already
+established, unaffected by this work, and inherently proportional to
+the decompressed content regardless of how it got there - see this
+section's own "real constraint" framing above) dominates total process
+memory, masking whatever the decompression phase itself did either way.
+Isolating the decompression phase directly (via `--nrows 1`, which
+still fully decompresses the file - `--nrows` only ever bounds the
+*downstream* row-reading, not decompression itself - while making the
+CSV phase's own memory trivial) shows the real, unmasked effect
+cleanly, in both metrics, three rounds each: peak footprint 206 MB ->
+13 MB (~94%), maxRSS 209 MB -> 23 MB (~89%). Reported both ways
+deliberately, the same "don't cherry-pick the flattering metric"
+discipline this project's own Performance section already holds itself
+to (compare the eighth optimization pass's own honestly-reported,
+smaller-than-expected CSV win) - the small full-pipeline regression in
+one metric is real, understood, and an acceptable tradeoff for a
+dramatic, unmasked win in the case this phase actually targets (a large
+decompressed payload), not swept under the rug.
+
+Every fix verified the same way as every phase before it: full test
+suite (347 unit + 241 integration on `--features full`, 211 + 88 on the
+default build, two new) unchanged and passing, clippy/fmt clean across
+every individually plausible feature combination that touches
+`zstd_support` (default, `zstd`, `avro`, `parquet`, `orc`, `xlsx`,
+`npy`, `full`) matching each one's own established baseline exactly,
+and byte-identical output confirmed via `diff` against a pre-streaming-
+but-bugfixed baseline across every committed `.zst` fixture, not just
+the new one.
+
+**Deliberately not done yet, in order of likely next steps**: every
+other naturally-streamable or header-then-sequential-rows format
+(MessagePack/CBOR, Avro, dBase, Stata, SAS7BDAT, SPSS, NumPy); and,
+hardest and last, the formats that need the *tail* of the file before
+the body means anything at all (Parquet, Arrow IPC, ORC, SQLite, every
+ZIP-based format) - true streaming there means `Seek`-based random
+access replacing a single in-memory buffer throughout each decoder, a
+materially larger rewrite per format than anything done so far. The
+`suggest_ideal_type` incremental-accumulator rewrite (the deeper win
+described above) remains entirely unstarted, tracked as its own future
 phase.
 
 ## Cloud-platform file compatibility

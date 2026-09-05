@@ -675,6 +675,29 @@ fn zstd_with_fse_compressed_tables_reads_correctly_end_to_end() {
     assert_eq!(column(cols, "email")["ideal_type"], "Email");
 }
 
+// Found via real-world testing (a real zstd-CLI-compressed 100 MB CSV,
+// while measuring the streaming-decompression rewrite's own memory
+// footprint) rather than a synthetic edge case: HuffmanTable::parse's
+// old maxBits formula (`32 - (weight_total - 1).leading_zeros()`)
+// silently computed one bit too few whenever a literals block's own
+// Huffman weight total happened to land exactly on a power of 2 - a
+// real, common occurrence, not a rare corner case - since the correct
+// formula (`32 - weight_total.leading_zeros()`, matching zstd's own
+// `HUF_readStats`) always adds one more bit regardless. Every existing
+// committed .zst fixture happened not to hit this exact boundary, which
+// is exactly why a real, sizeable file was needed to find it at all.
+// This fixture (4,500 rows, minimized by bisecting row count against
+// the pre-fix binary) reliably reproduces it in ~13 KB.
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_huffman_table_with_a_power_of_two_weight_total_decodes_correctly() {
+    let doc = run_json("edge_zstd_huffman_power_of_two_weight_total.csv.zst", &[]);
+    let cols = table(&doc, "edge_zstd_huffman_power_of_two_weight_total");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "id")["row_count"], 4500);
+}
+
 #[cfg(feature = "zstd")]
 #[test]
 fn zstd_with_a_corrupted_checksum_gives_an_actionable_error_not_a_panic() {

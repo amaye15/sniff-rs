@@ -33,6 +33,55 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-zstd` branch (Darwin arm64)
+
+The zstd decompression layer converted to a sliding-window streaming
+decoder (`ZstdStreamSink`, bounded to each frame's own declared
+`Window_Size` - resolved dynamically per file from its own header,
+unlike DEFLATE's fixed 32 KiB - plus a 4x flush-batching margin) instead
+of decompressing the whole frame into one `Vec<u8>` first. See CLAUDE.md's
+"Streaming reads / memory footprint" section for the full writeup,
+including a real, pre-existing Huffman-table bug this pass's own
+real-file measurement found and fixed (unrelated to streaming itself -
+verified on both sides of the comparison below).
+
+**Real file** (100 MB CSV, real `zstd` CLI compression, 95.8 MB
+decompressed, one frame, 2 MiB declared `Window_Size`), `/usr/bin/time -l`,
+3 rounds each:
+
+Full pipeline (decompress + the already-streaming CSV reader):
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old (bugfixed, non-streaming) | 697 MB | 482 MB |
+| New (streaming) | 585 MB | 516 MB |
+| Change | **-16%** | **+7%** |
+
+Decompression phase isolated via `--nrows 1` (still fully decompresses
+the file - `--nrows` only bounds downstream row-reading - while making
+the CSV-typing phase's own memory trivial, so it stops masking the
+result):
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old (bugfixed, non-streaming) | 209 MB | 206 MB |
+| New (streaming) | 23 MB | 13 MB |
+| Change | **-89%** | **-94%** |
+
+Both confirmed byte-identical via `diff`, including against every other
+committed `.zst` fixture. The full-pipeline "peak footprint" increase is
+real and reproducible (not noise - consistent across all 3 rounds), and
+reported honestly rather than only citing the flattering isolated
+number: for this file, the *downstream* CSV column-typing phase (already
+established, unaffected by this work) dominates total process memory
+regardless of how decompression got there, so the streaming win is real
+but masked in that one metric for this particular file shape - the
+isolated measurement is what actually demonstrates the mechanism this
+phase targets. No Criterion benchmark target currently isolates zstd
+decompression, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-weblog-syslog` branch (Darwin arm64)
 
 `columns_from_weblog`/`columns_from_syslog` converted from
