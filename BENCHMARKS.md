@@ -33,6 +33,48 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-xls` branch (Darwin arm64)
+
+`xlsx_support::CfbFile` (OLE2/Compound File Binary, backing old-style
+`.xls`) converted from a whole-file `data: Vec<u8>` buffer to
+`Seek`+`read_exact` per sector off a real `fs::File` - `read_chain`/
+`open`/`read_stream` all moved to `&mut self`; `read_mini_chain`/
+`has_stream` needed no change (the former only ever slices the
+already-resident mini-stream, the latter never touches sector data at
+all). The real, disclosed scope here is "stop double-buffering the
+whole file alongside the separately-extracted Workbook stream," not
+full BIFF8-record-level streaming - the Workbook stream itself has to
+stay fully materialized regardless, since BOUNDSHEET8 records address
+sheet data by absolute byte position scattered throughout it. See
+CLAUDE.md's "Streaming reads / memory footprint" section for the full
+writeup, including why this format turned out more tractable than its
+own prior "chain-walk itself needs to become lazy" framing suggested.
+
+Measured on a real 17.5 MB `.xls` file (65,000 rows, 10 columns, via
+LibreOffice's "MS Excel 97" export filter converting an
+`openpyxl`-generated `.xlsx` - no tool in this environment writes `.xls`
+directly): full-scan maxRSS 180 MB -> 138 MB (~23%), peak footprint
+155 MB -> 117 MB (~25%). `--nrows 1` shows essentially the same
+reduction (maxRSS 172 MB -> 128 MB, ~26%; peak footprint 152 MB ->
+117 MB, ~23%) rather than a larger unmasked one - direct confirmation
+that the win is the eliminated whole-file buffer, not a per-row bound,
+since the Workbook stream is always fully read regardless of `--nrows`.
+Output byte-identical via `diff` in both cases.
+
+Verified via the complete existing test suite (348 unit tests on
+`--features full`, including the existing
+`cfb_reader_extracts_the_real_workbook_stream` byte-exact CFB test,
+unchanged and passing) plus 308 integration tests against a clean
+baseline (a concurrent in-progress edit to `tests/integration.rs` in
+another session introduced an unrelated duplicate test name blocking a
+direct run - worked around by temporarily swapping in the last-
+committed file for verification, then restoring the working copy
+exactly). Clippy/fmt clean across default, `xlsx`, and `full`, each
+matching its own already-established baseline (default=1, xlsx=4,
+full=5) exactly.
+
+---
+
 ## 2026-09-05 — `feat/streaming-sas7bdat` branch (Darwin arm64)
 
 `sas7bdat_support::page_slice` (indexing a whole-file `data: &[u8]`

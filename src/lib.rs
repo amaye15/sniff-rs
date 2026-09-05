@@ -46429,6 +46429,7 @@ mod zip_support {
 mod xlsx_support {
     use super::zip_support::ZipArchive;
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
 
     // --- Hand-rolled minimal XML parser ---
     // Scoped deliberately narrowly: just enough to read the well-formed,
@@ -47422,7 +47423,7 @@ mod xlsx_support {
     const CFB_ENDOFCHAIN: u32 = 0xFFFF_FFFE;
 
     pub(crate) struct CfbFile {
-        data: Vec<u8>,
+        file: fs::File,
         sector_size: usize,
         mini_sector_size: usize,
         fat: Vec<u32>,
@@ -47459,18 +47460,24 @@ mod xlsx_support {
         }
 
         /// Follows a regular sector chain (via the main FAT) starting at
-        /// `start`, concatenating every sector's raw bytes.
-        fn read_chain(&self, start: u32) -> Result<Vec<u8>> {
+        /// `start`, concatenating every sector's raw bytes. Each sector is
+        /// read fresh via `Seek`, never assuming the whole file is
+        /// resident - a chain can jump to any sector, not just the next
+        /// one in file order, so this can't be a simple forward-only scan.
+        fn read_chain(&mut self, start: u32) -> Result<Vec<u8>> {
             let mut out = Vec::new();
             let mut sector = start;
             let mut guard = 0usize;
             while sector != CFB_ENDOFCHAIN {
                 let offset = self.sector_offset(sector);
-                let chunk = self
-                    .data
-                    .get(offset..offset + self.sector_size)
+                let mut chunk = vec![0u8; self.sector_size];
+                self.file
+                    .seek(SeekFrom::Start(offset as u64))
                     .context("truncated CFB sector chain")?;
-                out.extend_from_slice(chunk);
+                self.file
+                    .read_exact(&mut chunk)
+                    .context("truncated CFB sector chain")?;
+                out.extend_from_slice(&chunk);
                 sector = *self
                     .fat
                     .get(sector as usize)
@@ -47510,19 +47517,32 @@ mod xlsx_support {
         }
 
         pub(crate) fn open(path: &Path) -> Result<Self> {
-            let data = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
-            if data.len() < 512 || data[0..8] != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+            let mut file =
+                fs::File::open(path).with_context(|| format!("failed to read {path:?}"))?;
+            // Read only the fixed 512-byte header up front - a `Read::take`
+            // (rather than a fixed-size `read_exact`) so a genuinely
+            // too-small file still reaches the length check below with
+            // whatever short prefix it actually has, instead of failing on
+            // a generic I/O error first.
+            let mut header = Vec::new();
+            file.by_ref()
+                .take(512)
+                .read_to_end(&mut header)
+                .with_context(|| format!("failed to read {path:?}"))?;
+            if header.len() < 512
+                || header[0..8] != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
+            {
                 bail!("not a valid OLE2/Compound File Binary file (bad signature)");
             }
-            let sector_shift = Self::read_u16(&data, 30)?;
-            let mini_sector_shift = Self::read_u16(&data, 32)?;
-            let num_fat_sectors = Self::read_u32(&data, 44)?;
-            let first_dir_sector = Self::read_u32(&data, 48)?;
-            let mini_stream_cutoff = Self::read_u32(&data, 56)?;
-            let first_minifat_sector = Self::read_u32(&data, 60)?;
-            let num_minifat_sectors = Self::read_u32(&data, 64)?;
-            let first_difat_sector = Self::read_u32(&data, 68)?;
-            let num_difat_sectors = Self::read_u32(&data, 72)?;
+            let sector_shift = Self::read_u16(&header, 30)?;
+            let mini_sector_shift = Self::read_u16(&header, 32)?;
+            let num_fat_sectors = Self::read_u32(&header, 44)?;
+            let first_dir_sector = Self::read_u32(&header, 48)?;
+            let mini_stream_cutoff = Self::read_u32(&header, 56)?;
+            let first_minifat_sector = Self::read_u32(&header, 60)?;
+            let num_minifat_sectors = Self::read_u32(&header, 64)?;
+            let first_difat_sector = Self::read_u32(&header, 68)?;
+            let num_difat_sectors = Self::read_u32(&header, 72)?;
             if !(6..=20).contains(&sector_shift) || !(2..=20).contains(&mini_sector_shift) {
                 bail!("unsupported OLE2 sector size");
             }
@@ -47532,10 +47552,11 @@ mod xlsx_support {
             // The DIFAT: 109 entries embedded in the header, followed by
             // any number of dedicated DIFAT sectors (each holding
             // sector_size/4 - 1 more entries, plus a trailing pointer to
-            // the next DIFAT sector).
+            // the next DIFAT sector) - read fresh via Seek, never the
+            // whole file.
             let mut fat_sector_locations = Vec::new();
             for i in 0..109 {
-                let entry = Self::read_u32(&data, 76 + i * 4)?;
+                let entry = Self::read_u32(&header, 76 + i * 4)?;
                 if entry != CFB_FREESECT {
                     fat_sector_locations.push(entry);
                 }
@@ -47545,8 +47566,10 @@ mod xlsx_support {
                 let entries_per_sector = sector_size / 4 - 1;
                 for _ in 0..num_difat_sectors {
                     let offset = 512 + sector as usize * sector_size;
-                    let chunk = data
-                        .get(offset..offset + sector_size)
+                    let mut chunk = vec![0u8; sector_size];
+                    file.seek(SeekFrom::Start(offset as u64))
+                        .context("truncated CFB DIFAT sector")?;
+                    file.read_exact(&mut chunk)
                         .context("truncated CFB DIFAT sector")?;
                     for i in 0..entries_per_sector {
                         let entry = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
@@ -47566,12 +47589,15 @@ mod xlsx_support {
             }
 
             // The FAT itself: each listed sector holds sector_size/4
-            // u32 entries.
+            // u32 entries - read fresh via Seek, bounded by sector count
+            // (small metadata), never the whole file.
             let mut fat = Vec::new();
             for &sector in &fat_sector_locations {
                 let offset = 512 + sector as usize * sector_size;
-                let chunk = data
-                    .get(offset..offset + sector_size)
+                let mut chunk = vec![0u8; sector_size];
+                file.seek(SeekFrom::Start(offset as u64))
+                    .context("truncated CFB FAT sector")?;
+                file.read_exact(&mut chunk)
                     .context("truncated CFB FAT sector")?;
                 for i in 0..sector_size / 4 {
                     fat.push(u32::from_le_bytes(
@@ -47582,7 +47608,7 @@ mod xlsx_support {
             let _ = num_fat_sectors; // informational only; fat_sector_locations is authoritative
 
             let mut cfb = CfbFile {
-                data,
+                file,
                 sector_size,
                 mini_sector_size,
                 fat,
@@ -47624,11 +47650,13 @@ mod xlsx_support {
 
             // The root entry's own stream *is* the mini stream every small
             // stream's data actually lives inside.
-            if let Some(root) = cfb.directory.iter().find(|e| e.object_type == 5)
-                && root.start_sector != CFB_ENDOFCHAIN
-            {
-                cfb.mini_stream = cfb.read_chain(root.start_sector)?;
-                cfb.mini_stream.truncate(root.stream_size as usize);
+            if let Some(root) = cfb.directory.iter().find(|e| e.object_type == 5) {
+                let root_start_sector = root.start_sector;
+                let root_stream_size = root.stream_size;
+                if root_start_sector != CFB_ENDOFCHAIN {
+                    cfb.mini_stream = cfb.read_chain(root_start_sector)?;
+                    cfb.mini_stream.truncate(root_stream_size as usize);
+                }
             }
             if num_minifat_sectors > 0 {
                 let minifat_bytes = cfb.read_chain(first_minifat_sector)?;
@@ -47642,18 +47670,20 @@ mod xlsx_support {
             Ok(cfb)
         }
 
-        pub(crate) fn read_stream(&self, name: &str) -> Result<Vec<u8>> {
+        pub(crate) fn read_stream(&mut self, name: &str) -> Result<Vec<u8>> {
             let entry = self
                 .directory
                 .iter()
                 .find(|e| e.object_type == 2 && e.name == name)
                 .ok_or_else(|| anyhow!("no '{name}' stream in this OLE2 file"))?;
-            let mut bytes = if entry.stream_size < u64::from(self.mini_stream_cutoff) {
-                self.read_mini_chain(entry.start_sector)?
+            let start_sector = entry.start_sector;
+            let stream_size = entry.stream_size;
+            let mut bytes = if stream_size < u64::from(self.mini_stream_cutoff) {
+                self.read_mini_chain(start_sector)?
             } else {
-                self.read_chain(entry.start_sector)?
+                self.read_chain(start_sector)?
             };
-            bytes.truncate(entry.stream_size as usize);
+            bytes.truncate(stream_size as usize);
             Ok(bytes)
         }
 
@@ -48355,7 +48385,7 @@ mod xlsx_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-        let cfb = CfbFile::open(path)?;
+        let mut cfb = CfbFile::open(path)?;
         let stream = cfb
             .read_stream("Workbook")
             .or_else(|_| cfb.read_stream("Book"))
@@ -52636,7 +52666,7 @@ mod tests {
     #[cfg(feature = "xlsx")]
     #[test]
     fn cfb_reader_extracts_the_real_workbook_stream() {
-        let cfb =
+        let mut cfb =
             xlsx_support::CfbFile::open(Path::new("tests/fixtures/type_detection_lo.xls")).unwrap();
         let workbook = cfb.read_stream("Workbook").unwrap();
         assert_eq!(workbook.len(), 2268);

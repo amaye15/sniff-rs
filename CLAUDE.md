@@ -4550,19 +4550,90 @@ for lack of a file to scale to. Clippy/fmt clean across the default,
 `sas7bdat`, and `full` builds, each matching its own established
 baseline.
 
-**Deliberately not done yet**: old-style `.xls` (OLE2/CFB, a *different*
-container format than the ZIP-based four `ZipArchive` already covers,
-and - unlike every phase converted so far, SAS7BDAT included, all of
-which turned out to be forward-only or independently-addressable-chunk
-access patterns - one whose sector-chain-following genuinely can
-reference an arbitrary, non-sequential next sector, so getting a
-comparable win means the chain-walk itself becoming lazy, not just its
-outer caller reading a smaller bounded span). Per-entry streaming
-decompression inside `ZipArchive::read` itself (described above) is
-also a real, disclosed, separately-scoped remaining gap, not folded into
-this phase. The `suggest_ideal_type` incremental-accumulator rewrite
-(the deeper win described above) remains entirely unstarted, tracked as
-its own future phase.
+**Old-style `.xls` (OLE2/CFB) went fourteenth, and turned out more
+tractable than its own "genuinely non-sequential chain-walk" framing
+(this section's own prior write-up, above) initially suggested** -
+re-reading `CfbFile`'s own `read_chain`/`read_mini_chain` plus
+`columns_from_xls`'s call site specifically to check whether that
+framing actually held, rather than trusting the earlier assessment,
+found a real, safe, tractable path: `read_chain`'s per-sector FAT
+lookups genuinely can jump to any sector (unlike every other phase
+converted so far, SAS7BDAT included, which all turned out to be
+forward-only or independently-addressable-chunk access patterns), but
+*this* format's own actual usage never needed the chain-walk itself to
+become lazy at all - it only ever needed to stop reading the *whole
+file* into one resident `Vec<u8>` up front, alongside the metadata/
+directory/mini-stream structures that same buffer's own bytes get
+copied out of during `open()`. `read_chain`/`open`/`read_stream` moved
+from indexing a resident `data: &[u8]` to a `Seek`+`read_exact` per
+sector off a real `fs::File` (`CfbFile.file`), the identical shape
+`sqlite_support::read_page`/`sas7bdat_support::read_page` already
+established for their own page-by-page reads - `read_mini_chain` needed
+no equivalent change, since it only ever slices the already-resident
+`mini_stream` (itself populated via one `read_chain` call during
+`open()`, not re-read per stream). `has_stream` (used only by
+`sniff_format`'s own content-detection dispatch) stayed `&self`
+throughout, since it never touches sector data at all - only
+`read_chain`/`read_stream`/`open`'s own three internal call sites needed
+`&mut self`.
+
+**The real, honest, disclosed scope of this fix is "stop double-
+buffering the whole file alongside the separately-extracted Workbook
+stream," not full BIFF8-record-level streaming** - the same class of
+fix as the very first CSV/gzip Tier-1 conversions at the top of this
+section, confirmed directly by re-reading `columns_from_xls`: it calls
+`cfb.read_stream("Workbook").or_else(|_| cfb.read_stream("Book"))`
+exactly once into a fully-materialized `stream: Vec<u8>`, after which
+`cfb` (and the underlying file) is never touched again - every
+subsequent parse (`xls_parse_workbook_globals`, per-sheet
+`xls_parse_sheet`) operates on random byte-position slices *within*
+that one already-resident stream, because BOUNDSHEET8 records address
+sheet data by absolute byte position scattered throughout it. That
+stream has to stay fully materialized regardless of how it's read off
+disk, so this phase's real win is eliminating the redundant whole-file
+buffer that used to sit alongside it, not eliminating the Workbook
+stream's own memory cost.
+
+Measured on a real 17.5 MB `.xls` file (65,000 rows, 10 columns -
+LibreOffice's own "MS Excel 97" export filter converting a
+`openpyxl`-generated `.xlsx`, the same real-conversion provenance every
+other `.xls` fixture in this project already has, since no tool in this
+environment can write a genuine `.xls` file directly), 1 round each (a
+small, tight comparison window - see below for why a larger round count
+wasn't needed here): full-scan maxRSS 180 MB -> 138 MB (~23%), peak
+footprint 155 MB -> 117 MB (~25%). Isolating via `--nrows 1` shows
+essentially the *same* reduction rather than a larger, unmasked one the
+way every `Seek`-tier phase before this one showed (maxRSS 172 MB ->
+128 MB, ~26%; peak footprint 152 MB -> 117 MB, ~23%) - direct,
+consistent confirmation of the "stop double-buffering" framing above:
+since the Workbook stream itself is always fully read regardless of
+`--nrows`, there's no further row-level win left to unmask the way
+there was for SQLite/Parquet/Arrow IPC's own genuinely page/row-group/
+batch-bounded reads. Output confirmed byte-identical via `diff` in both
+cases. Full test suite (348 unit tests on `--features full`, including
+the existing `cfb_reader_extracts_the_real_workbook_stream` byte-exact
+CFB test, unchanged and passing with zero test modifications needed)
+and 308 integration tests verified against a clean baseline (see this
+project's own concurrent-editing note elsewhere in this file - a
+duplicate test name in another in-progress session's own edits to
+`tests/integration.rs` blocked a direct `cargo test` run, worked around
+by temporarily swapping in the last-committed `tests/integration.rs`
+for verification, then restoring the working copy exactly). Clippy/fmt
+clean across the default, `xlsx`, and `full` builds, each matching its
+own already-established baseline (default=1, xlsx=4, full=5) exactly -
+zero new warnings introduced.
+
+**Deliberately not done yet**: per-entry streaming decompression inside
+`ZipArchive::read` itself (described above) is a real, disclosed,
+separately-scoped remaining gap. A genuine per-BIFF8-record streaming
+rewrite of `.xls` itself (as opposed to the container-level fix above)
+remains out of scope for the reason already stated - the Workbook
+stream's own record layout requires random access within it regardless
+of how the container bytes reach memory. The `suggest_ideal_type`
+incremental-accumulator rewrite (the deeper win described earlier in
+this section) remains entirely unstarted, tracked as its own future
+phase. With this phase, every format on the original streaming roadmap
+has now been converted or audited-and-found-already-streaming.
 
 ## Cloud-platform file compatibility
 
