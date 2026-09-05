@@ -12242,10 +12242,19 @@ mod orc_support {
             });
         }
 
-        // One `Vec<Option<String>>` accumulator per top-level column,
-        // filled stripe by stripe.
-        let mut accumulated: Vec<Vec<Option<String>>> =
-            top_level.iter().map(|_| Vec::new()).collect();
+        // One incremental type-detection accumulator per top-level column,
+        // fed value-by-value stripe by stripe rather than collecting a
+        // full `Vec<Option<String>>` per column first. `row_count` tracks
+        // the total rows seen (a placeholder/compound column pushes
+        // nothing but still advances this), which is what the `--nrows`
+        // cap and every column's final `total` are measured against - the
+        // exact `accumulated[..].len()` semantics the old
+        // `Vec<Option<String>>`-per-column version had.
+        let mut states: Vec<ColumnAccumulatorState> = top_level
+            .iter()
+            .map(|_| ColumnAccumulatorState::new())
+            .collect();
+        let mut row_count: usize = 0;
         let mut placeholder_notes: Vec<Option<String>> = top_level.iter().map(|_| None).collect();
 
         // The set of column ids this reader actually cares about is fixed
@@ -12261,7 +12270,7 @@ mod orc_support {
             top_level.iter().map(|c| c.column_id).collect();
 
         'stripes: for stripe_info in &footer.stripes {
-            if nrows.is_some_and(|limit| accumulated.first().is_none_or(|c| c.len() >= limit)) {
+            if nrows.is_some_and(|limit| row_count >= limit) {
                 break;
             }
             if stripe_info.footer_length > MAX_SECTION_LEN {
@@ -12307,6 +12316,8 @@ mod orc_support {
             let num_rows = stripe_info.number_of_rows as usize;
             for (idx, col) in top_level.iter().enumerate() {
                 if col.kind.is_compound() {
+                    // A placeholder column stores nothing; `row_count`
+                    // below is what carries its length forward.
                     placeholder_notes[idx] = Some(match col.kind {
                         OrcTypeKind::Struct => {
                             "nested Struct column - not yet supported, consider flattening upstream"
@@ -12326,13 +12337,11 @@ mod orc_support {
                         }
                         _ => unreachable!("is_compound() only true for the four kinds above"),
                     });
-                    accumulated[idx].extend(std::iter::repeat_n(None, num_rows));
                     continue;
                 }
                 if matches!(col.kind, OrcTypeKind::Other(_)) {
                     placeholder_notes[idx] =
                         Some("unrecognized ORC column type - not supported".to_string());
-                    accumulated[idx].extend(std::iter::repeat_n(None, num_rows));
                     continue;
                 }
                 let encoding = stripe_footer
@@ -12364,21 +12373,20 @@ mod orc_support {
                     col.precision,
                     col.scale,
                 )?;
-                accumulated[idx].extend(values);
+                for v in values.into_iter().flatten() {
+                    states[idx].push(v, n_samples);
+                }
             }
+            row_count += num_rows;
 
-            if nrows.is_some_and(|limit| accumulated.first().is_none_or(|c| c.len() >= limit)) {
+            if nrows.is_some_and(|limit| row_count >= limit) {
                 break 'stripes;
             }
         }
 
+        let total = row_count;
         let mut out = Vec::with_capacity(top_level.len());
-        for ((col, values), note) in top_level
-            .into_iter()
-            .zip(accumulated)
-            .zip(placeholder_notes)
-        {
-            let total = values.len();
+        for ((col, state), note) in top_level.into_iter().zip(states).zip(placeholder_notes) {
             if let Some(note) = note {
                 out.push(ColumnProfile {
                     name: col.name,
@@ -12413,16 +12421,10 @@ mod orc_support {
                     unreachable!("handled above")
                 }
             };
-            let raw_values: Vec<String> = values.into_iter().flatten().collect();
-            out.push(profile_column(
-                ColumnInput {
-                    name: col.name,
-                    current_type: current_type.to_string(),
-                    raw_values,
-                    total,
-                    skip_heuristics: false,
-                },
-                n_samples,
+            out.push(state.into_profile_with_declared_type(
+                col.name,
+                total,
+                current_type.to_string(),
             ));
         }
         Ok(out)

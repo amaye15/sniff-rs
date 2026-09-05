@@ -33,6 +33,38 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/incremental-orc` branch (Darwin arm64)
+
+ORC wired through `ColumnAccumulatorState`, the eighth format converted.
+`accumulated: Vec<Vec<Option<String>>>` (every stripe's values for every
+column, held until the last stripe) becomes `Vec<ColumnAccumulatorState>`
+fed value-by-value per stripe. A single `row_count` counter (advanced
+once per stripe by every column alike) replaces `accumulated[..].len()`
+for the `--nrows` cap and every column's `total`. `current_type`
+hardcoded per `OrcTypeKind`; compound/unrecognized columns still emit a
+disclosed placeholder `ColumnProfile` directly.
+
+Measured on a real 84 MB, 500,000-row ORC file (id/amount/25-word
+free-text/4-value category, via `pyarrow.orc`): maxRSS 390-398 MB ->
+224-227 MB (~43%), peak footprint ~213 MB -> ~155 MB (~27%), 3 rounds.
+Smaller than the row-oriented readers' ~98% on purpose: ORC's own
+stripe-at-a-time decode granularity (`read_scalar_column` still returns
+a whole stripe's `Vec<Option<String>>`) is now the floor, the same way
+one row group is Parquet's own streaming floor - this phase removed the
+cross-stripe buffer, not that per-stripe cost.
+
+Output byte-identical via `diff` against the entire 359-file fixture
+corpus, plus every committed `.orc` fixture (every codec, dictionary
+strings, decimals, timestamps, RLEv2, missing-values) at 3 `--samples`
+settings with `--nrows` unset/2/3 (135 combinations) - zero mismatches.
+Full test suite unchanged (including
+`orc_reader_matches_the_orc_rust_crate_output_exactly`), clippy/fmt
+clean across default/`orc`/`full`, established baselines (default=1,
+orc=1, full=5 - the pre-existing `chunks_exact`/question-mark findings
+from a newer clippy version).
+
+---
+
 ## 2026-09-06 — `feat/incremental-sas7bdat` branch (Darwin arm64)
 
 SAS7BDAT wired through `ColumnAccumulatorState`, the seventh format

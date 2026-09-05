@@ -4978,20 +4978,72 @@ matching established baselines (the same pre-existing `chunks_exact`/
 question-mark clippy findings on unrelated lines, from a newer clippy
 version, confirmed identical on unmodified `main` via `git stash`).
 
+**ORC went eighth**, and - like Parquet's own streaming phase before it -
+took a smaller relative reduction than the seven pure-`Vec`-of-values
+readers before it, for a structural reason worth stating plainly rather
+than glossing. `columns_from_orc` already builds its output stripe by
+stripe (a real ORC file's rows are split across independent stripes,
+each with its own compressed byte ranges - see the Architecture section),
+but held `accumulated: Vec<Vec<Option<String>>>` - *every* stripe's
+decoded values for *every* top-level column - resident until the last
+stripe was read. That's now `Vec<ColumnAccumulatorState>`, fed value by
+value as each stripe's `read_scalar_column` output is produced and then
+dropped, so the cross-stripe accumulation is gone: peak memory is now
+one stripe's decompressed streams plus one stripe's worth of one
+column's decoded strings, not the whole table. What's *not* removed is
+that per-stripe granularity itself - `read_scalar_column` still returns
+a `Vec<Option<String>>` for a whole stripe's rows before they're folded
+in - so the floor here is one stripe, the same way Parquet's own
+streaming floor is one row group. Going below that would mean pushing
+the accumulator down into the RLE decoders themselves, a separately-
+scoped further phase. `current_type` is a hardcoded `&str` per
+`OrcTypeKind` (bool/i64/f64/String/Decimal/Date/Timestamp) - the
+declared-type path, `into_profile_with_declared_type` unchanged. A
+compound (Struct/List/Map/Union) or unrecognized column is still a
+disclosed placeholder `ColumnProfile` built directly, exactly as before
+- it just no longer pads `accumulated` with `num_rows` `None`s to keep
+lengths aligned; a single `row_count` counter (advanced once per stripe,
+by every column alike) now carries what `accumulated[..].len()` used to,
+and is what both the `--nrows` cap and every column's final `total` are
+measured against.
+
+Measured on a real 84 MB, 500,000-row ORC file (id/amount/a
+25-word free-text description/a 4-value category column, generated via
+`pyarrow.orc`): maxRSS 390-398 MB -> 224-227 MB (~43%), peak footprint
+~213 MB -> ~155 MB (~27%), consistent across 3 rounds - a real,
+worthwhile reduction, honestly smaller than the ~98% the row-oriented
+readers got because ORC's own stripe-at-a-time decode granularity, not
+the cross-stripe buffer this phase removed, is what now dominates.
+Output confirmed byte-identical via `diff` against the pre-change binary
+across the entire 359-file fixture corpus, and separately across every
+committed `.orc` fixture (every compression codec, dictionary strings,
+decimals, timestamps, RLEv2 encodings, and the missing-values fixture -
+the last exercising the per-value `None`-not-pushed path directly) at
+every combination of 3 `--samples` settings and `--nrows` unset/2/3 (135
+combinations) - zero mismatches. Full test suite (347 unit + 360
+integration, including `orc_reader_matches_the_orc_rust_crate_output_exactly`,
+zero modifications needed) and clippy/fmt clean across default/`orc`/
+`full`, matching established baselines (the same pre-existing
+`chunks_exact`/question-mark clippy findings on unrelated lines, from a
+newer clippy version, confirmed identical on unmodified `main`).
+
 **Deliberately not done yet**: every other `profile_column`/
 `profile_json_path`-based reader still holds a full column's values
-resident (Excel, ORC, JSON, YAML, TOML, Avro, MessagePack,
+resident (Excel, JSON, YAML, TOML, Avro, MessagePack,
 CBOR, XML, Parquet/Arrow's nested columns) - each would need its own
 `ColumnInput`/`profile_column` (or `profile_json_path`) call site
 converted the same way CSV's/fixed-width's/dBase's/Stata's/SPSS's/
-NumPy's/SAS7BDAT's were, and each deserves its own real-file measurement
-before being called done, the same one-phase-at-a-time discipline this
-whole section has already used throughout. Excel specifically would need
-its own, larger restructuring (see above) rather than the same drop-in
-bypass pattern the seven converted so far all shared. Per-entry
-streaming decompression inside `ZipArchive::read` itself remains a
-real, disclosed, separately-scoped remaining gap, not folded into any
-phase
+NumPy's/SAS7BDAT's/ORC's were, and each deserves its own real-file
+measurement before being called done, the same one-phase-at-a-time
+discipline this whole section has already used throughout. Excel
+specifically would need its own, larger restructuring (see above) rather
+than the same drop-in bypass pattern the eight converted so far all
+shared. The `profile_json_path`-based nested formats are a genuinely
+different shape - a per-*path* recursive engine, not a per-column one -
+so converting them is its own separately-scoped design question, not the
+same drop-in. Per-entry streaming decompression inside
+`ZipArchive::read` itself remains a real, disclosed, separately-scoped
+remaining gap, not folded into any phase
 here.
 
 ## Cloud-platform file compatibility
