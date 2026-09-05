@@ -4078,15 +4078,135 @@ and byte-identical output confirmed via `diff` against a pre-streaming-
 but-bugfixed baseline across every committed `.zst` fixture, not just
 the new one.
 
-**Deliberately not done yet, in order of likely next steps**: every
-other naturally-streamable or header-then-sequential-rows format
-(MessagePack/CBOR, Avro, dBase, Stata, SAS7BDAT, SPSS, NumPy); and,
-hardest and last, the formats that need the *tail* of the file before
-the body means anything at all (Parquet, Arrow IPC, ORC, SQLite, every
-ZIP-based format) - true streaming there means `Seek`-based random
-access replacing a single in-memory buffer throughout each decoder, a
-materially larger rewrite per format than anything done so far. The
-`suggest_ideal_type` incremental-accumulator rewrite (the deeper win
+**Auditing the rest of the originally-planned list came seventh, before
+writing any more code** - checking each remaining format's actual read
+pattern directly (grepping for `fs::read`/`fs::read_to_string`/
+`read_to_end` and reading the surrounding function) rather than assuming
+every format on the original list still needed work. It didn't:
+`columns_from_msgpack`/`columns_from_cbor` already decode one value at a
+time straight off a `BufReader`, never buffering the raw byte stream at
+all; `columns_from_avro` already reads one block at a time (each
+independently size-bounded by the format itself) and its own `--nrows`
+check already breaks out of the block loop early, bounding real I/O
+already; `columns_from_dbase`/`columns_from_stata` already read
+sequentially through a `BufReader` with `read_exact` per record, and
+Stata's own `--nrows` check already runs before reading each row. None
+of these five needed any change at all - they'd already been written
+this way from the start, just never audited against this specific
+"stop double-buffering" lens before.
+
+Two genuine gaps turned up in the remaining two, both fixed:
+
+- **SPSS (`columns_from_spss`)** read its header/dictionary via
+  `BufReader` correctly, but then called `r.read_to_end(&mut rest)` -
+  the entire remainder of the file - before ever decoding a single case
+  (row). Fixed by converting `CaseSource`/`BytecodeDecompressor` from
+  operating over a borrowed `&'a [u8]` slice to a generic `R: Read`
+  stream - safe because neither one ever needs to look backward; both
+  are purely forward, single-pass consumers of case data, confirmed by
+  reading each one's own `next_slot` logic line by line before making
+  the change. `read_slot` (a new small helper) reads exactly one 8-byte
+  slot from a real stream, distinguishing a clean end-of-data (`Ok(None)`,
+  nothing left to read at all) from a genuine mid-slot truncation (an
+  error) - the same "zero bytes before any were read is EOF, zero bytes
+  after some were already read is truncation" distinction this project's
+  other streaming readers already draw at the line/chunk level, just
+  applied here at the level of `Read::read`'s own byte count.
+  `columns_from_spss` now hands `CaseSource` the same `BufReader` the
+  header was already read from, continuing from wherever that left off,
+  instead of a fresh in-memory buffer - and `read_cases`'s own existing
+  `if nrows.is_some_and(...) { break; }` check, which already ran before
+  pulling the next row's slots, now genuinely stops reading from disk
+  once the limit is reached, the same free `--nrows`-bounds-I/O property
+  every other phase's own early-break check already picked up once its
+  underlying read became lazy.
+- **NumPy (`columns_from_npy_reader`)'s plain (non-structured) dtype
+  path** read the *entire* array body into one `Vec<u8>` before decoding
+  a single element, regardless of `--nrows` - correct for Fortran
+  (column-major) order, where a single row's elements are genuinely
+  scattered stride-`n_rows` apart through the file, but unnecessary for
+  the far more common row-major (`C`) order, where rows are exactly as
+  contiguous as a structured dtype's own already-streaming records are.
+  Row-major (and 1D, where "order" makes no real difference at all) now
+  streams one row at a time via `reader.read_exact`, identical in shape
+  to the structured-dtype path a few lines above it; Fortran order with
+  more than one column stays a deliberate, disclosed whole-buffer read -
+  `reader` isn't guaranteed to support seeking (a `.npz` entry is a
+  decompression stream, not a real file), so skipping the unneeded
+  trailing rows of each column without reading them isn't available
+  here the way it would be for a plain `File`.
+
+Measured on two real files, generated the same way as every other
+phase's own real-file measurement:
+
+A 64 MB uncompressed SPSS file (2,000,000 rows, 3 columns), 3 rounds
+each: peak footprint 435 MB -> 371 MB (~15%), maxRSS 540 MB -> 471 MB
+(~13%) - both confirmed byte-identical via `diff`. No `--nrows`-specific
+isolation was needed to see this cleanly, unlike zstd's own phase - SPSS
+has no separate "decompress, then re-parse" step for a downstream reader
+to mask the win behind; reading cases and building the typed column
+accumulator happen in the same single pass.
+
+A 160 MB NumPy file (2,000,000 x 10 row-major `float64` array) showed
+the *same* full-pipeline masking phenomenon zstd's own phase already
+documented, for the identical reason: the array body (160 MB) is small
+relative to the downstream `columns: Vec<Vec<String>>` accumulator
+(20,000,000 stringified floats, the same inherent Tier-2 cost every
+format pays regardless of how the source bytes were read) that ends up
+dominating total process memory either way, so the full pipeline showed
+no clean win either direction (maxRSS +8%, peak footprint -1% - both
+within the range this kind of measurement noise already produces
+elsewhere in this project). Isolating the array-reading phase directly
+via `--nrows 1` (which, now that the C-order path is genuinely lazy,
+reads only the first row's 80 bytes instead of the whole 160 MB body)
+shows the real, unmasked mechanism cleanly: peak footprint 161 MB ->
+0.85 MB (~99.5%), maxRSS 162 MB -> 2.0 MB (~99%) - confirmed
+byte-identical via `diff` across every committed `.npy`/`.npz` fixture,
+not just the new measurement file.
+
+Two new integration tests
+(`spss_nrows_stops_reading_before_a_truncated_tail`,
+`npy_nrows_stops_reading_before_a_truncated_tail`) lock in the
+`--nrows`-bounds-real-I/O behavior the same way as every earlier phase's
+own version, adapted to these two binary formats: rather than invalid
+UTF-8 appended past a text cutoff, each generates a real file (via
+`pyreadstat`/`numpy`, matching this project's own established real-tool
+fixture-generation convention) then truncates it well before its own
+declared row count is satisfied - a small `--nrows` still succeeds
+(only that many rows are ever read), while omitting `--nrows` fails,
+on the identical truncated file. Full test suite (347 unit + 243
+integration on `--features full`, 211 + 88 on default, two new)
+unchanged and passing, clippy/fmt clean across every individually
+plausible feature combination (default, `spss`, `npy`, `full`) matching
+each one's own established baseline exactly.
+
+**One item from the original list, SAS7BDAT, turned out to belong in
+the harder tier below rather than this one, found by reading its own
+metadata-parsing logic rather than assumed simple by category.**
+`parse_metadata` walks *every* page in the file once to collect
+scattered subheaders (a `ROW_SIZE` subheader carrying `rows_per_page` -
+needed to correctly bound a later `Mix` page's own trailing row - can
+appear on any page in the metadata region, not just the first one), and
+`collect_rows` then walks the file a *second* time, from the start
+again, now that metadata is fully known, to actually extract rows -
+including re-reading data embedded in `Mix` pages the first pass already
+visited. This is a genuine two-pass-over-the-whole-file structure, not
+a simple sequential scan - converting it to real streaming would mean
+either `Seek`-based re-reading (bounding memory to one page at a time
+but reading the file twice from disk) or buffering just the `Mix`-page
+row data found during the metadata pass, either way a materially bigger
+rewrite than anything done in this or the preceding six phases, and
+closer in spirit to Parquet's own tail-footer problem than to a plain
+`BufReader` swap. Moved to the harder tier below rather than attempted
+here.
+
+**Deliberately not done yet**: the formats that need either genuine
+random (`Seek`-based) access or more than one full pass over the file
+before the data means anything at all - SAS7BDAT (see above), Parquet,
+Arrow IPC, ORC, SQLite, and every ZIP-based format (`.xlsx`/`.xls`/
+`.xlsb`/`.ods`/`.npz`) - a materially larger rewrite per format than
+anything done so far. The `suggest_ideal_type` incremental-accumulator
+rewrite (the deeper win
 described above) remains entirely unstarted, tracked as its own future
 phase.
 

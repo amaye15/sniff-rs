@@ -4852,3 +4852,112 @@ fn batch_mode_index_caps_the_files_table_on_a_large_directory() {
     assert_eq!(index.matches("| f").count(), 50);
     assert!(index.contains("…and 7 more file(s) not shown here"));
 }
+
+// --- Streaming: --nrows bounds real I/O for SPSS and NumPy too ---
+// Both readers were converted from a single whole-remaining-file/whole-
+// array-body read to reading exactly as many rows as --nrows asks for
+// (see CLAUDE.md's "Streaming reads / memory footprint" section). These
+// two tests prove that's genuinely true of *disk reads*, not just of how
+// many rows end up profiled afterward: a file truncated right after
+// enough bytes for a handful of rows still succeeds with a small enough
+// --nrows, and fails without it on the identical file, since only the
+// streaming path ever stops asking the file for more bytes before
+// reaching the truncation.
+
+#[cfg(feature = "npy")]
+#[test]
+fn npy_nrows_stops_reading_before_a_truncated_tail() {
+    let dir = TempDir::new();
+    let path = dir.path().join("big.npy");
+    // A real, C-order 2D float64 array (1000 rows x 4 cols) via numpy
+    // itself, so the header this reader has to parse is genuine, not
+    // hand-guessed.
+    let py_code = format!(
+        "import numpy as np; a = np.arange(1000*4, dtype='<f8').reshape(1000, 4); np.save(r'{}', a)",
+        path.to_str().unwrap()
+    );
+    let out = Command::new("python3")
+        .args(["-c", &py_code])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "failed to generate npy fixture: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Truncate to header + exactly 10 rows' worth of data, well short of
+    // the 1000 the header itself declares.
+    let full = std::fs::read(&path).unwrap();
+    let header_len = full.len() - 1000 * 4 * 8;
+    let truncated = &full[..header_len + 10 * 4 * 8];
+    std::fs::write(&path, truncated).unwrap();
+
+    let with_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--nrows", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        with_nrows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_nrows.stderr)
+    );
+
+    let without_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(
+        !without_nrows.status.success(),
+        "reading past the truncated tail should fail without --nrows"
+    );
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_nrows_stops_reading_before_a_truncated_tail() {
+    let dir = TempDir::new();
+    let path = dir.path().join("big.sav");
+    // A real, uncompressed .sav via pyreadstat, so the dictionary/case-
+    // data layout this reader has to parse is genuine.
+    let py_code = format!(
+        "import pyreadstat, pandas as pd, numpy as np\n\
+         df = pd.DataFrame({{'id': np.arange(1000, dtype='int64'), 'name': [f'user_{{i}}' for i in range(1000)]}})\n\
+         pyreadstat.write_sav(df, r'{}')\n",
+        path.to_str().unwrap()
+    );
+    let out = Command::new("python3")
+        .args(["-c", &py_code])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "failed to generate sav fixture: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Truncate well before the file's own declared case count is
+    // satisfied, but past enough real case data for a handful of rows.
+    let full = std::fs::read(&path).unwrap();
+    let truncated = &full[..full.len() / 4];
+    std::fs::write(&path, truncated).unwrap();
+
+    let with_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--nrows", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        with_nrows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_nrows.stderr)
+    );
+
+    let without_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(
+        !without_nrows.status.success(),
+        "reading past the truncated tail should fail without --nrows"
+    );
+}

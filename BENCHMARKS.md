@@ -33,6 +33,57 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-spss-npy` branch (Darwin arm64)
+
+An audit of the remaining "naturally streamable" formats found five
+(MessagePack, CBOR, Avro, dBase, Stata) already streaming - no change
+needed - and two real gaps, both fixed. See CLAUDE.md's "Streaming
+reads / memory footprint" section for the full writeup, including why
+SAS7BDAT (also on the original list) turned out to need a genuine
+two-pass rewrite and was moved to the harder tier instead.
+
+**SPSS** (`columns_from_spss`'s `read_to_end` of the whole remaining
+file replaced with a streaming `CaseSource`/`BytecodeDecompressor` over
+a generic `Read`): real file (64 MB, 2,000,000 rows, 3 columns,
+uncompressed), 3 rounds:
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 540 MB | 435 MB |
+| New | 471 MB | 371 MB |
+| Change | **-13%** | **-15%** |
+
+**NumPy** (`columns_from_npy_reader`'s plain-dtype row-major path now
+streams one row at a time instead of reading the whole array body up
+front; Fortran order with >1 column stays a disclosed whole-buffer
+read). Full pipeline on a 160 MB file (2,000,000 x 10 `float64`) showed
+no clean win either direction - the downstream `Vec<Vec<String>>`
+column accumulator (20,000,000 stringified values) dominates regardless
+of how the array bytes were read, the same masking effect zstd's own
+phase already documented:
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 975 MB | 881 MB |
+| New | 1,051 MB | 872 MB |
+| Change | +8% | -1% |
+
+Isolating the array-reading phase directly (`--nrows 1`, which now
+reads only the first row instead of the whole body) shows the real,
+unmasked mechanism:
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 162 MB | 161 MB |
+| New | 2.0 MB | 0.85 MB |
+| Change | **-99%** | **-99.5%** |
+
+Both confirmed byte-identical via `diff` against every committed
+fixture, not just the measurement files. No Criterion benchmark target
+currently isolates either reader, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-zstd` branch (Darwin arm64)
 
 The zstd decompression layer converted to a sliding-window streaming

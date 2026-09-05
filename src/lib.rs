@@ -9696,26 +9696,52 @@ mod spss_support {
         })
     }
 
+    /// Reads exactly one 8-byte case-data slot from a real `Read` stream,
+    /// distinguishing a clean end-of-data (`Ok(None)`, nothing at all left
+    /// to read) from a genuine mid-slot truncation (an error) - the same
+    /// "zero bytes before any were read is EOF, zero bytes after some
+    /// were already read is truncation" distinction `stream_utf8_chunks`
+    /// and friends already draw elsewhere in this file, just at the
+    /// byte-count level `Read::read` exposes rather than a `BufRead`
+    /// line boundary. Neither `CaseSource::Raw` nor `BytecodeDecompressor`
+    /// below ever needs to look backward - both are purely forward,
+    /// single-pass consumers of case data - so reading through this
+    /// instead of a full in-memory `&[u8]` slice needs no algorithm
+    /// change at all, just a different source of bytes.
+    fn read_slot(r: &mut impl Read) -> Result<Option<[u8; 8]>> {
+        let mut buf = [0u8; 8];
+        let mut filled = 0usize;
+        while filled < 8 {
+            let n = r.read(&mut buf[filled..])?;
+            if n == 0 {
+                if filled == 0 {
+                    return Ok(None);
+                }
+                bail!("SPSS case data ends mid-slot");
+            }
+            filled += n;
+        }
+        Ok(Some(buf))
+    }
+
     /// Stateful RLE-style decompressor for SPSS's own "bytecode"
     /// compression - verified against `ambers`'s own `compression/
     /// bytecode.rs`. Eight 1-byte opcodes ("a control block") govern the
     /// next eight 8-byte slots; a control block's own boundary never
     /// aligns with a case (row) boundary, so the decompressor's state
     /// must carry across `next_slot` calls rather than resetting per row.
-    struct BytecodeDecompressor<'a> {
-        data: &'a [u8],
-        pos: usize,
+    struct BytecodeDecompressor<R: Read> {
+        reader: R,
         control: [u8; 8],
         control_idx: usize,
         bias: f64,
         eof: bool,
     }
 
-    impl<'a> BytecodeDecompressor<'a> {
-        fn new(data: &'a [u8], bias: f64) -> Self {
+    impl<R: Read> BytecodeDecompressor<R> {
+        fn new(reader: R, bias: f64) -> Self {
             BytecodeDecompressor {
-                data,
-                pos: 0,
+                reader,
                 control: [0; 8],
                 control_idx: 8,
                 bias,
@@ -9730,11 +9756,10 @@ mod spss_support {
                     return Ok(None);
                 }
                 if self.control_idx >= 8 {
-                    let Some(block) = self.data.get(self.pos..self.pos + 8) else {
+                    let Some(block) = read_slot(&mut self.reader)? else {
                         return Ok(None);
                     };
-                    self.control.copy_from_slice(block);
-                    self.pos += 8;
+                    self.control = block;
                     self.control_idx = 0;
                 }
                 let code = self.control[self.control_idx];
@@ -9746,12 +9771,9 @@ mod spss_support {
                         return Ok(Some(value.to_le_bytes()));
                     }
                     COMPRESS_RAW_FOLLOWS => {
-                        let raw = self
-                            .data
-                            .get(self.pos..self.pos + 8)
+                        let raw = read_slot(&mut self.reader)?
                             .context("truncated SPSS bytecode-compressed data (raw slot)")?;
-                        self.pos += 8;
-                        return Ok(Some(raw.try_into().unwrap()));
+                        return Ok(Some(raw));
                     }
                     COMPRESS_EIGHT_SPACES => return Ok(Some([b' '; 8])),
                     COMPRESS_SYSMIS => return Ok(Some(SYSMIS_BITS.to_le_bytes())),
@@ -9764,21 +9786,15 @@ mod spss_support {
         }
     }
 
-    enum CaseSource<'a> {
-        Raw { data: &'a [u8], pos: usize },
-        Bytecode(BytecodeDecompressor<'a>),
+    enum CaseSource<R: Read> {
+        Raw(R),
+        Bytecode(BytecodeDecompressor<R>),
     }
 
-    impl CaseSource<'_> {
+    impl<R: Read> CaseSource<R> {
         fn next_slot(&mut self) -> Result<Option<[u8; 8]>> {
             match self {
-                CaseSource::Raw { data, pos } => {
-                    let Some(bytes) = data.get(*pos..*pos + 8) else {
-                        return Ok(None);
-                    };
-                    *pos += 8;
-                    Ok(Some(bytes.try_into().unwrap()))
-                }
+                CaseSource::Raw(r) => read_slot(r),
                 CaseSource::Bytecode(d) => d.next_slot(),
             }
         }
@@ -9834,8 +9850,8 @@ mod spss_support {
     /// per non-ghost variable per row (`None` for both SYSMIS and a
     /// user-declared missing value - this project's usual "missing values
     /// never fake a type change" treatment).
-    fn read_cases(
-        mut source: CaseSource,
+    fn read_cases<R: Read>(
+        mut source: CaseSource<R>,
         dict: &Dictionary,
         nrows: Option<usize>,
     ) -> Result<Vec<Vec<Option<String>>>> {
@@ -9950,16 +9966,19 @@ mod spss_support {
                  rebuild the file as an uncompressed or default-compressed .sav"
             );
         }
-        let mut rest = Vec::new();
-        r.read_to_end(&mut rest)
-            .context("failed reading SPSS case data")?;
+        // Streams case data straight off the same BufReader the header/
+        // dictionary were already read from, instead of first reading
+        // the entire remainder of the file into one Vec<u8> - safe
+        // because neither CaseSource::Raw nor BytecodeDecompressor ever
+        // needs to look backward (see read_slot's own doc comment), and
+        // it's what lets --nrows genuinely bound real I/O here too:
+        // read_cases's own early-break check now stops pulling further
+        // bytes from disk once the row limit is reached, rather than
+        // that limit only ever trimming an already-fully-read buffer.
         let source = match dict.header.compression {
-            Compression::None => CaseSource::Raw {
-                data: &rest,
-                pos: 0,
-            },
+            Compression::None => CaseSource::Raw(r),
             Compression::Bytecode => {
-                CaseSource::Bytecode(BytecodeDecompressor::new(&rest, dict.header.bias))
+                CaseSource::Bytecode(BytecodeDecompressor::new(r, dict.header.bias))
             }
             Compression::Zlib => unreachable!("handled above"),
         };
@@ -10130,7 +10149,7 @@ mod spss_support {
             control[1] = COMPRESS_EIGHT_SPACES;
             control[2] = COMPRESS_SYSMIS;
             control[3] = COMPRESS_END_OF_FILE;
-            let mut d = BytecodeDecompressor::new(&control, 100.0);
+            let mut d = BytecodeDecompressor::new(&control[..], 100.0);
 
             let first = d.next_slot().unwrap().unwrap();
             assert_eq!(f64::from_le_bytes(first), 1.0);
@@ -42280,7 +42299,7 @@ mod npy_support {
     // structured array, a Fortran-order 2D array, and a sub-array field).
     // ---------------------------------------------------------------
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum Order {
         C,
         Fortran,
@@ -42603,12 +42622,39 @@ mod npy_support {
                     offset += size;
                 }
             }
+        } else if order == Order::C || n_cols <= 1 {
+            // Row-major (or a 1D array, where "order" makes no real
+            // difference - a single column is trivially contiguous
+            // either way): rows are laid out one after another exactly
+            // like the structured/record case above, so this streams one
+            // row at a time too instead of reading the whole array body
+            // into memory up front. --nrows genuinely bounds real I/O
+            // here as well - once rows_to_read rows have been read,
+            // nothing further is pulled from the file at all.
+            let elem_size = field_sizes[0];
+            let mut buf = vec![0u8; n_cols * elem_size];
+            for row in 0..rows_to_read {
+                reader
+                    .read_exact(&mut buf)
+                    .with_context(|| format!("failed reading row {row}"))?;
+                for (col_idx, column) in columns.iter_mut().enumerate() {
+                    let start = col_idx * elem_size;
+                    column.push(npy_value_to_string(
+                        &fields[0].dtype,
+                        &buf[start..start + elem_size],
+                    ));
+                }
+            }
         } else {
-            // A plain array has no such guarantee - in particular, Fortran
-            // (column-major) order means a single row's elements are scattered
-            // stride-n_rows apart through the whole file, not contiguous - so
-            // this reads every element up front and computes each one's flat
-            // index explicitly rather than trying to stream row-sized chunks.
+            // Fortran (column-major) order with more than one column: a
+            // single row's elements are scattered stride-n_rows apart
+            // through the whole file, not contiguous, and `reader` isn't
+            // guaranteed to support seeking (a `.npz` entry is a
+            // decompression stream, not a real file) - so this deliberately
+            // stays a whole-buffer read rather than the row-at-a-time
+            // streaming above, a disclosed scope boundary (see CLAUDE.md's
+            // Streaming reads section) rather than an oversight. `--nrows`
+            // still only trims the *kept* output here, not real I/O.
             let elem_size = field_sizes[0];
             let total_elems = n_rows * n_cols;
             let mut buf = vec![0u8; total_elems * elem_size];
@@ -42617,10 +42663,7 @@ mod npy_support {
             })?;
             for row in 0..rows_to_read {
                 for (col_idx, column) in columns.iter_mut().enumerate() {
-                    let flat_index = match order {
-                        Order::C => row * n_cols + col_idx,
-                        Order::Fortran => col_idx * n_rows + row,
-                    };
+                    let flat_index = col_idx * n_rows + row;
                     let start = flat_index * elem_size;
                     column.push(npy_value_to_string(
                         &fields[0].dtype,
