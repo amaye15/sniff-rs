@@ -411,6 +411,36 @@ directory-batch mode - the batch orchestration in `run_directory` is
 genuinely new, but it adds no new format-specific logic of its own
 anywhere.
 
+**Testing** mostly follows this project's usual per-throwaway-`TempDir`
+pattern (recursion, the naming-collision fix, `--output-dir` mirroring,
+fail-fast naming the offending file with prior successes intact, the
+zero-match error, the self-output regression, every validation error, and
+the symlink-cycle/no-follow behavior each get their own small, focused
+tree). One test is different: `tests/fixtures/edge_batch_directory/` is a
+small, permanent, *committed* fixture tree - the same "reviewable without
+reading test code" reasoning every other format's own fixture already
+gets in this project - covering several real shapes at once: a plain
+top-level file, a dotfile (proving the "include hidden files" decision
+actually holds), a genuinely unrecognized file, a gzip-compressed file
+(proving decompression runs before detection in batch mode too), an
+extensionless-but-content-sniffable file that's *also* multi-table
+(SQLite - proving `dispatch_reader`'s multi-table branch works
+identically inside batch orchestration), a `--format`-only format
+(syslog) with no extension convention at all (proving it's correctly
+never auto-detected rather than silently mishandled), and two levels of
+subdirectory nesting. Every test against it passes `--output-dir` so the
+fixture directory itself is never written into and stays pristine across
+runs - the same read-only-fixture discipline this project already
+applies everywhere else, just newly relevant here since batch mode is
+the first feature in this project that could otherwise mutate its own
+committed fixtures by running against them. The identical fixture also
+locks in the not-compiled-in case from the opposite direction: a
+`#[cfg(not(feature = "sqlite"))]`-gated test proves the same extensionless
+SQLite file is still *identified* correctly (content-sniffing doesn't
+care what's compiled in) but fails fast with the same actionable
+"rebuild with --features" error single-file mode already gives, rather
+than either a silent skip or a wrong success.
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:

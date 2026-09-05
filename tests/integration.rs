@@ -4231,3 +4231,185 @@ fn batch_mode_does_not_follow_a_symlinked_directory_but_reads_a_symlinked_file()
         assert!(dir.path().join("file_link.csv.dictionary.md").exists());
     }
 }
+
+/// A comprehensive fixture tree exercising every real-world shape at once,
+/// rather than one narrow thing per test: a plain top-level file, a hidden
+/// (dotfile) file - proving the "include hidden files" decision actually
+/// holds, a genuinely unrecognized file, a gzip-compressed file - proving
+/// decompression runs before detection in batch mode too, an extensionless
+/// but content-sniffable file that also happens to be multi-table (SQLite),
+/// a `--format`-only format (syslog) with no extension convention - proving
+/// it's correctly never auto-detected rather than silently mishandled, and
+/// two levels of subdirectory nesting. Kept as a small, permanent, committed
+/// fixture (unlike every other batch-mode test's own throwaway TempDir tree)
+/// specifically so this exact combination is reviewable and doesn't have to
+/// be reconstructed by reading test code - the same reason every other
+/// format in this project has its own committed fixture. Every test against
+/// it uses --output-dir so the fixture directory itself is never written
+/// into and stays pristine across runs.
+#[cfg(feature = "sqlite")]
+#[test]
+fn batch_mode_processes_a_comprehensive_real_world_fixture_tree() {
+    let out = TempDir::new();
+    let output = run_dir(&[
+        "tests/fixtures/edge_batch_directory",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "batch run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("README.txt: skipped (unrecognized format)"));
+    assert!(stderr.contains("unreachable_without_format.log: skipped (unrecognized format)"));
+    assert!(
+        stderr.contains("6 file(s) processed (2 skipped), 7 tables, 50 columns total"),
+        "got: {stderr}"
+    );
+
+    // Every recognized file, at every depth, produced its own output under
+    // the mirrored tree.
+    assert!(out.path().join("top.csv.dictionary.md").exists());
+    assert!(out.path().join(".hidden.csv.dictionary.md").exists());
+    assert!(out.path().join("compressed.csv.dictionary.md").exists());
+    assert!(
+        out.path()
+            .join("sniffable_no_extension.dictionary.md")
+            .exists()
+    );
+    assert!(out.path().join("level1/mid.jsonl.dictionary.md").exists());
+    assert!(
+        out.path()
+            .join("level1/level2/deep.csv.dictionary.md")
+            .exists()
+    );
+    // The two unrecognized files produced nothing.
+    assert!(!out.path().join("README.txt.dictionary.md").exists());
+    assert!(
+        !out.path()
+            .join("unreachable_without_format.log.dictionary.md")
+            .exists()
+    );
+
+    // The multi-table SQLite file's own two tables both actually flattened
+    // through the shared BTreeMap<table, columns> shape correctly - a real
+    // check that dispatch_reader's Sqlite branch works identically inside
+    // batch orchestration, not just in single-file mode.
+    let content =
+        std::fs::read_to_string(out.path().join("sniffable_no_extension.dictionary.md")).unwrap();
+    assert!(content.contains("## events"));
+    assert!(content.contains("## users"));
+}
+
+/// The exact fixture above, run against a build where SQLite isn't
+/// compiled in: the extensionless file is still correctly *identified* as
+/// SQLite (content-sniffing doesn't care what's compiled in), so this
+/// must fail fast with the same actionable "rebuild with --features"
+/// error single-file mode already gives - not a silent skip, since
+/// "detect_format could identify it" and "this build can actually read
+/// it" are two different questions, and only the first one is what batch
+/// mode treats as a non-fatal skip.
+#[cfg(not(feature = "sqlite"))]
+#[test]
+fn batch_mode_fails_fast_when_a_recognized_format_is_not_compiled_in() {
+    let dir = TempDir::new();
+    std::fs::copy(
+        fixture("sample.sqlite"),
+        dir.path().join("sniffable_no_extension"),
+    )
+    .unwrap();
+
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sniffable_no_extension"),
+        "error should name the offending file: {stderr}"
+    );
+    assert!(
+        stderr.contains("isn't compiled in"),
+        "expected the same actionable not-compiled-in error single-file mode gives: {stderr}"
+    );
+}
+
+#[test]
+fn batch_mode_treats_a_decompression_failure_as_fail_fast_not_a_skip() {
+    let dir = TempDir::new();
+    // Sorted so the good file is processed before the corrupt one is reached.
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a_good.csv")).unwrap();
+    std::fs::copy(
+        fixture("malformed_gzip_checksum.csv.gz"),
+        dir.path().join("z_bad.csv.gz"),
+    )
+    .unwrap();
+
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("z_bad.csv.gz"),
+        "error should name the offending file: {stderr}"
+    );
+    assert!(
+        !stderr.contains("z_bad.csv.gz: skipped"),
+        "a decompression failure is a real error, not an unrecognized-format skip: {stderr}"
+    );
+    assert!(dir.path().join("a_good.csv.dictionary.md").exists());
+}
+
+#[test]
+fn batch_mode_supports_json_and_json_schema_output() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+
+    let json_out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--output-format",
+        "json-schema",
+        "--output-dir",
+        json_out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "batch run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out_path = json_out.path().join("data.csv.dictionary.schema.json");
+    assert!(out_path.exists());
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(doc["$schema"], "http://json-schema.org/draft-07/schema#");
+    assert!(doc["tables"]["data"]["properties"]["zip_code"].is_object());
+}
+
+#[test]
+fn batch_mode_applies_global_flags_uniformly() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--output-format",
+        "json",
+        "--samples",
+        "1",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("data.csv.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    let cols = table(&doc, "data");
+    let zip = column(cols, "zip_code");
+    assert_eq!(
+        zip["sample_values"].as_array().unwrap().len(),
+        1,
+        "--samples 1 should have applied to every file in the batch"
+    );
+}
