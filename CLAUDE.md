@@ -4825,17 +4825,44 @@ including the direct `dbase_reader_matches_the_dbase_crate_output_
 exactly` oracle test passing unchanged) and clippy/fmt clean across
 default/`dbase`/`full`, matching established baselines exactly.
 
+**Stata went fourth**, and turned out to be the simplest conversion of
+the four so far: its own read loop already checked `nrows` *before*
+reading each observation (`if nrows.is_some_and(|limit| total >= limit)
+{ break; }`), so - unlike dBase - there was no "decode always,
+accumulate conditionally" split to preserve; `--nrows` already bounded
+real I/O here, and continues to unchanged. `current_type` again comes
+from the file's own declared variable type (`type_label`), so this
+reuses `into_profile_with_declared_type`/`finish_profile` exactly as
+dBase's own phase already established, needing no further additions to
+`ColumnAccumulatorState` itself - the second consumer of that split is
+what confirms it was worth generalizing rather than writing a
+dBase-only method.
+
+Measured on a real 32 MB, 200,000-row `.dta` file (id/amount/a
+150-character free-text description column, generated via `pandas`'
+`to_stata` at release 118, since this project's own tooling has no
+native Stata writer): maxRSS 76-83 MB -> ~2.1 MB (~97%), peak footprint
+59-64 MB -> ~0.95-1.0 MB (~98.4%), consistent across 3 rounds. Output
+confirmed byte-identical via `diff` against the pre-change binary
+across the entire 359-file fixture corpus, and separately across every
+committed `.dta` fixture at every combination of 3 `--samples` settings
+and with/without `--nrows 2` (30 combinations) - zero mismatches. Full
+test suite (347 unit + 360 integration, including the direct `stata_
+reader_matches_the_dta_crate_output_exactly` oracle test, zero
+modifications needed) and clippy/fmt clean across default/`stata`/
+`full`, matching established baselines exactly.
+
 **Deliberately not done yet**: every other `profile_column`/
 `profile_json_path`-based reader still holds a full column's values
-resident (Excel, NumPy, Stata, SAS7BDAT, SPSS, ORC, JSON, YAML, TOML,
-Avro, MessagePack, CBOR, XML, Parquet/Arrow's nested columns) - each
-would need its own `ColumnInput`/`profile_column` (or `profile_json_
-path`) call site converted the same way CSV's/fixed-width's/dBase's
+resident (Excel, NumPy, SAS7BDAT, SPSS, ORC, JSON, YAML, TOML, Avro,
+MessagePack, CBOR, XML, Parquet/Arrow's nested columns) - each would
+need its own `ColumnInput`/`profile_column` (or `profile_json_path`)
+call site converted the same way CSV's/fixed-width's/dBase's/Stata's
 were, and each deserves its own real-file measurement before being
 called done, the same one-phase-at-a-time discipline this whole section
 has already used throughout. Excel specifically would need its own,
 larger restructuring (see above) rather than the same drop-in bypass
-pattern the three converted so far all shared. Per-entry streaming
+pattern the four converted so far all shared. Per-entry streaming
 decompression inside `ZipArchive::read` itself remains a real,
 disclosed, separately-scoped remaining gap, not folded into any phase
 here.

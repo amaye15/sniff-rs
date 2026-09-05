@@ -33,6 +33,31 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/incremental-stata` branch (Darwin arm64)
+
+Stata wired through `ColumnAccumulatorState`, the fourth format
+converted (after CSV/fixed-width/dBase) and the simplest so far - its
+own read loop already checks `nrows` before reading each observation,
+so no "decode always, accumulate conditionally" split was needed the
+way dBase's own phase required. Reuses `into_profile_with_declared_type`
+unchanged (current_type comes from Stata's own declared variable type).
+
+Measured on a real 32 MB, 200,000-row `.dta` file (id/amount/a 150-char
+free-text column, via pandas' `to_stata`): maxRSS 76-83 MB -> ~2.1 MB
+(~97%), peak footprint 59-64 MB -> ~0.95-1.0 MB (~98.4%), consistent
+across 3 rounds. Output byte-identical via `diff` against the entire
+359-file fixture corpus, plus every committed `.dta` fixture at 3
+`--samples` settings with/without `--nrows 2` (30 combinations) - zero
+mismatches.
+
+Verified via the full test suite (347 unit + 360 integration, including
+the `stata_reader_matches_the_dta_crate_output_exactly` oracle test,
+zero modifications needed) and clippy/fmt clean across default/`stata`/
+`full`, matching established baselines (default=1, stata=1, full=5)
+exactly.
+
+---
+
 ## 2026-09-05 — `feat/incremental-dbase` branch (Darwin arm64)
 
 dBase wired through `ColumnAccumulatorState`, the third format converted

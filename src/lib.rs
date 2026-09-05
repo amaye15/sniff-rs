@@ -7827,7 +7827,18 @@ mod stata_support {
         }
 
         let utf8 = preamble.release.default_encoding_is_utf8();
-        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); variable_types.len()];
+        // One `ColumnAccumulatorState` per variable (the same shared,
+        // bounded-footprint accumulator CSV/fixed-width/dBase already
+        // use) instead of a `Vec<Option<String>>` held for every record,
+        // bypassing `ColumnInput`/`profile_column` entirely - the Tier 2
+        // win CLAUDE.md's "Streaming reads / memory footprint" section
+        // describes. `current_type` comes from Stata's own declared
+        // variable type (`type_label`), never inferred from values, so
+        // this uses `into_profile_with_declared_type` below, the same
+        // "declared type is a hint" split dBase's own conversion needed.
+        let mut col_states: Vec<ColumnAccumulatorState> = (0..variable_types.len())
+            .map(|_| ColumnAccumulatorState::new())
+            .collect();
         let mut total = 0usize;
         for _ in 0..preamble.observation_count {
             if nrows.is_some_and(|limit| total >= limit) {
@@ -7849,25 +7860,21 @@ mod stata_support {
                     utf8,
                 )
                 .with_context(|| format!("failed decoding a record from {path:?}"))?;
-                raw[col_idx].push(value);
+                if let Some(s) = value {
+                    col_states[col_idx].push(s, n_samples);
+                }
             }
             total += 1;
         }
 
-        let mut columns = Vec::new();
-        for ((name, vt), values) in variable_names.into_iter().zip(variable_types).zip(raw) {
-            let non_null: Vec<String> = values.into_iter().flatten().collect();
-            columns.push(profile_column(
-                ColumnInput {
-                    name,
-                    current_type: type_label(vt).to_string(),
-                    raw_values: non_null,
-                    total,
-                    skip_heuristics: false,
-                },
-                n_samples,
-            ));
-        }
+        let columns = variable_names
+            .into_iter()
+            .zip(variable_types)
+            .zip(col_states)
+            .map(|((name, vt), state)| {
+                state.into_profile_with_declared_type(name, total, type_label(vt).to_string())
+            })
+            .collect();
         Ok(columns)
     }
 } // mod stata_support
