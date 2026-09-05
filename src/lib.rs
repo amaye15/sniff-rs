@@ -45229,23 +45229,64 @@ fn lz_back_copy(out: &mut Vec<u8>, dist: usize, len: usize) {
     }
 }
 
+/// Where a DEFLATE decoder's output actually goes - implemented once for
+/// a plain `Vec<u8>` (every existing caller of `inflate`/`inflate_to`
+/// that decompresses one already-bounded block/chunk/entry at a time:
+/// Avro's own deflate codec, ORC's ZLIB codec, ZIP archive entries) and
+/// once for `GzipStreamSink` (the top-level `.gz` *file* path, the one
+/// place a decompressed output could genuinely be too large to hold
+/// entirely in memory). `inflate_block`'s own decode loop is written
+/// once, generically, against this trait, rather than existing as two
+/// separately-maintained copies of the same Huffman-decode logic for
+/// the bounded and streaming cases.
+trait DeflateSink {
+    fn push_literal(&mut self, byte: u8) -> Result<()>;
+    fn push_slice(&mut self, bytes: &[u8]) -> Result<()>;
+    /// Copies `len` bytes starting `dist` bytes back from the current
+    /// output position - the caller has already checked `dist <=
+    /// self.available_len()` via `inflate_block`'s own single shared
+    /// check, so an implementation doesn't need to repeat it.
+    fn back_copy(&mut self, dist: usize, len: usize) -> Result<()>;
+    /// How many bytes are currently available to be referenced by a
+    /// back-copy - the full cumulative output for a plain `Vec<u8>`
+    /// sink, or a streaming sink's own bounded recent-history length.
+    /// Structurally equivalent once at least `DEFLATE_WINDOW` bytes have
+    /// been produced, since RFC 1951 caps every real back-reference
+    /// distance at exactly that many bytes.
+    fn available_len(&self) -> usize;
+}
+
+impl DeflateSink for Vec<u8> {
+    fn push_literal(&mut self, byte: u8) -> Result<()> {
+        self.push(byte);
+        Ok(())
+    }
+    fn push_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn back_copy(&mut self, dist: usize, len: usize) -> Result<()> {
+        lz_back_copy(self, dist, len);
+        Ok(())
+    }
+    fn available_len(&self) -> usize {
+        self.len()
+    }
+}
+
 /// Decodes one compressed block's symbol stream (shared by fixed and
 /// dynamic Huffman blocks - they differ only in which tables they hand
 /// in) directly into `out`, stopping at the end-of-block symbol (256).
-/// Back-references index straight into `out` itself rather than a
-/// bounded sliding window, matching every other reader in this project
-/// (CSV/JSON/YAML/... all read their whole input into memory too - see
-/// CLAUDE.md's Dependency footprint section).
-fn inflate_block<R: std::io::Read>(
+fn inflate_block<R: std::io::Read, O: DeflateSink>(
     bits: &mut BitReader<R>,
-    out: &mut Vec<u8>,
+    out: &mut O,
     lencode: &HuffmanTable,
     distcode: &HuffmanTable,
 ) -> Result<()> {
     loop {
         let symbol = lencode.decode(bits)?;
         if symbol < 256 {
-            out.push(symbol as u8);
+            out.push_literal(symbol as u8)?;
         } else if symbol == 256 {
             return Ok(());
         } else {
@@ -45259,12 +45300,12 @@ fn inflate_block<R: std::io::Read>(
                 bail!("invalid DEFLATE stream: bad distance code {dsym}");
             }
             let dist = DIST_BASE[dsym] as usize + bits.bits(DIST_EXTRA[dsym] as u32)? as usize;
-            if dist > out.len() {
+            if dist > out.available_len() {
                 bail!(
                     "invalid DEFLATE stream: distance {dist} goes further back than any output produced so far"
                 );
             }
-            lz_back_copy(out, dist, length);
+            out.back_copy(dist, length)?;
         }
     }
 }
@@ -45338,10 +45379,30 @@ fn dynamic_tables<R: std::io::Read>(
 }
 
 /// Decodes a raw DEFLATE stream (no gzip/zlib wrapper) to its full
-/// uncompressed bytes.
+/// uncompressed bytes. `#[allow(dead_code)]`: genuinely called from
+/// production code under `--features parquet` (its own DEFLATE block
+/// codec) and `--features avro` (Avro's "deflate" block codec), both of
+/// which decompress one already-bounded block at a time and have no
+/// reason to route through the streaming `inflate_to` a whole `.gz`
+/// *file* needs - but neither feature is on in a bare default build,
+/// where `decompress_if_needed`'s own gzip-file case now calls
+/// `gzip_decompress_to` directly instead of this Vec<u8>-returning form,
+/// which is what makes this look unused there even though it isn't in
+/// every real build that actually needs it. Every one of this function's
+/// own dedicated unit tests calls it directly too.
+#[allow(dead_code)]
 fn inflate<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
-    let mut bits = BitReader::new(input);
     let mut out = Vec::new();
+    inflate_to(input, &mut out)?;
+    Ok(out)
+}
+
+/// The real DEFLATE decode loop `inflate` is a thin wrapper around -
+/// generic over `DeflateSink` so the exact same logic drives either the
+/// simple in-memory case (`out: Vec<u8>`) or the streaming `.gz`-file
+/// case (`out: GzipStreamSink`, see that type's own doc comment).
+fn inflate_to<R: std::io::Read, O: DeflateSink>(input: R, out: &mut O) -> Result<()> {
+    let mut bits = BitReader::new(input);
     loop {
         let bfinal = bits.bits(1)?;
         let btype = bits.bits(2)?;
@@ -45353,18 +45414,19 @@ fn inflate<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
                 if len != !nlen {
                     bail!("invalid DEFLATE stream: stored block length check failed");
                 }
-                out.reserve(len as usize);
-                for _ in 0..len {
-                    out.push(bits.read_u8()?);
+                let mut block = vec![0u8; len as usize];
+                for b in &mut block {
+                    *b = bits.read_u8()?;
                 }
+                out.push_slice(&block)?;
             }
             1 => {
                 let (lencode, distcode) = fixed_tables();
-                inflate_block(&mut bits, &mut out, &lencode, &distcode)?;
+                inflate_block(&mut bits, out, &lencode, &distcode)?;
             }
             2 => {
                 let (lencode, distcode) = dynamic_tables(&mut bits)?;
-                inflate_block(&mut bits, &mut out, &lencode, &distcode)?;
+                inflate_block(&mut bits, out, &lencode, &distcode)?;
             }
             _ => bail!("invalid DEFLATE stream: reserved block type 3"),
         }
@@ -45372,15 +45434,12 @@ fn inflate<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
             break;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-/// CRC-32 (IEEE 802.3, the same polynomial gzip's own footer uses),
-/// table-based and built once per process via `OnceLock` rather than a
-/// `lazy_static`-style dependency - std alone is enough for this.
-fn crc32(data: &[u8]) -> u32 {
+fn crc32_table() -> &'static [u32; 256] {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
+    TABLE.get_or_init(|| {
         let mut table = [0u32; 256];
         for (i, entry) in table.iter_mut().enumerate() {
             let mut c = i as u32;
@@ -45394,13 +45453,51 @@ fn crc32(data: &[u8]) -> u32 {
             *entry = c;
         }
         table
-    });
+    })
+}
 
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+/// An incremental CRC-32 (IEEE 802.3, the same polynomial gzip's own
+/// footer uses) accumulator - the one-shot `crc32` below is a thin
+/// wrapper over this, kept as a separate type specifically so the
+/// streaming gzip decompressor (`GzipStreamSink`) can verify a member's
+/// trailer checksum against bytes it's already flushed out and dropped
+/// from memory, updating a running state one chunk at a time instead of
+/// needing the complete decompressed output held in memory at once to
+/// scan over.
+struct Crc32Incremental {
+    crc: u32,
+}
+
+impl Crc32Incremental {
+    fn new() -> Self {
+        Crc32Incremental { crc: 0xFFFF_FFFF }
     }
-    crc ^ 0xFFFF_FFFF
+
+    fn update(&mut self, data: &[u8]) {
+        let table = crc32_table();
+        for &b in data {
+            self.crc = table[((self.crc ^ b as u32) & 0xFF) as usize] ^ (self.crc >> 8);
+        }
+    }
+
+    fn finish(self) -> u32 {
+        self.crc ^ 0xFFFF_FFFF
+    }
+}
+
+/// CRC-32 (IEEE 802.3, the same polynomial gzip's own footer uses),
+/// table-based and built once per process via `OnceLock` rather than a
+/// `lazy_static`-style dependency - std alone is enough for this.
+/// `#[allow(dead_code)]`: genuinely called from production code under
+/// `--features avro` (verifying an Avro "deflate" block's own checksum)
+/// and `--features xlsx`/`npy` (verifying a ZIP archive entry's own
+/// CRC-32) - just not in a bare default build, the same reason `inflate`
+/// above needs the identical allow.
+#[allow(dead_code)]
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = Crc32Incremental::new();
+    crc.update(data);
+    crc.finish()
 }
 
 fn read_null_terminated<R: std::io::Read>(input: &mut R) -> Result<()> {
@@ -45411,6 +45508,111 @@ fn read_null_terminated<R: std::io::Read>(input: &mut R) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+/// RFC 1951 caps any DEFLATE back-reference distance at exactly this
+/// many bytes - a hard protocol limit, not an implementation choice - so
+/// once that many bytes have been produced, anything older can never be
+/// referenced again and is safe to flush out and drop from memory.
+const DEFLATE_WINDOW: usize = 32 * 1024;
+/// `GzipStreamSink` flushes once its buffered window grows past this
+/// (4x the real window size) rather than the instant it exceeds
+/// `DEFLATE_WINDOW`, batching the O(n) cost of draining old bytes out of
+/// a growable `Vec` across many pushes instead of paying it on every one.
+const DEFLATE_FLUSH_THRESHOLD: usize = DEFLATE_WINDOW * 4;
+
+/// A `DeflateSink` used only for the top-level `.gz` *file* decompression
+/// path (`decompress_if_needed`, via `gzip_decompress_to`) - every other
+/// caller of `inflate`/`inflate_to` (Avro's own deflate codec, ORC's
+/// ZLIB codec, ZIP archive entries) decompresses one already-bounded
+/// block/chunk/entry at a time straight into a plain `Vec<u8>` and is
+/// completely unaffected by this type's existence.
+///
+/// Rather than a true circular buffer, `window` is a plain, growable
+/// `Vec` that gets drained back down to exactly `DEFLATE_WINDOW` bytes
+/// once it grows past `DEFLATE_FLUSH_THRESHOLD` - see that constant's
+/// own doc comment for why. `crc`/`total_len` track the running CRC-32
+/// and total decompressed length *incrementally* as bytes are flushed
+/// out, since gzip's own trailer verifies both against the *complete*
+/// decompressed stream for that member - a check this sink can still do
+/// correctly even though it never holds that complete stream in memory
+/// at once.
+struct GzipStreamSink<'a> {
+    window: Vec<u8>,
+    sink: &'a mut dyn std::io::Write,
+    crc: Crc32Incremental,
+    total_len: u64,
+}
+
+impl<'a> GzipStreamSink<'a> {
+    fn new(sink: &'a mut dyn std::io::Write) -> Self {
+        GzipStreamSink {
+            window: Vec::with_capacity(DEFLATE_FLUSH_THRESHOLD),
+            sink,
+            crc: Crc32Incremental::new(),
+            total_len: 0,
+        }
+    }
+
+    fn maybe_flush(&mut self) -> Result<()> {
+        if self.window.len() > DEFLATE_FLUSH_THRESHOLD {
+            let keep_from = self.window.len() - DEFLATE_WINDOW;
+            self.crc.update(&self.window[..keep_from]);
+            self.total_len += keep_from as u64;
+            self.sink
+                .write_all(&self.window[..keep_from])
+                .context("failed to write decompressed data")?;
+            self.window.drain(..keep_from);
+        }
+        Ok(())
+    }
+
+    /// Flushes every remaining byte and returns this member's final
+    /// CRC-32 and total decompressed length, to check against its own
+    /// gzip trailer. Consumes `self` since nothing more should ever be
+    /// written through a sink once its stream is declared finished.
+    fn finish(mut self) -> Result<(u32, u64)> {
+        self.crc.update(&self.window);
+        self.total_len += self.window.len() as u64;
+        self.sink
+            .write_all(&self.window)
+            .context("failed to write decompressed data")?;
+        Ok((self.crc.finish(), self.total_len))
+    }
+}
+
+impl<'a> DeflateSink for GzipStreamSink<'a> {
+    fn push_literal(&mut self, byte: u8) -> Result<()> {
+        self.window.push(byte);
+        self.maybe_flush()
+    }
+    fn push_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        self.window.extend_from_slice(bytes);
+        self.maybe_flush()
+    }
+    fn back_copy(&mut self, dist: usize, len: usize) -> Result<()> {
+        lz_back_copy(&mut self.window, dist, len);
+        self.maybe_flush()
+    }
+    fn available_len(&self) -> usize {
+        self.window.len()
+    }
+}
+
+/// Decompresses a whole gzip stream into memory - a thin wrapper around
+/// `gzip_decompress_to` (see that function's own doc comment for the
+/// full RFC 1952 container writeup), used by every caller that
+/// decompresses one already-bounded block/chunk at a time (Parquet's own
+/// GZIP codec, under `--features parquet`) or just wants an owned buffer
+/// (this function's own test suite). `#[allow(dead_code)]` for the same
+/// reason `inflate` above needs it: not reachable from production code
+/// in a bare default build, since `decompress_if_needed`'s own gzip-file
+/// case calls `gzip_decompress_to` directly instead.
+#[allow(dead_code)]
+fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    gzip_decompress_to(input, &mut out)?;
+    Ok(out)
 }
 
 /// Parses a gzip container (RFC 1952) around the raw DEFLATE stream:
@@ -45442,10 +45644,18 @@ fn read_null_terminated<R: std::io::Read>(input: &mut R) -> Result<()> {
 /// past a real end), decoding and concatenating every member found - the
 /// exact same fix this function's own top-level `.gz`/`.gzip` file
 /// support needed too, since both paths share this one function.
-fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
+///
+/// Generic over the destination `Write` so this exact same header/
+/// footer/multi-member logic drives either an in-memory `Vec<u8>`
+/// (`gzip_decompress` above) or, via `decompress_if_needed`, a real temp
+/// file - each member decompressed through its own fresh
+/// `GzipStreamSink` (bounded to `DEFLATE_WINDOW` bytes of memory
+/// regardless of that member's own decompressed size), writing straight
+/// to `sink` as it goes rather than ever accumulating the whole
+/// decompressed output in one buffer first.
+fn gzip_decompress_to<R: std::io::Read>(input: R, sink: &mut impl std::io::Write) -> Result<()> {
     use std::io::{BufRead, Read};
     let mut input = std::io::BufReader::new(input);
-    let mut output = Vec::new();
     let mut first = true;
 
     loop {
@@ -45503,7 +45713,9 @@ fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
                 .context("failed to read gzip FHCRC")?;
         }
 
-        let decompressed = inflate(&mut input)?;
+        let mut member_sink = GzipStreamSink::new(sink);
+        inflate_to(&mut input, &mut member_sink)?;
+        let (actual_crc, actual_len) = member_sink.finish()?;
 
         let mut footer = [0u8; 8];
         input
@@ -45512,17 +45724,15 @@ fn gzip_decompress<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
         let expected_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
         let expected_isize = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
 
-        if crc32(&decompressed) != expected_crc {
+        if actual_crc != expected_crc {
             bail!("gzip CRC32 checksum mismatch - the file is corrupt or truncated");
         }
-        if (decompressed.len() as u64 & 0xFFFF_FFFF) as u32 != expected_isize {
+        if (actual_len & 0xFFFF_FFFF) as u32 != expected_isize {
             bail!("gzip size checksum mismatch - the file is corrupt or truncated");
         }
-
-        output.extend_from_slice(&decompressed);
     }
 
-    Ok(output)
+    Ok(())
 }
 
 // --- Hand-rolled ZIP reader (PKWARE APPNOTE.TXT) ---
@@ -49765,11 +49975,16 @@ fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFil
     let mut tmp = TempFile::new()?;
     match compression {
         Compression::Gzip => {
-            let bytes =
-                gzip_decompress(input).with_context(|| format!("failed to decompress {path:?}"))?;
-            tmp.as_file_mut()
-                .write_all(&bytes)
-                .with_context(|| format!("failed to write decompressed data for {path:?}"))?;
+            // Streams straight into the temp file (bounded to
+            // DEFLATE_WINDOW bytes of memory regardless of the file's
+            // own decompressed size, per GzipStreamSink's own doc
+            // comment) rather than decompressing the whole thing into a
+            // Vec<u8> first and then writing that buffer out - the same
+            // "stop double-buffering" win already delivered for CSV/
+            // fixed-width/JSON Lines, applied to the layer in front of
+            // every one of them.
+            gzip_decompress_to(input, tmp.as_file_mut())
+                .with_context(|| format!("failed to decompress {path:?}"))?;
         }
         Compression::Zstd => {
             let bytes = decompress_zstd(input, path)?;

@@ -33,6 +33,36 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-decompression` branch (Darwin arm64)
+
+The gzip compression layer converted to a sliding-window streaming
+decoder (`GzipStreamSink`, bounded to `DEFLATE_WINDOW` = 32 KiB of
+memory regardless of the file's decompressed size) instead of
+decompressing the whole file into one `Vec<u8>` before writing it to the
+temp file - see CLAUDE.md's "Streaming reads / memory footprint"
+section. This is the full end-to-end pipeline (decompress + the
+already-streaming CSV reader from earlier in this log), not just
+decompression in isolation.
+
+**Ad-hoc, real file** (a 155 MB CSV, gzip-compressed to 26 MB, 163 MB
+decompressed - forcing roughly 1,200 flush cycles):
+
+| | Peak RSS | Real time |
+|---|---|---|
+| Old (`gzip_decompress` -> `Vec<u8>` -> temp file) | 865 MB | 2.32s |
+| New (`gzip_decompress_to` streams into temp file) | 728 MB | 2.06s |
+| Change | **-16%** | **-11%** |
+
+Output confirmed byte-identical via `diff`. Also confirmed: corrupted
+CRC-32 and, separately, corrupted ISIZE footer fields are both still
+caught correctly after ~1,200 flush cycles (proving the incremental
+checksum carries its running state across flushes, not just within
+one), and a 300-iteration bit-flip fuzz pass against a real fixture
+produced zero panics. No Criterion benchmark target currently isolates
+gzip decompression specifically, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-jsonl` branch (Darwin arm64)
 
 JSON Lines converted to line-at-a-time streaming (`read_json_values` +

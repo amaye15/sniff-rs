@@ -3853,10 +3853,89 @@ fixed-width's own reader uses), so there's no risk of trailing garbage
 landing in the same read-buffer chunk as row 0 regardless of how small
 the valid prefix is.
 
-**Deliberately not done yet, in order of likely next steps**: the
-gzip/zstd compression layer (fixing the double-buffering finding above
-would benefit every compressed format at once, independent of which
-inner format it wraps); every other naturally-streamable or
+**The gzip compression layer went fourth**, and needed genuinely
+different reasoning than the three record-oriented readers before it:
+LZ77-family decompression (DEFLATE) resolves back-references into its
+*own already-produced output*, so it can't simply stream forward without
+a way to answer "what did I output N bytes ago" - naively "streaming"
+the decoder's output straight to the temp file, with no memory at all,
+would just break every back-reference more than the read-buffer's own
+size back. The actual fix is a **sliding window**: RFC 1951 caps any
+DEFLATE back-reference distance at exactly 32,768 bytes (`DEFLATE_WINDOW`)
+- a hard protocol limit, not an implementation choice - so once that many
+bytes have been produced, anything older can never be referenced again
+and is safe to flush to the real output and drop from memory. This
+turns what used to be "decompress the whole file into one `Vec<u8>`,
+*then* write that whole buffer to the temp file" into a bounded,
+constant-memory operation regardless of the file's own decompressed size.
+
+Implementation: a new `DeflateSink` trait - `push_literal`/`push_slice`/
+`back_copy`/`available_len` - lets `inflate_block`'s own Huffman-decode
+loop (unchanged in every other respect) drive either a plain `Vec<u8>`
+(every *other* caller of `inflate`/`inflate_to` - Avro's own deflate
+codec, ORC's ZLIB codec, ZIP archive entries - all decompress one
+already-bounded block/chunk/entry at a time and are completely
+unaffected by any of this) or the new `GzipStreamSink`, which keeps a
+plain growable `Vec` as its own window, draining it back down to exactly
+`DEFLATE_WINDOW` bytes once it grows past `DEFLATE_FLUSH_THRESHOLD` (4x
+the window) - batching the O(n) drain cost across many pushes rather
+than paying it on every single one. `crc32` was similarly split into a
+one-shot wrapper over a new `Crc32Incremental` accumulator, since gzip's
+own trailer verifies the CRC-32 and total length against the *complete*
+decompressed stream for that member - a check `GzipStreamSink` can still
+do correctly by updating that running state as each chunk is flushed
+out, never needing the complete stream held in memory to compute it.
+`gzip_decompress_to`/`gzip_decompress` follow the same "extract the real
+engine, keep the old function as a thin wrapper" shape as every other
+phase - `decompress_if_needed`'s own gzip branch now calls
+`gzip_decompress_to` directly into the temp file, while `gzip_decompress`
+(still `Vec<u8>`-returning, used by Parquet's own GZIP codec and this
+function's own test suite) stays exactly as it always behaved.
+
+Verified far more heavily than the previous three phases, given this
+touches decompression correctness directly: the complete existing test
+suite (dynamic Huffman blocks, every optional gzip header field,
+corrupted-checksum detection, concatenated members, empty input)
+unchanged and passing - strong evidence on its own, since several of
+those fixtures are large enough to force at least one real flush cycle.
+Beyond that: a real ~163 MB gzip-compressed CSV forcing roughly 1,200
+flush cycles, byte-identical output confirmed via `diff`; the identical
+file with its CRC-32 and, separately, its ISIZE footer field corrupted,
+both still correctly caught as errors *after* that many flushes (proving
+the incremental checksum genuinely carries its running state across
+flush boundaries, not just within one); and a 300-iteration bit-flip
+fuzz pass against a real fixture with zero panics. Two new committed
+fixtures (`edge_gzip_multi_flush.csv.gz`, ~665 KB decompressed - several
+multiples of the flush threshold - and its corrupted-checksum sibling)
+lock the multi-flush case in as a permanent regression test, rather than
+relying only on the large ad-hoc file used to find and measure this.
+
+**A real regression was found and fixed before this shipped, by checking
+feature combinations beyond the usual two endpoints** - a habit this
+project has needed before (see the Dependency footprint section's own
+`chrono`-removal writeup) and needed again here: once
+`decompress_if_needed` no longer called the `Vec<u8>`-returning
+`gzip_decompress`/`inflate`/`crc32` directly, those three became
+genuinely unreachable from production code in *any* build that doesn't
+also enable `parquet` or `avro` or `xlsx`/`npy` (their only other real
+callers) - which includes the bare **default build**, the single most
+common way this project is built. `cargo clippy --release -- -D
+warnings` on the plain default build - not just `--features full` -
+caught this immediately as three new dead-code errors; each function
+now carries a narrow, specific `#[allow(dead_code)]` explaining exactly
+which feature combinations still need it, the same treatment this
+project already gives a handful of Parquet/Arrow IPC fields for the
+identical "genuinely used, just not in every build" reason. Confirmed
+clean afterward across every individually plausible combination
+(default, `zstd`, `parquet`, `avro`, `xlsx`, `npy`, `full`), not just
+the two that were already being checked.
+
+**Deliberately not done yet, in order of likely next steps**: zstd's own
+compression layer, which needs meaningfully more care than gzip's - its
+maximum back-reference distance (`Window_Size`) is *declared in the
+frame header* rather than a fixed protocol constant, so a sliding window
+for it needs to be sized dynamically per file rather than a single fixed
+32 KiB constant; every other naturally-streamable or
 header-then-sequential-rows format (MessagePack/CBOR, weblog, syslog,
 Avro, dBase, Stata, SAS7BDAT, SPSS, NumPy); and, hardest and last, the
 formats that need the *tail* of the file before the body means anything

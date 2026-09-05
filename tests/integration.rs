@@ -491,6 +491,44 @@ fn gzip_with_a_corrupted_checksum_gives_an_actionable_error_not_a_panic() {
     );
 }
 
+// 15,000 rows / ~665 KB decompressed - comfortably past DEFLATE_WINDOW's
+// own 32 KiB and several multiples of GzipStreamSink's own 128 KiB flush
+// threshold, so decoding this file genuinely exercises multiple
+// flush-and-continue cycles rather than fitting inside a single one.
+#[test]
+fn gzip_streaming_decompression_survives_multiple_flush_cycles() {
+    let doc = run_json("edge_gzip_multi_flush.csv.gz", &[]);
+    let cols = table(&doc, "edge_gzip_multi_flush");
+    assert_eq!(column(cols, "id")["row_count"], 15000);
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "amount")["ideal_type"], "f64");
+}
+
+// The identical file above with one bit flipped in its footer - proves
+// the streaming CRC32/ISIZE checks (computed incrementally across
+// several flushes, never over one complete in-memory buffer) still
+// correctly catch corruption rather than a flush accidentally losing
+// track of the running checksum state partway through.
+#[test]
+fn gzip_corrupted_checksum_is_still_caught_across_multiple_flush_cycles() {
+    let output = Command::new(bin())
+        .args([
+            fixture("malformed_gzip_checksum_multi_flush.csv.gz")
+                .to_str()
+                .unwrap(),
+            "-",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("checksum mismatch"),
+        "error should mention the checksum mismatch, not panic: {stderr}"
+    );
+}
+
 #[test]
 fn gzip_with_an_invalid_header_gives_an_actionable_error_not_a_panic() {
     let bad_gz = fixture("_scratch_not_actually_gzip.csv.gz");
