@@ -4743,17 +4743,51 @@ ones, since `ColumnInput` is no longer part of CSV's own pipeline -
 zero other changes needed) and clippy/fmt clean across default/`full`,
 matching established baselines exactly.
 
+**Fixed-width text went second, right after CSV** - matching the exact
+order Tier 1 already used for these two formats, since they share the
+same shape (no quoting, one row per line) that made CSV's own conversion
+tractable. `ColumnAccumulatorState` (renamed from `CsvColumnAccumulator`'s
+former `CsvColumnState` - nothing about it was ever CSV-specific, so
+this is a straight rename plus a doc-comment update, not a rewrite) is
+now genuinely shared: `columns_from_fixed_width` folds each qualifying
+field straight into it exactly the way `CsvColumnAccumulator::accept`
+already does, replacing its own old `Vec<Vec<Option<String>>>` (every
+value held resident for the whole read, then flattened into
+`ColumnInput.raw_values`) and bypassing `ColumnInput`/`profile_column`
+the same way CSV's own phase did. `naive_current_type` - no longer
+called by CSV or fixed-width, both now using the incremental
+`NaiveTypeAccumulator` instead - picked up `#[allow(dead_code)]`, since
+it's genuinely unused in the bare default build but still the
+whole-slice current-type source for `weblog_support`/`syslog_support`
+and the hand-rolled `.xls` reader, none of which are compiled into that
+build.
+
+Measured on a real 180 MB, 500,000-row fixed-width file (id/name/email/
+a 300-character free-text description column, matching the same shape
+used to measure CSV's own phase): maxRSS 309-324 MB -> 2.6 MB (~99%),
+peak footprint 249-257 MB -> 1.5 MB (~99%), consistent across 3 rounds.
+Output confirmed byte-identical via `diff` against the pre-change
+binary across the entire 359-file fixture corpus (every format, not
+just fixed-width), and separately across every committed `.fwf`
+fixture at every combination of 3 `--samples` settings and with/without
+`--nrows 2` (54 combinations, using each fixture's own already-
+established `--widths` from its existing tests) - zero mismatches.
+Full test suite (347 unit + 360 integration, zero test modifications
+needed this time - fixed-width had no direct unit tests calling
+`columns_from_fixed_width` the way CSV's two did) and clippy/fmt clean
+across default/`full`, matching established baselines exactly.
+
 **Deliberately not done yet**: every other `profile_column`/
 `profile_json_path`-based reader still holds a full column's values
-resident (Excel, fixed-width, NumPy, dBase, Stata, SAS7BDAT, SPSS, ORC,
-JSON, YAML, TOML, Avro, MessagePack, CBOR, XML, Parquet/Arrow's nested
-columns) - each would need its own `ColumnInput`/`profile_column` (or
-`profile_json_path`) call site converted the same way CSV's was, and
-each deserves its own real-file measurement before being called done,
-the same one-phase-at-a-time discipline this whole section has already
-used throughout. Per-entry streaming decompression inside
-`ZipArchive::read` itself remains a real, disclosed, separately-scoped
-remaining gap, not folded into either phase here.
+resident (Excel, NumPy, dBase, Stata, SAS7BDAT, SPSS, ORC, JSON, YAML,
+TOML, Avro, MessagePack, CBOR, XML, Parquet/Arrow's nested columns) -
+each would need its own `ColumnInput`/`profile_column` (or
+`profile_json_path`) call site converted the same way CSV's/fixed-
+width's were, and each deserves its own real-file measurement before
+being called done, the same one-phase-at-a-time discipline this whole
+section has already used throughout. Per-entry streaming decompression
+inside `ZipArchive::read` itself remains a real, disclosed, separately-
+scoped remaining gap, not folded into any phase here.
 
 ## Cloud-platform file compatibility
 

@@ -4804,6 +4804,14 @@ fn round1(x: f64) -> f64 {
 
 // --- CSV / TSV reader ---
 
+/// No longer called by CSV or fixed-width text (both now use the
+/// incremental `NaiveTypeAccumulator` instead, fed one value at a time as
+/// `ColumnAccumulatorState`'s own `push`) - genuinely unused in the bare
+/// default build, hence `#[allow(dead_code)]`, but still the whole-slice
+/// current-type source for `weblog_support`/`syslog_support`'s own
+/// readers and the hand-rolled `.xls` reader, none of which are compiled
+/// into that build.
+#[allow(dead_code)]
 fn naive_current_type(values: &[&str]) -> &'static str {
     if values
         .iter()
@@ -5187,24 +5195,27 @@ fn stream_utf8_chunks_with_size(
     }
 }
 
-/// Per-column state `CsvColumnAccumulator` folds each qualifying field
-/// into as it streams by, replacing what used to be one `Vec<String>` per
-/// column (every value held resident for the whole read) with a bounded
-/// footprint: two small incremental type-detection accumulators plus a
-/// `samples` list capped at `n_samples` - see CLAUDE.md's "Streaming reads
-/// / memory footprint" section (Tier 2) for why this is the first reader
-/// converted this way, and which readers still hold a full column's
-/// values (everything else, for now).
-struct CsvColumnState {
+/// Shared per-column accumulator for any reader that can fold values in
+/// one at a time as it streams a file: replaces what used to be one
+/// `Vec<String>` per column (every value held resident for the whole
+/// read) with a bounded footprint - two small incremental type-detection
+/// accumulators plus a `samples` list capped at `n_samples`. First used by
+/// CSV (`CsvColumnAccumulator`), then reused unchanged by fixed-width
+/// text (`columns_from_fixed_width`) - both are simple one-record-per-line
+/// formats with no reason to duplicate this logic. See CLAUDE.md's
+/// "Streaming reads / memory footprint" section (Tier 2) for which
+/// readers still hold a full column's values resident (everything not
+/// yet converted this way).
+struct ColumnAccumulatorState {
     total_non_null: usize,
     ideal_acc: IdealTypeAccumulator,
     naive_acc: NaiveTypeAccumulator,
     samples: Vec<String>,
 }
 
-impl CsvColumnState {
+impl ColumnAccumulatorState {
     fn new() -> Self {
-        CsvColumnState {
+        ColumnAccumulatorState {
             total_non_null: 0,
             ideal_acc: IdealTypeAccumulator::new(),
             naive_acc: NaiveTypeAccumulator::new(),
@@ -5232,11 +5243,11 @@ impl CsvColumnState {
 
     /// Mirrors `profile_column`'s remaining logic exactly (missing_pct,
     /// the empty-column special case, the missing-values note suffix) -
-    /// this is CSV's own bypass of `ColumnInput`/`profile_column`, not a
-    /// generalization of it; every other reader still goes through those
-    /// unchanged.
+    /// this bypasses `ColumnInput`/`profile_column` entirely for whichever
+    /// reader builds this state incrementally; every reader that hasn't
+    /// been converted yet still goes through those unchanged.
     fn into_profile(self, name: String, total: usize) -> ColumnProfile {
-        let CsvColumnState {
+        let ColumnAccumulatorState {
             total_non_null,
             ideal_acc,
             naive_acc,
@@ -5286,7 +5297,7 @@ struct CsvColumnAccumulator {
     n_samples: usize,
     record_index: usize,
     headers: Vec<String>,
-    col_states: Vec<CsvColumnState>,
+    col_states: Vec<ColumnAccumulatorState>,
     total: usize,
     done: bool,
 }
@@ -5313,7 +5324,9 @@ impl CsvColumnAccumulator {
             // A skipped leading row - discarded, never even reaching a
             // header or column concept.
         } else if self.record_index == self.skip_rows {
-            self.col_states = (0..record.len()).map(|_| CsvColumnState::new()).collect();
+            self.col_states = (0..record.len())
+                .map(|_| ColumnAccumulatorState::new())
+                .collect();
             self.headers = record;
         } else if self.nrows.is_some_and(|limit| self.total >= limit) {
             self.done = true;
@@ -5347,7 +5360,7 @@ impl CsvColumnAccumulator {
 /// them (a record, or a field within one, can span a chunk boundary -
 /// `csv_state`/`field`/`record` below are exactly the state that lets it
 /// resume correctly), and `CsvColumnAccumulator` folds each record
-/// straight into its own per-column `CsvColumnState` as it arrives -
+/// straight into its own per-column `ColumnAccumulatorState` as it arrives -
 /// itself now a bounded footprint (two small type-detection accumulators
 /// plus up to `n_samples` sample values) rather than a `Vec<String>`
 /// holding every value in the column, the Tier 2 win CLAUDE.md's
@@ -5359,7 +5372,7 @@ impl CsvColumnAccumulator {
 /// hand, rather than reading the whole thing first and truncating after.
 /// This bypasses `ColumnInput`/`profile_column` entirely (both unchanged,
 /// still used by every other reader) - building `ColumnProfile`s directly
-/// from each column's already-reduced state via `CsvColumnState::
+/// from each column's already-reduced state via `ColumnAccumulatorState::
 /// into_profile`.
 fn columns_from_csv(
     path: &Path,
@@ -5617,12 +5630,18 @@ fn slice_fixed_width(line: &str, widths: &[usize], scratch: &mut Vec<char>) -> V
 /// UTF-8 continuation byte, so it can never be misidentified mid-
 /// character). `nrows` now also bounds real disk I/O rather than just
 /// how many rows get profiled afterward - the `for` loop's own `break`
-/// simply stops pulling more lines from the underlying reader.
+/// simply stops pulling more lines from the underlying reader. Each
+/// qualifying field folds straight into its column's `ColumnAccumulatorState`
+/// (the same shared, bounded-footprint accumulator CSV uses - see its own
+/// doc comment) instead of a `Vec<Option<String>>` held for the whole
+/// read, bypassing `ColumnInput`/`profile_column` entirely, the Tier 2
+/// win CLAUDE.md's "Streaming reads / memory footprint" section describes.
 fn columns_from_fixed_width(
     path: &Path,
     nrows: Option<usize>,
     widths: &[usize],
-) -> Result<Vec<ColumnInput>> {
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
     use std::io::BufRead;
     let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
     let mut lines = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines();
@@ -5633,47 +5652,34 @@ fn columns_from_fixed_width(
     let mut scratch: Vec<char> = Vec::new();
     let headers = slice_fixed_width(&header_line, widths, &mut scratch);
 
-    let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); widths.len()];
-    let mut i = 0;
+    let mut col_states: Vec<ColumnAccumulatorState> = (0..widths.len())
+        .map(|_| ColumnAccumulatorState::new())
+        .collect();
+    let mut total = 0usize;
     for line in lines {
         let line = line.with_context(|| format!("failed to read {path:?}"))?;
         if line.trim().is_empty() {
             continue; // e.g. a trailing blank line at EOF
         }
-        if nrows.is_some_and(|limit| i >= limit) {
+        if nrows.is_some_and(|limit| total >= limit) {
             break;
         }
         for (col_idx, field) in slice_fixed_width(&line, widths, &mut scratch)
             .into_iter()
             .enumerate()
         {
-            let missing = field.is_empty() || is_missing_sentinel(&field);
-            raw[col_idx].push(if missing { None } else { Some(field) });
+            if !(field.is_empty() || is_missing_sentinel(&field)) {
+                col_states[col_idx].push(field, n_samples);
+            }
         }
-        i += 1;
+        total += 1;
     }
 
-    let mut columns = Vec::new();
-    for (col_idx, name) in headers.into_iter().enumerate() {
-        let total = raw[col_idx].len();
-        let non_null: Vec<String> = std::mem::take(&mut raw[col_idx])
-            .into_iter()
-            .flatten()
-            .collect();
-        let current_type = if non_null.is_empty() {
-            "String".to_string()
-        } else {
-            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-            naive_current_type(&refs).to_string()
-        };
-        columns.push(ColumnInput {
-            name,
-            current_type,
-            raw_values: non_null,
-            total,
-            skip_heuristics: false,
-        });
-    }
+    let columns = headers
+        .into_iter()
+        .zip(col_states)
+        .map(|(name, state)| state.into_profile(name, total))
+        .collect();
     Ok(columns)
 }
 
@@ -51339,10 +51345,7 @@ fn dispatch_reader(
                         "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
                     )
                 })?;
-                columns_from_fixed_width(read_path, args.nrows, widths)?
-                    .into_iter()
-                    .map(|c| profile_column(c, args.samples))
-                    .collect()
+                columns_from_fixed_width(read_path, args.nrows, widths, args.samples)?
             }
             InputFormat::Npy => columns_from_npy(read_path, args.nrows, args.samples)?,
             InputFormat::CommonLog => columns_from_weblog(read_path, args.nrows, false)?

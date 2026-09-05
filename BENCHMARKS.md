@@ -33,6 +33,29 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/incremental-fixed-width` branch (Darwin arm64)
+
+Fixed-width text wired through the same `ColumnAccumulatorState` CSV's
+own Tier 2 phase introduced (renamed from `CsvColumnState` - nothing
+about it was CSV-specific), replacing `columns_from_fixed_width`'s old
+`Vec<Vec<Option<String>>>` and bypassing `ColumnInput`/`profile_column`
+the same way. `naive_current_type` picked up `#[allow(dead_code)]`
+(genuinely unused in the default build now, still used by weblog/
+syslog/`.xls`).
+
+Measured on a real 180 MB, 500,000-row fixed-width file (id/name/email/
+a 300-char free-text column): maxRSS 309-324 MB -> 2.6 MB (~99%), peak
+footprint 249-257 MB -> 1.5 MB (~99%), consistent across 3 rounds.
+Output byte-identical via `diff` against the entire 359-file fixture
+corpus, plus every committed `.fwf` fixture at 3 `--samples` settings
+with/without `--nrows 2` (54 combinations) - zero mismatches.
+
+Verified via the full test suite (347 unit + 360 integration, zero
+test modifications needed) and clippy/fmt clean across default/`full`,
+matching established baselines (default=1, full=5) exactly.
+
+---
+
 ## 2026-09-05 — `feat/incremental-ideal-type` branch (Darwin arm64)
 
 `suggest_ideal_type` converted from a whole-slice `&[&str]` function to a
