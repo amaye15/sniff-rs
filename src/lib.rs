@@ -3255,7 +3255,7 @@ struct ColumnProfile {
 impl ColumnProfile {
     fn to_json(&self) -> json_support::Value {
         use json_support::{Map, Value};
-        let mut obj = Map::with_capacity(7);
+        let mut obj = Map::with_capacity(8);
         obj.insert("name".to_string(), Value::from(self.name.clone()));
         obj.insert(
             "current_type".to_string(),
@@ -3281,6 +3281,16 @@ impl ColumnProfile {
             ),
         );
         obj.insert("notes".to_string(), Value::from(self.notes.clone()));
+        // Added after every other field, deliberately: this is a genuine
+        // JSON-shape addition to an already-documented, already-shipped
+        // output (see CLAUDE.md's own JSON shape example), not a field
+        // this tool always had - appending rather than inserting it
+        // logically alongside missing_pct keeps every existing byte-for-
+        // byte fixture/snapshot comparison that predates this field
+        // failing loudly on the one new key at the end, instead of a
+        // silently-reordered diff scattered through the middle of the
+        // object.
+        obj.insert("row_count".to_string(), Value::from(self.row_count));
         Value::Object(obj)
     }
 }
@@ -3314,7 +3324,8 @@ mod column_profile_to_json_tests {
                 "description",
                 "missing_pct",
                 "sample_values",
-                "notes"
+                "notes",
+                "row_count"
             ]
         );
         assert_eq!(
@@ -3325,6 +3336,7 @@ mod column_profile_to_json_tests {
             obj.get("missing_pct"),
             Some(&json_support::Value::from(0.0))
         );
+        assert_eq!(obj.get("row_count"), Some(&json_support::Value::from(2)));
     }
 
     #[test]
@@ -3349,6 +3361,7 @@ mod column_profile_to_json_tests {
         assert_eq!(via_real["missing_pct"], 40.0);
         assert_eq!(via_real["sample_values"][0], "2024-01-15");
         assert_eq!(via_real["description"], "");
+        assert_eq!(via_real["row_count"], 5);
     }
 }
 

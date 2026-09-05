@@ -238,12 +238,28 @@ everything else's implicit single one:
         "description": "",
         "missing_pct": 0.0,
         "sample_values": ["02134", "90210"],
-        "notes": "leading zeros in raw values (likely an ID/code)"
+        "notes": "leading zeros in raw values (likely an ID/code)",
+        "row_count": 100
       }
     ]
   }
 }
 ```
+
+`row_count` is how many rows/records this column was profiled against (the
+same total every `missing_pct` above is already derived from) — added after
+every other field, deliberately, so a comparison predating this field fails
+loudly on the one new key at the end rather than a reordered diff scattered
+through the middle of the object. For a flat reader (CSV, Excel, SQLite, …)
+every column in one table carries the same value; for a nested JSON-shaped
+table, only the *first* column in a table's array (the top-level path's own
+row — see "profile_json_records" below) reflects the table's real record
+count, since a descendant path's own `row_count` reflects its own nesting
+level's slot count instead, which can legitimately differ (e.g. an array
+that pools several elements per parent record). `row_count` is deliberately
+`--output-format json` only — `json-schema` has no vocabulary slot for "how
+many rows," the same reason that format never carried `sample_values`/
+`notes` either.
 
 `description` is always empty — intentionally left for a human (or an agent
 downstream of this one) to fill in; no heuristic should be guessing what a

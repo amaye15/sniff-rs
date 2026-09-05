@@ -244,6 +244,27 @@ fn markdown_output_ends_with_exactly_one_newline() {
 }
 
 #[test]
+fn json_output_reports_row_count_per_column() {
+    let doc = run_json("sample.csv", &[]);
+    let cols = table(&doc, "sample");
+    // sample.csv has 5 data rows - every column in a flat reader shares
+    // the exact same row_count, since they're all profiled from the same
+    // table's rows.
+    assert_eq!(column(cols, "user_id")["row_count"], 5);
+    assert_eq!(column(cols, "zip_code")["row_count"], 5);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn json_output_reports_an_independent_row_count_per_table() {
+    let doc = run_json("sample.sqlite", &[]);
+    // Two tables, two genuinely different row counts - row_count must
+    // never leak one table's count into another's.
+    assert_eq!(column(table(&doc, "events"), "event_id")["row_count"], 3);
+    assert_eq!(column(table(&doc, "users"), "user_id")["row_count"], 5);
+}
+
+#[test]
 fn unrecognized_extension_gives_an_actionable_error_not_a_panic() {
     let output = Command::new(bin())
         .args(["/dev/null.mystery"])
