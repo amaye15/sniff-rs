@@ -43763,13 +43763,27 @@ enum InputFormat {
 }
 
 impl InputFormat {
+    /// The label used for this format everywhere it's shown to a user or a
+    /// JSON consumer (the `"format"` field, and the Markdown summary line).
+    /// Deliberately kept identical to the primary `--format` value that
+    /// selects this variant (see the `--format` parsing match below) so
+    /// there's exactly one spelling of each format name in this tool's
+    /// entire surface, not two that quietly drift - four variants
+    /// (`ArrowIpc`/`FixedWidth`/`CommonLog`/`CombinedLog`) used an
+    /// underscore-separated label here that didn't match their own
+    /// hyphenated `--format` value at all (`arrow_ipc` vs. the accepted
+    /// `--format arrow`; `fixed_width`/`common_log`/`combined_log` vs. the
+    /// accepted `--format fixed-width`/`common-log`/`combined-log`) until
+    /// this was caught by actually reading real Markdown output rather than
+    /// just the code - the same "verify against real output" discipline
+    /// this project holds every heuristic to.
     fn as_str(&self) -> &'static str {
         match self {
             InputFormat::Csv => "csv",
             InputFormat::Tsv => "tsv",
             InputFormat::Json => "json",
             InputFormat::Parquet => "parquet",
-            InputFormat::ArrowIpc => "arrow_ipc",
+            InputFormat::ArrowIpc => "arrow",
             InputFormat::Avro => "avro",
             InputFormat::Xlsx => "xlsx",
             InputFormat::Sqlite => "sqlite",
@@ -43779,11 +43793,11 @@ impl InputFormat {
             InputFormat::Cbor => "cbor",
             InputFormat::Ini => "ini",
             InputFormat::Xml => "xml",
-            InputFormat::FixedWidth => "fixed_width",
+            InputFormat::FixedWidth => "fixed-width",
             InputFormat::Npy => "npy",
             InputFormat::Npz => "npz",
-            InputFormat::CommonLog => "common_log",
-            InputFormat::CombinedLog => "combined_log",
+            InputFormat::CommonLog => "common-log",
+            InputFormat::CombinedLog => "combined-log",
             InputFormat::Syslog => "syslog",
             InputFormat::Syslog5424 => "syslog5424",
             InputFormat::Dbase => "dbase",
@@ -52353,7 +52367,7 @@ mod tests {
     fn sniff_format_recognizes_every_fixed_magic_number() {
         sniff_matches(b"SQLite format 3\x00rest of the file...", "sqlite");
         sniff_matches(b"Obj\x01\x04\x14avro.codec...", "avro");
-        sniff_matches(b"ARROW1\x00\x00rest...", "arrow_ipc");
+        sniff_matches(b"ARROW1\x00\x00rest...", "arrow");
         sniff_matches(b"\x93NUMPY\x01\x00rest...", "npy");
         sniff_matches(
             &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0],
