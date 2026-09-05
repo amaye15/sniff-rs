@@ -33,6 +33,33 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/incremental-spss` branch (Darwin arm64)
+
+SPSS wired through `ColumnAccumulatorState`, the fifth format converted
+(after CSV/fixed-width/dBase/Stata). `read_cases` now returns
+`(Vec<ColumnAccumulatorState>, usize)` instead of a full
+`Vec<Vec<Option<String>>>`. `current_type` is a fixed `"f64"`/`"String"`
+picked from the variable's own `VarType` (neither inferred nor a
+per-field label) - the second shape `into_profile_with_declared_type`
+had to accommodate, needing no further changes.
+
+Measured on a real 34 MB, 200,000-row `.sav` file (id/amount/a 150-char
+free-text column, via `pyreadstat`): maxRSS 80-87 MB -> ~2.4 MB (~97%),
+peak footprint 58-63 MB -> ~1.2 MB (~98%), consistent across 3 rounds.
+Output byte-identical via `diff` against the entire 359-file fixture
+corpus, plus every committed `.sav` fixture (bytecode-compressed and
+uncompressed) at 3 `--samples` settings with/without `--nrows 2` (48
+combinations) - zero mismatches.
+
+Verified via the full test suite (347 unit + 360 integration, including
+both `spss_reader_matches_the_ambers_crate_output_exactly` and
+`spss_reader_agrees_with_the_ambers_crate_on_malformed_input`, zero
+modifications needed) and clippy/fmt clean across default/`spss`/
+`full`, matching established baselines (default=1, spss=1, full=5)
+exactly.
+
+---
+
 ## 2026-09-05 — `feat/incremental-stata` branch (Darwin arm64)
 
 Stata wired through `ColumnAccumulatorState`, the fourth format

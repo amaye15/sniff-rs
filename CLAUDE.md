@@ -4852,19 +4852,57 @@ reader_matches_the_dta_crate_output_exactly` oracle test, zero
 modifications needed) and clippy/fmt clean across default/`stata`/
 `full`, matching established baselines exactly.
 
+**SPSS went fifth.** Its own `read_cases` already streamed case data off
+the same `BufReader` the header/dictionary were read from (a Tier 1 win
+from an earlier phase), but still built and returned a full
+`Vec<Vec<Option<String>>>` before `columns_from_spss` ever touched it -
+`read_cases` now returns `(Vec<ColumnAccumulatorState>, usize)` instead,
+folding each decoded, non-missing value straight into its column's
+accumulator as `nominal_case_size`-wide rows are decoded, the identical
+bypass pattern the four prior conversions established. `current_type`
+for SPSS is neither inferred from values nor a per-field label read off
+the file - it's a fixed `"f64"`/`"String"` chosen by the variable's own
+`VarType` - so this is the *second* genuinely different shape
+`into_profile_with_declared_type` had to accommodate, and needed no
+further changes to accept it: a hardcoded string is just as valid a
+"declared type" as dBase's field-type byte or Stata's variable-type
+label. One real, if minor, lint surfaced while writing this phase's own
+doc comment: a line starting with `- ` immediately after unrelated
+existing prose was misread by `clippy::doc_lazy_continuation` as an
+unindented list continuation (the same lint class - `doc_lazy_
+continuation` - this project's earlier `IdealTypeAccumulator` doc
+comment already hit once during the CSV/fixed-width phase) - reworded
+rather than suppressed, since the sentence didn't need the dash at all.
+
+Measured on a real 34 MB, 200,000-row `.sav` file (id/amount/a
+150-character free-text description column, via `pyreadstat`'s
+`write_sav`): maxRSS 80-87 MB -> ~2.4 MB (~97%), peak footprint 58-63 MB
+-> ~1.2 MB (~98%), consistent across 3 rounds. Output confirmed
+byte-identical via `diff` against the pre-change binary across the
+entire 359-file fixture corpus, and separately across every committed
+`.sav` fixture (both bytecode-compressed and uncompressed variants,
+exercising both `CaseSource` branches) at every combination of 3
+`--samples` settings and with/without `--nrows 2` (48 combinations) -
+zero mismatches. Full test suite (347 unit + 360 integration, including
+both `spss_reader_matches_the_ambers_crate_output_exactly` and
+`spss_reader_agrees_with_the_ambers_crate_on_malformed_input`, zero
+modifications needed) and clippy/fmt clean across default/`spss`/
+`full`, matching established baselines exactly.
+
 **Deliberately not done yet**: every other `profile_column`/
 `profile_json_path`-based reader still holds a full column's values
-resident (Excel, NumPy, SAS7BDAT, SPSS, ORC, JSON, YAML, TOML, Avro,
+resident (Excel, NumPy, SAS7BDAT, ORC, JSON, YAML, TOML, Avro,
 MessagePack, CBOR, XML, Parquet/Arrow's nested columns) - each would
 need its own `ColumnInput`/`profile_column` (or `profile_json_path`)
-call site converted the same way CSV's/fixed-width's/dBase's/Stata's
-were, and each deserves its own real-file measurement before being
-called done, the same one-phase-at-a-time discipline this whole section
-has already used throughout. Excel specifically would need its own,
-larger restructuring (see above) rather than the same drop-in bypass
-pattern the four converted so far all shared. Per-entry streaming
-decompression inside `ZipArchive::read` itself remains a real,
-disclosed, separately-scoped remaining gap, not folded into any phase
+call site converted the same way CSV's/fixed-width's/dBase's/Stata's/
+SPSS's were, and each deserves its own real-file measurement before
+being called done, the same one-phase-at-a-time discipline this whole
+section has already used throughout. Excel specifically would need its
+own, larger restructuring (see above) rather than the same drop-in
+bypass pattern the five converted so far all shared. Per-entry
+streaming decompression inside `ZipArchive::read` itself remains a
+real, disclosed, separately-scoped remaining gap, not folded into any
+phase
 here.
 
 ## Cloud-platform file compatibility

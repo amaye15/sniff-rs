@@ -10245,17 +10245,27 @@ mod spss_support {
     /// per non-ghost variable per row (`None` for both SYSMIS and a
     /// user-declared missing value - this project's usual "missing values
     /// never fake a type change" treatment).
+    /// Returns one `ColumnAccumulatorState` per visible variable (the
+    /// same shared, bounded-footprint accumulator CSV/fixed-width/dBase/
+    /// Stata already use - see its own doc comment) plus the true row
+    /// count, instead of a `Vec<Vec<Option<String>>>` held for every case,
+    /// bypassing `ColumnInput`/`profile_column` entirely - the Tier 2 win
+    /// CLAUDE.md's "Streaming reads / memory footprint" section describes.
     fn read_cases<R: Read>(
         mut source: CaseSource<R>,
         dict: &Dictionary,
         nrows: Option<usize>,
-    ) -> Result<Vec<Vec<Option<String>>>> {
+        n_samples: usize,
+    ) -> Result<(Vec<ColumnAccumulatorState>, usize)> {
         let visible: Vec<&VariableRecord> = dict.variables.iter().filter(|v| !v.is_ghost).collect();
-        let mut columns: Vec<Vec<Option<String>>> = vec![Vec::new(); visible.len()];
+        let mut col_states: Vec<ColumnAccumulatorState> = (0..visible.len())
+            .map(|_| ColumnAccumulatorState::new())
+            .collect();
+        let mut total = 0usize;
         let slots_per_row = dict.header.nominal_case_size;
 
         'rows: loop {
-            if nrows.is_some_and(|limit| columns.first().is_some_and(|c| c.len() >= limit)) {
+            if nrows.is_some_and(|limit| total >= limit) {
                 break;
             }
             let mut row_slots: Vec<[u8; 8]> = Vec::with_capacity(slots_per_row);
@@ -10339,11 +10349,14 @@ mod spss_support {
                         }
                     }
                 };
-                columns[col_idx].push(value);
+                if let Some(s) = value {
+                    col_states[col_idx].push(s, n_samples);
+                }
             }
+            total += 1;
         }
 
-        Ok(columns)
+        Ok((col_states, total))
     }
 
     pub(crate) fn columns_from_spss(
@@ -10378,25 +10391,20 @@ mod spss_support {
             Compression::Zlib => unreachable!("handled above"),
         };
 
-        let columns = read_cases(source, &dict, nrows)?;
+        let (col_states, total) = read_cases(source, &dict, nrows, n_samples)?;
         let visible: Vec<&VariableRecord> = dict.variables.iter().filter(|v| !v.is_ghost).collect();
 
         let mut out = Vec::with_capacity(visible.len());
-        for (var, raw) in visible.iter().zip(columns) {
-            let total = raw.len();
+        for (var, state) in visible.iter().zip(col_states) {
             let current_type = match var.var_type {
                 VarType::Numeric => "f64",
                 VarType::Str(_) => "String",
             };
-            let raw_values: Vec<String> = raw.into_iter().flatten().collect();
-            let col = ColumnInput {
-                name: var.long_name.clone(),
-                current_type: current_type.to_string(),
-                raw_values,
+            out.push(state.into_profile_with_declared_type(
+                var.long_name.clone(),
                 total,
-                skip_heuristics: false,
-            };
-            out.push(profile_column(col, n_samples));
+                current_type.to_string(),
+            ));
         }
         Ok(out)
     }
