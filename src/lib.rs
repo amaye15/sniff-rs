@@ -4639,97 +4639,148 @@ fn naive_current_type(values: &[&str]) -> &'static str {
 /// single `char`, cast down to `u8` before reaching here, matching what
 /// the `csv` crate's own `u8`-typed `.delimiter()` builder method already
 /// required).
+///
+/// This is a thin wrapper around `csv_feed_chunk` - the actual state
+/// machine, extracted so `columns_from_csv`'s own streaming reader (see
+/// below) can drive the *exact* same, already-adversarially-tested logic
+/// a chunk at a time instead of over one fully-materialized buffer,
+/// without a second, independently-maintained copy of it. Feeding the
+/// whole `content` as a single "chunk" here is simply the degenerate
+/// case of that same engine - proven to still produce byte-identical
+/// output via `csv_feed_chunk`'s own doc comment and this module's own
+/// chunk-boundary tests.
 fn parse_csv(content: &str, delimiter: u8) -> Vec<Vec<String>> {
     let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let delimiter = delimiter as char;
 
-    #[derive(Clone, Copy, PartialEq)]
-    enum State {
-        StartRecord,
-        StartField,
-        InField,
-        InQuotedField,
-        InDoubleEscapedQuote,
+    let mut state = CsvState::StartRecord;
+    let mut field = String::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut records: Vec<Vec<String>> = Vec::new();
+    csv_feed_chunk(
+        content,
+        delimiter,
+        &mut state,
+        &mut field,
+        &mut record,
+        &mut |r| {
+            records.push(r);
+            Ok(())
+        },
+    )
+    .expect("the in-memory record callback above never returns Err");
+
+    // Flush a final, unterminated record (no trailing newline) - anything
+    // other than a pristine StartRecord means real content is pending.
+    if state != CsvState::StartRecord {
+        record.push(field);
+        records.push(record);
     }
 
-    fn is_term(c: char) -> bool {
-        c == '\r' || c == '\n'
-    }
+    records
+}
 
-    // Handles one character exactly the way `State::StartField` always
-    // has (quote begins a quoted field, a delimiter ends an empty field,
-    // a terminator ends an empty record, anything else starts a plain
-    // field) - factored out so it can also be called, inline, from
-    // `State::StartRecord`'s own "first real character of a record" case
-    // below. A plain fn (not a closure) because it's called from two
-    // different match arms that each already hold a `&mut` borrow of
-    // `state` for the surrounding match - passing `field`/`record`/
-    // `records` as explicit parameters sidesteps any borrow conflict a
-    // capturing closure would have here.
-    fn start_field(
-        c: char,
-        delimiter: char,
-        field: &mut String,
-        record: &mut Vec<String>,
-        records: &mut Vec<Vec<String>>,
-    ) -> State {
-        if c == '"' {
-            State::InQuotedField
-        } else if c == delimiter {
-            record.push(std::mem::take(field));
-            State::StartField
-        } else if is_term(c) {
-            record.push(std::mem::take(field));
-            records.push(std::mem::take(record));
-            State::StartRecord
-        } else {
-            field.push(c);
-            State::InField
-        }
-    }
+#[derive(Clone, Copy, PartialEq)]
+enum CsvState {
+    StartRecord,
+    StartField,
+    InField,
+    InQuotedField,
+    InDoubleEscapedQuote,
+}
 
-    // A single forward pass over the underlying bytes, tracking a byte
-    // cursor (`pos`) rather than iterating `content.chars()` one
-    // character at a time - the old whole-file `Vec<char>` materialized 4
-    // bytes per character regardless of the source encoding (a real,
-    // measurable regression versus the `csv`-crate-based reader this
-    // replaced, see CLAUDE.md's Dependency footprint section), and even
-    // after that was fixed, a real profiling pass (`samply`/`atos`
-    // against this project's own release build) found `field.push(c)` -
-    // appending one already-decoded `char` at a time while `InField`/
-    // `InQuotedField` - to be a genuine hot spot in its own right on a
-    // large real CSV: every ordinary character paid for a UTF-8 decode
-    // (advancing the old `chars()` iterator) and a separate re-encode
-    // (`String::push`'s own per-char cost), instead of one bulk copy for
-    // the whole run of ordinary characters between two delimiters.
-    //
-    // `InField`/`InQuotedField` now scan forward over raw bytes for the
-    // next delimiter/terminator/closing-quote and `push_str` the whole
-    // span at once. This is safe with multi-byte UTF-8 content despite
-    // operating below the `char` level: `delimiter`, `'\r'`, `'\n'`, and
-    // `'"'` are all single-byte ASCII values, and a UTF-8 continuation
-    // byte is always in `0x80..=0xBF` - strictly above the ASCII range -
-    // so a byte-for-byte scan for any of these four values can never
-    // mistake a byte in the *middle* of a multi-byte character for a
-    // real boundary; every position this scan stops at is guaranteed to
-    // already be a valid `char` boundary. `StartRecord`/`StartField`/
-    // `InDoubleEscapedQuote` are pure single-character decision points
-    // (never a "run" to batch), so they still decode exactly one `char`
-    // per step via `content[pos..].chars().next()` and advance `pos` by
-    // that character's own UTF-8 length - functionally identical to one
-    // step of the old `for c in content.chars()` loop, just addressed by
-    // byte offset instead of iterator position.
-    let bytes = content.as_bytes();
+fn csv_is_term(c: char) -> bool {
+    c == '\r' || c == '\n'
+}
+
+// Handles one character exactly the way `CsvState::StartField` always
+// has (quote begins a quoted field, a delimiter ends an empty field, a
+// terminator ends an empty record, anything else starts a plain field) -
+// factored out so it can also be called, inline, from
+// `CsvState::StartRecord`'s own "first real character of a record" case
+// below. A plain fn (not a closure) because it's called from two
+// different match arms that each already hold a `&mut` borrow of `state`
+// for the surrounding match - passing `field`/`record`/`on_record` as
+// explicit parameters sidesteps any borrow conflict a capturing closure
+// would have here.
+fn csv_start_field(
+    c: char,
+    delimiter: char,
+    field: &mut String,
+    record: &mut Vec<String>,
+    on_record: &mut impl FnMut(Vec<String>) -> Result<()>,
+) -> Result<CsvState> {
+    Ok(if c == '"' {
+        CsvState::InQuotedField
+    } else if c == delimiter {
+        record.push(std::mem::take(field));
+        CsvState::StartField
+    } else if csv_is_term(c) {
+        record.push(std::mem::take(field));
+        on_record(std::mem::take(record))?;
+        CsvState::StartRecord
+    } else {
+        field.push(c);
+        CsvState::InField
+    })
+}
+
+/// The shared, resumable core of the hand-rolled CSV/TSV state machine
+/// (see `parse_csv`'s own doc comment for the behavior this replicates,
+/// verified directly against `csv-core`'s `transition_nfa`). Extracted
+/// specifically so the *same* logic can drive two different callers: a
+/// single whole-buffer parse (`parse_csv`, feeding all of `content` in
+/// one call) and a chunk-at-a-time streaming read
+/// (`columns_from_csv`'s own reader below, feeding successive pieces of
+/// a file that's never fully materialized in memory). `state`/`field`/
+/// `record` are threaded in and mutated in place specifically so a
+/// streaming caller can resume exactly where the previous chunk left
+/// off - a field, or an in-progress quoted value, can legitimately span
+/// a chunk boundary, the same way it can already span a line within one
+/// buffer. `on_record` is called immediately whenever a complete record
+/// is recognized, rather than this function collecting them itself -
+/// letting a streaming caller fold each record straight into its own
+/// per-column accumulator instead of ever holding a `Vec` of every
+/// record the file contains.
+///
+/// A single forward pass over the underlying bytes, tracking a byte
+/// cursor (`pos`) rather than iterating `chunk.chars()` one character at
+/// a time - a real, measured hot spot in this project's own history
+/// (see CLAUDE.md's Performance section) when done the naive way.
+/// `InField`/`InQuotedField` scan forward over raw bytes for the next
+/// delimiter/terminator/closing-quote and `push_str` the whole span at
+/// once. This is safe with multi-byte UTF-8 content despite operating
+/// below the `char` level: `delimiter`, `'\r'`, `'\n'`, and `'"'` are all
+/// single-byte ASCII values, and a UTF-8 continuation byte is always in
+/// `0x80..=0xBF` - strictly above the ASCII range - so a byte-for-byte
+/// scan for any of these four values can never mistake a byte in the
+/// *middle* of a multi-byte character for a real boundary; every
+/// position this scan stops at is guaranteed to already be a valid
+/// `char` boundary. `StartRecord`/`StartField`/`InDoubleEscapedQuote` are
+/// pure single-character decision points (never a "run" to batch), so
+/// they still decode exactly one `char` per step via `chunk[pos..]
+/// .chars().next()` and advance `pos` by that character's own UTF-8
+/// length. `chunk` itself is guaranteed to be a complete, valid `&str` by
+/// every caller (`stream_utf8_chunks` never hands out a chunk ending
+/// mid-character), so this never needs to worry about a chunk boundary
+/// splitting a character - only about a *field* or *quoted value*
+/// spanning one, which `state`/`field`/`record` being caller-owned
+/// already handles.
+fn csv_feed_chunk(
+    chunk: &str,
+    delimiter: char,
+    state: &mut CsvState,
+    field: &mut String,
+    record: &mut Vec<String>,
+    on_record: &mut impl FnMut(Vec<String>) -> Result<()>,
+) -> Result<()> {
+    let bytes = chunk.as_bytes();
     let len = bytes.len();
     let mut pos = 0usize;
-    let mut records: Vec<Vec<String>> = Vec::new();
-    let mut record: Vec<String> = Vec::new();
-    let mut field = String::new();
-    let mut state = State::StartRecord;
 
     while pos < len {
-        match state {
-            State::InField => {
+        match *state {
+            CsvState::InField => {
                 let start = pos;
                 while pos < len {
                     let b = bytes[pos];
@@ -4739,109 +4790,286 @@ fn parse_csv(content: &str, delimiter: u8) -> Vec<Vec<String>> {
                     pos += 1;
                 }
                 if pos > start {
-                    field.push_str(&content[start..pos]);
+                    field.push_str(&chunk[start..pos]);
                 }
                 if pos >= len {
                     break;
                 }
                 if bytes[pos] == delimiter as u8 {
-                    record.push(std::mem::take(&mut field));
-                    state = State::StartField;
+                    record.push(std::mem::take(field));
+                    *state = CsvState::StartField;
                 } else {
-                    record.push(std::mem::take(&mut field));
-                    records.push(std::mem::take(&mut record));
-                    state = State::StartRecord;
+                    record.push(std::mem::take(field));
+                    on_record(std::mem::take(record))?;
+                    *state = CsvState::StartRecord;
                 }
                 pos += 1;
             }
-            State::InQuotedField => {
+            CsvState::InQuotedField => {
                 let start = pos;
                 while pos < len && bytes[pos] != b'"' {
                     pos += 1;
                 }
                 if pos > start {
-                    field.push_str(&content[start..pos]);
+                    field.push_str(&chunk[start..pos]);
                 }
                 if pos >= len {
                     break;
                 }
-                state = State::InDoubleEscapedQuote;
+                *state = CsvState::InDoubleEscapedQuote;
                 pos += 1;
             }
-            State::StartRecord | State::StartField | State::InDoubleEscapedQuote => {
-                let c = content[pos..]
+            CsvState::StartRecord | CsvState::StartField | CsvState::InDoubleEscapedQuote => {
+                let c = chunk[pos..]
                     .chars()
                     .next()
                     .expect("pos < len on a str's own byte boundary always has a next char");
                 pos += c.len_utf8();
-                match state {
-                    State::StartRecord => {
-                        if !is_term(c) {
-                            state =
-                                start_field(c, delimiter, &mut field, &mut record, &mut records);
+                match *state {
+                    CsvState::StartRecord => {
+                        if !csv_is_term(c) {
+                            *state = csv_start_field(c, delimiter, field, record, on_record)?;
                         }
                     }
-                    State::StartField => {
-                        state = start_field(c, delimiter, &mut field, &mut record, &mut records);
+                    CsvState::StartField => {
+                        *state = csv_start_field(c, delimiter, field, record, on_record)?;
                     }
-                    State::InDoubleEscapedQuote => {
+                    CsvState::InDoubleEscapedQuote => {
                         if c == '"' {
                             field.push('"');
-                            state = State::InQuotedField;
+                            *state = CsvState::InQuotedField;
                         } else if c == delimiter {
-                            record.push(std::mem::take(&mut field));
-                            state = State::StartField;
-                        } else if is_term(c) {
-                            record.push(std::mem::take(&mut field));
-                            records.push(std::mem::take(&mut record));
-                            state = State::StartRecord;
+                            record.push(std::mem::take(field));
+                            *state = CsvState::StartField;
+                        } else if csv_is_term(c) {
+                            record.push(std::mem::take(field));
+                            on_record(std::mem::take(record))?;
+                            *state = CsvState::StartRecord;
                         } else {
                             field.push(c);
-                            state = State::InField;
+                            *state = CsvState::InField;
                         }
                     }
-                    State::InField | State::InQuotedField => unreachable!("handled above"),
+                    CsvState::InField | CsvState::InQuotedField => unreachable!("handled above"),
                 }
             }
         }
     }
-    // Flush a final, unterminated record (no trailing newline) - anything
-    // other than a pristine StartRecord means real content is pending.
-    if state != State::StartRecord {
-        record.push(field);
-        records.push(record);
-    }
-
-    records
+    Ok(())
 }
 
+/// How much of a file is ever held in memory at once by
+/// `stream_utf8_chunks` (plus, in the worst case, up to 3 carried-over
+/// bytes of an incomplete trailing UTF-8 sequence) - a fixed, small
+/// constant regardless of the file's own size, which is the entire point
+/// of reading this way instead of `fs::read`/`fs::read_to_string`.
+const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+
+/// Reads `path` in fixed-size chunks, handing each one to `on_chunk` as a
+/// guaranteed-complete, valid `&str` - never materializing the whole file
+/// in memory the way `fs::read_to_string` does. A raw byte read can, and
+/// routinely will, land in the middle of a multi-byte UTF-8 character;
+/// any such incomplete trailing sequence is carried over and prepended to
+/// the *next* read rather than ever being handed to `on_chunk`, using
+/// `Utf8Error::valid_up_to`/`error_len` to tell "just need more bytes"
+/// apart from "this is genuinely invalid UTF-8" (the same distinction
+/// `std::str::from_utf8`'s own documented contract exists to support).
+/// `on_chunk` returns `Ok(true)` to keep reading or `Ok(false)` to stop
+/// early without reading the rest of the file at all - what
+/// `columns_from_csv` uses to make `--nrows` bound real disk I/O, not
+/// just how many rows get profiled after the fact.
+fn stream_utf8_chunks(path: &Path, on_chunk: impl FnMut(&str) -> Result<bool>) -> Result<()> {
+    stream_utf8_chunks_with_size(path, STREAM_CHUNK_SIZE, on_chunk)
+}
+
+/// The real implementation behind `stream_utf8_chunks`, parameterized
+/// over the read-buffer size so tests can force a tiny one (a handful of
+/// bytes) to actually stress the multi-byte-UTF-8-boundary-carrying logic
+/// below without needing a multi-hundred-KB fixture file to do it -
+/// `stream_utf8_chunks` itself always uses the real `STREAM_CHUNK_SIZE`.
+fn stream_utf8_chunks_with_size(
+    path: &Path,
+    chunk_size: usize,
+    mut on_chunk: impl FnMut(&str) -> Result<bool>,
+) -> Result<()> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut buf = vec![0u8; chunk_size];
+    let mut pending: Vec<u8> = Vec::new();
+
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("failed to read {path:?}"))?;
+        if n == 0 {
+            if !pending.is_empty() {
+                bail!("{path:?} contains invalid UTF-8");
+            }
+            return Ok(());
+        }
+        pending.extend_from_slice(&buf[..n]);
+        match std::str::from_utf8(&pending) {
+            Ok(s) => {
+                if !on_chunk(s)? {
+                    return Ok(());
+                }
+                pending.clear();
+            }
+            Err(e) => {
+                if e.error_len().is_some() {
+                    // A genuine invalid byte sequence, not just a
+                    // multi-byte character truncated at this read's own
+                    // boundary (that case has `error_len() == None`).
+                    bail!("{path:?} contains invalid UTF-8");
+                }
+                let valid_up_to = e.valid_up_to();
+                let s = std::str::from_utf8(&pending[..valid_up_to])
+                    .expect("valid_up_to is always a valid UTF-8 boundary");
+                if !on_chunk(s)? {
+                    return Ok(());
+                }
+                pending.drain(..valid_up_to);
+            }
+        }
+    }
+}
+
+/// The streaming counterpart of `columns_from_csv`'s old
+/// `fs::read_to_string` + `parse_csv` pipeline: folds each record
+/// straight into per-column accumulators as `csv_feed_chunk` recognizes
+/// it, so the only thing ever held in memory proportional to the file's
+/// own size is the columnar data itself (still genuinely needed in full,
+/// for non-sampled type detection - see CLAUDE.md's own writeup on why
+/// that's a deliberate, disclosed limit rather than a further-reducible
+/// one) - never a second, separate copy of the raw file text or of every
+/// record re-materialized as a `Vec<Vec<String>>` first. `record_index`
+/// counts every record seen (skipped rows included), so `skip_rows`/the
+/// header row/real data rows are told apart the same way the old
+/// slice-based `records.split_off` version did - a file with fewer
+/// records than `skip_rows + 1` still correctly produces zero columns,
+/// `headers`/`col_values` simply never being populated.
+struct CsvColumnAccumulator {
+    skip_rows: usize,
+    nrows: Option<usize>,
+    record_index: usize,
+    headers: Vec<String>,
+    col_values: Vec<Vec<String>>,
+    total: usize,
+    done: bool,
+}
+
+impl CsvColumnAccumulator {
+    fn new(skip_rows: usize, nrows: Option<usize>) -> Self {
+        CsvColumnAccumulator {
+            skip_rows,
+            nrows,
+            record_index: 0,
+            headers: Vec::new(),
+            col_values: Vec::new(),
+            total: 0,
+            done: false,
+        }
+    }
+
+    fn accept(&mut self, record: Vec<String>) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        if self.record_index < self.skip_rows {
+            // A skipped leading row - discarded, never even reaching a
+            // header or column concept.
+        } else if self.record_index == self.skip_rows {
+            self.col_values = vec![Vec::new(); record.len()];
+            self.headers = record;
+        } else if self.nrows.is_some_and(|limit| self.total >= limit) {
+            self.done = true;
+        } else {
+            if record.len() != self.headers.len() {
+                bail!(
+                    "CSV error: found record with {} fields, but the header has {} fields",
+                    record.len(),
+                    self.headers.len()
+                );
+            }
+            for (col_idx, field) in record.into_iter().enumerate() {
+                let trimmed = field.trim();
+                if !(trimmed.is_empty() || is_missing_sentinel(trimmed)) {
+                    self.col_values[col_idx].push(field);
+                }
+            }
+            self.total += 1;
+            if self.nrows.is_some_and(|limit| self.total >= limit) {
+                self.done = true;
+            }
+        }
+        self.record_index += 1;
+        Ok(())
+    }
+}
+
+/// Reads and profiles a CSV/TSV file without ever holding the raw file
+/// text in memory: `stream_utf8_chunks` supplies bounded, fixed-size
+/// pieces of the file, `csv_feed_chunk` recognizes complete records from
+/// them (a record, or a field within one, can span a chunk boundary -
+/// `csv_state`/`field`/`record` below are exactly the state that lets it
+/// resume correctly), and `CsvColumnAccumulator` folds each record
+/// straight into its own per-column storage as it arrives. The only
+/// thing still held proportional to the file's own size is that columnar
+/// data itself - genuinely unavoidable while type detection stays
+/// non-sampled (see CLAUDE.md's own writeup on this), but a real,
+/// meaningful reduction from the old `fs::read_to_string` + `parse_csv`
+/// pipeline's peak of "the whole raw file text *and* the fully-parsed
+/// structure held at once." `--nrows` now also bounds real disk I/O, not
+/// just how many rows end up profiled - `CsvColumnAccumulator::done`
+/// flows back out through `csv_feed_chunk`'s `on_record` callback to
+/// `stream_utf8_chunks`'s own early-stop signal, so a `--nrows 100` run
+/// against a multi-gigabyte file stops reading it once 100 rows are in
+/// hand, rather than reading the whole thing first and truncating after.
 fn columns_from_csv(
     path: &Path,
     nrows: Option<usize>,
     delimiter: u8,
     skip_rows: usize,
 ) -> Result<Vec<ColumnInput>> {
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let mut records = parse_csv(&content, delimiter);
+    let delimiter = delimiter as char;
+    let mut csv_state = CsvState::StartRecord;
+    let mut field = String::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut acc = CsvColumnAccumulator::new(skip_rows, nrows);
+    let mut first_chunk = true;
 
-    // If the file has fewer than skip_rows+1 rows, there's no header to
-    // read at all - headers stays empty and the loop below produces zero
-    // columns, the same silent-empty-result behavior this function has
-    // always had for that case (never an error - skip_rows past the end
-    // of a short file isn't itself a malformed-input signal). Moved out
-    // (`mem::take`/`split_off`) rather than `.cloned()`/a borrowed slice -
-    // every cell in a real CSV used to get copied twice before reaching
-    // `ColumnInput` (once building `raw` from a borrowed `data_rows`, once
-    // more building `non_null` from `raw` itself); since nothing reads
-    // `records` again after this point, there's nothing to preserve by
-    // cloning instead of moving.
-    let headers: Vec<String> = if skip_rows < records.len() {
-        std::mem::take(&mut records[skip_rows])
-    } else {
-        Vec::new()
-    };
-    let split_at = (skip_rows + 1).min(records.len());
-    let data_rows: Vec<Vec<String>> = records.split_off(split_at);
+    stream_utf8_chunks(path, |chunk| {
+        if acc.done {
+            return Ok(false);
+        }
+        // A leading UTF-8 BOM is stripped, but only at the very start of
+        // the file - `first_chunk` always contains it in full (it's 3
+        // bytes, far smaller than a single read), so there's no risk of
+        // it being split across the boundary this check cares about.
+        let chunk = if first_chunk {
+            first_chunk = false;
+            chunk.strip_prefix('\u{FEFF}').unwrap_or(chunk)
+        } else {
+            chunk
+        };
+        csv_feed_chunk(
+            chunk,
+            delimiter,
+            &mut csv_state,
+            &mut field,
+            &mut record,
+            &mut |r| acc.accept(r),
+        )?;
+        Ok(!acc.done)
+    })?;
+
+    // Flush a final, unterminated record (no trailing newline) - anything
+    // other than a pristine StartRecord means real content is pending.
+    if !acc.done && csv_state != CsvState::StartRecord {
+        record.push(std::mem::take(&mut field));
+        acc.accept(std::mem::take(&mut record))?;
+    }
 
     // One `Vec<String>` per column holding only the non-null values,
     // plus a running row count - rather than a `Vec<Vec<Option<String>>>`
@@ -4849,30 +5077,8 @@ fn columns_from_csv(
     // be flattened per column. `profile_column` reconstructs
     // `missing_pct` from `total` minus the value count, so the `None`
     // slots were never needed.
-    let mut col_values: Vec<Vec<String>> = vec![Vec::new(); headers.len()];
-    let mut total = 0usize;
-    for record in data_rows {
-        if nrows.is_some_and(|limit| total >= limit) {
-            break;
-        }
-        if record.len() != headers.len() {
-            bail!(
-                "CSV error: found record with {} fields, but the header has {} fields",
-                record.len(),
-                headers.len()
-            );
-        }
-        for (col_idx, field) in record.into_iter().enumerate() {
-            let trimmed = field.trim();
-            if !(trimmed.is_empty() || is_missing_sentinel(trimmed)) {
-                col_values[col_idx].push(field);
-            }
-        }
-        total += 1;
-    }
-
     let mut columns = Vec::new();
-    for (name, non_null) in headers.into_iter().zip(col_values) {
+    for (name, non_null) in acc.headers.into_iter().zip(acc.col_values) {
         let current_type = if non_null.is_empty() {
             "String".to_string()
         } else {
@@ -4883,7 +5089,7 @@ fn columns_from_csv(
             name,
             current_type,
             raw_values: non_null,
-            total,
+            total: acc.total,
             skip_heuristics: false,
         });
     }
@@ -50342,6 +50548,122 @@ mod tests {
             records,
             vec![vec!["id", "note"], vec!["1", "never closed\n2,plain\n"]]
         );
+    }
+
+    /// Feeds `content` through `csv_feed_chunk` split at every possible
+    /// boundary spaced `chunk_size` chars apart, resuming across calls
+    /// with the same `state`/`field`/`record` exactly the way
+    /// `columns_from_csv`'s own streaming reader does - proving the
+    /// engine that backs both `parse_csv` (one giant "chunk") and real
+    /// file streaming (many small ones) produces byte-identical output
+    /// regardless of how the same bytes happen to be sliced.
+    fn parse_csv_via_tiny_chunks(
+        content: &str,
+        delimiter: u8,
+        chunk_size: usize,
+    ) -> Vec<Vec<String>> {
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+        let delimiter = delimiter as char;
+        let mut state = CsvState::StartRecord;
+        let mut field = String::new();
+        let mut record: Vec<String> = Vec::new();
+        let mut records: Vec<Vec<String>> = Vec::new();
+
+        // Splitting at a fixed *char* count (not byte count) guarantees
+        // every chunk this test hands to csv_feed_chunk is itself valid
+        // UTF-8, matching the real guarantee stream_utf8_chunks makes to
+        // its own callers - this test is deliberately only exercising
+        // csv_feed_chunk's own field/record-spans-a-chunk-boundary logic,
+        // not stream_utf8_chunks' separate multi-byte-splitting logic
+        // (covered by its own dedicated test below).
+        let chars: Vec<char> = content.chars().collect();
+        for piece in chars.chunks(chunk_size.max(1)) {
+            let chunk: String = piece.iter().collect();
+            csv_feed_chunk(
+                &chunk,
+                delimiter,
+                &mut state,
+                &mut field,
+                &mut record,
+                &mut |r| {
+                    records.push(r);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        if state != CsvState::StartRecord {
+            record.push(field);
+            records.push(record);
+        }
+        records
+    }
+
+    #[test]
+    fn csv_feed_chunk_is_boundary_position_independent() {
+        // A representative mix of everything parse_csv's own dedicated
+        // tests already prove for the whole-buffer case: quoted fields
+        // with embedded newlines and commas, content after a closing
+        // quote, CRLF/bare-CR/bare-LF terminators, consecutive blank
+        // lines, an unterminated quote, and multi-byte UTF-8 content -
+        // chosen so at least one chunk boundary is guaranteed to land
+        // mid-field, mid-quoted-value, and mid-multi-byte-character
+        // across the various chunk sizes tried below.
+        let content = "id,name,note\n\
+             1,café,\"line one\nline two, still one field\"\n\
+             2,日本語,\"abc\"def\n\
+             \r\n\
+             3,plain,\r\n\
+             4,emoji🔥,\"never closed\n";
+        let expected = parse_csv(content, b',');
+        for chunk_size in [1usize, 2, 3, 5, 7, 11, 17, 64, 10_000] {
+            let got = parse_csv_via_tiny_chunks(content, b',', chunk_size);
+            assert_eq!(
+                got, expected,
+                "mismatch at chunk_size={chunk_size} (chars, not bytes)"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_utf8_chunks_never_splits_a_multi_byte_character_across_a_read() {
+        // café/日本語/emoji together cover 2-, 3-, and 4-byte UTF-8
+        // sequences - a tiny 3-byte read buffer all but guarantees at
+        // least one of them gets split across two raw reads, which is
+        // exactly the case `stream_utf8_chunks_with_size` has to carry
+        // over correctly rather than handing a caller a broken `&str`.
+        let content = "café,日本語,emoji🔥,plain\nend";
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "sniff-rs-test-stream-utf8-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, content).unwrap();
+
+        let mut reassembled = String::new();
+        stream_utf8_chunks_with_size(&path, 3, |chunk| {
+            reassembled.push_str(chunk);
+            Ok(true)
+        })
+        .unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(reassembled, content);
+    }
+
+    #[test]
+    fn stream_utf8_chunks_rejects_genuinely_invalid_utf8() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "sniff-rs-test-stream-utf8-invalid-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [b'a', b'b', 0xFF, 0xFE, b'c']).unwrap();
+
+        let result = stream_utf8_chunks_with_size(&path, 3, |_| Ok(true));
+        std::fs::remove_file(&path).ok();
+
+        assert!(result.is_err());
     }
 
     // days_from_civil/civil_from_days (Howard Hinnant's civil-calendar

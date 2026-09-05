@@ -3683,6 +3683,120 @@ clippy/fmt clean throughout, and byte-identical output confirmed via
 `.ods`/`.xls`/`.xlsb`/`.npz` fixture plus both synthetic `.npz` stress
 files.
 
+## Streaming reads / memory footprint
+
+A deliberate, ongoing effort - prompted directly by the user, who wants
+this tool to scale to arbitrarily large files while keeping type
+detection genuinely exhaustive (every non-null value in a column, never
+a sample) - to stop loading whole files into memory before profiling
+them. Checked before assuming anything about the current state: every
+one of this project's 25 format-reader modules calls `fs::read`/
+`fs::read_to_string` - the *entire* file - before parsing a single byte,
+confirmed by grepping for those calls directly rather than trusted from
+memory. A compressed file pays for this twice over: `decompress_if_needed`
+fully decompresses gzip/zstd into one in-memory buffer, writes *that
+whole buffer* to a temp file, and the downstream reader then reads the
+temp file fully into memory again. `--nrows` doesn't reduce memory
+today either - it truncates *after* the whole file is already read and
+parsed, not before.
+
+**The real constraint, made explicit before any code changed**: even
+with a fully-streamed file read, peak memory can't drop below "one copy
+of every non-null value per column," because non-sampled typing
+genuinely needs to see the whole column - `suggest_ideal_type` takes the
+complete `&[&str]` slice, confirmed directly (nothing truncates
+`raw_values`/`non_null` before that call except an explicit,
+user-requested `--nrows`). This splits the problem into two genuinely
+different, separately-scoped wins:
+
+1. **Stop double-buffering** - never hold the raw file text *and* the
+   fully-parsed columnar structure in memory at the same time. This is
+   what's been done so far (CSV/TSV below); it's safe, doesn't touch any
+   type-detection logic, and is a real, measured reduction, not a
+   symbolic one.
+2. **Make `suggest_ideal_type` itself incremental** - a running
+   accumulator instead of a stored slice - which is what would actually
+   get peak memory *below* one-column's-worth of data. Genuinely
+   achievable in principle (almost every check in that function is
+   already `.all()`/count-shaped, which streams naturally; category
+   detection's unique-value tracking and sample-value collection are
+   already bounded to ~51 entries and `n_samples` respectively, not
+   unbounded) - but `suggest_ideal_type` is the single most heavily
+   tested, adversarially-fuzzed, real-world-corpus-validated function in
+   this entire codebase (see the design-philosophy section above), so
+   rewriting its internals is deliberately treated as a separate, later,
+   higher-scrutiny phase rather than bundled into the read-streaming work.
+
+**CSV/TSV (`columns_from_csv`) is the first format converted**, chosen
+for being always-compiled (no `--features` needed) and the shape most
+likely to actually be huge in practice. The old `fs::read_to_string` +
+`parse_csv` pipeline is replaced by three pieces:
+
+- `stream_utf8_chunks` - reads a file in fixed `STREAM_CHUNK_SIZE`
+  (256 KiB) pieces via a plain `File`, never materializing the whole
+  file. A raw byte read can, and routinely will, land mid-character; any
+  incomplete trailing UTF-8 sequence is carried over and prepended to
+  the *next* read rather than ever handed to a caller, using
+  `Utf8Error::valid_up_to()`/`error_len()` to tell "just need more
+  bytes" apart from "this is genuinely invalid UTF-8" - the same
+  distinction that API's own documented contract exists to support. A
+  caller's callback returns `Ok(false)` to stop reading early without
+  touching the rest of the file - what makes `--nrows` bound real disk
+  I/O now, not just how many rows end up profiled afterward, confirmed
+  directly: a file with deliberately invalid UTF-8 bytes appended far
+  past the `--nrows` cutoff succeeds cleanly with `--nrows`, and fails
+  with an actionable error without it, on the identical file.
+- `csv_feed_chunk` - `parse_csv`'s own state machine (already verified
+  directly against `csv-core`'s `transition_nfa`, see the Dependency
+  footprint section), extracted so the *exact* same logic can drive
+  either a single whole-buffer call (`parse_csv` itself, feeding all
+  content as one "chunk" - a pure refactor, byte-identical output,
+  confirmed by every existing `parse_csv` test passing unchanged) or a
+  real chunked file stream. `state`/`field`/`record` are threaded in and
+  mutated in place specifically so a field, or an in-progress quoted
+  value, can resume correctly across a chunk boundary - the same way it
+  already could across an internal line boundary within one buffer.
+  Verified with a dedicated boundary-position-independence test: a
+  string exercising quoted fields with embedded newlines, content after
+  a closing quote, CRLF/bare-CR/bare-LF terminators, an unterminated
+  quote, and multi-byte UTF-8 content is fed through at chunk sizes of
+  1, 2, 3, 5, 7, 11, 17, 64, and 10,000 *characters* - proving the result
+  is identical to `parse_csv`'s own whole-buffer output regardless of
+  exactly where a boundary happens to fall, including deliberately
+  mid-field and mid-quoted-value.
+- `CsvColumnAccumulator` - folds each record straight into per-column
+  storage as `csv_feed_chunk` recognizes it, replacing the old
+  `records.split_off`-based two-pass split into header/data rows with an
+  index-based one (`record_index < skip_rows` / `== skip_rows` / `>
+  skip_rows`) that works incrementally as records arrive one at a time
+  instead of all at once.
+
+**Measured, not assumed**: a real 2,000,000-row, 155 MB synthetic CSV
+(5 columns - int, string, email, float, free text) through the old and
+new binaries side by side. Peak RSS (`/usr/bin/time -l`): **1,196 MB
+old, 693 MB new - a ~42% reduction** - and slightly faster too (1.98s
+real time old, 1.59s new, likely from no longer paying for a full extra
+allocation-and-copy of the raw file text), with output confirmed
+byte-identical via `diff`. Full test suite (345 unit + 233 integration
+on `--features full`, 211 + 83 on the default build) passing unchanged,
+fmt/clippy clean.
+
+**Deliberately not done yet, in order of likely next steps**: fixed-width
+text and JSON Lines (both naturally single-forward-pass streamable, the
+same shape as CSV); the gzip/zstd compression layer (fixing the
+double-buffering finding above would benefit every compressed format at
+once, independent of which inner format it wraps); every other
+naturally-streamable or header-then-sequential-rows format (MessagePack/
+CBOR, weblog, syslog, Avro, dBase, Stata, SAS7BDAT, SPSS, NumPy); and,
+hardest and last, the formats that need the *tail* of the file before
+the body means anything at all (Parquet, Arrow IPC, ORC, SQLite, every
+ZIP-based format) - true streaming there means `Seek`-based random
+access replacing a single in-memory buffer throughout each decoder, a
+materially larger rewrite per format than anything done so far. The
+`suggest_ideal_type` incremental-accumulator rewrite (the deeper win
+described above) remains entirely unstarted, tracked as its own future
+phase.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

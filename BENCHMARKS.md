@@ -33,6 +33,42 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-csv-reader` branch (Darwin arm64)
+
+CSV/TSV converted from `fs::read_to_string` + whole-buffer `parse_csv`
+to a genuinely streaming reader (`stream_utf8_chunks` + `csv_feed_chunk`
++ `CsvColumnAccumulator`) - see CLAUDE.md's new "Streaming reads / memory
+footprint" section for the full writeup. This entry is memory-focused,
+not purely CPU-time-focused like every other entry in this log, so it
+carries an ad-hoc real-file measurement alongside the usual Criterion
+numbers.
+
+**Ad-hoc, real file** (2,000,000 rows, 155 MB, 5 columns - int/string/
+email/float/free-text - old and new binaries built from the same
+working tree, run back-to-back via `/usr/bin/time -l`):
+
+| | Peak RSS | Real time |
+|---|---|---|
+| Old (`fs::read_to_string`) | 1,196 MB | 1.98s |
+| New (streaming) | 693 MB | 1.59s |
+| Change | **-42%** | **-20%** |
+
+Output confirmed byte-identical via `diff`.
+
+**`end_to_end/csv`** (Criterion point estimate, vs. this same machine's
+prior snapshot):
+
+| Rows | Time | Change |
+|---|---|---|
+| 100 | 1.42 ms | -9.6% |
+| 10,000 | 9.97 ms | -11.8% |
+| 200,000 | 165.9 ms | -15.7% |
+
+The win growing with row count is expected - the eliminated raw-text
+buffer's own size (and the allocation/copy cost of building it) scales
+with the file, while the rest of the pipeline's per-row cost doesn't
+change at all.
+
 ## 2026-09-02 — `perf/orc-quadratic-and-lz-backcopy` @ `8ecd1ba` (Darwin arm64, Apple M4)
 
 An 18-commit branch pass. The theme is quadratic and redundant-work
