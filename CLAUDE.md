@@ -5208,21 +5208,55 @@ mismatches. Full test suite unchanged (all four
 no-dense-grid test, hidden/empty sheets, multi-sheet dates), clippy/fmt
 clean across default/`xlsx`/`full`, established baselines.
 
+**A top-level JSON array (`[ ... ]`) went next** - the largest remaining
+JSON shape that was still fully materialized. `json_support` gained
+`from_str_top_array_each`: it parses `[`, then one element at a time via
+the same `Parser::parse_value` the whole-document path uses, handing
+each `Value` to a callback and freeing it before the next - the same
+grammar and the same trailing-content rule as `from_str`, just yielding
+instead of collecting into a `Vec<Value>`. `columns_from_json` routes
+the array shape (first non-blank line starts with `[`) through it into a
+`JsonRecordStreamProfiler`, byte-identical to the old "parse the whole
+array into a `Vec<Value>`, `truncate` to `--nrows`, then the all-object-
+records vs. single-`value`-column branch". Every element is still parsed
+(a malformed one still errors) even past `--nrows`, which only bounds
+what's pushed. `read_json_values` (which had handled the array and
+single-document shapes) shrank to `read_json_single_document` -
+`columns_from_json` now dispatches all three shapes itself.
+
+Measured on a real 144 MB, 1,000,000-element JSON array (id/email/
+amount/a 3-element array/a 1-field nested object/bool): maxRSS
+1.35-1.68 GB -> ~299-357 MB (~78-82%), peak footprint ~1.6-1.67 GB ->
+~289-348 MB (~83%), 3 rounds. Smaller than the ~99% the record-stream
+formats got, and honestly so: this parser is `&str`-based, so the whole
+file's text stays resident (`fs::read_to_string`) - that ~290-350 MB
+residual *is* the file copy, and going below it would need the
+streaming-parser rewrite described next. Output byte-identical via `diff`
+against the pre-change binary across the entire 359-file fixture corpus
+in all three output formats with `--nrows` unset/1/2 (3,231
+combinations), plus a 400-iteration fuzz over array shapes (all-object /
+mixed / scalar / nested, with nulls) crossed with `--nrows`/`--samples`/
+output format - zero mismatches. Full test suite unchanged (two unit
+tests renamed/moved to assert through `columns_from_json` since
+`read_json_values` no longer exists), clippy/fmt clean across
+default/`full`, established baselines.
+
 **Deliberately not done yet**: `.ods`/`.xls`/`.xlsb` still build a
-`SheetGrid` (a smaller concern - see above), and the remaining
-`profile_json_records`-based readers still materialize their whole
-record set (TOML, YAML, XML, Parquet/Arrow's nested columns, and JSON's
-own top-level-array and single-multi-line-document shapes). A YAML
-`---`-multi-document stream is genuinely streamable (one document at a
-time); the rest are inherently whole-buffer - a single TOML/YAML/JSON
-document, a top-level JSON array, or an XML tree is one value with no
-record boundary to stream on, and their hand-rolled parsers are all
-`&str`-buffer parsers with no pull mode, so getting them below one file
-copy would need a from-scratch streaming-parser rewrite of exactly the
-most carefully-verified code, for shapes rarely large enough to matter -
-disproportionate, and out of scope. Per-entry streaming decompression
-inside `ZipArchive::read` itself remains a real, disclosed,
-separately-scoped remaining gap, not folded into any phase here.
+`SheetGrid` (a smaller concern - their inputs are already fully
+resident). A YAML `---`-multi-document stream is genuinely streamable
+(one document at a time) and still wants doing. Everything else left is
+**inherently whole-buffer**: a single TOML/YAML/JSON document, or an XML
+tree, is one value with no record boundary to stream on, and every
+hand-rolled parser here (`json_support`, `toml_support`, `yaml_support`,
+`xml_support`) is an `&str`-buffer parser with no pull mode over a
+`Read` - so even the streamable-in-principle cases (top-level JSON array
+above included) can't drop below one resident file copy without a
+from-scratch streaming-parser rewrite of exactly the most carefully-
+verified code in the project, for shapes that are rarely large enough to
+matter. That's disproportionate and out of scope. Per-entry streaming
+decompression inside `ZipArchive::read` (which would also shave the
+residual off the OOXML and JSON-array numbers above) remains a real,
+disclosed, separately-scoped remaining gap.
 
 ## Cloud-platform file compatibility
 

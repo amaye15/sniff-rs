@@ -1480,6 +1480,54 @@ mod json_support {
         Ok(value)
     }
 
+    /// Streams the elements of a top-level JSON array (`[ ... ]`) one at a
+    /// time via `on_element`, without ever collecting them into a
+    /// `Vec<Value>`. The input string itself is still fully resident (this
+    /// is an `&str` parser with no pull mode over a `Read`), but each
+    /// element's own `Value` tree is freed as soon as `on_element`
+    /// returns - so a huge array of records never holds them all at once.
+    /// Requires the input to be exactly one top-level array, aside from
+    /// leading/trailing whitespace (the same trailing-content rule
+    /// `from_str` enforces); every element is parsed (so a malformed one
+    /// still errors) even if `on_element` chooses to ignore it.
+    pub(crate) fn from_str_top_array_each(
+        s: &str,
+        mut on_element: impl FnMut(Value) -> std::result::Result<(), ParseError>,
+    ) -> std::result::Result<(), ParseError> {
+        let mut parser = Parser::new(s);
+        parser.skip_whitespace();
+        if parser.peek() != Some(b'[') {
+            return Err(parser.error("expected a top-level JSON array"));
+        }
+        parser.enter()?;
+        parser.pos += 1; // consume '['
+        parser.skip_whitespace();
+        if parser.peek() == Some(b']') {
+            parser.pos += 1;
+            parser.depth -= 1;
+        } else {
+            loop {
+                let value = parser.parse_value()?;
+                on_element(value)?;
+                parser.skip_whitespace();
+                match parser.peek() {
+                    Some(b',') => parser.pos += 1,
+                    Some(b']') => {
+                        parser.pos += 1;
+                        parser.depth -= 1;
+                        break;
+                    }
+                    _ => return Err(parser.error("expected ',' or ']' in array")),
+                }
+            }
+        }
+        parser.skip_whitespace();
+        if parser.pos != parser.bytes.len() {
+            return Err(parser.error("trailing characters after a complete JSON value"));
+        }
+        Ok(())
+    }
+
     // Only called from feature-gated readers (Avro's schema bytes, and
     // several oracle tests) - unused in a plain default build.
     #[allow(dead_code)]
@@ -12807,51 +12855,23 @@ fn first_non_blank_line(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Reads either a top-level JSON array or a single JSON document (object
-/// or scalar, possibly pretty-printed across multiple lines) into one
-/// materialized value list. JSON Lines - the one streamable shape, and
-/// the one most likely to be huge in practice - is handled separately by
-/// `columns_from_json`/`profile_json_lines_streaming` before this is ever
-/// called, so this only ever sees the two whole-buffer cases: the
-/// hand-rolled parser has no incremental/pull mode for extracting array
-/// elements one at a time, so a top-level array or a genuinely multi-line
-/// single document both still need the whole thing parsed as one nested
-/// value - a disclosed, harder-scoped gap, see CLAUDE.md's Streaming
-/// reads section. `nrows` is applied by the caller (`values.truncate`).
-///
-/// A value is *not* required to be an object here - a top-level array of
-/// bare scalars (`[1, 2, 3]`) is a real, common shape with no natural
-/// field names but still a genuine single column, same as a headerless
-/// CSV or NumPy's plain 1D array elsewhere in this file.
-fn read_json_values(path: &Path, _nrows: Option<usize>) -> Result<Vec<JsonValue>> {
-    let Some(first_line) = first_non_blank_line(path)? else {
+/// Reads a single JSON document (object or scalar, possibly pretty-
+/// printed across multiple lines) into a one-element value list. The two
+/// streamable shapes are handled by `columns_from_json` before this is
+/// ever reached: JSON Lines via `profile_json_lines_streaming`, and a
+/// top-level array via `json_support::from_str_top_array_each`. A single
+/// multi-line document genuinely can't stream - the hand-rolled parser
+/// has no pull mode and there's no record boundary to stop on - so it
+/// stays a whole-buffer read, a disclosed gap (see CLAUDE.md's Streaming
+/// reads section).
+fn read_json_single_document(path: &Path) -> Result<Vec<JsonValue>> {
+    let Some(_first_line) = first_non_blank_line(path)? else {
         // The file is empty or entirely whitespace - no JSON content at
         // all, which every reader downstream of this treats as zero
         // records rather than an error, matching every other lenient
         // format's own "genuinely empty input -> an empty table" choice.
         return Ok(Vec::new());
     };
-
-    if first_line.trim_start().starts_with('[') {
-        // The hand-rolled parser only ever returns a single top-level
-        // `Value`, never a generically-`Deserialize`d `Vec<T>` the way
-        // `serde`'s blanket `Vec<T>` impl let the old `serde_json`-based
-        // version do directly - unwrap the top-level array by hand
-        // instead.
-        let content =
-            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        return match json_support::from_str(&content) {
-            Ok(JsonValue::Array(items)) => Ok(items),
-            Ok(_) => unreachable!("content starts with '[' so a successful parse must be an array"),
-            Err(e) => Err(e).with_context(|| format!("failed to parse {path:?} as a JSON array")),
-        };
-    }
-
-    // Not an array, and `columns_from_json` already ruled out JSON Lines
-    // (the first line doesn't parse whole on its own) - so this is a
-    // single, possibly multi-line (pretty-printed) document, the same
-    // "whole document = one record" choice TOML and YAML's single-mapping
-    // mode already make for their own single-document shapes.
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
     json_support::from_str(&content)
         .map(|v| vec![v])
@@ -13270,26 +13290,41 @@ fn columns_from_json(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    // JSON Lines is the one streamable shape (each line an independent,
-    // self-contained value) - detected exactly as `read_json_values` does
-    // (first non-blank line doesn't start with '[' and parses whole on its
-    // own), and handled without ever materializing the record set. A
-    // top-level array or a single multi-line document both still need the
-    // whole thing parsed as one nested value (the hand-rolled parser has
-    // no pull mode), so they stay a whole-buffer read - a disclosed,
-    // harder-scoped gap, see CLAUDE.md's "Streaming reads" section.
-    if let Some(first_line) = first_non_blank_line(path)?
-        && !first_line.trim_start().starts_with('[')
-        && json_support::from_str(&first_line).is_ok()
-    {
+    let Some(first_line) = first_non_blank_line(path)? else {
+        // Empty/whitespace-only file - zero records, matching every other
+        // lenient format's "genuinely empty input -> an empty table".
+        return Ok(Vec::new());
+    };
+
+    // Top-level array: stream its elements one at a time over the
+    // (resident) file text via `from_str_top_array_each`, folding each
+    // straight into a `JsonRecordStreamProfiler` - byte-identical to the
+    // old "parse the whole `[...]` into a `Vec<Value>`, `truncate`, then
+    // dual-mode branch". Every element is still parsed (a malformed one
+    // still errors) even past `--nrows`, which only bounds what's pushed.
+    if first_line.trim_start().starts_with('[') {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        json_support::from_str_top_array_each(&content, |v| {
+            if nrows.is_none_or(|n| profiler.total < n) {
+                profiler.push(&v);
+            }
+            Ok(())
+        })
+        .with_context(|| format!("failed to parse {path:?} as a JSON array"))?;
+        return Ok(profiler.finish());
+    }
+
+    // JSON Lines: each line an independent, self-contained value (the
+    // first line parses whole on its own) - streamed record-by-record.
+    if json_support::from_str(&first_line).is_ok() {
         return profile_json_lines_streaming(path, nrows, n_samples);
     }
 
-    let mut values = read_json_values(path, nrows)?;
-    // Still a backstop: the top-level-array and single-document paths
-    // always read the whole document regardless (see read_json_values'
-    // own doc comment for why), so this remains the only thing bounding
-    // *their* output to nrows.
+    // A single, possibly multi-line (pretty-printed) document - genuinely
+    // whole-buffer (no record boundary, no pull-mode parser).
+    let mut values = read_json_single_document(path)?;
     if let Some(n) = nrows {
         values.truncate(n);
     }
@@ -13304,14 +13339,6 @@ fn columns_from_json(
             .collect();
         Ok(profile_json_records(&records, n_samples))
     } else {
-        // Not every top-level value/line is an object, so there's no
-        // field-name-per-column shape to extract - but the values
-        // themselves (scalars, or a scalar/object mix) are still a real
-        // single column, profiled by the same recursive engine a nested
-        // array-of-scalars sub-column already goes through. profile_json_path
-        // expects nulls pre-filtered from `values` (its own recursive call
-        // site does the same) - unwrap_arrays only drops nulls it finds
-        // *inside* a nested array, not from this top-level list itself.
         let total = values.len();
         let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
         Ok(profile_json_path(
@@ -53388,14 +53415,14 @@ mod tests {
     fn read_values(json_text: &str) -> Vec<JsonValue> {
         let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, json_text.as_bytes()).unwrap();
-        read_json_values(tmp.path(), None).unwrap()
+        read_json_single_document(tmp.path()).unwrap()
     }
 
     #[test]
-    fn read_json_values_accepts_a_pretty_printed_single_object() {
+    fn read_json_single_document_accepts_a_pretty_printed_single_object() {
         // Previously misdetected as JSON Lines mode (content doesn't
-        // start with '[') and then failed line-by-line, since "{" alone
-        // isn't valid JSON on its own line.
+        // start with '{' on a parseable line) and then failed line-by-
+        // line, since "{" alone isn't valid JSON on its own line.
         let values = read_values("{\n  \"a\": \"b\"\n}");
         assert_eq!(values, vec![json!({"a": "b"})]);
     }
@@ -53418,17 +53445,22 @@ mod tests {
     }
 
     #[test]
-    fn read_json_values_accepts_a_top_level_array_of_scalars() {
-        let values = read_values("[1, 2, 3]");
-        assert_eq!(values, vec![json!(1), json!(2), json!(3)]);
+    fn columns_from_json_accepts_a_top_level_array_of_scalars() {
+        // Streamed element-by-element via from_str_top_array_each; a bare
+        // scalar array has no field names but is still one real column.
+        let mut tmp = TempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"[1, 2, 3]").unwrap();
+        let cols = columns_from_json(tmp.path(), None, 3).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "value");
+        assert_eq!(cols[0].ideal_type, "i64");
+        assert_eq!(cols[0].row_count, 3);
     }
 
     #[test]
-    fn read_json_values_on_an_empty_file_falls_through_to_zero_records() {
-        // Neither the array branch (doesn't start with '[') nor the
-        // single-document parse (empty string isn't valid JSON) can
-        // claim this - it must still land on the existing, tested "empty
-        // file -> zero records" contract rather than erroring.
+    fn read_json_single_document_on_an_empty_file_falls_through_to_zero_records() {
+        // An empty string isn't valid JSON, but must still land on the
+        // "empty file -> zero records" contract rather than erroring.
         assert_eq!(read_values(""), Vec::<JsonValue>::new());
     }
 

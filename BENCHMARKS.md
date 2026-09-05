@@ -33,6 +33,27 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/streaming-json-array` branch (Darwin arm64)
+
+Top-level JSON array (`[ ... ]`) streamed. `json_support::from_str_top_array_each`
+parses `[` then one element at a time via the same `Parser::parse_value`,
+handing each `Value` to a callback and freeing it before the next -
+same grammar/trailing-content rule as `from_str`, no `Vec<Value>`.
+`columns_from_json` routes the array shape through it into a
+`JsonRecordStreamProfiler`; every element still parsed past `--nrows` (a
+malformed one still errors), `--nrows` only bounds what's pushed.
+`read_json_values` -> `read_json_single_document`.
+
+Measured on a real 144 MB, 1,000,000-element JSON array: maxRSS
+1.35-1.68 GB -> ~299-357 MB (~78-82%), peak footprint ~1.6-1.67 GB ->
+~289-348 MB (~83%), 3 rounds. Not ~99% by design - the parser is
+`&str`-based so the file text stays resident; that residual *is* the
+file copy. Byte-identical output across the full corpus in all three
+formats with `--nrows` unset/1/2 (3,231 combinations) plus a
+400-iteration array-shape fuzz.
+
+---
+
 ## 2026-09-06 — `feat/incremental-xlsx` branch (Darwin arm64)
 
 Excel converted. All four spreadsheet readers: `SheetGrid::into_column_inputs`
