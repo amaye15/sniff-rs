@@ -12366,26 +12366,74 @@ fn unwrap_arrays(values: Vec<&JsonValue>) -> (Vec<&JsonValue>, bool) {
     (pool, saw_array)
 }
 
+/// Reads lines from `path` until the first one with real (non-whitespace)
+/// content is found, returned verbatim (not trimmed) - or `None` if the
+/// file is empty or entirely whitespace. Reads at most a handful of
+/// lines in the overwhelmingly common case (a real file essentially never
+/// has leading blank lines before its own content starts), so this stays
+/// a small, bounded read regardless of the file's own total size - the
+/// same "peek, don't buffer the whole thing" shape `detect_preamble_rows`
+/// already uses for CSV.
+fn first_non_blank_line(path: &Path) -> Result<Option<String>> {
+    use std::io::BufRead;
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("failed to read {path:?}"))?;
+        if !line.trim().is_empty() {
+            return Ok(Some(line));
+        }
+    }
+    Ok(None)
+}
+
 /// Reads either a top-level JSON array, a single JSON document (object or
 /// scalar, possibly pretty-printed across multiple lines), or JSON Lines
-/// (one value per non-empty line) - detected by whether the trimmed
-/// content starts with '[', then by whether the *whole* content parses as
-/// one value. Every element/line must itself be valid JSON, but is *not*
-/// required to be an object here - a top-level array or JSON Lines stream
-/// of bare scalars (`[1, 2, 3]`, or one ID per line) is a real, common
-/// shape with no natural field names but still a genuine single column,
-/// same as a headerless CSV or NumPy's plain 1D array elsewhere in this
-/// file - columns_from_json decides what to do with the result.
-fn read_json_values(path: &Path) -> Result<Vec<JsonValue>> {
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let trimmed = content.trim_start();
+/// (one value per non-empty line) - detected by whether the first
+/// non-blank line starts with '[', then by whether *that line alone*
+/// parses as a complete JSON value. Every element/line must itself be
+/// valid JSON, but is *not* required to be an object here - a top-level
+/// array or JSON Lines stream of bare scalars (`[1, 2, 3]`, or one ID per
+/// line) is a real, common shape with no natural field names but still a
+/// genuine single column, same as a headerless CSV or NumPy's plain 1D
+/// array elsewhere in this file - columns_from_json decides what to do
+/// with the result.
+///
+/// Checking only the first line, rather than the whole file, is a sound
+/// substitute for the old "does the *whole* content parse as one value"
+/// check, not just a convenient heuristic: JSON's own grammar means a
+/// value that parses completely can never be "continued" by further
+/// tokens after it, so whatever follows a first line that already parses
+/// as a complete value can only be more independent top-level values
+/// (i.e. this genuinely is JSON Lines) or invalid trailing content -
+/// exactly the case the old whole-document-first algorithm's own check
+/// would have failed on and fallen through to identical per-line parsing
+/// for anyway. This lets a genuine JSON Lines file - the shape most
+/// likely to actually be huge in practice - stream a line at a time via
+/// `stream_json_lines` below, never materializing the raw file text as
+/// one buffer; a top-level array or a genuinely multi-line single
+/// document both still need the whole thing parsed as one nested value
+/// regardless (the hand-rolled parser has no incremental/pull mode for
+/// extracting array elements one at a time), so those two shapes are
+/// deliberately left as a whole-buffer read - see CLAUDE.md's Streaming
+/// reads section for why that's a disclosed, harder-scoped gap rather
+/// than an oversight.
+fn read_json_values(path: &Path, nrows: Option<usize>) -> Result<Vec<JsonValue>> {
+    let Some(first_line) = first_non_blank_line(path)? else {
+        // The file is empty or entirely whitespace - no JSON content at
+        // all, which every reader downstream of this treats as zero
+        // records rather than an error, matching every other lenient
+        // format's own "genuinely empty input -> an empty table" choice.
+        return Ok(Vec::new());
+    };
 
-    if trimmed.starts_with('[') {
+    if first_line.trim_start().starts_with('[') {
         // The hand-rolled parser only ever returns a single top-level
         // `Value`, never a generically-`Deserialize`d `Vec<T>` the way
         // `serde`'s blanket `Vec<T>` impl let the old `serde_json`-based
         // version do directly - unwrap the top-level array by hand
         // instead.
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
         return match json_support::from_str(&content) {
             Ok(JsonValue::Array(items)) => Ok(items),
             Ok(_) => unreachable!("content starts with '[' so a successful parse must be an array"),
@@ -12393,29 +12441,47 @@ fn read_json_values(path: &Path) -> Result<Vec<JsonValue>> {
         };
     }
 
-    // A single JSON document - most commonly a pretty-printed object, the
-    // overwhelmingly common shape for a hand-authored or tool-saved
-    // config/response file - parses as exactly one value with nothing
-    // left over. Try that first, the same "whole document = one record"
-    // choice TOML and YAML's single-mapping mode already make for their
-    // own single-document shapes. A genuine multi-record JSON Lines
-    // stream fails this: the parser rejects trailing content after a
-    // complete value ("trailing characters", confirmed directly against
-    // real serde_json's own behavior rather than assumed), so it falls
-    // through to per-line parsing below exactly as before - this is a
-    // pure additive fallback, not a replacement for JSON Lines detection.
-    if let Ok(v) = json_support::from_str(&content) {
-        return Ok(vec![v]);
+    if json_support::from_str(&first_line).is_ok() {
+        return stream_json_lines(path, nrows);
     }
 
-    trimmed
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            json_support::from_str(line)
-                .with_context(|| format!("failed to parse a line of {path:?} as JSON"))
-        })
-        .collect()
+    // The first line alone isn't valid JSON by itself, so this can't be
+    // JSON Lines - the only remaining possibility is a single, possibly
+    // multi-line (pretty-printed) document, the same "whole document =
+    // one record" choice TOML and YAML's single-mapping mode already
+    // make for their own single-document shapes.
+    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    json_support::from_str(&content)
+        .map(|v| vec![v])
+        .with_context(|| format!("failed to parse {path:?} as JSON"))
+}
+
+/// Streams a genuine JSON Lines file a line at a time via
+/// `BufReader::lines()`, never materializing the raw file text as one
+/// buffer - `read_json_values` only ever calls this once it's already
+/// confirmed the first line alone parses as a complete value, so every
+/// remaining line is expected to be independently valid JSON too. `nrows`
+/// stops the read itself early (the `for` loop simply stops pulling from
+/// the underlying reader) rather than only truncating the result
+/// afterward, the same real-I/O-bound benefit CSV/fixed-width's own
+/// streaming readers already give `--nrows`.
+fn stream_json_lines(path: &Path, nrows: Option<usize>) -> Result<Vec<JsonValue>> {
+    use std::io::BufRead;
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut values = Vec::new();
+    for line in std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines() {
+        if nrows.is_some_and(|limit| values.len() >= limit) {
+            break;
+        }
+        let line = line.with_context(|| format!("failed to read {path:?}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = json_support::from_str(&line)
+            .with_context(|| format!("failed to parse a line of {path:?} as JSON"))?;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 /// Profiles one JSON "path". `total` is how many parent slots could have held
@@ -12670,7 +12736,12 @@ fn columns_from_json(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    let mut values = read_json_values(path)?;
+    let mut values = read_json_values(path, nrows)?;
+    // Still a backstop even though stream_json_lines' own early-stop
+    // already respects nrows: the top-level-array and single-document
+    // paths it doesn't cover always read the whole document regardless
+    // (see read_json_values' own doc comment for why), so this remains
+    // the only thing bounding *their* output to nrows.
     if let Some(n) = nrows {
         values.truncate(n);
     }
@@ -51621,7 +51692,7 @@ mod tests {
     fn read_values(json_text: &str) -> Vec<JsonValue> {
         let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, json_text.as_bytes()).unwrap();
-        read_json_values(tmp.path()).unwrap()
+        read_json_values(tmp.path(), None).unwrap()
     }
 
     #[test]

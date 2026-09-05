@@ -133,6 +133,43 @@ fn csv_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
 }
 
 #[test]
+fn jsonl_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
+    // Proves --nrows bounds real disk I/O for the streaming JSON Lines
+    // reader too (stream_json_lines), not just how many rows get
+    // profiled afterward. Unlike the CSV version, this needs no minimum
+    // file size - stream_json_lines validates one line at a time via
+    // BufRead::lines(), the same as the fixed-width reader, so there's
+    // no risk of the garbage landing in the same read-buffer chunk as
+    // row 0 regardless of how small the valid prefix is.
+    let dir = TempDir::new();
+    let path = dir.path().join("data.jsonl");
+    let mut content = String::new();
+    for i in 0..1000 {
+        content.push_str(&format!("{{\"id\": {i}, \"name\": \"user_{i}\"}}\n"));
+    }
+    let mut bytes = content.into_bytes();
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    bytes.extend_from_slice(b" garbage not valid utf8\n");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let with_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--nrows", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        with_nrows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_nrows.stderr)
+    );
+
+    let without_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!without_nrows.status.success());
+}
+
+#[test]
 fn json_schema_output_maps_types_and_nullability() {
     let doc = run_with_format("sample.csv", "json-schema", &[]);
     assert_eq!(doc["$schema"], "http://json-schema.org/draft-07/schema#");

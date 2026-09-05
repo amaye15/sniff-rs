@@ -33,6 +33,29 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-jsonl` branch (Darwin arm64)
+
+JSON Lines converted to line-at-a-time streaming (`read_json_values` +
+`stream_json_lines`) - see CLAUDE.md's "Streaming reads / memory
+footprint" section. The smallest win of the three formats streamed so
+far, since a parsed JSON `Value` tree already carries more structural
+overhead per record than CSV's/fixed-width's plain `String` cells,
+leaving less relative benefit from removing the raw-text double-buffer.
+
+**Ad-hoc, real file** (1,000,000 rows, 125 MB JSONL, 5 fields):
+
+| | Peak RSS | Real time |
+|---|---|---|
+| Old (`fs::read_to_string`) | 901 MB | 1.64s |
+| New (streaming) | 835 MB | 1.54s |
+| Change | **-7%** | ~flat |
+
+Output confirmed byte-identical via `diff`. No Criterion benchmark
+target currently covers JSON specifically enough to isolate this change
+from JSON's own per-record flattening cost, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-fixed-width` branch (Darwin arm64)
 
 Fixed-width text converted to `BufReader::lines()`-based streaming - see

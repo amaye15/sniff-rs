@@ -3806,23 +3806,66 @@ ever gets a chance to matter; the fixed-width version has no such
 constraint, since `BufRead::lines()` validates one line at a time
 regardless of its own internal buffer size.
 
-**Deliberately not done yet, in order of likely next steps**: JSON Lines
-(the same naturally single-forward-pass streamable shape as CSV/fixed-
-width - though a single top-level JSON array or pretty-printed object is
-a different problem, since the whole document is genuinely one nested
-value, not independent lines); the gzip/zstd compression layer (fixing
-the double-buffering finding above would benefit every compressed
-format at once, independent of which inner format it wraps); every
-other naturally-streamable or header-then-sequential-rows format
-(MessagePack/CBOR, weblog, syslog, Avro, dBase, Stata, SAS7BDAT, SPSS,
-NumPy); and, hardest and last, the formats that need the *tail* of the
-file before the body means anything at all (Parquet, Arrow IPC, ORC,
-SQLite, every ZIP-based format) - true streaming there means
-`Seek`-based random access replacing a single in-memory buffer
-throughout each decoder, a materially larger rewrite per format than
-anything done so far. The `suggest_ideal_type` incremental-accumulator
-rewrite (the deeper win described above) remains entirely unstarted,
-tracked as its own future
+**JSON Lines (`read_json_values`) went third**, and needed real care:
+unlike CSV/fixed-width, a `.json`/`.jsonl` file can be *three* genuinely
+different shapes (a top-level array, a single possibly-multi-line
+document, or true JSON Lines), and only the last one is actually
+streamable - the other two are one nested `Value` the hand-rolled parser
+has no incremental/pull mode for extracting piece by piece, so they
+stay a deliberate, disclosed whole-buffer read. The old detection order
+("does the *whole* content parse as one value, then fall back to
+per-line") is unavoidably whole-buffer by construction - it can't decide
+without having already read everything. The fix: check only whether the
+*first non-blank line* parses as a complete JSON value on its own. This
+is a sound substitute, not just a convenient heuristic - proven, not
+assumed: JSON's own grammar means a value that parses completely can
+never be "continued" by further tokens after it, so whatever follows a
+first line that already parses as one complete value can only be more
+independent top-level values (genuine JSON Lines) or invalid trailing
+content - exactly the case the old whole-document-first check would
+have failed on and fallen through to identical per-line parsing for
+anyway. `first_non_blank_line` peeks a bounded prefix (the same
+"peek, don't buffer the whole file" shape `detect_preamble_rows` already
+uses for CSV) to find that line; if it starts with `[`, or fails to
+parse alone, `read_json_values` falls back to the old whole-file read
+unchanged. Every existing edge case (a pretty-printed single object, a
+genuine multi-record stream, a top-level array of scalars, a fully
+empty file) still resolves identically - confirmed by the complete
+existing `read_json_values` test suite passing unchanged, not just
+reasoned through.
+
+`--nrows` gets the same real-I/O-bound benefit CSV/fixed-width's own
+readers already give it, but only for the genuinely streamable JSON
+Lines path (`stream_json_lines`) - the array/single-document paths still
+read the whole file regardless, so `columns_from_json`'s own post-hoc
+`.truncate()` stays in place as the backstop that bounds *their* output.
+
+Measured on a real 1,000,000-row, 125 MB JSONL file: peak RSS
+901 MB -> 835 MB (~7% - the smallest of the three formats streamed so
+far, since a parsed JSON `Value` tree already carries meaningfully more
+structural overhead per record than a `Vec<String>` row does, making the
+eliminated raw-text buffer a smaller share of total memory here), output
+confirmed byte-identical via `diff`. A new integration test locks in the
+`--nrows`-bounds-I/O behavior the same way as CSV/fixed-width's own -
+unlike CSV, this needs no minimum file size, since `stream_json_lines`
+validates one line at a time via `BufRead::lines()` (the same mechanism
+fixed-width's own reader uses), so there's no risk of trailing garbage
+landing in the same read-buffer chunk as row 0 regardless of how small
+the valid prefix is.
+
+**Deliberately not done yet, in order of likely next steps**: the
+gzip/zstd compression layer (fixing the double-buffering finding above
+would benefit every compressed format at once, independent of which
+inner format it wraps); every other naturally-streamable or
+header-then-sequential-rows format (MessagePack/CBOR, weblog, syslog,
+Avro, dBase, Stata, SAS7BDAT, SPSS, NumPy); and, hardest and last, the
+formats that need the *tail* of the file before the body means anything
+at all (Parquet, Arrow IPC, ORC, SQLite, every ZIP-based format) - true
+streaming there means `Seek`-based random access replacing a single
+in-memory buffer throughout each decoder, a materially larger rewrite
+per format than anything done so far. The `suggest_ideal_type`
+incremental-accumulator rewrite (the deeper win described above) remains
+entirely unstarted, tracked as its own future
 phase.
 
 ## Cloud-platform file compatibility
