@@ -33,6 +33,46 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-sqlite` branch (Darwin arm64)
+
+SQLite's own `page_slice` (indexing into a whole-file `data: &[u8]`
+buffer) replaced with `read_page` (a real `Seek`+`read_exact` of one
+page off a `fs::File`), and `collect_table_rows`/`profile_table`
+restructured to decode and fold each row into its column accumulators
+via a callback as the b-tree walk visits it, instead of collecting every
+row's raw payload into a `Vec` first. See CLAUDE.md's "Streaming reads /
+memory footprint" section for the full writeup - the first of the
+`Seek`-needing tier actually converted.
+
+Real file (107 MB, 2,000,000 rows, 4 columns, via Python's `sqlite3`),
+`/usr/bin/time -l`, 3 rounds each:
+
+Full table scan:
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 732-763 MB | 507-573 MB |
+| New | 636-650 MB | ~510 MB |
+| Change | **-13%** | roughly flat |
+
+Isolated via `--nrows 1` (now reads only the first few pages instead of
+the whole file):
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 109 MB | 108 MB |
+| New | 2.0 MB | 0.85 MB |
+| Change | **-98%** | **-99%** |
+
+Both confirmed byte-identical via `diff`. The complete existing SQLite
+test suite (overflow-page reassembly, table-level `PRIMARY KEY` rowid
+alias, `WITHOUT ROWID` disclosed placeholder, zero-row table, multi-
+table type-affinity violation, semantic-type recognition) passed
+unchanged with zero test modifications needed. No Criterion benchmark
+target currently isolates this reader, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-spss-npy` branch (Darwin arm64)
 
 An audit of the remaining "naturally streamable" formats found five

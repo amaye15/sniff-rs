@@ -43103,6 +43103,7 @@ fn describe_sql_kinds(counts: &SqlKindCounts) -> String {
 #[cfg(feature = "sqlite")]
 mod sqlite_support {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
 
     /// SQLite's own on-disk B-tree/record format, hand-decoded directly
     /// from the file bytes. `rusqlite` couldn't play the same "read the
@@ -43232,41 +43233,62 @@ mod sqlite_support {
         Ok((result, 9))
     }
 
-    fn page_slice<'a>(
-        data: &'a [u8],
+    /// Reads exactly one page fresh off disk via `Seek`, instead of
+    /// slicing into a whole-file buffer - the change that lets this
+    /// reader's own peak memory scale with page size rather than with
+    /// database size. A b-tree walk only ever needs one page (or, during
+    /// an overflow chain, one page plus whatever's already been
+    /// assembled for that single row) resident at a time regardless of
+    /// how large the table or file is - unlike a plain sequential
+    /// format, SQLite's own page-graph structure already makes random
+    /// access to individual pages the *natural* access pattern, not an
+    /// added complication a streaming rewrite has to invent from
+    /// scratch.
+    fn read_page(
+        file: &mut fs::File,
         page_num: u32,
         page_size: u32,
         path: &Path,
-    ) -> Result<&'a [u8]> {
+    ) -> Result<Vec<u8>> {
         if page_num == 0 {
             bail!("invalid SQLite page number 0 in {path:?}");
         }
-        let start = (page_num as usize - 1) * page_size as usize;
-        let end = start + page_size as usize;
-        data.get(start..end).with_context(|| {
+        let offset = (page_num as u64 - 1) * page_size as u64;
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed seeking to SQLite page {page_num} in {path:?}"))?;
+        let mut buf = vec![0u8; page_size as usize];
+        file.read_exact(&mut buf).with_context(|| {
             format!(
                 "SQLite page {page_num} is out of range in {path:?} (file truncated or corrupt)"
             )
-        })
+        })?;
+        Ok(buf)
     }
 
     /// Walks a table b-tree (rowid table only - an index b-tree page type
     /// here means the table uses WITHOUT ROWID storage, a disclosed,
-    /// unsupported shape) depth-first, appending every leaf row's
-    /// `(rowid, payload)` in ascending-rowid order - exactly the order an
-    /// index-free `SELECT *` returns rows in.
+    /// unsupported shape) depth-first, invoking `on_row` for every leaf
+    /// row's `(rowid, payload)` in ascending-rowid order - exactly the
+    /// order an index-free `SELECT *` returns rows in. Calling back per
+    /// row instead of collecting into a `Vec` first is what lets a full
+    /// table scan build its column accumulators incrementally, the same
+    /// "fold each record straight into per-column storage" shape
+    /// `CsvColumnAccumulator` already uses for CSV - the b-tree walk
+    /// itself never needs to hold more than one row's own decoded
+    /// payload at a time.
     #[allow(clippy::too_many_arguments)]
     fn collect_table_rows(
-        data: &[u8],
+        file: &mut fs::File,
         page_num: u32,
         page_size: u32,
         usable_size: u32,
         path: &Path,
         depth: u32,
         limit: Option<usize>,
-        out: &mut Vec<(i64, Vec<u8>)>,
+        count: &mut usize,
+        on_row: &mut dyn FnMut(i64, Vec<u8>) -> Result<()>,
     ) -> Result<()> {
-        if limit.is_some_and(|n| out.len() >= n) {
+        if limit.is_some_and(|n| *count >= n) {
             return Ok(());
         }
         if depth > MAX_BTREE_DEPTH {
@@ -43274,7 +43296,7 @@ mod sqlite_support {
                 "SQLite b-tree in {path:?} is nested past {MAX_BTREE_DEPTH} levels (likely a corrupt page-number cycle)"
             );
         }
-        let page = page_slice(data, page_num, page_size, path)?;
+        let page = read_page(file, page_num, page_size, path)?;
         let hdr_off = if page_num == 1 { 100 } else { 0 };
         let page_type = *page.get(hdr_off).context("truncated SQLite page header")?;
         let num_cells = u16::from_be_bytes([
@@ -43297,7 +43319,7 @@ mod sqlite_support {
         };
         let cell_ptr_base = hdr_off + header_len;
         for i in 0..num_cells {
-            if limit.is_some_and(|n| out.len() >= n) {
+            if limit.is_some_and(|n| *count >= n) {
                 return Ok(());
             }
             let ptr_off = cell_ptr_base + i * 2;
@@ -43317,22 +43339,24 @@ mod sqlite_support {
                         .unwrap(),
                 );
                 collect_table_rows(
-                    data,
+                    file,
                     child,
                     page_size,
                     usable_size,
                     path,
                     depth + 1,
                     limit,
-                    out,
+                    count,
+                    on_row,
                 )?;
             } else {
                 let (rowid, payload) =
-                    parse_leaf_cell(data, page, cell_off, page_size, usable_size, path)?;
-                out.push((rowid, payload));
+                    parse_leaf_cell(file, &page, cell_off, page_size, usable_size, path)?;
+                on_row(rowid, payload)?;
+                *count += 1;
             }
         }
-        if is_interior && limit.is_none_or(|n| out.len() < n) {
+        if is_interior && limit.is_none_or(|n| *count < n) {
             let rightmost = u32::from_be_bytes(
                 page.get(hdr_off + 8..hdr_off + 12)
                     .context("truncated SQLite interior page header")?
@@ -43340,14 +43364,15 @@ mod sqlite_support {
                     .unwrap(),
             );
             collect_table_rows(
-                data,
+                file,
                 rightmost,
                 page_size,
                 usable_size,
                 path,
                 depth + 1,
                 limit,
-                out,
+                count,
+                on_row,
             )?;
         }
         Ok(())
@@ -43360,7 +43385,7 @@ mod sqlite_support {
     /// verified directly against its file-format documentation rather
     /// than recalled from memory.
     fn parse_leaf_cell(
-        data: &[u8],
+        file: &mut fs::File,
         page: &[u8],
         cell_off: usize,
         page_size: u32,
@@ -43410,7 +43435,7 @@ mod sqlite_support {
                         "SQLite overflow chain in {path:?} is unreasonably long (possibly corrupt or cyclic)"
                     );
                 }
-                let opage = page_slice(data, next_page, page_size, path)?;
+                let opage = read_page(file, next_page, page_size, path)?;
                 let follow = u32::from_be_bytes(opage[0..4].try_into().unwrap());
                 let capacity = usable - 4;
                 let take = remaining.min(capacity) as usize;
@@ -43550,46 +43575,38 @@ mod sqlite_support {
 
     /// `sqlite_master`'s root page is always page 1 by construction - one
     /// more fixed fact of the file format, not something to look up.
-    fn read_schema(data: &[u8], header: &DbHeader, path: &Path) -> Result<Vec<SchemaEntry>> {
-        let mut rows = Vec::new();
-        collect_table_rows(
-            data,
-            1,
-            header.page_size,
-            header.usable_size,
-            path,
-            0,
-            None,
-            &mut rows,
-        )
-        .with_context(|| format!("failed reading the SQLite schema (sqlite_master) in {path:?}"))?;
-
+    fn read_schema(
+        file: &mut fs::File,
+        header: &DbHeader,
+        path: &Path,
+    ) -> Result<Vec<SchemaEntry>> {
         let mut entries = Vec::new();
-        for (_rowid, payload) in rows {
+        let mut count = 0usize;
+        let mut on_row = |_rowid: i64, payload: Vec<u8>| -> Result<()> {
             let values = decode_record(&payload)
                 .with_context(|| format!("failed decoding a sqlite_master row in {path:?}"))?;
             if values.len() < 5 {
-                continue;
+                return Ok(());
             }
             let Value::Text(kind) = &values[0] else {
-                continue;
+                return Ok(());
             };
             if kind != "table" {
-                continue;
+                return Ok(());
             }
             let Value::Text(name) = &values[1] else {
-                continue;
+                return Ok(());
             };
             // Mirrors `NOT LIKE 'sqlite_%'`, which SQLite's own LIKE
             // operator evaluates case-insensitively for ASCII.
             if name.to_ascii_lowercase().starts_with("sqlite_") {
-                continue;
+                return Ok(());
             }
             let Value::Integer(rootpage) = &values[3] else {
-                continue;
+                return Ok(());
             };
             if *rootpage <= 0 {
-                continue;
+                return Ok(());
             }
             let sql = match &values[4] {
                 Value::Text(s) => s.clone(),
@@ -43600,7 +43617,21 @@ mod sqlite_support {
                 rootpage: *rootpage as u32,
                 sql,
             });
-        }
+            Ok(())
+        };
+        collect_table_rows(
+            file,
+            1,
+            header.page_size,
+            header.usable_size,
+            path,
+            0,
+            None,
+            &mut count,
+            &mut on_row,
+        )
+        .with_context(|| format!("failed reading the SQLite schema (sqlite_master) in {path:?}"))?;
+
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
@@ -44076,7 +44107,7 @@ mod sqlite_support {
     }
 
     fn profile_table(
-        data: &[u8],
+        file: &mut fs::File,
         header: &DbHeader,
         entry: &SchemaEntry,
         nrows: Option<usize>,
@@ -44088,24 +44119,18 @@ mod sqlite_support {
             bail!("uses WITHOUT ROWID storage, which isn't supported");
         }
 
-        let mut rows = Vec::new();
-        collect_table_rows(
-            data,
-            entry.rootpage,
-            header.page_size,
-            header.usable_size,
-            path,
-            0,
-            nrows,
-            &mut rows,
-        )
-        .with_context(|| format!("failed reading rows for table '{}'", entry.name))?;
-
         let n_cols = parsed.columns.len();
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
         let mut kind_counts: Vec<SqlKindCounts> = vec![SqlKindCounts::default(); n_cols];
 
-        for (rowid, payload) in rows {
+        // Decodes and folds each row straight into the per-column
+        // accumulators as the b-tree walk visits it, rather than
+        // collecting every row's raw payload into a Vec first - the same
+        // "fold into per-column storage as records arrive" shape
+        // `CsvColumnAccumulator` already uses for CSV, applied here to a
+        // b-tree walk instead of a byte stream.
+        let mut count = 0usize;
+        let mut on_row = |rowid: i64, payload: Vec<u8>| -> Result<()> {
             let values = decode_record(&payload)?;
             for i in 0..n_cols {
                 // A record can legitimately have fewer values than the
@@ -44122,7 +44147,20 @@ mod sqlite_support {
                 let value = apply_affinity(value, parsed.real_affinity[i]);
                 raw[i].push(value_to_string(&value, &mut kind_counts[i]));
             }
-        }
+            Ok(())
+        };
+        collect_table_rows(
+            file,
+            entry.rootpage,
+            header.page_size,
+            header.usable_size,
+            path,
+            0,
+            nrows,
+            &mut count,
+            &mut on_row,
+        )
+        .with_context(|| format!("failed reading rows for table '{}'", entry.name))?;
 
         let mut profiles = Vec::new();
         for (i, name) in parsed.columns.into_iter().enumerate() {
@@ -44151,8 +44189,16 @@ mod sqlite_support {
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
         check_no_pending_wal(path)?;
-        let data = fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
-        let header = read_header(&data, path)?;
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        // Only the fixed 100-byte file header is ever needed up front -
+        // everything past it (the schema, every table's own rows) is
+        // read one page at a time via `read_page` as the b-tree walk
+        // actually needs it, rather than loading the whole database into
+        // memory before a single row is decoded.
+        let mut header_buf = [0u8; 100];
+        file.read_exact(&mut header_buf)
+            .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+        let header = read_header(&header_buf, path)?;
         if header.text_encoding != 0 && header.text_encoding != 1 {
             bail!(
                 "{path:?} uses SQLite text encoding {} (UTF-16), which isn't supported - only UTF-8 databases are",
@@ -44160,14 +44206,14 @@ mod sqlite_support {
             );
         }
 
-        let entries = read_schema(&data, &header, path)?;
+        let entries = read_schema(&mut file, &header, path)?;
         if entries.is_empty() {
             bail!("no user tables found in {path:?}");
         }
 
         let mut out = Vec::new();
         for entry in entries {
-            let profiles = match profile_table(&data, &header, &entry, nrows, n_samples, path) {
+            let profiles = match profile_table(&mut file, &header, &entry, nrows, n_samples, path) {
                 Ok(p) => p,
                 Err(e) => vec![ColumnProfile {
                     name: "value".to_string(),

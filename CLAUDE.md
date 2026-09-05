@@ -4200,13 +4200,84 @@ closer in spirit to Parquet's own tail-footer problem than to a plain
 `BufReader` swap. Moved to the harder tier below rather than attempted
 here.
 
-**Deliberately not done yet**: the formats that need either genuine
-random (`Seek`-based) access or more than one full pass over the file
-before the data means anything at all - SAS7BDAT (see above), Parquet,
-Arrow IPC, ORC, SQLite, and every ZIP-based format (`.xlsx`/`.xls`/
-`.xlsb`/`.ods`/`.npz`) - a materially larger rewrite per format than
-anything done so far. The `suggest_ideal_type` incremental-accumulator
-rewrite (the deeper win
+**SQLite (`columns_from_sqlite`) went eighth**, the first of the
+`Seek`-needing tier actually attempted - and it turned out more
+tractable than SAS7BDAT's own two-pass problem, not because it needs
+less random access, but because it needs a *different kind*: SQLite's
+own page-graph structure (a table b-tree's interior pages point to
+child pages by number, resolved one at a time as the walk descends)
+already makes per-page random access the *natural* way to read it, not
+a complication layered on top of an otherwise-sequential format the way
+a genuine two-pass rewrite would be. `read_page` replaces `page_slice`
+(which used to index directly into a `data: &[u8]` holding the *entire*
+database file) with a real `Seek`-then-`read_exact` of exactly one page
+off a `fs::File` - the file is opened once, its first 100 bytes read for
+the header, and nothing else is ever loaded eagerly.
+
+That alone would only bound *page* memory, not the real target: a full
+`SELECT *`-shaped table scan still visits every leaf page eventually, so
+without a second change the b-tree walk would just collect every row's
+decoded payload into one giant `Vec<(i64, Vec<u8>)>` before profiling
+any of it - the identical double-buffering problem every earlier phase
+in this section has fixed, just shaped like a tree walk instead of a
+byte stream this time. `collect_table_rows` (the recursive b-tree
+walker) was restructured to call back per row (`on_row: &mut dyn FnMut(
+i64, Vec<u8>) -> Result<()>`) instead of appending into a `Vec`, and
+`profile_table` now decodes and folds each row straight into its
+per-column accumulators from inside that callback as the walk visits
+it - the same "fold into per-column storage as records arrive" shape
+`CsvColumnAccumulator` already uses for CSV, just driven by a page-tree
+traversal instead of a linear byte stream. `read_schema` (which walks
+`sqlite_master`'s own tiny b-tree at a fixed page 1) got the identical
+treatment for consistency, though its own table is small enough that
+the win there is immaterial - real memory only ever needs to hold one
+row's own decoded values, a small handful of small per-column
+accumulators, and whatever's currently in the `File`'s own OS-level read
+buffer, never the whole database.
+
+`--nrows` gets a large, genuinely new win here, not just the "stops
+pulling further bytes" property every earlier phase's own early-break
+check already had for free: `collect_table_rows`'s existing `limit`
+check already stopped visiting *further pages* once enough rows were
+found, even in the old whole-file-buffer version - but since the whole
+file was already resident in memory before the b-tree walk ever started
+in that version, `--nrows` never bounded a single byte of *disk I/O*
+there. Now that a page is only ever read from disk the moment the walk
+actually visits it, a small `--nrows` genuinely means only a handful of
+pages are ever read at all, regardless of how large the rest of the
+database is.
+
+Measured on a real 107 MB SQLite file (2,000,000 rows, 4 columns,
+generated via Python's own `sqlite3` module), 3 rounds: full-table-scan
+maxRSS 732-763 MB -> 636-650 MB (~13%), peak footprint 507-573 MB ->
+510 MB (roughly flat - old's own footprint varied more round to round
+here than new's did, consistent with the old version's memory profile
+being dominated by one large, variably-timed `fs::read` allocation
+rather than many small, steady page-sized ones). Isolating the effect
+via `--nrows 1` (which now reads only the first few pages instead of
+the whole 107 MB file) shows the real, unmasked mechanism cleanly: peak
+footprint 108 MB -> 0.85 MB (~99%), maxRSS 109 MB -> 2.0 MB (~98%).
+Output confirmed byte-identical via `diff`, and the complete existing
+SQLite test suite - overflow-page reassembly, a table-level `PRIMARY
+KEY` rowid alias, a `WITHOUT ROWID` table's disclosed placeholder, a
+zero-row table, multi-table output with a real type-affinity violation,
+UUID/Email/IPv4/date recognition - passed unchanged against the new
+`Seek`-based implementation with zero test changes needed, strong
+evidence on its own that the rewrite preserved every existing behavior
+exactly. Clippy/fmt clean across the default, `sqlite`, and `full`
+builds, each matching its own established baseline.
+
+**Deliberately not done yet**: the remaining formats that need either
+genuine random (`Seek`-based) access or more than one full pass over
+the file before the data means anything at all - SAS7BDAT (a genuine
+two-pass structure, see above - a materially different problem from
+SQLite's own single-pass-but-random-access shape), Parquet, Arrow IPC,
+ORC, and every ZIP-based format (`.xlsx`/`.xls`/`.xlsb`/`.ods`/`.npz`) -
+each a materially larger rewrite than anything done so far, and each
+likely to need its own format-specific approach the way SQLite's page-
+graph structure and SAS7BDAT's two-pass metadata scan already turned
+out to be genuinely different problems rather than one shared pattern.
+The `suggest_ideal_type` incremental-accumulator rewrite (the deeper win
 described above) remains entirely unstarted, tracked as its own future
 phase.
 
