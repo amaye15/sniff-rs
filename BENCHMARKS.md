@@ -33,6 +33,41 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/incremental-json-path` branch (Darwin arm64)
+
+The shared `profile_json_path` recursive flattener (every non-native
+nested format bridges through it) went incremental, in two phases.
+Phase A: `JsonPathAccumulator` - a per-path accumulator tree (kind
+counts, an `IdealTypeAccumulator` for scalars, `n_samples`-capped sample
+lists, one child accumulator per object key in first-seen order); `push`
+walks arrays inline (replacing `unwrap_arrays`, now deleted);
+`profile_json_path` is a thin `new/push/finish` wrapper. Phase B:
+`columns_from_json` routes JSON Lines to `profile_json_lines_streaming`,
+which pushes each record straight into a root accumulator via
+`BufReader::lines()` - never collecting `Vec<JsonValue>`.
+`stream_json_lines` deleted; `read_json_values` now only handles the two
+non-streamable shapes (top-level array, single multi-line document).
+
+Measured on a real 230 MB, 1,000,000-record nested JSONL file
+(id/email/amount/3-element array/2-field nested object/bool/RFC 3339
+timestamp): maxRSS 1.66-1.68 GB -> ~2.5 MB (~99.8%), peak footprint
+~1.56 GB -> ~1.4 MB (~99.9%), 3 rounds - the largest single reduction of
+the whole streaming effort (a parsed JSON `Value` tree carries far more
+per-record overhead than a flat row).
+
+Output byte-identical via `diff` against the pre-change binary across the
+entire 359-file corpus in all three output formats with/without
+`--nrows` (2,154 combinations), a 400-iteration nested-JSON structure
+fuzz, and a 500-iteration JSONL-specific fuzz (blank/null lines,
+`--nrows`, `--samples`, mixed line shapes) - zero mismatches. Full test
+suite unchanged bar one unit test renamed/rewritten to assert the JSONL
+shape through `columns_from_json` instead of `read_json_values` (which no
+longer handles JSON Lines). Clippy/fmt clean across default/`full`,
+established baselines (the pre-existing `chunks_exact`/question-mark
+findings from a newer clippy version).
+
+---
+
 ## 2026-09-06 — `feat/incremental-orc` branch (Darwin arm64)
 
 ORC wired through `ColumnAccumulatorState`, the eighth format converted.

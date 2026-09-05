@@ -12788,37 +12788,6 @@ fn describe_kinds(counts: &JsonKindCounts) -> String {
     format!("mixed({inner})")
 }
 
-/// Recursively unwraps arrays of any depth into a flat pool of non-array,
-/// non-null leaf values (scalars and/or objects), noting whether an array
-/// was seen anywhere along the way. Takes `values` by value so the common
-/// case - a column with no arrays at all - hands the same `Vec` straight
-/// back with no second allocation (the recursive walk is only needed
-/// when there's actually an array to flatten).
-fn unwrap_arrays(values: Vec<&JsonValue>) -> (Vec<&JsonValue>, bool) {
-    if !values.iter().any(|v| matches!(v, JsonValue::Array(_))) {
-        return (values, false);
-    }
-    fn walk<'a>(v: &'a JsonValue, pool: &mut Vec<&'a JsonValue>, saw_array: &mut bool) {
-        match v {
-            JsonValue::Array(items) => {
-                *saw_array = true;
-                for item in items {
-                    if !item.is_null() {
-                        walk(item, pool, saw_array);
-                    }
-                }
-            }
-            _ => pool.push(v),
-        }
-    }
-    let mut pool = Vec::with_capacity(values.len());
-    let mut saw_array = false;
-    for v in &values {
-        walk(v, &mut pool, &mut saw_array);
-    }
-    (pool, saw_array)
-}
-
 /// Reads lines from `path` until the first one with real (non-whitespace)
 /// content is found, returned verbatim (not trimmed) - or `None` if the
 /// file is empty or entirely whitespace. Reads at most a handful of
@@ -12839,38 +12808,23 @@ fn first_non_blank_line(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Reads either a top-level JSON array, a single JSON document (object or
-/// scalar, possibly pretty-printed across multiple lines), or JSON Lines
-/// (one value per non-empty line) - detected by whether the first
-/// non-blank line starts with '[', then by whether *that line alone*
-/// parses as a complete JSON value. Every element/line must itself be
-/// valid JSON, but is *not* required to be an object here - a top-level
-/// array or JSON Lines stream of bare scalars (`[1, 2, 3]`, or one ID per
-/// line) is a real, common shape with no natural field names but still a
-/// genuine single column, same as a headerless CSV or NumPy's plain 1D
-/// array elsewhere in this file - columns_from_json decides what to do
-/// with the result.
+/// Reads either a top-level JSON array or a single JSON document (object
+/// or scalar, possibly pretty-printed across multiple lines) into one
+/// materialized value list. JSON Lines - the one streamable shape, and
+/// the one most likely to be huge in practice - is handled separately by
+/// `columns_from_json`/`profile_json_lines_streaming` before this is ever
+/// called, so this only ever sees the two whole-buffer cases: the
+/// hand-rolled parser has no incremental/pull mode for extracting array
+/// elements one at a time, so a top-level array or a genuinely multi-line
+/// single document both still need the whole thing parsed as one nested
+/// value - a disclosed, harder-scoped gap, see CLAUDE.md's Streaming
+/// reads section. `nrows` is applied by the caller (`values.truncate`).
 ///
-/// Checking only the first line, rather than the whole file, is a sound
-/// substitute for the old "does the *whole* content parse as one value"
-/// check, not just a convenient heuristic: JSON's own grammar means a
-/// value that parses completely can never be "continued" by further
-/// tokens after it, so whatever follows a first line that already parses
-/// as a complete value can only be more independent top-level values
-/// (i.e. this genuinely is JSON Lines) or invalid trailing content -
-/// exactly the case the old whole-document-first algorithm's own check
-/// would have failed on and fallen through to identical per-line parsing
-/// for anyway. This lets a genuine JSON Lines file - the shape most
-/// likely to actually be huge in practice - stream a line at a time via
-/// `stream_json_lines` below, never materializing the raw file text as
-/// one buffer; a top-level array or a genuinely multi-line single
-/// document both still need the whole thing parsed as one nested value
-/// regardless (the hand-rolled parser has no incremental/pull mode for
-/// extracting array elements one at a time), so those two shapes are
-/// deliberately left as a whole-buffer read - see CLAUDE.md's Streaming
-/// reads section for why that's a disclosed, harder-scoped gap rather
-/// than an oversight.
-fn read_json_values(path: &Path, nrows: Option<usize>) -> Result<Vec<JsonValue>> {
+/// A value is *not* required to be an object here - a top-level array of
+/// bare scalars (`[1, 2, 3]`) is a real, common shape with no natural
+/// field names but still a genuine single column, same as a headerless
+/// CSV or NumPy's plain 1D array elsewhere in this file.
+fn read_json_values(path: &Path, _nrows: Option<usize>) -> Result<Vec<JsonValue>> {
     let Some(first_line) = first_non_blank_line(path)? else {
         // The file is empty or entirely whitespace - no JSON content at
         // all, which every reader downstream of this treats as zero
@@ -12894,113 +12848,120 @@ fn read_json_values(path: &Path, nrows: Option<usize>) -> Result<Vec<JsonValue>>
         };
     }
 
-    if json_support::from_str(&first_line).is_ok() {
-        return stream_json_lines(path, nrows);
-    }
-
-    // The first line alone isn't valid JSON by itself, so this can't be
-    // JSON Lines - the only remaining possibility is a single, possibly
-    // multi-line (pretty-printed) document, the same "whole document =
-    // one record" choice TOML and YAML's single-mapping mode already
-    // make for their own single-document shapes.
+    // Not an array, and `columns_from_json` already ruled out JSON Lines
+    // (the first line doesn't parse whole on its own) - so this is a
+    // single, possibly multi-line (pretty-printed) document, the same
+    // "whole document = one record" choice TOML and YAML's single-mapping
+    // mode already make for their own single-document shapes.
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
     json_support::from_str(&content)
         .map(|v| vec![v])
         .with_context(|| format!("failed to parse {path:?} as JSON"))
 }
 
-/// Streams a genuine JSON Lines file a line at a time via
-/// `BufReader::lines()`, never materializing the raw file text as one
-/// buffer - `read_json_values` only ever calls this once it's already
-/// confirmed the first line alone parses as a complete value, so every
-/// remaining line is expected to be independently valid JSON too. `nrows`
-/// stops the read itself early (the `for` loop simply stops pulling from
-/// the underlying reader) rather than only truncating the result
-/// afterward, the same real-I/O-bound benefit CSV/fixed-width's own
-/// streaming readers already give `--nrows`.
-fn stream_json_lines(path: &Path, nrows: Option<usize>) -> Result<Vec<JsonValue>> {
-    use std::io::BufRead;
-    let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let mut values = Vec::new();
-    for line in std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines() {
-        if nrows.is_some_and(|limit| values.len() >= limit) {
-            break;
-        }
-        let line = line.with_context(|| format!("failed to read {path:?}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = json_support::from_str(&line)
-            .with_context(|| format!("failed to parse a line of {path:?} as JSON"))?;
-        values.push(value);
-    }
-    Ok(values)
+/// Incremental equivalent of `profile_json_path`'s old whole-slice body:
+/// folds one JSON value at a time into a small bounded footprint (kind
+/// counts, an `IdealTypeAccumulator` for the scalar case, `n_samples`-
+/// capped sample lists, and one child accumulator per object key
+/// discovered) rather than retaining every value at this path. Every
+/// branch here is a mechanical translation of the corresponding step in
+/// the old function - see `profile_json_path` (now a thin wrapper) for
+/// how it's driven, and CLAUDE.md's "Streaming reads" section (Tier 2)
+/// for why the nested-format engine needed its own incremental shape.
+///
+/// `push` is only ever handed non-null values (callers pre-filter, the
+/// same contract the old `values: Vec<&JsonValue>` argument had); it
+/// walks arrays inline (matching `unwrap_arrays`), so a `JsonValue::Array`
+/// contributes its non-null leaves plus a `saw_array` flag, never itself.
+struct JsonPathAccumulator {
+    n_samples: usize,
+    /// One `push` call = one increment (an array counts once here,
+    /// pre-flatten) - the old `values.len()` used for `missing`.
+    pushed_count: usize,
+    saw_array: bool,
+    kind_counts: JsonKindCounts,
+    scalar_count: usize,
+    object_count: usize,
+    ideal_acc: IdealTypeAccumulator,
+    scalar_samples: Vec<String>,
+    object_samples: Vec<String>,
+    /// Child accumulators in first-seen key order, mirroring
+    /// `bucket_object_fields`'s own ordering.
+    child_order: Vec<String>,
+    child_index: HashMap<String, usize, FxBuildHasher>,
+    children: Vec<JsonPathAccumulator>,
 }
 
-/// Profiles one JSON "path". `total` is how many parent slots could have held
-/// a value here (for missing %); `values` are the non-null values actually
-/// found there. Returns this path's own row followed by every descendant row
-/// (dot-notation), in order, so nested content always ends up reported, not
-/// just labelled.
-fn profile_json_path(
-    name: String,
-    total: usize,
-    values: Vec<&JsonValue>,
-    n_samples: usize,
-) -> Vec<ColumnProfile> {
-    let missing = total.saturating_sub(values.len());
-    let missing_pct = round1(if total > 0 {
-        missing as f64 / total as f64 * 100.0
-    } else {
-        0.0
-    });
-
-    if values.is_empty() {
-        return vec![ColumnProfile {
-            name,
-            current_type: "null".to_string(),
-            ideal_type: "String".to_string(),
-            description: String::new(),
-            missing_pct,
-            sample_values: Vec::new(),
-            notes: "column is empty/all null".to_string(),
-            row_count: total,
-        }];
+impl JsonPathAccumulator {
+    fn new(n_samples: usize) -> Self {
+        JsonPathAccumulator {
+            n_samples,
+            pushed_count: 0,
+            saw_array: false,
+            kind_counts: JsonKindCounts::default(),
+            scalar_count: 0,
+            object_count: 0,
+            ideal_acc: IdealTypeAccumulator::new(),
+            scalar_samples: Vec::new(),
+            object_samples: Vec::new(),
+            child_order: Vec::new(),
+            child_index: HashMap::default(),
+            children: Vec::new(),
+        }
     }
 
-    let (pool, saw_array) = unwrap_arrays(values);
-    let wrap = |s: &str| {
-        if saw_array {
-            format!("Vec<{s}>")
-        } else {
-            s.to_string()
+    fn push(&mut self, v: &JsonValue) {
+        self.pushed_count += 1;
+        self.absorb(v);
+    }
+
+    /// Walks arrays (any depth) into their non-null leaves, matching
+    /// `unwrap_arrays`; every non-array leaf goes to `absorb_leaf`.
+    fn absorb(&mut self, v: &JsonValue) {
+        match v {
+            JsonValue::Array(items) => {
+                self.saw_array = true;
+                for item in items {
+                    if !item.is_null() {
+                        self.absorb(item);
+                    }
+                }
+            }
+            other => self.absorb_leaf(other),
         }
-    };
+    }
 
-    let mut kind_counts = JsonKindCounts::default();
-    // `Cow` rather than `String`: a `JsonValue::String` already owns its
-    // data for as long as the caller's own `values`/`pool` borrow lives
-    // (found via real profiling - `samply` plus `atos` symbolication
-    // against this project's own hand-rolled release build - to be a
-    // genuine hot spot: cloning every string value here, only to drop
-    // every one of those clones again at the end of this same function
-    // call, was real, measurable, wasted allocator traffic for exactly
-    // the common case of a plain string-typed column). Only `Number`
-    // genuinely needs a fresh owned allocation (there's no pre-existing
-    // string form to borrow); `Bool` needs none at all, since there are
-    // only ever two possible values.
-    let mut scalar_raw: Vec<Cow<str>> = Vec::new();
-    let mut object_maps: Vec<&json_support::Map> = Vec::new();
-
-    for v in &pool {
+    fn absorb_leaf(&mut self, v: &JsonValue) {
         match v {
             JsonValue::Object(m) => {
-                kind_counts.increment(JsonKind::Object);
-                object_maps.push(m);
+                self.kind_counts.increment(JsonKind::Object);
+                self.object_count += 1;
+                if self.object_samples.len() < self.n_samples {
+                    let mut s = String::new();
+                    json_support::write_compact_object(&mut s, m);
+                    if !self.object_samples.contains(&s) {
+                        self.object_samples.push(s);
+                    }
+                }
+                for (k, val) in m.iter() {
+                    let idx = match self.child_index.get(k.as_str()) {
+                        Some(&i) => i,
+                        None => {
+                            let i = self.children.len();
+                            self.child_order.push(k.clone());
+                            self.child_index.insert(k.clone(), i);
+                            self.children.push(JsonPathAccumulator::new(self.n_samples));
+                            i
+                        }
+                    };
+                    if !val.is_null() {
+                        self.children[idx].push(val);
+                    }
+                }
             }
             JsonValue::Bool(b) => {
-                kind_counts.increment(JsonKind::Bool);
-                scalar_raw.push(Cow::Borrowed(if *b { "true" } else { "false" }));
+                self.kind_counts.increment(JsonKind::Bool);
+                self.absorb_scalar(if *b { "true" } else { "false" });
             }
             JsonValue::Number(n) => {
                 let k = if n.is_i64() || n.is_u64() {
@@ -13008,109 +12969,139 @@ fn profile_json_path(
                 } else {
                     JsonKind::Float
                 };
-                kind_counts.increment(k);
-                scalar_raw.push(Cow::Owned(n.to_string()));
+                self.kind_counts.increment(k);
+                self.absorb_scalar(&n.to_string());
             }
             JsonValue::String(s) => {
-                kind_counts.increment(JsonKind::Str);
-                scalar_raw.push(Cow::Borrowed(s.as_str()));
+                self.kind_counts.increment(JsonKind::Str);
+                self.absorb_scalar(s);
             }
             JsonValue::Null | JsonValue::Array(_) => {
-                unreachable!("unwrap_arrays already removed these")
+                unreachable!("absorb() already handled arrays; nulls are pre-filtered")
             }
         }
     }
 
-    let (current_type, ideal_type, mut notes) = if pool.is_empty() {
-        // saw_array must be true here: values was non-empty but every array found was empty.
-        (
-            wrap("empty"),
-            wrap("empty"),
-            "array is always empty - can't infer an element type".to_string(),
-        )
-    } else if !object_maps.is_empty() && scalar_raw.is_empty() {
-        (
-            wrap("object"),
-            wrap("struct"),
-            format!("flattened into {name}.* below"),
-        )
-    } else if !scalar_raw.is_empty() && object_maps.is_empty() {
-        let base_current = describe_kinds(&kind_counts);
-        let refs: Vec<&str> = scalar_raw.iter().map(|s| s.as_ref()).collect();
-        let (ideal, note) = suggest_ideal_type(&refs, &base_current);
-        (wrap(&base_current), wrap(&ideal), note)
-    } else {
-        let base_current = describe_kinds(&kind_counts);
-        let note =
-            format!("mix of scalars and objects - object fields listed separately under {name}.*");
-        (wrap(&base_current), wrap("String"), note)
-    };
+    fn absorb_scalar(&mut self, s: &str) {
+        self.scalar_count += 1;
+        self.ideal_acc.push(s);
+        if self.scalar_samples.len() < self.n_samples && !self.scalar_samples.iter().any(|x| x == s)
+        {
+            self.scalar_samples.push(s.to_string());
+        }
+    }
 
-    if missing_pct > 0.0 {
-        let extra = "has missing values -> wrap in Option<T> / handle nulls";
-        notes = if notes.is_empty() {
-            extra.to_string()
+    fn finish(self, name: String, total: usize) -> Vec<ColumnProfile> {
+        let missing = total.saturating_sub(self.pushed_count);
+        let missing_pct = round1(if total > 0 {
+            missing as f64 / total as f64 * 100.0
         } else {
-            format!("{notes}; {extra}")
+            0.0
+        });
+
+        if self.pushed_count == 0 {
+            return vec![ColumnProfile {
+                name,
+                current_type: "null".to_string(),
+                ideal_type: "String".to_string(),
+                description: String::new(),
+                missing_pct,
+                sample_values: Vec::new(),
+                notes: "column is empty/all null".to_string(),
+                row_count: total,
+            }];
+        }
+
+        let saw_array = self.saw_array;
+        let wrap = |s: &str| {
+            if saw_array {
+                format!("Vec<{s}>")
+            } else {
+                s.to_string()
+            }
         };
-    }
+        let pool_is_empty = self.scalar_count == 0 && self.object_count == 0;
 
-    // Built lazily, one candidate at a time, rather than first
-    // materializing every value (or - worse, for the object case -
-    // deep-cloning every object just to stringify it) into a full
-    // `sample_pool` up front: `n_samples` is typically single digits, so
-    // a column with thousands or millions of values used to pay for a
-    // full clone of all of them purely to keep a handful. `samples`
-    // itself (bounded to `n_samples`) is small enough that a linear
-    // `.contains()` scan for de-duplication is cheaper than hashing, so
-    // there's no `HashSet` here either.
-    let mut samples: Vec<String> = Vec::new();
-    if !scalar_raw.is_empty() {
-        for v in &scalar_raw {
-            if samples.len() >= n_samples {
-                break;
-            }
-            if !samples.iter().any(|s| s == v.as_ref()) {
-                samples.push(v.clone().into_owned());
+        let (current_type, ideal_type, mut notes) = if pool_is_empty {
+            // saw_array must be true: something was pushed but every array was empty.
+            (
+                wrap("empty"),
+                wrap("empty"),
+                "array is always empty - can't infer an element type".to_string(),
+            )
+        } else if self.object_count > 0 && self.scalar_count == 0 {
+            (
+                wrap("object"),
+                wrap("struct"),
+                format!("flattened into {name}.* below"),
+            )
+        } else if self.scalar_count > 0 && self.object_count == 0 {
+            let base_current = describe_kinds(&self.kind_counts);
+            let (ideal, note) = self.ideal_acc.finish(&base_current);
+            (wrap(&base_current), wrap(&ideal), note)
+        } else {
+            let base_current = describe_kinds(&self.kind_counts);
+            let note = format!(
+                "mix of scalars and objects - object fields listed separately under {name}.*"
+            );
+            (wrap(&base_current), wrap("String"), note)
+        };
+
+        if missing_pct > 0.0 {
+            let extra = "has missing values -> wrap in Option<T> / handle nulls";
+            notes = if notes.is_empty() {
+                extra.to_string()
+            } else {
+                format!("{notes}; {extra}")
+            };
+        }
+
+        let samples = if self.scalar_count > 0 {
+            self.scalar_samples
+        } else {
+            self.object_samples
+        };
+
+        let mut result = vec![ColumnProfile {
+            name: name.clone(),
+            current_type,
+            ideal_type,
+            description: String::new(),
+            missing_pct,
+            sample_values: samples,
+            notes,
+            row_count: total,
+        }];
+
+        if self.object_count > 0 {
+            let child_total = self.object_count;
+            for (key, child) in self.child_order.into_iter().zip(self.children) {
+                result.extend(child.finish(format!("{name}.{key}"), child_total));
             }
         }
-    } else {
-        for m in &object_maps {
-            if samples.len() >= n_samples {
-                break;
-            }
-            let mut s = String::new();
-            json_support::write_compact_object(&mut s, m);
-            if !samples.contains(&s) {
-                samples.push(s);
-            }
-        }
+
+        result
     }
+}
 
-    let mut result = vec![ColumnProfile {
-        name: name.clone(),
-        current_type,
-        ideal_type,
-        description: String::new(),
-        missing_pct,
-        sample_values: samples,
-        notes,
-        row_count: total,
-    }];
-
-    if !object_maps.is_empty() {
-        let child_total = object_maps.len();
-        for (key, child_values) in bucket_object_fields(object_maps.iter().copied()) {
-            result.extend(profile_json_path(
-                format!("{name}.{key}"),
-                child_total,
-                child_values,
-                n_samples,
-            ));
-        }
+/// Profiles one JSON "path". `total` is how many parent slots could have held
+/// a value here (for missing %); `values` are the non-null values actually
+/// found there. Returns this path's own row followed by every descendant row
+/// (dot-notation), in order, so nested content always ends up reported, not
+/// just labelled. A thin wrapper over `JsonPathAccumulator` - the same
+/// "public entry point stays, the engine underneath is incremental" move
+/// `suggest_ideal_type` already made for its own Tier 2 conversion.
+fn profile_json_path(
+    name: String,
+    total: usize,
+    values: Vec<&JsonValue>,
+    n_samples: usize,
+) -> Vec<ColumnProfile> {
+    let mut acc = JsonPathAccumulator::new(n_samples);
+    for v in values {
+        acc.push(v);
     }
-
-    result
+    acc.finish(name, total)
 }
 
 /// Groups every `(key, value)` pair across a set of objects by key,
@@ -13184,17 +13175,96 @@ fn profile_json_records(records: &[json_support::Map], n_samples: usize) -> Vec<
     out
 }
 
+/// Streams a genuine JSON Lines file a line at a time, folding each record
+/// straight into a root `JsonPathAccumulator` rather than collecting every
+/// parsed `JsonValue` first - so peak memory stays at the accumulator tree
+/// plus one line, not the whole record set. Output is identical to the old
+/// "collect `Vec<JsonValue>`, then `profile_json_records` (all objects) or
+/// `profile_json_path("value", ...)` (anything else)" path:
+///  - zero records (empty/whitespace-only file, or every line filtered) ->
+///    an empty column list, matching `profile_json_records(&[])`;
+///  - every line a plain object -> the root's children finished directly
+///    (no `value.` prefix, no root row), matching `profile_json_records`;
+///  - anything else (a scalar line, an array line, a mix) -> the root
+///    finished as a single `value` column, matching `profile_json_path`.
+///
+/// `--nrows` stops the read itself early (the `for` loop stops pulling
+/// from the reader), the same real-I/O bound CSV/fixed-width already give
+/// it - a literal `null` line counts toward the limit and toward `total`
+/// (for missing %) but is never pushed, exactly as the old
+/// `values.iter().filter(|v| !v.is_null())` did.
+fn profile_json_lines_streaming(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    use std::io::BufRead;
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut root = JsonPathAccumulator::new(n_samples);
+    let mut total_records: usize = 0;
+    for line in std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines() {
+        if nrows.is_some_and(|limit| total_records >= limit) {
+            break;
+        }
+        let line = line.with_context(|| format!("failed to read {path:?}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = json_support::from_str(&line)
+            .with_context(|| format!("failed to parse a line of {path:?} as JSON"))?;
+        total_records += 1;
+        if !value.is_null() {
+            root.push(&value);
+        }
+    }
+
+    if total_records == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Every non-null line was a plain object and no array was seen: emit
+    // the top-level columns directly, the `profile_json_records` shape.
+    let all_objects = root.pushed_count > 0
+        && root.scalar_count == 0
+        && !root.saw_array
+        && root.object_count == root.pushed_count;
+    if all_objects && root.pushed_count == total_records {
+        let child_total = root.object_count;
+        let mut out = Vec::new();
+        for (key, child) in root.child_order.into_iter().zip(root.children) {
+            out.extend(child.finish(key, child_total));
+        }
+        return Ok(out);
+    }
+
+    Ok(root.finish("value".to_string(), total_records))
+}
+
 fn columns_from_json(
     path: &Path,
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
+    // JSON Lines is the one streamable shape (each line an independent,
+    // self-contained value) - detected exactly as `read_json_values` does
+    // (first non-blank line doesn't start with '[' and parses whole on its
+    // own), and handled without ever materializing the record set. A
+    // top-level array or a single multi-line document both still need the
+    // whole thing parsed as one nested value (the hand-rolled parser has
+    // no pull mode), so they stay a whole-buffer read - a disclosed,
+    // harder-scoped gap, see CLAUDE.md's "Streaming reads" section.
+    if let Some(first_line) = first_non_blank_line(path)?
+        && !first_line.trim_start().starts_with('[')
+        && json_support::from_str(&first_line).is_ok()
+    {
+        return profile_json_lines_streaming(path, nrows, n_samples);
+    }
+
     let mut values = read_json_values(path, nrows)?;
-    // Still a backstop even though stream_json_lines' own early-stop
-    // already respects nrows: the top-level-array and single-document
-    // paths it doesn't cover always read the whole document regardless
-    // (see read_json_values' own doc comment for why), so this remains
-    // the only thing bounding *their* output to nrows.
+    // Still a backstop: the top-level-array and single-document paths
+    // always read the whole document regardless (see read_json_values'
+    // own doc comment for why), so this remains the only thing bounding
+    // *their* output to nrows.
     if let Some(n) = nrows {
         values.truncate(n);
     }
@@ -53215,12 +53285,20 @@ mod tests {
     }
 
     #[test]
-    fn read_json_values_still_splits_a_genuine_multi_record_jsonl_stream() {
-        // The single-document fallback must not swallow real JSON Lines
-        // data - serde_json rejects trailing content after a complete
-        // value, so this correctly falls through to per-line parsing.
-        let values = read_values("{\"a\":1}\n{\"a\":2}\n");
-        assert_eq!(values, vec![json!({"a": 1}), json!({"a": 2})]);
+    fn columns_from_json_still_splits_a_genuine_multi_record_jsonl_stream() {
+        // JSON Lines is now intercepted by columns_from_json (first line
+        // parses whole on its own) and streamed record-by-record via
+        // profile_json_lines_streaming, never routed through
+        // read_json_values' single-document fallback - a 2-record stream
+        // of objects must produce the profile_json_records shape (one
+        // column per field, no `value.` prefix, no root row).
+        let mut tmp = TempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"{\"a\":1}\n{\"a\":2}\n").unwrap();
+        let cols = columns_from_json(tmp.path(), None, 3).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "a");
+        assert_eq!(cols[0].ideal_type, "i64");
+        assert_eq!(cols[0].row_count, 2);
     }
 
     #[test]

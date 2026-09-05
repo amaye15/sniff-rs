@@ -5027,23 +5027,96 @@ zero modifications needed) and clippy/fmt clean across default/`orc`/
 `chunks_exact`/question-mark clippy findings on unrelated lines, from a
 newer clippy version, confirmed identical on unmodified `main`).
 
-**Deliberately not done yet**: every other `profile_column`/
-`profile_json_path`-based reader still holds a full column's values
-resident (Excel, JSON, YAML, TOML, Avro, MessagePack,
-CBOR, XML, Parquet/Arrow's nested columns) - each would need its own
-`ColumnInput`/`profile_column` (or `profile_json_path`) call site
-converted the same way CSV's/fixed-width's/dBase's/Stata's/SPSS's/
-NumPy's/SAS7BDAT's/ORC's were, and each deserves its own real-file
-measurement before being called done, the same one-phase-at-a-time
-discipline this whole section has already used throughout. Excel
-specifically would need its own, larger restructuring (see above) rather
-than the same drop-in bypass pattern the eight converted so far all
-shared. The `profile_json_path`-based nested formats are a genuinely
-different shape - a per-*path* recursive engine, not a per-column one -
-so converting them is its own separately-scoped design question, not the
-same drop-in. Per-entry streaming decompression inside
-`ZipArchive::read` itself remains a real, disclosed, separately-scoped
-remaining gap, not folded into any phase
+**The `profile_json_path` engine went incremental next - the nested-format
+equivalent of the `suggest_ideal_type` Tier 2 conversion, and done in the
+same two-phase shape (engine first, then wire one reader).** This is the
+shared recursive flattener every non-native nested format bridges through
+(JSON, YAML, TOML, Avro, MessagePack, CBOR, XML, Parquet/Arrow's nested
+columns - see the Architecture section), so it's the single highest-
+leverage remaining target, but also a genuinely different shape from the
+per-column readers above: it's a per-*path* recursive engine that, at
+each path, needs every value at that path across all records at once (to
+bucket object fields, to pool array scalars, to run `suggest_ideal_type`
+over them).
+
+**Phase A: `JsonPathAccumulator`.** Every step of the old whole-slice
+`profile_json_path` reduces to something a per-path accumulator tree can
+compute one value at a time: the `unwrap_arrays` flatten becomes a
+`push` that walks arrays inline (setting a `saw_array` flag, recursing
+into non-null elements); `JsonKindCounts` is already incremental; the
+scalar case feeds an `IdealTypeAccumulator` (whose own equivalence to
+`suggest_ideal_type` was already established in the CSV Tier 2 phase) and
+an `n_samples`-capped sample list; the object case get-or-creates one
+child `JsonPathAccumulator` per key in first-seen order (mirroring
+`bucket_object_fields`), pushing each object's non-null field value into
+it; `write_compact_object` samples for the object-only case are collected
+bounded during `push` too, since the branch that needs them isn't known
+until `finish`. `finish(name, total)` walks the same four-way branch
+(empty-array / object-only / scalar-only / mixed) in the same order,
+builds the same notes, and recurses children with `child_total =
+object_count` (the old `object_maps.len()`), exactly as before.
+`profile_json_path` itself became a thin wrapper - `new(); for v { push }
+; finish` - so all 50-plus direct callers and unit tests keep exercising
+the same entry point with no second implementation to drift.
+`unwrap_arrays` is deleted outright (its whole job is now `push`'s
+array-walk).
+
+**Phase B: streaming JSON Lines through it.** `columns_from_json`
+detects the JSON Lines shape exactly as before (first non-blank line
+doesn't start with `[` and parses whole on its own) and now routes it to
+`profile_json_lines_streaming`, which reads a line at a time via
+`BufReader::lines()`, parses each, and pushes each non-null record
+straight into a root `JsonPathAccumulator` - never collecting the record
+set. At end-of-stream it reproduces `columns_from_json`'s old whole-set
+decision exactly: zero records -> an empty column list (matching
+`profile_json_records(&[])`); every non-null line a plain object with no
+array seen -> the root's children finished directly, no `value.` prefix
+and no root row (the `profile_json_records` shape); anything else (a
+scalar line, an array line, a mix, or any `null` lines mixed in) -> the
+root finished as one `value` column, with `total` counting the `null`
+lines for missing-% just as the old `values.len()` did. A top-level
+array or a single multi-line document still can't stream (the hand-
+rolled JSON parser has no pull mode) and stay a whole-buffer read -
+`read_json_values` is now only those two cases, and `stream_json_lines`
+(which returned a materialized `Vec<JsonValue>`) is deleted.
+
+Measured on a real 230 MB, 1,000,000-record nested JSONL file (id/email/
+amount/a 3-element string array/a 2-field nested object/bool/an RFC 3339
+timestamp): maxRSS 1.66-1.68 GB -> ~2.5 MB (~99.8%), peak footprint
+~1.56 GB -> ~1.4 MB (~99.9%), 3 rounds - the largest single reduction of
+this whole section, since a parsed JSON `Value` tree carries far more
+per-record overhead than a flat row does, so eliminating the resident
+record set matters proportionally more here than for CSV. Output
+confirmed byte-identical via `diff` against the pre-change binary across
+the entire 359-file fixture corpus in all three output formats with and
+without `--nrows` (2,154 combinations), plus a 400-iteration randomized
+nested-JSON structure fuzz (arrays/objects/scalars/nulls to depth 4) and
+a 500-iteration JSON-Lines-specific fuzz (blank lines, literal `null`
+lines, `--nrows`, `--samples`, object/scalar/array/mixed line shapes) -
+zero mismatches in either. Full test suite (347 unit + 360 integration;
+one unit test renamed and rewritten from asserting on `read_json_values`
+directly to asserting the JSONL shape through `columns_from_json`, since
+`read_json_values` no longer handles JSON Lines at all) and clippy/fmt
+clean across default/`full`, matching established baselines (the same
+pre-existing `chunks_exact`/question-mark clippy findings, confirmed
+identical on unmodified `main`).
+
+**Deliberately not done yet**: every other `profile_json_path`-based
+reader still materializes its whole record set before profiling (Avro,
+MessagePack, CBOR, TOML, YAML, XML, Parquet/Arrow's nested columns, and
+JSON's own top-level-array and single-multi-line-document shapes) - the
+incremental engine is now in place for all of them, but each reader
+would need its own record-at-a-time feed into a root
+`JsonPathAccumulator` the way `profile_json_lines_streaming` does, and
+each deserves its own real-file measurement. Several are inherently
+whole-buffer regardless (a single TOML/YAML document, a top-level JSON
+array - no record boundary to stream on); the genuinely streamable ones
+are the record-stream formats (Avro blocks, concatenated MessagePack/
+CBOR values, a YAML multi-document stream). Excel still needs its own
+larger `SheetGrid` restructuring (see above) rather than the drop-in
+bypass the eight `profile_column` conversions shared. Per-entry
+streaming decompression inside `ZipArchive::read` itself remains a real,
+disclosed, separately-scoped remaining gap, not folded into any phase
 here.
 
 ## Cloud-platform file compatibility
