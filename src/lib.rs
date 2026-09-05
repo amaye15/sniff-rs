@@ -3222,6 +3222,13 @@ const DATE_FORMATS: &[&str] = &[
 /// seconds (verified the same way as the DATE_FORMATS entries above).
 const TIME_FORMATS: &[&str] = &["%H:%M:%S%.f", "%H:%M", "%I:%M:%S %p", "%I:%M %p"];
 
+/// `suggest_ideal_type`'s own `IdealTypeAccumulator` no longer calls this -
+/// it tracks one running bool per `TIME_FORMATS` entry incrementally
+/// instead of re-scanning the whole slice per candidate format - but this
+/// whole-slice form is kept (and still directly, extensively unit-tested)
+/// as the simpler reference shape for a one-shot check outside that
+/// incremental engine.
+#[allow(dead_code)]
 fn matching_time_format(values: &[&str]) -> Option<&'static str> {
     TIME_FORMATS
         .iter()
@@ -3438,6 +3445,9 @@ fn is_bool_word(s: &str) -> bool {
         .any(|w| s.eq_ignore_ascii_case(w))
 }
 
+/// See `matching_time_format`'s own doc comment - kept for its direct unit
+/// tests, no longer called from `suggest_ideal_type` itself.
+#[allow(dead_code)]
 fn matching_date_format(values: &[&str]) -> Option<&'static str> {
     DATE_FORMATS
         .iter()
@@ -4199,254 +4209,462 @@ fn is_vin(s: &str) -> bool {
     b[8] == expected
 }
 
-/// The core type-detection heuristic: given a column's raw string values
-/// and its declared "current" type, returns an `(ideal_type, notes)` pair.
-/// Public specifically so `benches/heuristic_engine.rs` can call it
-/// directly (in-process, no subprocess/I/O noise) - this is the one
-/// function in the crate's otherwise-private internals exposed for that
-/// reason alone, not as a general-purpose library API (`run()` remains the
-/// only supported entry point for actual use).
-pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
-    // Precise, unambiguous grammars are checked first - each one fully
-    // explains the whole string, so there's no risk of a cruder check
-    // (leading-zero, in particular) firing on a substring pattern instead.
-    if values.iter().all(|v| is_hex_color(v)) {
-        return (
-            "Hex Color".to_string(),
-            "matches #RGB/#RGBA/#RRGGBB/#RRGGBBAA hex color format".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_mac_address(v)) {
-        return (
-            "MAC Address".to_string(),
-            "matches MAC address format".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_iban(v)) {
-        return (
-            "IBAN".to_string(),
-            "matches IBAN format (mod-97 checksum valid)".to_string(),
-        );
-    }
-    // ISBN/EAN/UPC/IMEI/VIN are all checked ahead of the broader-range
-    // credit card check below: they only match an exact 10, 12, 13, 15, or
-    // 17-character length, so the more narrowly-scoped match should win a
-    // tie (a 13-digit number can in principle satisfy both a card issuer's
-    // Luhn check and EAN-13's own mod-10 check by coincidence - genuinely
-    // undecidable from the digits alone without domain context, the same
-    // kind of irreducible ambiguity as a dotted-quad value being valid as
-    // both IPv4 and a version string; a VIN containing only digits, which
-    // the standard doesn't strictly forbid though real ones never do this,
-    // is the same story at 17 characters).
-    if values.iter().all(|v| is_isbn10(v)) {
-        return (
-            "ISBN-10".to_string(),
-            "matches ISBN-10 format (mod-11 checksum valid)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_isbn13(v)) {
-        return (
-            "ISBN-13".to_string(),
-            "matches ISBN-13 format (978/979 prefix, EAN-13 checksum valid)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_ean_or_upc(v)) {
-        return (
-            "EAN-13 / UPC-A".to_string(),
-            "matches EAN-13/UPC-A barcode format (checksum valid)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_imei(v)) {
-        return (
-            "IMEI".to_string(),
-            "matches IMEI format (15 digits, Luhn checksum valid)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_vin(v)) {
-        return (
-            "VIN".to_string(),
-            "matches Vehicle Identification Number format (mod-11 checksum valid)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_credit_card_number(v)) {
-        return (
-            "Credit Card Number".to_string(),
-            "matches card number format (Luhn checksum valid)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_uuid(v)) {
-        return ("UUID".to_string(), "matches UUID format".to_string());
-    }
-    // Checked ahead of parse_prefixed_int further down: a ULID beginning
-    // "0X..." (a real, valid Crockford digit sequence) would otherwise get
-    // intercepted by the "0x" hex-literal prefix check first, since that
-    // needs only a 2-character match versus this check's full 26.
-    if values.iter().all(|v| is_ulid(v)) {
-        return (
-            "ULID".to_string(),
-            "matches ULID format (Crockford base32, valid timestamp bits)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_email(v)) {
-        return (
-            "Email".to_string(),
-            "matches email address format".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_ipv4(v)) {
-        return (
-            "IPv4".to_string(),
-            "matches IPv4 address format".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_ipv6(v)) {
-        return (
-            "IPv6".to_string(),
-            "matches IPv6 address format".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_cidr(v)) {
-        return (
-            "CIDR".to_string(),
-            "matches CIDR notation (address/prefix-length, valid range)".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_semver(v)) {
-        return (
-            "SemVer".to_string(),
-            "matches MAJOR.MINOR.PATCH semver.org format".to_string(),
-        );
-    }
-    if values.iter().all(|v| is_url(v)) {
-        return ("URL".to_string(), "matches URL format".to_string());
-    }
+/// An incremental, one-value-at-a-time engine backing `suggest_ideal_type`
+/// (below) - built so peak memory for type detection can eventually drop
+/// below "every value in a column held in memory at once" (see CLAUDE.md's
+/// "Streaming reads / memory footprint" section, Tier 2). Every check
+/// `suggest_ideal_type` performs reduces to one of three shapes, all
+/// commutative/associative and therefore safe to compute incrementally with
+/// results identical to the original whole-slice version regardless of
+/// what order values arrive in:
+///   - an AND across every value of a stateless per-value predicate (the
+///     23 precise-grammar checks, bool-word, and the 34+38 date/time
+///     candidate formats) - one running `bool` per check, ANDed on `push`,
+///     with a skip-forever-once-false early exit that reproduces `.all()`'s
+///     own short-circuit cost exactly.
+///   - an OR across every value (`has_leading_zero`) - one running `bool`,
+///     ORed on `push`.
+///   - a handful of genuinely stateful mini-accumulators: the hash-digest
+///     "first value sets a candidate, every later value must equal it"
+///     check, the i64/f64 numeric branch's own flags, and the category/
+///     enum unique-value `HashSet` (already written this way inline in the
+///     original function, just never fed one value at a time before now).
+///
+/// `suggest_ideal_type` itself is now a thin wrapper over this type - the
+/// single source of truth for every check's exact logic and priority
+/// order lives here, not duplicated between an incremental and a
+/// whole-slice version.
+struct IdealTypeAccumulator {
+    hex_color_ok: bool,
+    mac_address_ok: bool,
+    iban_ok: bool,
+    isbn10_ok: bool,
+    isbn13_ok: bool,
+    ean_upc_ok: bool,
+    imei_ok: bool,
+    vin_ok: bool,
+    credit_card_ok: bool,
+    uuid_ok: bool,
+    ulid_ok: bool,
+    email_ok: bool,
+    ipv4_ok: bool,
+    ipv6_ok: bool,
+    cidr_ok: bool,
+    semver_ok: bool,
+    url_ok: bool,
+    prefixed_int_ok: bool,
+    jwt_ok: bool,
+    embedded_json_ok: bool,
+    wkt_ok: bool,
+    lat_lon_ok: bool,
+    cron_ok: bool,
 
-    if values.iter().all(|v| parse_prefixed_int(v).is_some()) {
-        return (
-            "i64".to_string(),
-            "base-prefixed literal (0x/0b/0o), decoded from its declared base".to_string(),
-        );
-    }
+    // Hash-digest-shape: no "AND identity" starting state makes sense here
+    // (it depends on the *first* pushed value, not a fixed predicate), so
+    // both fields start in their "hasn't fired" state and are set once,
+    // on the first `push`.
+    hash_candidate: Option<&'static str>,
+    hash_first_len: usize,
+    hash_ok: bool,
 
-    if values.iter().all(|v| is_jwt(v)) {
-        return (
-            "JWT".to_string(),
-            "matches JSON Web Token format (header/payload decode as JSON objects)".to_string(),
-        );
-    }
+    // One running bool per candidate format, same shape as the grammar
+    // checks above but data-driven off `DATE_FORMATS`/`TIME_FORMATS`
+    // rather than a fixed field per check.
+    date_ok: Vec<bool>,
+    time_ok: Vec<bool>,
 
-    if values.iter().all(|v| is_embedded_json(v)) {
-        return (
-            "String".to_string(),
-            "cell holds embedded JSON (object/array) - consider parsing it separately".to_string(),
-        );
-    }
+    any_leading_zero: bool,
+    bool_word_ok: bool,
 
-    // Checked well ahead of the weaker lat/lon check below - the OGC
-    // keyword makes this a much stronger, more specific signal, the same
-    // "more specific match wins" principle as everywhere else in this file.
-    if values.iter().all(|v| is_wkt_geometry(v)) {
-        return (
-            "WKT Geometry".to_string(),
-            "matches Well-Known Text geometry format".to_string(),
-        );
-    }
+    i64_ok: bool,
+    f64_ok: bool,
+    any_percent: bool,
+    any_nonfinite: bool,
+    any_precision_loss: bool,
 
-    // Checked last among the "precise grammar" checks, deliberately: unlike
-    // everything above it, this has no checksum or fixed prefix to rule out
-    // coincidence - see is_lat_lon_pair's own doc comment.
-    if values.iter().all(|v| is_lat_lon_pair(v)) {
-        return (
-            "Geographic Coordinates".to_string(),
-            "matches \"lat,lon\" within valid ranges (±90/±180)".to_string(),
-        );
-    }
+    // Identical shape to the original inline loop: insert until the count
+    // exceeds 50, then stop inserting entirely - `category_disqualified`
+    // is what lets `push` skip the (now pointless) `contains`/`insert`
+    // work for the rest of the column, the same "never finishes the scan"
+    // optimization the original code already had.
+    unique: HashSet<String, FxBuildHasher>,
+    category_disqualified: bool,
 
-    // Same tier as is_lat_lon_pair, same reason: no checksum or prefix, so
-    // this carries the same kind of disclosed, irreducible ambiguity - see
-    // is_cron_expression's own doc comment.
-    if values.iter().all(|v| is_cron_expression(v)) {
-        return (
-            "Cron Expression".to_string(),
-            "matches 5-field cron format (minute hour day-of-month month day-of-week)".to_string(),
-        );
-    }
+    total: usize,
+}
 
-    // Note-only, never a type change: see hash_digest_kind's doc comment
-    // for why this is deliberately the weakest-confidence check here.
-    if let Some(kind) = values.first().and_then(|first| hash_digest_kind(first))
-        && values.iter().all(|v| hash_digest_kind(v) == Some(kind))
-    {
-        return (
-            "String".to_string(),
-            format!(
-                "matches {kind} hex-digest length ({} hex chars) - shape only, not a validated hash",
-                values[0].len()
-            ),
-        );
-    }
+impl IdealTypeAccumulator {
+    fn new() -> Self {
+        IdealTypeAccumulator {
+            hex_color_ok: true,
+            mac_address_ok: true,
+            iban_ok: true,
+            isbn10_ok: true,
+            isbn13_ok: true,
+            ean_upc_ok: true,
+            imei_ok: true,
+            vin_ok: true,
+            credit_card_ok: true,
+            uuid_ok: true,
+            ulid_ok: true,
+            email_ok: true,
+            ipv4_ok: true,
+            ipv6_ok: true,
+            cidr_ok: true,
+            semver_ok: true,
+            url_ok: true,
+            prefixed_int_ok: true,
+            jwt_ok: true,
+            embedded_json_ok: true,
+            wkt_ok: true,
+            lat_lon_ok: true,
+            cron_ok: true,
 
-    // Date/time formats are checked before the leading-zero heuristic below:
-    // a value like "01/15/2024" or "09:00:00" has a leading zero on its
-    // month/hour, but it's a structured date/time, not a numeric ID that
-    // lost a zero - the more specific, fully-explaining match should win.
-    if let Some(fmt) = matching_date_format(values) {
-        return (
-            "NaiveDate / DateTime".to_string(),
-            format!("all values match date format \"{fmt}\""),
-        );
-    }
+            hash_candidate: None,
+            hash_first_len: 0,
+            hash_ok: false,
 
-    if let Some(fmt) = matching_time_format(values) {
-        return (
-            "NaiveTime".to_string(),
-            format!("all values match time format \"{fmt}\""),
-        );
-    }
+            date_ok: vec![true; DATE_FORMATS.len()],
+            time_ok: vec![true; TIME_FORMATS.len()],
 
-    if values.iter().any(|v| has_leading_zero(v)) {
-        let mut note = "leading zeros in raw values (likely an ID/code)".to_string();
-        if current == "i64" || current == "f64" {
-            note.push_str(" - a naive numeric parse already lost them");
+            any_leading_zero: false,
+            bool_word_ok: true,
+
+            i64_ok: true,
+            f64_ok: true,
+            any_percent: false,
+            any_nonfinite: false,
+            any_precision_loss: false,
+
+            unique: HashSet::default(),
+            category_disqualified: false,
+
+            total: 0,
         }
-        return ("String".to_string(), note);
     }
 
-    if values.iter().all(|v| is_bool_word(v)) {
-        return (
-            "bool".to_string(),
-            "values are yes/no/true/false/on/off".to_string(),
-        );
-    }
-
-    // Both the i64 and the f64 branch require *every* value to parse, so
-    // if the very first value doesn't even parse as f64 (the looser of
-    // the two) the column can't be either - skip normalizing every value
-    // and building the two full-length `Vec`s those branches need. A
-    // plain free-text or category-label column (a common shape, and
-    // `suggest_ideal_type`'s own documented worst case) takes this path.
-    let first_parses_numeric = values
-        .first()
-        .is_some_and(|v| normalize_numeric_str(v).0.parse::<f64>().is_ok());
-    if first_parses_numeric {
-        let normalized: Vec<(Cow<str>, bool)> =
-            values.iter().map(|v| normalize_numeric_str(v)).collect();
-        let any_percent = normalized.iter().any(|(_, pct)| *pct);
-        let cleaned_refs: Vec<&str> = normalized.iter().map(|(s, _)| s.as_ref()).collect();
-
-        if cleaned_refs.iter().all(|v| v.parse::<i64>().is_ok()) {
-            return ("i64".to_string(), numeric_note(current, "i64", any_percent));
+    fn push(&mut self, v: &str) {
+        if self.hex_color_ok {
+            self.hex_color_ok = is_hex_color(v);
         }
-        if cleaned_refs.iter().all(|v| v.parse::<f64>().is_ok()) {
-            let mut note = numeric_note(current, "f64", any_percent);
-            // Rust's f64 parser accepts "inf"/"infinity"/"nan" (any case, signed)
-            // as legitimate values - real IEEE-754 special values, not a parse
-            // error - so a stray "Infinity" typed into an otherwise-clean numeric
-            // column sails through silently unless flagged explicitly here.
-            if cleaned_refs
-                .iter()
-                .any(|v| v.parse::<f64>().is_ok_and(|f| !f.is_finite()))
-            {
+        if self.mac_address_ok {
+            self.mac_address_ok = is_mac_address(v);
+        }
+        if self.iban_ok {
+            self.iban_ok = is_iban(v);
+        }
+        if self.isbn10_ok {
+            self.isbn10_ok = is_isbn10(v);
+        }
+        if self.isbn13_ok {
+            self.isbn13_ok = is_isbn13(v);
+        }
+        if self.ean_upc_ok {
+            self.ean_upc_ok = is_ean_or_upc(v);
+        }
+        if self.imei_ok {
+            self.imei_ok = is_imei(v);
+        }
+        if self.vin_ok {
+            self.vin_ok = is_vin(v);
+        }
+        if self.credit_card_ok {
+            self.credit_card_ok = is_credit_card_number(v);
+        }
+        if self.uuid_ok {
+            self.uuid_ok = is_uuid(v);
+        }
+        if self.ulid_ok {
+            self.ulid_ok = is_ulid(v);
+        }
+        if self.email_ok {
+            self.email_ok = is_email(v);
+        }
+        if self.ipv4_ok {
+            self.ipv4_ok = is_ipv4(v);
+        }
+        if self.ipv6_ok {
+            self.ipv6_ok = is_ipv6(v);
+        }
+        if self.cidr_ok {
+            self.cidr_ok = is_cidr(v);
+        }
+        if self.semver_ok {
+            self.semver_ok = is_semver(v);
+        }
+        if self.url_ok {
+            self.url_ok = is_url(v);
+        }
+        if self.prefixed_int_ok {
+            self.prefixed_int_ok = parse_prefixed_int(v).is_some();
+        }
+        if self.jwt_ok {
+            self.jwt_ok = is_jwt(v);
+        }
+        if self.embedded_json_ok {
+            self.embedded_json_ok = is_embedded_json(v);
+        }
+        if self.wkt_ok {
+            self.wkt_ok = is_wkt_geometry(v);
+        }
+        if self.lat_lon_ok {
+            self.lat_lon_ok = is_lat_lon_pair(v);
+        }
+        if self.cron_ok {
+            self.cron_ok = is_cron_expression(v);
+        }
+
+        if self.total == 0 {
+            self.hash_candidate = hash_digest_kind(v);
+            self.hash_first_len = v.len();
+            self.hash_ok = self.hash_candidate.is_some();
+        } else if self.hash_ok {
+            self.hash_ok = hash_digest_kind(v) == self.hash_candidate;
+        }
+
+        for (fmt, ok) in DATE_FORMATS.iter().zip(self.date_ok.iter_mut()) {
+            if *ok {
+                *ok = matches_date_format(v, fmt);
+            }
+        }
+        for (fmt, ok) in TIME_FORMATS.iter().zip(self.time_ok.iter_mut()) {
+            if *ok {
+                *ok = matches_date_format(v, fmt);
+            }
+        }
+
+        if has_leading_zero(v) {
+            self.any_leading_zero = true;
+        }
+        if self.bool_word_ok {
+            self.bool_word_ok = is_bool_word(v);
+        }
+
+        let (cleaned, is_pct) = normalize_numeric_str(v);
+        if is_pct {
+            self.any_percent = true;
+        }
+        if self.i64_ok {
+            self.i64_ok = cleaned.parse::<i64>().is_ok();
+        }
+        if self.f64_ok {
+            match cleaned.parse::<f64>() {
+                Ok(f) => {
+                    if !f.is_finite() {
+                        self.any_nonfinite = true;
+                    }
+                }
+                Err(_) => self.f64_ok = false,
+            }
+        }
+        if is_plain_integer_literal(&cleaned) && cleaned.parse::<i64>().is_err() {
+            self.any_precision_loss = true;
+        }
+
+        if !self.category_disqualified && !self.unique.contains(v) {
+            self.unique.insert(v.to_string());
+            if self.unique.len() > 50 {
+                self.category_disqualified = true;
+            }
+        }
+
+        self.total += 1;
+    }
+
+    fn finish(self, current: &str) -> (String, String) {
+        if self.hex_color_ok {
+            return (
+                "Hex Color".to_string(),
+                "matches #RGB/#RGBA/#RRGGBB/#RRGGBBAA hex color format".to_string(),
+            );
+        }
+        if self.mac_address_ok {
+            return (
+                "MAC Address".to_string(),
+                "matches MAC address format".to_string(),
+            );
+        }
+        if self.iban_ok {
+            return (
+                "IBAN".to_string(),
+                "matches IBAN format (mod-97 checksum valid)".to_string(),
+            );
+        }
+        if self.isbn10_ok {
+            return (
+                "ISBN-10".to_string(),
+                "matches ISBN-10 format (mod-11 checksum valid)".to_string(),
+            );
+        }
+        if self.isbn13_ok {
+            return (
+                "ISBN-13".to_string(),
+                "matches ISBN-13 format (978/979 prefix, EAN-13 checksum valid)".to_string(),
+            );
+        }
+        if self.ean_upc_ok {
+            return (
+                "EAN-13 / UPC-A".to_string(),
+                "matches EAN-13/UPC-A barcode format (checksum valid)".to_string(),
+            );
+        }
+        if self.imei_ok {
+            return (
+                "IMEI".to_string(),
+                "matches IMEI format (15 digits, Luhn checksum valid)".to_string(),
+            );
+        }
+        if self.vin_ok {
+            return (
+                "VIN".to_string(),
+                "matches Vehicle Identification Number format (mod-11 checksum valid)".to_string(),
+            );
+        }
+        if self.credit_card_ok {
+            return (
+                "Credit Card Number".to_string(),
+                "matches card number format (Luhn checksum valid)".to_string(),
+            );
+        }
+        if self.uuid_ok {
+            return ("UUID".to_string(), "matches UUID format".to_string());
+        }
+        if self.ulid_ok {
+            return (
+                "ULID".to_string(),
+                "matches ULID format (Crockford base32, valid timestamp bits)".to_string(),
+            );
+        }
+        if self.email_ok {
+            return (
+                "Email".to_string(),
+                "matches email address format".to_string(),
+            );
+        }
+        if self.ipv4_ok {
+            return (
+                "IPv4".to_string(),
+                "matches IPv4 address format".to_string(),
+            );
+        }
+        if self.ipv6_ok {
+            return (
+                "IPv6".to_string(),
+                "matches IPv6 address format".to_string(),
+            );
+        }
+        if self.cidr_ok {
+            return (
+                "CIDR".to_string(),
+                "matches CIDR notation (address/prefix-length, valid range)".to_string(),
+            );
+        }
+        if self.semver_ok {
+            return (
+                "SemVer".to_string(),
+                "matches MAJOR.MINOR.PATCH semver.org format".to_string(),
+            );
+        }
+        if self.url_ok {
+            return ("URL".to_string(), "matches URL format".to_string());
+        }
+        if self.prefixed_int_ok {
+            return (
+                "i64".to_string(),
+                "base-prefixed literal (0x/0b/0o), decoded from its declared base".to_string(),
+            );
+        }
+        if self.jwt_ok {
+            return (
+                "JWT".to_string(),
+                "matches JSON Web Token format (header/payload decode as JSON objects)".to_string(),
+            );
+        }
+        if self.embedded_json_ok {
+            return (
+                "String".to_string(),
+                "cell holds embedded JSON (object/array) - consider parsing it separately"
+                    .to_string(),
+            );
+        }
+        if self.wkt_ok {
+            return (
+                "WKT Geometry".to_string(),
+                "matches Well-Known Text geometry format".to_string(),
+            );
+        }
+        if self.lat_lon_ok {
+            return (
+                "Geographic Coordinates".to_string(),
+                "matches \"lat,lon\" within valid ranges (±90/±180)".to_string(),
+            );
+        }
+        if self.cron_ok {
+            return (
+                "Cron Expression".to_string(),
+                "matches 5-field cron format (minute hour day-of-month month day-of-week)"
+                    .to_string(),
+            );
+        }
+        if self.hash_ok
+            && let Some(kind) = self.hash_candidate
+        {
+            return (
+                "String".to_string(),
+                format!(
+                    "matches {kind} hex-digest length ({} hex chars) - shape only, not a validated hash",
+                    self.hash_first_len
+                ),
+            );
+        }
+
+        if let Some(fmt) = DATE_FORMATS
+            .iter()
+            .zip(self.date_ok.iter())
+            .find(|(_, ok)| **ok)
+            .map(|(fmt, _)| *fmt)
+        {
+            return (
+                "NaiveDate / DateTime".to_string(),
+                format!("all values match date format \"{fmt}\""),
+            );
+        }
+        if let Some(fmt) = TIME_FORMATS
+            .iter()
+            .zip(self.time_ok.iter())
+            .find(|(_, ok)| **ok)
+            .map(|(fmt, _)| *fmt)
+        {
+            return (
+                "NaiveTime".to_string(),
+                format!("all values match time format \"{fmt}\""),
+            );
+        }
+
+        if self.any_leading_zero {
+            let mut note = "leading zeros in raw values (likely an ID/code)".to_string();
+            if current == "i64" || current == "f64" {
+                note.push_str(" - a naive numeric parse already lost them");
+            }
+            return ("String".to_string(), note);
+        }
+
+        if self.bool_word_ok {
+            return (
+                "bool".to_string(),
+                "values are yes/no/true/false/on/off".to_string(),
+            );
+        }
+
+        if self.i64_ok {
+            return (
+                "i64".to_string(),
+                numeric_note(current, "i64", self.any_percent),
+            );
+        }
+        if self.f64_ok {
+            let mut note = numeric_note(current, "f64", self.any_percent);
+            if self.any_nonfinite {
                 let extra = "contains a non-finite value (Infinity/NaN) - verify this isn't a data-quality sentinel before trusting downstream arithmetic";
                 note = if note.is_empty() {
                     extra.to_string()
@@ -4454,16 +4672,7 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
                     format!("{note}; {extra}")
                 };
             }
-            // A value that's itself a plain integer literal but individually
-            // failed i64 parsing (as opposed to merely being outvoted by some
-            // other, differently-shaped value in the same column, like the
-            // "infinity" case just above) is, by construction, already too
-            // large to represent exactly as f64 either - see
-            // is_plain_integer_literal's doc comment.
-            if cleaned_refs
-                .iter()
-                .any(|v| is_plain_integer_literal(v) && v.parse::<i64>().is_err())
-            {
+            if self.any_precision_loss {
                 let extra = "value(s) exceed i64's range and f64's exact-integer range (~2^53) - representing as float silently loses precision";
                 note = if note.is_empty() {
                     extra.to_string()
@@ -4473,48 +4682,46 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
             }
             return ("f64".to_string(), note);
         }
-    }
 
-    // Built incrementally with an early exit once the count passes 50,
-    // rather than an unconditional `values.iter().collect()` - the
-    // category check below can only ever fire when `unique.len() <= 50`,
-    // so once that's no longer true, no further insertion can change the
-    // outcome and the remaining values (which can genuinely be the
-    // overwhelming majority of a large, high-cardinality column - this is
-    // exactly `suggest_ideal_type`'s own documented free-text worst case)
-    // never need to be hashed at all. A column that stays at or under 50
-    // distinct values for its entire length still does the same full
-    // scan as before - this only ever removes work, never adds any.
-    // `FxBuildHasher`, not the default SipHash - see that type's own doc
-    // comment for why (profiler-confirmed: this exact loop, hashing the
-    // same short values over and over for a low-cardinality column, was
-    // the single largest cluster in a real profile).
-    let mut unique: HashSet<&str, FxBuildHasher> = HashSet::default();
-    for v in values.iter().copied() {
-        unique.insert(v);
-        if unique.len() > 50 {
+        if self.category_disqualified {
             return ("String".to_string(), String::new());
         }
-    }
-    // A single unique value is a degenerate case the ratio check below can
-    // never catch on a small file (10 rows / 1 unique value = 10%
-    // cardinality, already past the 5% bar) - constant is constant
-    // regardless of row count, so it's checked unconditionally first.
-    if unique.len() == 1 {
-        return (
-            "enum / category".to_string(),
-            "constant column (1 unique value)".to_string(),
-        );
-    }
-    let ratio = unique.len() as f64 / values.len() as f64;
-    if ratio < 0.05 {
-        return (
-            "enum / category".to_string(),
-            format!("low cardinality ({} unique values)", unique.len()),
-        );
-    }
+        if self.unique.len() == 1 {
+            return (
+                "enum / category".to_string(),
+                "constant column (1 unique value)".to_string(),
+            );
+        }
+        let ratio = self.unique.len() as f64 / self.total as f64;
+        if ratio < 0.05 {
+            return (
+                "enum / category".to_string(),
+                format!("low cardinality ({} unique values)", self.unique.len()),
+            );
+        }
 
-    ("String".to_string(), String::new())
+        ("String".to_string(), String::new())
+    }
+}
+
+/// The core type-detection heuristic: given a column's raw string values
+/// and its declared "current" type, returns an `(ideal_type, notes)` pair.
+/// A thin wrapper over `IdealTypeAccumulator` (above) - every check's exact
+/// logic and priority order lives there now, computed incrementally, with
+/// this function existing purely so the ~50 existing tests and
+/// `benches/heuristic_engine.rs` (see this function's own visibility note)
+/// keep working against the same whole-slice signature they always have.
+/// Public specifically so `benches/heuristic_engine.rs` can call it
+/// directly (in-process, no subprocess/I/O noise) - this is the one
+/// function in the crate's otherwise-private internals exposed for that
+/// reason alone, not as a general-purpose library API (`run()` remains the
+/// only supported entry point for actual use).
+pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
+    let mut acc = IdealTypeAccumulator::new();
+    for v in values {
+        acc.push(v);
+    }
+    acc.finish(current)
 }
 
 /// Escapes the two characters that would break a Markdown table cell.
@@ -4609,6 +4816,51 @@ fn naive_current_type(values: &[&str]) -> &'static str {
         "f64"
     } else {
         "String"
+    }
+}
+
+/// An incremental mirror of `naive_current_type` - same bool/i64/f64/String
+/// priority order, same vacuous-true-on-zero-pushes shape, just fed one
+/// value at a time instead of a whole slice. Used only by CSV's own
+/// streaming column accumulator (below); every other reader still calls
+/// `naive_current_type` directly against its own fully-collected slice.
+struct NaiveTypeAccumulator {
+    bool_ok: bool,
+    i64_ok: bool,
+    f64_ok: bool,
+}
+
+impl NaiveTypeAccumulator {
+    fn new() -> Self {
+        NaiveTypeAccumulator {
+            bool_ok: true,
+            i64_ok: true,
+            f64_ok: true,
+        }
+    }
+
+    fn push(&mut self, v: &str) {
+        if self.bool_ok {
+            self.bool_ok = v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false");
+        }
+        if self.i64_ok {
+            self.i64_ok = v.parse::<i64>().is_ok();
+        }
+        if self.f64_ok {
+            self.f64_ok = v.parse::<f64>().is_ok();
+        }
+    }
+
+    fn finish(&self) -> &'static str {
+        if self.bool_ok {
+            "bool"
+        } else if self.i64_ok {
+            "i64"
+        } else if self.f64_ok {
+            "f64"
+        } else {
+            "String"
+        }
     }
 }
 
@@ -4935,38 +5187,119 @@ fn stream_utf8_chunks_with_size(
     }
 }
 
-/// The streaming counterpart of `columns_from_csv`'s old
-/// `fs::read_to_string` + `parse_csv` pipeline: folds each record
-/// straight into per-column accumulators as `csv_feed_chunk` recognizes
-/// it, so the only thing ever held in memory proportional to the file's
-/// own size is the columnar data itself (still genuinely needed in full,
-/// for non-sampled type detection - see CLAUDE.md's own writeup on why
-/// that's a deliberate, disclosed limit rather than a further-reducible
-/// one) - never a second, separate copy of the raw file text or of every
-/// record re-materialized as a `Vec<Vec<String>>` first. `record_index`
-/// counts every record seen (skipped rows included), so `skip_rows`/the
-/// header row/real data rows are told apart the same way the old
-/// slice-based `records.split_off` version did - a file with fewer
-/// records than `skip_rows + 1` still correctly produces zero columns,
-/// `headers`/`col_values` simply never being populated.
+/// Per-column state `CsvColumnAccumulator` folds each qualifying field
+/// into as it streams by, replacing what used to be one `Vec<String>` per
+/// column (every value held resident for the whole read) with a bounded
+/// footprint: two small incremental type-detection accumulators plus a
+/// `samples` list capped at `n_samples` - see CLAUDE.md's "Streaming reads
+/// / memory footprint" section (Tier 2) for why this is the first reader
+/// converted this way, and which readers still hold a full column's
+/// values (everything else, for now).
+struct CsvColumnState {
+    total_non_null: usize,
+    ideal_acc: IdealTypeAccumulator,
+    naive_acc: NaiveTypeAccumulator,
+    samples: Vec<String>,
+}
+
+impl CsvColumnState {
+    fn new() -> Self {
+        CsvColumnState {
+            total_non_null: 0,
+            ideal_acc: IdealTypeAccumulator::new(),
+            naive_acc: NaiveTypeAccumulator::new(),
+            samples: Vec::new(),
+        }
+    }
+
+    /// `field` is the original, untrimmed value - matching the old
+    /// `Vec<String>`-based version, which stored (and fed to
+    /// `suggest_ideal_type`/samples) the raw field, only ever using its
+    /// trimmed form to decide whether it counts as missing at all.
+    fn push(&mut self, field: String, n_samples: usize) {
+        // Linear-scan dedup against `samples` itself, not a `HashSet` -
+        // same "n_samples is single digits" reasoning `profile_column`'s
+        // own sample loop already documents. Skipped entirely once full,
+        // so this never costs more than `profile_column`'s own bounded
+        // scan did.
+        if self.samples.len() < n_samples && !self.samples.iter().any(|s| s == &field) {
+            self.samples.push(field.clone());
+        }
+        self.ideal_acc.push(&field);
+        self.naive_acc.push(&field);
+        self.total_non_null += 1;
+    }
+
+    /// Mirrors `profile_column`'s remaining logic exactly (missing_pct,
+    /// the empty-column special case, the missing-values note suffix) -
+    /// this is CSV's own bypass of `ColumnInput`/`profile_column`, not a
+    /// generalization of it; every other reader still goes through those
+    /// unchanged.
+    fn into_profile(self, name: String, total: usize) -> ColumnProfile {
+        let CsvColumnState {
+            total_non_null,
+            ideal_acc,
+            naive_acc,
+            samples,
+        } = self;
+        let missing = total.saturating_sub(total_non_null);
+        let missing_pct = round1(if total > 0 {
+            missing as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        });
+        let (current_type, ideal_type, mut notes) = if total_non_null == 0 {
+            (
+                "String".to_string(),
+                "String".to_string(),
+                "column is empty/all null".to_string(),
+            )
+        } else {
+            let current_type = naive_acc.finish().to_string();
+            let (ideal_type, notes) = ideal_acc.finish(&current_type);
+            (current_type, ideal_type, notes)
+        };
+        if missing_pct > 0.0 {
+            let extra = "has missing values -> wrap in Option<T> / handle nulls";
+            notes = if notes.is_empty() {
+                extra.to_string()
+            } else {
+                format!("{notes}; {extra}")
+            };
+        }
+        ColumnProfile {
+            name,
+            current_type,
+            ideal_type,
+            description: String::new(),
+            missing_pct,
+            sample_values: samples,
+            notes,
+            row_count: total,
+        }
+    }
+}
+
 struct CsvColumnAccumulator {
     skip_rows: usize,
     nrows: Option<usize>,
+    n_samples: usize,
     record_index: usize,
     headers: Vec<String>,
-    col_values: Vec<Vec<String>>,
+    col_states: Vec<CsvColumnState>,
     total: usize,
     done: bool,
 }
 
 impl CsvColumnAccumulator {
-    fn new(skip_rows: usize, nrows: Option<usize>) -> Self {
+    fn new(skip_rows: usize, nrows: Option<usize>, n_samples: usize) -> Self {
         CsvColumnAccumulator {
             skip_rows,
             nrows,
+            n_samples,
             record_index: 0,
             headers: Vec::new(),
-            col_values: Vec::new(),
+            col_states: Vec::new(),
             total: 0,
             done: false,
         }
@@ -4980,7 +5313,7 @@ impl CsvColumnAccumulator {
             // A skipped leading row - discarded, never even reaching a
             // header or column concept.
         } else if self.record_index == self.skip_rows {
-            self.col_values = vec![Vec::new(); record.len()];
+            self.col_states = (0..record.len()).map(|_| CsvColumnState::new()).collect();
             self.headers = record;
         } else if self.nrows.is_some_and(|limit| self.total >= limit) {
             self.done = true;
@@ -4995,7 +5328,7 @@ impl CsvColumnAccumulator {
             for (col_idx, field) in record.into_iter().enumerate() {
                 let trimmed = field.trim();
                 if !(trimmed.is_empty() || is_missing_sentinel(trimmed)) {
-                    self.col_values[col_idx].push(field);
+                    self.col_states[col_idx].push(field, self.n_samples);
                 }
             }
             self.total += 1;
@@ -5014,29 +5347,32 @@ impl CsvColumnAccumulator {
 /// them (a record, or a field within one, can span a chunk boundary -
 /// `csv_state`/`field`/`record` below are exactly the state that lets it
 /// resume correctly), and `CsvColumnAccumulator` folds each record
-/// straight into its own per-column storage as it arrives. The only
-/// thing still held proportional to the file's own size is that columnar
-/// data itself - genuinely unavoidable while type detection stays
-/// non-sampled (see CLAUDE.md's own writeup on this), but a real,
-/// meaningful reduction from the old `fs::read_to_string` + `parse_csv`
-/// pipeline's peak of "the whole raw file text *and* the fully-parsed
-/// structure held at once." `--nrows` now also bounds real disk I/O, not
-/// just how many rows end up profiled - `CsvColumnAccumulator::done`
-/// flows back out through `csv_feed_chunk`'s `on_record` callback to
+/// straight into its own per-column `CsvColumnState` as it arrives -
+/// itself now a bounded footprint (two small type-detection accumulators
+/// plus up to `n_samples` sample values) rather than a `Vec<String>`
+/// holding every value in the column, the Tier 2 win CLAUDE.md's
+/// "Streaming reads / memory footprint" section describes. `--nrows` still
+/// bounds real disk I/O the same way it always has - `CsvColumnAccumulator::
+/// done` flows back out through `csv_feed_chunk`'s `on_record` callback to
 /// `stream_utf8_chunks`'s own early-stop signal, so a `--nrows 100` run
 /// against a multi-gigabyte file stops reading it once 100 rows are in
 /// hand, rather than reading the whole thing first and truncating after.
+/// This bypasses `ColumnInput`/`profile_column` entirely (both unchanged,
+/// still used by every other reader) - building `ColumnProfile`s directly
+/// from each column's already-reduced state via `CsvColumnState::
+/// into_profile`.
 fn columns_from_csv(
     path: &Path,
     nrows: Option<usize>,
     delimiter: u8,
     skip_rows: usize,
-) -> Result<Vec<ColumnInput>> {
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
     let delimiter = delimiter as char;
     let mut csv_state = CsvState::StartRecord;
     let mut field = String::new();
     let mut record: Vec<String> = Vec::new();
-    let mut acc = CsvColumnAccumulator::new(skip_rows, nrows);
+    let mut acc = CsvColumnAccumulator::new(skip_rows, nrows, n_samples);
     let mut first_chunk = true;
 
     stream_utf8_chunks(path, |chunk| {
@@ -5071,29 +5407,13 @@ fn columns_from_csv(
         acc.accept(std::mem::take(&mut record))?;
     }
 
-    // One `Vec<String>` per column holding only the non-null values,
-    // plus a running row count - rather than a `Vec<Vec<Option<String>>>`
-    // (an `Option` slot per cell, cols x rows of them) that then has to
-    // be flattened per column. `profile_column` reconstructs
-    // `missing_pct` from `total` minus the value count, so the `None`
-    // slots were never needed.
-    let mut columns = Vec::new();
-    for (name, non_null) in acc.headers.into_iter().zip(acc.col_values) {
-        let current_type = if non_null.is_empty() {
-            "String".to_string()
-        } else {
-            let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-            naive_current_type(&refs).to_string()
-        };
-        columns.push(ColumnInput {
-            name,
-            current_type,
-            raw_values: non_null,
-            total: acc.total,
-            skip_heuristics: false,
-        });
-    }
-    Ok(columns)
+    let total = acc.total;
+    Ok(acc
+        .headers
+        .into_iter()
+        .zip(acc.col_states)
+        .map(|(name, state)| state.into_profile(name, total))
+        .collect())
 }
 
 // A leading row above the real header is a real, observed pattern with (at
@@ -50997,18 +51317,12 @@ fn dispatch_reader(
             InputFormat::Csv => {
                 let delim = args.delimiter.unwrap_or(',') as u8;
                 let skip_rows = resolve_skip_rows(args.skip_rows, read_path, delim);
-                columns_from_csv(read_path, args.nrows, delim, skip_rows)?
-                    .into_iter()
-                    .map(|c| profile_column(c, args.samples))
-                    .collect()
+                columns_from_csv(read_path, args.nrows, delim, skip_rows, args.samples)?
             }
             InputFormat::Tsv => {
                 let delim = args.delimiter.unwrap_or('\t') as u8;
                 let skip_rows = resolve_skip_rows(args.skip_rows, read_path, delim);
-                columns_from_csv(read_path, args.nrows, delim, skip_rows)?
-                    .into_iter()
-                    .map(|c| profile_column(c, args.samples))
-                    .collect()
+                columns_from_csv(read_path, args.nrows, delim, skip_rows, args.samples)?
             }
             InputFormat::Json => columns_from_json(read_path, args.nrows, args.samples)?,
             InputFormat::Parquet => columns_from_parquet(read_path, args.nrows, args.samples)?,
@@ -54656,10 +54970,10 @@ mod tests {
         let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, with_preamble.as_bytes()).unwrap();
 
-        let cols = columns_from_csv(tmp.path(), None, b',', 1).unwrap();
+        let cols = columns_from_csv(tmp.path(), None, b',', 1, 3).unwrap();
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "name", "age"]);
-        assert_eq!(cols[0].raw_values, vec!["1", "2"]);
+        assert_eq!(cols[0].sample_values, vec!["1", "2"]);
     }
 
     #[test]
@@ -54668,7 +54982,7 @@ mod tests {
         let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, tiny.as_bytes()).unwrap();
 
-        let cols = columns_from_csv(tmp.path(), None, b',', 100).unwrap();
+        let cols = columns_from_csv(tmp.path(), None, b',', 100, 3).unwrap();
         assert!(cols.is_empty());
     }
 

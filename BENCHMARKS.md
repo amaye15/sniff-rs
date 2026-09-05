@@ -33,6 +33,39 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/incremental-ideal-type` branch (Darwin arm64)
+
+`suggest_ideal_type` converted from a whole-slice `&[&str]` function to a
+thin wrapper over a new `IdealTypeAccumulator` (one running bool/small
+state per check, fed one value at a time, mathematically identical
+results to the original by construction - see CLAUDE.md's "Streaming
+reads / memory footprint" section for the full writeup), then CSV wired
+through it directly (`CsvColumnState` replacing `CsvColumnAccumulator`'s
+old `Vec<Vec<String>>`), bypassing `ColumnInput`/`profile_column` for CSV
+only - every other reader unchanged.
+
+Measured on two real files: a 180 MB, 500,000-row CSV with a deliberately
+extreme 300-character free-text column - full-scan maxRSS 346 MB ->
+3.5 MB (~99%), peak footprint 282 MB -> 2.4 MB (~99%), consistent across
+3 rounds. A more realistic 318 MB, 2,000,000-row file (id/name/email/
+amount/free-text) - maxRSS 856 MB -> 3.9 MB (~99.5%), peak footprint
+824 MB -> 2.8 MB (~99.7%). Output byte-identical via `diff` in both
+cases, and across every committed `.csv` fixture (48 files) at two
+`--samples` settings, plus a 200,000-column randomized fuzz-equivalence
+check (development-only, not committed) proving the new accumulator
+matches the old whole-slice logic exactly across eight value shapes.
+
+Verified via the complete existing test suite (347 unit + 308
+integration against a clean baseline) passing with only two direct
+`columns_from_csv` unit tests updated (`raw_values` assertions became
+`sample_values`, since `ColumnInput` is no longer part of CSV's own
+pipeline), plus a byte-identical `--output-format json` diff against the
+pre-change binary across the entire 359-file fixture corpus (every
+format, not just CSV). Clippy/fmt clean across default/`full`, matching
+established baselines (default=1, full=5) exactly.
+
+---
+
 ## 2026-09-05 — `feat/streaming-xls` branch (Darwin arm64)
 
 `xlsx_support::CfbFile` (OLE2/Compound File Binary, backing old-style

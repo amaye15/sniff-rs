@@ -4623,17 +4623,137 @@ clean across the default, `xlsx`, and `full` builds, each matching its
 own already-established baseline (default=1, xlsx=4, full=5) exactly -
 zero new warnings introduced.
 
-**Deliberately not done yet**: per-entry streaming decompression inside
-`ZipArchive::read` itself (described above) is a real, disclosed,
-separately-scoped remaining gap. A genuine per-BIFF8-record streaming
-rewrite of `.xls` itself (as opposed to the container-level fix above)
-remains out of scope for the reason already stated - the Workbook
-stream's own record layout requires random access within it regardless
-of how the container bytes reach memory. The `suggest_ideal_type`
-incremental-accumulator rewrite (the deeper win described earlier in
-this section) remains entirely unstarted, tracked as its own future
-phase. With this phase, every format on the original streaming roadmap
-has now been converted or audited-and-found-already-streaming.
+With the `.xls` phase, every format on the original streaming roadmap
+(Tier 1: stop double-buffering a whole-file read alongside its own parsed
+structure) has now been converted or audited-and-found-already-streaming.
+Two items remained explicitly deferred at that point: per-entry streaming
+decompression inside `ZipArchive::read`, and the much bigger Tier 2 win -
+making `suggest_ideal_type` itself incremental, so peak memory could drop
+*below* one column's worth of values, not just stop double-buffering it.
+The user picked Tier 2 next.
+
+**`suggest_ideal_type` went incremental (Tier 2) in two phases - the
+accumulator engine itself, then wiring exactly one reader (CSV) through
+it - deliberately not both readers and engine at once**, given this is,
+by this file's own account, the single most heavily tested,
+adversarially-fuzzed, real-world-corpus-validated function in the entire
+codebase (53 references, 50 of them direct test call sites).
+
+**Phase A: `IdealTypeAccumulator`.** Every one of `suggest_ideal_type`'s
+~30 checks turned out to reduce to one of three shapes, all commutative/
+associative and therefore safe to compute one value at a time with
+results identical to the original whole-slice version regardless of
+what order values arrive in: an AND across every value of a stateless
+per-value predicate (the 23 precise-grammar checks, bool-word, and the
+34+4 date/time candidate formats - one running `bool` per check, ANDed
+on `push`, with a skip-forever-once-false early exit that reproduces
+`.all()`'s own short-circuit cost exactly - a check that fails on value 0
+still costs O(1) for the whole column, same as before); an OR across
+every value (`has_leading_zero`); and a handful of genuinely stateful
+mini-accumulators - the category/enum `HashSet` (already written inline
+in exactly this "insert incrementally, bail past a 50-cap" shape, just
+never fed one value at a time before), the hash-digest-kind "first value
+sets a candidate, every later value must equal it" check, and the i64/f64
+numeric branch's own flags (`any_percent`/`any_nonfinite`/
+`any_precision_loss`, all computed off one shared `normalize_numeric_str`
+call per value regardless of which type ultimately wins). One real
+optimization fell out for free: the old `first_parses_numeric` gate
+(skip building two full-length `Vec`s if `values.first()` doesn't parse
+as f64) turned out to be provably redundant, not just fast - if the
+first value fails f64, it necessarily fails i64 too, so the branch would
+fail via `.all()` anyway - so the incremental version needs no
+equivalent gate at all.
+
+`suggest_ideal_type` itself became a thin wrapper (`let mut acc =
+IdealTypeAccumulator::new(); for v in values { acc.push(v); }
+acc.finish(current)`) - this is the safety-critical move: the public
+signature and all 50 existing direct tests keep exercising the exact
+same entry point, so there's no second, divergent implementation to
+drift out of sync. Verified four ways before trusting it: the complete
+existing test suite (347 unit tests on `--features full`, 211 default,
+zero modifications needed) passing unchanged; a temporary, development-
+only fuzz-equivalence test (not committed) that reimplemented the old
+whole-slice logic under a different name and compared it against the
+new accumulator across 200,000 randomly generated columns spanning
+eight different value shapes (random ASCII/unicode, digit strings,
+formatted floats, UUID-like values, near-miss UUIDs, dates, leading-zero
+codes) crossed with four different `current` strings - zero mismatches;
+a byte-identical `--output-format json` `diff` against the pre-change
+binary across the *entire* committed fixture corpus (359 files, every
+format this project reads, not just CSV/JSON) - zero mismatches; and
+clippy/fmt clean across default/`full`, matching established baselines
+exactly (`matching_date_format`/`matching_time_format` picked up
+`#[allow(dead_code)]` - kept for their own direct unit tests, but no
+longer called from `suggest_ideal_type`, which now tracks the same
+34+4 candidate formats as running per-format booleans instead of
+re-scanning the whole slice per candidate).
+
+**Phase B: wiring CSV through it.** Scope deliberately narrowed to CSV
+alone, matching every earlier phase's own "one format, fully verified,
+then stop" discipline - Excel, fixed-width, NumPy, dBase, Stata,
+SAS7BDAT, SPSS, ORC (all `profile_column`-based) and every JSON-shaped
+nested format (all `profile_json_path`-based) are explicitly not
+touched here; `ColumnInput`/`profile_column` themselves are untouched,
+still used unchanged by every other reader. A new `NaiveTypeAccumulator`
+(a 3-flag bool/i64/f64 incremental mirror of `naive_current_type`, used
+only by CSV) and `CsvColumnState` (bundling an `IdealTypeAccumulator`, a
+`NaiveTypeAccumulator`, a running non-null count, and an `n_samples`-
+capped `samples` list) replace `CsvColumnAccumulator`'s old
+`col_values: Vec<Vec<String>>` - each qualifying field is folded
+straight into its column's `CsvColumnState` as `csv_feed_chunk`
+recognizes it (sample collection first, since it needs to clone before
+the value is borrowed into the two type accumulators; the same linear-
+scan-dedup-capped-at-`n_samples` shape `profile_column`'s own sample
+loop already uses), rather than ever being pushed onto a `Vec<String>`
+that lives for the rest of the read. `columns_from_csv` now returns
+`Vec<ColumnProfile>` directly via `CsvColumnState::into_profile`
+(replicating `profile_column`'s exact remaining logic - missing_pct,
+the empty-column special case, the missing-values note suffix) -
+bypassing `ColumnInput`/`profile_column` entirely for CSV, so no other
+reader's code path is touched at all.
+
+This is the first phase in this whole section where the *full, whole-
+file* measurement is the clean, unmasked number - every earlier
+Seek-tier phase's own full-scan measurement was partly or fully masked
+by exactly this downstream per-column storage cost (documented
+repeatedly throughout this section as "the real constraint"), so this
+phase's numbers are, structurally, what all of those were always
+waiting on. Measured on two real files: a 180 MB, 500,000-row CSV with
+a deliberately extreme 300-character free-text column (id/uuid/
+description/amount/category) - full-scan maxRSS 346 MB -> 3.5 MB
+(~99%), peak footprint 282 MB -> 2.4 MB (~99%), consistent across 3
+repeated rounds (342-324 MB -> 3.3-3.7 MB each round); and a more
+realistic 318 MB, 2,000,000-row file (id/name/email/amount/free-text,
+matching Tier 1's own original CSV-phase fixture shape) - maxRSS 856 MB
+-> 3.9 MB (~99.5%), peak footprint 824 MB -> 2.8 MB (~99.7%). The
+realistic file's reduction is just as dramatic as the deliberately
+extreme one because every column in it - not just the free-text one -
+is naturally high-cardinality (sequential ids, per-row unique emails,
+word-combination free text), so under Tier 1 every single column still
+paid for one heap-allocated `String` per row regardless of content;
+Tier 2 removes all of that for CSV, not just the column that happens to
+look obviously unbounded. Output confirmed byte-identical via `diff` in
+both cases, and separately across every `--samples`/`--nrows`
+combination tested (1/3/5/10 samples, with and without `--nrows 5`) on
+`type_detection.csv`, plus every committed `.csv` fixture at two
+different `--samples` settings (48 files x 2 - zero mismatches).
+Full test suite (347 unit + 308 integration against a clean baseline,
+two unit tests updated - `raw_values` assertions became `sample_values`
+ones, since `ColumnInput` is no longer part of CSV's own pipeline -
+zero other changes needed) and clippy/fmt clean across default/`full`,
+matching established baselines exactly.
+
+**Deliberately not done yet**: every other `profile_column`/
+`profile_json_path`-based reader still holds a full column's values
+resident (Excel, fixed-width, NumPy, dBase, Stata, SAS7BDAT, SPSS, ORC,
+JSON, YAML, TOML, Avro, MessagePack, CBOR, XML, Parquet/Arrow's nested
+columns) - each would need its own `ColumnInput`/`profile_column` (or
+`profile_json_path`) call site converted the same way CSV's was, and
+each deserves its own real-file measurement before being called done,
+the same one-phase-at-a-time discipline this whole section has already
+used throughout. Per-entry streaming decompression inside
+`ZipArchive::read` itself remains a real, disclosed, separately-scoped
+remaining gap, not folded into either phase here.
 
 ## Cloud-platform file compatibility
 
