@@ -1,0 +1,20 @@
+# literal block scalars
+literal_keep: |
+  line one
+  line two
+  line three
+
+folded: >
+  this is a long
+  folded text that
+  should join with spaces
+
+literal_strip: |-
+  no trailing newline
+folded_keep: |+
+  keep trailing newline
+
+plain: simple value
+number: 42
+bool_val: true
+null_val: null

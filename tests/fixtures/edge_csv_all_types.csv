@@ -1,0 +1,3 @@
+uuid,email,ipv4,ipv6,url,hex_color,iban,credit_card,isbn,custom
+550e8400-e29b-41d4-a716-446655440000,alice@example.com,192.168.1.1,2001:db8::1,https://example.com,#FF5733,GB29NWBK60161331926819,4111111111111111,9780306406157,plain
+6fa459ea-ee8a-3ca4-894e-db77e160355e,bob@example.org,10.0.0.5,2001:db8::2,http://example.org,#00FF00,DE89370400440532013000,5500005555555559,9780132350884,plain2

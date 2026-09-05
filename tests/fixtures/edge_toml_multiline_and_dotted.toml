@@ -1,0 +1,25 @@
+title = "TOML Edge"
+str_basic = "basic"
+str_literal = 'literal\nnot escaped'
+str_multiline_basic = """
+first line
+second line"""
+str_multiline_literal = '''
+first literal
+second literal'''
+
+[database]
+server = "192.168.1.1"
+ports = [8000, 8001, 8002]
+
+[database.connection]
+max = 5000
+enabled = true
+
+# Dotted keys creating subtables
+a.b.c = 1
+a.b.d = 2
+a.e = 3
+
+inline = {x = 1, y = 2, z = 3}
+numbers = [1, 2, 3,]

@@ -1,0 +1,5 @@
+id,float_col,desc
+1,1.5,normal
+2,Infinity,should note non-finite
+3,NaN,also non-finite
+4,-inf,lowercase inf

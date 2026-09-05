@@ -1,0 +1,4 @@
+id,payload,normal
+1,"{""key"": ""value"", ""num"": 42}",100
+2,"{""a"": 1, ""b"": 2}",200
+3,plain string,300

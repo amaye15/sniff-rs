@@ -1,0 +1,29 @@
+title = "Complex Test"
+[owner]
+name = "Alice"
+contact.email = "alice@example.com"
+
+[database]
+server = "192.168.1.1"
+ports = [ 8000, 8001, 8002, ]
+connection_max = 5000
+
+str_multiline = """
+The quick brown fox jumps over the lazy dog."""
+
+[[products]]
+name = "Hammer"
+sku = 738594937
+
+[[products]]
+name = "Nail"
+sku = 284758393
+color = "gray"
+
+[servers.alpha]
+ip = "10.0.0.1"
+role = "frontend"
+
+[servers.beta]
+ip = "10.0.0.2"
+role = "backend"

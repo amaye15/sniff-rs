@@ -1,0 +1,4 @@
+id;name;score;email
+1;Alice;95.5;alice@example.com
+2;Bob;87.0;bob@example.org
+3;Carol;;carol@example.net

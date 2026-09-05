@@ -1,0 +1,6 @@
+user_id,signup_date,is_active,age,purchase_count,account_balance,plan,zip_code,notes
+U1001,2024-01-15,yes,34,3,1250.50,gold,02134,Referred by friend
+U1002,2024-02-20,no,29,0,340.00,silver,90210,
+U1003,2024-03-05,yes,45,12,"5,120.75",gold,00501,VIP customer
+U1004,2024-01-30,yes,,1,89.20,bronze,10001,
+U1005,2024-04-11,no,52,7,12000.00,gold,33101,Flagged for review

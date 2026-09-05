@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE root SYSTEM "test.dtd">
+<?xml-stylesheet type="text/xsl" href="style.xsl"?>
+<!-- This is a comment with <tags> that should be ignored -->
+<root>
+  <item id="1" status="active">
+    <name><![CDATA[Alice & Bob <test>]]></name>
+    <bio>Regular text with <!-- inline comment --> more text</bio>
+    <score>42</score>
+  </item>
+  <item id="2" status="inactive">
+    <name><![CDATA[Carol & Dave]]></name>
+    <bio>Another bio</bio>
+    <score>99</score>
+  </item>
+  <item id="3" status="active">
+    <name>Eve</name>
+    <bio><![CDATA[CDATA with ]]><![CDATA[ split]]></bio>
+    <score>7</score>
+  </item>
+</root>

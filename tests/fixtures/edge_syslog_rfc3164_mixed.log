@@ -1,0 +1,4 @@
+<34>Oct 11 22:14:15 mymachine su[123]: 'su root' failed for lonvick on /dev/pts/8
+Oct 11 22:14:15 mymachine kernel: [12345.678] eth0: link up
+<13>Feb  5 17:32:18 10.0.0.1 myapp: Test without pid
+<45>Jan  1 00:00:01 host "my tag with spaces"[999]: message with spaces in tag

@@ -1,0 +1,11 @@
+# anchor value test - the anchor's value should be read normally (tag discarded)
+defaults: &defaults
+  color: blue
+  size: large
+plain: &myanchor "hello world"
+items:
+  - name: Alice
+    score: 10
+  - name: Bob
+    score: 20
+single_value: &ref 42

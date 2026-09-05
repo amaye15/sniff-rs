@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<root>
+  <item id="1" flag="true"><title>Hello</title><desc>World</desc><empty/></item>
+  <item id="2" flag="false"><title>Foo</title><desc>Bar</desc><empty/></item>
+  <different><a>1</a><b>2</b></different>
+</root>

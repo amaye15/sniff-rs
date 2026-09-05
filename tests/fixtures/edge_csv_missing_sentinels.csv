@@ -1,0 +1,10 @@
+id,score,status,comment
+1,100,active,good
+2,NA,unknown,
+3,N/A,,missing
+4,NULL,NA,NA
+5,None,active,None
+6,-,inactive,?
+7,?,unknown,unknown
+8,unknown,,empty
+9,42,active,ok

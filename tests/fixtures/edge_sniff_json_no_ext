@@ -1,0 +1,3 @@
+{"user_id": "U1", "metadata": {"source": "web", "risk_score": 12}, "events": [{"type": "login", "amount": null}, {"type": "purchase", "amount": 50}]}
+{"user_id": "U2", "metadata": {"source": "app", "risk_score": 45}, "events": [{"type": "login", "amount": null}]}
+{"user_id": "U3", "metadata": {"source": "web", "risk_score": 3}, "events": []}

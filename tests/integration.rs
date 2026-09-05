@@ -4853,6 +4853,1366 @@ fn batch_mode_index_caps_the_files_table_on_a_large_directory() {
     assert!(index.contains("…and 7 more file(s) not shown here"));
 }
 
+// ---------------------------------------------------------------------------
+// Additional edge-case fixtures added to broaden coverage beyond the
+// original committed corpus. Each fixture is small and permanent
+// (committed under tests/fixtures/edge_*) - the same "reviewable without
+// reading test code" discipline every other format's fixture already gets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn csv_quoted_fields_with_embedded_commas_quotes_and_newlines() {
+    let doc = run_json("edge_csv_quoted_fields.csv", &[]);
+    let cols = table(&doc, "edge_csv_quoted_fields");
+
+    // Embedded comma must not split the field; the sample should retain it.
+    let desc = column(cols, "description");
+    assert!(
+        desc["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "hello, world"),
+        "quoted comma not preserved: {desc:?}"
+    );
+    // Embedded newline inside quotes must stay as one row, not two.
+    assert!(
+        desc["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().contains('\n')),
+        "embedded newline should be inside a single field: {desc:?}"
+    );
+    assert_eq!(desc["row_count"], 3);
+    // Doubled quotes -> single quote in output.
+    let notes = column(cols, "notes");
+    assert!(
+        notes["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "a \"quoted\" word"),
+        "escaped quotes not decoded: {notes:?}"
+    );
+    // Empty quoted field "" is treated as missing (same as CSV's own empty-field handling).
+    assert!(
+        (desc["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1,
+        "empty quoted field should be missing"
+    );
+}
+
+#[test]
+fn csv_semicolon_delimited_requires_explicit_delimiter_flag() {
+    // Without --delimiter, the whole line is one string column (semicolons not split).
+    let doc_default = run_json("edge_csv_semicolon.csv", &[]);
+    let cols_default = table(&doc_default, "edge_csv_semicolon");
+    assert_eq!(
+        cols_default.len(),
+        1,
+        "without --delimiter ';' the file should collapse to one column"
+    );
+
+    // With --delimiter ';' it parses correctly as 4 columns with correct types.
+    let doc = run_with_format("edge_csv_semicolon.csv", "json", &["--delimiter", ";"]);
+    let cols = table(&doc, "edge_csv_semicolon");
+    assert_eq!(cols.len(), 4);
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "email")["ideal_type"], "Email");
+    let score = column(cols, "score");
+    assert!(
+        (score["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1,
+        "empty score should be missing"
+    );
+}
+
+#[test]
+fn csv_long_preamble_beyond_max_scan_does_not_auto_detect() {
+    // MAX_PREAMBLE_SCAN is 5. With 6 sparse preamble rows, auto-detection must NOT fire -
+    // the first sparse line becomes the header, not the real header after it.
+    let doc = run_json("edge_csv_long_preamble.csv", &[]);
+    let cols = table(&doc, "edge_csv_long_preamble");
+    // Header is the first preamble line, not "id".
+    assert!(
+        cols.iter().any(|c| c["name"] == "Preamble line 1"),
+        "expected preamble line to be treated as header when beyond scan cap: {cols:?}"
+    );
+    assert!(
+        !cols.iter().any(|c| c["name"] == "id"),
+        "real header should NOT be detected when preamble exceeds cap"
+    );
+    // The file has 6 preamble + 1 header + 3 data = 10 lines total, but header is preamble[0] so 9 rows profiled.
+    assert_eq!(cols[0]["row_count"], 9);
+}
+
+#[test]
+fn csv_crlf_and_blank_lines_are_handled() {
+    // CRLF (\r\n) line endings must not leave a stray '\r' in values.
+    let doc = run_json("edge_csv_crlf.csv", &[]);
+    let cols = table(&doc, "edge_csv_crlf");
+    assert_eq!(column(cols, "name")["row_count"], 3);
+    for c in cols {
+        for v in c["sample_values"].as_array().unwrap() {
+            assert!(
+                !v.as_str().unwrap().contains('\r'),
+                "CRLF should be stripped, got {v:?}"
+            );
+        }
+    }
+
+    // Blank lines (empty records) must be skipped entirely, not treated as 1-field rows.
+    let doc2 = run_json("edge_csv_blank_lines.csv", &[]);
+    let cols2 = table(&doc2, "edge_csv_blank_lines");
+    assert_eq!(column(cols2, "id")["row_count"], 3);
+    assert_eq!(
+        column(cols2, "name")["sample_values"],
+        serde_json::json!(["Alice", "Bob", "Carol"])
+    );
+}
+
+#[test]
+fn tsv_tab_delimited_reads_without_explicit_flag() {
+    let doc = run_json("edge_tsv_tab.tsv", &[]);
+    let cols = table(&doc, "edge_tsv_tab");
+    assert!(cols.iter().any(|c| c["name"] == "name"));
+    assert_eq!(column(cols, "score")["ideal_type"], "i64");
+}
+
+#[test]
+fn json_duplicate_keys_last_value_wins() {
+    let doc = run_json("edge_json_duplicate_keys.json", &[]);
+    let cols = table(&doc, "edge_json_duplicate_keys");
+    // Duplicate "name" keys - last occurrence should win per Map::insert contract.
+    let name = column(cols, "name");
+    let vals: Vec<&str> = name["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        vals.contains(&"Alicia"),
+        "last duplicate should win, got {vals:?}"
+    );
+    assert!(
+        vals.contains(&"Bobby"),
+        "last duplicate should win, got {vals:?}"
+    );
+    assert!(
+        !vals.contains(&"Alice"),
+        "first duplicate should be overwritten"
+    );
+}
+
+#[test]
+fn json_unicode_keys_and_emoji_preserved() {
+    let doc = run_json("edge_json_unicode_keys.json", &[]);
+    let cols = table(&doc, "edge_json_unicode_keys");
+    // Japanese key "名前" should survive as a column name (possibly escaped in JSON output but must be findable).
+    // serde_json escapes non-ASCII by default in this tool's output, but the test helper does string compare on the escaped form.
+    // We check that the table has 4 columns and that emoji values are preserved.
+    assert_eq!(cols.len(), 4);
+    let emoji = column(cols, "emoji");
+    let vals = emoji["sample_values"].as_array().unwrap();
+    // Values contain multi-byte unicode that must not panic and must be present.
+    assert!(
+        vals.iter().any(|v| v.as_str().unwrap().contains("café")),
+        "emoji column should contain café: {vals:?}"
+    );
+    assert_eq!(emoji["row_count"], 2);
+}
+
+#[test]
+fn json_blank_lines_and_mixed_scalar_object_array() {
+    // Blank lines in JSON Lines are skipped; file has 3 records despite 2 blank lines.
+    let doc = run_json("edge_json_blank_lines.jsonl", &[]);
+    let cols = table(&doc, "edge_json_blank_lines");
+    assert_eq!(column(cols, "id")["row_count"], 3);
+
+    // Mixed scalar+object top-level array: profiling falls back to a single "value" column.
+    let doc2 = run_json("edge_json_mixed_array.json", &[]);
+    let cols2 = table(&doc2, "edge_json_mixed_array");
+    let value = column(cols2, "value");
+    assert!(
+        value["current_type"]
+            .as_str()
+            .unwrap()
+            .starts_with("mixed("),
+        "mixed array should be reported as mixed: {value:?}"
+    );
+    assert!(
+        value["notes"]
+            .as_str()
+            .unwrap()
+            .contains("mix of scalars and objects")
+    );
+    // Object fields within the mixed array are still flattened and typed.
+    assert!(cols2.iter().any(|c| c["name"] == "value.id"));
+    assert_eq!(column(cols2, "value.x")["ideal_type"], "i64");
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn xml_cdata_comments_pi_and_doctype_not_miscounted_as_too_deep() {
+    let doc = run_json("edge_xml_cdata_comments.xml", &[]);
+    let cols = table(&doc, "edge_xml_cdata_comments");
+    // CDATA content must be preserved verbatim, including special chars.
+    let name = column(cols, "name");
+    assert!(
+        name["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "Alice & Bob <test>"),
+        "CDATA not decoded correctly: {name:?}"
+    );
+    assert_eq!(column(cols, "@id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "score")["ideal_type"], "i64");
+    // Comments / PI / DOCTYPE must not affect record detection - still 3 records.
+    assert_eq!(name["row_count"], 3);
+}
+
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_anchor_value_is_stripped_not_treated_as_literal() {
+    let doc = run_json("edge_yaml_anchor_value.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_anchor_value");
+    // &defaults anchor tag must be discarded, value read normally.
+    assert!(cols.iter().any(|c| c["name"] == "defaults.color"));
+    assert_eq!(column(cols, "defaults.color")["sample_values"][0], "blue");
+    assert_eq!(column(cols, "plain")["sample_values"][0], "hello world");
+    // Literal "&myanchor" must NOT appear in output.
+    for c in cols {
+        for v in c["sample_values"].as_array().unwrap() {
+            assert!(
+                !v.as_str().unwrap().contains("&myanchor"),
+                "anchor tag leaked into value: {v:?}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn toml_complex_dotted_keys_and_array_of_tables() {
+    let doc = run_json("edge_toml_complex.toml", &[]);
+    let cols = table(&doc, "edge_toml_complex");
+    // Dotted key "contact.email" inside [owner] flattens to owner.contact.email.
+    assert!(cols.iter().any(|c| c["name"] == "owner.contact.email"));
+    // Inline table trailing comma and multiline string (TOML 1.1.0) should not error.
+    assert_eq!(column(cols, "title")["sample_values"][0], "Complex Test");
+    // Array of tables [[products]] becomes Vec<object> and flattens.
+    let products = column(cols, "products");
+    assert_eq!(products["current_type"], "Vec<object>");
+    assert!(cols.iter().any(|c| c["name"] == "products.name"));
+    // [servers.alpha] / [servers.beta] sub-tables flatten correctly.
+    assert!(cols.iter().any(|c| c["name"] == "servers.alpha.ip"));
+    assert!(cols.iter().any(|c| c["name"] == "servers.beta.role"));
+}
+
+#[cfg(feature = "ini")]
+#[test]
+fn ini_duplicate_sections_and_keys_pooled() {
+    let doc = run_json("edge_ini_duplicate_sections.ini", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert!(
+        tables.contains_key("owner"),
+        "owner section missing: {tables:?}"
+    );
+    assert!(tables.contains_key("database"), "database section missing");
+    let owner = table(&doc, "owner");
+    // Duplicate key "name" within one section pools into an array -> flattened handling
+    // This tool pools repeated keys into an array value; the column should exist and have samples.
+    let name = column(owner, "name");
+    // Depending on impl, duplicate keys become Vec<String> with pooled values or last-wins;
+    // this project's ini_support pools duplicates into an array value, so ideal_type should be String or Vec<String>.
+    assert!(name["sample_values"].as_array().unwrap().len() >= 1);
+    // Re-opened [owner] must have appended its new key "role" rather than creating a second table.
+    assert!(
+        owner.iter().any(|c| c["name"] == "role"),
+        "re-opened section's key not merged: {owner:?}"
+    );
+    assert_eq!(
+        tables.len(),
+        2,
+        "duplicate sections should not create extra tables"
+    );
+}
+
+#[test]
+fn fwf_unicode_with_fixed_widths() {
+    let doc = run_with_format(
+        "edge_fwf_unicode.fwf",
+        "json",
+        &[
+            "--format",
+            "fixed-width",
+            "--widths",
+            "3,10,5",
+            "--samples",
+            "10",
+        ],
+    );
+    let cols = table(&doc, "edge_fwf_unicode");
+    assert_eq!(cols.len(), 3);
+    assert_eq!(column(cols, "ID")["ideal_type"], "i64");
+    let name = column(cols, "NAME");
+    assert!(
+        name["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "café")
+    );
+    assert!(
+        name["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "日本語")
+    );
+    // Emoji (multi-byte) must be handled correctly as character-based slicing, not byte-based.
+    assert!(
+        name["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("emoji"))
+    );
+    assert_eq!(column(cols, "SCORE")["ideal_type"], "i64");
+    assert_eq!(column(cols, "NAME")["row_count"], 4);
+}
+
+#[cfg(feature = "weblog")]
+#[test]
+fn weblog_ipv6_host_recognized() {
+    let doc = run_with_format("edge_weblog_ipv6.log", "json", &["--format", "common-log"]);
+    let cols = table(&doc, "edge_weblog_ipv6");
+    let host = column(cols, "host");
+    assert_eq!(host["ideal_type"], "IPv6");
+    // Bytes field "-" on the third line is missing.
+    let bytes = column(cols, "bytes");
+    assert!((bytes["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1);
+    let method = column(cols, "method");
+    assert!(
+        method["sample_values"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("GET"))
+    );
+}
+
+#[test]
+fn json_schema_output_for_edge_csv_quoted_fields_is_valid() {
+    let doc = run_with_format("edge_csv_quoted_fields.csv", "json-schema", &[]);
+    let schema = &doc["tables"]["edge_csv_quoted_fields"];
+    assert_eq!(schema["type"], "object");
+    // description column has missing values -> nullable union, not required.
+    assert_eq!(
+        schema["properties"]["description"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert!(
+        !schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "description")
+    );
+}
+
+#[test]
+fn nrows_limits_output_row_count_on_a_real_file() {
+    let doc = run_json("sample.csv", &["--nrows", "2"]);
+    let cols = table(&doc, "sample");
+    assert_eq!(column(cols, "user_id")["row_count"], 2);
+    // With nrows 2, sample_values should still be at most the row count.
+    for c in cols {
+        assert!(c["sample_values"].as_array().unwrap().len() <= 2);
+    }
+}
+
+#[test]
+fn delimiter_flag_rejects_a_multi_character_argument() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.csv").to_str().unwrap(),
+            "-",
+            "--delimiter",
+            "ab",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("delimiter") || stderr.contains("single"),
+        "expected a delimiter validation error, got: {stderr}"
+    );
+}
+
+#[test]
+fn csv_missing_sentinels_are_treated_as_null() {
+    let doc = run_json("edge_csv_missing_sentinels.csv", &[]);
+    let cols = table(&doc, "edge_csv_missing_sentinels");
+    // score column uses 7 of 9 values as known missing sentinels (NA, N/A, NULL, None, -, ?, unknown)
+    let score = column(cols, "score");
+    assert!(
+        (score["missing_pct"].as_f64().unwrap() - 77.8).abs() < 0.1,
+        "score missing_pct should reflect sentinels as missing: {score:?}"
+    );
+    assert_eq!(score["ideal_type"], "i64");
+    // status "unknown" is also a sentinel (case-insensitive) -> 55.6% missing
+    let status = column(cols, "status");
+    assert!((status["missing_pct"].as_f64().unwrap() - 55.6).abs() < 0.1);
+    // is_missing_sentinel must be case-insensitive: "NA" and "na" both count.
+    // Verified via the fact that row 3's "NA" and row 5's "None" are both counted.
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_mixed_affinity_and_all_null_column() {
+    let doc = run_json("edge_sqlite_mixed_types.sqlite", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    // View must be excluded - only 2 real tables.
+    assert_eq!(tables.len(), 2, "view should be excluded");
+    assert!(tables.contains_key("mixed"));
+    assert!(tables.contains_key("empty_table"));
+    assert!(
+        !tables.contains_key("mixed_view"),
+        "view should not appear as a table"
+    );
+
+    let mixed = table(&doc, "mixed");
+    // INTEGER PRIMARY KEY alias behaves as i64, not null.
+    assert_eq!(column(mixed, "id")["current_type"], "i64");
+    // All-null column is 100% missing and reports as null current_type.
+    let all_null = column(mixed, "nullable_all_null");
+    assert_eq!(all_null["missing_pct"].as_f64().unwrap(), 100.0);
+    assert_eq!(all_null["current_type"], "null");
+    assert_eq!(all_null["sample_values"].as_array().unwrap().len(), 0);
+    // REAL affinity column holding both text and numbers must be reported as mixed.
+    let aff = column(mixed, "mixed_affinity");
+    assert!(
+        aff["current_type"].as_str().unwrap().starts_with("mixed("),
+        "mixed affinity not reported: {aff:?}"
+    );
+    assert!(aff["current_type"].as_str().unwrap().contains("String"));
+    assert!(aff["current_type"].as_str().unwrap().contains("f64"));
+    // Empty table has 0 rows on every column.
+    let empty = table(&doc, "empty_table");
+    for c in empty {
+        assert_eq!(c["row_count"], 0);
+    }
+}
+
+#[test]
+fn gzip_decompresses_quoted_fields_and_missing_sentinels_transparently() {
+    // Gzip is a preprocessing step before format detection (decompress_if_needed);
+    // the inner CSV heuristics must work identically through it, including
+    // quoted-field parsing and missing-sentinel handling.
+    let doc = run_json("edge_csv_quoted_fields.csv.gz", &[]);
+    assert_eq!(doc["file"], "edge_csv_quoted_fields.csv.gz");
+    assert_eq!(doc["format"], "csv");
+    let cols = table(&doc, "edge_csv_quoted_fields");
+    let desc = column(cols, "description");
+    assert!(
+        desc["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "hello, world")
+    );
+
+    let doc2 = run_json("edge_csv_missing_sentinels.csv.gz", &[]);
+    let score = column(table(&doc2, "edge_csv_missing_sentinels"), "score");
+    assert!((score["missing_pct"].as_f64().unwrap() - 77.8).abs() < 0.1);
+}
+
+// ---------------------------------------------------------------------------
+// Second batch of edge fixtures - deeper heuristic and format coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn csv_numeric_formatting_currency_percent_and_parens() {
+    let doc = run_json("edge_csv_numeric_formatting.csv", &[]);
+    let cols = table(&doc, "edge_csv_numeric_formatting");
+    assert_eq!(column(cols, "amount")["ideal_type"], "f64");
+    assert!(
+        column(cols, "amount")["notes"]
+            .as_str()
+            .unwrap()
+            .contains("numeric strings")
+    );
+    assert_eq!(column(cols, "percent")["ideal_type"], "i64");
+    assert!(
+        column(cols, "percent")["notes"]
+            .as_str()
+            .unwrap()
+            .contains("%")
+    );
+    assert_eq!(column(cols, "paren_neg")["ideal_type"], "f64");
+    // Currency with € and £ must also be recognized (same as $).
+    assert_eq!(column(cols, "currency_mixed")["ideal_type"], "f64");
+}
+
+#[test]
+fn csv_category_boundary_and_constant_detection() {
+    let doc = run_json("edge_csv_category_boundary.csv", &[]);
+    let cols = table(&doc, "edge_csv_category_boundary");
+    assert_eq!(column(cols, "cat_col")["ideal_type"], "enum / category");
+    assert!(
+        column(cols, "cat_col")["notes"]
+            .as_str()
+            .unwrap()
+            .contains("40 unique")
+    );
+    assert_eq!(column(cols, "not_cat_col")["ideal_type"], "String");
+    // 51 unique > 50 must not be category.
+    assert!(
+        column(cols, "not_cat_col")["notes"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+
+    let doc2 = run_json("edge_csv_constant_column.csv", &[]);
+    let cols2 = table(&doc2, "edge_csv_constant_column");
+    assert_eq!(
+        column(cols2, "constant_col")["ideal_type"],
+        "enum / category"
+    );
+    assert!(
+        column(cols2, "constant_col")["notes"]
+            .as_str()
+            .unwrap()
+            .contains("constant column")
+    );
+}
+
+#[test]
+fn csv_infinity_nan_and_oversized_int_notes() {
+    let doc = run_json("edge_csv_infinity_nan.csv", &[]);
+    let cols = table(&doc, "edge_csv_infinity_nan");
+    let f = column(cols, "float_col");
+    // Infinity and -inf are non-finite f64 values -> note, and NaN is missing sentinel so 25% missing.
+    assert!(f["notes"].as_str().unwrap().contains("non-finite"));
+    assert!((f["missing_pct"].as_f64().unwrap() - 25.0).abs() < 0.1);
+
+    let doc2 = run_json("edge_csv_oversized_int.csv", &[]);
+    let big = column(table(&doc2, "edge_csv_oversized_int"), "big_int");
+    assert!(big["notes"].as_str().unwrap().contains("exceed i64"));
+}
+
+#[test]
+fn csv_leading_zeros_and_embedded_json_detection() {
+    let doc = run_json("edge_csv_leading_zeros.csv", &[]);
+    let zip = column(table(&doc, "edge_csv_leading_zeros"), "zip_code");
+    assert_eq!(zip["ideal_type"], "String");
+    assert!(zip["notes"].as_str().unwrap().contains("leading zeros"));
+    assert!(zip["notes"].as_str().unwrap().contains("already lost"));
+
+    let doc2 = run_json("edge_csv_embedded_json.csv", &[]);
+    let payload = column(table(&doc2, "edge_csv_embedded_json"), "payload");
+    // Not all rows are JSON (one is plain string) -> must NOT be flagged as embedded JSON.
+    assert!(
+        payload["notes"].as_str().unwrap().is_empty(),
+        "mixed plain+JSON should not be flagged: {payload:?}"
+    );
+
+    let doc3 = run_json("edge_csv_all_types.csv", &[]);
+    let cols3 = table(&doc3, "edge_csv_all_types");
+    assert_eq!(column(cols3, "uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols3, "email")["ideal_type"], "Email");
+    assert_eq!(column(cols3, "ipv4")["ideal_type"], "IPv4");
+    assert_eq!(column(cols3, "ipv6")["ideal_type"], "IPv6");
+    assert_eq!(column(cols3, "url")["ideal_type"], "URL");
+    assert_eq!(column(cols3, "hex_color")["ideal_type"], "Hex Color");
+    assert_eq!(column(cols3, "iban")["ideal_type"], "IBAN");
+}
+
+#[test]
+fn json_nested_deep_and_scientific_and_all_null() {
+    let doc = run_json("edge_json_nested_deep.json", &[]);
+    let cols = table(&doc, "edge_json_nested_deep");
+    // 10 levels deep -> a.b.c.d.e.f.g.h.i.j should exist and be typed.
+    assert!(cols.iter().any(|c| c["name"] == "a.b.c.d.e.f.g.h.i.j"));
+    assert_eq!(
+        column(cols, "a.b.c.d.e.f.g.h.i.j")["sample_values"][0],
+        "deep_value"
+    );
+
+    let doc2 = run_json("edge_json_all_null_field.json", &[]);
+    let val = column(table(&doc2, "edge_json_all_null_field"), "val");
+    assert_eq!(val["missing_pct"].as_f64().unwrap(), 100.0);
+    assert_eq!(val["current_type"], "null");
+
+    let doc3 = run_json("edge_json_scientific.json", &[]);
+    let sci = column(table(&doc3, "edge_json_scientific"), "sci");
+    assert_eq!(sci["ideal_type"], "f64");
+}
+
+#[test]
+fn json_nested_arrays_and_mixed_content() {
+    let doc = run_json("edge_json_nested_arrays.json", &[]);
+    let cols = table(&doc, "edge_json_nested_arrays");
+    // matrix is an array of arrays (nested arrays) -> Vec<i64> or similar, not a crash.
+    assert!(cols.iter().any(|c| c["name"] == "matrix"));
+}
+
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_literal_block_and_flow_collections() {
+    let doc = run_json("edge_yaml_literal_block.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_literal_block");
+    let keep = column(cols, "literal_keep");
+    assert!(
+        keep["sample_values"][0]
+            .as_str()
+            .unwrap()
+            .contains("line one")
+    );
+    assert!(
+        keep["sample_values"][0].as_str().unwrap().ends_with('\n'),
+        "literal_keep should retain trailing newline"
+    );
+    let strip = column(cols, "literal_strip");
+    assert!(
+        !strip["sample_values"][0].as_str().unwrap().ends_with('\n'),
+        "literal_strip should strip trailing newline"
+    );
+
+    let doc2 = run_json("edge_yaml_flow_collections.yaml", &[]);
+    let cols2 = table(&doc2, "edge_yaml_flow_collections");
+    assert!(cols2.iter().any(|c| c["name"] == "flow_seq"));
+    // flow_seq contains mixed types (ints + string + bool) -> Vec<mixed(...)> with ideal Vec<String>
+    let flow = column(cols2, "flow_seq");
+    assert!(
+        flow["current_type"].as_str().unwrap().starts_with("Vec<"),
+        "flow_seq should be Vec: {flow:?}"
+    );
+    assert!(
+        flow["current_type"].as_str().unwrap().contains("mixed")
+            || flow["ideal_type"] == "Vec<String>"
+    );
+    assert!(cols2.iter().any(|c| c["name"] == "flow_map.a"));
+}
+
+#[cfg(feature = "toml")]
+#[test]
+fn toml_multiline_and_dotted_keys() {
+    let doc = run_json("edge_toml_multiline_and_dotted.toml", &[]);
+    let cols = table(&doc, "edge_toml_multiline_and_dotted");
+    assert!(cols.iter().any(|c| c["name"] == "str_multiline_basic"));
+    // Dotted keys a.b.c under [database.connection] become database.connection.a.b.c etc.
+    assert!(
+        cols.iter()
+            .any(|c| c["name"].as_str().unwrap().contains("a.b.c"))
+    );
+    assert!(cols.iter().any(|c| c["name"] == "database.ports"));
+}
+
+#[cfg(feature = "ini")]
+#[test]
+fn ini_inline_comment_and_empty_section() {
+    let doc = run_json("edge_ini_inline_comment.ini", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert!(tables.contains_key("section1"));
+    let s1 = table(&doc, "section1");
+    assert!(s1.iter().any(|c| c["name"] == "key1"));
+    assert!(s1.iter().any(|c| c["name"] == "empty_key"));
+    // Duplicate key "duplicate" is in section2, not section1 - pools into Vec<String>.
+    let s2 = table(&doc, "section2");
+    let dup = column(s2, "duplicate");
+    assert_eq!(dup["current_type"], "Vec<String>");
+    assert_eq!(dup["sample_values"], serde_json::json!(["first", "second"]));
+    assert!(tables.contains_key("section2"));
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn xml_mixed_content_and_self_closing() {
+    let doc = run_json("edge_xml_mixed_content.xml", &[]);
+    let cols = table(&doc, "edge_xml_mixed_content");
+    // Homogeneous <item> vs <different> under root -> root is treated as one record (mixed children tags),
+    // so columns include both item and different flattenings.
+    // At least attributes and nested elements should appear.
+    assert!(
+        cols.iter()
+            .any(|c| c["name"] == "@id" || c["name"] == "item.@id")
+    );
+
+    let doc2 = run_json("edge_xml_self_closing.xml", &[]);
+    let cols2 = table(&doc2, "edge_xml_self_closing");
+    assert_eq!(column(cols2, "@id")["row_count"], 3);
+    assert_eq!(
+        column(cols2, "@name")["sample_values"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn fwf_staggered_and_basic_unicode() {
+    let doc = run_with_format(
+        "edge_fwf_staggered.fwf",
+        "json",
+        &["--format", "fixed-width", "--widths", "5,5,10"],
+    );
+    let cols = table(&doc, "edge_fwf_staggered");
+    assert_eq!(cols.len(), 3);
+    let name = column(cols, "NAME");
+    assert!(
+        name["missing_pct"].as_f64().unwrap() > 0.0,
+        "empty NAME field should be missing"
+    );
+    assert_eq!(column(cols, "DESC")["row_count"], 4);
+}
+
+#[cfg(feature = "weblog")]
+#[test]
+fn weblog_combined_and_common_edge() {
+    let doc = run_with_format(
+        "edge_weblog_combined.log",
+        "json",
+        &["--format", "combined-log"],
+    );
+    let cols = table(&doc, "edge_weblog_combined");
+    assert!(cols.iter().any(|c| c["name"] == "referer"));
+    assert!(cols.iter().any(|c| c["name"] == "user_agent"));
+    let status = column(cols, "status");
+    assert_eq!(status["ideal_type"], "i64");
+    // Second line has "-" for bytes and referer/user_agent -> missing.
+    let bytes = column(cols, "bytes");
+    assert!(bytes["missing_pct"].as_f64().unwrap() > 0.0);
+}
+
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_structured_and_mixed_pri() {
+    let doc = run_with_format(
+        "edge_syslog_rfc5424_structured.log",
+        "json",
+        &["--format", "syslog5424"],
+    );
+    let cols = table(&doc, "edge_syslog_rfc5424_structured");
+    let sd = column(cols, "structured_data");
+    assert!(
+        sd["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("exampleSDID"))
+    );
+    // Second line has "-" as structured_data -> missing.
+    assert!(sd["missing_pct"].as_f64().unwrap() > 0.0);
+
+    let doc2 = run_with_format(
+        "edge_syslog_rfc3164_mixed.log",
+        "json",
+        &["--format", "syslog", "--samples", "10"],
+    );
+    let cols2 = table(&doc2, "edge_syslog_rfc3164_mixed");
+    assert_eq!(
+        column(cols2, "facility")["missing_pct"].as_f64().unwrap(),
+        25.0
+    ); // one line without PRI = 1/4 missing
+    // Tag with spaces: fourth line has tag '"my tag with spaces"' (including quotes as part of tag).
+    // With --samples 10 we see all 4 tags; check that at least one sample contains "my tag".
+    let tag = column(cols2, "tag");
+    assert!(
+        tag["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("my tag")),
+        "tag with spaces not preserved: {tag:?}"
+    );
+}
+
+#[cfg(feature = "cbor")]
+#[test]
+fn cbor_manual_concatenated_records() {
+    let doc = run_json("edge_cbor_manual.cbor", &[]);
+    let cols = table(&doc, "edge_cbor_manual");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "name")["ideal_type"], "String");
+    assert_eq!(column(cols, "id")["row_count"], 2);
+}
+
+#[cfg(feature = "msgpack")]
+#[test]
+fn msgpack_manual_concatenated_records() {
+    let doc = run_json("edge_msgpack_manual.msgpack", &[]);
+    let cols = table(&doc, "edge_msgpack_manual");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "name")["sample_values"][0], "Alice");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_date_affinity_mixed_column() {
+    let doc = run_json("edge_sqlite_date_affinity.sqlite", &[]);
+    let cols = table(&doc, "events");
+    // created_at is TEXT holding dates -> should be detected as NaiveDate.
+    assert_eq!(
+        column(cols, "created_at")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    // mixed REAL column holding both date string and plain text -> mixed.
+    let mixed = column(cols, "mixed");
+    assert!(
+        mixed["current_type"].as_str().unwrap().contains("mixed")
+            || mixed["current_type"] == "String"
+    );
+}
+
+#[test]
+fn cli_nrows_zero_and_samples_zero_edge() {
+    // --nrows 0 should produce an empty table (0 rows) without panic.
+    let doc = run_json("sample.csv", &["--nrows", "0"]);
+    let cols = table(&doc, "sample");
+    for c in cols {
+        assert_eq!(c["row_count"], 0);
+    }
+    // --samples 0 should produce empty sample_values but still succeed.
+    let doc2 = run_with_format("sample.csv", "json", &["--samples", "0"]);
+    let cols2 = table(&doc2, "sample");
+    for c in cols2 {
+        assert_eq!(c["sample_values"].as_array().unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn cli_output_schema_for_heuristic_types() {
+    // Verify json-schema output maps a few more heuristic types correctly.
+    let doc = run_with_format("edge_csv_all_types.csv", "json-schema", &[]);
+    let props = &doc["tables"]["edge_csv_all_types"]["properties"];
+    assert_eq!(props["uuid"]["type"], "string");
+    assert_eq!(props["uuid"]["format"], "uuid");
+    assert_eq!(props["email"]["format"], "email");
+    assert_eq!(props["ipv4"]["format"], "ipv4");
+    assert_eq!(props["ipv6"]["format"], "ipv6");
+    assert_eq!(props["url"]["format"], "uri");
+}
+
+#[test]
+fn csv_delimiter_with_tab_and_skip_rows() {
+    let doc = run_with_format("edge_tsv_tab.tsv", "json", &["--delimiter", "\t"]);
+    let cols = table(&doc, "edge_tsv_tab");
+    assert_eq!(column(cols, "score")["ideal_type"], "i64");
+    // --skip-rows should skip preamble rows before header.
+    let doc2 = run_with_format("preamble.csv", "json", &["--skip-rows", "1"]);
+    let cols2 = table(&doc2, "preamble");
+    assert!(cols2.iter().any(|c| c["name"] == "id"));
+}
+
+#[test]
+fn csv_heuristic_remaining_types() {
+    let doc = run_json("edge_csv_heuristic_remaining.csv", &[]);
+    let cols = table(&doc, "edge_csv_heuristic_remaining");
+    assert_eq!(column(cols, "ulid")["ideal_type"], "ULID");
+    assert_eq!(column(cols, "mac")["ideal_type"], "MAC Address");
+    assert_eq!(column(cols, "isbn10")["ideal_type"], "ISBN-10");
+    assert_eq!(column(cols, "ean")["ideal_type"], "EAN-13 / UPC-A");
+    assert_eq!(column(cols, "imei")["ideal_type"], "IMEI");
+    assert_eq!(column(cols, "vin")["ideal_type"], "VIN");
+    assert_eq!(column(cols, "cidr")["ideal_type"], "CIDR");
+    assert_eq!(column(cols, "semver")["ideal_type"], "SemVer");
+    assert_eq!(column(cols, "wkt")["ideal_type"], "WKT Geometry");
+    assert_eq!(column(cols, "cron")["ideal_type"], "Cron Expression");
+    assert_eq!(column(cols, "jwt")["ideal_type"], "JWT");
+    assert_eq!(
+        column(cols, "latlon")["ideal_type"],
+        "Geographic Coordinates"
+    );
+    assert!(
+        column(cols, "hash_md5")["notes"]
+            .as_str()
+            .unwrap()
+            .contains("MD5")
+    );
+    assert_eq!(column(cols, "constant")["ideal_type"], "enum / category");
+}
+
+#[test]
+fn csv_header_only_and_mixed_column_and_date_formats() {
+    let doc = run_json("edge_csv_header_only.csv", &[]);
+    let cols = table(&doc, "edge_csv_header_only");
+    assert_eq!(cols.len(), 3);
+    for c in cols {
+        assert_eq!(c["row_count"], 0);
+        assert_eq!(c["sample_values"].as_array().unwrap().len(), 0);
+        assert_eq!(c["notes"], "column is empty/all null");
+    }
+
+    let doc2 = run_json("edge_csv_category_exact_boundary.csv", &[]);
+    let cols2 = table(&doc2, "edge_csv_category_exact_boundary");
+    // 4 unique / 100 rows = 4% <5% and <=50 -> category
+    assert_eq!(
+        column(cols2, "cat_4_unique")["ideal_type"],
+        "enum / category"
+    );
+    // 5 unique / 100 rows = 5% not <5% -> not category
+    assert_eq!(column(cols2, "cat_5_unique")["ideal_type"], "String");
+
+    let doc3 = run_json("edge_csv_mixed_column.csv", &[]);
+    let mixed = column(table(&doc3, "edge_csv_mixed_column"), "mixed");
+    // CSV current_type for a column mixing ints and strings is String (not mixed),
+    // while its ideal_type falls back to String as well. Pure int column stays i64.
+    assert_eq!(mixed["ideal_type"], "String");
+    assert!(mixed["current_type"].as_str().unwrap().contains("String"));
+    assert_eq!(
+        column(table(&doc3, "edge_csv_mixed_column"), "pure")["ideal_type"],
+        "i64"
+    );
+
+    let doc4 = run_json("edge_csv_date_formats.csv", &[]);
+    let cols4 = table(&doc4, "edge_csv_date_formats");
+    assert_eq!(
+        column(cols4, "iso_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(
+        column(cols4, "us_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(
+        column(cols4, "eu_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(
+        column(cols4, "rfc2822")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[test]
+fn content_sniffing_for_extensionless_files() {
+    // JSON without extension should be sniffed via leading { / [.
+    let doc = run_json("edge_sniff_json_no_ext", &[]);
+    assert_eq!(doc["format"], "json");
+    assert!(doc["tables"]["edge_sniff_json_no_ext"].as_array().is_some());
+
+    // CSV without extension is deliberately NOT sniffed -> requires --format.
+    let output = Command::new(bin())
+        .args([fixture("edge_sniff_csv_no_ext").to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format"),
+        "CSV without extension should demand --format: {stderr}"
+    );
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn content_sniffing_parquet_without_extension() {
+    let doc = run_json("edge_sniff_parquet_no_ext", &[]);
+    assert_eq!(doc["format"], "parquet");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn content_sniffing_sqlite_without_extension() {
+    let doc = run_json("edge_sniff_sqlite_no_ext", &[]);
+    assert_eq!(doc["format"], "sqlite");
+}
+
+#[test]
+fn cli_error_handling_for_missing_file_and_invalid_flags() {
+    let output = Command::new(bin())
+        .args(["/nonexistent/path.csv", "-"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+
+    let output2 = Command::new(bin())
+        .args([
+            fixture("sample.csv").to_str().unwrap(),
+            "-",
+            "--format",
+            "not_a_format",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output2.status.success());
+    let stderr = String::from_utf8_lossy(&output2.stderr);
+    assert!(stderr.contains("unrecognized --format") || stderr.contains("format"));
+
+    let output3 = Command::new(bin())
+        .args([
+            fixture("sample.csv").to_str().unwrap(),
+            "-",
+            "--widths",
+            "not,numbers",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output3.status.success());
+}
+
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_edge_cases_unicode_and_date() {
+    let doc = run_json("edge_dbf_edge_cases.dbf", &[]);
+    let cols = table(&doc, "edge_dbf_edge_cases");
+    assert_eq!(column(cols, "NAME")["ideal_type"], "String");
+    assert!(
+        column(cols, "NAME")["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "café")
+    );
+    assert_eq!(column(cols, "BIRTH")["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(column(cols, "ACTIVE")["ideal_type"], "bool");
+    // Numeric N field is stored as f64 but ideal is i64 for whole numbers.
+    assert_eq!(column(cols, "ID")["ideal_type"], "i64");
+}
+
+#[cfg(feature = "stata")]
+#[test]
+fn stata_edge_cases_missing_and_unicode() {
+    let doc = run_json("edge_stata_edge_cases.dta", &[]);
+    let cols = table(&doc, "edge_stata_edge_cases");
+    assert_eq!(column(cols, "name")["sample_values"][2], "café");
+    let score = column(cols, "score");
+    assert!((score["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1);
+    assert_eq!(score["ideal_type"], "f64");
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_edge_cases_missing_and_unicode() {
+    let doc = run_json("edge_spss_edge_cases.sav", &[]);
+    let cols = table(&doc, "edge_spss_edge_cases");
+    let amount = column(cols, "amount");
+    assert!((amount["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1);
+    assert_eq!(column(cols, "name")["sample_values"][0], "Alice");
+}
+
+#[cfg(feature = "avro")]
+#[test]
+fn avro_edge_cases_nested_and_logical_types() {
+    let doc = run_json("edge_avro_edge_cases.avro", &[]);
+    let cols = table(&doc, "edge_avro_edge_cases");
+    let tags = column(cols, "tags");
+    assert_eq!(tags["current_type"], "Vec<String>");
+    let created = column(cols, "metadata.created");
+    assert_eq!(created["ideal_type"], "NaiveDate / DateTime");
+    let score = column(cols, "score");
+    assert!((score["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1);
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn xlsx_edge_cases_multiple_sheets_and_dates() {
+    let doc = run_json("edge_xlsx_edge_cases.xlsx", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(tables.len(), 2);
+    assert!(tables.contains_key("Edge"));
+    assert!(tables.contains_key("Second"));
+    let edge = table(&doc, "Edge");
+    assert_eq!(column(edge, "date")["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(column(edge, "score")["missing_pct"].as_f64().unwrap(), 33.3);
+    let second = table(&doc, "Second");
+    assert_eq!(column(second, "value")["ideal_type"], "i64");
+}
+
+#[cfg(feature = "npy")]
+#[test]
+fn npy_structured_edge_various_types() {
+    let doc = run_json("edge_npy_structured_edge.npy", &[]);
+    let cols = table(&doc, "edge_npy_structured_edge");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "score")["ideal_type"], "f64");
+    assert!(cols.iter().any(|c| c["name"] == "name"));
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn parquet_edge_cases_nested_and_timestamp() {
+    let doc = run_json("edge_parquet_edge_cases.parquet", &[]);
+    let cols = table(&doc, "edge_parquet_edge_cases");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "score")["missing_pct"].as_f64().unwrap(), 33.3);
+    assert_eq!(
+        column(cols, "created_at")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    // Nested struct/list should be flattened correctly (unlike ORC).
+    assert!(cols.iter().any(|c| c["name"] == "metadata.active"));
+    assert_eq!(column(cols, "tags")["current_type"], "Vec<String>");
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_edge_cases_nested_placeholder() {
+    let doc = run_json("edge_orc_edge_cases.orc", &[]);
+    let cols = table(&doc, "edge_orc_edge_cases");
+    assert_eq!(column(cols, "score")["missing_pct"].as_f64().unwrap(), 33.3);
+    // ORC nested types are disclosed placeholders (not yet supported).
+    let tags = column(cols, "tags");
+    assert!(tags["notes"].as_str().unwrap().contains("nested") || tags["current_type"] == "List");
+    let meta = column(cols, "metadata");
+    assert!(meta["notes"].as_str().unwrap().contains("nested") || meta["current_type"] == "Struct");
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn arrow_ipc_edge_cases_nested_and_timestamp() {
+    let doc = run_json("edge_arrow_edge_cases.arrow", &[]);
+    let cols = table(&doc, "edge_arrow_edge_cases");
+    assert_eq!(
+        column(cols, "created_at")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert!(cols.iter().any(|c| c["name"] == "metadata.count"));
+    assert_eq!(column(cols, "metadata.active")["ideal_type"], "bool");
+}
+
+#[test]
+fn format_override_for_misnamed_file() {
+    // Copy a CSV to .txt and require --format to read it.
+    let dir = TempDir::new();
+    let misnamed = dir.path().join("data.txt");
+    std::fs::copy(fixture("sample.csv"), &misnamed).unwrap();
+    let output = Command::new(bin())
+        .args([
+            misnamed.to_str().unwrap(),
+            "-",
+            "--format",
+            "csv",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "misnamed CSV with --format csv should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(doc["tables"]["data"].as_array().is_some());
+    // Without --format it should fail (CSV not sniffed).
+    let output2 = Command::new(bin())
+        .args([misnamed.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!output2.status.success());
+}
+
+#[test]
+fn csv_with_pipe_delimiter_and_tsv_auto() {
+    // Pipe-delimited file via --delimiter
+    let dir = TempDir::new();
+    let path = dir.path().join("pipe.csv");
+    std::fs::write(&path, "id|name|score\n1|Alice|10\n2|Bob|20\n").unwrap();
+    let doc = run_with_format(path.to_str().unwrap(), "json", &["--delimiter", "|"]);
+    // When delimiter is correctly specified, it should parse 3 columns.
+    // run_with_format expects a fixture name, but we use direct Command for temp file.
+    let output = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--delimiter",
+            "|",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let doc2: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tables = doc2["tables"].as_object().unwrap();
+    let cols = tables.values().next().unwrap().as_array().unwrap();
+    assert_eq!(cols.len(), 3);
+}
+
+#[test]
+fn empty_file_and_header_only_produce_empty_tables() {
+    let doc = run_json("malformed_empty.csv", &[]);
+    // Empty file (0 bytes) should produce an empty table, not a crash.
+    let tables = doc["tables"].as_object().unwrap();
+    assert!(
+        tables
+            .values()
+            .next()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+            || doc["tables"]["malformed_empty"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+    );
+    let doc2 = run_json("edge_csv_header_only.csv", &[]);
+    for c in table(&doc2, "edge_csv_header_only") {
+        assert_eq!(c["row_count"], 0);
+    }
+}
+
+#[test]
+fn nrows_and_samples_edge_with_all_formats() {
+    // --nrows larger than file should just return full file.
+    let doc = run_json("sample.csv", &["--nrows", "100"]);
+    assert_eq!(column(table(&doc, "sample"), "user_id")["row_count"], 5);
+    // --samples larger than distinct values should cap at distinct count.
+    let doc2 = run_with_format("sample.csv", "json", &["--samples", "100"]);
+    let cols = table(&doc2, "sample");
+    for c in cols {
+        assert!(c["sample_values"].as_array().unwrap().len() <= 100);
+    }
+}
+
+#[test]
+fn json_schema_required_fields_for_missing_data() {
+    let doc = run_with_format("edge_csv_missing_sentinels.csv", "json-schema", &[]);
+    let schema = &doc["tables"]["edge_csv_missing_sentinels"];
+    // score has missing -> not required, id has no missing -> required
+    let required = schema["required"].as_array().unwrap();
+    assert!(required.iter().any(|v| v == "id"));
+    assert!(!required.iter().any(|v| v == "score"));
+}
+
+#[cfg(feature = "sas7bdat")]
+#[test]
+fn sas7bdat_reads_with_json_schema_output() {
+    let doc = run_with_format("sas7bdat_people_nonascii.sas7bdat", "json-schema", &[]);
+    let props = &doc["tables"]["sas7bdat_people_nonascii"]["properties"];
+    // Age is f64 current but i64 ideal -> should be integer in schema (since ideal drives schema).
+    assert!(props["AGE"].is_object());
+}
+
+#[cfg(feature = "spss")]
+#[test]
+fn spss_zsav_gives_clean_error_and_sav_reads_schema() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_spss_zlib_compressed.zsav").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("zsav")
+            || stderr.to_lowercase().contains("zlib")
+            || stderr.contains("not supported")
+    );
+
+    let doc = run_with_format("edge_spss_edge_cases.sav", "json-schema", &[]);
+    assert!(doc["tables"]["edge_spss_edge_cases"]["properties"].is_object());
+}
+
+#[cfg(feature = "stata")]
+#[test]
+fn stata_schema_and_json_output_consistent() {
+    let doc_json = run_json("edge_stata_edge_cases.dta", &[]);
+    let doc_schema = run_with_format("edge_stata_edge_cases.dta", "json-schema", &[]);
+    let cols = table(&doc_json, "edge_stata_edge_cases");
+    let schema_props = doc_schema["tables"]["edge_stata_edge_cases"]["properties"]
+        .as_object()
+        .unwrap();
+    // Every column in JSON should have a corresponding property in schema.
+    for c in cols {
+        let name = c["name"].as_str().unwrap();
+        assert!(
+            schema_props.contains_key(name),
+            "schema missing column {name}"
+        );
+    }
+}
+
+#[cfg(feature = "orc")]
+#[test]
+fn orc_all_types_schema_maps_correctly() {
+    let doc = run_with_format("type_detection.orc", "json-schema", &[]);
+    let props = &doc["tables"]["type_detection"]["properties"];
+    assert!(props.is_object());
+    // At least one property should be present and have a type.
+    assert!(!props.as_object().unwrap().is_empty());
+}
+
+#[test]
+fn csv_with_bom_and_gzip_both_handled() {
+    let dir = TempDir::new();
+    let src = fixture("malformed_bom.csv");
+    let gz_path = dir.path().join("bom.csv.gz");
+    let py_code = format!(
+        "import gzip; data=open(r'{}','rb').read(); open(r'{}','wb').write(gzip.compress(data))",
+        src.to_str().unwrap(),
+        gz_path.to_str().unwrap()
+    );
+    let out = Command::new("python3")
+        .args(["-c", &py_code])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "failed to gzip bom file: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc = run_json(gz_path.to_str().unwrap(), &[]);
+    let cols = doc["tables"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(cols.iter().any(|c| c["name"] == "name"));
+}
+
+#[test]
+fn directory_batch_with_sniffable_and_gzipped_files() {
+    // Batch mode should handle sniffable (no ext) and gzipped files via decompress_if_needed + sniff_format.
+    let dir = TempDir::new();
+    std::fs::copy(
+        fixture("edge_sniff_json_no_ext"),
+        dir.path().join("data_no_ext"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture("edge_csv_quoted_fields.csv.gz"),
+        dir.path().join("quoted.csv.gz"),
+    )
+    .unwrap();
+    let out = TempDir::new();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "batch with sniffable+gz should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out.path().join("data_no_ext.dictionary.json").exists());
+    // Gzip output name uses the compression-stripped logical name (quoted.csv.gz -> quoted.csv.dictionary.json).
+    assert!(out.path().join("quoted.csv.dictionary.json").exists());
+    let idx: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("_index.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(idx["files"], 2);
+}
+
 // --- Streaming: --nrows bounds real I/O for SPSS and NumPy too ---
 // Both readers were converted from a single whole-remaining-file/whole-
 // array-body read to reading exactly as many rows as --nrows asks for

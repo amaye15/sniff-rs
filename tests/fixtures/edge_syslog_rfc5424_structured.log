@@ -1,0 +1,3 @@
+<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 [exampleSDID@32473 iut="3" eventSource="Application" eventID="1011"] BOMAn application event to record
+<13>1 2003-10-11T22:14:15.003Z mymachine.example.com myproc 1234 ID47 - Test message without SD
+<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evnts - - [exampleSDID@32473 iut="3"] Structured only
