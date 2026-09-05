@@ -3221,6 +3221,21 @@ struct ColumnProfile {
     missing_pct: f64,
     sample_values: Vec<String>,
     notes: String,
+    // How many rows/records this column was profiled against (the same
+    // `total` every `missing_pct` above is already derived from) - kept
+    // deliberately out of `to_json` below, so it never becomes part of the
+    // documented JSON/json-schema output shape. Exists purely to let
+    // `render_markdown` show a real row count per table without silently
+    // widening this tool's actual JSON API. For a flat reader (CSV, Excel,
+    // SQLite, ...) every column in a table shares the exact same value;
+    // for a nested JSON-shaped table, only the *first* profile in a
+    // table's `Vec<ColumnProfile>` (the top-level path's own row, per
+    // `profile_json_path`'s "this path's own row followed by every
+    // descendant row" contract) reflects the table's real record count -
+    // a descendant row's own `row_count` reflects its own nesting level's
+    // slot count instead, which can legitimately differ (e.g. an array
+    // that pools several elements per parent record).
+    row_count: usize,
 }
 
 // This project used to have a hand-rolled `impl serde::Serialize for
@@ -3284,6 +3299,7 @@ mod column_profile_to_json_tests {
             missing_pct: 0.0,
             sample_values: vec!["02134".to_string(), "90210".to_string()],
             notes: "leading zeros".to_string(),
+            row_count: 2,
         };
         let json_support::Value::Object(obj) = p.to_json() else {
             panic!("expected an Object");
@@ -3321,6 +3337,7 @@ mod column_profile_to_json_tests {
             missing_pct: 40.0,
             sample_values: vec!["2024-01-15".to_string()],
             notes: "".to_string(),
+            row_count: 5,
         };
         // `to_json()` rendered through the hand-rolled pretty-printer,
         // then parsed by a genuinely independent reference implementation
@@ -4466,12 +4483,72 @@ pub fn suggest_ideal_type(values: &[&str], current: &str) -> (String, String) {
 /// of a value with neither - `str::replace` otherwise allocates a fresh
 /// `String` (here, twice) on every call regardless, and this runs ~7
 /// times per column in `render_markdown`.
+/// Escapes the CommonMark/GFM special characters that can actually matter
+/// *inside* a table cell - not the full grammar, just what's reachable
+/// from there. `#`/`-`/`>`/a digit-dot marker only carry block-level
+/// meaning at the very start of a raw source *line*, and every line this
+/// tool renders is already a table row prefixed by its own leading `|`,
+/// so none of those ever reach "start of line" from the block parser's
+/// perspective and need no escaping here. Everything else that matters
+/// mid-line - emphasis (`*`/`_`), strikethrough (`~`), code spans
+/// (`` ` ``), raw HTML/autolinks (`<`), links (`[`/`]`), and the escape
+/// character itself (`\`) - does need it: a column name or a note is
+/// real, often untrusted, data (this project's own adversarial fixtures
+/// already stress-test SQL/shell/template-injection-shaped *values*; a
+/// column *name* carrying the identical shape got no equivalent
+/// protection in Markdown output before this).
+///
+/// `_` gets one deliberate exception: CommonMark never treats an
+/// "intraword" underscore (alphanumeric on both sides, e.g. every `_` in
+/// `user_uuid`) as an emphasis delimiter at all, by design - and this
+/// tool's whole domain is real-world column names, which are
+/// overwhelmingly `snake_case`. Blanket-escaping every underscore would
+/// turn nearly every real example this tool produces into a wall of
+/// backslashes (`user\_uuid`) to guard against a case CommonMark's own
+/// grammar already makes safe. Only a `_` that isn't intraword - a
+/// leading/trailing one, or one next to punctuation/whitespace, the
+/// shape that can actually open or close emphasis - gets escaped.
+///
+/// A single pass over `s`'s own characters, not sequential `.replace()`
+/// calls, is deliberate: an escaping backslash inserted by one pass can
+/// get re-matched and doubly-escaped by a later pass over the same
+/// string (concretely, escaping `*` first and `\` second would turn a
+/// literal `a\*b` into `a\\\*b`, an extra dangling backslash pair, not
+/// `a\\*b`).
 fn escape_md(s: &str) -> Cow<'_, str> {
-    if s.bytes().any(|b| b == b'|' || b == b'\n') {
-        Cow::Owned(s.replace('|', "\\|").replace('\n', " "))
-    } else {
-        Cow::Borrowed(s)
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric()
     }
+    fn underscore_is_intraword(chars: &[char], i: usize) -> bool {
+        i > 0 && is_word_char(chars[i - 1]) && i + 1 < chars.len() && is_word_char(chars[i + 1])
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+    let needs_escaping = chars.iter().enumerate().any(|(i, &c)| match c {
+        '\n' | '|' | '\\' | '*' | '`' | '<' | '[' | ']' | '~' => true,
+        '_' => !underscore_is_intraword(&chars, i),
+        _ => false,
+    });
+    if !needs_escaping {
+        return Cow::Borrowed(s);
+    }
+
+    let mut out = String::with_capacity(s.len() + 8);
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '\n' => out.push(' '),
+            '|' | '\\' | '*' | '`' | '<' | '[' | ']' | '~' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '_' if !underscore_is_intraword(&chars, i) => {
+                out.push('\\');
+                out.push('_');
+            }
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Round to 1 decimal place so JSON output shows 66.7, not 66.66666666666667.
@@ -11598,6 +11675,7 @@ mod orc_support {
                     missing_pct: 0.0,
                     sample_values: Vec::new(),
                     notes: note,
+                    row_count: total,
                 });
                 continue;
             }
@@ -12105,6 +12183,7 @@ fn profile_json_path(
             missing_pct,
             sample_values: Vec::new(),
             notes: "column is empty/all null".to_string(),
+            row_count: total,
         }];
     }
 
@@ -12235,6 +12314,7 @@ fn profile_json_path(
         missing_pct,
         sample_values: samples,
         notes,
+        row_count: total,
     }];
 
     if !object_maps.is_empty() {
@@ -42310,6 +42390,7 @@ mod npy_support {
                     missing_pct: 0.0,
                     sample_values: Vec::new(),
                     notes: format!("array '{array_name}' could not be profiled: {e}"),
+                    row_count: 0, // unreadable - no real row count is knowable
                 }],
             };
             out.push((array_name, profiles));
@@ -43703,6 +43784,7 @@ mod sqlite_support {
                     missing_pct: 0.0,
                     sample_values: Vec::new(),
                     notes: format!("table '{}' could not be profiled: {e}", entry.name),
+                    row_count: 0, // unreadable - no real row count is knowable
                 }],
             };
             out.push((entry.name, profiles));
@@ -44178,6 +44260,7 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         missing_pct,
         sample_values: samples,
         notes,
+        row_count: col.total,
     }
 }
 
@@ -44327,9 +44410,19 @@ fn render_markdown(
 
     let mut md = format!("# Data Dictionary: {file_name}\n\n");
     md.push_str(&format!(
-        "**Format:** {} · **Tables:** {table_count} · **Columns:** {col_count}\n\n",
+        "**Format:** {} · **Tables:** {table_count} · **Columns:** {col_count}",
         format.as_str()
     ));
+    // A single-table source has exactly one real row count for the whole
+    // file, so it's worth stating right in the summary line - a
+    // multi-table source doesn't (each table has its own), so it gets a
+    // per-table caption under its own heading instead, below.
+    if table_count == 1
+        && let Some(first_profile) = tables.values().next().and_then(|p| p.first())
+    {
+        md.push_str(&format!(" · **Rows:** {}", first_profile.row_count));
+    }
+    md.push_str("\n\n");
 
     let show_headers = table_count > 1; // only multi-table sources (SQLite) get ## sections
 
@@ -44359,6 +44452,14 @@ fn render_markdown(
                 md_anchor_slug(table_name, index),
                 escape_md(table_name)
             ));
+            // See ColumnProfile::row_count's own doc comment: the first
+            // profile in a table's own list always reflects that table's
+            // real row count, whether the table's columns are flat
+            // siblings (CSV/Excel/SQLite/...) or a nested JSON-shaped
+            // path's own top-level row.
+            if let Some(first_profile) = profiles.first() {
+                md.push_str(&format!("**Rows:** {}\n\n", first_profile.row_count));
+            }
         }
 
         // Description is always empty today (intentionally left for a human
@@ -54934,6 +55035,7 @@ mod tests {
             missing_pct,
             sample_values: vec![],
             notes: String::new(),
+            row_count: 10,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = std::iter::once((
             "t".to_string(),
@@ -54947,5 +55049,97 @@ mod tests {
         assert!(md.contains(&format!("{:.1}%", HIGH_MISSING_PCT_THRESHOLD - 0.1)));
         assert!(!md.contains(&format!("**{:.1}%**", HIGH_MISSING_PCT_THRESHOLD - 0.1)));
         assert!(md.contains(&format!("**{:.1}%**", HIGH_MISSING_PCT_THRESHOLD)));
+    }
+
+    // --- escape_md hardening ---
+
+    #[test]
+    fn escape_md_leaves_snake_case_names_untouched() {
+        // Every underscore here is intraword (alphanumeric on both
+        // sides) - CommonMark itself never treats these as emphasis, so
+        // escaping them would only add visual noise to the overwhelmingly
+        // common case in this tool's own domain.
+        assert_eq!(escape_md("user_uuid"), "user_uuid");
+        assert_eq!(escape_md("a_b_c_d"), "a_b_c_d");
+    }
+
+    #[test]
+    fn escape_md_escapes_a_leading_and_trailing_underscore() {
+        // Neither underscore here is intraword (each has a non-
+        // alphanumeric neighbor - the string boundary itself) - left
+        // unescaped, "_bold_" would render as emphasis around "bold".
+        assert_eq!(escape_md("_bold_"), "\\_bold\\_");
+    }
+
+    #[test]
+    fn escape_md_neutralizes_raw_html_and_emphasis_markup() {
+        assert_eq!(
+            escape_md("<script>alert(1)</script>"),
+            "\\<script>alert(1)\\</script>"
+        );
+        assert_eq!(escape_md("a*b"), "a\\*b");
+        assert_eq!(escape_md("a`b"), "a\\`b");
+        assert_eq!(escape_md("a[b]c"), "a\\[b\\]c");
+        assert_eq!(escape_md("a~~b~~c"), "a\\~\\~b\\~\\~c");
+    }
+
+    #[test]
+    fn escape_md_does_not_double_escape_a_backslash_next_to_a_special_char() {
+        // A single pass, not sequential `.replace()` calls, is what makes
+        // this come out right: escaping `*` before `\` (or vice versa) in
+        // two separate passes would re-match and doubly-escape whichever
+        // backslash was inserted first.
+        assert_eq!(escape_md("a\\*b"), "a\\\\\\*b");
+    }
+
+    #[test]
+    fn escape_md_still_borrows_when_nothing_needs_escaping() {
+        assert!(matches!(escape_md("plain text"), Cow::Borrowed(_)));
+    }
+
+    // --- row_count / "Rows:" caption ---
+
+    #[test]
+    fn render_markdown_shows_a_row_count_for_a_single_table_source() {
+        let profile = ColumnProfile {
+            name: "id".to_string(),
+            current_type: "i64".to_string(),
+            ideal_type: "i64".to_string(),
+            description: String::new(),
+            missing_pct: 0.0,
+            sample_values: vec!["1".to_string()],
+            notes: String::new(),
+            row_count: 42,
+        };
+        let tables: BTreeMap<String, Vec<ColumnProfile>> =
+            std::iter::once(("t".to_string(), vec![profile])).collect();
+        let md = render_markdown("f.csv", &InputFormat::Csv, &tables);
+        assert!(md.contains("**Rows:** 42"));
+    }
+
+    #[test]
+    fn render_markdown_shows_a_per_table_row_count_for_multi_table_sources() {
+        let profile_with_rows = |row_count: usize| ColumnProfile {
+            name: "id".to_string(),
+            current_type: "i64".to_string(),
+            ideal_type: "i64".to_string(),
+            description: String::new(),
+            missing_pct: 0.0,
+            sample_values: vec![],
+            notes: String::new(),
+            row_count,
+        };
+        let tables: BTreeMap<String, Vec<ColumnProfile>> = [
+            ("events".to_string(), vec![profile_with_rows(3)]),
+            ("users".to_string(), vec![profile_with_rows(7)]),
+        ]
+        .into_iter()
+        .collect();
+        let md = render_markdown("f.sqlite", &InputFormat::Sqlite, &tables);
+        // The top summary line never claims one aggregate row count across
+        // multiple, independently-sized tables.
+        assert!(!md.contains("· **Rows:**"));
+        assert!(md.contains("**Rows:** 3"));
+        assert!(md.contains("**Rows:** 7"));
     }
 }
