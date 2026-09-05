@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="style.xsl"?>
+<!-- outer comment -->
+<root>
+  <!-- inner comment with <tag> -->
+  <item id="1">value1</item>
+  <?custom-pi data?>
+  <item id="2"><![CDATA[raw <content> & stuff]]></item>
+</root>

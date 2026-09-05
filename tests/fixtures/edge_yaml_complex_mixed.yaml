@@ -1,0 +1,9 @@
+# yaml with explicit tags and complex
+explicit_str: !!str 12345
+inline_int: !!int "42"
+flow_mixed: [1, "two", true, null]
+nested:
+  level1:
+    level2:
+      value: deep
+multiline_plain: this is a very long plain scalar that spans multiple lines but is not quoted and should be parsed as one string

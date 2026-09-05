@@ -1,0 +1,4 @@
+title = "test"
+numbers = [1, 2, 3]
+mixed = [1, "two", 3.14]
+nested = {a = 1, b = "hello"}

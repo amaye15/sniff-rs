@@ -1,0 +1,6 @@
+ulid_val = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+imei_val = "356938035643809"
+cidr_val = "10.0.0.0/8"
+wkt_val = "POINT(30 10)"
+cron_val = "0 0 * * *"
+semver_val = "1.2.3"

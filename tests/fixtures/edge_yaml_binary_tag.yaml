@@ -1,0 +1,4 @@
+plain: hello
+binary_data: !!binary "SGVsbG8gd29ybGQ="
+explicit_int: !!int "42"
+explicit_str: !!str 123

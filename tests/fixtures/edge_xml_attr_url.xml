@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<root>
+  <item url="https://example.com/path?query=1&amp;other=2" count="42">hello</item>
+  <item url="http://test.org" count="100">world</item>
+</root>

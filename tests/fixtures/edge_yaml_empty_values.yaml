@@ -1,0 +1,5 @@
+empty_str: ""
+empty_arr: []
+empty_obj: {}
+present: value
+null_val: null

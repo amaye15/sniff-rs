@@ -1,0 +1,9 @@
+literal: |
+  line1
+  line2
+folded: >
+  folded line1
+  folded line2
+plain_multiline: this is a plain
+  multiline scalar
+  with indentation

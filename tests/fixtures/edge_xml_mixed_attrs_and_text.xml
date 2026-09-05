@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<root>
+  <item id="1" flag="true">hello <b>world</b> tail</item>
+  <item id="2" flag="false">foo <b>bar</b> baz</item>
+</root>

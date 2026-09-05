@@ -1,0 +1,2 @@
+{"ulid": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "imei": "356938035643809", "cidr": "192.168.1.0/24", "wkt": "POINT(1 1)", "cron": "*/5 * * * *"}
+{"ulid": "01BX5ZZKBKACTAV9WEVGEMMVRZ", "imei": "490154203237518", "cidr": "10.0.0.0/8", "wkt": "LINESTRING(0 0, 1 1)", "cron": "0 0 * * 0"}
