@@ -3930,16 +3930,58 @@ clean afterward across every individually plausible combination
 (default, `zstd`, `parquet`, `avro`, `xlsx`, `npy`, `full`), not just
 the two that were already being checked.
 
+**The web access log and syslog readers (`columns_from_weblog`/
+`columns_from_syslog`) went fifth**, and - like fixed-width text before
+them - turned out to need none of `stream_utf8_chunks`'s own chunk-
+boundary-carrying machinery at all: a log line is always one complete,
+independent record with no possibility of spanning multiple lines
+(exactly the same reasoning fixed-width's own streaming rewrite already
+established), so `std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE,
+file).lines()` is the whole change - `fs::read_to_string` plus
+`content.lines().enumerate()` becomes a real streaming line iterator,
+with the three downstream `parse_line`/`parse_rfc5424_line`/
+`parse_rfc3164_line` call sites updated to pass `&line` instead of
+`line`, since each is now an owned `String` from the iterator rather
+than a borrowed `&str` slice of an in-memory buffer. `--nrows` already
+got the same real-I/O-bounding benefit CSV/fixed-width/JSONL's own
+readers already have, and for free: both readers' existing `if
+nrows.is_some_and(|limit| total >= limit) { break; }` check already ran
+*before* attempting to parse each line (needed regardless of streaming,
+so a line past the row cutoff was never required to even be
+well-formed) - once the underlying reads are genuinely lazy, that same
+early `break` now also stops pulling further bytes from disk, with zero
+additional code needed to get that property.
+
+Measured on two real, synthetic 2,000,000-row files generated the same
+way as every other phase's own measurement: a 168 MB Common Log file
+(`peak memory footprint`, `/usr/bin/time -l`) went from 872 MB to 690 MB
+(a ~21% reduction; `maximum resident set size` 1,135 MB -> 932 MB, ~18%),
+and a 155 MB RFC 3164 syslog file went from 792 MB to 649 MB peak
+footprint (~18%; RSS 1,007 MB -> 911 MB, ~10% - smaller than the Common
+Log file's own reduction, since syslog's own per-row column count is
+lower, making the eliminated raw-text buffer a proportionally smaller
+share of total memory here, the same pattern JSON Lines' own smaller
+reduction already showed relative to CSV's). Both confirmed
+byte-identical via `diff`. Two new integration tests
+(`weblog_nrows_stops_reading_before_a_malformed_line_past_the_cutoff`,
+`syslog_nrows_stops_reading_before_a_malformed_line_past_the_cutoff`)
+lock in the `--nrows`-bounds-real-I/O behavior the same way as every
+earlier streaming phase's own version - neither needs the CSV version's
+minimum-file-size constraint, for the identical reason fixed-width/JSONL's
+own tests don't: `BufRead::lines()` validates one line at a time
+regardless of internal buffer size, so there's no risk of a malformed
+line past the cutoff landing in the same read-buffer chunk as row 0.
+
 **Deliberately not done yet, in order of likely next steps**: zstd's own
 compression layer, which needs meaningfully more care than gzip's - its
 maximum back-reference distance (`Window_Size`) is *declared in the
 frame header* rather than a fixed protocol constant, so a sliding window
 for it needs to be sized dynamically per file rather than a single fixed
 32 KiB constant; every other naturally-streamable or
-header-then-sequential-rows format (MessagePack/CBOR, weblog, syslog,
-Avro, dBase, Stata, SAS7BDAT, SPSS, NumPy); and, hardest and last, the
-formats that need the *tail* of the file before the body means anything
-at all (Parquet, Arrow IPC, ORC, SQLite, every ZIP-based format) - true
+header-then-sequential-rows format (MessagePack/CBOR, Avro, dBase,
+Stata, SAS7BDAT, SPSS, NumPy); and, hardest and last, the formats that
+need the *tail* of the file before the body means anything at all
+(Parquet, Arrow IPC, ORC, SQLite, every ZIP-based format) - true
 streaming there means `Seek`-based random access replacing a single
 in-memory buffer throughout each decoder, a materially larger rewrite
 per format than anything done so far. The `suggest_ideal_type`

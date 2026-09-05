@@ -33,6 +33,39 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-weblog-syslog` branch (Darwin arm64)
+
+`columns_from_weblog`/`columns_from_syslog` converted from
+`fs::read_to_string` + `content.lines()` to a real streaming
+`BufReader::lines()` - see CLAUDE.md's "Streaming reads / memory
+footprint" section. No chunk-boundary machinery needed (like fixed-width
+text before them, a log line is always one complete, independent
+record).
+
+**Ad-hoc, real files** (2,000,000 rows each, `/usr/bin/time -l`):
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Common Log, 168 MB - old | 1,135 MB | 872 MB |
+| Common Log, 168 MB - new | 932 MB | 690 MB |
+| Change | **-18%** | **-21%** |
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| RFC 3164 syslog, 155 MB - old | 1,007 MB | 792 MB |
+| RFC 3164 syslog, 155 MB - new | 911 MB | 649 MB |
+| Change | **-10%** | **-18%** |
+
+Both confirmed byte-identical via `diff`. Syslog's smaller RSS reduction
+is consistent with its lower per-row column count (7 vs. 9), the same
+pattern JSON Lines' own smaller reduction showed relative to CSV's - a
+smaller fraction of total memory is the eliminated raw-text buffer when
+there's less parsed-column data to offset it against. No Criterion
+benchmark target currently isolates either reader, so this entry is
+ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-decompression` branch (Darwin arm64)
 
 The gzip compression layer converted to a sliding-window streaming

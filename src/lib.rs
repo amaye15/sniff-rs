@@ -5512,13 +5512,24 @@ mod weblog_support {
         if s == "-" { None } else { Some(s.to_string()) }
     }
 
+    /// Streams `path` a line at a time via `BufReader::lines()` rather
+    /// than `fs::read_to_string`-ing the whole file - a Common/Combined
+    /// Log Format line, like fixed-width text, is a complete, independent
+    /// record with no possibility of spanning multiple lines, so this
+    /// needs none of `stream_utf8_chunks`'s own chunk-boundary-carrying
+    /// machinery (see that function's own doc comment) - just the same
+    /// `BufRead::lines()` approach `columns_from_fixed_width` already
+    /// uses, for the identical reason (its own byte-level `\n` scan is
+    /// UTF-8-safe, and `nrows`'s own `break` already stops pulling more
+    /// lines from the underlying reader with no extra plumbing needed).
     pub(crate) fn columns_from_weblog(
         path: &Path,
         nrows: Option<usize>,
         combined: bool,
     ) -> Result<Vec<ColumnInput>> {
-        let content =
-            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        use std::io::BufRead;
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let lines = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines();
 
         let mut names: Vec<&str> = vec![
             "host",
@@ -5537,7 +5548,8 @@ mod weblog_support {
 
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
         let mut total = 0usize;
-        for (line_no, line) in content.lines().enumerate() {
+        for (line_no, line) in lines.enumerate() {
+            let line = line.with_context(|| format!("failed to read {path:?}"))?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -5549,7 +5561,7 @@ mod weblog_support {
             } else {
                 "Common Log"
             };
-            let caps = parse_line(line, combined).ok_or_else(|| {
+            let caps = parse_line(&line, combined).ok_or_else(|| {
                 anyhow!(
                     "line {} doesn't match {format_name} Format: {line:?}",
                     line_no + 1
@@ -5957,13 +5969,17 @@ mod syslog_support {
         Some((pri, timestamp, hostname, tag, pid, message))
     }
 
+    /// Streams `path` a line at a time - see `columns_from_weblog`'s own
+    /// doc comment for why a syslog line, like a web access log line, is
+    /// safely streamable with nothing more than `BufRead::lines()`.
     pub(crate) fn columns_from_syslog(
         path: &Path,
         nrows: Option<usize>,
         rfc5424: bool,
     ) -> Result<Vec<ColumnInput>> {
-        let content =
-            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        use std::io::BufRead;
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let lines = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines();
 
         let names: Vec<&str> = if rfc5424 {
             vec![
@@ -5992,7 +6008,8 @@ mod syslog_support {
 
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
         let mut total = 0usize;
-        for (line_no, line) in content.lines().enumerate() {
+        for (line_no, line) in lines.enumerate() {
+            let line = line.with_context(|| format!("failed to read {path:?}"))?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -6002,7 +6019,7 @@ mod syslog_support {
             let format_name = if rfc5424 { "RFC 5424" } else { "RFC 3164" };
 
             let values: Vec<Option<String>> = if rfc5424 {
-                let caps = parse_rfc5424_line(line).ok_or_else(|| {
+                let caps = parse_rfc5424_line(&line).ok_or_else(|| {
                     anyhow!(
                         "line {} doesn't match syslog {format_name}: {line:?}",
                         line_no + 1
@@ -6024,7 +6041,7 @@ mod syslog_support {
                     Some(caps[8].to_string()),
                 ]
             } else {
-                let (pri, timestamp, hostname, tag, pid, message) = parse_rfc3164_line(line)
+                let (pri, timestamp, hostname, tag, pid, message) = parse_rfc3164_line(&line)
                     .ok_or_else(|| {
                         anyhow!(
                             "line {} doesn't match syslog {format_name}: {line:?}",

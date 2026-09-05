@@ -169,6 +169,95 @@ fn jsonl_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
     assert!(!without_nrows.status.success());
 }
 
+#[cfg(feature = "weblog")]
+#[test]
+fn weblog_nrows_stops_reading_before_a_malformed_line_past_the_cutoff() {
+    // Proves --nrows bounds real disk I/O for the streaming weblog reader
+    // too, the same way it already does for CSV/fixed-width/JSONL: a line
+    // that doesn't match Common Log's grammar sitting well past the
+    // cutoff must not cause a failure with --nrows, but must fail without
+    // it, on the identical file. Like fixed-width and JSONL (and unlike
+    // CSV), this needs no minimum file size - BufRead::lines() validates
+    // one line at a time, so there's no read-buffer-chunk boundary to
+    // worry about landing the bad line alongside row 0.
+    let dir = TempDir::new();
+    let path = dir.path().join("access.log");
+    let mut content = String::new();
+    for i in 0..1000 {
+        content.push_str(&format!(
+            "192.168.1.{} - - [10/Oct/2024:13:55:36 -0700] \"GET /page{i}.html HTTP/1.1\" 200 {}\n",
+            i % 255,
+            1000 + i % 500
+        ));
+    }
+    content.push_str("this line does not match Common Log Format at all\n");
+    std::fs::write(&path, &content).unwrap();
+
+    let with_nrows = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--format",
+            "common-log",
+            "--nrows",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        with_nrows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_nrows.stderr)
+    );
+
+    let without_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--format", "common-log"])
+        .output()
+        .unwrap();
+    assert!(!without_nrows.status.success());
+}
+
+#[cfg(feature = "syslog")]
+#[test]
+fn syslog_nrows_stops_reading_before_a_malformed_line_past_the_cutoff() {
+    // Same proof as weblog's own version above, for the syslog reader.
+    let dir = TempDir::new();
+    let path = dir.path().join("messages.log");
+    let mut content = String::new();
+    for i in 0..1000 {
+        content.push_str(&format!(
+            "<34>Oct 11 22:14:{:02} mymachine su[{}]: someone did something on line {i}\n",
+            i % 60,
+            1000 + i % 9000
+        ));
+    }
+    content.push_str("nope, not a syslog line\n");
+    std::fs::write(&path, &content).unwrap();
+
+    let with_nrows = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--format",
+            "syslog",
+            "--nrows",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        with_nrows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_nrows.stderr)
+    );
+
+    let without_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--format", "syslog"])
+        .output()
+        .unwrap();
+    assert!(!without_nrows.status.success());
+}
+
 #[test]
 fn json_schema_output_maps_types_and_nullability() {
     let doc = run_with_format("sample.csv", "json-schema", &[]);
