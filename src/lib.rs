@@ -8781,6 +8781,13 @@ mod sas7bdat_support {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Walks the file's pages a second time (metadata is already fully
+    /// parsed by now) and hands each decoded row's raw bytes to `on_row`
+    /// as it's produced, rather than collecting every row into a
+    /// `Vec<Vec<u8>>` first - so peak memory stays at one page plus one
+    /// row, not the whole table. `on_row` returns the running count of
+    /// rows it has accepted so far, which this uses for its own `want`
+    /// (row-limit) cap checks in place of a `rows.len()` it no longer has.
     fn collect_rows(
         file: &mut fs::File,
         header: &Header,
@@ -8790,10 +8797,11 @@ mod sas7bdat_support {
         compression: CompressionKind,
         limit: Option<usize>,
         path: &Path,
-    ) -> Result<Vec<Vec<u8>>> {
+        mut on_row: impl FnMut(&[u8]) -> Result<u64>,
+    ) -> Result<()> {
         let row_len = row_len as usize;
         if row_len == 0 || total_rows == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let max_row_len = u64::from(header.page_size) * MAX_ROW_LEN_PAGE_MULTIPLE;
         if row_len as u64 > max_row_len {
@@ -8801,7 +8809,7 @@ mod sas7bdat_support {
         }
 
         let want = limit.map_or(total_rows, |n| (n as u64).min(total_rows));
-        let mut rows: Vec<Vec<u8>> = Vec::new();
+        let mut produced: u64 = 0;
         let hdr = header.page_header_size as usize;
         let pointer_size = header.subheader_pointer_size as usize;
 
@@ -8830,7 +8838,7 @@ mod sas7bdat_support {
             if subheader_count != 0 {
                 let mut cursor = hdr;
                 for _ in 0..subheader_count {
-                    if u64::try_from(rows.len()).unwrap_or(u64::MAX) >= want {
+                    if produced >= want {
                         break 'pages;
                     }
                     let pointer = page
@@ -8859,17 +8867,18 @@ mod sas7bdat_support {
                             }
                             let mut off = 0usize;
                             while off + row_len <= sub.len() {
-                                if u64::try_from(rows.len()).unwrap_or(u64::MAX) >= want {
+                                if produced >= want {
                                     break;
                                 }
-                                rows.push(sub[off..off + row_len].to_vec());
+                                produced = on_row(&sub[off..off + row_len])?;
                                 produced_here += 1;
                                 off += row_len;
                             }
                         }
                         1 => {}
                         4 => {
-                            rows.push(decompress_row(compression, sub, row_len)?);
+                            let decoded = decompress_row(compression, sub, row_len)?;
+                            produced = on_row(&decoded)?;
                             produced_here += 1;
                         }
                         other => bail!("unsupported SAS7BDAT subheader compression mode {other}"),
@@ -8915,21 +8924,19 @@ mod sas7bdat_support {
                         }
                     }
                 };
-                let rows_here = possible_rows
-                    .min(cap)
-                    .min(want.saturating_sub(rows.len() as u64));
+                let rows_here = possible_rows.min(cap).min(want.saturating_sub(produced));
                 let mut off = data_start;
                 for _ in 0..rows_here {
-                    rows.push(page[off..off + row_len].to_vec());
+                    produced = on_row(&page[off..off + row_len])?;
                     off += row_len;
                 }
             }
 
-            if u64::try_from(rows.len()).unwrap_or(u64::MAX) >= want {
+            if produced >= want {
                 break;
             }
         }
-        Ok(rows)
+        Ok(())
     }
 
     // --- Text decoding ---
@@ -9398,7 +9405,11 @@ mod sas7bdat_support {
             })
             .collect();
 
-        let rows = collect_rows(
+        let n_cols = columns_raw.len();
+        let mut states: Vec<ColumnAccumulatorState> =
+            (0..n_cols).map(|_| ColumnAccumulatorState::new()).collect();
+        let mut rows_seen: u64 = 0;
+        collect_rows(
             &mut file,
             &header,
             row_info.row_length,
@@ -9407,35 +9418,36 @@ mod sas7bdat_support {
             compression,
             nrows,
             path,
+            |row: &[u8]| -> Result<u64> {
+                for i in 0..n_cols {
+                    if let Some(s) = cell_to_string(
+                        logical_types[i],
+                        &columns_raw[i],
+                        row,
+                        header.endianness,
+                        decoder,
+                    )? {
+                        states[i].push(s, n_samples);
+                    }
+                }
+                rows_seen += 1;
+                Ok(rows_seen)
+            },
         )?;
 
-        let n_cols = columns_raw.len();
-        let mut raw: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(rows.len()); n_cols];
-        for row in &rows {
-            for i in 0..n_cols {
-                raw[i].push(cell_to_string(
-                    logical_types[i],
-                    &columns_raw[i],
-                    row,
-                    header.endianness,
-                    decoder,
-                )?);
-            }
-        }
-
-        let mut profiles = Vec::new();
-        for (i, name) in names.into_iter().enumerate() {
-            let total = raw[i].len();
-            let non_null: Vec<String> = std::mem::take(&mut raw[i]).into_iter().flatten().collect();
-            let col = ColumnInput {
-                name,
-                current_type: logical_type_label(logical_types[i]).to_string(),
-                raw_values: non_null,
-                total,
-                skip_heuristics: false,
-            };
-            profiles.push(profile_column(col, n_samples));
-        }
+        let total = rows_seen as usize;
+        let profiles = names
+            .into_iter()
+            .zip(states)
+            .enumerate()
+            .map(|(i, (name, state))| {
+                state.into_profile_with_declared_type(
+                    name,
+                    total,
+                    logical_type_label(logical_types[i]).to_string(),
+                )
+            })
+            .collect();
         Ok(profiles)
     }
 } // mod sas7bdat_support

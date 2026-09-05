@@ -33,6 +33,37 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/incremental-sas7bdat` branch (Darwin arm64)
+
+SAS7BDAT wired through `ColumnAccumulatorState`, the seventh format
+converted. `collect_rows` now takes an `impl FnMut(&[u8]) -> Result<u64>`
+callback invoked per row instead of returning a `Vec<Vec<u8>>` of every
+raw row; the caller folds each row's cells straight into one
+`ColumnAccumulatorState` per column via `cell_to_string`, dropping both
+the whole-table raw-byte buffer and the separate
+`Vec<Vec<Option<String>>>` string copy. `current_type` from the file's
+own declared column type (`logical_type_label`); missing cells
+(`cell_to_string` -> `None`) are simply not pushed.
+
+No before/after footprint measurement - no tool in this environment can
+write a `.sas7bdat` file, so there's no large real fixture to measure
+against (the same disclosed limitation the Tier 1 SAS7BDAT phase had).
+Correctness-only: full test suite unchanged (including
+`sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly`), plus
+byte-identical old-vs-new `--output-format json` across every committed
+`.sas7bdat` fixture + a truncated copy at 3 `--samples` settings
+with/without `--nrows 2`, and the entire 359-file fixture corpus - zero
+mismatches. Memory claim rests on the structural argument (one page +
+one row + bounded accumulators, page-forward-only), same as SQLite's own
+callback-converted phase already proved at scale.
+
+Clippy/fmt clean across default/`sas7bdat`/`full`, matching established
+baselines (default=1, sas7bdat=1, full=5) - the count-of-1/5 being the
+pre-existing `chunks_exact`/question-mark findings from a newer clippy
+version, confirmed identical on unmodified `main`.
+
+---
+
 ## 2026-09-05 — `feat/incremental-npy` branch (Darwin arm64)
 
 NumPy wired through `ColumnAccumulatorState`, the sixth format converted

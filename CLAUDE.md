@@ -4929,17 +4929,66 @@ clippy findings on unrelated lines, from a newer clippy version than
 this baseline was last checked against, are unrelated to this change -
 confirmed identical on unmodified `main` via `git stash`).
 
+**SAS7BDAT went seventh.** Its Tier 1 phase (see the sixth streaming
+phase above) had already made both metadata- and row-reading passes
+walk one page at a time via `read_page` - but `collect_rows` still
+returned a `Vec<Vec<u8>>` holding *every* decoded row's raw bytes, and
+`columns_from_sas7bdat` then built a second full copy as
+`Vec<Vec<Option<String>>>` before handing each column to
+`ColumnInput`/`profile_column`. `collect_rows` now takes an
+`impl FnMut(&[u8]) -> Result<u64>` callback and invokes it per row as
+each row is produced (from any of its three row sources - a compressed-
+data subheader's inline rows, a compression-mode-4 subheader, or the
+Data/Mix page trailing-row fallback), returning the running accepted-row
+count the callback reports so its own `want` (row-limit) cap checks
+still work without a `rows.len()` it no longer has. The caller's
+callback folds each row's cells straight into one
+`ColumnAccumulatorState` per column via `cell_to_string`, so peak memory
+is now one page plus one row plus the bounded accumulators, not the
+whole table twice over. `current_type` comes from the file's own
+declared column type (`logical_type_label` over the format-metadata type
+code plus optional format name) - the same declared-type path dBase/
+Stata/SPSS/NumPy already use, `into_profile_with_declared_type`
+unchanged. Unlike NumPy, SAS7BDAT does have a real per-cell missing
+concept (`cell_to_string` returns `Option<String>`), so a `None` cell is
+simply not pushed and `total` for `finish_profile` is the row count the
+callback saw, exactly as `raw[i].len()` gave it before.
+
+**No quantitative real-file measurement was possible, disclosed the same
+way the Tier 1 SAS7BDAT phase already had to**: no tool anywhere in this
+environment can *write* a `.sas7bdat` file (`pyreadstat` only reads
+them), so there's no way to generate a large real fixture to measure a
+before/after footprint against. Verification is correctness-only: the
+full test suite (including the direct
+`sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly` oracle
+comparison, zero modifications needed) passes unchanged, and a
+controlled old-vs-new binary comparison produced byte-identical
+`--output-format json` output across every committed `.sas7bdat` fixture
+(`sas7bdat_people_nonascii`, `edge_sas_copy`, `malformed_garbage`) plus a
+deliberately truncated copy (to exercise `read_page`'s own "out of
+range" error path) at every combination of 3 `--samples` settings and
+with/without `--nrows 2`, and across the entire 359-file fixture corpus.
+The memory claim rests on the same structural argument every other
+callback-converted phase in this section made: nothing is ever held
+beyond one page, one row, and the per-column accumulators, for a
+page-forward-only access pattern the Tier 1 phase already proved out at
+scale for SQLite (whose own `collect_table_rows` got the identical
+callback treatment). Clippy/fmt clean across default/`sas7bdat`/`full`,
+matching established baselines (the same pre-existing `chunks_exact`/
+question-mark clippy findings on unrelated lines, from a newer clippy
+version, confirmed identical on unmodified `main` via `git stash`).
+
 **Deliberately not done yet**: every other `profile_column`/
 `profile_json_path`-based reader still holds a full column's values
-resident (Excel, SAS7BDAT, ORC, JSON, YAML, TOML, Avro, MessagePack,
+resident (Excel, ORC, JSON, YAML, TOML, Avro, MessagePack,
 CBOR, XML, Parquet/Arrow's nested columns) - each would need its own
 `ColumnInput`/`profile_column` (or `profile_json_path`) call site
 converted the same way CSV's/fixed-width's/dBase's/Stata's/SPSS's/
-NumPy's were, and each deserves its own real-file measurement before
-being called done, the same one-phase-at-a-time discipline this whole
-section has already used throughout. Excel specifically would need its
-own, larger restructuring (see above) rather than the same drop-in
-bypass pattern the six converted so far all shared. Per-entry
+NumPy's/SAS7BDAT's were, and each deserves its own real-file measurement
+before being called done, the same one-phase-at-a-time discipline this
+whole section has already used throughout. Excel specifically would need
+its own, larger restructuring (see above) rather than the same drop-in
+bypass pattern the seven converted so far all shared. Per-entry
 streaming decompression inside `ZipArchive::read` itself remains a
 real, disclosed, separately-scoped remaining gap, not folded into any
 phase
