@@ -4889,17 +4889,57 @@ both `spss_reader_matches_the_ambers_crate_output_exactly` and
 modifications needed) and clippy/fmt clean across default/`spss`/
 `full`, matching established baselines exactly.
 
+**NumPy went sixth.** `columns_from_npy_reader` already streamed its row
+data lazily off the underlying reader (a Tier 1 win from an earlier
+phase - one row's worth of bytes read at a time in the structured/
+row-major cases, with a disclosed whole-buffer exception for Fortran-
+order multi-column arrays, see that phase's own writeup above), but
+still collected every decoded value into a plain `Vec<Vec<String>>`
+before handing each column to `ColumnInput`/`profile_column`. That
+`Vec<Vec<String>>` is now `Vec<ColumnAccumulatorState>`, filled the
+identical way for all three of the reader's existing branches
+(structured/record, row-major C-order, and the Fortran-order fallback) -
+`column.push(value, n_samples)` in place of `column.push(value)`, one
+line changed per branch, with no other restructuring needed since the
+per-row loop shape was already exactly right. `current_type` for NumPy
+comes from the array's own declared dtype (`npy_type_label`), a third
+distinct flavor of the same "declared type is a hint" split dBase's
+field-type byte and Stata's variable-type label already established -
+`into_profile_with_declared_type` needed no changes to accept it,
+further confirming the abstraction's generality. `total` for
+`finish_profile` is `rows_to_read` directly (every one of NumPy's three
+branches pushes exactly one value per row read, with no format-level
+concept of a missing/null element at all, so `total_non_null` always
+equals `total` here).
+
+Measured on a real 163 MB, 200,000-row structured `.npy` file (id/name/
+email/amount/a 150-character free-text description field, generated via
+`numpy.save`): maxRSS 91-98 MB -> ~2.0 MB (~98%), peak footprint
+69-72 MB -> ~1.1-1.2 MB (~98%), consistent across 3 rounds. Output
+confirmed byte-identical via `diff` against the pre-change binary
+across the entire 359-file fixture corpus, and separately across every
+committed `.npy`/`.npz` fixture (plain 1D, structured, big-endian,
+sub-array fields, Fortran-order, and the per-array-isolation `.npz`
+fixture) at every combination of 3 `--samples` settings and with/without
+`--nrows 2` (78 combinations) - zero mismatches. Full test suite (347
+unit + 360 integration, zero modifications needed) and clippy/fmt clean
+across default/`npy`/`full`, matching established baselines exactly
+(a handful of pre-existing `chunks_exact`-lint/question-mark-operator
+clippy findings on unrelated lines, from a newer clippy version than
+this baseline was last checked against, are unrelated to this change -
+confirmed identical on unmodified `main` via `git stash`).
+
 **Deliberately not done yet**: every other `profile_column`/
 `profile_json_path`-based reader still holds a full column's values
-resident (Excel, NumPy, SAS7BDAT, ORC, JSON, YAML, TOML, Avro,
-MessagePack, CBOR, XML, Parquet/Arrow's nested columns) - each would
-need its own `ColumnInput`/`profile_column` (or `profile_json_path`)
-call site converted the same way CSV's/fixed-width's/dBase's/Stata's/
-SPSS's were, and each deserves its own real-file measurement before
+resident (Excel, SAS7BDAT, ORC, JSON, YAML, TOML, Avro, MessagePack,
+CBOR, XML, Parquet/Arrow's nested columns) - each would need its own
+`ColumnInput`/`profile_column` (or `profile_json_path`) call site
+converted the same way CSV's/fixed-width's/dBase's/Stata's/SPSS's/
+NumPy's were, and each deserves its own real-file measurement before
 being called done, the same one-phase-at-a-time discipline this whole
 section has already used throughout. Excel specifically would need its
 own, larger restructuring (see above) rather than the same drop-in
-bypass pattern the five converted so far all shared. Per-entry
+bypass pattern the six converted so far all shared. Per-entry
 streaming decompression inside `ZipArchive::read` itself remains a
 real, disclosed, separately-scoped remaining gap, not folded into any
 phase

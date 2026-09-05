@@ -33,6 +33,35 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/incremental-npy` branch (Darwin arm64)
+
+NumPy wired through `ColumnAccumulatorState`, the sixth format converted
+(after CSV/fixed-width/dBase/Stata/SPSS). `columns_from_npy_reader`'s
+`Vec<Vec<String>>` becomes `Vec<ColumnAccumulatorState>`, one line changed
+per branch (structured/record, row-major C-order, Fortran-order fallback)
+since the per-row streaming loop shape was already correct. `current_type`
+comes from the array's own declared dtype (`npy_type_label`) - a third
+distinct shape `into_profile_with_declared_type` accommodates with no
+further changes.
+
+Measured on a real 163 MB, 200,000-row structured `.npy` file (id/name/
+email/amount/a 150-char free-text column, via `numpy.save`): maxRSS
+91-98 MB -> ~2.0 MB (~98%), peak footprint 69-72 MB -> ~1.1-1.2 MB (~98%),
+consistent across 3 rounds. Output byte-identical via `diff` against the
+entire 359-file fixture corpus, plus every committed `.npy`/`.npz` fixture
+at 3 `--samples` settings with/without `--nrows 2` (78 combinations) -
+zero mismatches.
+
+Verified via the full test suite (347 unit + 360 integration, zero
+modifications needed) and clippy/fmt clean across default/`npy`/`full`,
+matching established baselines (default=1, npy=1, full=5) exactly. A
+handful of pre-existing `chunks_exact`/question-mark clippy findings on
+unrelated lines (newer clippy version than this baseline was last checked
+against) confirmed identical on unmodified `main` via `git stash` - not
+introduced by this change.
+
+---
+
 ## 2026-09-05 — `feat/incremental-spss` branch (Darwin arm64)
 
 SPSS wired through `ColumnAccumulatorState`, the fifth format converted

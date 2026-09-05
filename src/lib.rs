@@ -43287,11 +43287,10 @@ mod npy_support {
             })
             .collect::<Result<_>>()?;
 
-        let mut columns: Vec<Vec<String>> = if is_record {
-            vec![Vec::new(); fields.len()]
-        } else {
-            vec![Vec::new(); n_cols]
-        };
+        let n_states = if is_record { fields.len() } else { n_cols };
+        let mut columns: Vec<ColumnAccumulatorState> = (0..n_states)
+            .map(|_| ColumnAccumulatorState::new())
+            .collect();
         let rows_to_read = nrows.map_or(n_rows, |limit| limit.min(n_rows));
 
         if is_record {
@@ -43306,10 +43305,8 @@ mod npy_support {
                     .with_context(|| format!("failed reading row {row}"))?;
                 let mut offset = 0;
                 for (col_idx, (field, size)) in fields.iter().zip(&field_sizes).enumerate() {
-                    columns[col_idx].push(npy_value_to_string(
-                        &field.dtype,
-                        &buf[offset..offset + size],
-                    ));
+                    let value = npy_value_to_string(&field.dtype, &buf[offset..offset + size]);
+                    columns[col_idx].push(value, n_samples);
                     offset += size;
                 }
             }
@@ -43330,10 +43327,9 @@ mod npy_support {
                     .with_context(|| format!("failed reading row {row}"))?;
                 for (col_idx, column) in columns.iter_mut().enumerate() {
                     let start = col_idx * elem_size;
-                    column.push(npy_value_to_string(
-                        &fields[0].dtype,
-                        &buf[start..start + elem_size],
-                    ));
+                    let value =
+                        npy_value_to_string(&fields[0].dtype, &buf[start..start + elem_size]);
+                    column.push(value, n_samples);
                 }
             }
         } else {
@@ -43356,10 +43352,9 @@ mod npy_support {
                 for (col_idx, column) in columns.iter_mut().enumerate() {
                     let flat_index = col_idx * n_rows + row;
                     let start = flat_index * elem_size;
-                    column.push(npy_value_to_string(
-                        &fields[0].dtype,
-                        &buf[start..start + elem_size],
-                    ));
+                    let value =
+                        npy_value_to_string(&fields[0].dtype, &buf[start..start + elem_size]);
+                    column.push(value, n_samples);
                 }
             }
         }
@@ -43381,18 +43376,8 @@ mod npy_support {
             .into_iter()
             .zip(current_types)
             .zip(columns)
-            .map(|((name, current_type), values)| {
-                let total = values.len();
-                profile_column(
-                    ColumnInput {
-                        name,
-                        current_type,
-                        raw_values: values,
-                        total,
-                        skip_heuristics: false,
-                    },
-                    n_samples,
-                )
+            .map(|((name, current_type), state)| {
+                state.into_profile_with_declared_type(name, rows_to_read, current_type)
             })
             .collect())
     }
