@@ -5128,22 +5128,54 @@ without `--nrows` (2,154 combinations); full test suite unchanged
 (including `avro_reader_matches_the_apache_avro_crate_output_exactly`),
 clippy/fmt clean across default/`avro`/`full`, established baselines.
 
+**MessagePack and CBOR went next, together** - they share this exact
+reader shape verbatim (a stream of concatenated self-delimiting values,
+with a "single top-level value that's an array -> use its elements as
+the records" transform). The old code collected `Vec<Value>`, applied
+that transform, then built a *second* full `Vec<JsonValue>` copy before
+the dual-mode branch. Both now decode one top-level `Value` at a time
+and fold it straight into a `JsonRecordStreamProfiler` via
+`value_to_json`. The single-array transform is resolved with a
+one-value lookahead: decode the first value, peek `fill_buf().is_empty()`
+- if that's the only value and it's an array, its elements are the
+records; otherwise the first value plus every subsequent one are the
+concatenated records. Every value is still fully decoded regardless of
+`--nrows` (matching the old decode-all-then-`truncate`), so a malformed
+trailing record past the cutoff still errors exactly as before -
+`--nrows` only bounds what's *pushed* into the profiler. The
+single-top-level-array shape still decodes that one array whole
+(`read_value` has no pull mode), but even then this drops the redundant
+second copy.
+
+Measured on real 500,000-record concatenated-record files (id/email/
+amount/a 3-element array/a 2-field nested map/bool, ~70 MB each):
+MessagePack maxRSS 1.15-1.18 GB -> ~2.3 MB (~99.8%), peak footprint
+~1.16 GB -> ~1.0-1.1 MB (~99.9%); CBOR maxRSS 1.05-1.06 GB -> ~2.2 MB
+(~99.8%), peak footprint ~1.04 GB -> ~0.9-1.0 MB (~99.9%); 3 rounds
+each. Output byte-identical via `diff` against the pre-change binary
+across the entire 359-file fixture corpus in all three output formats
+with `--nrows` unset/1/2 (3,231 combinations), plus a 400-iteration
+fuzz over concatenated-records / concatenated-scalars / single-array
+shapes crossed with `--nrows`/`--samples` - zero mismatches. Full test
+suite unchanged (including `msgpack_reader_matches_the_rmpv_crate_output_exactly`
+and `cbor_reader_matches_the_ciborium_crate_output_exactly`, plus the
+concatenated-records, top-level-array, malformed, and deeply-nested
+tests for both), clippy/fmt clean across default/`msgpack`/`cbor`/
+`full`, established baselines.
+
 **Deliberately not done yet**: the remaining `profile_json_records`-based
-readers still materialize their whole record set (MessagePack, CBOR,
-TOML, YAML, XML, Parquet/Arrow's nested columns, and JSON's own
-top-level-array and single-multi-line-document shapes). MessagePack and
-CBOR are genuinely streamable (concatenated self-delimiting values) but
-each has a "single top-level array -> use its elements" transform that
-needs a one-value lookahead to resolve, so they're a slightly more
-careful wiring than Avro's clean block loop; a YAML multi-document
-stream is streamable too. The rest are inherently whole-buffer (a single
-TOML/YAML document, a top-level JSON array - no record boundary to
-stream on). Each streamable one still wants its own real-file
-measurement. Excel still needs its own larger `SheetGrid` restructuring
-(see above) rather than the drop-in bypass the eight `profile_column`
-conversions shared. Per-entry streaming decompression inside
-`ZipArchive::read` itself remains a real, disclosed, separately-scoped
-remaining gap, not folded into any phase here.
+readers still materialize their whole record set (TOML, YAML, XML,
+Parquet/Arrow's nested columns, and JSON's own top-level-array and
+single-multi-line-document shapes). A YAML `---`-multi-document stream
+is genuinely streamable (one document at a time); the rest are
+inherently whole-buffer (a single TOML/YAML document, a top-level JSON
+or XML tree - no record boundary to stream on). The streamable one still
+wants its own real-file measurement. Excel still needs its own larger
+`SheetGrid` restructuring (see above) rather than the drop-in bypass the
+eight `profile_column` conversions shared. Per-entry streaming
+decompression inside `ZipArchive::read` itself remains a real,
+disclosed, separately-scoped remaining gap, not folded into any phase
+here.
 
 ## Cloud-platform file compatibility
 

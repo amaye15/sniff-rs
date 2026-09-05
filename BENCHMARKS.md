@@ -33,6 +33,28 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/incremental-msgpack-cbor` branch (Darwin arm64)
+
+MessagePack and CBOR wired through the incremental JSON-path engine
+(they share this reader shape verbatim). Each now decodes one top-level
+`Value` at a time and folds it into a `JsonRecordStreamProfiler` via
+`value_to_json` instead of building `Vec<Value>` *and* a second
+`Vec<JsonValue>` copy. The "single top-level array -> use its elements"
+transform is resolved with a one-value lookahead
+(`fill_buf().is_empty()` after the first value). Every value still fully
+decoded regardless of `--nrows` (so a malformed trailing record still
+errors); `--nrows` only bounds what's pushed.
+
+Measured on real 500,000-record concatenated-record files (~70 MB each):
+MessagePack maxRSS 1.15-1.18 GB -> ~2.3 MB (~99.8%), peak footprint
+~1.16 GB -> ~1.0-1.1 MB (~99.9%); CBOR maxRSS 1.05-1.06 GB -> ~2.2 MB
+(~99.8%), peak footprint ~1.04 GB -> ~0.9-1.0 MB (~99.9%); 3 rounds
+each. Byte-identical output across the full corpus in all three output
+formats with `--nrows` unset/1/2 (3,231 combinations) plus a
+400-iteration shape/flag fuzz; both crate oracle comparisons unchanged.
+
+---
+
 ## 2026-09-06 — `feat/incremental-avro` branch (Darwin arm64)
 
 Avro wired through the incremental JSON-path engine - the first

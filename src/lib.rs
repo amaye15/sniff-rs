@@ -38935,56 +38935,60 @@ mod msgpack_support {
         let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
         let mut reader = BufReader::new(file);
 
-        let mut top_values = Vec::new();
-        while !reader
+        // Each top-level value folds straight into the shared streaming
+        // profiler as it's decoded (see the CBOR reader's own copy of this
+        // for the full reasoning - the two formats share this shape
+        // verbatim). Every value is still decoded regardless of `--nrows`
+        // (matching the old decode-all-then-`truncate`), so a malformed
+        // trailing record past the cutoff still errors exactly as before;
+        // `--nrows` only bounds what's *pushed*. Not every MessagePack
+        // stream holds map-typed records - a stream of bare scalars (e.g.
+        // IoT/telemetry readings, a real, common shape for this format
+        // specifically because it's compact binary encoding) has no field
+        // names to extract, but is still a genuine single column, handled
+        // by `JsonRecordStreamProfiler`'s own dual-mode ending.
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let push_capped = |profiler: &mut JsonRecordStreamProfiler, jv: &JsonValue| {
+            if nrows.is_none_or(|n| profiler.total < n) {
+                profiler.push(jv);
+            }
+        };
+        if !reader
             .fill_buf()
             .with_context(|| format!("failed reading {path:?}"))?
             .is_empty()
         {
-            let v = read_value(&mut reader, MAX_DEPTH)
+            let first = read_value(&mut reader, MAX_DEPTH)
                 .with_context(|| format!("failed decoding a MessagePack value from {path:?}"))?;
-            top_values.push(v);
-        }
-
-        let values: Vec<Value> = if top_values.len() == 1 {
-            match top_values.into_iter().next().unwrap() {
-                Value::Array(items) => items,
-                other => vec![other],
+            let has_more = !reader
+                .fill_buf()
+                .with_context(|| format!("failed reading {path:?}"))?
+                .is_empty();
+            if !has_more {
+                match first {
+                    Value::Array(items) => {
+                        for item in &items {
+                            push_capped(&mut profiler, &value_to_json(item));
+                        }
+                    }
+                    other => push_capped(&mut profiler, &value_to_json(&other)),
+                }
+            } else {
+                push_capped(&mut profiler, &value_to_json(&first));
+                while !reader
+                    .fill_buf()
+                    .with_context(|| format!("failed reading {path:?}"))?
+                    .is_empty()
+                {
+                    let v = read_value(&mut reader, MAX_DEPTH).with_context(|| {
+                        format!("failed decoding a MessagePack value from {path:?}")
+                    })?;
+                    push_capped(&mut profiler, &value_to_json(&v));
+                }
             }
-        } else {
-            top_values
-        };
-
-        let mut values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
-        if let Some(n) = nrows {
-            values.truncate(n);
         }
 
-        // Not every MessagePack stream holds map-typed records - a stream of
-        // bare scalars (e.g. IoT/telemetry readings, a real, common shape for
-        // this format specifically because it's compact binary encoding) has
-        // no field names to extract, but is still a genuine single column.
-        // Same fallback the JSON/YAML/Avro readers already use for their own
-        // analogous case, found the same way: real-world testing.
-        if values.iter().all(JsonValue::is_object) {
-            let records: Vec<json_support::Map> = values
-                .into_iter()
-                .map(|v| match v {
-                    JsonValue::Object(m) => m,
-                    _ => unreachable!("just checked every value is an object"),
-                })
-                .collect();
-            Ok(profile_json_records(&records, n_samples))
-        } else {
-            let total = values.len();
-            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-            Ok(profile_json_path(
-                "value".to_string(),
-                total,
-                refs,
-                n_samples,
-            ))
-        }
+        Ok(profiler.finish())
     }
 } // mod msgpack_support
 
@@ -41883,56 +41887,68 @@ mod cbor_support {
         let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
         let mut reader = BufReader::new(file);
 
-        let mut top_values = Vec::new();
-        while !reader
+        // Each top-level value folds straight into the shared streaming
+        // profiler as it's decoded, so a concatenated-records file never
+        // holds them all resident - only one `Value` tree at a time plus
+        // the bounded accumulator. The single-top-level-array shape still
+        // decodes that one array whole (`read_value` has no pull mode),
+        // but even then this drops the second full copy the old code built
+        // (`Vec<Value>` *and* `Vec<JsonValue>`). Every value is still
+        // decoded regardless of `--nrows` (matching the old
+        // decode-all-then-`truncate`), so a malformed trailing record past
+        // the cutoff still errors exactly as before - `--nrows` only
+        // bounds what's *pushed*.
+        //
+        // The dual-mode ending (all-object records vs. one `value` column)
+        // is `JsonRecordStreamProfiler`'s: a stream of bare CBOR scalars
+        // (e.g. IoT/telemetry readings - CBOR is the format RFC 7049/8949
+        // was written for, and constrained-device telemetry is exactly
+        // this shape in practice) has no field names to extract, but is
+        // still a genuine single column, not an error.
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let push_capped = |profiler: &mut JsonRecordStreamProfiler, jv: &JsonValue| {
+            if nrows.is_none_or(|n| profiler.total < n) {
+                profiler.push(jv);
+            }
+        };
+        if !reader
             .fill_buf()
             .with_context(|| format!("failed reading {path:?}"))?
             .is_empty()
         {
-            let v = read_value(&mut reader, MAX_DEPTH)
+            let first = read_value(&mut reader, MAX_DEPTH)
                 .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
-            top_values.push(v);
-        }
-
-        let values: Vec<Value> = if top_values.len() == 1 {
-            match top_values.into_iter().next().unwrap() {
-                Value::Array(items) => items,
-                other => vec![other],
+            let has_more = !reader
+                .fill_buf()
+                .with_context(|| format!("failed reading {path:?}"))?
+                .is_empty();
+            if !has_more {
+                // Exactly one top-level value: an array's elements are the
+                // records, mirroring the JSON/MessagePack single-`[...]`
+                // convention.
+                match first {
+                    Value::Array(items) => {
+                        for item in &items {
+                            push_capped(&mut profiler, &value_to_json(item));
+                        }
+                    }
+                    other => push_capped(&mut profiler, &value_to_json(&other)),
+                }
+            } else {
+                push_capped(&mut profiler, &value_to_json(&first));
+                while !reader
+                    .fill_buf()
+                    .with_context(|| format!("failed reading {path:?}"))?
+                    .is_empty()
+                {
+                    let v = read_value(&mut reader, MAX_DEPTH)
+                        .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
+                    push_capped(&mut profiler, &value_to_json(&v));
+                }
             }
-        } else {
-            top_values
-        };
-
-        let mut values: Vec<JsonValue> = values.iter().map(value_to_json).collect();
-        if let Some(n) = nrows {
-            values.truncate(n);
         }
 
-        // Same fallback as MessagePack's reader (and JSON/YAML/Avro before
-        // it): a stream of bare CBOR scalars (e.g. IoT/telemetry readings -
-        // CBOR is the format RFC 7049/8949 was written for, and
-        // constrained-device telemetry is exactly this shape in practice)
-        // has no field names to extract, but is still a genuine single
-        // column, not an error.
-        if values.iter().all(JsonValue::is_object) {
-            let records: Vec<json_support::Map> = values
-                .into_iter()
-                .map(|v| match v {
-                    JsonValue::Object(m) => m,
-                    _ => unreachable!("just checked every value is an object"),
-                })
-                .collect();
-            Ok(profile_json_records(&records, n_samples))
-        } else {
-            let total = values.len();
-            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-            Ok(profile_json_path(
-                "value".to_string(),
-                total,
-                refs,
-                n_samples,
-            ))
-        }
+        Ok(profiler.finish())
     }
 } // mod cbor_support
 
