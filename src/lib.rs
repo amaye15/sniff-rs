@@ -28437,6 +28437,7 @@ mod lz4_support {
 #[cfg(feature = "parquet")]
 mod parquet_support {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
 
     // ---------------------------------------------------------------
     // Thrift compact protocol - read side only. Verified field-for-field
@@ -29387,7 +29388,15 @@ mod parquet_support {
     /// Reads the whole file, verifies the leading and trailing `"PAR1"`
     /// magic (the footer-length-encoding variant, `"PARE"`, signals an
     /// encrypted footer - out of scope, a disclosed error), and decodes
-    /// the Thrift-encoded `FileMetaData` footer.
+    /// the Thrift-encoded `FileMetaData` footer. `#[allow(dead_code)]`:
+    /// the production entry point (`profile_parquet_file`) reads via
+    /// `open_and_read_footer`/`read_row_group_bytes` instead now, so this
+    /// whole-buffer form is only ever reached by this module's own test
+    /// suite, which wants a full resident buffer to slice at arbitrary
+    /// offsets for its own oracle comparisons - invisible to a plain,
+    /// non-test build, the same reason several other superseded-but-kept
+    /// functions elsewhere in this file need the identical allow.
+    #[allow(dead_code)]
     pub(crate) fn read_footer(path: &Path) -> Result<(Vec<u8>, FileMetaData)> {
         let data = fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
         if data.len() < 12 {
@@ -29413,6 +29422,135 @@ mod parquet_support {
         let metadata = read_file_metadata(&mut reader)
             .with_context(|| format!("failed to parse the Parquet footer metadata in {path:?}"))?;
         Ok((data, metadata))
+    }
+
+    /// Reads just the file's own trailing magic/footer-length/footer
+    /// bytes via `Seek`, instead of `read_footer`'s own whole-file
+    /// `fs::read` (kept exactly as-is for this module's own test suite,
+    /// which wants a full resident buffer to slice at arbitrary offsets
+    /// for its own oracle comparisons). The production entry point never
+    /// needs more than the footer up front - every row group's own real
+    /// data is read later, on demand, by `read_row_group_bytes`, bounded
+    /// to exactly that row group's own byte span rather than the whole
+    /// file regardless of how many row groups it has.
+    fn open_and_read_footer(path: &Path) -> Result<(fs::File, FileMetaData)> {
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {path:?}"))?
+            .len();
+        if file_len < 12 {
+            bail!("{path:?} is too small to be a Parquet file");
+        }
+        let mut head = [0u8; 4];
+        file.read_exact(&mut head)
+            .with_context(|| format!("failed reading {path:?}"))?;
+        if head != *MAGIC {
+            bail!("{path:?} does not start with the Parquet magic number \"PAR1\"");
+        }
+        // The file's last 8 bytes are [4-byte footer length][4-byte
+        // magic] - read those first to learn exactly how many more
+        // bytes the real footer itself needs.
+        file.seek(SeekFrom::End(-8))
+            .with_context(|| format!("failed seeking into {path:?}"))?;
+        let mut tail = [0u8; 8];
+        file.read_exact(&mut tail)
+            .with_context(|| format!("failed reading {path:?}"))?;
+        let tail_magic = &tail[4..8];
+        if tail_magic == b"PARE" {
+            bail!("{path:?} has an encrypted Parquet footer, which isn't supported");
+        }
+        if tail_magic != MAGIC {
+            bail!("{path:?} does not end with the Parquet magic number \"PAR1\"");
+        }
+        let footer_len = u32::from_le_bytes(tail[0..4].try_into().unwrap()) as u64;
+        let footer_start = (file_len - 8)
+            .checked_sub(footer_len)
+            .context("Parquet footer length exceeds the file size")?;
+        file.seek(SeekFrom::Start(footer_start))
+            .with_context(|| format!("failed seeking into {path:?}"))?;
+        let mut footer_bytes = vec![0u8; footer_len as usize];
+        file.read_exact(&mut footer_bytes)
+            .with_context(|| format!("failed reading the Parquet footer in {path:?}"))?;
+        let mut reader = ThriftReader::new(&footer_bytes);
+        let metadata = read_file_metadata(&mut reader)
+            .with_context(|| format!("failed to parse the Parquet footer metadata in {path:?}"))?;
+        Ok((file, metadata))
+    }
+
+    /// The byte span a row group's own column chunks actually occupy in
+    /// the file - the minimum start (a chunk's dictionary page, if it has
+    /// one, always precedes its data pages) and the maximum end (start
+    /// plus `total_compressed_size`, which already covers every page in
+    /// that chunk including any dictionary page) across every column.
+    /// Real writers lay a row group's chunks out contiguously, but
+    /// nothing in the format guarantees it - taking the min/max across
+    /// all columns, rather than assuming the first/last column chunk in
+    /// declaration order is also first/last by file position, is what
+    /// makes this correct either way, at the cost of at most a few
+    /// harmless unused padding bytes if the layout isn't contiguous.
+    fn row_group_byte_range(rg: &RowGroup) -> Result<(u64, u64)> {
+        let mut range: Option<(u64, u64)> = None;
+        for col in &rg.columns {
+            let Some(meta) = col.meta_data.as_ref() else {
+                continue;
+            };
+            let chunk_start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset);
+            let chunk_start = u64::try_from(chunk_start).context("negative Parquet page offset")?;
+            let chunk_size = u64::try_from(meta.total_compressed_size)
+                .context("negative Parquet compressed size")?;
+            let chunk_end = chunk_start
+                .checked_add(chunk_size)
+                .context("Parquet chunk end offset overflow")?;
+            range = Some(match range {
+                None => (chunk_start, chunk_end),
+                Some((s, e)) => (s.min(chunk_start), e.max(chunk_end)),
+            });
+        }
+        range.context("Parquet row group has no column chunks")
+    }
+
+    /// Returns a clone of `rg` with every column's own `data_page_offset`/
+    /// `dictionary_page_offset` shifted back by `shift` - turning an
+    /// absolute file offset into one relative to the start of whatever
+    /// smaller buffer `read_row_group_bytes` actually read. Every
+    /// existing decode function (`decode_column_chunk_triples` and
+    /// everything built on it) already treats these fields as "where to
+    /// start reading pages from *this* buffer", so nothing downstream
+    /// needs to change at all once the offsets and the buffer agree with
+    /// each other.
+    fn shift_row_group_offsets(rg: &RowGroup, shift: u64) -> Result<RowGroup> {
+        let shift = i64::try_from(shift).context("Parquet row group offset shift overflow")?;
+        let mut rg = rg.clone();
+        for col in &mut rg.columns {
+            if let Some(meta) = col.meta_data.as_mut() {
+                meta.data_page_offset -= shift;
+                if let Some(d) = meta.dictionary_page_offset.as_mut() {
+                    *d -= shift;
+                }
+            }
+        }
+        Ok(rg)
+    }
+
+    /// Reads exactly one row group's own compressed bytes off disk via
+    /// `Seek`, instead of `decode_row_group_flat`/`decode_row_group_nested`
+    /// ever needing the *whole* file resident just to decode one of
+    /// possibly many row groups - the change that lets this reader's own
+    /// peak memory scale with the largest single row group rather than
+    /// with total file size, the same "row group" granularity Parquet's
+    /// own format already uses as its natural unit of independent,
+    /// randomly-accessible data.
+    fn read_row_group_bytes(file: &mut fs::File, rg: &RowGroup) -> Result<(Vec<u8>, RowGroup)> {
+        let (start, end) = row_group_byte_range(rg)?;
+        file.seek(SeekFrom::Start(start))
+            .context("failed seeking to a Parquet row group")?;
+        let len = usize::try_from(end - start).context("Parquet row group is implausibly large")?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf)
+            .context("truncated Parquet row group")?;
+        let adjusted = shift_row_group_offsets(rg, start)?;
+        Ok((buf, adjusted))
     }
 
     // ---------------------------------------------------------------
@@ -32241,7 +32379,7 @@ mod parquet_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let (file_data, meta) = read_footer(path)?;
+        let (mut file, meta) = open_and_read_footer(path)?;
         let schema = build_schema(&meta.schema)?;
         let SchemaNode::Group {
             children: root_fields,
@@ -32286,7 +32424,8 @@ mod parquet_support {
                 if nrows.is_some_and(|limit| total >= limit) {
                     break;
                 }
-                let rg_cols = decode_row_group_flat(&file_data, &schema, rg)?;
+                let (rg_bytes, rg) = read_row_group_bytes(&mut file, rg)?;
+                let rg_cols = decode_row_group_flat(&rg_bytes, &schema, &rg)?;
                 let rg_rows = rg_cols.first().map_or(0, Vec::len);
                 let take = nrows.map_or(rg_rows, |limit| rg_rows.min(limit - total));
                 for (acc, mut rg_col) in per_col.iter_mut().zip(rg_cols) {
@@ -32316,7 +32455,11 @@ mod parquet_support {
 
         let mut rows: Vec<JsonValue> = Vec::new();
         'row_groups: for rg in &meta.row_groups {
-            for row in decode_row_group_nested(&file_data, &schema, rg)? {
+            if nrows.is_some_and(|limit| rows.len() >= limit) {
+                break;
+            }
+            let (rg_bytes, rg) = read_row_group_bytes(&mut file, rg)?;
+            for row in decode_row_group_nested(&rg_bytes, &schema, &rg)? {
                 if nrows.is_some_and(|limit| rows.len() >= limit) {
                     break 'row_groups;
                 }

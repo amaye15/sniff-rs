@@ -4340,23 +4340,99 @@ against real fixture CRC32/size values - passed unchanged with zero test
 modifications needed. Clippy/fmt clean across the default, `xlsx`,
 `npy`, and `full` builds, each matching its own established baseline.
 
+**Parquet went eleventh**, and turned out to need a meaningfully smaller
+change than its own decode logic's size would suggest - the payoff of
+this reader's own careful, phase-by-phase construction (see the
+Dependency footprint section's own multi-phase writeup): every internal
+decode function already treated `data_page_offset`/`dictionary_page_offset`
+as nothing more than "where to start reading pages from *this buffer*",
+never assuming anything about what else the buffer might contain or how
+large it is relative to the whole file. That meant the fix didn't need
+to touch `decode_column_chunk_triples`, the RLE/dictionary/delta
+decoders, or the nested Struct/List/Map reconstruction at all - only
+*what buffer, and what offsets, `profile_parquet_file`'s own row-group
+loop hands them*.
+
+`open_and_read_footer` replaces `read_footer`'s own whole-file
+`fs::read` for the production entry point (kept, unchanged, for this
+module's own test suite, which wants a full resident buffer for its
+oracle comparisons) with a `Seek`-based read of just the trailing magic/
+footer-length/footer bytes - the same bounded "read only the tail"
+shape Parquet's own footer-last layout was already designed around.
+`row_group_byte_range` computes the min/max byte span a row group's own
+column chunks actually occupy (each chunk's own start - its dictionary
+page offset if it has one, else its data page offset - plus its own
+`total_compressed_size`, which already covers every page in that
+chunk); `read_row_group_bytes` then does exactly one `Seek`+`read_exact`
+of that span into a small, row-group-sized buffer, and
+`shift_row_group_offsets` returns a cloned `RowGroup` with every
+column's own offsets rebased to be relative to that buffer's own start
+instead of the whole file's. The existing decode functions run
+completely unmodified against this smaller buffer and its adjusted
+offsets - correct for exactly the reason above, and proven so by the
+complete existing Parquet test suite (19 fixtures, every compression
+codec, every encoding, nested Struct/List/Map reconstruction, the real-
+world NYC taxi/`parquet-testing` corpus tests) passing unchanged with
+zero test modifications needed, since they all still exercise the same
+underlying decoders through `read_footer`'s own unchanged whole-buffer
+path.
+
+`--nrows` picked up the identical "stops touching further data" property
+the flat path already had, extended to the nested path too: both now
+check the row/value limit *before* reading the next row group's own
+bytes from disk, not just before decoding the *next row* once a row
+group's bytes are already resident - a genuinely new bound for the
+nested path (which previously read and fully decoded an entire row
+group's worth of rows before its own per-row limit check ever ran), and
+one that scales with however many row groups a real, large Parquet file
+actually has (a NYC-taxi-shaped file can easily have dozens).
+
+Real-world testing (not just the existing fixture suite) proved the
+one part of this rewrite with no existing single-row-group fixture to
+exercise it: whether `row_group_byte_range`'s min/max-across-columns
+computation is actually correct once there's more than one row group to
+get wrong relative to another. Two real, `pyarrow`-generated multi-
+row-group files (10 row groups each, one flat 3-column/50,000-row
+schema, one nested struct+list/20,000-row schema, `row_group_size` set
+explicitly low specifically to force multiple groups from a modest row
+count) both produced byte-identical output to the pre-change binary,
+including with `--nrows` set to a value that spans a row-group boundary
+mid-group - proving the per-row-group early-stop and the byte-range
+computation both hold up across a real multi-group file, not just the
+single-row-group shape every committed fixture happens to have.
+
+Measured on a real 55 MB Parquet file (3,000,000 rows, 4 columns, 30
+row groups via `pyarrow`), 3 rounds: full-scan peak footprint 691-710 MB
+-> 630-636 MB (~10%), maxRSS roughly flat (792-877 MB -> 772-803 MB,
+noisy either direction - the same downstream-column-storage masking
+effect zstd's/NumPy's own full-pipeline measurements already
+documented, here with 30 row groups' worth of accumulated column data
+dominating regardless of how each row group's own bytes were read).
+Isolating a single row group's own read via `--nrows 1` shows the real,
+unmasked mechanism cleanly: peak footprint 97-100 MB -> 35-42 MB
+(~60%), maxRSS 103-110 MB -> 46-52 MB (~53%). Both confirmed byte-
+identical via `diff`. Clippy/fmt clean across the default, `parquet`,
+and `full` builds, each matching its own established baseline.
+
 **Deliberately not done yet**: the remaining formats that need either
 genuine random (`Seek`-based) access or more than one full pass over
 the file before the data means anything at all - SAS7BDAT (a genuine
 two-pass structure, see above - a materially different problem from
-SQLite's/ZipArchive's own single-pass-but-random-access shape), Parquet,
-Arrow IPC, and old-style `.xls` (OLE2/CFB, a *different* container
-format than the ZIP-based four `ZipArchive` already covers) - each a
-materially larger rewrite than anything done so far, and each likely to
-need its own format-specific approach the way SQLite's page-graph
-structure, SAS7BDAT's two-pass metadata scan, and `ZipArchive`'s central-
-directory-driven access already turned out to be three genuinely
-different problems rather than one shared pattern. Per-entry streaming
-decompression inside `ZipArchive::read` itself (described above) is
-also a real, disclosed, separately-scoped remaining gap, not folded into
-this phase. The `suggest_ideal_type` incremental-accumulator rewrite
-(the deeper win described above) remains entirely unstarted, tracked as
-its own future phase.
+SQLite's/ZipArchive's/Parquet's own single-pass-but-random-access
+shape), Arrow IPC (likely the most similar remaining problem to
+Parquet's own, sharing the same "footer/schema first, scattered
+row-batch buffers after" layout, but with FlatBuffers instead of Thrift
+and no exact equivalent tested yet), and old-style `.xls` (OLE2/CFB, a
+*different* container format than the ZIP-based four `ZipArchive`
+already covers, and - unlike Parquet's own clean row-group boundaries -
+one whose sector-chain-following would need to become genuinely lazy
+itself to get a comparable win, not just have its outer caller read a
+smaller bounded span). Per-entry streaming decompression inside
+`ZipArchive::read` itself (described above) is also a real, disclosed,
+separately-scoped remaining gap, not folded into this phase. The
+`suggest_ideal_type` incremental-accumulator rewrite (the deeper win
+described above) remains entirely unstarted, tracked as its own future
+phase.
 
 ## Cloud-platform file compatibility
 

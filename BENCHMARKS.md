@@ -33,6 +33,49 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-parquet` branch (Darwin arm64)
+
+`profile_parquet_file` converted from decoding every row group against
+one whole-file `fs::read` buffer to reading each row group's own
+compressed byte span via `Seek` (`open_and_read_footer` +
+`read_row_group_bytes`, offsets rebased via `shift_row_group_offsets`) -
+no change needed to any of the actual decode logic (RLE/dictionary/
+delta, nested reconstruction), since it already only ever treated page
+offsets as "relative to whatever buffer this is". See CLAUDE.md's
+"Streaming reads / memory footprint" section for the full writeup,
+including the two real multi-row-group fixtures generated to prove the
+row-group byte-span computation holds up across more than one group.
+
+Real file (55 MB, 3,000,000 rows, 4 columns, 30 row groups via
+`pyarrow`), `/usr/bin/time -l`, 3 rounds:
+
+Full scan:
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 792-877 MB | 691-710 MB |
+| New | 772-803 MB | 630-636 MB |
+| Change | roughly flat | **-10%** |
+
+Isolated via `--nrows 1` (now reads only the first row group instead of
+the whole file):
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 103-110 MB | 97-100 MB |
+| New | 46-52 MB | 35-42 MB |
+| Change | **-53%** | **-60%** |
+
+Both confirmed byte-identical via `diff`, including two new real
+multi-row-group `pyarrow` fixtures (flat and nested schemas, 10 row
+groups each) and an `--nrows` value spanning a row-group boundary. The
+complete existing 19-fixture Parquet test suite (every codec, every
+encoding, nested reconstruction, the real-world corpus tests) passed
+unchanged with zero test modifications. No Criterion benchmark target
+currently isolates this reader, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-zip-archive` branch (Darwin arm64)
 
 `zip_support::ZipArchive` (shared by `.xlsx`/`.ods`/`.xlsb`/`.npz`)
