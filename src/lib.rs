@@ -7547,6 +7547,7 @@ fn columns_from_stata(
 #[cfg(feature = "sas7bdat")]
 mod sas7bdat_support {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
 
     /// A hand-rolled SAS7BDAT reader. Unlike every pure-Rust crate this
     /// project has hand-rolled away so far, there is no single
@@ -7886,23 +7887,37 @@ mod sas7bdat_support {
         }
     }
 
-    fn page_slice<'a>(
-        data: &'a [u8],
+    /// Reads exactly one page fresh off disk via `Seek`, instead of
+    /// slicing into a whole-file buffer - both `parse_metadata` and
+    /// `collect_rows` walk every page in strictly increasing order with
+    /// no backward jumps at all (a subheader pointer is always local to
+    /// its own page, never a reference to another page number the way
+    /// SQLite's own b-tree child pointers are), so this needs nothing
+    /// more sophisticated than a plain forward `Seek` per page - the
+    /// genuine two-pass structure this format has (see this module's own
+    /// doc comment on why that's a materially different problem from
+    /// SQLite's/Parquet's/Arrow IPC's own single-pass-but-random-access
+    /// shape) means the file is read twice from disk, once per pass, but
+    /// neither pass ever needs more than one page resident at a time.
+    fn read_page(
+        file: &mut fs::File,
         header: &Header,
         page_index: u64,
         path: &Path,
-    ) -> Result<&'a [u8]> {
-        let start = header.data_offset + page_index * u64::from(header.page_size);
-        let start = usize::try_from(start).context("SAS7BDAT page offset exceeds usize")?;
-        let end = start + header.page_size as usize;
-        data.get(start..end)
-            .with_context(|| format!("SAS7BDAT page {page_index} is out of range in {path:?}"))
+    ) -> Result<Vec<u8>> {
+        let offset = header.data_offset + page_index * u64::from(header.page_size);
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed seeking to SAS7BDAT page {page_index} in {path:?}"))?;
+        let mut buf = vec![0u8; header.page_size as usize];
+        file.read_exact(&mut buf)
+            .with_context(|| format!("SAS7BDAT page {page_index} is out of range in {path:?}"))?;
+        Ok(buf)
     }
 
-    fn parse_metadata(data: &[u8], header: &Header, path: &Path) -> Result<Metadata> {
+    fn parse_metadata(file: &mut fs::File, header: &Header, path: &Path) -> Result<Metadata> {
         let mut meta = Metadata::default();
         for page_index in 0..header.page_count {
-            let page = page_slice(data, header, page_index, path)?;
+            let page = read_page(file, header, page_index, path)?;
             let hdr = header.page_header_size as usize;
             let page_type = header.endianness.u16(
                 page.get(hdr - 8..hdr - 6)
@@ -8402,7 +8417,7 @@ mod sas7bdat_support {
 
     #[allow(clippy::too_many_arguments)]
     fn collect_rows(
-        data: &[u8],
+        file: &mut fs::File,
         header: &Header,
         row_len: u32,
         total_rows: u64,
@@ -8426,7 +8441,7 @@ mod sas7bdat_support {
         let pointer_size = header.subheader_pointer_size as usize;
 
         'pages: for page_index in 0..header.page_count {
-            let page = page_slice(data, header, page_index, path)?;
+            let page = read_page(file, header, page_index, path)?;
             let page_type = header.endianness.u16(
                 page.get(hdr - 8..hdr - 6)
                     .context("truncated SAS7BDAT page header")?,
@@ -8947,9 +8962,24 @@ mod sas7bdat_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let data = fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
-        let header = read_header(&data, path)?;
-        let meta = parse_metadata(&data, &header, path)?;
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        // Only a small, fixed-size prefix is ever needed for the header
+        // itself - `Read::take` rather than a fixed-size `read_exact` so
+        // a genuinely too-small file still reaches `read_header`'s own
+        // "file too small for a SAS7BDAT header" check with whatever
+        // (possibly short) prefix it actually has, instead of failing
+        // with a generic I/O error first. Metadata and row data are each
+        // read in their own separate, later pass, one page at a time via
+        // `read_page` - see that function's own doc comment for why this
+        // format's genuine two-pass structure still doesn't need more
+        // than one page resident in memory at once.
+        let mut header_buf = Vec::new();
+        file.by_ref()
+            .take(512)
+            .read_to_end(&mut header_buf)
+            .with_context(|| format!("failed reading {path:?}"))?;
+        let header = read_header(&header_buf, path)?;
+        let meta = parse_metadata(&mut file, &header, path)?;
 
         let row_info = meta
             .row_info
@@ -9004,7 +9034,7 @@ mod sas7bdat_support {
             .collect();
 
         let rows = collect_rows(
-            &data,
+            &mut file,
             &header,
             row_info.row_length,
             row_info.total_rows,

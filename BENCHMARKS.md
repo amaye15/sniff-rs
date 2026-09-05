@@ -33,6 +33,34 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-sas7bdat` branch (Darwin arm64)
+
+`sas7bdat_support::page_slice` (indexing a whole-file `data: &[u8]`
+buffer) replaced with `read_page` (`Seek`+`read_exact` of one page off a
+`fs::File`) - the same shape as `sqlite_support`'s own conversion.
+Re-reading `parse_metadata`/`collect_rows` found neither actually needs
+random access at all: both walk pages strictly forward with no backward
+jumps, so the format's genuine two-pass structure (metadata scattered
+anywhere in the file, resolved before a second pass can correctly bound
+row counts) costs a second full read of the file from disk, not a
+second full *load into memory* - each pass still only ever holds one
+page at a time. See CLAUDE.md's "Streaming reads / memory footprint"
+section for the full writeup, including why no quantitative large-file
+measurement was possible here (no tool in this environment can write a
+genuine SAS7BDAT file).
+
+Verified via the complete existing test suite (213 unit + 127
+integration against a clean baseline, including the
+`sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly` oracle test)
+passing unchanged, plus a controlled old-vs-new comparison against both
+real committed fixtures and a deliberately truncated copy - byte-
+identical output in every successful case, the same actionable error
+(modulo a cosmetic `Caused by:` addition already accepted in the SQLite
+phase) in the truncated one. Clippy/fmt clean across default,
+`sas7bdat`, and `full`, each matching its own established baseline.
+
+---
+
 ## 2026-09-05 — `feat/streaming-arrow-ipc` branch (Darwin arm64)
 
 The same fix as Parquet's own phase, applied to Arrow IPC's own footer/

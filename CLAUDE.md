@@ -4484,22 +4484,85 @@ footprint 629-630 MB -> ~31 MB (~95%). Both confirmed byte-identical via
 feature gate both Parquet and Arrow IPC build under), and `full` builds,
 each matching its own established baseline.
 
-**Deliberately not done yet**: the remaining formats that need either
-genuine random (`Seek`-based) access or more than one full pass over
-the file before the data means anything at all - SAS7BDAT (a genuine
-two-pass structure, see above - a materially different problem from
-SQLite's/ZipArchive's/Parquet's/Arrow IPC's own single-pass-but-random-
-access shape) and old-style `.xls` (OLE2/CFB, a *different* container
-format than the ZIP-based four `ZipArchive` already covers, and - unlike
-Parquet's/Arrow IPC's own clean, independently-addressable chunk/block
-boundaries - one whose sector-chain-following would need to become
-genuinely lazy itself to get a comparable win, not just have its outer
-caller read a smaller bounded span). Per-entry streaming decompression
-inside `ZipArchive::read` itself (described above) is also a real,
-disclosed, separately-scoped remaining gap, not folded into this phase.
-The `suggest_ideal_type` incremental-accumulator rewrite (the deeper win
-described above) remains entirely unstarted, tracked as its own future
-phase.
+**SAS7BDAT went thirteenth, and turned out considerably more tractable
+than its own "genuine two-pass structure" framing (see this section's
+own sixth-phase entry above) initially suggested** - re-reading
+`parse_metadata`/`collect_rows` specifically to check *why* two passes
+were needed, rather than assuming that automatically meant random
+access, found the real shape: both walk `0..header.page_count` in
+strictly increasing order with no backward jumps at all. A subheader
+pointer is always an offset *local to the page it's found on* - never a
+reference to some other page number the way SQLite's own b-tree child
+pointers are - so neither pass ever needs anything but a plain forward
+`Seek` to the next page. The "two-pass" part is real (metadata scattered
+anywhere in the file has to be fully collected - specifically
+`rows_per_page` from the ROW_SIZE subheader - before a second pass can
+correctly bound a `Mix` page's own trailing row count) and stays exactly
+as real as before, but it turned out to be a separate concern from
+*memory* entirely: two sequential forward-only page scans, one page
+resident at a time, are no harder to stream than the earlier single-pass
+formats already converted - the file just gets read from disk twice
+instead of once, a real, disclosed I/O-time tradeoff traded for a real
+memory bound, not a compromise on correctness.
+
+`read_page` replaces `page_slice` with the identical `Seek`+`read_exact`
+shape `sqlite_support`'s own version already established; `parse_metadata`/
+`collect_rows` both changed from taking `data: &[u8]` to `file: &mut
+fs::File`, with their one internal `page_slice(data, ...)` call site each
+becoming `read_page(file, ...)` - no other structural change needed in
+either function, since both already built their own output (a `Metadata`
+struct, a `Vec<Vec<u8>>` of raw rows) incrementally per page rather than
+needing the whole file's pages simultaneously. `columns_from_sas7bdat`
+now reads only a small, fixed-size (512-byte, generously covering the
+format's own largest possible header layout) prefix up front via
+`Read::take` rather than a fixed-size `read_exact` - specifically so a
+genuinely too-small file still reaches `read_header`'s own existing
+"file too small for a SAS7BDAT header" check with whatever short prefix
+it actually got, instead of failing on a generic I/O error first from a
+`read_exact` that couldn't fill a fixed buffer.
+
+**No quantitative real-file measurement was possible for this phase -
+disclosed honestly rather than skipped without comment.** Every other
+phase in this section measured a real, large file; SAS7BDAT is the one
+format in this entire project with no tool available anywhere in this
+environment that can *write* one at all (confirmed again here, not just
+assumed from the earlier hand-roll's own finding) - `pyreadstat`, the
+library used to generate every other statistical-format fixture in this
+project, only reads SAS7BDAT, never writes it. Verification here is
+correctness-only: the complete existing test suite (213 unit + 127
+integration tests against the clean baseline, including the direct
+`sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly` oracle
+comparison and the one real vendored fixture this format has,
+`sas7bdat_people_nonascii.sas7bdat`) passed unchanged with zero test
+modifications, and a controlled old-vs-new binary comparison against
+both real fixtures plus a deliberately truncated copy (to exercise
+`read_page`'s own new "out of range" error path) produced byte-identical
+output in every successful case and the same actionable error - modulo
+a cosmetically different `Caused by:` chain from `read_exact`'s own I/O
+error type, the identical harmless difference SQLite's own phase already
+disclosed - in the truncated one. The structural argument stands on the
+same footing as every other phase's own real-file evidence: peak memory
+now scales with one page (typically a few KB to tens of KB) rather than
+whole file size, for a format whose page-forward-only access pattern
+makes this the same class of guarantee SQLite's own measured phase
+already proved out, just not independently re-confirmed at scale here
+for lack of a file to scale to. Clippy/fmt clean across the default,
+`sas7bdat`, and `full` builds, each matching its own established
+baseline.
+
+**Deliberately not done yet**: old-style `.xls` (OLE2/CFB, a *different*
+container format than the ZIP-based four `ZipArchive` already covers,
+and - unlike every phase converted so far, SAS7BDAT included, all of
+which turned out to be forward-only or independently-addressable-chunk
+access patterns - one whose sector-chain-following genuinely can
+reference an arbitrary, non-sequential next sector, so getting a
+comparable win means the chain-walk itself becoming lazy, not just its
+outer caller reading a smaller bounded span). Per-entry streaming
+decompression inside `ZipArchive::read` itself (described above) is
+also a real, disclosed, separately-scoped remaining gap, not folded into
+this phase. The `suggest_ideal_type` incremental-accumulator rewrite
+(the deeper win described above) remains entirely unstarted, tracked as
+its own future phase.
 
 ## Cloud-platform file compatibility
 
