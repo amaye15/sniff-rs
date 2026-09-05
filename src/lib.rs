@@ -5286,27 +5286,44 @@ fn slice_fixed_width(line: &str, widths: &[usize], scratch: &mut Vec<char>) -> V
     fields
 }
 
+/// Streams `path` a line at a time via `BufReader::lines()` rather than
+/// `fs::read_to_string`-ing the whole file - fixed-width text has no
+/// quoting/escaping and (by construction, one row per line) no field can
+/// ever span multiple lines, so unlike CSV this needs none of
+/// `stream_utf8_chunks`'s own chunk-boundary-carrying machinery: a line
+/// is always a complete, independent unit, and `BufRead::lines()`'s own
+/// byte-level `\n` scan is exactly as UTF-8-safe as `csv_feed_chunk`'s
+/// own byte scan for the identical reason (`0x0A` can never appear as a
+/// UTF-8 continuation byte, so it can never be misidentified mid-
+/// character). `nrows` now also bounds real disk I/O rather than just
+/// how many rows get profiled afterward - the `for` loop's own `break`
+/// simply stops pulling more lines from the underlying reader.
 fn columns_from_fixed_width(
     path: &Path,
     nrows: Option<usize>,
     widths: &[usize],
 ) -> Result<Vec<ColumnInput>> {
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let mut lines = content.lines();
-    let header_line = lines.next().ok_or_else(|| anyhow!("{path:?} is empty"))?;
+    use std::io::BufRead;
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut lines = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines();
+    let header_line = match lines.next() {
+        None => bail!("{path:?} is empty"),
+        Some(line) => line.with_context(|| format!("failed to read {path:?}"))?,
+    };
     let mut scratch: Vec<char> = Vec::new();
-    let headers = slice_fixed_width(header_line, widths, &mut scratch);
+    let headers = slice_fixed_width(&header_line, widths, &mut scratch);
 
     let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); widths.len()];
     let mut i = 0;
     for line in lines {
+        let line = line.with_context(|| format!("failed to read {path:?}"))?;
         if line.trim().is_empty() {
             continue; // e.g. a trailing blank line at EOF
         }
         if nrows.is_some_and(|limit| i >= limit) {
             break;
         }
-        for (col_idx, field) in slice_fixed_width(line, widths, &mut scratch)
+        for (col_idx, field) in slice_fixed_width(&line, widths, &mut scratch)
             .into_iter()
             .enumerate()
         {

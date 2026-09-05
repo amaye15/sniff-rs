@@ -3781,20 +3781,48 @@ byte-identical via `diff`. Full test suite (345 unit + 233 integration
 on `--features full`, 211 + 83 on the default build) passing unchanged,
 fmt/clippy clean.
 
-**Deliberately not done yet, in order of likely next steps**: fixed-width
-text and JSON Lines (both naturally single-forward-pass streamable, the
-same shape as CSV); the gzip/zstd compression layer (fixing the
-double-buffering finding above would benefit every compressed format at
-once, independent of which inner format it wraps); every other
-naturally-streamable or header-then-sequential-rows format (MessagePack/
-CBOR, weblog, syslog, Avro, dBase, Stata, SAS7BDAT, SPSS, NumPy); and,
-hardest and last, the formats that need the *tail* of the file before
-the body means anything at all (Parquet, Arrow IPC, ORC, SQLite, every
-ZIP-based format) - true streaming there means `Seek`-based random
-access replacing a single in-memory buffer throughout each decoder, a
-materially larger rewrite per format than anything done so far. The
-`suggest_ideal_type` incremental-accumulator rewrite (the deeper win
-described above) remains entirely unstarted, tracked as its own future
+**Fixed-width text (`columns_from_fixed_width`) went next**, and turned
+out much simpler than CSV: no quoting/escaping, and (one row per line,
+by construction) no field can ever span multiple lines, so it needs none
+of `stream_utf8_chunks`'s own chunk-boundary-carrying machinery at all.
+`std::io::BufReader::lines()` already streams a line at a time, and its
+own byte-level `\n` scan is exactly as UTF-8-safe as `csv_feed_chunk`'s
+for the identical reason (`0x0A` can never appear as a UTF-8
+continuation byte). `--nrows` gets the same early-stop benefit for free
+here, even more directly than CSV's - the `for line in lines { ...
+break; }` loop simply stops pulling from the underlying reader, with no
+callback-based "done" signal needed. Measured on a real 2,000,000-row,
+95 MB fixed-width file: peak RSS 538 MB -> 483 MB (~10% - a smaller win
+than CSV's, since fixed-width's raw text is already closer in size to
+its parsed form, with no delimiter/quote overhead to strip away), output
+confirmed byte-identical via `diff`. Two new integration tests (one for
+CSV, one for fixed-width) lock in the `--nrows`-bounds-real-I/O
+behavior directly: a file with invalid UTF-8 appended well past the
+`--nrows` cutoff succeeds with `--nrows`, fails without it, on the
+identical file - the CSV version specifically needs its valid prefix to
+exceed `STREAM_CHUNK_SIZE` (256 KiB), or the garbage would land in the
+same first chunk as row 0 and fail UTF-8 validation before `--nrows`
+ever gets a chance to matter; the fixed-width version has no such
+constraint, since `BufRead::lines()` validates one line at a time
+regardless of its own internal buffer size.
+
+**Deliberately not done yet, in order of likely next steps**: JSON Lines
+(the same naturally single-forward-pass streamable shape as CSV/fixed-
+width - though a single top-level JSON array or pretty-printed object is
+a different problem, since the whole document is genuinely one nested
+value, not independent lines); the gzip/zstd compression layer (fixing
+the double-buffering finding above would benefit every compressed
+format at once, independent of which inner format it wraps); every
+other naturally-streamable or header-then-sequential-rows format
+(MessagePack/CBOR, weblog, syslog, Avro, dBase, Stata, SAS7BDAT, SPSS,
+NumPy); and, hardest and last, the formats that need the *tail* of the
+file before the body means anything at all (Parquet, Arrow IPC, ORC,
+SQLite, every ZIP-based format) - true streaming there means
+`Seek`-based random access replacing a single in-memory buffer
+throughout each decoder, a materially larger rewrite per format than
+anything done so far. The `suggest_ideal_type` incremental-accumulator
+rewrite (the deeper win described above) remains entirely unstarted,
+tracked as its own future
 phase.
 
 ## Cloud-platform file compatibility

@@ -93,6 +93,46 @@ fn csv_leading_zero_and_date_heuristics() {
 }
 
 #[test]
+fn csv_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
+    // Proves --nrows bounds real disk I/O for the streaming CSV reader,
+    // not just how many rows get profiled afterward: a file with
+    // deliberately invalid UTF-8 bytes appended well past the --nrows
+    // cutoff must still succeed with --nrows, and fail without it, on
+    // the identical file.
+    // The valid prefix must exceed stream_utf8_chunks' own 256 KiB read
+    // buffer, or the garbage bytes below would land in the *same* first
+    // chunk as row 0 - failing UTF-8 validation before --nrows ever gets
+    // a chance to stop reading, rather than genuinely proving early stop.
+    let dir = TempDir::new();
+    let path = dir.path().join("data.csv");
+    let mut content = String::from("id,name\n");
+    for i in 0..30_000 {
+        content.push_str(&format!("{i},user_{i}\n"));
+    }
+    assert!(content.len() > 256 * 1024, "test fixture too small");
+    let mut bytes = content.into_bytes();
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    bytes.extend_from_slice(b" garbage not valid utf8\n");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let with_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--nrows", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        with_nrows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_nrows.stderr)
+    );
+
+    let without_nrows = Command::new(bin())
+        .args([path.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!without_nrows.status.success());
+}
+
+#[test]
 fn json_schema_output_maps_types_and_nullability() {
     let doc = run_with_format("sample.csv", "json-schema", &[]);
     assert_eq!(doc["$schema"], "http://json-schema.org/draft-07/schema#");
@@ -298,6 +338,57 @@ fn fixed_width_slices_columns_by_declared_character_widths() {
 
     let plan = column(cols, "plan");
     assert_eq!(plan["current_type"], "String");
+}
+
+#[test]
+fn fixed_width_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
+    // Proves --nrows bounds real disk I/O for the streaming fixed-width
+    // reader, not just how many rows get profiled afterward: a file with
+    // deliberately invalid UTF-8 bytes appended well past the --nrows
+    // cutoff must still succeed with --nrows, and fail without it, on
+    // the identical file.
+    let dir = TempDir::new();
+    let path = dir.path().join("data.txt");
+    let mut content = String::from("ID   NAME\n");
+    for i in 0..1000 {
+        content.push_str(&format!("{i:<5}user_{i}\n"));
+    }
+    let mut bytes = content.into_bytes();
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    bytes.extend_from_slice(b" garbage not valid utf8\n");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let with_nrows = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--format",
+            "fixed-width",
+            "--widths",
+            "5,10",
+            "--nrows",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        with_nrows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_nrows.stderr)
+    );
+
+    let without_nrows = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--format",
+            "fixed-width",
+            "--widths",
+            "5,10",
+        ])
+        .output()
+        .unwrap();
+    assert!(!without_nrows.status.success());
 }
 
 #[test]

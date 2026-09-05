@@ -33,6 +33,28 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-fixed-width` branch (Darwin arm64)
+
+Fixed-width text converted to `BufReader::lines()`-based streaming - see
+CLAUDE.md's "Streaming reads / memory footprint" section. Simpler than
+CSV (no chunk-boundary machinery needed at all, since a line can never
+span multiple lines by construction), and a correspondingly smaller win,
+since fixed-width's raw text is already close in size to its parsed
+form with no delimiter/quote overhead to strip away.
+
+**Ad-hoc, real file** (2,000,000 rows, 95 MB, 3 columns):
+
+| | Peak RSS | Real time |
+|---|---|---|
+| Old (`fs::read_to_string`) | 538 MB | 1.01s |
+| New (streaming) | 483 MB | 1.04s |
+| Change | **-10%** | ~flat |
+
+Output confirmed byte-identical via `diff`. No Criterion benchmark
+target currently covers fixed-width, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-csv-reader` branch (Darwin arm64)
 
 CSV/TSV converted from `fs::read_to_string` + whole-buffer `parse_csv`
