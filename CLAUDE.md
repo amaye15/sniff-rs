@@ -4777,17 +4777,68 @@ needed this time - fixed-width had no direct unit tests calling
 `columns_from_fixed_width` the way CSV's two did) and clippy/fmt clean
 across default/`full`, matching established baselines exactly.
 
+**dBase went third**, picked next because its own read pattern is the
+closest remaining match to CSV/fixed-width's shape (sequential
+`read_exact` per record, no random access) among the readers still
+using `ColumnInput`/`profile_column` - considerably more tractable than
+Excel's own `SheetGrid`, which already fully materializes every cell of
+a sheet into a sparse `data_rows` structure *before* `into_column_inputs`
+ever runs (a real, deliberate, already-optimized design replacing an
+even more wasteful dense grid - see that struct's own doc comment) -
+converting that further would mean restructuring all four spreadsheet
+parsers' own cell-extraction loops to fold rows in as they're read
+rather than collecting every cell first, a materially bigger, separately
+-scoped undertaking left for its own future phase rather than attempted
+here.
+
+One real design wrinkle `ColumnAccumulatorState` didn't originally
+handle: dBase's `current_type` comes from the file's own declared field
+type (`field_type_label`), never inferred from values the way CSV/
+fixed-width's `NaiveTypeAccumulator` does - the same "declared type is a
+hint, not the truth" split this project's design philosophy already
+documents for this exact field. `into_profile` (the CSV/fixed-width
+entry point) and a new sibling, `into_profile_with_declared_type` (for a
+reader that already knows its own current_type), now both delegate to a
+shared `finish_profile` - the incremental `NaiveTypeAccumulator` still
+runs during `push` regardless of which entry point a reader will
+eventually call, since there's no way to know in advance, but its
+result is simply never consulted for a declared-type reader like dBase.
+`columns_from_dbase` also has an existing, deliberate behavior worth
+preserving exactly: every non-deleted record is always fully read and
+decoded regardless of `nrows` (so a malformed record past the cutoff
+still surfaces as an error, unchanged from before) - only whether a
+decoded value gets *accumulated* is now bounded by `nrows`, a "decode
+always, keep conditionally" split that preserves this exact error-
+surfacing behavior while still capping what the accumulators ever hold.
+
+Measured on a real 52 MB, 200,000-row `.dbf` file (id/name/email/a
+200-character free-text column, generated via the `dbf` Python package
+per this project's own established fixture-generation convention):
+maxRSS 94-101 MB -> ~2.1-2.2 MB (~98%), peak footprint 77-78 MB ->
+0.87-1.0 MB (~98.7%), consistent across 3 rounds. Output confirmed
+byte-identical via `diff` against the pre-change binary across the
+entire 359-file fixture corpus, and separately across every committed
+`.dbf` fixture at every combination of 3 `--samples` settings and
+with/without `--nrows 2` (54 combinations) - zero mismatches. Full test
+suite (347 unit + 360 integration, zero test modifications needed,
+including the direct `dbase_reader_matches_the_dbase_crate_output_
+exactly` oracle test passing unchanged) and clippy/fmt clean across
+default/`dbase`/`full`, matching established baselines exactly.
+
 **Deliberately not done yet**: every other `profile_column`/
 `profile_json_path`-based reader still holds a full column's values
-resident (Excel, NumPy, dBase, Stata, SAS7BDAT, SPSS, ORC, JSON, YAML,
-TOML, Avro, MessagePack, CBOR, XML, Parquet/Arrow's nested columns) -
-each would need its own `ColumnInput`/`profile_column` (or
-`profile_json_path`) call site converted the same way CSV's/fixed-
-width's were, and each deserves its own real-file measurement before
-being called done, the same one-phase-at-a-time discipline this whole
-section has already used throughout. Per-entry streaming decompression
-inside `ZipArchive::read` itself remains a real, disclosed, separately-
-scoped remaining gap, not folded into any phase here.
+resident (Excel, NumPy, Stata, SAS7BDAT, SPSS, ORC, JSON, YAML, TOML,
+Avro, MessagePack, CBOR, XML, Parquet/Arrow's nested columns) - each
+would need its own `ColumnInput`/`profile_column` (or `profile_json_
+path`) call site converted the same way CSV's/fixed-width's/dBase's
+were, and each deserves its own real-file measurement before being
+called done, the same one-phase-at-a-time discipline this whole section
+has already used throughout. Excel specifically would need its own,
+larger restructuring (see above) rather than the same drop-in bypass
+pattern the three converted so far all shared. Per-entry streaming
+decompression inside `ZipArchive::read` itself remains a real,
+disclosed, separately-scoped remaining gap, not folded into any phase
+here.
 
 ## Cloud-platform file compatibility
 

@@ -5246,11 +5246,42 @@ impl ColumnAccumulatorState {
     /// this bypasses `ColumnInput`/`profile_column` entirely for whichever
     /// reader builds this state incrementally; every reader that hasn't
     /// been converted yet still goes through those unchanged.
+    /// For a reader whose `current_type` is *inferred from the values
+    /// themselves* (CSV, fixed-width - no format-level type declaration
+    /// exists to trust instead) via the incremental `NaiveTypeAccumulator`.
     fn into_profile(self, name: String, total: usize) -> ColumnProfile {
+        let naive_current_type = if self.total_non_null == 0 {
+            "String".to_string()
+        } else {
+            self.naive_acc.finish().to_string()
+        };
+        self.finish_profile(name, total, naive_current_type)
+    }
+
+    /// For a reader whose `current_type` instead comes from the file's own
+    /// declared/stored type (dBase's field-type byte, SQLite's column
+    /// affinity, Parquet's physical type, ...) - the same "declared type
+    /// is a hint, not the truth" split `profile_column` already draws when
+    /// its caller passes in an externally-derived `ColumnInput.current_type`
+    /// rather than relying on `naive_current_type`. The incremental
+    /// `NaiveTypeAccumulator` inside `self` is simply never consulted here.
+    /// Currently only dBase uses this path, so it's dead code (hence the
+    /// allow) in any build without `--features dbase`.
+    #[allow(dead_code)]
+    fn into_profile_with_declared_type(
+        self,
+        name: String,
+        total: usize,
+        current_type: String,
+    ) -> ColumnProfile {
+        self.finish_profile(name, total, current_type)
+    }
+
+    fn finish_profile(self, name: String, total: usize, current_type: String) -> ColumnProfile {
         let ColumnAccumulatorState {
             total_non_null,
             ideal_acc,
-            naive_acc,
+            naive_acc: _,
             samples,
         } = self;
         let missing = total.saturating_sub(total_non_null);
@@ -5259,16 +5290,10 @@ impl ColumnAccumulatorState {
         } else {
             0.0
         });
-        let (current_type, ideal_type, mut notes) = if total_non_null == 0 {
-            (
-                "String".to_string(),
-                "String".to_string(),
-                "column is empty/all null".to_string(),
-            )
+        let (ideal_type, mut notes) = if total_non_null == 0 {
+            ("String".to_string(), "column is empty/all null".to_string())
         } else {
-            let current_type = naive_acc.finish().to_string();
-            let (ideal_type, notes) = ideal_acc.finish(&current_type);
-            (current_type, ideal_type, notes)
+            ideal_acc.finish(&current_type)
         };
         if missing_pct > 0.0 {
             let extra = "has missing values -> wrap in Option<T> / handle nulls";
@@ -6908,12 +6933,20 @@ mod dbase_support {
         // Parquet's own `profile_parquet_file` and JSON's
         // `bucket_object_fields` (see CLAUDE.md's Performance section) -
         // positional indexing instead of a per-row name lookup.
+        // One `ColumnAccumulatorState` per field (the same shared,
+        // bounded-footprint accumulator CSV/fixed-width already use - see
+        // its own doc comment) instead of a `Vec<Option<String>>` held for
+        // every record, bypassing `ColumnInput`/`profile_column` entirely -
+        // the Tier 2 win CLAUDE.md's "Streaming reads / memory footprint"
+        // section describes.
         let n_fields = fields.len();
-        let mut raw: Vec<Vec<Option<String>>> =
-            vec![Vec::with_capacity(header.num_records as usize); n_fields];
+        let mut col_states: Vec<ColumnAccumulatorState> = (0..n_fields)
+            .map(|_| ColumnAccumulatorState::new())
+            .collect();
         let mut deletion_flag = [0u8; 1];
         let mut record_buf = vec![0u8; record_data_len];
         let mut total = 0usize;
+        let mut kept = 0usize;
         for _ in 0..header.num_records {
             r.read_exact(&mut deletion_flag)
                 .context("failed reading a dBase record's deletion flag")?;
@@ -6925,44 +6958,43 @@ mod dbase_support {
             r.read_exact(&mut record_buf)
                 .context("failed reading a dBase record")?;
 
+            // Every non-deleted record is still read and decoded
+            // regardless of `nrows` (so a malformed record past the
+            // cutoff still surfaces as an error, matching this reader's
+            // established behavior) - only whether it's *accumulated*
+            // is bounded, the same "decode always, keep conditionally"
+            // split that lets `nrows` cap memory without changing which
+            // records get a chance to error.
+            let keep_this_row = match nrows {
+                Some(n) => kept < n,
+                None => true,
+            };
             let mut pos = 0usize;
             for (col_idx, f) in fields.iter().enumerate() {
                 let field_bytes = &record_buf[pos..pos + f.field_length as usize];
                 pos += f.field_length as usize;
                 let value = read_field_value(f, field_bytes, text_mode)?;
-                raw[col_idx].push(value_to_string(&value));
+                if keep_this_row && let Some(s) = value_to_string(&value) {
+                    col_states[col_idx].push(s, n_samples);
+                }
             }
             total += 1;
-        }
-        // Matches the old `records.truncate(n)`'s own behavior exactly:
-        // every non-deleted record is still read and decoded regardless of
-        // `nrows` (so a malformed record past the cutoff still surfaces as
-        // an error, same as before), only the *kept* representation is
-        // capped.
-        if let Some(n) = nrows {
-            total = total.min(n);
-            for col in &mut raw {
-                col.truncate(n);
+            if keep_this_row {
+                kept += 1;
             }
         }
-
-        let mut columns = Vec::new();
-        for (col_idx, f) in fields.into_iter().enumerate() {
-            let raw_values: Vec<String> = std::mem::take(&mut raw[col_idx])
-                .into_iter()
-                .flatten()
-                .collect();
-            columns.push(profile_column(
-                ColumnInput {
-                    name: f.name,
-                    current_type: field_type_label(f.field_type).to_string(),
-                    raw_values,
-                    total,
-                    skip_heuristics: false,
-                },
-                n_samples,
-            ));
+        if let Some(n) = nrows {
+            total = total.min(n);
         }
+
+        let columns = fields
+            .into_iter()
+            .zip(col_states)
+            .map(|(f, state)| {
+                let current_type = field_type_label(f.field_type).to_string();
+                state.into_profile_with_declared_type(f.name, total, current_type)
+            })
+            .collect();
         Ok(columns)
     }
 } // mod dbase_support

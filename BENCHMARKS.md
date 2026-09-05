@@ -33,6 +33,35 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/incremental-dbase` branch (Darwin arm64)
+
+dBase wired through `ColumnAccumulatorState`, the third format converted
+after CSV/fixed-width - picked next as the closest remaining match to
+their own sequential-read shape among readers still using `ColumnInput`/
+`profile_column` (Excel's `SheetGrid` already fully materializes a
+sheet's cells before column assembly, a bigger separate undertaking).
+Added `into_profile_with_declared_type`/`finish_profile` since dBase's
+`current_type` comes from the file's own declared field type, not
+inferred from values the way CSV/fixed-width's `NaiveTypeAccumulator`
+does. Preserved the existing "every record is decoded regardless of
+`nrows`, only accumulation is bounded" behavior exactly (a malformed
+record past the cutoff still errors, unchanged).
+
+Measured on a real 52 MB, 200,000-row `.dbf` file (id/name/email/a
+200-char free-text column): maxRSS 94-101 MB -> ~2.1-2.2 MB (~98%),
+peak footprint 77-78 MB -> 0.87-1.0 MB (~98.7%), consistent across 3
+rounds. Output byte-identical via `diff` against the entire 359-file
+fixture corpus, plus every committed `.dbf` fixture at 3 `--samples`
+settings with/without `--nrows 2` (54 combinations) - zero mismatches.
+
+Verified via the full test suite (347 unit + 360 integration, including
+the `dbase_reader_matches_the_dbase_crate_output_exactly` oracle test,
+zero modifications needed) and clippy/fmt clean across default/`dbase`/
+`full`, matching established baselines (default=1, dbase=1, full=5)
+exactly.
+
+---
+
 ## 2026-09-05 — `feat/incremental-fixed-width` branch (Darwin arm64)
 
 Fixed-width text wired through the same `ColumnAccumulatorState` CSV's
