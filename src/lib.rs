@@ -49808,6 +49808,137 @@ fn looks_like_own_output(path: &Path) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
+/// The top-level index directory mode writes once per run, alongside
+/// every per-file output - a lightweight, at-a-glance manifest of the
+/// whole run (which files were profiled, how big each one was, and where
+/// its own output landed) rather than a second copy of every file's real
+/// column tables. Deliberately ends in `.dictionary.md` - the exact same
+/// suffix `OWN_OUTPUT_SUFFIXES` already recognizes - so a later run's own
+/// `looks_like_own_output` check protects this file for free, with no
+/// separate guard needed: it's found, skipped, and (per
+/// `render_directory_index`'s own doc comment below) never re-listed as
+/// a "skipped" entry in the fresh index that run writes.
+const DIRECTORY_INDEX_FILE_NAME: &str = "_index.dictionary.md";
+
+/// `path`'s components relative to `root`, joined with `/` regardless of
+/// the host platform - so a link written into the index is portable even
+/// though `PathBuf`'s own `Display` would use `\` on Windows. Falls back
+/// to `path` itself (unjoined) if it genuinely isn't under `root`, which
+/// shouldn't happen given how every caller here constructs its paths, but
+/// is a safe, non-panicking fallback rather than an assumption worth
+/// unwrapping on.
+fn relative_display_path(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Wraps a path in CommonMark's `<...>` link-destination form, which -
+/// unlike a bare, unwrapped destination - can contain spaces (routine in
+/// real file paths) without breaking the link. `<`/`>`/`\` are the only
+/// characters that need escaping inside this form.
+fn md_link_dest(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('<');
+    for c in path.chars() {
+        match c {
+            '<' | '>' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('>');
+    out
+}
+
+/// One successfully-profiled file's own row in the directory index.
+struct BatchIndexEntry {
+    /// Display name, relative to the directory root that was walked.
+    source_relative: String,
+    /// Link target, relative to wherever the index itself is written
+    /// (the same directory as the per-file output it points at, so this
+    /// is always just that output's own filename or a short subpath).
+    output_relative: String,
+    table_count: usize,
+    col_count: usize,
+}
+
+/// Renders the top-level directory index: a `File | Tables | Columns |
+/// Output` table (capped at `MAX_TOC_ENTRIES`, the same cap this project
+/// already uses for a single file's own Table-of-Contents, for the
+/// identical reason - a directory can hold far more files than a
+/// listing can usefully show) plus a `## Skipped` section naming every
+/// file that couldn't be identified at all. A file skipped because it
+/// looked like this tool's own prior output is deliberately *not* listed
+/// here - see `DIRECTORY_INDEX_FILE_NAME`'s own doc comment - since that
+/// outcome isn't a data-quality signal worth surfacing on every re-run,
+/// unlike a genuinely unrecognized file.
+fn render_directory_index(
+    dir: &Path,
+    entries: &[BatchIndexEntry],
+    unrecognized: &[String],
+    total_tables: usize,
+    total_columns: usize,
+) -> String {
+    let mut md = format!(
+        "# Directory Data Dictionary: {}\n\n",
+        escape_md(&dir.display().to_string())
+    );
+    md.push_str(&format!(
+        "**Files:** {} · **Tables:** {total_tables} · **Columns:** {total_columns}",
+        entries.len()
+    ));
+    if !unrecognized.is_empty() {
+        md.push_str(&format!(" · **Skipped:** {}", unrecognized.len()));
+    }
+    md.push_str("\n\n");
+
+    md.push_str("## Files\n\n");
+    md.push_str("| File | Tables | Columns | Output |\n");
+    md.push_str("|---|---|---|---|\n");
+    let shown = entries.len().min(MAX_TOC_ENTRIES);
+    for entry in &entries[..shown] {
+        md.push_str(&format!(
+            "| {} | {} | {} | [{}]({}) |\n",
+            escape_md(&entry.source_relative),
+            entry.table_count,
+            entry.col_count,
+            escape_md(&entry.output_relative),
+            md_link_dest(&entry.output_relative),
+        ));
+    }
+    if entries.len() > shown {
+        md.push_str(&format!(
+            "\n…and {} more file(s) not shown here (each still has its own output)\n",
+            entries.len() - shown
+        ));
+    }
+    md.push('\n');
+
+    if !unrecognized.is_empty() {
+        md.push_str("## Skipped\n\n");
+        let shown_skips = unrecognized.len().min(MAX_TOC_ENTRIES);
+        for path in &unrecognized[..shown_skips] {
+            md.push_str(&format!("- {} - unrecognized format\n", escape_md(path)));
+        }
+        if unrecognized.len() > shown_skips {
+            md.push_str(&format!(
+                "- …and {} more\n",
+                unrecognized.len() - shown_skips
+            ));
+        }
+        md.push('\n');
+    }
+
+    md.truncate(md.trim_end_matches('\n').len());
+    md.push('\n');
+    md
+}
+
 fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let dir = &args.input_path;
     if args.output_path.is_some() {
@@ -49829,10 +49960,18 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let mut files = Vec::new();
     collect_files_sorted(dir, &mut files)?;
 
+    // The index is written wherever the per-file outputs themselves land -
+    // co-located with the sources by default, or under --output-dir when
+    // given - so every link inside it is a short, correct relative path
+    // with no directory-walking needed to follow.
+    let index_dir = args.output_dir.as_deref().unwrap_or(dir);
+
     let mut processed = 0usize;
     let mut skipped = 0usize;
     let mut total_tables = 0usize;
     let mut total_columns = 0usize;
+    let mut index_entries: Vec<BatchIndexEntry> = Vec::new();
+    let mut unrecognized: Vec<String> = Vec::new();
 
     for path in &files {
         if looks_like_own_output(path) {
@@ -49859,6 +49998,7 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             Ok(format) => format,
             Err(_) => {
                 skipped += 1;
+                unrecognized.push(relative_display_path(dir, path));
                 eprintln!("{}: skipped (unrecognized format)", path.display());
                 continue;
             }
@@ -49897,6 +50037,12 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
         processed += 1;
         total_tables += table_count;
         total_columns += col_count;
+        index_entries.push(BatchIndexEntry {
+            source_relative: relative_display_path(dir, path),
+            output_relative: relative_display_path(index_dir, &output_path),
+            table_count,
+            col_count,
+        });
         eprintln!(
             "{}: {table_count} tables, {col_count} columns -> {}",
             path.display(),
@@ -49907,8 +50053,25 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if processed == 0 {
         bail!("no recognized files found in {dir:?} ({skipped} file(s) skipped as unrecognized)");
     }
+
+    // A top-level index alongside every per-file output, regardless of
+    // --output-format - a navigation aid for the whole run, not "the"
+    // output, so it's produced even on a --output-format json/json-schema
+    // run whose per-file outputs aren't markdown at all.
+    let index_path = index_dir.join(DIRECTORY_INDEX_FILE_NAME);
+    let index_content = render_directory_index(
+        dir,
+        &index_entries,
+        &unrecognized,
+        total_tables,
+        total_columns,
+    );
+    fs::write(&index_path, &index_content)
+        .with_context(|| format!("failed to write {index_path:?}"))?;
+
     eprintln!(
-        "{processed} file(s) processed ({skipped} skipped), {total_tables} tables, {total_columns} columns total"
+        "{processed} file(s) processed ({skipped} skipped), {total_tables} tables, {total_columns} columns total -> {}",
+        index_path.display()
     );
 
     Ok(())
@@ -55443,5 +55606,90 @@ mod tests {
         assert!(!md.contains("· **Rows:**"));
         assert!(md.contains("**Rows:** 3"));
         assert!(md.contains("**Rows:** 7"));
+    }
+
+    // --- Directory-batch mode's top-level index ---
+
+    #[test]
+    fn md_link_dest_wraps_a_plain_path_in_angle_brackets() {
+        assert_eq!(
+            md_link_dest("data.csv.dictionary.md"),
+            "<data.csv.dictionary.md>"
+        );
+    }
+
+    #[test]
+    fn md_link_dest_escapes_angle_brackets_and_backslashes() {
+        assert_eq!(md_link_dest("a<b>c\\d"), "<a\\<b\\>c\\\\d>");
+    }
+
+    #[test]
+    fn relative_display_path_joins_nested_components_with_forward_slashes() {
+        let root = Path::new("/tmp/batch");
+        let path = Path::new("/tmp/batch/level1/level2/deep.csv");
+        assert_eq!(relative_display_path(root, path), "level1/level2/deep.csv");
+    }
+
+    #[test]
+    fn relative_display_path_handles_a_top_level_file() {
+        let root = Path::new("/tmp/batch");
+        let path = Path::new("/tmp/batch/top.csv");
+        assert_eq!(relative_display_path(root, path), "top.csv");
+    }
+
+    fn index_entry(source: &str, output: &str, tables: usize, cols: usize) -> BatchIndexEntry {
+        BatchIndexEntry {
+            source_relative: source.to_string(),
+            output_relative: output.to_string(),
+            table_count: tables,
+            col_count: cols,
+        }
+    }
+
+    #[test]
+    fn render_directory_index_lists_files_and_omits_the_skipped_section_when_empty() {
+        let entries = vec![
+            index_entry("a.csv", "a.csv.dictionary.md", 1, 3),
+            index_entry("sub/b.jsonl", "sub/b.jsonl.dictionary.md", 1, 5),
+        ];
+        let md = render_directory_index(Path::new("/tmp/data"), &entries, &[], 2, 8);
+        assert!(md.contains("**Files:** 2 · **Tables:** 2 · **Columns:** 8"));
+        assert!(!md.contains("**Skipped:**"));
+        assert!(md.contains("| a.csv | 1 | 3 | [a.csv.dictionary.md](<a.csv.dictionary.md>) |"));
+        assert!(!md.contains("## Skipped"));
+    }
+
+    #[test]
+    fn render_directory_index_lists_unrecognized_files_under_a_skipped_section() {
+        let entries = vec![index_entry("a.csv", "a.csv.dictionary.md", 1, 3)];
+        let unrecognized = vec!["README.txt".to_string(), "notes.log".to_string()];
+        let md = render_directory_index(Path::new("/tmp/data"), &entries, &unrecognized, 1, 3);
+        assert!(md.contains("**Skipped:** 2"));
+        assert!(md.contains("## Skipped"));
+        assert!(md.contains("- README.txt - unrecognized format"));
+        assert!(md.contains("- notes.log - unrecognized format"));
+    }
+
+    #[test]
+    fn render_directory_index_caps_the_files_table_past_max_toc_entries() {
+        let entries: Vec<BatchIndexEntry> = (0..MAX_TOC_ENTRIES + 7)
+            .map(|i| {
+                index_entry(
+                    &format!("f{i:03}.csv"),
+                    &format!("f{i:03}.csv.dictionary.md"),
+                    1,
+                    1,
+                )
+            })
+            .collect();
+        let md = render_directory_index(
+            Path::new("/tmp/data"),
+            &entries,
+            &[],
+            entries.len(),
+            entries.len(),
+        );
+        assert_eq!(md.matches("| f").count(), MAX_TOC_ENTRIES);
+        assert!(md.contains("…and 7 more file(s) not shown here"));
     }
 }

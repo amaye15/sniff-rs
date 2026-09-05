@@ -4301,6 +4301,21 @@ fn batch_mode_processes_a_comprehensive_real_world_fixture_tree() {
         std::fs::read_to_string(out.path().join("sniffable_no_extension.dictionary.md")).unwrap();
     assert!(content.contains("## events"));
     assert!(content.contains("## users"));
+
+    // The top-level index landed alongside the per-file outputs (under
+    // --output-dir, same as everything else), lists every processed file
+    // exactly once - the multi-table SQLite file included, as one row, not
+    // two - and names both genuinely unrecognized files under its own
+    // Skipped section.
+    let index_path = out.path().join("_index.dictionary.md");
+    assert!(index_path.exists());
+    let index = std::fs::read_to_string(&index_path).unwrap();
+    assert!(index.contains("**Files:** 6 · **Tables:** 7 · **Columns:** 50 · **Skipped:** 2"));
+    assert!(index.contains("| top.csv | 1 | 9 |"));
+    assert!(index.contains("| sniffable_no_extension | 2 | 7 |"));
+    assert!(index.contains("| level1/level2/deep.csv | 1 | 9 |"));
+    assert!(index.contains("- README.txt - unrecognized format"));
+    assert!(index.contains("- unreachable_without_format.log - unrecognized format"));
 }
 
 /// The exact fixture above, run against a build where SQLite isn't
@@ -4412,4 +4427,71 @@ fn batch_mode_applies_global_flags_uniformly() {
         1,
         "--samples 1 should have applied to every file in the batch"
     );
+}
+
+#[test]
+fn batch_mode_writes_the_index_co_located_when_no_output_dir_is_given() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(output.status.success());
+    assert!(dir.path().join("_index.dictionary.md").exists());
+}
+
+#[test]
+fn batch_mode_writes_the_index_regardless_of_output_format() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    let out = TempDir::new();
+
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--output-format",
+        "json-schema",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    // The index itself is always Markdown, even when every per-file
+    // output it links to is json-schema - it's a navigation aid, not
+    // "the" output.
+    let index = std::fs::read_to_string(out.path().join("_index.dictionary.md")).unwrap();
+    assert!(index.contains("[data.csv.dictionary.schema.json](<data.csv.dictionary.schema.json>)"));
+    assert!(out.path().join("data.csv.dictionary.schema.json").exists());
+}
+
+#[test]
+fn batch_mode_index_does_not_list_its_own_prior_output_as_skipped_on_a_second_run() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+
+    let first = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(first.status.success());
+    let second = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(second.status.success());
+
+    let index = std::fs::read_to_string(dir.path().join("_index.dictionary.md")).unwrap();
+    assert!(
+        !index.contains("**Skipped:**"),
+        "the index must not carry over its own prior output (or itself) as a skipped file: {index}"
+    );
+    assert!(!index.contains("## Skipped"));
+}
+
+#[test]
+fn batch_mode_index_caps_the_files_table_on_a_large_directory() {
+    let dir = TempDir::new();
+    for i in 0..57 {
+        std::fs::copy(
+            fixture("sample.csv"),
+            dir.path().join(format!("f{i:03}.csv")),
+        )
+        .unwrap();
+    }
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(output.status.success());
+    let index = std::fs::read_to_string(dir.path().join("_index.dictionary.md")).unwrap();
+    assert_eq!(index.matches("| f").count(), 50);
+    assert!(index.contains("…and 7 more file(s) not shown here"));
 }

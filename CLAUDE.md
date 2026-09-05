@@ -306,12 +306,53 @@ Pointing `sniff-rs` at a directory instead of a file switches to batch
 mode: every file under it (recursively) that this tool can identify on
 its own - by extension or content-sniffing, exactly `detect_format`'s
 existing single-file logic - gets its own output, written next to its
-own source file by default.
+own source file by default, alongside one top-level index summarizing
+the whole run.
 
 ```bash
 sniff-rs ./data/                              # recurse, one output per recognized file
 sniff-rs ./data/ --output-dir ./dictionaries/ # outputs mirrored under a separate directory
 ```
+
+**The top-level index** (`_index.dictionary.md`, always this exact name,
+always plain Markdown) is written once per run wherever the per-file
+outputs themselves land - alongside them if co-located, or at the top of
+`--output-dir` if given, never mirrored into a subdirectory the way a
+per-file output is, since it describes the whole run rather than one
+file. It's deliberately a lightweight manifest, not a second copy of
+every file's real column tables: a `File | Tables | Columns | Output`
+table (one row per successfully-profiled file, linking to that file's
+own real output) plus a `## Skipped` section naming every file that
+couldn't be identified at all. Both settled after asking the user
+directly rather than guessing at scope - a full merged document
+inlining every file's actual tables into one file was the more
+feature-complete-sounding alternative, but was explicitly declined in
+favor of staying small and readable even across a directory with
+hundreds of files, matching the existing `MAX_TOC_ENTRIES` cap this
+project already uses for a single file's own Table-of-Contents (the
+index's own Files/Skipped listings are capped at the identical
+threshold, for the identical reason). Produced unconditionally,
+regardless of `--output-format` - even a `--output-format json` batch
+run gets this one Markdown index alongside its `.json` per-file
+outputs, since it's a navigation aid for humans, not "the" output the
+`--output-format` flag is choosing between.
+
+The index's own filename ends in `.dictionary.md` - the exact suffix
+`OWN_OUTPUT_SUFFIXES` (below) already recognizes - so a later run's
+`looks_like_own_output` check protects it for free, with zero new guard
+code: it's found, skipped, and never reprocessed as if it were input
+data, the identical protection every per-file output already had. One
+thing that check does *not* automatically give it: a file skipped for
+looking like this tool's own prior output (the index included) is
+deliberately never listed under the fresh index's own `## Skipped`
+section either, since that outcome isn't a data-quality signal worth
+repeating on every re-run - unlike a genuinely unrecognized file, which
+is. `unrecognized: Vec<String>` (fed only from the `detect_format`-
+failure branch, never the own-output-skip branch) is what keeps these
+two skip categories from bleeding into each other in the persisted
+document, confirmed directly by running the exact same directory twice
+in a row and checking the second run's index carries no stale
+"skipped" entries for its own first run's output.
 
 Every design choice here was made deliberately, not assumed, several
 after real testing surfaced a concrete problem with the obvious first
@@ -440,6 +481,18 @@ SQLite file is still *identified* correctly (content-sniffing doesn't
 care what's compiled in) but fails fast with the same actionable
 "rebuild with --features" error single-file mode already gives, rather
 than either a silent skip or a wrong success.
+
+The top-level index gets its own layer of coverage on top of this: unit
+tests directly on `render_directory_index`/`md_link_dest`/
+`relative_display_path` (the files-table cap, the `## Skipped` section's
+presence/absence, angle-bracket link-destination escaping), plus
+integration tests proving the index is written co-located by default,
+written regardless of `--output-format` (with its own links correctly
+pointing at whatever extension that run actually produced), capped the
+same way a single file's own Table-of-Contents already is, and - the one
+genuinely easy-to-get-wrong interaction - that running the same directory
+twice in a row never leaves stale "skipped" entries for the index's own
+prior output in the second run's fresh copy.
 
 ## Architecture
 
