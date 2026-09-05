@@ -44167,26 +44167,127 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
     }
 }
 
-fn render_markdown(file_name: &str, tables: &BTreeMap<String, Vec<ColumnProfile>>) -> String {
-    let mut md = format!("# Data Dictionary: {file_name}\n\n");
-    let show_headers = tables.len() > 1; // only multi-table sources (SQLite) get ## sections
-    for (table_name, profiles) in tables {
-        if show_headers {
-            md.push_str(&format!("## {}\n\n", escape_md(table_name)));
+/// Turns a table name into a stable, renderer-agnostic anchor id. Every
+/// non-ASCII-alphanumeric run collapses to one `-`, and the caller's own
+/// table index is always appended - not just on collision - so two
+/// differently-named tables can never collide, and a name that's already
+/// anchor-safe still gets a guaranteed-unique id with no extra bookkeeping.
+/// This deliberately never relies on a renderer's own heading-to-anchor
+/// slugification (GitHub, VS Code, and a generic CommonMark renderer don't
+/// all agree on it - unicode folding and punctuation-stripping rules
+/// differ), which is exactly what would make a hand-written `#slug` link
+/// silently dead on some other renderer.
+fn md_anchor_slug(name: &str, index: usize) -> String {
+    let mut slug = String::with_capacity(name.len() + 4);
+    let mut last_was_dash = true; // true so a leading run of non-alnum is dropped, not turned into a leading '-'
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
         }
-        md.push_str("| Column | Current Type | Ideal Type | Description | Missing % | Sample Values | Notes |\n");
-        md.push_str("|---|---|---|---|---|---|---|\n");
-        for p in profiles {
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        format!("table-{index}")
+    } else {
+        format!("{slug}-{index}")
+    }
+}
+
+fn render_markdown(
+    file_name: &str,
+    format: &InputFormat,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> String {
+    let table_count = tables.len();
+    let col_count: usize = tables.values().map(Vec::len).sum();
+
+    let mut md = format!("# Data Dictionary: {file_name}\n\n");
+    md.push_str(&format!(
+        "**Format:** {} · **Tables:** {table_count} · **Columns:** {col_count}\n\n",
+        format.as_str()
+    ));
+
+    let show_headers = table_count > 1; // only multi-table sources (SQLite) get ## sections
+
+    if show_headers {
+        md.push_str("## Tables\n\n");
+        for (index, table_name) in tables.keys().enumerate() {
             md.push_str(&format!(
-                "| {} | {} | {} | {} | {:.1}% | {} | {} |\n",
-                escape_md(&p.name),
-                escape_md(&p.current_type),
-                escape_md(&p.ideal_type),
-                escape_md(&p.description),
-                p.missing_pct,
-                escape_md(&p.sample_values.join(", ")),
-                escape_md(&p.notes),
+                "- [{}](#{})\n",
+                escape_md(table_name),
+                md_anchor_slug(table_name, index)
             ));
+        }
+        md.push('\n');
+    }
+
+    for (index, (table_name, profiles)) in tables.iter().enumerate() {
+        if show_headers {
+            md.push_str(&format!(
+                "<a id=\"{}\"></a>\n## {}\n\n",
+                md_anchor_slug(table_name, index),
+                escape_md(table_name)
+            ));
+        }
+
+        // Description is always empty today (intentionally left for a human
+        // to fill in - see the design-philosophy section in CLAUDE.md), so
+        // rendering it as its own column in every single table wastes a
+        // column on nothing but blank cells. Drop it per-table whenever
+        // every profile's description really is blank; the moment even one
+        // profile in a table carries real text, the column comes back for
+        // that table.
+        let show_description = profiles.iter().any(|p| !p.description.is_empty());
+
+        if show_description {
+            md.push_str("| Column | Current Type | Ideal Type | Description | Missing % | Sample Values | Notes |\n");
+            md.push_str("|---|---|---|---|---|---|---|\n");
+        } else {
+            md.push_str(
+                "| Column | Current Type | Ideal Type | Missing % | Sample Values | Notes |\n",
+            );
+            md.push_str("|---|---|---|---|---|---|\n");
+        }
+
+        for p in profiles {
+            // Bold Ideal Type whenever it disagrees with Current Type - the
+            // entire reason this tool reports both columns instead of one
+            // is to surface exactly this gap (a declared/observed type that
+            // isn't what the data really is), so scanning for it shouldn't
+            // require reading every row of every column side by side.
+            let ideal_type_cell = if p.ideal_type == p.current_type {
+                escape_md(&p.ideal_type).into_owned()
+            } else {
+                format!("**{}**", escape_md(&p.ideal_type))
+            };
+            if show_description {
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {:.1}% | {} | {} |\n",
+                    escape_md(&p.name),
+                    escape_md(&p.current_type),
+                    ideal_type_cell,
+                    escape_md(&p.description),
+                    p.missing_pct,
+                    escape_md(&p.sample_values.join(", ")),
+                    escape_md(&p.notes),
+                ));
+            } else {
+                md.push_str(&format!(
+                    "| {} | {} | {} | {:.1}% | {} | {} |\n",
+                    escape_md(&p.name),
+                    escape_md(&p.current_type),
+                    ideal_type_cell,
+                    p.missing_pct,
+                    escape_md(&p.sample_values.join(", ")),
+                    escape_md(&p.notes),
+                ));
+            }
         }
         md.push('\n');
     }
@@ -49239,7 +49340,7 @@ pub fn run() -> Result<()> {
     };
 
     let rendered = match output_format {
-        OutputFormat::Markdown => render_markdown(&file_name, &tables),
+        OutputFormat::Markdown => render_markdown(&file_name, &format, &tables),
         OutputFormat::Json => render_json(&file_name, &format, &tables)?,
         OutputFormat::JsonSchema => render_json_schema(&file_name, &tables)?,
     };
