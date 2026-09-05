@@ -33,6 +33,47 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-arrow-ipc` branch (Darwin arm64)
+
+The same fix as Parquet's own phase, applied to Arrow IPC's own footer/
+`Block`-list layout: `profile_arrow_ipc_file` now reads each
+`RecordBatch`/`DictionaryBatch`'s own `[offset, offset+metaDataLength+
+bodyLength)` span via `Seek` instead of one whole-file buffer, handing
+the unmodified `read_message_at`/`decode_record_batch_columns` a plain
+`0` offset into that fresh, block-sized buffer - simpler than Parquet's
+own fix, since every buffer-region offset inside a message was already
+relative to its own body, needing no rebase at all. See CLAUDE.md's
+"Streaming reads / memory footprint" section for the full writeup.
+
+Real file (175 MB, 3,000,000 rows, 4 columns, 30 record batches via
+`pyarrow`), `/usr/bin/time -l`, 3 rounds:
+
+Full scan:
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 958-985 MB | 820-846 MB |
+| New | 818-822 MB | 646-671 MB |
+| Change | **-15%** | **-20%** |
+
+Isolated via `--nrows 1` (now reads only the first record batch instead
+of the whole file):
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 737-745 MB | 629-630 MB |
+| New | 36-45 MB | ~31 MB |
+| Change | **-94%** | **-95%** |
+
+Both confirmed byte-identical via `diff`, including a new real 10-batch
+`pyarrow` fixture (every committed fixture has exactly one batch) with
+`--nrows` spanning a batch boundary. All 24 existing `arrow_ipc_support`
+unit tests and 4 integration tests passed unchanged with zero test
+modifications. No Criterion benchmark target currently isolates this
+reader, so this entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-parquet` branch (Darwin arm64)
 
 `profile_parquet_file` converted from decoding every row group against

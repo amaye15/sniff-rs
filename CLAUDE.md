@@ -4414,23 +4414,90 @@ unmasked mechanism cleanly: peak footprint 97-100 MB -> 35-42 MB
 identical via `diff`. Clippy/fmt clean across the default, `parquet`,
 and `full` builds, each matching its own established baseline.
 
+**Arrow IPC went twelfth, and confirmed the prediction from Parquet's
+own phase**: it really was the most similar remaining problem to
+Parquet's, right down to the fix needing even less structural change.
+Both share the same "footer/schema first, scattered per-batch buffers
+after" layout - a file footer lists every `RecordBatch`/`DictionaryBatch`
+as a `Block { offset, metaDataLength, bodyLength }`, FlatBuffers' own
+direct equivalent of Parquet's Thrift-encoded row-group column-chunk
+offsets. The one thing that made this conversion *simpler* than
+Parquet's own: every buffer-region offset *inside* a decoded message
+(`ArrowBufferRegion.offset` in `read_ipc_buffer`) was already relative
+to that message's own body slice, never to the whole file - unlike
+Parquet's page offsets, which needed an explicit rebase
+(`shift_row_group_offsets`) once a smaller buffer replaced the whole
+file, an Arrow IPC block's own bytes can be read via `Seek` straight
+into a fresh buffer and handed to the *completely unmodified*
+`read_message_at`/`decode_record_batch_columns` with a plain literal
+`0` in place of the block's own absolute file offset - no metadata
+cloning or offset arithmetic needed at all.
+
+`parse_footer_table` is the shared FlatBuffers-`Footer`-table parser
+factored out of the old `read_footer` (kept, unchanged, as the
+whole-buffer form this module's own test suite still uses for its
+oracle comparisons) - once footer bytes are in hand, every `fb_*`
+accessor already addresses positions relative to *that* buffer alone,
+so the same parsing logic serves both `read_footer`'s slice and
+`open_and_read_footer`'s freshly-`Seek`-read one unchanged.
+`read_block_bytes` reads one block's own `metaDataLength + bodyLength`
+span; `resolve_dictionaries_streaming`/`read_arrow_ipc_file_columns_
+streaming` are the production, `Seek`-based siblings of
+`read_arrow_ipc_footer_and_dicts`/`read_arrow_ipc_file_columns` (both
+kept, unchanged, since the former is still needed by the latter's own
+`#[cfg(test)]`-only row-oriented sibling, `read_arrow_ipc_file_rows`).
+
+`--nrows` picked up the identical per-block early-stop Parquet's own
+nested path just gained: checked *before* reading the next record
+batch's own bytes from disk, not just before keeping its rows once
+already decoded - genuinely bounding how many of a file's batches ever
+get touched, the same "row-group"-shaped granularity Parquet's own
+phase established, just called a "batch" here.
+
+Verified the same way Parquet's own multi-row-group gap was closed:
+every committed `.arrow` fixture happens to have exactly one
+`RecordBatch`, so a real, `pyarrow`-generated 10-batch file (written via
+repeated `writer.write_batch` calls) was used to prove the block-reading
+loop and the `--nrows`-spanning-a-batch-boundary case both hold up
+correctly - byte-identical to the pre-change binary in both the whole-
+file and `--nrows`-truncated cases. All 24 existing `arrow_ipc_support`
+unit tests (dictionary encoding with/without nulls, LZ4/Zstd-compressed
+batches including the multi-block-LZ4 cross-block-back-reference
+regression test, the Streaming format, Union/RunEndEncoded/View types,
+Duration/Interval/Time) and all 4 integration tests passed unchanged
+with zero test modifications needed, since they all still exercise the
+same underlying decoders through the unchanged whole-buffer path.
+
+Measured on a real 175 MB Arrow IPC file (3,000,000 rows, 4 columns, 30
+record batches via `pyarrow`), 3 rounds: full-scan maxRSS 958-985 MB ->
+818-822 MB (~15%), peak footprint 820-846 MB -> 646-671 MB (~20%) - a
+real, visible win even in the full-scan case here, less masked by
+downstream column storage than Parquet's own equivalent measurement
+was, plausibly because Arrow IPC's uncompressed columnar body needs
+less CPU/allocation overhead to decode than Parquet's RLE/dictionary
+encodings do, leaving relatively more of total memory attributable to
+the *input* buffer this phase actually shrank. Isolating a single
+batch's own read via `--nrows 1` shows an even larger effect than
+Parquet's own isolated case: maxRSS 737-745 MB -> 36-45 MB (~94%), peak
+footprint 629-630 MB -> ~31 MB (~95%). Both confirmed byte-identical via
+`diff`. Clippy/fmt clean across the default, `parquet` (the shared
+feature gate both Parquet and Arrow IPC build under), and `full` builds,
+each matching its own established baseline.
+
 **Deliberately not done yet**: the remaining formats that need either
 genuine random (`Seek`-based) access or more than one full pass over
 the file before the data means anything at all - SAS7BDAT (a genuine
 two-pass structure, see above - a materially different problem from
-SQLite's/ZipArchive's/Parquet's own single-pass-but-random-access
-shape), Arrow IPC (likely the most similar remaining problem to
-Parquet's own, sharing the same "footer/schema first, scattered
-row-batch buffers after" layout, but with FlatBuffers instead of Thrift
-and no exact equivalent tested yet), and old-style `.xls` (OLE2/CFB, a
-*different* container format than the ZIP-based four `ZipArchive`
-already covers, and - unlike Parquet's own clean row-group boundaries -
-one whose sector-chain-following would need to become genuinely lazy
-itself to get a comparable win, not just have its outer caller read a
-smaller bounded span). Per-entry streaming decompression inside
-`ZipArchive::read` itself (described above) is also a real, disclosed,
-separately-scoped remaining gap, not folded into this phase. The
-`suggest_ideal_type` incremental-accumulator rewrite (the deeper win
+SQLite's/ZipArchive's/Parquet's/Arrow IPC's own single-pass-but-random-
+access shape) and old-style `.xls` (OLE2/CFB, a *different* container
+format than the ZIP-based four `ZipArchive` already covers, and - unlike
+Parquet's/Arrow IPC's own clean, independently-addressable chunk/block
+boundaries - one whose sector-chain-following would need to become
+genuinely lazy itself to get a comparable win, not just have its outer
+caller read a smaller bounded span). Per-entry streaming decompression
+inside `ZipArchive::read` itself (described above) is also a real,
+disclosed, separately-scoped remaining gap, not folded into this phase.
+The `suggest_ideal_type` incremental-accumulator rewrite (the deeper win
 described above) remains entirely unstarted, tracked as its own future
 phase.
 

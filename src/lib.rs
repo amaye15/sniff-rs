@@ -33607,6 +33607,7 @@ mod parquet_support {
 mod arrow_ipc_support {
     use super::*;
     use std::collections::VecDeque;
+    use std::io::{Read, Seek, SeekFrom};
 
     // ---------------------------------------------------------------
     // FlatBuffers read-side primitives - verified directly against the
@@ -34377,24 +34378,14 @@ mod arrow_ipc_support {
     /// before trusting the rest of the file - the same "verify what's
     /// verifiable" discipline this project applies to every other format's
     /// magic-number check.
-    fn read_footer(file_data: &[u8]) -> Result<ArrowFileFooter> {
-        if file_data.len() < 8 || &file_data[..6] != ARROW_MAGIC {
-            bail!("not a valid Arrow IPC file (missing leading ARROW1 magic)");
-        }
-        if file_data.len() < 10 {
-            bail!("Arrow IPC file too short to contain a footer");
-        }
-        let trailer_start = file_data.len() - 10;
-        let trailer = &file_data[trailer_start..];
-        if &trailer[4..10] != ARROW_MAGIC {
-            bail!("not a valid Arrow IPC file (missing trailing ARROW1 magic)");
-        }
-        let footer_len = u32::from_le_bytes(trailer[0..4].try_into().unwrap()) as usize;
-        let footer_start = trailer_start
-            .checked_sub(footer_len)
-            .context("Arrow IPC footer length exceeds file size")?;
-        let footer_buf = &file_data[footer_start..trailer_start];
-
+    /// Parses the footer's own FlatBuffers `Footer` table - shared by
+    /// both `read_footer` (the whole-buffer form kept for this module's
+    /// own test suite) and `open_and_read_footer` (the `Seek`-based
+    /// production form): once the footer's own bytes are in hand, every
+    /// `fb_*` accessor below already addresses positions relative to
+    /// *that* buffer, not the whole file, so there's nothing left that
+    /// differs between the two callers from this point on.
+    fn parse_footer_table(footer_buf: &[u8]) -> Result<ArrowFileFooter> {
         let footer_table = fb_root(footer_buf)?;
         let schema_loc = fb_get_ref(footer_buf, footer_table, 1)?
             .context("Arrow IPC footer missing its own schema")?;
@@ -34422,6 +34413,102 @@ mod arrow_ipc_support {
             dictionaries,
             record_batches,
         })
+    }
+
+    /// `#[allow(dead_code)]`: the production entry point
+    /// (`profile_arrow_ipc_file`) reads via `open_and_read_footer`
+    /// instead now, so this whole-buffer form is only ever reached by
+    /// this module's own `#[cfg(test)]` code (`read_arrow_ipc_file_rows`
+    /// and its own test suite), invisible to a plain, non-test build -
+    /// the same reason `parquet_support::read_footer` needs the
+    /// identical allow.
+    #[allow(dead_code)]
+    fn read_footer(file_data: &[u8]) -> Result<ArrowFileFooter> {
+        if file_data.len() < 8 || &file_data[..6] != ARROW_MAGIC {
+            bail!("not a valid Arrow IPC file (missing leading ARROW1 magic)");
+        }
+        if file_data.len() < 10 {
+            bail!("Arrow IPC file too short to contain a footer");
+        }
+        let trailer_start = file_data.len() - 10;
+        let trailer = &file_data[trailer_start..];
+        if &trailer[4..10] != ARROW_MAGIC {
+            bail!("not a valid Arrow IPC file (missing trailing ARROW1 magic)");
+        }
+        let footer_len = u32::from_le_bytes(trailer[0..4].try_into().unwrap()) as usize;
+        let footer_start = trailer_start
+            .checked_sub(footer_len)
+            .context("Arrow IPC footer length exceeds file size")?;
+        let footer_buf = &file_data[footer_start..trailer_start];
+        parse_footer_table(footer_buf)
+    }
+
+    /// Reads just the file's own leading magic and trailing magic/
+    /// footer-length/footer bytes via `Seek`, instead of `read_footer`'s
+    /// own whole-file buffer (kept exactly as-is for this module's test
+    /// suite). The production entry point never needs more than the
+    /// footer up front - every dictionary and record batch is read
+    /// later, on demand, by `read_block_bytes`, bounded to exactly that
+    /// block's own byte span rather than the whole file regardless of
+    /// how many blocks it has.
+    fn open_and_read_footer(path: &Path) -> Result<(fs::File, ArrowFileFooter)> {
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {path:?}"))?
+            .len();
+        if file_len < 10 {
+            bail!("Arrow IPC file too short to contain a footer");
+        }
+        let mut head = [0u8; 6];
+        file.read_exact(&mut head)
+            .with_context(|| format!("failed reading {path:?}"))?;
+        if head != *ARROW_MAGIC {
+            bail!("not a valid Arrow IPC file (missing leading ARROW1 magic)");
+        }
+        file.seek(SeekFrom::End(-10))
+            .with_context(|| format!("failed seeking into {path:?}"))?;
+        let mut trailer = [0u8; 10];
+        file.read_exact(&mut trailer)
+            .with_context(|| format!("failed reading {path:?}"))?;
+        if trailer[4..10] != *ARROW_MAGIC {
+            bail!("not a valid Arrow IPC file (missing trailing ARROW1 magic)");
+        }
+        let footer_len = u32::from_le_bytes(trailer[0..4].try_into().unwrap()) as u64;
+        let trailer_start = file_len - 10;
+        let footer_start = trailer_start
+            .checked_sub(footer_len)
+            .context("Arrow IPC footer length exceeds file size")?;
+        file.seek(SeekFrom::Start(footer_start))
+            .with_context(|| format!("failed seeking into {path:?}"))?;
+        let mut footer_buf = vec![0u8; footer_len as usize];
+        file.read_exact(&mut footer_buf)
+            .with_context(|| format!("failed reading the Arrow IPC footer in {path:?}"))?;
+        let footer = parse_footer_table(&footer_buf)?;
+        Ok((file, footer))
+    }
+
+    /// Reads exactly one `Block`'s own bytes (metadata immediately
+    /// followed by body, per the IPC file format's own framing) off disk
+    /// via `Seek` - the change that lets a dictionary or record batch be
+    /// decoded without the whole file, or even every other block, ever
+    /// being resident at once.
+    fn read_block_bytes(file: &mut fs::File, block: &ArrowBlock) -> Result<Vec<u8>> {
+        let offset = u64::try_from(block.offset).context("negative Arrow IPC Block offset")?;
+        let meta_len = u64::try_from(block.meta_data_length)
+            .context("negative Arrow IPC Block metadata length")?;
+        let body_len =
+            u64::try_from(block.body_length).context("negative Arrow IPC Block body length")?;
+        let total = meta_len
+            .checked_add(body_len)
+            .context("Arrow IPC Block length overflow")?;
+        file.seek(SeekFrom::Start(offset))
+            .context("failed seeking to an Arrow IPC block")?;
+        let mut buf =
+            vec![0u8; usize::try_from(total).context("Arrow IPC block is implausibly large")?];
+        file.read_exact(&mut buf)
+            .context("truncated Arrow IPC block")?;
+        Ok(buf)
     }
 
     // ---------------------------------------------------------------
@@ -36033,16 +36120,16 @@ mod arrow_ipc_support {
         decoder.decode_field(value_field)
     }
 
-    /// Reads a complete Arrow IPC *File*-format file into row objects -
-    /// this reader's own top-level entry point, mirroring `arrow-ipc`'s
-    /// own `FileReader`: read the footer (Phase 1), resolve every
-    /// `DictionaryBatch` in file order (a delta batch appends to, rather
-    /// than replaces, its id's existing values - the IPC spec's own
-    /// "streaming dictionary" mechanism for a dictionary that grows across
-    /// a file), then decode every `RecordBatch` in file order.
-    /// Reads the footer and resolves every `DictionaryBatch` (a delta
-    /// batch appends to its id's existing values) - the shared front half
-    /// of both `read_arrow_ipc_file_rows` and `read_arrow_ipc_file_columns`.
+    /// Reads the footer and resolves every `DictionaryBatch` in file
+    /// order (a delta batch appends to, rather than replaces, its id's
+    /// existing values - the IPC spec's own "streaming dictionary"
+    /// mechanism for a dictionary that grows across a file) - the
+    /// whole-buffer counterpart to `resolve_dictionaries_streaming`,
+    /// used only by this module's own `#[cfg(test)]` code now
+    /// (`read_arrow_ipc_file_rows`); `#[allow(dead_code)]` since the
+    /// production path reads via that streaming form instead, making
+    /// this one invisible to a plain, non-test build.
+    #[allow(dead_code)]
     fn read_arrow_ipc_footer_and_dicts(
         file_data: &[u8],
     ) -> Result<(ArrowFileFooter, HashMap<i64, Vec<JsonValue>>)> {
@@ -36112,26 +36199,82 @@ mod arrow_ipc_support {
         Ok(rows)
     }
 
-    /// The column-oriented counterpart to `read_arrow_ipc_file_rows`:
-    /// every `RecordBatch` is already decoded column-major internally
-    /// (`decode_record_batch_columns`), so this concatenates those
-    /// per-column vectors across batches directly rather than
-    /// transposing to row objects and letting `profile_arrow_ipc_file`
-    /// transpose them straight back. One `Vec<JsonValue>` per top-level
-    /// schema field, in schema order.
-    fn read_arrow_ipc_file_columns(
-        file_data: &[u8],
-    ) -> Result<(ArrowFileFooter, Vec<Vec<JsonValue>>)> {
-        let (footer, dictionaries) = read_arrow_ipc_footer_and_dicts(file_data)?;
+    /// The `Seek`-based counterpart to `read_arrow_ipc_footer_and_dicts`,
+    /// used only by the production streaming path
+    /// (`read_arrow_ipc_file_columns_streaming`) - reads each
+    /// `DictionaryBatch`'s own bytes via `read_block_bytes` instead of
+    /// slicing a whole-file buffer. Dictionaries are typically small
+    /// relative to a file's real record batches (a dictionary holds only
+    /// the *unique* values a column actually uses, not one entry per
+    /// row), so reading every one of them up front - the same as this
+    /// project's other "small, bounded, resolve-once" metadata reads -
+    /// is a reasonable, deliberate cost, not a gap.
+    fn resolve_dictionaries_streaming(
+        file: &mut fs::File,
+        footer: &ArrowFileFooter,
+    ) -> Result<HashMap<i64, Vec<JsonValue>>> {
+        let mut dict_field_by_id = HashMap::new();
+        for field in &footer.schema.fields {
+            collect_dictionary_fields(field, &mut dict_field_by_id);
+        }
+
+        let mut dictionaries: HashMap<i64, Vec<JsonValue>> = HashMap::new();
+        for block in &footer.dictionaries {
+            let block_bytes = read_block_bytes(file, block)?;
+            let (header, body) =
+                read_message_at(&block_bytes, 0, block.meta_data_length, block.body_length)?;
+            let ArrowMessageHeader::DictionaryBatch(dict_meta) = header else {
+                bail!(
+                    "Arrow IPC footer's own dictionaries list points at a non-DictionaryBatch \
+                     message"
+                );
+            };
+            let value_field = dict_field_by_id.get(&dict_meta.id).with_context(|| {
+                format!(
+                    "Arrow IPC DictionaryBatch id {} has no matching schema field",
+                    dict_meta.id
+                )
+            })?;
+            let values =
+                decode_dictionary_batch(value_field, &dict_meta.data, body, &dictionaries)?;
+            if dict_meta.is_delta {
+                dictionaries.entry(dict_meta.id).or_default().extend(values);
+            } else {
+                dictionaries.insert(dict_meta.id, values);
+            }
+        }
+        Ok(dictionaries)
+    }
+
+    /// The column-oriented, `Seek`-based counterpart to
+    /// `read_arrow_ipc_file_rows`: every `RecordBatch` is already decoded
+    /// column-major internally (`decode_record_batch_columns`), so this
+    /// concatenates those per-column vectors across batches directly
+    /// rather than transposing to row objects and letting
+    /// `profile_arrow_ipc_file` transpose them straight back. One
+    /// `Vec<JsonValue>` per top-level schema field, in schema order.
+    /// `nrows` is checked *before* reading the next record batch's own
+    /// bytes from disk, not just before keeping its rows once already
+    /// decoded - a real batch never gets read at all once enough rows
+    /// have already been collected from earlier ones, the same
+    /// "row-group" granularity `parquet_support::profile_parquet_file`
+    /// already bounds its own row-group reads by.
+    fn read_arrow_ipc_file_columns_streaming(
+        file: &mut fs::File,
+        footer: &ArrowFileFooter,
+        nrows: Option<usize>,
+    ) -> Result<Vec<Vec<JsonValue>>> {
+        let dictionaries = resolve_dictionaries_streaming(file, footer)?;
         let mut columns: Vec<Vec<JsonValue>> =
             footer.schema.fields.iter().map(|_| Vec::new()).collect();
+        let mut total = 0usize;
         for block in &footer.record_batches {
-            let (header, body) = read_message_at(
-                file_data,
-                block.offset,
-                block.meta_data_length,
-                block.body_length,
-            )?;
+            if nrows.is_some_and(|limit| total >= limit) {
+                break;
+            }
+            let block_bytes = read_block_bytes(file, block)?;
+            let (header, body) =
+                read_message_at(&block_bytes, 0, block.meta_data_length, block.body_length)?;
             let ArrowMessageHeader::RecordBatch(batch_meta) = header else {
                 bail!(
                     "Arrow IPC footer's own recordBatches list points at a non-RecordBatch \
@@ -36140,11 +36283,13 @@ mod arrow_ipc_support {
             };
             let batch_cols =
                 decode_record_batch_columns(&footer.schema, &batch_meta, body, &dictionaries)?;
+            let batch_rows = batch_cols.first().map_or(0, |(_, vals)| vals.len());
             for (acc, (_, vals)) in columns.iter_mut().zip(batch_cols) {
                 acc.extend(vals);
             }
+            total += batch_rows;
         }
-        Ok((footer, columns))
+        Ok(columns)
     }
 
     /// Whether a field's own declared type needs `profile_json_path`
@@ -36275,15 +36420,15 @@ mod arrow_ipc_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let file_data = std::fs::read(path).with_context(|| format!("failed to open {path:?}"))?;
+        let (mut file, footer) = open_and_read_footer(path)?;
         // Column-oriented from end to end: every RecordBatch is decoded
-        // column-major already, so this reads the file straight into one
+        // column-major already, so this reads straight into one
         // `Vec<JsonValue>` per field rather than building row objects
         // (re-cloning every field name into every row) only to transpose
         // them straight back to columns. Fields line up with
         // `footer.schema.fields` by position, so no name lookup is
         // needed at all.
-        let (footer, mut columns) = read_arrow_ipc_file_columns(&file_data)?;
+        let mut columns = read_arrow_ipc_file_columns_streaming(&mut file, &footer, nrows)?;
         if let Some(limit) = nrows {
             for col in &mut columns {
                 col.truncate(limit);
