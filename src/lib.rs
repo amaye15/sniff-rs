@@ -44213,6 +44213,110 @@ fn md_anchor_slug(name: &str, index: usize) -> String {
     }
 }
 
+/// A source with more tables than this gets a truncated Table of Contents
+/// ("...and N more") rather than one bullet per table. Real, not
+/// hypothetical: this project's own INI reader is benchmarked against
+/// synthetic files with tens of thousands of sections (= tables) - a flat
+/// bullet-per-table ToC at that scale would itself be a multi-thousand-line
+/// wall, exactly the unusable-document problem the ToC exists to prevent in
+/// the first place. Every table still gets a real `##` section and a real
+/// anchor regardless of this cap - only the *listing* is capped.
+const MAX_TOC_ENTRIES: usize = 50;
+
+/// `Missing %` is bolded at or above this threshold - "has missing values"
+/// alone (already in the Notes column) doesn't distinguish a column that's
+/// 2% missing from one that's 90% missing, and the latter is the one worth
+/// noticing without reading every row's Notes cell.
+const HIGH_MISSING_PCT_THRESHOLD: f64 = 50.0;
+
+/// Sample values exist to give a quick, at-a-glance feel for a column's
+/// real content, not to reproduce it in full - a JWT or an embedded-JSON
+/// blob can run past a hundred characters, and just one such value in one
+/// column would blow out an entire table's rendered width. Truncated at a
+/// fixed *character* count, not byte count, since sample values routinely
+/// carry genuine multi-byte content (café/日本語/emoji, per this project's
+/// own adversarial fixtures) - slicing by byte offset could otherwise land
+/// mid-character. A literal newline is also normalized to a space here
+/// (not just escaped) since it can't survive into a table cell's own
+/// single-line text either way. `--output-format json`/`json-schema`
+/// always carry the untruncated, unmodified value.
+const MAX_SAMPLE_VALUE_CHARS: usize = 60;
+
+fn clean_sample_value_for_markdown(v: &str) -> String {
+    let mut out = String::with_capacity(v.len().min(MAX_SAMPLE_VALUE_CHARS + 1));
+    let mut truncated = false;
+    for (count, c) in v.chars().enumerate() {
+        if count >= MAX_SAMPLE_VALUE_CHARS {
+            truncated = true;
+            break;
+        }
+        match c {
+            '\n' => out.push(' '),
+            // A `|` still has to be backslash-escaped even when the value
+            // is about to be wrapped in a code span - verified directly
+            // against the GFM spec's own worked example (`` b `\|` az ``
+            // renders as `b <code>|</code> az`), since a table row is
+            // split into cells by scanning the *raw* source text for an
+            // unescaped `|` before any inline content (code spans
+            // included) is parsed. An unescaped `|` here would have
+            // split the row into two cells instead of landing inside the
+            // code span - this project's own initial implementation got
+            // this backwards before being checked against the spec.
+            '|' => out.push_str("\\|"),
+            _ => out.push(c),
+        }
+    }
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
+/// Wraps `s` in a CommonMark inline code span, choosing a backtick fence
+/// one longer than the longest run of backticks already inside `s` (per
+/// the CommonMark spec - a code span's delimiter must outrun any backtick
+/// content it wraps, or the span closes early on the first internal run).
+/// A leading/trailing space is added whenever `s` itself starts or ends
+/// with a backtick (or is empty), the same spec-mandated padding that lets
+/// a code span's content start or end with its own fence character without
+/// visually fusing into it.
+fn md_code_span(s: &str) -> String {
+    let mut longest_run = 0usize;
+    let mut current_run = 0usize;
+    for c in s.chars() {
+        if c == '`' {
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    let fence = "`".repeat(longest_run + 1);
+    if s.is_empty() || s.starts_with('`') || s.ends_with('`') {
+        format!("{fence} {s} {fence}")
+    } else {
+        format!("{fence}{s}{fence}")
+    }
+}
+
+/// Renders a column's sample values as a comma-joined list of individually
+/// fenced code spans, e.g. `` `40.7128,-74.0060`, `51.5074,-0.1278` `` -
+/// each value visually self-delimits even when it contains its own commas
+/// (coordinate pairs, embedded JSON), which a bare comma-joined string
+/// can't do. `clean_sample_value_for_markdown` still backslash-escapes any
+/// `|` in the value before it's wrapped here - a code span does *not*
+/// protect a literal `|` from being read as a cell delimiter, since GFM's
+/// table extension splits a row into cells by scanning the raw source text
+/// for an unescaped `|` before any inline content (code spans included) is
+/// parsed, confirmed directly against the spec's own worked example.
+fn render_sample_values_cell(sample_values: &[String]) -> String {
+    sample_values
+        .iter()
+        .map(|v| md_code_span(&clean_sample_value_for_markdown(v)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_markdown(
     file_name: &str,
     format: &InputFormat,
@@ -44231,11 +44335,18 @@ fn render_markdown(
 
     if show_headers {
         md.push_str("## Tables\n\n");
-        for (index, table_name) in tables.keys().enumerate() {
+        let toc_shown = table_count.min(MAX_TOC_ENTRIES);
+        for (index, table_name) in tables.keys().enumerate().take(toc_shown) {
             md.push_str(&format!(
                 "- [{}](#{})\n",
                 escape_md(table_name),
                 md_anchor_slug(table_name, index)
+            ));
+        }
+        if table_count > toc_shown {
+            md.push_str(&format!(
+                "- …and {} more table(s) (see `--output-format json` for the full list)\n",
+                table_count - toc_shown
             ));
         }
         md.push('\n');
@@ -44280,25 +44391,36 @@ fn render_markdown(
             } else {
                 format!("**{}**", escape_md(&p.ideal_type))
             };
+            // Same bold-on-signal treatment as Ideal Type above, applied to
+            // the other column whose plain text alone doesn't distinguish
+            // "worth a second look" from "unremarkable" - a column that's
+            // 90% missing reads identically to one that's 2% missing until
+            // a threshold is drawn somewhere.
+            let missing_pct_cell = if p.missing_pct >= HIGH_MISSING_PCT_THRESHOLD {
+                format!("**{:.1}%**", p.missing_pct)
+            } else {
+                format!("{:.1}%", p.missing_pct)
+            };
+            let sample_values_cell = render_sample_values_cell(&p.sample_values);
             if show_description {
                 md.push_str(&format!(
-                    "| {} | {} | {} | {} | {:.1}% | {} | {} |\n",
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
                     escape_md(&p.name),
                     escape_md(&p.current_type),
                     ideal_type_cell,
                     escape_md(&p.description),
-                    p.missing_pct,
-                    escape_md(&p.sample_values.join(", ")),
+                    missing_pct_cell,
+                    sample_values_cell,
                     escape_md(&p.notes),
                 ));
             } else {
                 md.push_str(&format!(
-                    "| {} | {} | {} | {:.1}% | {} | {} |\n",
+                    "| {} | {} | {} | {} | {} | {} |\n",
                     escape_md(&p.name),
                     escape_md(&p.current_type),
                     ideal_type_cell,
-                    p.missing_pct,
-                    escape_md(&p.sample_values.join(", ")),
+                    missing_pct_cell,
+                    sample_values_cell,
                     escape_md(&p.notes),
                 ));
             }
@@ -54693,5 +54815,137 @@ mod tests {
         let mine = orc_support::columns_from_orc(path, None, 100);
         let theirs = columns_from_orc_via_orc_rust_crate(path, 100);
         assert_eq!(mine.is_ok(), theirs.is_ok());
+    }
+
+    // --- Markdown rendering helpers ---
+
+    #[test]
+    fn md_code_span_wraps_plain_content_in_a_single_backtick_pair() {
+        assert_eq!(md_code_span("hello"), "`hello`");
+        assert_eq!(md_code_span("a|b"), "`a|b`");
+    }
+
+    #[test]
+    fn md_code_span_widens_its_fence_past_the_longest_internal_backtick_run() {
+        // One internal backtick needs a two-backtick fence, or the span
+        // would close on the first internal backtick instead of wrapping it.
+        assert_eq!(md_code_span("a`b"), "``a`b``");
+        // Two consecutive internal backticks need a three-backtick fence.
+        assert_eq!(md_code_span("a``b"), "```a``b```");
+    }
+
+    #[test]
+    fn md_code_span_pads_content_that_starts_or_ends_with_a_backtick() {
+        assert_eq!(md_code_span("`x"), "`` `x ``");
+        assert_eq!(md_code_span("x`"), "`` x` ``");
+        assert_eq!(md_code_span(""), "`  `");
+    }
+
+    #[test]
+    fn clean_sample_value_for_markdown_leaves_a_short_value_untouched() {
+        assert_eq!(clean_sample_value_for_markdown("550e8400"), "550e8400");
+    }
+
+    #[test]
+    fn clean_sample_value_for_markdown_truncates_by_char_not_byte_count() {
+        // 61 multi-byte characters (café repeated) - a byte-offset slice at
+        // MAX_SAMPLE_VALUE_CHARS would either panic or cut mid-character;
+        // this must stop at exactly 60 real characters plus the ellipsis.
+        let long_value: String = "café".repeat(20); // 80 chars, each up to 2 bytes
+        let cleaned = clean_sample_value_for_markdown(&long_value);
+        assert_eq!(cleaned.chars().count(), MAX_SAMPLE_VALUE_CHARS + 1); // +1 for '…'
+        assert!(cleaned.ends_with('…'));
+        assert!(long_value.starts_with(cleaned.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn clean_sample_value_for_markdown_replaces_embedded_newlines_with_spaces() {
+        assert_eq!(
+            clean_sample_value_for_markdown("line1\nline2"),
+            "line1 line2"
+        );
+    }
+
+    #[test]
+    fn clean_sample_value_for_markdown_escapes_pipes_even_though_the_caller_wraps_it_in_a_code_span()
+     {
+        // Locks in the exact shape of the GFM spec's own worked example
+        // (example 200: `` b `\|` az `` renders as `b <code>|</code> az`)
+        // - a code span does not protect a literal `|` from being read as
+        // a table-cell delimiter, since row-splitting happens on the raw
+        // source text before any inline content is parsed.
+        assert_eq!(clean_sample_value_for_markdown("a|b"), "a\\|b");
+    }
+
+    #[test]
+    fn render_sample_values_cell_code_spans_each_value_separately() {
+        let values = vec![
+            "40.7128,-74.0060".to_string(),
+            "51.5074,-0.1278".to_string(),
+        ];
+        assert_eq!(
+            render_sample_values_cell(&values),
+            "`40.7128,-74.0060`, `51.5074,-0.1278`"
+        );
+    }
+
+    #[test]
+    fn render_sample_values_cell_is_empty_for_no_samples() {
+        assert_eq!(render_sample_values_cell(&[]), "");
+    }
+
+    #[test]
+    fn render_sample_values_cell_escapes_a_pipe_inside_the_code_span() {
+        let values = vec!["shell | pipe".to_string()];
+        assert_eq!(render_sample_values_cell(&values), "`shell \\| pipe`");
+    }
+
+    #[test]
+    fn md_anchor_slug_is_unique_across_two_tables_that_slugify_identically() {
+        // "Order Details" and "order-details" collapse to the same base
+        // slug once lowercased and punctuation-folded - the trailing index
+        // is what actually guarantees uniqueness, not the name itself.
+        assert_ne!(
+            md_anchor_slug("Order Details", 0),
+            md_anchor_slug("order-details", 1)
+        );
+    }
+
+    #[test]
+    fn render_markdown_caps_the_table_of_contents_past_max_toc_entries() {
+        let tables: BTreeMap<String, Vec<ColumnProfile>> = (0..MAX_TOC_ENTRIES + 5)
+            .map(|i| (format!("t{i:03}"), Vec::new()))
+            .collect();
+        let md = render_markdown("many.ini", &InputFormat::Ini, &tables);
+        assert_eq!(md.matches("](#t").count(), MAX_TOC_ENTRIES);
+        assert!(md.contains("…and 5 more table(s)"));
+        // Every table still gets its own real anchor and heading, even the
+        // ones the capped ToC listing above doesn't link to.
+        assert_eq!(md.matches("<a id=\"t").count(), MAX_TOC_ENTRIES + 5);
+    }
+
+    #[test]
+    fn render_markdown_bolds_missing_pct_at_or_above_the_high_threshold() {
+        let profile_at = |missing_pct: f64| ColumnProfile {
+            name: "col".to_string(),
+            current_type: "String".to_string(),
+            ideal_type: "String".to_string(),
+            description: String::new(),
+            missing_pct,
+            sample_values: vec![],
+            notes: String::new(),
+        };
+        let tables: BTreeMap<String, Vec<ColumnProfile>> = std::iter::once((
+            "t".to_string(),
+            vec![
+                profile_at(HIGH_MISSING_PCT_THRESHOLD - 0.1),
+                profile_at(HIGH_MISSING_PCT_THRESHOLD),
+            ],
+        ))
+        .collect();
+        let md = render_markdown("f.csv", &InputFormat::Csv, &tables);
+        assert!(md.contains(&format!("{:.1}%", HIGH_MISSING_PCT_THRESHOLD - 0.1)));
+        assert!(!md.contains(&format!("**{:.1}%**", HIGH_MISSING_PCT_THRESHOLD - 0.1)));
+        assert!(md.contains(&format!("**{:.1}%**", HIGH_MISSING_PCT_THRESHOLD)));
     }
 }
