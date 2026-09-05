@@ -314,45 +314,62 @@ sniff-rs ./data/                              # recurse, one output per recogniz
 sniff-rs ./data/ --output-dir ./dictionaries/ # outputs mirrored under a separate directory
 ```
 
-**The top-level index** (`_index.dictionary.md`, always this exact name,
-always plain Markdown) is written once per run wherever the per-file
+**The top-level index** is written once per run wherever the per-file
 outputs themselves land - alongside them if co-located, or at the top of
 `--output-dir` if given, never mirrored into a subdirectory the way a
 per-file output is, since it describes the whole run rather than one
 file. It's deliberately a lightweight manifest, not a second copy of
 every file's real column tables: a `File | Tables | Columns | Output`
-table (one row per successfully-profiled file, linking to that file's
-own real output) plus a `## Skipped` section naming every file that
-couldn't be identified at all. Both settled after asking the user
-directly rather than guessing at scope - a full merged document
-inlining every file's actual tables into one file was the more
-feature-complete-sounding alternative, but was explicitly declined in
-favor of staying small and readable even across a directory with
-hundreds of files, matching the existing `MAX_TOC_ENTRIES` cap this
-project already uses for a single file's own Table-of-Contents (the
-index's own Files/Skipped listings are capped at the identical
-threshold, for the identical reason). Produced unconditionally,
-regardless of `--output-format` - even a `--output-format json` batch
-run gets this one Markdown index alongside its `.json` per-file
-outputs, since it's a navigation aid for humans, not "the" output the
-`--output-format` flag is choosing between.
+listing (one row/entry per successfully-profiled file, linking to that
+file's own real output) plus a record of every file that couldn't be
+identified at all. Both settled after asking the user directly rather
+than guessing at scope - a full merged document inlining every file's
+actual tables into one file was the more feature-complete-sounding
+alternative, but was explicitly declined in favor of staying small and
+readable even across a directory with hundreds of files.
 
-The index's own filename ends in `.dictionary.md` - the exact suffix
-`OWN_OUTPUT_SUFFIXES` (below) already recognizes - so a later run's
-`looks_like_own_output` check protects it for free, with zero new guard
-code: it's found, skipped, and never reprocessed as if it were input
-data, the identical protection every per-file output already had. One
-thing that check does *not* automatically give it: a file skipped for
-looking like this tool's own prior output (the index included) is
-deliberately never listed under the fresh index's own `## Skipped`
-section either, since that outcome isn't a data-quality signal worth
-repeating on every re-run - unlike a genuinely unrecognized file, which
-is. `unrecognized: Vec<String>` (fed only from the `detect_format`-
-failure branch, never the own-output-skip branch) is what keeps these
-two skip categories from bleeding into each other in the persisted
-document, confirmed directly by running the exact same directory twice
-in a row and checking the second run's index carries no stale
-"skipped" entries for its own first run's output.
+**Its format follows `--output-format`, exactly like a per-file
+output's own extension does** - `directory_index_file_name` maps
+`md` -> `_index.dictionary.md` (`render_directory_index`, a `File |
+Tables | Columns | Output` Markdown table capped at `MAX_TOC_ENTRIES`,
+the same cap this project already uses for a single file's own
+Table-of-Contents, for the identical reason - a directory can hold far
+more files than a *rendered* listing can usefully show) and
+`json`/`json-schema` both -> `_index.dictionary.json`
+(`render_directory_index_json`, this tool's own rich JSON shape -
+`{"directory", "files", "tables", "columns", "skipped", "entries": [...],
+"unrecognized": [...]}`). Both JSON-flavored output formats share the one
+JSON manifest rather than needing a third rendering, since a file
+manifest has no natural json-schema.org shape of its own - a schema
+describes typed columns, not a list of files. This was also settled by
+asking rather than assumed: the alternative of always writing the
+Markdown index regardless of `--output-format` (with an optional
+*additional* JSON one) was considered and explicitly turned down in
+favor of the index following the same format-selection convention
+every other output in this tool already uses. The JSON manifest is
+deliberately **not** capped at `MAX_TOC_ENTRIES` the way the Markdown
+table is - that cap exists to keep a *rendered* table readable, a
+concern that doesn't apply to a JSON array a consumer is going to parse
+programmatically, so truncating it would be real, silent data loss for
+exactly the audience reaching for JSON over Markdown in the first place.
+
+Either filename ends in one of `OWN_OUTPUT_SUFFIXES` (below,
+`.dictionary.md` or `.dictionary.json`) - the exact suffixes those
+already recognize - so a later run's `looks_like_own_output` check
+protects the index for free, with zero new guard code: it's found,
+skipped, and never reprocessed as if it were input data, the identical
+protection every per-file output already had. One thing that check does
+*not* automatically give it: a file skipped for looking like this tool's
+own prior output (the index included) is deliberately never listed
+under the fresh index's own skipped-files record either, since that
+outcome isn't a data-quality signal worth repeating on every re-run -
+unlike a genuinely unrecognized file, which is. `unrecognized:
+Vec<String>` (fed only from the `detect_format`-failure branch, never
+the own-output-skip branch) is what keeps these two skip categories from
+bleeding into each other in the persisted document, confirmed directly
+by running the exact same directory twice in a row (in both output
+formats) and checking the second run's index carries no stale "skipped"
+entries for its own first run's output.
 
 Every design choice here was made deliberately, not assumed, several
 after real testing surfaced a concrete problem with the obvious first
@@ -483,16 +500,20 @@ care what's compiled in) but fails fast with the same actionable
 than either a silent skip or a wrong success.
 
 The top-level index gets its own layer of coverage on top of this: unit
-tests directly on `render_directory_index`/`md_link_dest`/
-`relative_display_path` (the files-table cap, the `## Skipped` section's
-presence/absence, angle-bracket link-destination escaping), plus
-integration tests proving the index is written co-located by default,
-written regardless of `--output-format` (with its own links correctly
-pointing at whatever extension that run actually produced), capped the
-same way a single file's own Table-of-Contents already is, and - the one
-genuinely easy-to-get-wrong interaction - that running the same directory
-twice in a row never leaves stale "skipped" entries for the index's own
-prior output in the second run's fresh copy.
+tests directly on `render_directory_index`/`render_directory_index_json`/
+`md_link_dest`/`relative_display_path` (the Markdown files-table cap, the
+`## Skipped` section's presence/absence, angle-bracket link-destination
+escaping), plus integration tests proving the index is written co-located
+by default, that its format follows `--output-format` correctly for all
+three values (`md`/`json`/`json-schema`, the latter two sharing the one
+JSON manifest rather than either getting its own Markdown copy), that its
+links correctly point at whatever extension that run actually produced,
+that the Markdown table is capped the same way a single file's own
+Table-of-Contents already is while the JSON array deliberately is *not*,
+and - the one genuinely easy-to-get-wrong interaction, checked in both
+output formats - that running the same directory twice in a row never
+leaves stale "skipped" entries for the index's own prior output in the
+second run's fresh copy.
 
 ## Architecture
 

@@ -4440,7 +4440,7 @@ fn batch_mode_writes_the_index_co_located_when_no_output_dir_is_given() {
 }
 
 #[test]
-fn batch_mode_writes_the_index_regardless_of_output_format() {
+fn batch_mode_writes_a_json_index_for_output_format_json_schema() {
     let dir = TempDir::new();
     std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
     let out = TempDir::new();
@@ -4453,12 +4453,91 @@ fn batch_mode_writes_the_index_regardless_of_output_format() {
         out.path().to_str().unwrap(),
     ]);
     assert!(output.status.success());
-    // The index itself is always Markdown, even when every per-file
-    // output it links to is json-schema - it's a navigation aid, not
-    // "the" output.
-    let index = std::fs::read_to_string(out.path().join("_index.dictionary.md")).unwrap();
-    assert!(index.contains("[data.csv.dictionary.schema.json](<data.csv.dictionary.schema.json>)"));
+    // A file manifest has no natural json-schema.org shape of its own -
+    // json-schema output-format still gets this tool's own rich JSON
+    // index, not a schema, and not the Markdown one either.
+    assert!(!out.path().join("_index.dictionary.md").exists());
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("_index.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["files"], 1);
+    assert_eq!(doc["entries"][0]["source"], "data.csv");
+    assert_eq!(
+        doc["entries"][0]["output"],
+        "data.csv.dictionary.schema.json"
+    );
     assert!(out.path().join("data.csv.dictionary.schema.json").exists());
+}
+
+#[test]
+fn batch_mode_writes_a_json_index_for_output_format_json() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    let out = TempDir::new();
+
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("_index.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["directory"], dir.path().to_str().unwrap());
+    assert_eq!(doc["files"], 1);
+    assert_eq!(doc["tables"], 1);
+    assert_eq!(doc["columns"], 9);
+    assert_eq!(doc["skipped"], 0);
+    assert_eq!(doc["entries"][0]["source"], "data.csv");
+    assert_eq!(doc["entries"][0]["tables"], 1);
+    assert_eq!(doc["entries"][0]["columns"], 9);
+    assert_eq!(doc["entries"][0]["output"], "data.csv.dictionary.json");
+    assert_eq!(doc["unrecognized"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn batch_mode_json_index_is_not_capped_at_max_toc_entries() {
+    // Unlike the Markdown index's rendered table, the JSON manifest exists
+    // specifically for programmatic consumption - truncating it would be
+    // real data loss for exactly the audience that reaches for JSON.
+    let dir = TempDir::new();
+    for i in 0..57 {
+        std::fs::copy(
+            fixture("sample.csv"),
+            dir.path().join(format!("f{i:03}.csv")),
+        )
+        .unwrap();
+    }
+    let output = run_dir(&[dir.path().to_str().unwrap(), "--output-format", "json"]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("_index.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["entries"].as_array().unwrap().len(), 57);
+}
+
+#[test]
+fn batch_mode_json_index_does_not_list_its_own_prior_output_as_skipped() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+
+    let first = run_dir(&[dir.path().to_str().unwrap(), "--output-format", "json"]);
+    assert!(first.status.success());
+    let second = run_dir(&[dir.path().to_str().unwrap(), "--output-format", "json"]);
+    assert!(second.status.success());
+
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("_index.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["skipped"], 0);
+    assert_eq!(doc["unrecognized"].as_array().unwrap().len(), 0);
 }
 
 #[test]

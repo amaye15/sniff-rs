@@ -49812,13 +49812,25 @@ fn looks_like_own_output(path: &Path) -> bool {
 /// every per-file output - a lightweight, at-a-glance manifest of the
 /// whole run (which files were profiled, how big each one was, and where
 /// its own output landed) rather than a second copy of every file's real
-/// column tables. Deliberately ends in `.dictionary.md` - the exact same
-/// suffix `OWN_OUTPUT_SUFFIXES` already recognizes - so a later run's own
-/// `looks_like_own_output` check protects this file for free, with no
-/// separate guard needed: it's found, skipped, and (per
-/// `render_directory_index`'s own doc comment below) never re-listed as
-/// a "skipped" entry in the fresh index that run writes.
-const DIRECTORY_INDEX_FILE_NAME: &str = "_index.dictionary.md";
+/// column tables. Its name follows `--output-format` the same way a
+/// per-file output's own extension does: `md` writes the Markdown
+/// manifest below, `json`/`json-schema` both write the JSON one instead
+/// (a file manifest has no natural json-schema.org shape of its own - a
+/// schema describes typed columns, not a list of files - so both JSON-
+/// flavored output formats share the one JSON manifest rather than this
+/// needing a third rendering). Either name ends in exactly one of
+/// `OWN_OUTPUT_SUFFIXES` (`.dictionary.md`/`.dictionary.json`), so a
+/// later run's own `looks_like_own_output` check protects it for free,
+/// with no separate guard needed: it's found, skipped, and (per
+/// `render_directory_index`/`render_directory_index_json`'s own doc
+/// comments below) never re-listed as a "skipped" entry in the fresh
+/// index that run writes.
+fn directory_index_file_name(output_format: &OutputFormat) -> &'static str {
+    match output_format {
+        OutputFormat::Markdown => "_index.dictionary.md",
+        OutputFormat::Json | OutputFormat::JsonSchema => "_index.dictionary.json",
+    }
+}
 
 /// `path`'s components relative to `root`, joined with `/` regardless of
 /// the host platform - so a link written into the index is portable even
@@ -49867,16 +49879,16 @@ struct BatchIndexEntry {
     col_count: usize,
 }
 
-/// Renders the top-level directory index: a `File | Tables | Columns |
-/// Output` table (capped at `MAX_TOC_ENTRIES`, the same cap this project
-/// already uses for a single file's own Table-of-Contents, for the
-/// identical reason - a directory can hold far more files than a
-/// listing can usefully show) plus a `## Skipped` section naming every
-/// file that couldn't be identified at all. A file skipped because it
-/// looked like this tool's own prior output is deliberately *not* listed
-/// here - see `DIRECTORY_INDEX_FILE_NAME`'s own doc comment - since that
-/// outcome isn't a data-quality signal worth surfacing on every re-run,
-/// unlike a genuinely unrecognized file.
+/// Renders the top-level directory index (`--output-format md`): a
+/// `File | Tables | Columns | Output` table (capped at `MAX_TOC_ENTRIES`,
+/// the same cap this project already uses for a single file's own
+/// Table-of-Contents, for the identical reason - a directory can hold far
+/// more files than a listing can usefully show) plus a `## Skipped`
+/// section naming every file that couldn't be identified at all. A file
+/// skipped because it looked like this tool's own prior output is
+/// deliberately *not* listed here - see `directory_index_file_name`'s own
+/// doc comment - since that outcome isn't a data-quality signal worth
+/// surfacing on every re-run, unlike a genuinely unrecognized file.
 fn render_directory_index(
     dir: &Path,
     entries: &[BatchIndexEntry],
@@ -49937,6 +49949,70 @@ fn render_directory_index(
     md.truncate(md.trim_end_matches('\n').len());
     md.push('\n');
     md
+}
+
+/// Renders the top-level directory index as JSON (`--output-format json`
+/// or `json-schema`, per `directory_index_file_name`'s own doc comment) -
+/// the same information `render_directory_index` shows a human, in a
+/// shape a script can consume directly (e.g. filtering `entries` by
+/// `tables` with `jq`). Deliberately *not* capped at `MAX_TOC_ENTRIES`
+/// the way the Markdown table is: that cap exists to keep a *rendered*
+/// table readable, a concern that doesn't apply to a JSON array a
+/// consumer is going to parse programmatically - truncating it would be
+/// real, silent data loss for exactly the audience reaching for JSON
+/// over Markdown in the first place. The same skip-category rule as the
+/// Markdown index still applies: `unrecognized` never includes a file
+/// skipped for looking like this tool's own prior output.
+fn render_directory_index_json(
+    dir: &Path,
+    entries: &[BatchIndexEntry],
+    unrecognized: &[String],
+    total_tables: usize,
+    total_columns: usize,
+) -> String {
+    use json_support::{Map, Value};
+
+    let mut doc = Map::with_capacity(6);
+    doc.insert(
+        "directory".to_string(),
+        Value::from(dir.display().to_string()),
+    );
+    doc.insert("files".to_string(), Value::from(entries.len()));
+    doc.insert("tables".to_string(), Value::from(total_tables));
+    doc.insert("columns".to_string(), Value::from(total_columns));
+    doc.insert("skipped".to_string(), Value::from(unrecognized.len()));
+
+    let entries_json: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            let mut obj = Map::with_capacity(4);
+            obj.insert(
+                "source".to_string(),
+                Value::from(entry.source_relative.clone()),
+            );
+            obj.insert("tables".to_string(), Value::from(entry.table_count));
+            obj.insert("columns".to_string(), Value::from(entry.col_count));
+            obj.insert(
+                "output".to_string(),
+                Value::from(entry.output_relative.clone()),
+            );
+            Value::Object(obj)
+        })
+        .collect();
+    doc.insert("entries".to_string(), Value::Array(entries_json));
+
+    doc.insert(
+        "unrecognized".to_string(),
+        Value::Array(
+            unrecognized
+                .iter()
+                .cloned()
+                .map(Value::from)
+                .collect::<Vec<_>>(),
+        ),
+    );
+
+    json_support::to_pretty_string(&Value::Object(doc))
 }
 
 fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
@@ -50058,14 +50134,23 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     // --output-format - a navigation aid for the whole run, not "the"
     // output, so it's produced even on a --output-format json/json-schema
     // run whose per-file outputs aren't markdown at all.
-    let index_path = index_dir.join(DIRECTORY_INDEX_FILE_NAME);
-    let index_content = render_directory_index(
-        dir,
-        &index_entries,
-        &unrecognized,
-        total_tables,
-        total_columns,
-    );
+    let index_path = index_dir.join(directory_index_file_name(output_format));
+    let index_content = match output_format {
+        OutputFormat::Markdown => render_directory_index(
+            dir,
+            &index_entries,
+            &unrecognized,
+            total_tables,
+            total_columns,
+        ),
+        OutputFormat::Json | OutputFormat::JsonSchema => render_directory_index_json(
+            dir,
+            &index_entries,
+            &unrecognized,
+            total_tables,
+            total_columns,
+        ),
+    };
     fs::write(&index_path, &index_content)
         .with_context(|| format!("failed to write {index_path:?}"))?;
 
