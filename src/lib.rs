@@ -42738,7 +42738,7 @@ mod npy_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-        let archive = zip_support::ZipArchive::open(path)
+        let mut archive = zip_support::ZipArchive::open(path)
             .with_context(|| format!("failed to open {path:?} as a .npz archive"))?;
         let names: Vec<(String, String)> = archive
             .names()
@@ -45880,10 +45880,12 @@ fn gzip_decompress_to<R: std::io::Read>(input: R, sink: &mut impl std::io::Write
 #[cfg(any(feature = "xlsx", feature = "npy"))]
 mod zip_support {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
 
     const ZIP_EOCD_SIG: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
     const ZIP_CENTRAL_DIR_SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
     const ZIP_LOCAL_HEADER_SIG: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+    const ZIP_LOCAL_HEADER_SIZE: usize = 30;
 
     fn zip_read_u16(data: &[u8], pos: usize) -> Result<u16> {
         let b = data
@@ -45908,8 +45910,17 @@ mod zip_support {
         pub(crate) crc32: u32,
     }
 
+    /// A real on-disk file, read from lazily via `Seek` rather than one
+    /// whole-archive `Vec<u8>` held for the archive's own lifetime - the
+    /// central directory (proportional to entry *count*, not entry
+    /// *content*) and the EOCD record's own bounded tail scan are the
+    /// only two things ever read eagerly; each entry's compressed bytes
+    /// are read fresh, on demand, only when `read` is actually called for
+    /// that entry. A `.npz` holding thousands of large arrays, or an
+    /// `.xlsx` with a genuinely huge sheet, no longer needs its entire
+    /// compressed archive resident in memory just to read one part of it.
     pub(crate) struct ZipArchive {
-        data: Vec<u8>,
+        file: fs::File,
         pub(crate) entries: Vec<ZipEntry>,
         // Built once in `open`, used by `read` for an O(1) lookup instead
         // of a linear scan over `entries` - see `read`'s own doc comment
@@ -45919,12 +45930,30 @@ mod zip_support {
 
     impl ZipArchive {
         pub(crate) fn open(path: &Path) -> Result<Self> {
-            let data = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
-            let eocd_pos = Self::find_eocd(&data)?;
+            let mut file =
+                fs::File::open(path).with_context(|| format!("failed to read {path:?}"))?;
+            let file_len = file
+                .metadata()
+                .with_context(|| format!("failed to read metadata for {path:?}"))?
+                .len();
 
-            let entry_count = zip_read_u16(&data, eocd_pos + 10)?;
-            let central_dir_size = zip_read_u32(&data, eocd_pos + 12)?;
-            let central_dir_offset = zip_read_u32(&data, eocd_pos + 16)?;
+            // The end-of-central-directory record's signature must be
+            // searched for backward from the end of the file, since it's
+            // followed by a variable-length (0-65,535 byte) archive
+            // comment - but that search only ever needs the file's own
+            // trailing 22 + 65,535 bytes at most, never the whole archive.
+            let tail_len = (22u64 + 65_535).min(file_len);
+            let tail_start = file_len - tail_len;
+            file.seek(SeekFrom::Start(tail_start))
+                .with_context(|| format!("failed seeking into {path:?}"))?;
+            let mut tail = vec![0u8; tail_len as usize];
+            file.read_exact(&mut tail)
+                .with_context(|| format!("failed reading {path:?}"))?;
+            let eocd_pos = Self::find_eocd(&tail)?;
+
+            let entry_count = zip_read_u16(&tail, eocd_pos + 10)?;
+            let central_dir_size = zip_read_u32(&tail, eocd_pos + 12)?;
+            let central_dir_offset = zip_read_u32(&tail, eocd_pos + 16)?;
             if central_dir_offset == 0xFFFF_FFFF
                 || central_dir_size == 0xFFFF_FFFF
                 || entry_count == 0xFFFF
@@ -45932,25 +45961,35 @@ mod zip_support {
                 bail!("zip64 archives are not supported");
             }
 
+            // Reads exactly the central directory's own declared size,
+            // wherever it lives in the file - proportional to how many
+            // entries the archive has, never to how large their
+            // compressed content is.
+            file.seek(SeekFrom::Start(u64::from(central_dir_offset)))
+                .with_context(|| format!("failed seeking into {path:?}"))?;
+            let mut central_dir = vec![0u8; central_dir_size as usize];
+            file.read_exact(&mut central_dir)
+                .context("truncated zip central directory")?;
+
             let mut entries = Vec::with_capacity(entry_count as usize);
-            let mut pos = central_dir_offset as usize;
+            let mut pos = 0usize;
             for _ in 0..entry_count {
-                let sig = data
+                let sig = central_dir
                     .get(pos..pos + 4)
                     .context("truncated zip central directory")?;
                 if sig != ZIP_CENTRAL_DIR_SIG {
                     bail!("invalid zip central directory entry signature");
                 }
-                let method = zip_read_u16(&data, pos + 10)?;
-                let crc32 = zip_read_u32(&data, pos + 16)?;
-                let compressed_size = zip_read_u32(&data, pos + 20)?;
-                let uncompressed_size = zip_read_u32(&data, pos + 24)?;
-                let name_len = zip_read_u16(&data, pos + 28)? as usize;
-                let extra_len = zip_read_u16(&data, pos + 30)? as usize;
-                let comment_len = zip_read_u16(&data, pos + 32)? as usize;
-                let local_header_offset = zip_read_u32(&data, pos + 42)?;
+                let method = zip_read_u16(&central_dir, pos + 10)?;
+                let crc32 = zip_read_u32(&central_dir, pos + 16)?;
+                let compressed_size = zip_read_u32(&central_dir, pos + 20)?;
+                let uncompressed_size = zip_read_u32(&central_dir, pos + 24)?;
+                let name_len = zip_read_u16(&central_dir, pos + 28)? as usize;
+                let extra_len = zip_read_u16(&central_dir, pos + 30)? as usize;
+                let comment_len = zip_read_u16(&central_dir, pos + 32)? as usize;
+                let local_header_offset = zip_read_u32(&central_dir, pos + 42)?;
                 let name_start = pos + 46;
-                let name_bytes = data
+                let name_bytes = central_dir
                     .get(name_start..name_start + name_len)
                     .context("truncated zip entry name")?;
                 entries.push(ZipEntry {
@@ -45970,7 +46009,7 @@ mod zip_support {
                 .map(|(i, e)| (e.name.clone(), i))
                 .collect();
             Ok(ZipArchive {
-                data,
+                file,
                 entries,
                 name_index,
             })
@@ -45978,13 +46017,14 @@ mod zip_support {
 
         /// The end-of-central-directory record's signature must be searched
         /// for backward from the end of the file, since it's followed by a
-        /// variable-length (0-65,535 byte) archive comment.
+        /// variable-length (0-65,535 byte) archive comment. `data` here is
+        /// only ever the bounded tail buffer `open` already read, never the
+        /// whole archive.
         fn find_eocd(data: &[u8]) -> Result<usize> {
             if data.len() < 22 {
                 bail!("not a valid zip archive: too short");
             }
-            let scan_start = data.len().saturating_sub(22 + 65_535);
-            (scan_start..=data.len() - 22)
+            (0..=data.len() - 22)
                 .rev()
                 .find(|&pos| data[pos..pos + 4] == ZIP_EOCD_SIG)
                 .context("not a valid zip archive: end of central directory record not found")
@@ -46004,36 +46044,44 @@ mod zip_support {
         /// (per-layer model weights, many dataset splits/features), so
         /// this was genuinely O(archives entries^2) for that format.
         /// `name_index` (built once in `open`) resolves this to one O(1)
-        /// lookup per call instead.
-        pub(crate) fn read(&self, name: &str) -> Result<Vec<u8>> {
+        /// lookup per call instead. `&mut self` now, not `&self` - reading
+        /// an entry's compressed bytes means seeking this archive's own
+        /// shared `File` handle, which needs a mutable borrow the same way
+        /// any other `Read`/`Seek` call would.
+        pub(crate) fn read(&mut self, name: &str) -> Result<Vec<u8>> {
             let entry = self
                 .name_index
                 .get(name)
                 .map(|&i| &self.entries[i])
                 .ok_or_else(|| anyhow!("zip archive has no entry named '{name}'"))?;
 
-            let pos = entry.local_header_offset as usize;
-            let sig = self
-                .data
-                .get(pos..pos + 4)
+            self.file
+                .seek(SeekFrom::Start(u64::from(entry.local_header_offset)))
+                .context("failed seeking to a zip local file header")?;
+            let mut header = [0u8; ZIP_LOCAL_HEADER_SIZE];
+            self.file
+                .read_exact(&mut header)
                 .context("truncated zip local header")?;
+            let sig = &header[0..4];
             if sig != ZIP_LOCAL_HEADER_SIG {
                 bail!(
                     "invalid zip local file header signature for '{}'",
                     entry.name
                 );
             }
-            let name_len = zip_read_u16(&self.data, pos + 26)? as usize;
-            let extra_len = zip_read_u16(&self.data, pos + 28)? as usize;
-            let data_start = pos + 30 + name_len + extra_len;
-            let compressed = self
-                .data
-                .get(data_start..data_start + entry.compressed_size as usize)
+            let name_len = zip_read_u16(&header, 26)? as usize;
+            let extra_len = zip_read_u16(&header, 28)? as usize;
+            self.file
+                .seek(SeekFrom::Current((name_len + extra_len) as i64))
+                .context("failed seeking past a zip entry's name/extra fields")?;
+            let mut compressed = vec![0u8; entry.compressed_size as usize];
+            self.file
+                .read_exact(&mut compressed)
                 .with_context(|| format!("truncated zip entry data for '{}'", entry.name))?;
 
             let decompressed = match entry.method {
-                0 => compressed.to_vec(),
-                8 => inflate(compressed)
+                0 => compressed,
+                8 => inflate(&compressed[..])
                     .with_context(|| format!("failed to inflate zip entry '{}'", entry.name))?,
                 other => bail!(
                     "unsupported zip compression method {other} for '{}' - only stored (0) and deflate (8) are supported",
@@ -46813,7 +46861,7 @@ mod xlsx_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-        let zip = ZipArchive::open(path)?;
+        let mut zip = ZipArchive::open(path)?;
 
         let workbook_xml = String::from_utf8(zip.read("xl/workbook.xml")?)
             .context("xl/workbook.xml is not valid UTF-8")?;
@@ -46999,7 +47047,7 @@ mod xlsx_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-        let zip = ZipArchive::open(path)?;
+        let mut zip = ZipArchive::open(path)?;
         let content_bytes = zip
             .read("content.xml")
             .context("no content.xml in ODF archive")?;
@@ -48452,7 +48500,7 @@ mod xlsx_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-        let zip = ZipArchive::open(path)?;
+        let mut zip = ZipArchive::open(path)?;
 
         let rels_xml = String::from_utf8(zip.read("xl/_rels/workbook.bin.rels")?)
             .context("xl/_rels/workbook.bin.rels is not valid UTF-8")?;
@@ -51559,7 +51607,7 @@ mod tests {
         use xlsx_support::xml_parse;
         use zip_support::ZipArchive;
 
-        let archive = ZipArchive::open(Path::new("tests/fixtures/sample.xlsx")).unwrap();
+        let mut archive = ZipArchive::open(Path::new("tests/fixtures/sample.xlsx")).unwrap();
         let names: Vec<&str> = archive.names().collect();
         for expected in [
             "docProps/app.xml",
@@ -51615,7 +51663,7 @@ mod tests {
             "tests/fixtures/edge_zero_rows_and_unicode.xlsx",
             "tests/fixtures/edge_xlsx_native_date_cells.xlsx",
         ] {
-            let archive = ZipArchive::open(Path::new(f)).unwrap();
+            let mut archive = ZipArchive::open(Path::new(f)).unwrap();
             for name in archive.names().map(str::to_string).collect::<Vec<_>>() {
                 if name.ends_with(".xml") || name.ends_with(".rels") {
                     let bytes = archive.read(&name).unwrap();
@@ -51631,7 +51679,7 @@ mod tests {
             "tests/fixtures/edge_zero_rows_and_unicode.xlsx",
             "tests/fixtures/edge_xlsx_native_date_cells.xlsx",
         ] {
-            let archive = ZipArchive::open(Path::new(f)).unwrap();
+            let mut archive = ZipArchive::open(Path::new(f)).unwrap();
             for name in archive.names().map(str::to_string).collect::<Vec<_>>() {
                 let entry_crc = archive
                     .entries

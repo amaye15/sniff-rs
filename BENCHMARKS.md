@@ -33,6 +33,36 @@ re-run.
 
 ---
 
+## 2026-09-05 — `feat/streaming-zip-archive` branch (Darwin arm64)
+
+`zip_support::ZipArchive` (shared by `.xlsx`/`.ods`/`.xlsb`/`.npz`)
+converted from reading the entire compressed archive into one `Vec<u8>`
+up front to reading only the bounded EOCD tail scan and the central
+directory itself eagerly, with each entry's own compressed bytes read
+fresh via `Seek` only when `read(name)` is actually called for it. See
+CLAUDE.md's "Streaming reads / memory footprint" section for the full
+writeup, including ORC's own audit finding (already streaming, no
+change needed).
+
+Real file (74 MB `.npz`, 5 arrays of ~15 MB random `float64` data each,
+DEFLATE-compressed via `numpy.savez_compressed`), `/usr/bin/time -l`,
+3 rounds:
+
+| | Peak RSS | Peak footprint |
+|---|---|---|
+| Old | 397-457 MB | ~347 MB |
+| New | 321-344 MB | ~262 MB |
+| Change | **-19 to -25%** | **-24%** |
+
+Both confirmed byte-identical via `diff`. The complete existing
+`.xlsx`/`.xlsb`/`.ods`/`.npz` test suite (including the direct
+`zip_archive_reads_and_verifies_real_xlsx_entries` CRC32/size
+cross-check) passed unchanged with zero test modifications. No
+Criterion benchmark target currently isolates this reader, so this
+entry is ad-hoc only.
+
+---
+
 ## 2026-09-05 — `feat/streaming-sqlite` branch (Darwin arm64)
 
 SQLite's own `page_slice` (indexing into a whole-file `data: &[u8]`

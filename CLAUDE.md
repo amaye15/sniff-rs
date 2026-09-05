@@ -4267,19 +4267,96 @@ evidence on its own that the rewrite preserved every existing behavior
 exactly. Clippy/fmt clean across the default, `sqlite`, and `full`
 builds, each matching its own established baseline.
 
+**Auditing ORC came ninth, before writing any more code** - the same
+"check the actual read pattern before assuming it needs work" discipline
+the seventh phase's audit already used for MessagePack/CBOR/Avro/dBase/
+Stata. It didn't need any: `columns_from_orc` already reads its
+postscript and footer via targeted `Seek`+`read_exact` calls from the
+tail of the file, and - the part that actually matters for a full table
+scan - walks stripes one at a time, seeking to each stripe's own file
+offset and reading only that stripe's own declared byte range, never the
+whole file. This was true from the day ORC support was first hand-
+rolled, not something this pass changed - the format's own "postscript
+at the tail, footer just before it, stripes as independent byte ranges
+elsewhere in the file" layout made a whole-file read simply unnecessary
+to begin with, the same way MessagePack/CBOR's own streaming decode
+never needed one either.
+
+**`ZipArchive` (shared by `.xlsx`/`.ods`/`.xlsb`/`.npz`, per this file's
+own Dependency footprint section) went tenth**, and turned out to share
+SQLite's own "already naturally random-access, just needs its I/O made
+lazy" shape rather than needing a genuine rewrite: a zip's own central
+directory already exists specifically so a reader can jump straight to
+any entry's own data without scanning the whole archive first - `open`
+used to defeat that by reading the *entire* compressed archive into one
+`data: Vec<u8>` regardless, then slicing into it later. `open` now reads
+only two genuinely small, bounded things: the end-of-central-directory
+record's own search window (at most 22 + 65,535 trailing bytes, per the
+format's own comment-length limit - never the whole file) via a `Seek`
+to the tail, and the central directory itself (proportional to entry
+*count*, never entry *content*) via a `Seek` to wherever it lives. Every
+entry's own compressed bytes are now read fresh, on demand, only when
+`read(name)` is actually called for that entry - a `Seek` to its local
+header, then exactly its own declared `compressed_size` bytes, instead
+of a slice into an already-fully-resident whole-archive buffer.
+`read`'s own signature had to move from `&self` to `&mut self` (seeking
+a shared `File` handle needs a mutable borrow the same as any other
+`Read`/`Seek` call), which every call site across `xlsx_support`'s
+three OOXML/BIFF8/ODF readers and `npy_support`'s `.npz` reader picked
+up as a one-line `let mut` change - none of them ever held a live borrow
+of the archive across a `read` call, so this needed no other structural
+change anywhere.
+
+One real, disclosed boundary this phase does *not* close: each entry's
+own DEFLATE-compressed bytes are still decompressed all at once via the
+existing whole-buffer `inflate`, not streamed the way gzip's own
+`GzipStreamSink` (Phase 4 above) streams its output - so a single
+*enormous* sheet or array inside an otherwise-modest archive still needs
+its own fully-decompressed size in memory for the moment it's being
+read. The win here is specifically in no longer holding *every other
+entry's* compressed bytes resident for the archive's entire lifetime,
+which is the more common real shape (an `.npz` with many named arrays,
+each read and released in turn) - true per-entry streaming decompression
+would be a further, separate phase, on the same "confidently scoped
+today, further work disclosed rather than assumed" footing every other
+partial win in this section already stands on.
+
+Measured on a real 74 MB `.npz` archive (5 arrays, ~15 MB of random
+`float64` data each, DEFLATE-compressed via `numpy.savez_compressed` -
+random data compresses poorly, so the compressed archive stays close to
+the raw 75 MB, a realistic stand-in for "many sizable entries" rather
+than a best-case number), 3 rounds: peak footprint 347 MB -> 262 MB
+(~24%), maxRSS 397-457 MB -> 321-344 MB (~19-25%) - both consistent
+across rounds, unlike some earlier phases' own noisier full-pipeline
+measurements, since every array here is read and profiled through the
+identical code path with nothing else competing for the "biggest single
+consumer of memory" role. Output confirmed byte-identical via `diff`.
+The complete existing `.xlsx`/`.xlsb`/`.ods`/`.npz` test suite - real
+multi-sheet workbooks, native date-cell resolution, a genuinely large
+ODS repeated-empty-row block (a real stress test of this exact reader's
+own seek-heavy access pattern), per-array `.npz` isolation, and the
+direct `zip_archive_reads_and_verifies_real_xlsx_entries` cross-check
+against real fixture CRC32/size values - passed unchanged with zero test
+modifications needed. Clippy/fmt clean across the default, `xlsx`,
+`npy`, and `full` builds, each matching its own established baseline.
+
 **Deliberately not done yet**: the remaining formats that need either
 genuine random (`Seek`-based) access or more than one full pass over
 the file before the data means anything at all - SAS7BDAT (a genuine
 two-pass structure, see above - a materially different problem from
-SQLite's own single-pass-but-random-access shape), Parquet, Arrow IPC,
-ORC, and every ZIP-based format (`.xlsx`/`.xls`/`.xlsb`/`.ods`/`.npz`) -
-each a materially larger rewrite than anything done so far, and each
-likely to need its own format-specific approach the way SQLite's page-
-graph structure and SAS7BDAT's two-pass metadata scan already turned
-out to be genuinely different problems rather than one shared pattern.
-The `suggest_ideal_type` incremental-accumulator rewrite (the deeper win
-described above) remains entirely unstarted, tracked as its own future
-phase.
+SQLite's/ZipArchive's own single-pass-but-random-access shape), Parquet,
+Arrow IPC, and old-style `.xls` (OLE2/CFB, a *different* container
+format than the ZIP-based four `ZipArchive` already covers) - each a
+materially larger rewrite than anything done so far, and each likely to
+need its own format-specific approach the way SQLite's page-graph
+structure, SAS7BDAT's two-pass metadata scan, and `ZipArchive`'s central-
+directory-driven access already turned out to be three genuinely
+different problems rather than one shared pattern. Per-entry streaming
+decompression inside `ZipArchive::read` itself (described above) is
+also a real, disclosed, separately-scoped remaining gap, not folded into
+this phase. The `suggest_ideal_type` incremental-accumulator rewrite
+(the deeper win described above) remains entirely unstarted, tracked as
+its own future phase.
 
 ## Cloud-platform file compatibility
 
