@@ -25,6 +25,7 @@ cargo build --release --features full      # every format, ~7-9 min clean cache
 ./target/release/sniff-rs events.jsonl out.md --samples 5
 ./target/release/sniff-rs warehouse.db - --output-format json | jq .
 ./target/release/sniff-rs data.csv.gz                       # gzip decompressed transparently
+./target/release/sniff-rs ./data/ --output-dir ./dictionaries/  # batch mode - see below
 ```
 
 `cargo test` covers the default build; `cargo test --features full` covers
@@ -298,6 +299,117 @@ guessing:
   }
 }
 ```
+
+## Directory-input batch mode
+
+Pointing `sniff-rs` at a directory instead of a file switches to batch
+mode: every file under it (recursively) that this tool can identify on
+its own - by extension or content-sniffing, exactly `detect_format`'s
+existing single-file logic - gets its own output, written next to its
+own source file by default.
+
+```bash
+sniff-rs ./data/                              # recurse, one output per recognized file
+sniff-rs ./data/ --output-dir ./dictionaries/ # outputs mirrored under a separate directory
+```
+
+Every design choice here was made deliberately, not assumed, several
+after real testing surfaced a concrete problem with the obvious first
+guess:
+
+- **Auto-detected from the input path being a directory**, not a new
+  required flag - `Path::is_dir()` is a plain filesystem fact, not a
+  content-sniffing guess, so it carries none of the ambiguity this
+  project is normally careful about (see "Content-based format
+  auto-detection" above for the cases where a guess genuinely would be
+  ambiguous).
+- **`--output-dir`, not the existing `[OUTPUT_PATH]` positional argument,
+  says where batch outputs go.** Reusing the positional argument (a file
+  path or `-` in single-file mode) to mean "an output directory" when the
+  input happens to be a directory was the first design, and was rejected
+  specifically because it makes one argument's *type* depend on another
+  argument's runtime value - confusing on its own, and doubly so sitting
+  next to a flag already named `--output-format`. `[OUTPUT_PATH]` is
+  therefore a hard error in directory mode (`"<dir> is a directory - use
+  --output-dir <PATH> instead of a positional output path"`), not a
+  silently-reinterpreted argument.
+- **Recurses fully**, walking every subdirectory. A symlink is resolved
+  and included only if it points at a regular file - a symlink pointing
+  at a directory is never followed, the same "don't risk a cycle"
+  caution `fd`/`ripgrep` apply by default, and confirmed directly (not
+  just reasoned about) with a hand-built symlink cycle pointing back at
+  the walk's own root. Walk order is sorted by name at each directory
+  level, so a re-run touches files in the identical order - meaningful
+  given the fail-fast policy below, since it's what makes "which files
+  got processed before an abort" reproducible.
+- **The first failure of any kind aborts the whole run immediately** -
+  deliberately with no special-casing between a corrupt file, a format
+  whose reader isn't compiled into this build (e.g. a `.parquet` file in
+  a default, non-`--features full` build), or any other error a single
+  file could produce. Whatever was already written before that point
+  stays on disk; directory mode never rolls back prior successes. The
+  one outcome that is *not* treated as a failure: a file `detect_format`
+  can't identify at all (no recognized extension, no sniffable content
+  signature) is skipped and noted, not fatal - this is the one case this
+  tool considers "nothing went wrong, this just isn't a file sniff-rs can
+  read," the same distinction the four `--format`-only formats (fixed-
+  width, the log formats) already make for single-file mode. A concrete
+  side effect worth knowing: `--format` and `--widths` are therefore hard
+  errors in directory mode too - `--format`'s whole purpose is forcing a
+  format detection would otherwise reject, which has no meaning applied
+  uniformly across a heterogeneous directory, and `--widths` only ever
+  matters for `--format fixed-width`, which (like the log formats) is
+  never auto-detected in the first place, so it can never be reached this
+  way either.
+- **Output filenames use the *full* original filename, not just the stem**
+  (`data.csv` -> `data.csv.dictionary.md`), unlike single-file mode's own
+  default naming (`data.csv` -> `data.dictionary.md`, via
+  `Path::with_extension`, which *replaces* the existing extension rather
+  than appending to it). This is a deliberate divergence, not an
+  oversight: single-file mode only ever names one output, so there's
+  nothing for `with_extension`'s behavior to collide with - but a
+  directory can easily hold `data.csv` and `data.json` side by side, and
+  both would want to write the identical `data.dictionary.md` if
+  co-located under the stem-only scheme. The full-filename scheme makes
+  that collision structurally impossible instead of just unlikely.
+- **A second run over the same directory doesn't reprocess its own prior
+  output** - found empirically, not reasoned out in advance, by actually
+  running this feature against its own output a second time:
+  `--output-format json`'s default naming produces a `.json`-extensioned
+  file, which this tool's own extension-based detection then matched
+  without hesitation on the next run, producing a genuine
+  `data.csv.dictionary.json.dictionary.json` - a data dictionary
+  describing another data dictionary's own JSON structure. Every default
+  output filename this tool ever produces (single-file mode included)
+  ends in exactly one of three fixed suffixes
+  (`.dictionary.md`/`.dictionary.json`/`.dictionary.schema.json`), so
+  `looks_like_own_output` recognizes and skips any file ending in one of
+  them before ever trying to read it - reported distinctly from a
+  genuine "unrecognized format" skip, so it's never silently conflated
+  with one. A custom output name a single-file run was given explicitly
+  is untouched by this - directory mode only ever produces default-named
+  output itself, so this only needs to recognize the shape *this
+  feature* can create.
+- **Zero files ultimately processed is an error, not a quiet success** -
+  whether that's a genuinely empty directory or one whose files all fail
+  to resolve to a known format, `"no recognized files found in <dir> (N
+  file(s) skipped as unrecognized)"` surfaces what's very likely a
+  mistake (the wrong path, or a directory that doesn't hold what was
+  expected) rather than silently doing nothing and exiting 0.
+- **Sequential, not parallel**, deliberately for now - directory-batch
+  processing is an embarrassingly parallel workload (independent files,
+  independent outputs) and a real future optimization candidate, but
+  shipping correct sequential behavior first and parallelizing only if a
+  real directory shows it matters matches this project's own
+  "measure before optimizing" discipline elsewhere (see "Performance"
+  below).
+
+Architecturally, `run()` now only decides which of two modes to enter;
+every per-format reader dispatch (`dispatch_reader`) and every rendering
+path (`render_output`) is shared, unchanged code between single-file and
+directory-batch mode - the batch orchestration in `run_directory` is
+genuinely new, but it adds no new format-specific logic of its own
+anywhere.
 
 ## Architecture
 

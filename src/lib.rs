@@ -2416,7 +2416,19 @@ struct Args {
     /// convention and are only reachable via --format)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
+    /// Only valid when input_path is a single file - a directory input uses
+    /// --output-dir instead (see that field's own doc comment for why this
+    /// is a separate flag rather than reusing this positional argument).
     output_path: Option<PathBuf>,
+    /// Directory-input batch mode only: where per-file outputs get written
+    /// (the input's own subdirectory structure is mirrored underneath it).
+    /// Left unset, each output is written next to its own source file
+    /// instead. Deliberately a distinctly-named flag, not the positional
+    /// output_path above repurposed by input type - overloading one
+    /// argument's meaning based on whether the input happens to be a file
+    /// or a directory is exactly the kind of ambiguity worth avoiding,
+    /// especially sitting next to a flag already named --output-format.
+    output_dir: Option<PathBuf>,
     /// Number of sample values to show per column
     samples: usize,
     /// Only read the first N rows/records (for large files)
@@ -2453,15 +2465,22 @@ blank Description field to fill in by hand.
 USAGE:
     sniff-rs <INPUT_PATH> [OUTPUT_PATH] [OPTIONS]
 
+    If INPUT_PATH is a directory, every file under it (recursively) that
+    sniff-rs can identify on its own is profiled, one output per input
+    file. OUTPUT_PATH is not valid in this mode - use --output-dir. The
+    first file that fails aborts the whole run; a file whose format can't
+    be identified at all is skipped and noted, not treated as a failure.
+
 ARGS:
     <INPUT_PATH>
-            Path to the input file. Format is inferred from the extension;
-            if there isn't one, or it's not recognized, the file's own
-            bytes are sniffed instead. A .gz or .zst extension is
-            transparently decompressed first.
+            Path to the input file, or a directory to batch-process (see
+            above). A file's format is inferred from its extension; if
+            there isn't one, or it's not recognized, its own bytes are
+            sniffed instead. A .gz or .zst extension is transparently
+            decompressed first.
     [OUTPUT_PATH]
-            Output path (default: <input>.dictionary.md or .json).
-            Pass "-" to write to stdout.
+            Single-file mode only. Output path (default:
+            <input>.dictionary.md or .json). Pass "-" to write to stdout.
 
 OPTIONS:
         --samples <N>          Number of sample values to show per column [default: 3]
@@ -2469,11 +2488,15 @@ OPTIONS:
         --format <FORMAT>       Override format detection (csv, tsv, json, parquet, arrow,
                                 avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml,
                                 fixed-width, npy, npz, common-log, combined-log, syslog,
-                                syslog5424, dbase, stata, sas7bdat)
+                                syslog5424, dbase, stata, sas7bdat) - single-file mode only
         --delimiter <CHAR>      Override the field delimiter for csv/tsv (single character)
         --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
-        --widths <N,N,...>      Column widths for --format fixed-width, comma-separated
+        --widths <N,N,...>      Column widths for --format fixed-width, comma-separated -
+                                single-file mode only
         --output-format <FMT>   md (default), json, or json-schema
+        --output-dir <DIR>      Directory-input mode only: where per-file outputs are
+                                written, mirroring the input's own subdirectory structure.
+                                Defaults to writing each output next to its own source file.
     -h, --help                  Print this help
     -V, --version                Print version
 "#;
@@ -2502,6 +2525,7 @@ impl Args {
         let mut skip_rows: Option<usize> = None;
         let mut widths: Option<Vec<usize>> = None;
         let mut output_format = "md".to_string();
+        let mut output_dir: Option<PathBuf> = None;
         let mut positionals: Vec<String> = Vec::new();
 
         let mut i = 0;
@@ -2575,6 +2599,7 @@ impl Args {
                         widths = Some(parsed?);
                     }
                     "output-format" => output_format = value(&mut i)?,
+                    "output-dir" => output_dir = Some(PathBuf::from(value(&mut i)?)),
                     other => bail!("unrecognized flag --{other}"),
                 }
             } else if let Some(short) = arg.strip_prefix('-')
@@ -2601,6 +2626,7 @@ impl Args {
         Ok(Args {
             input_path,
             output_path,
+            output_dir,
             samples,
             nrows,
             format,
@@ -43828,6 +43854,7 @@ fn columns_from_sqlite(
 
 // --- Format detection ---
 
+#[derive(Clone, Copy)]
 enum InputFormat {
     Csv,
     Tsv,
@@ -49481,10 +49508,148 @@ impl OutputFormat {
     }
 }
 
+/// The output file's extension for a given `--output-format`, shared by
+/// both single-file default naming and directory-mode's own naming.
+fn default_ext(output_format: &OutputFormat) -> &'static str {
+    match output_format {
+        OutputFormat::Markdown => "dictionary.md",
+        OutputFormat::Json => "dictionary.json",
+        OutputFormat::JsonSchema => "dictionary.schema.json",
+    }
+}
+
+/// Reads already-decompressed, already-format-identified bytes and
+/// produces this tool's shared table-name -> column-profiles shape -
+/// every format's own reader dispatch, factored out of `run()` so
+/// single-file mode and directory-batch mode share the exact same
+/// per-format logic rather than duplicating this match twice. Every
+/// format ends up as the same shape here so JSON/Markdown rendering never
+/// needs to special-case SQLite's (and Excel's, and INI's, and .npz's)
+/// multiple tables vs. everything else's single implicit one.
+fn dispatch_reader(
+    read_path: &Path,
+    logical_path: &Path,
+    format: InputFormat,
+    args: &Args,
+) -> Result<BTreeMap<String, Vec<ColumnProfile>>> {
+    let file_stem = logical_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    let tables: BTreeMap<String, Vec<ColumnProfile>> = if matches!(
+        format,
+        InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz
+    ) {
+        match format {
+            InputFormat::Sqlite => columns_from_sqlite(read_path, args.nrows, args.samples)?,
+            InputFormat::Xlsx => columns_from_xlsx(read_path, args.nrows, args.samples)?,
+            InputFormat::Ini => columns_from_ini(read_path, args.samples)?,
+            InputFormat::Npz => columns_from_npz(read_path, args.nrows, args.samples)?,
+            _ => unreachable!("handled by the outer matches! guard"),
+        }
+        .into_iter()
+        .collect()
+    } else {
+        let profiles: Vec<ColumnProfile> = match format {
+            InputFormat::Csv => {
+                let delim = args.delimiter.unwrap_or(',') as u8;
+                let skip_rows = resolve_skip_rows(args.skip_rows, read_path, delim);
+                columns_from_csv(read_path, args.nrows, delim, skip_rows)?
+                    .into_iter()
+                    .map(|c| profile_column(c, args.samples))
+                    .collect()
+            }
+            InputFormat::Tsv => {
+                let delim = args.delimiter.unwrap_or('\t') as u8;
+                let skip_rows = resolve_skip_rows(args.skip_rows, read_path, delim);
+                columns_from_csv(read_path, args.nrows, delim, skip_rows)?
+                    .into_iter()
+                    .map(|c| profile_column(c, args.samples))
+                    .collect()
+            }
+            InputFormat::Json => columns_from_json(read_path, args.nrows, args.samples)?,
+            InputFormat::Parquet => columns_from_parquet(read_path, args.nrows, args.samples)?,
+            InputFormat::ArrowIpc => columns_from_arrow_ipc(read_path, args.nrows, args.samples)?,
+            InputFormat::Avro => columns_from_avro(read_path, args.nrows, args.samples)?,
+            InputFormat::MsgPack => columns_from_msgpack(read_path, args.nrows, args.samples)?,
+            InputFormat::Toml => columns_from_toml(read_path, args.samples)?,
+            InputFormat::Yaml => columns_from_yaml(read_path, args.nrows, args.samples)?,
+            InputFormat::Cbor => columns_from_cbor(read_path, args.nrows, args.samples)?,
+            InputFormat::Xml => columns_from_xml(read_path, args.nrows, args.samples)?,
+            InputFormat::FixedWidth => {
+                let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
+                    anyhow!(
+                        "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
+                    )
+                })?;
+                columns_from_fixed_width(read_path, args.nrows, widths)?
+                    .into_iter()
+                    .map(|c| profile_column(c, args.samples))
+                    .collect()
+            }
+            InputFormat::Npy => columns_from_npy(read_path, args.nrows, args.samples)?,
+            InputFormat::CommonLog => columns_from_weblog(read_path, args.nrows, false)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+            InputFormat::CombinedLog => columns_from_weblog(read_path, args.nrows, true)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+            InputFormat::Syslog => columns_from_syslog(read_path, args.nrows, false)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+            InputFormat::Syslog5424 => columns_from_syslog(read_path, args.nrows, true)?
+                .into_iter()
+                .map(|c| profile_column(c, args.samples))
+                .collect(),
+            InputFormat::Dbase => columns_from_dbase(read_path, args.nrows, args.samples)?,
+            InputFormat::Stata => columns_from_stata(read_path, args.nrows, args.samples)?,
+            InputFormat::Sas7bdat => columns_from_sas7bdat(read_path, args.nrows, args.samples)?,
+            InputFormat::Spss => columns_from_spss(read_path, args.nrows, args.samples)?,
+            InputFormat::Orc => columns_from_orc(read_path, args.nrows, args.samples)?,
+            InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
+                unreachable!("handled above")
+            }
+        };
+        std::iter::once((file_stem, profiles)).collect()
+    };
+    Ok(tables)
+}
+
+/// Renders the shared table shape into one of the three output formats -
+/// also shared between single-file and directory-batch mode.
+fn render_output(
+    file_name: &str,
+    format: InputFormat,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    output_format: &OutputFormat,
+) -> Result<String> {
+    Ok(match output_format {
+        OutputFormat::Markdown => render_markdown(file_name, &format, tables),
+        OutputFormat::Json => render_json(file_name, &format, tables)?,
+        OutputFormat::JsonSchema => render_json_schema(file_name, tables)?,
+    })
+}
+
 pub fn run() -> Result<()> {
     let args = Args::parse()?;
-
     let output_format = OutputFormat::parse(&args.output_format)?;
+
+    if args.input_path.is_dir() {
+        run_directory(&args, &output_format)
+    } else {
+        run_single_file(&args, &output_format)
+    }
+}
+
+fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
+    if args.output_dir.is_some() {
+        bail!("--output-dir only applies when the input path is a directory");
+    }
 
     // data.csv.gz reads exactly like data.csv from here on: read_path points
     // at the real (decompressed) bytes every reader below opens, logical_path
@@ -49499,101 +49664,9 @@ pub fn run() -> Result<()> {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let file_stem = logical_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
 
-    // Every format ends up as the same shape - a table name mapped to its column
-    // profiles - so JSON/Markdown rendering never needs to special-case SQLite's
-    // (and Excel's, and INI's, and .npz's) multiple tables vs. everything
-    // else's single implicit one.
-    let tables: BTreeMap<String, Vec<ColumnProfile>> = if matches!(
-        format,
-        InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz
-    ) {
-        match format {
-            InputFormat::Sqlite => columns_from_sqlite(&read_path, args.nrows, args.samples)?,
-            InputFormat::Xlsx => columns_from_xlsx(&read_path, args.nrows, args.samples)?,
-            InputFormat::Ini => columns_from_ini(&read_path, args.samples)?,
-            InputFormat::Npz => columns_from_npz(&read_path, args.nrows, args.samples)?,
-            _ => unreachable!("handled by the outer matches! guard"),
-        }
-        .into_iter()
-        .collect()
-    } else {
-        let profiles: Vec<ColumnProfile> = match format {
-            InputFormat::Csv => {
-                let delim = args.delimiter.unwrap_or(',') as u8;
-                let skip_rows = resolve_skip_rows(args.skip_rows, &read_path, delim);
-                columns_from_csv(&read_path, args.nrows, delim, skip_rows)?
-                    .into_iter()
-                    .map(|c| profile_column(c, args.samples))
-                    .collect()
-            }
-            InputFormat::Tsv => {
-                let delim = args.delimiter.unwrap_or('\t') as u8;
-                let skip_rows = resolve_skip_rows(args.skip_rows, &read_path, delim);
-                columns_from_csv(&read_path, args.nrows, delim, skip_rows)?
-                    .into_iter()
-                    .map(|c| profile_column(c, args.samples))
-                    .collect()
-            }
-            InputFormat::Json => columns_from_json(&read_path, args.nrows, args.samples)?,
-            InputFormat::Parquet => columns_from_parquet(&read_path, args.nrows, args.samples)?,
-            InputFormat::ArrowIpc => columns_from_arrow_ipc(&read_path, args.nrows, args.samples)?,
-            InputFormat::Avro => columns_from_avro(&read_path, args.nrows, args.samples)?,
-            InputFormat::MsgPack => columns_from_msgpack(&read_path, args.nrows, args.samples)?,
-            InputFormat::Toml => columns_from_toml(&read_path, args.samples)?,
-            InputFormat::Yaml => columns_from_yaml(&read_path, args.nrows, args.samples)?,
-            InputFormat::Cbor => columns_from_cbor(&read_path, args.nrows, args.samples)?,
-            InputFormat::Xml => columns_from_xml(&read_path, args.nrows, args.samples)?,
-            InputFormat::FixedWidth => {
-                let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
-                    anyhow!(
-                        "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
-                    )
-                })?;
-                columns_from_fixed_width(&read_path, args.nrows, widths)?
-                    .into_iter()
-                    .map(|c| profile_column(c, args.samples))
-                    .collect()
-            }
-            InputFormat::Npy => columns_from_npy(&read_path, args.nrows, args.samples)?,
-            InputFormat::CommonLog => columns_from_weblog(&read_path, args.nrows, false)?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
-            InputFormat::CombinedLog => columns_from_weblog(&read_path, args.nrows, true)?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
-            InputFormat::Syslog => columns_from_syslog(&read_path, args.nrows, false)?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
-            InputFormat::Syslog5424 => columns_from_syslog(&read_path, args.nrows, true)?
-                .into_iter()
-                .map(|c| profile_column(c, args.samples))
-                .collect(),
-            InputFormat::Dbase => columns_from_dbase(&read_path, args.nrows, args.samples)?,
-            InputFormat::Stata => columns_from_stata(&read_path, args.nrows, args.samples)?,
-            InputFormat::Sas7bdat => columns_from_sas7bdat(&read_path, args.nrows, args.samples)?,
-            InputFormat::Spss => columns_from_spss(&read_path, args.nrows, args.samples)?,
-            InputFormat::Orc => columns_from_orc(&read_path, args.nrows, args.samples)?,
-            InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
-                unreachable!("handled above")
-            }
-        };
-        std::iter::once((file_stem, profiles)).collect()
-    };
-
-    let rendered = match output_format {
-        OutputFormat::Markdown => render_markdown(&file_name, &format, &tables),
-        OutputFormat::Json => render_json(&file_name, &format, &tables)?,
-        OutputFormat::JsonSchema => render_json_schema(&file_name, &tables)?,
-    };
+    let tables = dispatch_reader(&read_path, &logical_path, format, args)?;
+    let rendered = render_output(&file_name, format, &tables, output_format)?;
 
     let table_count = tables.len();
     let col_count: usize = tables.values().map(Vec::len).sum();
@@ -49605,15 +49678,10 @@ pub fn run() -> Result<()> {
         print!("{rendered}");
         eprintln!("{table_count} tables, {col_count} columns -> (stdout)");
     } else {
-        let default_ext = match output_format {
-            OutputFormat::Markdown => "dictionary.md",
-            OutputFormat::Json => "dictionary.json",
-            OutputFormat::JsonSchema => "dictionary.schema.json",
-        };
         let output_path = args
             .output_path
             .clone()
-            .unwrap_or_else(|| logical_path.with_extension(default_ext));
+            .unwrap_or_else(|| logical_path.with_extension(default_ext(output_format)));
         fs::write(&output_path, &rendered)
             .with_context(|| format!("failed to write {output_path:?}"))?;
         eprintln!(
@@ -49621,6 +49689,227 @@ pub fn run() -> Result<()> {
             output_path.display()
         );
     }
+
+    Ok(())
+}
+
+/// Recursively collects every regular file under `dir`, in a fixed,
+/// deterministic order (sorted by name at each directory level, so a
+/// re-run touches files in the identical order - important given
+/// directory-mode's own fail-fast policy, so exactly which files got
+/// processed before an abort is reproducible). A symlink is resolved (via
+/// `fs::metadata`, which follows it) and included only if it points at a
+/// regular file - a symlink pointing at a directory is never followed
+/// (the same "don't risk a cycle" caution `fd`/`ripgrep` apply by
+/// default), and a broken symlink is silently skipped, since there's
+/// nothing to read either way.
+fn collect_files_sorted(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {dir:?}"))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read directory entries in {dir:?}"))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {path:?}"))?;
+        if file_type.is_symlink() {
+            if let Ok(target_meta) = fs::metadata(&path)
+                && target_meta.is_file()
+            {
+                out.push(path);
+            }
+            // A symlink resolving to a directory is deliberately not
+            // followed (see this function's own doc comment), and a
+            // broken symlink resolves to an Err above - either way,
+            // there's nothing more to do with it than skip it.
+        } else if file_type.is_dir() {
+            collect_files_sorted(&path, out)?;
+        } else if file_type.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// The output filename for one file in a batch: the *full* original
+/// filename (not just its stem) plus the rendered format's own extension,
+/// e.g. `data.csv` -> `data.csv.dictionary.md`. Deliberately not
+/// `Path::with_extension` (which replaces, rather than appends to, the
+/// existing extension) - two files with the same stem but different
+/// extensions (`data.csv`/`data.json`) would otherwise both want to write
+/// the exact same output filename if they're co-located, a real collision
+/// this naming scheme exists specifically to avoid. `logical_path` (not
+/// the original path) is used so a compressed file names its output after
+/// its *decompressed* identity, matching how a single `data.csv.gz` input
+/// already behaves today (`data.dictionary.md`, not
+/// `data.csv.gz.dictionary.md`).
+fn batch_output_file_name(logical_path: &Path, ext: &str) -> PathBuf {
+    let base = logical_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    PathBuf::from(format!("{base}.{ext}"))
+}
+
+/// Where one file's output actually gets written in directory mode: next
+/// to the source file itself by default, or, if `--output-dir` was given,
+/// under that directory instead, with the input's own subdirectory
+/// structure (relative to the directory root that was walked) mirrored
+/// underneath it.
+fn batch_output_path(
+    root: &Path,
+    original_path: &Path,
+    logical_path: &Path,
+    output_dir: Option<&Path>,
+    ext: &str,
+) -> Result<PathBuf> {
+    let file_name = batch_output_file_name(logical_path, ext);
+    match output_dir {
+        None => Ok(original_path.with_file_name(file_name)),
+        Some(output_dir) => {
+            let relative_dir = original_path
+                .parent()
+                .unwrap_or(Path::new(""))
+                .strip_prefix(root)
+                .with_context(|| format!("{original_path:?} is not inside {root:?}"))?;
+            Ok(output_dir.join(relative_dir).join(file_name))
+        }
+    }
+}
+
+/// Every default output filename this tool itself ever produces - in
+/// single-file mode too - ends in exactly one of these three suffixes.
+/// Found empirically, not reasoned out in advance: running this exact
+/// directory-batch feature a second time over a directory it had already
+/// written into showed it dutifully re-profiling its own prior JSON
+/// output as if it were fresh input data (`--output-format json`'s
+/// default naming produces a `.json`-extensioned file, which this tool's
+/// own extension-based detection then matches without hesitation),
+/// producing a `data.csv.dictionary.json.dictionary.json` describing
+/// another data dictionary's own structure - the same "verify against
+/// real behavior, not just the design" discipline this project holds
+/// every heuristic to. A custom, non-default output name a single-file
+/// run was given explicitly is untouched by this check - directory mode
+/// only ever produces default-named output itself, so this only needs to
+/// recognize the shape *this feature* can create.
+const OWN_OUTPUT_SUFFIXES: [&str; 3] = [
+    ".dictionary.md",
+    ".dictionary.json",
+    ".dictionary.schema.json",
+];
+
+fn looks_like_own_output(path: &Path) -> bool {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    OWN_OUTPUT_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
+    let dir = &args.input_path;
+    if args.output_path.is_some() {
+        bail!(
+            "{dir:?} is a directory - use --output-dir <PATH> instead of a positional output path"
+        );
+    }
+    if args.format.is_some() {
+        bail!(
+            "--format can't be forced across a whole directory - only files sniff-rs can auto-detect on their own (by extension or content) are processed in directory mode; run it on a single file to override its format"
+        );
+    }
+    if args.widths.is_some() {
+        bail!(
+            "--widths only applies to --format fixed-width, which is never auto-detected and so is unreachable in directory mode"
+        );
+    }
+
+    let mut files = Vec::new();
+    collect_files_sorted(dir, &mut files)?;
+
+    let mut processed = 0usize;
+    let mut skipped = 0usize;
+    let mut total_tables = 0usize;
+    let mut total_columns = 0usize;
+
+    for path in &files {
+        if looks_like_own_output(path) {
+            skipped += 1;
+            eprintln!(
+                "{}: skipped (looks like this tool's own prior output)",
+                path.display()
+            );
+            continue;
+        }
+
+        let (read_path, logical_path, _decompressed_tmp) =
+            decompress_if_needed(path).with_context(|| format!("failed processing {path:?}"))?;
+
+        // A file whose format can't be identified at all (no recognized
+        // extension, and no sniffable content signature) is skipped, not
+        // a fatal error - this is the one outcome directory mode treats
+        // as "nothing went wrong, this just isn't a file sniff-rs can
+        // read." Any error past this point (a corrupt file, a format
+        // whose reader isn't compiled into this build, a write failure)
+        // is fail-fast, deliberately with no special-casing between those
+        // causes.
+        let format = match detect_format(&read_path, &logical_path, &None) {
+            Ok(format) => format,
+            Err(_) => {
+                skipped += 1;
+                eprintln!("{}: skipped (unrecognized format)", path.display());
+                continue;
+            }
+        };
+
+        let outcome = (|| -> Result<(usize, usize, PathBuf)> {
+            let tables = dispatch_reader(&read_path, &logical_path, format, args)?;
+            let file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let rendered = render_output(&file_name, format, &tables, output_format)?;
+
+            let output_path = batch_output_path(
+                dir,
+                path,
+                &logical_path,
+                args.output_dir.as_deref(),
+                default_ext(output_format),
+            )?;
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory {parent:?}"))?;
+            }
+            fs::write(&output_path, &rendered)
+                .with_context(|| format!("failed to write {output_path:?}"))?;
+
+            let table_count = tables.len();
+            let col_count: usize = tables.values().map(Vec::len).sum();
+            Ok((table_count, col_count, output_path))
+        })()
+        .with_context(|| format!("failed processing {path:?}"))?;
+
+        let (table_count, col_count, output_path) = outcome;
+        processed += 1;
+        total_tables += table_count;
+        total_columns += col_count;
+        eprintln!(
+            "{}: {table_count} tables, {col_count} columns -> {}",
+            path.display(),
+            output_path.display()
+        );
+    }
+
+    if processed == 0 {
+        bail!("no recognized files found in {dir:?} ({skipped} file(s) skipped as unrecognized)");
+    }
+    eprintln!(
+        "{processed} file(s) processed ({skipped} skipped), {total_tables} tables, {total_columns} columns total"
+    );
 
     Ok(())
 }

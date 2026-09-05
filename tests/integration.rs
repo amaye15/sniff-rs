@@ -4016,3 +4016,218 @@ fn an_extensionless_file_with_no_sniffable_signal_still_gets_an_actionable_error
         "expected an error pointing at --format: {stderr}"
     );
 }
+
+// --- Directory-input batch mode -----------------------------------------
+// Pointing sniff-rs at a directory profiles every file under it (recursively)
+// that it can identify on its own, one output per input, instead of a single
+// file. These tests build a real directory tree under a fresh TempDir rather
+// than a committed fixture directory, since batch mode writes output files
+// (co-located with the inputs by default) and a committed tests/fixtures/
+// directory should never be polluted by running the test suite.
+
+fn run_dir(args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .output()
+        .expect("failed to run binary")
+}
+
+#[test]
+fn batch_mode_processes_every_recognized_file_recursively() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::copy(fixture("nested.jsonl"), sub.join("data.jsonl")).unwrap();
+    std::fs::write(dir.path().join("README.txt"), "not a data file").unwrap();
+
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "batch run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("README.txt: skipped (unrecognized format)"));
+    assert!(stderr.contains("2 file(s) processed (1 skipped)"));
+
+    assert!(dir.path().join("data.csv.dictionary.md").exists());
+    assert!(sub.join("data.jsonl.dictionary.md").exists());
+    // The unrecognized file is left alone, not turned into an (empty or
+    // erroring) output of its own.
+    assert!(!dir.path().join("README.txt.dictionary.md").exists());
+}
+
+#[test]
+fn batch_mode_avoids_a_naming_collision_between_same_stem_different_extensions() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    std::fs::copy(fixture("nested.jsonl"), dir.path().join("data.json")).unwrap();
+
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(output.status.success());
+    // Both must exist, distinctly - with the old with_extension-based
+    // naming, both would have collided on "data.dictionary.md".
+    assert!(dir.path().join("data.csv.dictionary.md").exists());
+    assert!(dir.path().join("data.json.dictionary.md").exists());
+}
+
+#[test]
+fn batch_mode_writes_under_output_dir_mirroring_input_structure() {
+    let dir = TempDir::new();
+    let out_dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::copy(fixture("nested.jsonl"), sub.join("data.jsonl")).unwrap();
+
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--output-dir",
+        out_dir.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "batch run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(out_dir.path().join("data.csv.dictionary.md").exists());
+    assert!(out_dir.path().join("sub/data.jsonl.dictionary.md").exists());
+    // Nothing was written next to the sources instead.
+    assert!(!dir.path().join("data.csv.dictionary.md").exists());
+    assert!(!sub.join("data.jsonl.dictionary.md").exists());
+}
+
+#[test]
+fn batch_mode_fails_fast_and_names_the_offending_file() {
+    let dir = TempDir::new();
+    // Sorted order matters here: "a_" and "z_" prefixes guarantee good.csv
+    // is processed (and its output written) before bad.xlsx is reached.
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a_good.csv")).unwrap();
+    std::fs::write(dir.path().join("z_bad.xlsx"), "not a real xlsx file at all").unwrap();
+
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("z_bad.xlsx"),
+        "error should name the offending file: {stderr}"
+    );
+    // The good file that was processed before the failure keeps its
+    // output - directory mode never rolls back prior successes.
+    assert!(dir.path().join("a_good.csv.dictionary.md").exists());
+}
+
+#[test]
+fn batch_mode_errors_when_nothing_is_recognized() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("notes.txt"), "just text").unwrap();
+
+    let output = run_dir(&[dir.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no recognized files found"),
+        "expected an actionable error: {stderr}"
+    );
+}
+
+#[test]
+fn batch_mode_does_not_reprocess_its_own_prior_output_on_a_second_run() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+
+    let first = run_dir(&[dir.path().to_str().unwrap(), "--output-format", "json"]);
+    assert!(first.status.success());
+    assert!(dir.path().join("data.csv.dictionary.json").exists());
+
+    let second = run_dir(&[dir.path().to_str().unwrap(), "--output-format", "json"]);
+    assert!(second.status.success());
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("looks like this tool's own prior output"),
+        "expected the prior output to be recognized and skipped: {stderr}"
+    );
+    assert!(
+        !dir.path()
+            .join("data.csv.dictionary.json.dictionary.json")
+            .exists(),
+        "must not have re-profiled its own previous output"
+    );
+}
+
+#[test]
+fn batch_mode_rejects_a_positional_output_path() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    let output = run_dir(&[dir.path().to_str().unwrap(), "out.md"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output-dir"), "got: {stderr}");
+}
+
+#[test]
+fn batch_mode_rejects_a_format_override() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    let output = run_dir(&[dir.path().to_str().unwrap(), "--format", "csv"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--format"), "got: {stderr}");
+}
+
+#[test]
+fn batch_mode_rejects_widths() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("data.csv")).unwrap();
+    let output = run_dir(&[dir.path().to_str().unwrap(), "--widths", "5,10"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--widths"), "got: {stderr}");
+}
+
+#[test]
+fn single_file_mode_rejects_output_dir() {
+    let output = run_dir(&[
+        fixture("sample.csv").to_str().unwrap(),
+        "-",
+        "--output-dir",
+        "/tmp/should-not-be-used",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output-dir"), "got: {stderr}");
+}
+
+#[test]
+fn batch_mode_does_not_follow_a_symlinked_directory_but_reads_a_symlinked_file() {
+    let dir = TempDir::new();
+    let real_dir = dir.path().join("real_dir");
+    std::fs::create_dir(&real_dir).unwrap();
+    std::fs::copy(fixture("sample.csv"), real_dir.join("data.csv")).unwrap();
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&real_dir, dir.path().join("dir_link")).unwrap();
+        std::os::unix::fs::symlink(real_dir.join("data.csv"), dir.path().join("file_link.csv"))
+            .unwrap();
+        // A symlink cycle back to the root - must not hang or recurse
+        // forever.
+        std::os::unix::fs::symlink(dir.path(), real_dir.join("cycle_back")).unwrap();
+
+        let output = run_dir(&[dir.path().to_str().unwrap()]);
+        assert!(
+            output.status.success(),
+            "batch run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Exactly 2 files: the real one and the symlinked *file* - the
+        // symlinked *directory* must not have been descended into (which
+        // would have duplicated data.csv a second time).
+        assert!(stderr.contains("2 file(s) processed"), "got: {stderr}");
+        assert!(real_dir.join("data.csv.dictionary.md").exists());
+        assert!(dir.path().join("file_link.csv.dictionary.md").exists());
+    }
+}
