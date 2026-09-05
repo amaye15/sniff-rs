@@ -13175,24 +13175,74 @@ fn profile_json_records(records: &[json_support::Map], n_samples: usize) -> Vec<
     out
 }
 
+/// The dual-mode "profile a stream of top-level JSON-shaped values"
+/// ending that several readers share verbatim: collect the values, then
+/// emit either the `profile_json_records` shape (every value a plain
+/// object) or a single `value` column via `profile_json_path` (anything
+/// else). This folds each value straight into a root `JsonPathAccumulator`
+/// as it arrives rather than retaining the value list, so a reader that
+/// can produce its records one at a time (JSON Lines, Avro blocks, ...)
+/// never holds the whole set resident. Output is byte-identical to the
+/// old collect-then-branch code:
+///  - zero values -> an empty column list, matching `profile_json_records(&[])`;
+///  - every non-null value a plain object, no array seen -> the root's
+///    children finished directly (no `value.` prefix, no root row);
+///  - anything else -> the root finished as one `value` column, with
+///    `total` counting any `null` values for missing-% just as the old
+///    `values.len()` / `values.iter().filter(|v| !v.is_null())` split did.
+struct JsonRecordStreamProfiler {
+    root: JsonPathAccumulator,
+    total: usize,
+}
+
+impl JsonRecordStreamProfiler {
+    fn new(n_samples: usize) -> Self {
+        JsonRecordStreamProfiler {
+            root: JsonPathAccumulator::new(n_samples),
+            total: 0,
+        }
+    }
+
+    /// One top-level value. A `null` counts toward `total` (for missing %)
+    /// but is never pushed into the accumulator, matching the old
+    /// `filter(|v| !v.is_null())`.
+    fn push(&mut self, v: &JsonValue) {
+        self.total += 1;
+        if !v.is_null() {
+            self.root.push(v);
+        }
+    }
+
+    fn finish(self) -> Vec<ColumnProfile> {
+        if self.total == 0 {
+            return Vec::new();
+        }
+        let root = self.root;
+        let all_objects = root.pushed_count == self.total
+            && root.scalar_count == 0
+            && !root.saw_array
+            && root.object_count == root.pushed_count;
+        if all_objects {
+            let child_total = root.object_count;
+            let mut out = Vec::new();
+            for (key, child) in root.child_order.into_iter().zip(root.children) {
+                out.extend(child.finish(key, child_total));
+            }
+            return out;
+        }
+        root.finish("value".to_string(), self.total)
+    }
+}
+
 /// Streams a genuine JSON Lines file a line at a time, folding each record
-/// straight into a root `JsonPathAccumulator` rather than collecting every
+/// straight into a `JsonRecordStreamProfiler` rather than collecting every
 /// parsed `JsonValue` first - so peak memory stays at the accumulator tree
-/// plus one line, not the whole record set. Output is identical to the old
-/// "collect `Vec<JsonValue>`, then `profile_json_records` (all objects) or
-/// `profile_json_path("value", ...)` (anything else)" path:
-///  - zero records (empty/whitespace-only file, or every line filtered) ->
-///    an empty column list, matching `profile_json_records(&[])`;
-///  - every line a plain object -> the root's children finished directly
-///    (no `value.` prefix, no root row), matching `profile_json_records`;
-///  - anything else (a scalar line, an array line, a mix) -> the root
-///    finished as a single `value` column, matching `profile_json_path`.
+/// plus one line, not the whole record set.
 ///
 /// `--nrows` stops the read itself early (the `for` loop stops pulling
 /// from the reader), the same real-I/O bound CSV/fixed-width already give
 /// it - a literal `null` line counts toward the limit and toward `total`
-/// (for missing %) but is never pushed, exactly as the old
-/// `values.iter().filter(|v| !v.is_null())` did.
+/// (for missing %) but is never pushed.
 fn profile_json_lines_streaming(
     path: &Path,
     nrows: Option<usize>,
@@ -13200,10 +13250,9 @@ fn profile_json_lines_streaming(
 ) -> Result<Vec<ColumnProfile>> {
     use std::io::BufRead;
     let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let mut root = JsonPathAccumulator::new(n_samples);
-    let mut total_records: usize = 0;
+    let mut profiler = JsonRecordStreamProfiler::new(n_samples);
     for line in std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines() {
-        if nrows.is_some_and(|limit| total_records >= limit) {
+        if nrows.is_some_and(|limit| profiler.total >= limit) {
             break;
         }
         let line = line.with_context(|| format!("failed to read {path:?}"))?;
@@ -13212,32 +13261,9 @@ fn profile_json_lines_streaming(
         }
         let value = json_support::from_str(&line)
             .with_context(|| format!("failed to parse a line of {path:?} as JSON"))?;
-        total_records += 1;
-        if !value.is_null() {
-            root.push(&value);
-        }
+        profiler.push(&value);
     }
-
-    if total_records == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Every non-null line was a plain object and no array was seen: emit
-    // the top-level columns directly, the `profile_json_records` shape.
-    let all_objects = root.pushed_count > 0
-        && root.scalar_count == 0
-        && !root.saw_array
-        && root.object_count == root.pushed_count;
-    if all_objects && root.pushed_count == total_records {
-        let child_total = root.object_count;
-        let mut out = Vec::new();
-        for (key, child) in root.child_order.into_iter().zip(root.children) {
-            out.extend(child.finish(key, child_total));
-        }
-        return Ok(out);
-    }
-
-    Ok(root.finish("value".to_string(), total_records))
+    Ok(profiler.finish())
 }
 
 fn columns_from_json(
@@ -38502,7 +38528,18 @@ mod avro_support {
         let sync_marker = read_exact_vec(&mut r, 16)
             .with_context(|| format!("failed reading the header of {path:?}"))?;
 
-        let mut values: Vec<JsonValue> = Vec::new();
+        // Each decoded record folds straight into the shared streaming
+        // profiler as the block it came from is decompressed, so an Avro
+        // file's records are never all held resident at once - only one
+        // decompressed block's bytes plus the bounded accumulator tree.
+        // The dual-mode ending (all-object records vs. a single `value`
+        // column) is `JsonRecordStreamProfiler`'s own: not every Avro file
+        // holds record-typed rows - an Avro RPC response file, for
+        // instance, decodes to a bare scalar (found via a real-world sweep
+        // against the Apache Avro project's own interop test data: a
+        // "hello world" RPC response is just the string "Hello, world!",
+        // not an object).
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
         'blocks: while let Some(count) = try_read_zigzag(&mut r)
             .with_context(|| format!("failed reading a block from {path:?}"))?
         {
@@ -38519,41 +38556,16 @@ mod avro_support {
                 .with_context(|| format!("failed decompressing a block from {path:?}"))?;
             let mut cursor: &[u8] = &decompressed;
             for _ in 0..count {
-                if nrows.is_some_and(|limit| values.len() >= limit) {
+                if nrows.is_some_and(|limit| profiler.total >= limit) {
                     break 'blocks;
                 }
                 let value = decode_to_json(&mut cursor, &schema, &names)
                     .with_context(|| format!("failed decoding a record from {path:?}"))?;
-                values.push(value);
+                profiler.push(&value);
             }
         }
 
-        // Not every Avro file holds record-typed rows - an Avro RPC
-        // response file, for instance, decodes to a bare scalar (found via
-        // a real-world sweep against the Apache Avro project's own interop
-        // test data: a "hello world" RPC response is just the string
-        // "Hello, world!", not an object). The same fallback the
-        // JSON/YAML/MessagePack/CBOR readers already use for their own
-        // analogous case applies here too.
-        if values.iter().all(JsonValue::is_object) {
-            let records: Vec<json_support::Map> = values
-                .into_iter()
-                .map(|v| match v {
-                    JsonValue::Object(m) => m,
-                    _ => unreachable!("just checked every value is an object"),
-                })
-                .collect();
-            Ok(profile_json_records(&records, n_samples))
-        } else {
-            let total = values.len();
-            let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-            Ok(profile_json_path(
-                "value".to_string(),
-                total,
-                refs,
-                n_samples,
-            ))
-        }
+        Ok(profiler.finish())
     }
 } // mod avro_support
 

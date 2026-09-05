@@ -33,6 +33,27 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/incremental-avro` branch (Darwin arm64)
+
+Avro wired through the incremental JSON-path engine - the first
+`profile_json_records`-based reader converted. The shared collect-then-
+branch tail (all-object records vs. one `value` column) is factored into
+`JsonRecordStreamProfiler` (a root `JsonPathAccumulator` + a `total`
+counter); `profile_json_lines_streaming` refactored onto it (no-op),
+then Avro's block loop changed to `profiler.push(&value)` per record.
+Avro already read one block at a time, so only the accumulation target
+changed.
+
+Measured on a real 500,000-record deflate-compressed nested Avro file
+(id/email/amount/3-element array/2-field nested record/bool): maxRSS
+471-480 MB -> ~2.5 MB (~99.5%), peak footprint ~453-456 MB -> ~1.2-1.3 MB
+(~99.7%), 3 rounds. Byte-identical output across the full corpus in all
+three output formats with/without `--nrows` (2,154 combinations); full
+suite unchanged (incl. `avro_reader_matches_the_apache_avro_crate_output_exactly`),
+clippy/fmt clean across default/`avro`/`full`, established baselines.
+
+---
+
 ## 2026-09-06 — `feat/incremental-json-path` branch (Darwin arm64)
 
 The shared `profile_json_path` recursive flattener (every non-native

@@ -5101,23 +5101,49 @@ clean across default/`full`, matching established baselines (the same
 pre-existing `chunks_exact`/question-mark clippy findings, confirmed
 identical on unmodified `main`).
 
-**Deliberately not done yet**: every other `profile_json_path`-based
-reader still materializes its whole record set before profiling (Avro,
-MessagePack, CBOR, TOML, YAML, XML, Parquet/Arrow's nested columns, and
-JSON's own top-level-array and single-multi-line-document shapes) - the
-incremental engine is now in place for all of them, but each reader
-would need its own record-at-a-time feed into a root
-`JsonPathAccumulator` the way `profile_json_lines_streaming` does, and
-each deserves its own real-file measurement. Several are inherently
-whole-buffer regardless (a single TOML/YAML document, a top-level JSON
-array - no record boundary to stream on); the genuinely streamable ones
-are the record-stream formats (Avro blocks, concatenated MessagePack/
-CBOR values, a YAML multi-document stream). Excel still needs its own
-larger `SheetGrid` restructuring (see above) rather than the drop-in
-bypass the eight `profile_column` conversions shared. Per-entry
-streaming decompression inside `ZipArchive::read` itself remains a real,
-disclosed, separately-scoped remaining gap, not folded into any phase
-here.
+**Avro went next, the first `profile_json_records`-based reader wired
+through the new engine.** Its old tail was the exact same collect-then-
+branch code `columns_from_json` had - `Vec<JsonValue>`, then
+`all(is_object)` -> `profile_json_records` else `profile_json_path("value",
+...)` - so that ending was factored into a small shared
+`JsonRecordStreamProfiler` (a root `JsonPathAccumulator` plus a `total`
+counter; `push` counts `null`s toward `total` for missing-% but never
+feeds them in; `finish` picks the all-object-records shape or the single
+`value` column exactly as before). `profile_json_lines_streaming` was
+refactored onto it (a pure no-op, verified by the full suite), then
+Avro's own block loop was changed to `profiler.push(&value)` per decoded
+record instead of `values.push(value)` - so a decompressed block's bytes
+plus the bounded accumulator tree are all that's ever resident, never
+the whole record set. Avro already read one block at a time (a Tier 1
+audit finding), so this needed no I/O change, only the accumulation
+target.
+
+Measured on a real 500,000-record deflate-compressed nested Avro file
+(id/email/amount/a 3-element string array/a 2-field nested record/bool -
+13.5 MB on disk, far larger decompressed): maxRSS 471-480 MB -> ~2.5 MB
+(~99.5%), peak footprint ~453-456 MB -> ~1.2-1.3 MB (~99.7%), 3 rounds.
+Output byte-identical via `diff` against the pre-change binary across
+the entire 359-file fixture corpus in all three output formats with and
+without `--nrows` (2,154 combinations); full test suite unchanged
+(including `avro_reader_matches_the_apache_avro_crate_output_exactly`),
+clippy/fmt clean across default/`avro`/`full`, established baselines.
+
+**Deliberately not done yet**: the remaining `profile_json_records`-based
+readers still materialize their whole record set (MessagePack, CBOR,
+TOML, YAML, XML, Parquet/Arrow's nested columns, and JSON's own
+top-level-array and single-multi-line-document shapes). MessagePack and
+CBOR are genuinely streamable (concatenated self-delimiting values) but
+each has a "single top-level array -> use its elements" transform that
+needs a one-value lookahead to resolve, so they're a slightly more
+careful wiring than Avro's clean block loop; a YAML multi-document
+stream is streamable too. The rest are inherently whole-buffer (a single
+TOML/YAML document, a top-level JSON array - no record boundary to
+stream on). Each streamable one still wants its own real-file
+measurement. Excel still needs its own larger `SheetGrid` restructuring
+(see above) rather than the drop-in bypass the eight `profile_column`
+conversions shared. Per-entry streaming decompression inside
+`ZipArchive::read` itself remains a real, disclosed, separately-scoped
+remaining gap, not folded into any phase here.
 
 ## Cloud-platform file compatibility
 
