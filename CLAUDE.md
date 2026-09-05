@@ -5241,22 +5241,56 @@ tests renamed/moved to assert through `columns_from_json` since
 `read_json_values` no longer exists), clippy/fmt clean across
 default/`full`, established baselines.
 
-**Deliberately not done yet**: `.ods`/`.xls`/`.xlsb` still build a
-`SheetGrid` (a smaller concern - their inputs are already fully
-resident). A YAML `---`-multi-document stream is genuinely streamable
-(one document at a time) and still wants doing. Everything else left is
-**inherently whole-buffer**: a single TOML/YAML/JSON document, or an XML
-tree, is one value with no record boundary to stream on, and every
-hand-rolled parser here (`json_support`, `toml_support`, `yaml_support`,
-`xml_support`) is an `&str`-buffer parser with no pull mode over a
-`Read` - so even the streamable-in-principle cases (top-level JSON array
-above included) can't drop below one resident file copy without a
-from-scratch streaming-parser rewrite of exactly the most carefully-
-verified code in the project, for shapes that are rarely large enough to
-matter. That's disproportionate and out of scope. Per-entry streaming
-decompression inside `ZipArchive::read` (which would also shave the
-residual off the OOXML and JSON-array numbers above) remains a real,
-disclosed, separately-scoped remaining gap.
+**A YAML `---`-multi-document stream went next** - the last genuinely
+streamable shape. `parse_yaml_documents` (which returned
+`Vec<JsonValue>`, every document's tree resident at once) is now a
+`#[cfg(test)]`-only wrapper over `parse_yaml_documents_each`, which hands
+each document to a callback and frees it before parsing the next (the
+source `content` still fully resident - a line-based `&str` parser).
+`columns_from_yaml` streams documents into a `JsonRecordStreamProfiler`,
+holding back exactly one non-null document until it knows whether a
+second follows: a lone non-null document that's a sequence unwraps to
+its elements as records (the old "single top-level sequence = array of
+records" branch), otherwise every non-null document is a record. Null
+documents are dropped (the old `documents.retain(|v| !v.is_null())`),
+`--nrows` bounds what's pushed while every document is still parsed
+(errors preserved), and the dual-mode ending (all-object records vs. one
+`value` column) is the profiler's own - byte-identical to the old
+collect-then-branch.
+
+Measured on a real 25 MB, 200,000-document multi-doc YAML stream
+(id/email/amount/a free-text note/bool per document): maxRSS
+213-238 MB -> ~74-83 MB (~65%), peak footprint ~196-223 MB -> ~65-73 MB
+(~67%), 3 rounds. The residual is `content` plus `split_lines`'s
+`Vec<YLine>` of every line's `&str` slice - the `&str`-parser floor
+again. Output byte-identical via `diff` against the pre-change binary
+across the entire 359-file fixture corpus in all three output formats
+with `--nrows` unset/1/2 (3,231 combinations), plus a 400-iteration
+fuzz over multi-doc / single-mapping / top-level-sequence / mixed-shape
+streams with sprinkled null documents crossed with `--nrows`/`--samples`/
+output format - zero mismatches. Full test suite unchanged (every
+`yaml_parser_*` and `columns_from_yaml_*` test still exercises the same
+entry points), clippy/fmt clean across default/`yaml`/`full`,
+established baselines.
+
+**Every format with a record boundary to stream on now streams.** What
+remains materialized:
+- `.ods`/`.xls`/`.xlsb` still build a `SheetGrid` - a smaller concern,
+  since their inputs (a decompressed zip entry, the OLE2 `Workbook`
+  stream) are already fully resident regardless.
+- **Inherently whole-buffer**: a single TOML/YAML/JSON document, or an
+  XML tree, is one value with no internal record boundary, and every
+  hand-rolled parser here (`json_support`, `toml_support`,
+  `yaml_support`, `xml_support`) is an `&str`-buffer parser with no pull
+  mode over a `Read`. Even the streamable-in-principle shapes already
+  converted (top-level JSON array, YAML multi-doc) can't drop below one
+  resident file copy without a from-scratch streaming-parser rewrite of
+  exactly the most carefully-verified code in the project, for inputs
+  that are rarely large enough to matter - disproportionate, out of
+  scope.
+- Per-entry streaming decompression inside `ZipArchive::read` (which
+  would shave the residual off the OOXML `.xlsx` number too) remains a
+  real, disclosed, separately-scoped remaining gap.
 
 ## Cloud-platform file compatibility
 

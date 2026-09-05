@@ -40600,9 +40600,31 @@ mod yaml_support {
     /// Splits raw YAML text into top-level documents (`---`-separated,
     /// with an optional `...` end marker and optional leading
     /// `%`-directives), then parses each into a `JsonValue`.
+    /// Whole-list form, kept only for `#[cfg(test)]` unit tests - the
+    /// production reader (`columns_from_yaml`) uses the streaming
+    /// `parse_yaml_documents_each` directly.
+    #[cfg(test)]
     pub(crate) fn parse_yaml_documents(text: &str) -> Result<Vec<JsonValue>> {
-        let lines = split_lines(text)?;
         let mut docs = Vec::new();
+        parse_yaml_documents_each(text, |doc| {
+            docs.push(doc);
+            Ok(())
+        })?;
+        Ok(docs)
+    }
+
+    /// Same parse as `parse_yaml_documents`, but hands each document to
+    /// `on_doc` as it's parsed and frees it before the next - so a
+    /// `---`-multi-document stream never holds every document's tree
+    /// resident at once (the source `text` still is - this is a
+    /// line-based `&str` parser with no pull mode). Every document is
+    /// parsed regardless of what `on_doc` does with it, so a malformed
+    /// document anywhere in the stream still surfaces its error.
+    pub(crate) fn parse_yaml_documents_each(
+        text: &str,
+        mut on_doc: impl FnMut(JsonValue) -> Result<()>,
+    ) -> Result<()> {
+        let lines = split_lines(text)?;
         let mut i = 0usize;
         while i < lines.len() && lines[i].raw.starts_with('%') {
             i += 1;
@@ -40640,9 +40662,9 @@ mod yaml_support {
             }
             let mut pos = 0usize;
             let value = parse_document(&mut doc_lines, &mut pos)?;
-            docs.push(value);
+            on_doc(value)?;
         }
-        Ok(docs)
+        Ok(())
     }
 
     fn parse_document(lines: &mut [YLine], pos: &mut usize) -> Result<JsonValue> {
@@ -41435,55 +41457,62 @@ fn columns_from_yaml(
 ) -> Result<Vec<ColumnProfile>> {
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
 
-    let mut documents = yaml_support::parse_yaml_documents(&content)
-        .with_context(|| format!("failed to parse YAML in {path:?}"))?;
-    documents.retain(|v| !v.is_null());
+    // Stream documents one at a time (the source `content` still has to
+    // be fully resident - this is a line-based `&str` parser - but no
+    // document's own tree is kept past the point it's folded in). The
+    // dual-mode dispatch is unchanged: exactly one non-null top-level
+    // *sequence* document is an array of records (JSON's `[...]` mode);
+    // anything else - one mapping, one bare scalar, or a
+    // `---`-separated multi-document stream - is one record per
+    // document/element. A null document is dropped (the old
+    // `documents.retain(|v| !v.is_null())`). Not every record is a
+    // mapping - a sequence of scalars, a bare scalar, a mixed multi-doc
+    // stream are all real, valid shapes handled by
+    // `JsonRecordStreamProfiler`'s single-`value`-column fallback rather
+    // than rejected.
+    let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+    let feed = |profiler: &mut JsonRecordStreamProfiler, v: &JsonValue| {
+        if nrows.is_none_or(|n| profiler.total < n) {
+            profiler.push(v);
+        }
+    };
+    // The one non-null document seen so far, held back until we know
+    // whether a second follows (multi-doc) or it stands alone (and, if a
+    // sequence, unwraps to its elements).
+    let mut pending: Option<JsonValue> = None;
+    let mut multi = false;
+    yaml_support::parse_yaml_documents_each(&content, |doc| {
+        if doc.is_null() {
+            return Ok(());
+        }
+        match pending.take() {
+            None if !multi => pending = Some(doc),
+            first => {
+                // Second (or later) non-null document -> multi-doc mode.
+                if let Some(first) = first {
+                    feed(&mut profiler, &first);
+                }
+                multi = true;
+                feed(&mut profiler, &doc);
+            }
+        }
+        Ok(())
+    })
+    .with_context(|| format!("failed to parse YAML in {path:?}"))?;
 
-    // Same dual-mode dispatch as before: a single top-level sequence is
-    // an array of records (JSON's `[...]` mode); anything else - one
-    // mapping, one bare scalar, or a `---`-separated multi-document
-    // stream - is one record per document/element (TOML's own "whole
-    // document = one row" choice for its single-document shape).
-    let mut values: Vec<JsonValue> = Vec::new();
-    match documents.len() {
-        1 => match documents.into_iter().next().unwrap() {
-            JsonValue::Array(items) => values.extend(items),
-            other => values.push(other),
-        },
-        _ => values.extend(documents),
+    if !multi {
+        match pending {
+            None => {} // zero non-null documents -> empty column list
+            Some(JsonValue::Array(items)) => {
+                for item in &items {
+                    feed(&mut profiler, item);
+                }
+            }
+            Some(other) => feed(&mut profiler, &other),
+        }
     }
 
-    if let Some(n) = nrows {
-        values.truncate(n);
-    }
-
-    // Not every document/element is a mapping - a real, valid shape
-    // (a top-level sequence of scalars, a bare scalar document, or a
-    // multi-doc stream mixing shapes - all found via a real-world sweep
-    // against yaml-test-suite, the spec compliance corpus), not something
-    // to reject. Same fallback the JSON reader already uses for its own
-    // analogous case: profile the whole set as a single "value" column
-    // through the same recursive engine a nested array-of-scalars
-    // sub-column goes through, rather than a "must be a mapping" error.
-    if values.iter().all(JsonValue::is_object) {
-        let records: Vec<json_support::Map> = values
-            .into_iter()
-            .map(|v| match v {
-                JsonValue::Object(m) => m,
-                _ => unreachable!("just checked every value is an object"),
-            })
-            .collect();
-        Ok(profile_json_records(&records, n_samples))
-    } else {
-        let total = values.len();
-        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-        Ok(profile_json_path(
-            "value".to_string(),
-            total,
-            refs,
-            n_samples,
-        ))
-    }
+    Ok(profiler.finish())
 }
 
 #[cfg(not(feature = "yaml"))]

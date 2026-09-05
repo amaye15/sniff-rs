@@ -33,6 +33,25 @@ re-run.
 
 ---
 
+## 2026-09-06 — `feat/streaming-yaml-multidoc` branch (Darwin arm64)
+
+YAML `---`-multi-document stream streamed - the last shape with a record
+boundary. `parse_yaml_documents` (returned `Vec<JsonValue>`) is now a
+`#[cfg(test)]` wrapper over `parse_yaml_documents_each` (per-document
+callback, each freed before the next). `columns_from_yaml` streams into
+a `JsonRecordStreamProfiler`, holding back one non-null document for the
+single-sequence-unwrap lookahead. Null docs dropped, `--nrows` bounds
+pushes while every doc is still parsed, dual-mode ending unchanged.
+
+Measured on a real 25 MB, 200,000-document multi-doc YAML: maxRSS
+213-238 MB -> ~74-83 MB (~65%), peak footprint ~196-223 MB -> ~65-73 MB
+(~67%), 3 rounds. Residual is `content` + `split_lines`'s `Vec<YLine>` -
+the `&str`-parser floor. Byte-identical across the full corpus in all
+three formats with `--nrows` unset/1/2 (3,231 combinations) plus a
+400-iteration multi-shape fuzz.
+
+---
+
 ## 2026-09-06 — `feat/streaming-json-array` branch (Darwin arm64)
 
 Top-level JSON array (`[ ... ]`) streamed. `json_support::from_str_top_array_each`
