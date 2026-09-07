@@ -48658,15 +48658,93 @@ mod xlsx_support {
         None
     }
 
-    fn ods_parse_sheet(table: &XmlElement) -> SheetGrid {
-        let mut sparse: Vec<(usize, usize, String)> = Vec::new();
+    /// `(element name, attributes, was-self-closing)` for one start tag.
+    type OdsStartTag = (String, Vec<(String, String)>, bool);
+
+    /// Consumes one element start tag at `*pos` (`<name ...>` or
+    /// `<name .../>`), returning its name, attributes, and whether it was
+    /// self-closing. Leaves `*pos` just past the `>` / `/>`.
+    fn ods_consume_start_tag(xml: &str, pos: &mut usize) -> Result<OdsStartTag> {
+        let bytes = xml.as_bytes();
+        if bytes.get(*pos) != Some(&b'<') {
+            bail!("expected an element start tag");
+        }
+        *pos += 1;
+        let name = xml_parse_name(xml, pos)?.to_string();
+        let attrs = xml_parse_attrs(xml, pos)?;
+        xml_skip_ws(bytes, pos);
+        if xml_starts_with(bytes, *pos, "/>") {
+            *pos += 2;
+            return Ok((name, attrs, true));
+        }
+        if bytes.get(*pos) != Some(&b'>') {
+            bail!("expected '>' or '/>' to close the start tag for '{name}'");
+        }
+        *pos += 1;
+        Ok((name, attrs, false))
+    }
+
+    /// The name of the next element at `*pos` (`*pos` unchanged) - used to
+    /// dispatch a container's children without parsing a full subtree.
+    fn ods_peek_element_name(xml: &str, pos: usize) -> Result<String> {
+        let mut p = pos;
+        if xml.as_bytes().get(p) != Some(&b'<') {
+            bail!("expected an element start tag");
+        }
+        p += 1;
+        Ok(xml_parse_name(xml, &mut p)?.to_string())
+    }
+
+    /// An empty `<table:table>` (no rows, or self-closing) profiles as a
+    /// single unnamed, all-null column - exactly what `ods_parse_sheet` +
+    /// `SheetGrid::from_cells(&[], 1, 1)` + `into_column_profiles`
+    /// produced for the same shape.
+    fn ods_empty_table_profiles() -> Vec<ColumnProfile> {
+        vec![ColumnAccumulatorState::new().into_profile(String::new(), 0)]
+    }
+
+    /// Streams one `<table:table>`'s rows off `xml` starting at `*pos`
+    /// (positioned just past that table's own start tag), folding each
+    /// `<table:table-row>` subtree's cells into per-column
+    /// `ColumnAccumulatorState`s exactly as `ods_parse_sheet` +
+    /// `SheetGrid::into_column_profiles` did over a whole-DOM tree - so a
+    /// sheet's rows are never all resident at once, and no `SheetGrid`
+    /// of sparse cells is ever built. Leaves `*pos` just past the
+    /// matching `</table:table>`. Logical row 0 is the header;
+    /// `table:number-rows-repeated` / `-columns-repeated` advance logical
+    /// position without materializing an empty repeat.
+    fn ods_stream_table_profiles(
+        xml: &str,
+        pos: &mut usize,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let bytes = xml.as_bytes();
+        let mut header: Vec<Option<String>> = Vec::new();
+        let mut states: Vec<ColumnAccumulatorState> = Vec::new();
         let mut max_row = 0usize;
         let mut max_col = 0usize;
         let mut row_pos = 0usize;
 
-        for row_el in table.children_named("table:table-row") {
+        loop {
+            xml_skip_misc(bytes, pos)?;
+            if *pos >= bytes.len() || xml_starts_with(bytes, *pos, "</table:table>") {
+                if xml_starts_with(bytes, *pos, "</table:table>") {
+                    *pos += "</table:table>".len();
+                }
+                break;
+            }
+            if bytes.get(*pos) != Some(&b'<') {
+                *pos += 1;
+                continue;
+            }
+            let row_el = xml_parse_element(xml, pos)?;
+            if row_el.name != "table:table-row" {
+                continue;
+            }
+
             let row_repeat = ods_repeat_count(
-                row_el,
+                &row_el,
                 "table:number-rows-repeated",
                 ODS_MAX_ROWS.saturating_sub(row_pos),
             );
@@ -48693,8 +48771,25 @@ mod xlsx_support {
 
             if !row_cells.is_empty() {
                 for r in 0..row_repeat {
-                    for &(col, ref val) in &row_cells {
-                        sparse.push((row_pos + r, col, val.clone()));
+                    let logical = row_pos + r;
+                    if logical == 0 {
+                        for (col, val) in &row_cells {
+                            if *col >= header.len() {
+                                header.resize(*col + 1, None);
+                            }
+                            header[*col] = Some(val.clone());
+                        }
+                    } else {
+                        let data_idx = logical - 1;
+                        if nrows.is_some_and(|limit| data_idx >= limit) {
+                            continue;
+                        }
+                        for (col, val) in &row_cells {
+                            if *col >= states.len() {
+                                states.resize_with(*col + 1, ColumnAccumulatorState::new);
+                            }
+                            states[*col].push(val.clone(), n_samples);
+                        }
                     }
                 }
                 max_row = max_row.max(row_pos + row_repeat - 1);
@@ -48702,8 +48797,25 @@ mod xlsx_support {
             row_pos += row_repeat;
         }
 
-        // `max_row`/`max_col` are 0-based maxima; row 0 is the header.
-        SheetGrid::from_cells(sparse, max_row + 1, max_col + 1)
+        // `max_row`/`max_col` are 0-based maxima; row 0 is the header, so
+        // `n_data_rows` (the row count every `missing_pct` is derived
+        // from) is `max_row` and `ncol` is `max_col + 1` - the exact
+        // `SheetGrid::from_cells(_, max_row + 1, max_col + 1)` shape.
+        let ncol = max_col + 1;
+        let mut headers: Vec<String> = vec![String::new(); ncol];
+        for (col, value) in header.into_iter().enumerate() {
+            if let (true, Some(v)) = (col < ncol, value) {
+                headers[col] = v;
+            }
+        }
+        states.resize_with(ncol, ColumnAccumulatorState::new);
+        let n_data_rows = max_row;
+        let total = nrows.map_or(n_data_rows, |limit| limit.min(n_data_rows));
+        Ok(headers
+            .into_iter()
+            .zip(states)
+            .map(|(name, state)| state.into_profile(name, total))
+            .collect())
     }
 
     pub(crate) fn columns_from_ods(
@@ -48717,22 +48829,74 @@ mod xlsx_support {
             .context("no content.xml in ODF archive")?;
         let content_xml =
             String::from_utf8(content_bytes).context("content.xml is not valid UTF-8")?;
-        let root = xml_parse(&content_xml)?;
+        let bytes = content_xml.as_bytes();
 
-        let spreadsheet = root
-            .child("office:body")
-            .and_then(|b| b.child("office:spreadsheet"))
-            .ok_or_else(|| anyhow!("no <office:spreadsheet> element in {path:?}"))?;
+        let no_spreadsheet = || anyhow!("no <office:spreadsheet> element in {path:?}");
 
-        let mut out = Vec::new();
-        for table in spreadsheet.children_named("table:table") {
-            let sheet_name = table.attr("table:name").unwrap_or("Sheet1").to_string();
-            let grid = ods_parse_sheet(table);
-            if grid.is_empty_sheet() {
+        // Walk `<office:document-content>` -> `<office:body>` ->
+        // `<office:spreadsheet>` by consuming only each container's own
+        // start tag and discarding non-matching siblings, so the sheet
+        // data is never parsed into one DOM. Only `<table:table-row>`
+        // subtrees are ever materialized, one at a time.
+        let mut pos = 0usize;
+        xml_skip_misc(bytes, &mut pos)?;
+        let (_root, _root_attrs, root_sc) = ods_consume_start_tag(&content_xml, &mut pos)?;
+        if root_sc {
+            return Err(no_spreadsheet());
+        }
+
+        for (container, close_tag) in [
+            ("office:body", "</office:document-content>"),
+            ("office:spreadsheet", "</office:body>"),
+        ] {
+            let mut entered = false;
+            loop {
+                xml_skip_misc(bytes, &mut pos)?;
+                if pos >= bytes.len() || xml_starts_with(bytes, pos, close_tag) {
+                    break;
+                }
+                if bytes.get(pos) != Some(&b'<') {
+                    pos += 1;
+                    continue;
+                }
+                if ods_peek_element_name(&content_xml, pos)? == container {
+                    let (_n, _a, sc) = ods_consume_start_tag(&content_xml, &mut pos)?;
+                    entered = !sc;
+                    break;
+                }
+                let _discard = xml_parse_element(&content_xml, &mut pos)?;
+            }
+            if !entered {
+                return Err(no_spreadsheet());
+            }
+        }
+
+        let mut out: Vec<(String, Vec<ColumnProfile>)> = Vec::new();
+        loop {
+            xml_skip_misc(bytes, &mut pos)?;
+            if pos >= bytes.len() || xml_starts_with(bytes, pos, "</office:spreadsheet>") {
+                break;
+            }
+            if bytes.get(pos) != Some(&b'<') {
+                pos += 1;
                 continue;
             }
-            let profiles: Vec<ColumnProfile> = grid.into_column_profiles(nrows, n_samples);
-            out.push((sheet_name, profiles));
+            if ods_peek_element_name(&content_xml, pos)? == "table:table" {
+                let (_n, attrs, sc) = ods_consume_start_tag(&content_xml, &mut pos)?;
+                let name = attrs
+                    .iter()
+                    .find(|(k, _)| k == "table:name")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "Sheet1".to_string());
+                let profiles = if sc {
+                    ods_empty_table_profiles()
+                } else {
+                    ods_stream_table_profiles(&content_xml, &mut pos, nrows, n_samples)?
+                };
+                out.push((name, profiles));
+                continue;
+            }
+            let _discard = xml_parse_element(&content_xml, &mut pos)?;
         }
 
         if out.is_empty() {

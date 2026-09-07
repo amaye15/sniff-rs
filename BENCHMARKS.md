@@ -33,6 +33,33 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/streaming-ods-rows` branch (Darwin arm64)
+
+`.ods` no longer parses `content.xml` into one DOM. `columns_from_ods`
+byte-walks the decompressed `content.xml` (consuming only each
+container's start tag), then streams each `<table:table>`'s
+`<table:table-row>` children one `xml_parse_element` subtree at a time
+(`ods_stream_table_profiles`), folding cells into per-column
+`ColumnAccumulatorState`s - the OOXML `.xlsx` reader's own per-row shape.
+`ods_parse_sheet` + the `SheetGrid` sparse-cell build are gone. Output is
+byte-identical to the old `SheetGrid` path (repeated rows/cols, header =
+logical row 0, trailing blank rows invisible, `--nrows` bounds folding
+but not the `max_row`/`max_col` scan).
+
+Measured on a hand-built 11 MB, 400,000-row `.ods` (271 MB decompressed
+`content.xml`): maxRSS 2,645-2,651 MB -> 301-351 MB (~87-89%), peak
+footprint 2,620-2,666 MB -> 291-342 MB (~87-89%), 3 rounds; also faster
+(4.1s -> 2.5s real). Residual is the resident `content.xml` string (the
+`ZipArchive::read` gap). Byte-identical output across the full 359-file
+corpus in all three formats with `--nrows` unset/1/2 (3,258
+combinations) plus a 3,000-iteration hand-built-`.ods` fuzz (multi-table,
+repeated rows/cells, covered cells, blank rows, comments, empty/
+self-closing table, styles prelude, 1M-row trailing empty repeat). Full
+suite (`ods_reader_matches_calamine_output_exactly` unchanged) +
+clippy/fmt clean across default/`xlsx`/`full`, established baselines.
+
+---
+
 ## 2026-09-08 — `feat/streaming-xml-bytes` branch (Darwin arm64)
 
 A homogeneous `<root><item>...</item>...</root>` records file now streams

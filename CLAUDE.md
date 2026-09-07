@@ -5382,15 +5382,55 @@ output format - zero mismatches. Full test suite (two new
 refill-straddling shapes, and a declines-non-homogeneous-roots check) and
 clippy/fmt clean across default/`xml`/`full`, established baselines.
 
-**Every streamable JSON, YAML, and homogeneous-records XML shape now
-streams with no resident file copy.** What remains materialized:
-- `.ods`/`.xls`/`.xlsb` still build a `SheetGrid` - `.ods` from a
-  whole-sheet XML DOM (the OOXML reader's own pre-streaming shape), and
-  `.xls`/`.xlsb` from a resident record stream. `.ods` could take the
-  same per-`<table:table-row>` streaming the OOXML reader got; `.xls`/
-  `.xlsb` could fold records into accumulators as they're read. All
-  three still bottom out at the decompressed zip entry / OLE2 Workbook
-  stream (the `ZipArchive::read` / CFB gap below).
+**`.ods` then got the per-row treatment the OOXML `.xlsx` reader already
+had - it no longer parses `content.xml` into one DOM.** `ods_parse_sheet`
+(which built a `SheetGrid` of sparse cells from a whole `xml_parse` tree)
+is gone; `columns_from_ods` now byte-walks the decompressed `content.xml`,
+consuming only each container's own start tag (`<office:document-content>`
+-> `<office:body>` -> `<office:spreadsheet>`) and discarding non-matching
+siblings, then for each `<table:table>` streams its `<table:table-row>`
+children one `xml_parse_element` subtree at a time
+(`ods_stream_table_profiles`), folding cells into per-column
+`ColumnAccumulatorState`s. Output is byte-identical to the old
+`ods_parse_sheet` + `SheetGrid::from_cells` + `into_column_profiles` path,
+including every quirk that shape had: logical row 0 is the header, a
+repeated first row also seeds data rows, `table:number-rows-repeated` /
+`-columns-repeated` advance logical position without materializing an
+empty repeat (the real-scale trailing-empty-block case stays instant),
+`ncol` is `max_col + 1` and `n_data_rows` is the 0-based max non-empty
+row (trailing blank rows invisible), and `--nrows` bounds folding while
+still scanning every row for `max_row`/`max_col`. `content.xml` itself is
+still fully resident (the `ZipArchive::read` gap below), so this is the
+same "stop double-buffering the DOM on top of the decompressed entry"
+win the OOXML reader got, not per-entry streaming.
+
+Measured on a hand-built 11 MB, 400,000-row `.ods` (271 MB decompressed
+`content.xml` - id/name/email/amount/a long free-text description/a
+4-value category): maxRSS 2,645-2,651 MB -> 301-351 MB (~87-89%), peak
+footprint 2,620-2,666 MB -> 291-342 MB (~87-89%), 3 rounds; also faster
+(4.1s -> 2.5s real, no DOM build). The residual is the resident
+`content.xml` string plus the per-column accumulators. Output confirmed
+byte-identical via `diff` against the pre-change binary across the entire
+359-file fixture corpus in all three output formats with `--nrows`
+unset/1/2 (3,258 combinations), plus a 3,000-iteration old-vs-new fuzz
+over hand-built `.ods` files (1-3 tables, repeated rows/cells, covered
+cells, mixed value types, blank rows, comments between rows, a
+`<table:table-column>` header, an empty/self-closing table, a
+`<table:calculation-settings>` sibling, an `<office:automatic-styles>`
+prelude, a 1,048,570-row trailing empty repeat) crossed with
+`--nrows`/`--samples`/output format - zero mismatches. Full test suite
+(`ods_reader_matches_calamine_output_exactly` and the real-scale
+repeated-cells test unchanged and passing) and clippy/fmt clean across
+default/`xlsx`/`full`, established baselines.
+
+**Every streamable JSON, YAML, homogeneous-records XML, and `.ods` shape
+now streams with no whole-document DOM on top of its source bytes.** What
+remains materialized:
+- `.xls`/`.xlsb` still build a `SheetGrid` from a resident record stream
+  (the OLE2 `Workbook` stream / decompressed OOXML `.bin` parts). Both
+  could fold records into accumulators as they're read, but the record
+  stream itself stays resident regardless (the CFB / `ZipArchive::read`
+  gap below), so the win would be smaller than `.xlsx`/`.ods` saw.
 - **A single TOML or YAML document, or an XML tree with a non-
   homogeneous root**: one value with no internal record boundary.
   `toml_support`/`xml_support` are still `&str`-buffer parsers for these
