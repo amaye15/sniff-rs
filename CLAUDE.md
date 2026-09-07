@@ -5311,8 +5311,38 @@ string contents (`]`, `,`, `{`, tabs, multi-byte unicode, `\"` escapes),
 (four new `stream_top_level` unit tests, two renamed) and clippy/fmt
 clean across default/`full`, established baselines.
 
-**Every format with a record boundary now streams, and JSON streams
-with no resident file copy at all.** What remains materialized:
+**YAML then got the same treatment - a `---`-multi-document stream now
+reads document-at-a-time straight off a `Read`, holding no copy of the
+file.** `parse_yaml_documents_stream` reads lines via `BufReader::lines()`
+(replicating `split_lines`'s exact lexing: strip a trailing `\r`, measure
+the leading-space indent, reject tab indentation) and accumulates the
+current document's owned line strings, flushing them into the existing
+`parse_document` at each column-0 `---` / `--- ...` / `...` marker - the
+same document-boundary rule `parse_yaml_documents_each` uses, just fed
+line by line instead of over one resident `Vec<YLine>`. `split_lines` and
+`parse_yaml_documents_each` are now `#[cfg(test)]`-only (kept as the
+whole-buffer oracle a new equivalence unit test checks the stream against
+across directive/comment/blank/inline-marker/`...`/indented-doc/CRLF/
+empty-doc-region cases). `columns_from_yaml` opens a `File` and drives
+`parse_yaml_documents_stream`; its own hold-back-one-document lookahead
+(for the single-sequence-unwrap case) and dual-mode ending are unchanged.
+
+Measured on a real 46 MB, 300,000-document multi-doc YAML stream
+(id/email/amount/a 2-element sequence/a 2-field nested mapping/bool per
+document): maxRSS 188-221 MB -> ~2.5 MB (~99%), peak footprint
+178-212 MB -> ~1.4-1.5 MB (~99%), 3 rounds - no file copy resident, only
+the current document's lines and tree. Output byte-identical via `diff`
+against the pre-change binary across the entire 359-file fixture corpus
+in all three output formats with `--nrows` unset/1/2 (3,231
+combinations), plus a 500-iteration fuzz (multi-doc / single-mapping /
+indented-mapping / top-level-sequence / directive+comment / CRLF /
+leading-blank / block-scalar / nested-mapping / stray-`...` shapes)
+crossed with `--nrows`/`--samples`/output format - zero mismatches. Full
+test suite (one new stream/whole-buffer equivalence test) and clippy/fmt
+clean across default/`yaml`/`full`, established baselines.
+
+**Every streamable JSON and YAML shape now streams with no resident file
+copy.** What remains materialized:
 - `.ods`/`.xls`/`.xlsb` still build a `SheetGrid` - `.ods` from a
   whole-sheet XML DOM (the OOXML reader's own pre-streaming shape), and
   `.xls`/`.xlsb` from a resident record stream. `.ods` could take the
@@ -5320,15 +5350,18 @@ with no resident file copy at all.** What remains materialized:
   `.xlsb` could fold records into accumulators as they're read. All
   three still bottom out at the decompressed zip entry / OLE2 Workbook
   stream (the `ZipArchive::read` / CFB gap below).
-- **A single TOML or YAML document, or an XML tree**: one value with no
-  internal record boundary. `toml_support`/`yaml_support`/`xml_support`
-  are still `&str`-buffer parsers. The `stream_top_level` technique (a
-  structural boundary scanner feeding complete spans to the existing
-  parser) applies cleanly wherever there *is* a record boundary - a
-  YAML `---`-multi-document stream could scan document-at-a-time off a
-  `Read` the same way - but a lone document is genuinely one unit; the
-  parse tree is the irreducible cost there, and these inputs are rarely
-  large enough for the source-text copy on top to matter.
+- **A single TOML or YAML document, or an XML tree with a non-
+  homogeneous root**: one value with no internal record boundary.
+  `toml_support`/`xml_support` are still `&str`-buffer parsers (YAML's
+  own single-document path shares `parse_document`, which needs the
+  whole document's lines at once for indentation lookahead). The
+  parse tree is the irreducible cost for a lone document; the
+  source-text copy on top is bounded by one document's size, and these
+  inputs are rarely large enough for it to matter. An XML file whose
+  root has homogeneous same-tag children (the "records" shape) *is*
+  streamable by the same structural-boundary-scanner technique -
+  scan each depth-1 child element's span off a `Read`, parse it, drop
+  it - and is the next candidate if a large one shows up.
 - Per-entry streaming decompression inside `ZipArchive::read` (which
   would shave the residual off the OOXML `.xlsx` number and the `.ods`/
   `.xlsb` readers) remains a real, disclosed, separately-scoped gap.

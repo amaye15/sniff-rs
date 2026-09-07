@@ -40597,6 +40597,7 @@ mod yaml_support {
         num: usize,
     }
 
+    #[cfg(test)] // only the `parse_yaml_documents_each` test wrapper needs the whole-buffer split
     fn split_lines(text: &str) -> Result<Vec<YLine<'_>>> {
         let mut out = Vec::new();
         for (i, line) in text.lines().enumerate() {
@@ -40791,6 +40792,127 @@ mod yaml_support {
         Ok(docs)
     }
 
+    /// Parses one already-accumulated document's lines (owned `String`s,
+    /// each still carrying its original leading spaces) and hands the
+    /// result to `on_doc`, then leaves `doc_raw`/`doc_nums` cleared for
+    /// the next. Line lexing here mirrors `split_lines` exactly (measure
+    /// the leading-space indent, keep the rest as `raw`).
+    fn flush_yaml_doc(
+        doc_raw: &mut Vec<String>,
+        doc_nums: &mut Vec<usize>,
+        on_doc: &mut impl FnMut(JsonValue) -> Result<()>,
+    ) -> Result<()> {
+        let mut view: Vec<YLine> = doc_raw
+            .iter()
+            .zip(doc_nums.iter())
+            .map(|(raw, &num)| {
+                let trimmed = raw.trim_start_matches(' ');
+                YLine {
+                    indent: raw.len() - trimmed.len(),
+                    raw: trimmed,
+                    num,
+                }
+            })
+            .collect();
+        let mut pos = 0usize;
+        let value = parse_document(&mut view, &mut pos)?;
+        drop(view);
+        doc_raw.clear();
+        doc_nums.clear();
+        on_doc(value)
+    }
+
+    /// Streams a YAML `---`-multi-document file document-at-a-time
+    /// straight off a `Read` - the whole file's lines are never resident,
+    /// only the current document's own lines and tree. Line lexing (strip
+    /// a trailing `\r`, reject tab indentation) and document boundaries
+    /// (a column-0 `---` / `--- ...` / `...`) match
+    /// `parse_yaml_documents_each` exactly; the only difference is that
+    /// this one reads line by line instead of over one resident
+    /// `Vec<YLine>`. Every document is still parsed, so a malformed one
+    /// anywhere in the stream still surfaces its error.
+    pub(crate) fn parse_yaml_documents_stream<R: std::io::Read>(
+        reader: R,
+        mut on_doc: impl FnMut(JsonValue) -> Result<()>,
+    ) -> Result<()> {
+        use std::io::BufRead;
+        let br = std::io::BufReader::with_capacity(crate::STREAM_CHUNK_SIZE, reader);
+
+        let mut doc_raw: Vec<String> = Vec::new();
+        let mut doc_nums: Vec<usize> = Vec::new();
+        let mut past_directives = false;
+        let mut doc_started = false;
+        let mut line_no = 0usize;
+
+        for line in br.lines() {
+            let line = line.context("I/O error while reading YAML")?;
+            let line = line.strip_suffix('\r').unwrap_or(&line);
+            line_no += 1;
+            if line.starts_with('\t') && !line.trim().is_empty() {
+                bail!("YAML doesn't allow tabs for indentation (line {line_no})");
+            }
+            let trimmed = line.trim_start_matches(' ');
+
+            if !past_directives {
+                if trimmed.starts_with('%') {
+                    continue;
+                }
+                past_directives = true;
+            }
+
+            let is_marker = trimmed == "---" || trimmed.starts_with("--- ") || trimmed == "...";
+
+            if !doc_started {
+                if is_blank_or_comment(strip_comment(trimmed)) {
+                    continue;
+                }
+                if trimmed == "..." {
+                    continue; // a stray terminator between documents
+                }
+                doc_started = true;
+                if trimmed == "---" || trimmed.starts_with("--- ") {
+                    // `parse_yaml_documents_each` re-anchors inline `--- x`
+                    // content at indent 0, so it's pushed trimmed.
+                    let inline = trimmed.strip_prefix("---").unwrap().trim_start();
+                    if !inline.is_empty() {
+                        doc_raw.push(inline.to_string());
+                        doc_nums.push(line_no);
+                    }
+                } else {
+                    // A marker-less document's first line keeps its real
+                    // indentation (it establishes the root node's indent).
+                    doc_raw.push(line.to_string());
+                    doc_nums.push(line_no);
+                }
+                continue;
+            }
+
+            if is_marker && line.len() == trimmed.len() {
+                // A column-0 marker ends the document being accumulated.
+                flush_yaml_doc(&mut doc_raw, &mut doc_nums, &mut on_doc)?;
+                doc_started = false;
+                if trimmed == "..." {
+                    continue;
+                }
+                doc_started = true;
+                let inline = trimmed.strip_prefix("---").unwrap().trim_start();
+                if !inline.is_empty() {
+                    doc_raw.push(inline.to_string());
+                    doc_nums.push(line_no);
+                }
+                continue;
+            }
+
+            doc_raw.push(line.to_string());
+            doc_nums.push(line_no);
+        }
+
+        if doc_started {
+            flush_yaml_doc(&mut doc_raw, &mut doc_nums, &mut on_doc)?;
+        }
+        Ok(())
+    }
+
     /// Same parse as `parse_yaml_documents`, but hands each document to
     /// `on_doc` as it's parsed and frees it before the next - so a
     /// `---`-multi-document stream never holds every document's tree
@@ -40798,6 +40920,7 @@ mod yaml_support {
     /// line-based `&str` parser with no pull mode). Every document is
     /// parsed regardless of what `on_doc` does with it, so a malformed
     /// document anywhere in the stream still surfaces its error.
+    #[cfg(test)]
     pub(crate) fn parse_yaml_documents_each(
         text: &str,
         mut on_doc: impl FnMut(JsonValue) -> Result<()>,
@@ -41633,12 +41756,12 @@ fn columns_from_yaml(
     nrows: Option<usize>,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
 
-    // Stream documents one at a time (the source `content` still has to
-    // be fully resident - this is a line-based `&str` parser - but no
-    // document's own tree is kept past the point it's folded in). The
-    // dual-mode dispatch is unchanged: exactly one non-null top-level
+    // Stream documents one at a time straight off the file - only the
+    // current document's own lines and tree are ever resident, never the
+    // whole file. The dual-mode dispatch is unchanged: exactly one
+    // non-null top-level
     // *sequence* document is an array of records (JSON's `[...]` mode);
     // anything else - one mapping, one bare scalar, or a
     // `---`-separated multi-document stream - is one record per
@@ -41659,7 +41782,7 @@ fn columns_from_yaml(
     // sequence, unwraps to its elements).
     let mut pending: Option<JsonValue> = None;
     let mut multi = false;
-    yaml_support::parse_yaml_documents_each(&content, |doc| {
+    yaml_support::parse_yaml_documents_stream(file, |doc| {
         if doc.is_null() {
             return Ok(());
         }
@@ -54009,6 +54132,40 @@ mod tests {
     #[cfg(feature = "yaml")]
     fn yaml_doc(text: &str) -> JsonValue {
         yaml_support::parse_yaml_documents(text).unwrap().remove(0)
+    }
+
+    #[cfg(feature = "yaml")]
+    fn yaml_stream_docs(text: &str) -> Vec<JsonValue> {
+        let mut out = Vec::new();
+        yaml_support::parse_yaml_documents_stream(text.as_bytes(), |d| {
+            out.push(d);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn parse_yaml_documents_stream_matches_the_whole_buffer_parse() {
+        // Multi-doc with a directive, comments, blank lines, an inline
+        // `--- x`, a `...` terminator, an indented single-mapping doc,
+        // and CRLF line endings - the streaming line reader must produce
+        // the same document trees as split_lines + the outer loop.
+        for text in [
+            "%YAML 1.2\n---\n# c\n\na: 1\n---\nb: [2, 3]\n...\n--- 42\n",
+            "  x: 1\n  y:\n    - 2\n",
+            "- 1\n- 2\n- 3\n",
+            "one: 1\r\n---\r\ntwo: 2\r\n",
+            "\n\n\n",
+            "--- ~\n---\n---\nlast: true\n",
+        ] {
+            assert_eq!(
+                yaml_stream_docs(text),
+                yaml_support::parse_yaml_documents(text).unwrap(),
+                "mismatch for {text:?}"
+            );
+        }
     }
 
     #[cfg(feature = "yaml")]

@@ -33,6 +33,26 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/streaming-yaml-bytes` branch (Darwin arm64)
+
+YAML `---`-multi-document stream now reads document-at-a-time straight
+off a `Read` with no resident file copy. `parse_yaml_documents_stream`
+reads lines via `BufReader::lines()` (same lexing as `split_lines`),
+accumulates the current document's owned line strings, and flushes them
+into the existing `parse_document` at each column-0 `---`/`--- x`/`...`
+marker. `split_lines` + `parse_yaml_documents_each` are now
+`#[cfg(test)]` oracles.
+
+Measured on a real 46 MB, 300,000-document multi-doc YAML: maxRSS
+188-221 MB -> ~2.5 MB (~99%), peak footprint 178-212 MB -> ~1.4-1.5 MB
+(~99%), 3 rounds. Byte-identical output across the full 359-file corpus
+in all three formats with `--nrows` unset/1/2 (3,231 combinations) plus
+a 500-iteration multi-shape fuzz (directives, comments, CRLF, indented
+docs, block scalars, stray `...`, empty doc regions). Full suite (one
+new stream/whole-buffer equivalence test) + clippy/fmt clean.
+
+---
+
 ## 2026-09-08 — `feat/streaming-json-bytes` branch (Darwin arm64)
 
 The JSON reader now reads straight off a byte stream with no resident
