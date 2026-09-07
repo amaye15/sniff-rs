@@ -47682,11 +47682,6 @@ mod zip_support {
         /// them over a whole buffer. The returned `TempFile` is rewound
         /// to its start, ready to `Read`.
         ///
-        /// `#[allow(dead_code)]`: `.npz` (the `--features npy` reader)
-        /// uses this; a bare `--features xlsx` build's zip consumers
-        /// (`.xlsx`/`.xlsb`) still take the whole-buffer `read` path, so
-        /// they leave this unused until they're converted too.
-        #[allow(dead_code)]
         pub(crate) fn read_to_temp(&mut self, name: &str) -> Result<TempFile> {
             let (
                 method,
@@ -48773,38 +48768,231 @@ mod xlsx_support {
     /// `(element name, attributes, was-self-closing)` for one start tag.
     type OdsStartTag = (String, Vec<(String, String)>, bool);
 
-    /// Consumes one element start tag at `*pos` (`<name ...>` or
-    /// `<name .../>`), returning its name, attributes, and whether it was
-    /// self-closing. Leaves `*pos` just past the `>` / `/>`.
-    fn ods_consume_start_tag(xml: &str, pos: &mut usize) -> Result<OdsStartTag> {
-        let bytes = xml.as_bytes();
-        if bytes.get(*pos) != Some(&b'<') {
-            bail!("expected an element start tag");
-        }
-        *pos += 1;
-        let name = xml_parse_name(xml, pos)?.to_string();
-        let attrs = xml_parse_attrs(xml, pos)?;
-        xml_skip_ws(bytes, pos);
-        if xml_starts_with(bytes, *pos, "/>") {
-            *pos += 2;
-            return Ok((name, attrs, true));
-        }
-        if bytes.get(*pos) != Some(&b'>') {
-            bail!("expected '>' or '/>' to close the start tag for '{name}'");
-        }
-        *pos += 1;
-        Ok((name, attrs, false))
+    /// A bounded byte-window over a `Read` for the ODS `content.xml`
+    /// walk - keeps at most one 64 KiB refill of unconsumed bytes plus
+    /// whatever the current `<table:table-row>` span needs, discarding
+    /// the consumed prefix. The direct sibling of `xml_support`'s own
+    /// `XmlWindow` (different feature gate, so a deliberate small
+    /// duplication) and of the JSON reader's `ByteWindow`.
+    struct OdsXmlWindow<R> {
+        reader: R,
+        buf: Vec<u8>,
+        pos: usize,
+        eof: bool,
     }
 
-    /// The name of the next element at `*pos` (`*pos` unchanged) - used to
-    /// dispatch a container's children without parsing a full subtree.
-    fn ods_peek_element_name(xml: &str, pos: usize) -> Result<String> {
-        let mut p = pos;
-        if xml.as_bytes().get(p) != Some(&b'<') {
-            bail!("expected an element start tag");
+    impl<R: std::io::Read> OdsXmlWindow<R> {
+        const CHUNK: usize = 64 * 1024;
+
+        fn new(reader: R) -> Self {
+            OdsXmlWindow {
+                reader,
+                buf: Vec::new(),
+                pos: 0,
+                eof: false,
+            }
         }
-        p += 1;
-        Ok(xml_parse_name(xml, &mut p)?.to_string())
+
+        fn ensure(&mut self, need: usize) -> Result<()> {
+            while self.buf.len() - self.pos < need && !self.eof {
+                if self.pos > 0 {
+                    self.buf.drain(..self.pos);
+                    self.pos = 0;
+                }
+                let start = self.buf.len();
+                self.buf.resize(start + Self::CHUNK, 0);
+                let n = self
+                    .reader
+                    .read(&mut self.buf[start..])
+                    .context("I/O error while reading content.xml")?;
+                self.buf.truncate(start + n);
+                if n == 0 {
+                    self.eof = true;
+                }
+            }
+            Ok(())
+        }
+
+        fn peek(&mut self) -> Result<Option<u8>> {
+            self.ensure(1)?;
+            Ok(self.buf.get(self.pos).copied())
+        }
+
+        fn bump(&mut self, out: &mut Vec<u8>) -> Result<Option<u8>> {
+            let b = self.peek()?;
+            if let Some(b) = b {
+                out.push(b);
+                self.pos += 1;
+            }
+            Ok(b)
+        }
+
+        fn take(&mut self, n: usize, out: &mut Vec<u8>) -> Result<()> {
+            for _ in 0..n {
+                if self.bump(out)?.is_none() {
+                    bail!("unexpected end of content.xml");
+                }
+            }
+            Ok(())
+        }
+
+        /// Advances past `n` already-inspected bytes without copying them.
+        fn discard(&mut self, n: usize) -> Result<()> {
+            self.ensure(n)?;
+            self.pos += n.min(self.buf.len() - self.pos);
+            Ok(())
+        }
+
+        fn starts_with(&mut self, needle: &str) -> Result<bool> {
+            self.ensure(needle.len())?;
+            Ok(self.buf[self.pos..].starts_with(needle.as_bytes()))
+        }
+
+        fn skip_ws(&mut self) -> Result<()> {
+            while self.peek()?.is_some_and(|b| b.is_ascii_whitespace()) {
+                self.pos += 1;
+            }
+            Ok(())
+        }
+
+        fn copy_until(&mut self, needle: &str, out: &mut Vec<u8>) -> Result<()> {
+            loop {
+                if self.starts_with(needle)? {
+                    self.take(needle.len(), out)?;
+                    return Ok(());
+                }
+                if self.bump(out)?.is_none() {
+                    bail!("unterminated XML construct (expected {needle:?})");
+                }
+            }
+        }
+
+        fn skip_until(&mut self, needle: &str) -> Result<()> {
+            let mut sink = Vec::new();
+            self.copy_until(needle, &mut sink)
+        }
+
+        /// Skips whitespace, comments, PIs and a DOCTYPE - the same set
+        /// `xml_skip_misc` skips over a resident buffer. Stops at the
+        /// next `<` beginning a real tag, or at a non-`<` byte the
+        /// caller handles itself.
+        fn skip_misc(&mut self) -> Result<()> {
+            loop {
+                self.skip_ws()?;
+                if self.starts_with("<!--")? {
+                    self.skip_until("-->")?;
+                } else if self.starts_with("<?")? {
+                    self.skip_until("?>")?;
+                } else if self.starts_with("<!")? {
+                    self.skip_until(">")?;
+                } else {
+                    return Ok(());
+                }
+            }
+        }
+
+        /// With the cursor at `<`, copies the whole `<name ...>...</name>`
+        /// (or `<name/>`) subtree into `out`, tracking tag-nesting depth;
+        /// comments/PIs/CDATA are opaque and a `>` inside a quoted
+        /// attribute value doesn't close a tag. Same logic as
+        /// `xml_support::XmlWindow::scan_element`.
+        fn scan_element(&mut self, out: &mut Vec<u8>) -> Result<()> {
+            out.clear();
+            let mut depth: usize = 0;
+            loop {
+                if self.starts_with("<!--")? {
+                    self.copy_until("-->", out)?;
+                } else if self.starts_with("<![CDATA[")? {
+                    self.copy_until("]]>", out)?;
+                } else if self.starts_with("<?")? {
+                    self.copy_until("?>", out)?;
+                } else if self.starts_with("</")? {
+                    self.take(2, out)?;
+                    self.copy_until(">", out)?;
+                    depth = depth.checked_sub(1).context("unbalanced XML close tag")?;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                } else if self.peek()? == Some(b'<') {
+                    self.bump(out)?; // '<'
+                    let (mut in_dq, mut in_sq, mut last_sig) = (false, false, b'<');
+                    loop {
+                        let Some(b) = self.bump(out)? else {
+                            bail!("unterminated XML start tag");
+                        };
+                        match b {
+                            b'"' if !in_sq => in_dq = !in_dq,
+                            b'\'' if !in_dq => in_sq = !in_sq,
+                            b'>' if !in_dq && !in_sq => break,
+                            _ => {}
+                        }
+                        if !b.is_ascii_whitespace() && !in_dq && !in_sq {
+                            last_sig = b;
+                        }
+                    }
+                    if last_sig != b'/' {
+                        depth += 1;
+                    }
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                } else if self.bump(out)?.is_none() {
+                    bail!("unexpected end of content.xml inside an element");
+                }
+            }
+        }
+
+        /// Consumes one element start tag at the cursor (`<name ...>` or
+        /// `<name .../>`), returning name/attrs/self-closing via the
+        /// module's own `&str`-based `xml_parse_name`/`xml_parse_attrs`
+        /// over the scanned tag bytes. Leaves the cursor just past `>`.
+        fn consume_start_tag(&mut self) -> Result<OdsStartTag> {
+            if self.peek()? != Some(b'<') {
+                bail!("expected an element start tag in content.xml");
+            }
+            let mut tag = Vec::new();
+            self.bump(&mut tag)?; // '<'
+            let (mut in_dq, mut in_sq) = (false, false);
+            loop {
+                let Some(b) = self.bump(&mut tag)? else {
+                    bail!("unterminated element start tag in content.xml");
+                };
+                match b {
+                    b'"' if !in_sq => in_dq = !in_dq,
+                    b'\'' if !in_dq => in_sq = !in_sq,
+                    b'>' if !in_dq && !in_sq => break,
+                    _ => {}
+                }
+            }
+            let s = std::str::from_utf8(&tag).context("content.xml is not valid UTF-8")?;
+            let mut p = 1usize; // past '<'
+            let name = xml_parse_name(s, &mut p)?.to_string();
+            let attrs = xml_parse_attrs(s, &mut p)?;
+            xml_skip_ws(s.as_bytes(), &mut p);
+            let self_closing = xml_starts_with(s.as_bytes(), p, "/>");
+            Ok((name, attrs, self_closing))
+        }
+
+        /// The name of the element at the cursor (cursor unchanged), for
+        /// dispatching a container's children without scanning a full
+        /// subtree. A non-UTF-8 name comes back lossily - it just won't
+        /// match any container name the caller checks for.
+        fn peek_element_name(&mut self) -> Result<String> {
+            self.ensure(256)?;
+            let rest = &self.buf[self.pos..];
+            let after = rest.strip_prefix(b"<").unwrap_or(rest);
+            let end = after
+                .iter()
+                .position(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/' || b == b'=')
+                .unwrap_or(after.len());
+            Ok(String::from_utf8_lossy(&after[..end]).into_owned())
+        }
+
+        /// Scans one element subtree at the cursor and discards it.
+        fn skip_element(&mut self) -> Result<()> {
+            let mut sink = Vec::new();
+            self.scan_element(&mut sink)
+        }
     }
 
     /// An empty `<table:table>` (no rows, or self-closing) profiles as a
@@ -48815,42 +49003,47 @@ mod xlsx_support {
         vec![ColumnAccumulatorState::new().into_profile(String::new(), 0)]
     }
 
-    /// Streams one `<table:table>`'s rows off `xml` starting at `*pos`
-    /// (positioned just past that table's own start tag), folding each
-    /// `<table:table-row>` subtree's cells into per-column
-    /// `ColumnAccumulatorState`s exactly as `ods_parse_sheet` +
-    /// `SheetGrid::into_column_profiles` did over a whole-DOM tree - so a
-    /// sheet's rows are never all resident at once, and no `SheetGrid`
-    /// of sparse cells is ever built. Leaves `*pos` just past the
-    /// matching `</table:table>`. Logical row 0 is the header;
-    /// `table:number-rows-repeated` / `-columns-repeated` advance logical
-    /// position without materializing an empty repeat.
-    fn ods_stream_table_profiles(
-        xml: &str,
-        pos: &mut usize,
+    /// Streams one `<table:table>`'s rows off `win` (cursor just past
+    /// that table's own start tag), folding each `<table:table-row>`
+    /// subtree's cells into per-column `ColumnAccumulatorState`s exactly
+    /// as `ods_parse_sheet` + `SheetGrid::into_column_profiles` did over
+    /// a whole-DOM tree - so a sheet's rows are never all resident at
+    /// once, and no `SheetGrid` of sparse cells is ever built. Leaves
+    /// the cursor just past the matching `</table:table>`. Logical row 0
+    /// is the header; `table:number-rows-repeated` / `-columns-repeated`
+    /// advance logical position without materializing an empty repeat.
+    fn ods_stream_table_profiles<R: std::io::Read>(
+        win: &mut OdsXmlWindow<R>,
+        path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let bytes = xml.as_bytes();
         let mut header: Vec<Option<String>> = Vec::new();
         let mut states: Vec<ColumnAccumulatorState> = Vec::new();
         let mut max_row = 0usize;
         let mut max_col = 0usize;
         let mut row_pos = 0usize;
+        let mut span: Vec<u8> = Vec::new();
 
         loop {
-            xml_skip_misc(bytes, pos)?;
-            if *pos >= bytes.len() || xml_starts_with(bytes, *pos, "</table:table>") {
-                if xml_starts_with(bytes, *pos, "</table:table>") {
-                    *pos += "</table:table>".len();
-                }
+            win.skip_misc()?;
+            if win.starts_with("</table:table>")? {
+                win.discard("</table:table>".len())?;
                 break;
             }
-            if bytes.get(*pos) != Some(&b'<') {
-                *pos += 1;
-                continue;
+            match win.peek()? {
+                None => break,
+                Some(b'<') => {}
+                Some(_) => {
+                    win.discard(1)?;
+                    continue;
+                }
             }
-            let row_el = xml_parse_element(xml, pos)?;
+            win.scan_element(&mut span)?;
+            let text = std::str::from_utf8(&span)
+                .with_context(|| format!("content.xml in {path:?} is not valid UTF-8"))?;
+            let mut p = 0usize;
+            let row_el = xml_parse_element(text, &mut p)?;
             if row_el.name != "table:table-row" {
                 continue;
             }
@@ -48936,23 +49129,22 @@ mod xlsx_support {
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
         let mut zip = ZipArchive::open(path)?;
-        let content_bytes = zip
-            .read("content.xml")
+        let mut content = zip
+            .read_to_temp("content.xml")
             .context("no content.xml in ODF archive")?;
-        let content_xml =
-            String::from_utf8(content_bytes).context("content.xml is not valid UTF-8")?;
-        let bytes = content_xml.as_bytes();
+        let mut win = OdsXmlWindow::new(std::io::BufReader::new(content.as_file_mut()));
 
         let no_spreadsheet = || anyhow!("no <office:spreadsheet> element in {path:?}");
 
         // Walk `<office:document-content>` -> `<office:body>` ->
-        // `<office:spreadsheet>` by consuming only each container's own
-        // start tag and discarding non-matching siblings, so the sheet
-        // data is never parsed into one DOM. Only `<table:table-row>`
-        // subtrees are ever materialized, one at a time.
-        let mut pos = 0usize;
-        xml_skip_misc(bytes, &mut pos)?;
-        let (_root, _root_attrs, root_sc) = ods_consume_start_tag(&content_xml, &mut pos)?;
+        // `<office:spreadsheet>`, consuming only each container's own
+        // start tag and skipping non-matching siblings' whole subtrees,
+        // so the sheet data is never parsed into one DOM. Only
+        // `<table:table-row>` subtrees are ever materialized, one at a
+        // time, off a bounded byte window over the decompressed
+        // `content.xml` temp file.
+        win.skip_misc()?;
+        let (_root, _root_attrs, root_sc) = win.consume_start_tag()?;
         if root_sc {
             return Err(no_spreadsheet());
         }
@@ -48963,20 +49155,20 @@ mod xlsx_support {
         ] {
             let mut entered = false;
             loop {
-                xml_skip_misc(bytes, &mut pos)?;
-                if pos >= bytes.len() || xml_starts_with(bytes, pos, close_tag) {
+                win.skip_misc()?;
+                if win.peek()?.is_none() || win.starts_with(close_tag)? {
                     break;
                 }
-                if bytes.get(pos) != Some(&b'<') {
-                    pos += 1;
+                if win.peek()? != Some(b'<') {
+                    win.discard(1)?;
                     continue;
                 }
-                if ods_peek_element_name(&content_xml, pos)? == container {
-                    let (_n, _a, sc) = ods_consume_start_tag(&content_xml, &mut pos)?;
+                if win.peek_element_name()? == container {
+                    let (_n, _a, sc) = win.consume_start_tag()?;
                     entered = !sc;
                     break;
                 }
-                let _discard = xml_parse_element(&content_xml, &mut pos)?;
+                win.skip_element()?;
             }
             if !entered {
                 return Err(no_spreadsheet());
@@ -48985,16 +49177,16 @@ mod xlsx_support {
 
         let mut out: Vec<(String, Vec<ColumnProfile>)> = Vec::new();
         loop {
-            xml_skip_misc(bytes, &mut pos)?;
-            if pos >= bytes.len() || xml_starts_with(bytes, pos, "</office:spreadsheet>") {
+            win.skip_misc()?;
+            if win.peek()?.is_none() || win.starts_with("</office:spreadsheet>")? {
                 break;
             }
-            if bytes.get(pos) != Some(&b'<') {
-                pos += 1;
+            if win.peek()? != Some(b'<') {
+                win.discard(1)?;
                 continue;
             }
-            if ods_peek_element_name(&content_xml, pos)? == "table:table" {
-                let (_n, attrs, sc) = ods_consume_start_tag(&content_xml, &mut pos)?;
+            if win.peek_element_name()? == "table:table" {
+                let (_n, attrs, sc) = win.consume_start_tag()?;
                 let name = attrs
                     .iter()
                     .find(|(k, _)| k == "table:name")
@@ -49003,12 +49195,12 @@ mod xlsx_support {
                 let profiles = if sc {
                     ods_empty_table_profiles()
                 } else {
-                    ods_stream_table_profiles(&content_xml, &mut pos, nrows, n_samples)?
+                    ods_stream_table_profiles(&mut win, path, nrows, n_samples)?
                 };
                 out.push((name, profiles));
                 continue;
             }
-            let _discard = xml_parse_element(&content_xml, &mut pos)?;
+            win.skip_element()?;
         }
 
         if out.is_empty() {

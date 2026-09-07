@@ -33,6 +33,34 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/streaming-ods-window` branch (Darwin arm64)
+
+`.ods` drops its `content.xml` residual. `columns_from_ods` now
+`read_to_temp`s `content.xml` and drives an `OdsXmlWindow` (64 KiB-refill
+byte window over the temp `File`, sibling of `xml_support::XmlWindow`):
+the container walk consumes each start tag off the window and
+`scan_element`-skips non-matching sibling subtrees; each
+`<table:table-row>` is scanned into a reused buffer then handed to the
+unchanged `xml_parse_element` + cell-folding logic. Byte-identical to the
+resident-`String` byte-walk of the previous phase (repeated rows/cols,
+header = logical row 0, `--nrows` bounds folding not the scan).
+
+Measured on the same 11 MB / 400,000-row `.ods` (271 MB decompressed
+`content.xml`), stacking on the previous phase: maxRSS 292-351 MB ->
+~2.8 MB (~99%), peak footprint 283-342 MB -> ~1.5 MB (~99.5%), 3 rounds -
+full `.ods` journey across both phases 2,648 MB -> 2.8 MB (~99.9%).
+Byte-identical output across the full 359-file corpus in all three
+formats with `--nrows` unset/1/2 (3,258 combinations) plus a
+3,000-iteration hand-built-`.ods` fuzz (multi-table, repeated rows/cells,
+covered cells, comments/PIs between rows, empty/self-closing tables,
+styles/scripts/calc-settings siblings, 1M-row trailing empty repeat,
+stored + DEFLATE `content.xml`). Full suite
+(`ods_reader_matches_calamine_output_exactly` unchanged) + clippy/fmt
+clean across default/`xlsx`/`npy`/`full`, established baselines. `.xlsx`/
+`.xlsb` still use whole-entry `read`.
+
+---
+
 ## 2026-09-08 — `feat/streaming-zip-entry` branch (Darwin arm64)
 
 `ZipArchive` gains `read_to_temp(name)`: inflates one entry straight into

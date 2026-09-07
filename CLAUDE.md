@@ -5458,22 +5458,59 @@ DEFLATE-compressed zip entries) crossed with `--nrows`/output format -
 zero mismatches. `zip_archive_reads_and_verifies_real_xlsx_entries` gains
 a direct `read_to_temp`-vs-`read` byte-equality check on every entry of
 `sample.xlsx`. Full test suite and clippy/fmt clean across
-default/`npy`/`xlsx`/`full` (each individually, since `read`/
-`read_to_temp` are now each used by only one of the two zip features
-until the others are converted - both carry a narrow `#[allow(dead_code)]`
-noting which combos still need them), established baselines.
+default/`npy`/`xlsx`/`full` (each individually), established baselines -
+`read` carries a narrow `#[allow(dead_code)]` since a bare `--features
+npy` build's only zip consumer (`.npz`) now takes `read_to_temp`.
+
+**`.ods` then dropped its `content.xml` residual - it now walks a bounded
+byte window over the decompressed temp file, holding no copy of it.**
+`columns_from_ods` calls `ZipArchive::read_to_temp("content.xml")` (Phase
+above) and drives an `OdsXmlWindow` - a 64 KiB-refill byte window over
+the temp `File`, the direct sibling of `xml_support`'s `XmlWindow` and
+the JSON reader's `ByteWindow` (a deliberate small duplication, since
+`xml` and `xlsx` are independently gated). The container walk
+(`<office:document-content>` -> `<office:body>` -> `<office:spreadsheet>`)
+now consumes each container's start tag off the window and `scan_element`
+-skips non-matching siblings' whole subtrees without materializing them;
+each `<table:table-row>` is `scan_element`-ed into a reused buffer, then
+handed to the existing `xml_parse_element` -> the unchanged cell-folding
+logic. Output stays byte-identical to the resident-`String` byte-walk the
+previous phase established (same repeated-row/col semantics, header =
+logical row 0, `--nrows` bounds folding not the `max_row`/`max_col`
+scan). The one behavior change: the old whole-file `String::from_utf8`
+gate becomes a per-row `from_utf8` on each scanned span (plus the start
+tags), so invalid UTF-8 outside any row is no longer a hard error up
+front - the same "streaming reader isn't the malformed-input authority"
+tradeoff the top-level XML/YAML byte-window phases already carry.
+
+Measured on the same hand-built 11 MB, 400,000-row `.ods` (271 MB
+decompressed `content.xml`), stacking on the previous phase's own
+`content.xml`-resident result: maxRSS 292-351 MB -> ~2.8 MB (~99%), peak
+footprint 283-342 MB -> ~1.5 MB (~99.5%), 3 rounds - the full `.ods`
+journey across both phases is 2,648 MB -> 2.8 MB (~99.9%). Output
+byte-identical via `diff` against the pre-change binary across the entire
+359-file fixture corpus in all three output formats with `--nrows`
+unset/1/2 (3,258 combinations), plus a 3,000-iteration old-vs-new fuzz
+over hand-built `.ods` files (1-3 tables, repeated rows/cells, covered
+cells, comments and PIs between rows, `<table:table-column>` headers,
+empty/self-closing tables, `<table:calculation-settings>` /
+`<table:named-expressions>` / `<office:automatic-styles>` /
+`<office:scripts>` siblings, a 1,048,570-row trailing empty repeat, both
+stored and DEFLATE-compressed `content.xml` entries) crossed with
+`--nrows`/`--samples`/output format - zero mismatches. Full test suite
+(`ods_reader_matches_calamine_output_exactly` and the real-scale
+repeated-cells test unchanged and passing) and clippy/fmt clean across
+default/`xlsx`/`npy`/`full`, established baselines.
 
 **Every streamable JSON, YAML, homogeneous-records XML, `.ods`, and
 `.npz` shape now streams with no whole-document DOM or whole-entry buffer
 on top of its source bytes.** What remains materialized:
-- `.xlsx`/`.ods`/`.xlsb` still call `ZipArchive::read` (whole-entry
-  `Vec<u8>`) rather than `read_to_temp` - their byte-walk parsers are
-  `&str`/`&[u8]`-based, so routing through a temp file needs each one
-  converted to a windowed `Read` reader first (the same
-  `stream_xml_records`-style scan the top-level XML reader already uses).
-  `read_to_temp` is the infrastructure for that; the consumers aren't
-  converted yet. `.ods`'s ~271 MB `content.xml` residual and `.xlsx`'s
-  ~150-200 MB sheet-XML residual are what this would remove.
+- `.xlsx`/`.xlsb` still call `ZipArchive::read` (whole-entry `Vec<u8>`)
+  rather than `read_to_temp` - `.xlsx`'s `xlsx_parse_sheet_profiles` is
+  an `&str` byte-walk that would take the same `OdsXmlWindow`-style
+  conversion `.ods` just got (its ~150-200 MB sheet-XML residual is the
+  target); `.xlsx`'s shared-strings table and `.xlsb`'s binary `.bin`
+  record parsers would each need their own `Read`-based rework.
 - `.xls`/`.xlsb` also still build a `SheetGrid` from a resident record
   stream (the OLE2 `Workbook` stream / decompressed OOXML `.bin` parts).
   Both could fold records into accumulators as they're read, but the
