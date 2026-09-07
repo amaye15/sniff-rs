@@ -5423,14 +5423,63 @@ prelude, a 1,048,570-row trailing empty repeat) crossed with
 repeated-cells test unchanged and passing) and clippy/fmt clean across
 default/`xlsx`/`full`, established baselines.
 
-**Every streamable JSON, YAML, homogeneous-records XML, and `.ods` shape
-now streams with no whole-document DOM on top of its source bytes.** What
-remains materialized:
-- `.xls`/`.xlsb` still build a `SheetGrid` from a resident record stream
-  (the OLE2 `Workbook` stream / decompressed OOXML `.bin` parts). Both
-  could fold records into accumulators as they're read, but the record
-  stream itself stays resident regardless (the CFB / `ZipArchive::read`
-  gap below), so the win would be smaller than `.xlsx`/`.ods` saw.
+**`ZipArchive` then got a per-entry streaming-decompression path, and
+`.npz` was wired through it** - the shared floor under every zip-based
+format (`.xlsx`/`.ods`/`.xlsb`/`.npz`). `ZipArchive::read` returns one
+resident `Vec<u8>` of an entry's whole decompressed content;
+`ZipArchive::read_to_temp` instead inflates the entry straight into a
+`TempFile`, reusing the already-tested `inflate_to` + `GzipStreamSink`
+(the same windowed sink the streaming `.gz`-file path uses), so peak
+memory during decompression is the ~128 KiB DEFLATE flush window plus a
+64 KiB read buffer, not the uncompressed size. CRC-32 and uncompressed
+length are verified incrementally against the entry's central-directory
+record (via `GzipStreamSink`'s own `Crc32Incremental`, or a direct
+running CRC for a stored entry), exactly as `read` checks them over a
+whole buffer; the returned `TempFile` is rewound and ready to `Read`.
+`columns_from_npz` now calls `read_to_temp` and hands the temp file's
+`File` straight to `read_npy_header` + `columns_from_npy_reader` (both
+already `Read`-based), in place of a `Cursor` over the resident bytes -
+so a `.npz` holding many large arrays never materializes more than one
+array's decompressed bytes on disk (not in RAM) at a time. This is the
+`decompress_if_needed` temp-file pattern (already used for whole `.gz`/
+`.zst` files) applied per zip entry: it trades a bounded disk write for
+an unbounded RAM buffer.
+
+Measured on a 69 MB `.npz` (40x 200k-element `float64` arrays, a
+2M-element int array, a 2-D array, a structured array, a 3-D array that
+stays a disclosed per-array error): maxRSS 59-67 MB -> ~4.2 MB (~93%),
+peak footprint 29-33 MB -> ~3.0 MB (~90%), 3 rounds. Output confirmed
+byte-identical via `diff` against the pre-change binary across the entire
+359-file fixture corpus in all three output formats with `--nrows`
+unset/1/2 (3,258 combinations), plus a 600-iteration old-vs-new fuzz over
+`np.savez` / `np.savez_compressed` archives (1-6 arrays each, mixed
+dtypes, 1-D/2-D/structured/3-D/empty shapes - both stored and
+DEFLATE-compressed zip entries) crossed with `--nrows`/output format -
+zero mismatches. `zip_archive_reads_and_verifies_real_xlsx_entries` gains
+a direct `read_to_temp`-vs-`read` byte-equality check on every entry of
+`sample.xlsx`. Full test suite and clippy/fmt clean across
+default/`npy`/`xlsx`/`full` (each individually, since `read`/
+`read_to_temp` are now each used by only one of the two zip features
+until the others are converted - both carry a narrow `#[allow(dead_code)]`
+noting which combos still need them), established baselines.
+
+**Every streamable JSON, YAML, homogeneous-records XML, `.ods`, and
+`.npz` shape now streams with no whole-document DOM or whole-entry buffer
+on top of its source bytes.** What remains materialized:
+- `.xlsx`/`.ods`/`.xlsb` still call `ZipArchive::read` (whole-entry
+  `Vec<u8>`) rather than `read_to_temp` - their byte-walk parsers are
+  `&str`/`&[u8]`-based, so routing through a temp file needs each one
+  converted to a windowed `Read` reader first (the same
+  `stream_xml_records`-style scan the top-level XML reader already uses).
+  `read_to_temp` is the infrastructure for that; the consumers aren't
+  converted yet. `.ods`'s ~271 MB `content.xml` residual and `.xlsx`'s
+  ~150-200 MB sheet-XML residual are what this would remove.
+- `.xls`/`.xlsb` also still build a `SheetGrid` from a resident record
+  stream (the OLE2 `Workbook` stream / decompressed OOXML `.bin` parts).
+  Both could fold records into accumulators as they're read, but the
+  record stream itself stays resident regardless (the CFB /
+  `ZipArchive::read` gap), so the win would be smaller than `.xlsx`/
+  `.ods` saw.
 - **A single TOML or YAML document, or an XML tree with a non-
   homogeneous root**: one value with no internal record boundary.
   `toml_support`/`xml_support` are still `&str`-buffer parsers for these
@@ -5439,9 +5488,6 @@ remains materialized:
   The parse tree is the irreducible cost for a lone document; the
   source-text copy on top is bounded by one document's size, and these
   inputs are rarely large enough for it to matter.
-- Per-entry streaming decompression inside `ZipArchive::read` (which
-  would shave the residual off the OOXML `.xlsx` number and the `.ods`/
-  `.xlsb` readers) remains a real, disclosed, separately-scoped gap.
 
 ## Cloud-platform file compatibility
 

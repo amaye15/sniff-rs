@@ -44324,14 +44324,13 @@ mod npy_support {
         let mut out = Vec::new();
         for (array_name, entry_name) in names {
             let read_result = archive
-                .read(&entry_name)
+                .read_to_temp(&entry_name)
                 .with_context(|| format!("failed reading array '{array_name}' from {path:?}"))
-                .and_then(|bytes| {
-                    let mut cursor = std::io::Cursor::new(bytes);
-                    let header = read_npy_header(&mut cursor).with_context(|| {
+                .and_then(|mut tmp| {
+                    let header = read_npy_header(tmp.as_file_mut()).with_context(|| {
                         format!("failed to parse array '{array_name}' in {path:?} as .npy data")
                     })?;
-                    columns_from_npy_reader(header, cursor, nrows, n_samples)
+                    columns_from_npy_reader(header, tmp.as_file_mut(), nrows, n_samples)
                 });
 
             let profiles = match read_result {
@@ -47609,6 +47608,13 @@ mod zip_support {
         /// an entry's compressed bytes means seeking this archive's own
         /// shared `File` handle, which needs a mutable borrow the same way
         /// any other `Read`/`Seek` call would.
+        ///
+        /// `#[allow(dead_code)]`: the `.xlsx`/`.xlsb` readers and this
+        /// module's own tests still use this whole-buffer form, but a
+        /// bare `--features npy` build (whose only zip consumer, `.npz`,
+        /// now takes the streaming `read_to_temp` path) has no caller
+        /// left for it.
+        #[allow(dead_code)]
         pub(crate) fn read(&mut self, name: &str) -> Result<Vec<u8>> {
             let entry = self
                 .name_index
@@ -47664,6 +47670,112 @@ mod zip_support {
                 );
             }
             Ok(decompressed)
+        }
+
+        /// Like `read`, but streams the entry's decompressed bytes into a
+        /// temporary file instead of returning one resident `Vec<u8>` -
+        /// peak memory stays bounded by the DEFLATE sliding window
+        /// (`GzipStreamSink`, ~128 KiB) plus a small read buffer,
+        /// regardless of the entry's uncompressed size. The CRC-32 and
+        /// uncompressed length are verified incrementally against the
+        /// entry's central-directory record, exactly as `read` checks
+        /// them over a whole buffer. The returned `TempFile` is rewound
+        /// to its start, ready to `Read`.
+        ///
+        /// `#[allow(dead_code)]`: `.npz` (the `--features npy` reader)
+        /// uses this; a bare `--features xlsx` build's zip consumers
+        /// (`.xlsx`/`.xlsb`) still take the whole-buffer `read` path, so
+        /// they leave this unused until they're converted too.
+        #[allow(dead_code)]
+        pub(crate) fn read_to_temp(&mut self, name: &str) -> Result<TempFile> {
+            let (
+                method,
+                compressed_size,
+                uncompressed_size,
+                crc_expected,
+                local_header_offset,
+                entry_name,
+            ) = {
+                let entry = self
+                    .name_index
+                    .get(name)
+                    .map(|&i| &self.entries[i])
+                    .ok_or_else(|| anyhow!("zip archive has no entry named '{name}'"))?;
+                (
+                    entry.method,
+                    entry.compressed_size,
+                    entry.uncompressed_size,
+                    entry.crc32,
+                    entry.local_header_offset,
+                    entry.name.clone(),
+                )
+            };
+
+            self.file
+                .seek(SeekFrom::Start(u64::from(local_header_offset)))
+                .context("failed seeking to a zip local file header")?;
+            let mut header = [0u8; ZIP_LOCAL_HEADER_SIZE];
+            self.file
+                .read_exact(&mut header)
+                .context("truncated zip local header")?;
+            if header[0..4] != ZIP_LOCAL_HEADER_SIG {
+                bail!("invalid zip local file header signature for '{entry_name}'");
+            }
+            let name_len = zip_read_u16(&header, 26)? as usize;
+            let extra_len = zip_read_u16(&header, 28)? as usize;
+            self.file
+                .seek(SeekFrom::Current((name_len + extra_len) as i64))
+                .context("failed seeking past a zip entry's name/extra fields")?;
+
+            let mut tmp = TempFile::new()?;
+            let data = std::io::BufReader::new((&mut self.file).take(u64::from(compressed_size)));
+
+            let (crc_got, len_got) = match method {
+                0 => {
+                    let mut data = data;
+                    let mut crc = Crc32Incremental::new();
+                    let mut written: u64 = 0;
+                    let mut buf = [0u8; 64 * 1024];
+                    loop {
+                        let n = data.read(&mut buf).with_context(|| {
+                            format!("truncated zip entry data for '{entry_name}'")
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        crc.update(&buf[..n]);
+                        std::io::Write::write_all(&mut tmp, &buf[..n])
+                            .context("failed writing decompressed zip data to a temp file")?;
+                        written += n as u64;
+                    }
+                    (crc.finish(), written)
+                }
+                8 => {
+                    let mut sink = GzipStreamSink::new(&mut tmp);
+                    inflate_to(data, &mut sink)
+                        .with_context(|| format!("failed to inflate zip entry '{entry_name}'"))?;
+                    sink.finish()?
+                }
+                other => bail!(
+                    "unsupported zip compression method {other} for '{entry_name}' - only stored (0) and deflate (8) are supported"
+                ),
+            };
+
+            if len_got != u64::from(uncompressed_size) {
+                bail!(
+                    "zip entry '{entry_name}' decompressed to {len_got} bytes, expected {uncompressed_size}"
+                );
+            }
+            if crc_got != crc_expected {
+                bail!(
+                    "zip CRC32 checksum mismatch for '{entry_name}' - the file is corrupt or truncated"
+                );
+            }
+
+            tmp.as_file_mut()
+                .seek(SeekFrom::Start(0))
+                .context("failed rewinding a decompressed zip temp file")?;
+            Ok(tmp)
         }
     }
 } // mod zip_support
@@ -53473,6 +53585,13 @@ mod tests {
             let bytes = archive.read(name).unwrap();
             assert_eq!(bytes.len() as u32, size, "{name}: size");
             assert_eq!(crc32(&bytes), crc, "{name}: crc32");
+
+            // The streaming form must decompress to the identical bytes,
+            // verifying its own incremental CRC/length checks pass too.
+            let mut tmp = archive.read_to_temp(name).unwrap();
+            let mut streamed = Vec::new();
+            std::io::Read::read_to_end(tmp.as_file_mut(), &mut streamed).unwrap();
+            assert_eq!(streamed, bytes, "{name}: read_to_temp vs read");
         }
         let workbook = archive.read("xl/workbook.xml").unwrap();
         let text = String::from_utf8(workbook).unwrap();

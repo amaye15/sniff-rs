@@ -33,6 +33,33 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/streaming-zip-entry` branch (Darwin arm64)
+
+`ZipArchive` gains `read_to_temp(name)`: inflates one entry straight into
+a `TempFile` (reusing `inflate_to` + `GzipStreamSink`, the windowed sink
+the `.gz`-file path already uses), verifying CRC-32 / uncompressed length
+incrementally - peak decompression memory is the ~128 KiB DEFLATE flush
+window, not the uncompressed size. `columns_from_npz` now uses it,
+handing the temp file's `File` to `read_npy_header` +
+`columns_from_npy_reader` (already `Read`-based) instead of a `Cursor`
+over the resident `Vec<u8>`. Trades a bounded disk write for an unbounded
+RAM buffer, the `decompress_if_needed` pattern applied per zip entry.
+
+Measured on a 69 MB `.npz` (40x 200k `float64` + a 2M int + 2-D +
+structured + 3-D array): maxRSS 59-67 MB -> ~4.2 MB (~93%), peak
+footprint 29-33 MB -> ~3.0 MB (~90%), 3 rounds. Byte-identical output
+across the full 359-file corpus in all three formats with `--nrows`
+unset/1/2 (3,258 combinations) plus a 600-iteration `np.savez` /
+`np.savez_compressed` fuzz (1-6 arrays, mixed dtypes, 1-D/2-D/structured/
+3-D/empty, stored + deflated entries). Full suite (a `read_to_temp`-vs-
+`read` byte-equality check added to `zip_archive_reads_and_verifies_
+real_xlsx_entries`) + clippy/fmt clean across default/`npy`/`xlsx`/`full`,
+established baselines. `.xlsx`/`.ods`/`.xlsb` still use whole-entry
+`read` until their `&str`-based parsers are converted to a windowed
+`Read`.
+
+---
+
 ## 2026-09-08 — `feat/streaming-ods-rows` branch (Darwin arm64)
 
 `.ods` no longer parses `content.xml` into one DOM. `columns_from_ods`
