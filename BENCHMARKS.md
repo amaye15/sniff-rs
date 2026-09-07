@@ -33,6 +33,29 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/streaming-json-bytes` branch (Darwin arm64)
+
+The JSON reader now reads straight off a byte stream with no resident
+source copy. `json_support::stream_top_level` is a structural boundary
+scanner over a bounded `ByteWindow` (64 KiB refill over any `Read`): it
+tracks string state + `{}`/`[]` depth to find each top-level value's
+byte span, then hands that complete span to the existing `from_str` for
+the real parse. A top-level array yields one element span at a time; a
+single document yields one. `from_str_top_array_each` and
+`read_json_single_document` deleted; `columns_from_json` is now just
+"JSON Lines vs. `stream_top_level`".
+
+Measured on a 147 MB, 1,000,000-element JSON array: maxRSS 149 MB ->
+~2.6 MB (~98%), peak footprint 148 MB -> ~1.5 MB (~99%), 3 rounds - no
+file copy resident at all. Byte-identical output across the full 359-file
+corpus in all three formats with `--nrows` unset/1/2 (3,231
+combinations) plus a 600-iteration fuzz (array/single-doc/scalar shapes,
+tricky string contents, indent + whitespace variations). Full suite
+(four new `stream_top_level` unit tests) + clippy/fmt clean across
+default/`full`, established baselines.
+
+---
+
 ## 2026-09-06 — `feat/streaming-yaml-multidoc` branch (Darwin arm64)
 
 YAML `---`-multi-document stream streamed - the last shape with a record

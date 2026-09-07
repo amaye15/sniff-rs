@@ -263,6 +263,7 @@ mod json_support {
             matches!(self, Value::Null)
         }
 
+        #[allow(dead_code)] // feature-gated nested readers + tests; not the default build
         pub(crate) fn is_object(&self) -> bool {
             matches!(self, Value::Object(_))
         }
@@ -1480,50 +1481,198 @@ mod json_support {
         Ok(value)
     }
 
-    /// Streams the elements of a top-level JSON array (`[ ... ]`) one at a
-    /// time via `on_element`, without ever collecting them into a
-    /// `Vec<Value>`. The input string itself is still fully resident (this
-    /// is an `&str` parser with no pull mode over a `Read`), but each
-    /// element's own `Value` tree is freed as soon as `on_element`
-    /// returns - so a huge array of records never holds them all at once.
-    /// Requires the input to be exactly one top-level array, aside from
-    /// leading/trailing whitespace (the same trailing-content rule
-    /// `from_str` enforces); every element is parsed (so a malformed one
-    /// still errors) even if `on_element` chooses to ignore it.
-    pub(crate) fn from_str_top_array_each(
-        s: &str,
-        mut on_element: impl FnMut(Value) -> std::result::Result<(), ParseError>,
-    ) -> std::result::Result<(), ParseError> {
-        let mut parser = Parser::new(s);
-        parser.skip_whitespace();
-        if parser.peek() != Some(b'[') {
-            return Err(parser.error("expected a top-level JSON array"));
+    /// A bounded byte-window over a `Read`, used by `stream_top_level`
+    /// below to find each top-level value's exact byte span without ever
+    /// holding the whole source resident. Keeps at most `CHUNK` unconsumed
+    /// bytes buffered (plus whatever a single in-progress value's span
+    /// needs); the consumed prefix is discarded on refill.
+    struct ByteWindow<R> {
+        reader: R,
+        buf: Vec<u8>,
+        pos: usize,
+        eof: bool,
+    }
+
+    impl<R: std::io::Read> ByteWindow<R> {
+        const CHUNK: usize = 64 * 1024;
+
+        fn new(reader: R) -> Self {
+            ByteWindow {
+                reader,
+                buf: Vec::new(),
+                pos: 0,
+                eof: false,
+            }
         }
-        parser.enter()?;
-        parser.pos += 1; // consume '['
-        parser.skip_whitespace();
-        if parser.peek() == Some(b']') {
-            parser.pos += 1;
-            parser.depth -= 1;
-        } else {
-            loop {
-                let value = parser.parse_value()?;
-                on_element(value)?;
-                parser.skip_whitespace();
-                match parser.peek() {
-                    Some(b',') => parser.pos += 1,
-                    Some(b']') => {
-                        parser.pos += 1;
-                        parser.depth -= 1;
-                        break;
+
+        /// Ensures at least one unconsumed byte is available if the stream
+        /// isn't exhausted. Returns `Err` only on a genuine I/O failure.
+        fn fill(&mut self) -> std::result::Result<(), ParseError> {
+            while self.pos >= self.buf.len() && !self.eof {
+                if self.pos > 0 {
+                    self.buf.drain(..self.pos);
+                    self.pos = 0;
+                }
+                let start = self.buf.len();
+                self.buf.resize(start + Self::CHUNK, 0);
+                match self.reader.read(&mut self.buf[start..]) {
+                    Ok(0) => {
+                        self.buf.truncate(start);
+                        self.eof = true;
                     }
-                    _ => return Err(parser.error("expected ',' or ']' in array")),
+                    Ok(n) => self.buf.truncate(start + n),
+                    Err(e) => {
+                        return Err(ParseError {
+                            message: format!("I/O error while reading JSON: {e}"),
+                            line: 0,
+                            column: 0,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn peek(&mut self) -> std::result::Result<Option<u8>, ParseError> {
+            self.fill()?;
+            Ok(self.buf.get(self.pos).copied())
+        }
+
+        fn bump(&mut self) -> std::result::Result<Option<u8>, ParseError> {
+            let b = self.peek()?;
+            if b.is_some() {
+                self.pos += 1;
+            }
+            Ok(b)
+        }
+
+        fn skip_ws(&mut self) -> std::result::Result<(), ParseError> {
+            while matches!(self.peek()?, Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.pos += 1;
+            }
+            Ok(())
+        }
+
+        fn err(&self, message: impl Into<String>) -> ParseError {
+            ParseError {
+                message: message.into(),
+                line: 0,
+                column: 0,
+            }
+        }
+
+        /// Consumes exactly one complete JSON value's bytes into `out`
+        /// (which is cleared first), by tracking string state and
+        /// `{}`/`[]` nesting depth - it never parses the value's meaning,
+        /// only finds where it ends. The caller then hands `out` to
+        /// `from_str` for real parsing/validation. A value is complete
+        /// once the scanner is outside any string, back at depth 0, has
+        /// consumed at least one byte, and the next byte is EOF,
+        /// whitespace, or one of `,` `]` `}`.
+        fn scan_value(&mut self, out: &mut Vec<u8>) -> std::result::Result<(), ParseError> {
+            out.clear();
+            let mut depth: i64 = 0;
+            let mut in_string = false;
+            let mut escaped = false;
+            loop {
+                match self.peek()? {
+                    None => {
+                        if in_string || depth != 0 || out.is_empty() {
+                            return Err(self.err("unexpected end of input inside a JSON value"));
+                        }
+                        return Ok(());
+                    }
+                    Some(b) => {
+                        if !in_string
+                            && depth == 0
+                            && !out.is_empty()
+                            && matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
+                        {
+                            return Ok(());
+                        }
+                        self.pos += 1;
+                        out.push(b);
+                        if in_string {
+                            if escaped {
+                                escaped = false;
+                            } else if b == b'\\' {
+                                escaped = true;
+                            } else if b == b'"' {
+                                in_string = false;
+                            }
+                        } else {
+                            match b {
+                                b'"' => in_string = true,
+                                b'{' | b'[' => depth += 1,
+                                b'}' | b']' => {
+                                    depth -= 1;
+                                    if depth < 0 {
+                                        return Err(self.err("unbalanced ']' or '}' in JSON"));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
         }
-        parser.skip_whitespace();
-        if parser.pos != parser.bytes.len() {
-            return Err(parser.error("trailing characters after a complete JSON value"));
+    }
+
+    /// Reads a JSON document straight off a byte stream, handing each
+    /// top-level value to `on_value` and freeing it before reading the
+    /// next - so peak memory is one bounded read buffer plus one value's
+    /// span and tree, never the whole source.
+    ///
+    /// A top-level array `[ ... ]` calls `on_value` once per element; any
+    /// other single top-level value calls it once. Trailing
+    /// non-whitespace after the document is a hard error, the same rule
+    /// `from_str` enforces. Each value's bytes are handed to `from_str`
+    /// for the real parse, so a malformed value still errors.
+    pub(crate) fn stream_top_level<R: std::io::Read>(
+        reader: R,
+        mut on_value: impl FnMut(Value) -> std::result::Result<(), ParseError>,
+    ) -> std::result::Result<(), ParseError> {
+        let mut win = ByteWindow::new(reader);
+        let mut span: Vec<u8> = Vec::new();
+        win.skip_ws()?;
+
+        let parse_span = |span: &[u8]| -> std::result::Result<Value, ParseError> {
+            let s = std::str::from_utf8(span).map_err(|e| ParseError {
+                message: format!("invalid UTF-8 in JSON: {e}"),
+                line: 0,
+                column: 0,
+            })?;
+            from_str(s)
+        };
+
+        if win.peek()? == Some(b'[') {
+            win.pos += 1; // consume '['
+            win.skip_ws()?;
+            if win.peek()? == Some(b']') {
+                win.pos += 1;
+            } else {
+                loop {
+                    win.scan_value(&mut span)?;
+                    on_value(parse_span(&span)?)?;
+                    win.skip_ws()?;
+                    match win.bump()? {
+                        Some(b',') => {
+                            win.skip_ws()?;
+                        }
+                        Some(b']') => break,
+                        _ => return Err(win.err("expected ',' or ']' in JSON array")),
+                    }
+                }
+            }
+        } else {
+            win.scan_value(&mut span)?;
+            on_value(parse_span(&span)?)?;
+        }
+
+        win.skip_ws()?;
+        if win.peek()?.is_some() {
+            return Err(win.err("trailing characters after a complete JSON value"));
         }
         Ok(())
     }
@@ -1543,6 +1692,55 @@ mod json_support {
     #[cfg(test)]
     mod parser_tests {
         use super::*;
+
+        fn stream_collect(bytes: &[u8]) -> std::result::Result<Vec<Value>, ParseError> {
+            let mut out = Vec::new();
+            stream_top_level(bytes, |v| {
+                out.push(v);
+                Ok(())
+            })?;
+            Ok(out)
+        }
+
+        #[test]
+        fn stream_top_level_yields_array_elements_and_handles_tricky_strings() {
+            // Structural characters inside strings must not affect the
+            // element-boundary scan (depth/string tracking, `\"` escapes).
+            let got = stream_collect(
+                r#"[ 1, {"k": "a]b,c{d"}, "x\"y", [true, null], "café" ]"#.as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(got.len(), 5);
+            assert_eq!(got[0], Value::from(1i64));
+            assert_eq!(got[2], Value::String("x\"y".to_string()));
+            assert_eq!(got[4], Value::String("café".to_string()));
+        }
+
+        #[test]
+        fn stream_top_level_reads_a_pretty_printed_single_object_across_newlines() {
+            let got = stream_collect(b"\n  {\n    \"a\": 1,\n    \"b\": [2, 3]\n  }\n").unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0], json!({"a": 1, "b": [2, 3]}));
+        }
+
+        #[test]
+        fn stream_top_level_empty_array_yields_nothing() {
+            assert_eq!(stream_collect(b"  [ ]  ").unwrap().len(), 0);
+        }
+
+        #[test]
+        fn stream_top_level_rejects_trailing_content_and_malformed_elements() {
+            // Trailing junk after a complete document.
+            assert!(stream_collect(b"[1, 2] 3").is_err());
+            assert!(stream_collect(b"{\"a\":1} extra").is_err());
+            // A structurally-scanned element that isn't valid JSON still
+            // errors when handed to the real parser.
+            assert!(stream_collect(b"[1, 2 3]").is_err());
+            assert!(stream_collect(b"[01]").is_err()); // leading zero
+            // Unbalanced / unterminated.
+            assert!(stream_collect(b"[1, 2").is_err());
+            assert!(stream_collect(b"{\"a\": [1, 2}").is_err());
+        }
 
         #[test]
         fn parses_every_literal_and_container_shape() {
@@ -12855,27 +13053,32 @@ fn first_non_blank_line(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Reads a single JSON document (object or scalar, possibly pretty-
-/// printed across multiple lines) into a one-element value list. The two
-/// streamable shapes are handled by `columns_from_json` before this is
-/// ever reached: JSON Lines via `profile_json_lines_streaming`, and a
-/// top-level array via `json_support::from_str_top_array_each`. A single
-/// multi-line document genuinely can't stream - the hand-rolled parser
-/// has no pull mode and there's no record boundary to stop on - so it
-/// stays a whole-buffer read, a disclosed gap (see CLAUDE.md's Streaming
-/// reads section).
-fn read_json_single_document(path: &Path) -> Result<Vec<JsonValue>> {
-    let Some(_first_line) = first_non_blank_line(path)? else {
-        // The file is empty or entirely whitespace - no JSON content at
-        // all, which every reader downstream of this treats as zero
-        // records rather than an error, matching every other lenient
-        // format's own "genuinely empty input -> an empty table" choice.
-        return Ok(Vec::new());
-    };
-    let content = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    json_support::from_str(&content)
-        .map(|v| vec![v])
-        .with_context(|| format!("failed to parse {path:?} as JSON"))
+/// Streams a JSON file that isn't JSON Lines - either a top-level array
+/// `[ ... ]` (one `on_value` call per element) or a single top-level
+/// value/document (one call) - straight off a `BufReader` via
+/// `json_support::stream_top_level`, never materializing the source text.
+/// Each value's own `Value` tree is folded into `profiler` and dropped
+/// before the next is read, so peak memory is a bounded read buffer plus
+/// one value's span, one value's tree, and the accumulator - not the
+/// whole file. `--nrows` still parses every value (a malformed one past
+/// the cutoff still errors) but only pushes the first `n`, matching the
+/// old collect-then-`truncate`-then-branch behavior byte for byte.
+fn stream_json_document(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+    let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+    json_support::stream_top_level(reader, |v| {
+        if nrows.is_none_or(|n| profiler.total < n) {
+            profiler.push(&v);
+        }
+        Ok(())
+    })
+    .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+    Ok(profiler.finish())
 }
 
 /// Incremental equivalent of `profile_json_path`'s old whole-slice body:
@@ -13110,6 +13313,14 @@ impl JsonPathAccumulator {
 /// just labelled. A thin wrapper over `JsonPathAccumulator` - the same
 /// "public entry point stays, the engine underneath is incremental" move
 /// `suggest_ideal_type` already made for its own Tier 2 conversion.
+///
+/// Since the JSON reader itself now streams every shape through
+/// `JsonRecordStreamProfiler`/`JsonPathAccumulator` directly, this
+/// wrapper and `profile_json_records` below are reached only from the
+/// feature-gated nested-format readers (Avro/TOML/YAML/XML/INI/Parquet
+/// nested columns) and the `#[cfg(test)]` unit tests - genuinely unused
+/// in a bare default build, hence the `#[allow(dead_code)]`.
+#[allow(dead_code)]
 fn profile_json_path(
     name: String,
     total: usize,
@@ -13154,6 +13365,7 @@ fn profile_json_path(
 /// "column is empty/all null" `ColumnProfile` for that case, rather than
 /// the column silently vanishing from the output because every value
 /// happened to be filtered out before the key was ever recorded.
+#[allow(dead_code)] // see profile_json_path's note - default-build-dead, used by feature readers/tests
 fn bucket_object_fields<'a>(
     objects: impl IntoIterator<Item = &'a json_support::Map>,
 ) -> Vec<(String, Vec<&'a JsonValue>)> {
@@ -13179,8 +13391,12 @@ fn bucket_object_fields<'a>(
 }
 
 /// Shared by any format that decodes to a list of named-field records
-/// (JSON files today, Avro below) - extracts top-level columns in
-/// first-seen order and profiles each, recursing into nested content.
+/// (the feature-gated Avro/TOML/YAML/XML/INI readers) - extracts
+/// top-level columns in first-seen order and profiles each, recursing
+/// into nested content. The JSON reader itself no longer goes through
+/// here (see `profile_json_path`'s note), hence the `#[allow(dead_code)]`
+/// for the bare default build.
+#[allow(dead_code)]
 fn profile_json_records(records: &[json_support::Map], n_samples: usize) -> Vec<ColumnProfile> {
     let total = records.len();
     // Top-level column extraction for every JSON/JSONL file this tool
@@ -13296,58 +13512,20 @@ fn columns_from_json(
         return Ok(Vec::new());
     };
 
-    // Top-level array: stream its elements one at a time over the
-    // (resident) file text via `from_str_top_array_each`, folding each
-    // straight into a `JsonRecordStreamProfiler` - byte-identical to the
-    // old "parse the whole `[...]` into a `Vec<Value>`, `truncate`, then
-    // dual-mode branch". Every element is still parsed (a malformed one
-    // still errors) even past `--nrows`, which only bounds what's pushed.
-    if first_line.trim_start().starts_with('[') {
-        let content =
-            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
-        json_support::from_str_top_array_each(&content, |v| {
-            if nrows.is_none_or(|n| profiler.total < n) {
-                profiler.push(&v);
-            }
-            Ok(())
-        })
-        .with_context(|| format!("failed to parse {path:?} as a JSON array"))?;
-        return Ok(profiler.finish());
-    }
-
     // JSON Lines: each line an independent, self-contained value (the
-    // first line parses whole on its own) - streamed record-by-record.
-    if json_support::from_str(&first_line).is_ok() {
+    // first line doesn't open a top-level array and parses whole on its
+    // own) - streamed record-by-record.
+    if !first_line.trim_start().starts_with('[') && json_support::from_str(&first_line).is_ok() {
         return profile_json_lines_streaming(path, nrows, n_samples);
     }
 
-    // A single, possibly multi-line (pretty-printed) document - genuinely
-    // whole-buffer (no record boundary, no pull-mode parser).
-    let mut values = read_json_single_document(path)?;
-    if let Some(n) = nrows {
-        values.truncate(n);
-    }
-
-    if values.iter().all(JsonValue::is_object) {
-        let records: Vec<json_support::Map> = values
-            .into_iter()
-            .map(|v| match v {
-                JsonValue::Object(m) => m,
-                _ => unreachable!("just checked every value is an object"),
-            })
-            .collect();
-        Ok(profile_json_records(&records, n_samples))
-    } else {
-        let total = values.len();
-        let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
-        Ok(profile_json_path(
-            "value".to_string(),
-            total,
-            refs,
-            n_samples,
-        ))
-    }
+    // Everything else - a top-level array `[ ... ]` or a single
+    // (possibly pretty-printed multi-line) document - streams straight
+    // off a `BufReader` via `json_support::stream_top_level`, never
+    // materializing the source text. Byte-identical to the old "collect a
+    // `Vec<Value>`, `truncate` to `--nrows`, then the all-object-records
+    // vs. single-`value`-column branch".
+    stream_json_document(path, nrows, n_samples)
 }
 
 // --- Parquet + Arrow IPC/Feather readers (opt-in via --features parquet) ---
@@ -47628,11 +47806,12 @@ mod xlsx_support {
     /// no `SheetGrid`/`Vec<Vec<String>>` of values is ever built. Output
     /// is byte-identical to the old "parse the whole DOM into a
     /// `SheetGrid`, then `into_column_profiles`" path: the header is the
-    /// row numbered 1, `n_data_rows` is `(largest 1-based row number seen)
-    /// - 1` (blank rows counted, so `missing_pct` still reflects real
-    /// gaps), a data row's index is `row_num - 2`, and an empty value or a
-    /// cell past the header width contributes nothing. Returns `None` for
-    /// a sheet with no cells at all (the "skip this sheet" signal).
+    /// row numbered 1, `n_data_rows` is one less than the largest 1-based
+    /// row number seen (blank rows counted, so `missing_pct` still
+    /// reflects real gaps), a data row's index is `row_num - 2`, and an
+    /// empty value or a cell past the header width contributes nothing.
+    /// Returns `None` for a sheet with no cells at all (the "skip this
+    /// sheet" signal).
     fn xlsx_parse_sheet_profiles(
         xml: &str,
         shared_strings: &[String],
@@ -53441,17 +53620,27 @@ mod tests {
     // line", even though every one of them is a real, valid JSON document
     // with no ambiguity about what it contains. After both fixes: 95/95.
 
+    /// Collects the top-level value(s) `json_support::stream_top_level`
+    /// yields from `json_text` (fed as bytes, exercising the real
+    /// streaming path) - one entry for a single document, one per element
+    /// for a top-level array. An empty/whitespace-only input yields none.
     fn read_values(json_text: &str) -> Vec<JsonValue> {
-        let mut tmp = TempFile::new().unwrap();
-        std::io::Write::write_all(&mut tmp, json_text.as_bytes()).unwrap();
-        read_json_single_document(tmp.path()).unwrap()
+        if json_text.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        json_support::stream_top_level(json_text.as_bytes(), |v| {
+            out.push(v);
+            Ok(())
+        })
+        .unwrap();
+        out
     }
 
     #[test]
-    fn read_json_single_document_accepts_a_pretty_printed_single_object() {
-        // Previously misdetected as JSON Lines mode (content doesn't
-        // start with '{' on a parseable line) and then failed line-by-
-        // line, since "{" alone isn't valid JSON on its own line.
+    fn stream_top_level_accepts_a_pretty_printed_single_object() {
+        // A multi-line pretty-printed object is one top-level value,
+        // scanned across newlines and handed to the parser whole.
         let values = read_values("{\n  \"a\": \"b\"\n}");
         assert_eq!(values, vec![json!({"a": "b"})]);
     }
@@ -53475,8 +53664,8 @@ mod tests {
 
     #[test]
     fn columns_from_json_accepts_a_top_level_array_of_scalars() {
-        // Streamed element-by-element via from_str_top_array_each; a bare
-        // scalar array has no field names but is still one real column.
+        // Streamed element-by-element via stream_top_level; a bare scalar
+        // array has no field names but is still one real column.
         let mut tmp = TempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, b"[1, 2, 3]").unwrap();
         let cols = columns_from_json(tmp.path(), None, 3).unwrap();
@@ -53487,10 +53676,11 @@ mod tests {
     }
 
     #[test]
-    fn read_json_single_document_on_an_empty_file_falls_through_to_zero_records() {
-        // An empty string isn't valid JSON, but must still land on the
+    fn columns_from_json_on_an_empty_file_falls_through_to_zero_records() {
+        // An empty file isn't valid JSON, but must still land on the
         // "empty file -> zero records" contract rather than erroring.
-        assert_eq!(read_values(""), Vec::<JsonValue>::new());
+        let tmp = TempFile::new().unwrap();
+        assert!(columns_from_json(tmp.path(), None, 3).unwrap().is_empty());
     }
 
     #[test]

@@ -5273,24 +5273,65 @@ output format - zero mismatches. Full test suite unchanged (every
 entry points), clippy/fmt clean across default/`yaml`/`full`,
 established baselines.
 
-**Every format with a record boundary to stream on now streams.** What
-remains materialized:
-- `.ods`/`.xls`/`.xlsb` still build a `SheetGrid` - a smaller concern,
-  since their inputs (a decompressed zip entry, the OLE2 `Workbook`
-  stream) are already fully resident regardless.
-- **Inherently whole-buffer**: a single TOML/YAML/JSON document, or an
-  XML tree, is one value with no internal record boundary, and every
-  hand-rolled parser here (`json_support`, `toml_support`,
-  `yaml_support`, `xml_support`) is an `&str`-buffer parser with no pull
-  mode over a `Read`. Even the streamable-in-principle shapes already
-  converted (top-level JSON array, YAML multi-doc) can't drop below one
-  resident file copy without a from-scratch streaming-parser rewrite of
-  exactly the most carefully-verified code in the project, for inputs
-  that are rarely large enough to matter - disproportionate, out of
-  scope.
+**The JSON reader then dropped its own `&str`-parser floor entirely - it
+now reads straight off a byte stream, holding no copy of the source.**
+The user asked for genuine full streaming for the shapes still capped at
+one file copy, and for JSON the trick turned out not to need a
+streaming rewrite of the recursive `Parser` at all: `json_support`
+gained `stream_top_level`, a *structural* boundary scanner over a
+`ByteWindow` (a bounded 64 KiB-refill window over any `Read`, discarding
+its consumed prefix). The scanner never parses meaning - it tracks only
+string state (with `\` escapes) and `{}`/`[]` nesting depth to find
+where each top-level value's bytes end, then hands that one complete
+byte span to the existing `from_str` for the real parse and validation.
+So `[ {...}, {...}, ... ]` yields one element's span at a time (fed into
+a `JsonRecordStreamProfiler`, parsed, dropped), and a single
+multi-line document yields one span; trailing non-whitespace after the
+document is still the same hard error `from_str` enforces, and a
+structurally-scanned element that isn't valid JSON (`[1, 2 3]`, `[01]`)
+still errors when the real parser sees it. `columns_from_json` now has
+exactly two branches: JSON Lines (unchanged, line-streamed) and
+everything else (`stream_top_level` over a `BufReader`).
+`from_str_top_array_each` and `read_json_single_document` are both
+deleted; `profile_json_path`/`profile_json_records`/`bucket_object_fields`
+pick up `#[allow(dead_code)]` since the JSON reader no longer calls them
+(the feature-gated nested readers still do).
+
+Measured on the same 147 MB, 1,000,000-element JSON array: maxRSS
+149 MB -> ~2.6 MB (~98%), peak footprint 148 MB -> ~1.5 MB (~99%), 3
+rounds - the residual is now just the bounded read window plus one
+element's span/tree/accumulator, no file copy at all. Output confirmed
+byte-identical via `diff` against the pre-change binary across the
+entire 359-file fixture corpus in all three output formats with
+`--nrows` unset/1/2 (3,231 combinations), plus a 600-iteration fuzz over
+array / single-object / single-scalar shapes with deliberately tricky
+string contents (`]`, `,`, `{`, tabs, multi-byte unicode, `\"` escapes),
+`indent` variations, and leading/trailing whitespace, crossed with
+`--nrows`/`--samples`/output format - zero mismatches. Full test suite
+(four new `stream_top_level` unit tests, two renamed) and clippy/fmt
+clean across default/`full`, established baselines.
+
+**Every format with a record boundary now streams, and JSON streams
+with no resident file copy at all.** What remains materialized:
+- `.ods`/`.xls`/`.xlsb` still build a `SheetGrid` - `.ods` from a
+  whole-sheet XML DOM (the OOXML reader's own pre-streaming shape), and
+  `.xls`/`.xlsb` from a resident record stream. `.ods` could take the
+  same per-`<table:table-row>` streaming the OOXML reader got; `.xls`/
+  `.xlsb` could fold records into accumulators as they're read. All
+  three still bottom out at the decompressed zip entry / OLE2 Workbook
+  stream (the `ZipArchive::read` / CFB gap below).
+- **A single TOML or YAML document, or an XML tree**: one value with no
+  internal record boundary. `toml_support`/`yaml_support`/`xml_support`
+  are still `&str`-buffer parsers. The `stream_top_level` technique (a
+  structural boundary scanner feeding complete spans to the existing
+  parser) applies cleanly wherever there *is* a record boundary - a
+  YAML `---`-multi-document stream could scan document-at-a-time off a
+  `Read` the same way - but a lone document is genuinely one unit; the
+  parse tree is the irreducible cost there, and these inputs are rarely
+  large enough for the source-text copy on top to matter.
 - Per-entry streaming decompression inside `ZipArchive::read` (which
-  would shave the residual off the OOXML `.xlsx` number too) remains a
-  real, disclosed, separately-scoped remaining gap.
+  would shave the residual off the OOXML `.xlsx` number and the `.ods`/
+  `.xlsb` readers) remains a real, disclosed, separately-scoped gap.
 
 ## Cloud-platform file compatibility
 
