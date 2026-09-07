@@ -33,6 +33,32 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/biff-fold-cells` branch (Darwin arm64)
+
+`.xls`/`.xlsb` drop their `SheetGrid` intermediate. `xls_parse_sheet` /
+`xlsb_parse_sheet` built a resident `Vec<(row, col, String)>` that
+`SheetGrid::from_cells` bucketed into a `BTreeMap` before
+`into_column_profiles` folded it - two cell-value copies on top of the
+resident record stream. Both now fold each cell straight into per-column
+`ColumnAccumulatorState`s via a shared `biff_fold_cell` +
+`biff_finalize_profiles`, which reproduce `SheetGrid` +
+`into_column_profiles` byte for byte. `SheetGrid` and its three methods
+are deleted (nothing built one any more).
+
+Removes the `sparse` + `SheetGrid` copies (~2x cell data), not the
+resident record stream itself (OLE2 `Workbook` / whole-entry `.bin`
+`read` both stay). No large-file measurement possible - `.xls` tops out
+at a few MB, no tool here writes `.xlsb` (committed fixtures are the
+vendored POI ones, a few KB) - so correctness-only, the SAS7BDAT Tier-2
+boundary: byte-identical output across the full 359-file corpus in all
+three formats with `--nrows` unset/1/2/5 (4,344 combinations), plus
+`xls_reader_matches_calamine_output_exactly`,
+`xlsb_reader_matches_calamine_output_exactly`, and the three
+`xlsb_reader_*` real-bug regression tests unchanged. Clippy/fmt clean
+across default/`xlsx`/`npy`/`full`, established baselines.
+
+---
+
 ## 2026-09-08 — `feat/streaming-xlsx-window` branch (Darwin arm64)
 
 `.xlsx` (OOXML) worksheet XML now streams. `OdsXmlWindow` renamed

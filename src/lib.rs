@@ -48260,105 +48260,82 @@ mod xlsx_support {
         Ok(result)
     }
 
-    /// A worksheet reduced to just what column profiling needs, without
-    /// ever materializing a dense `max_row x max_col` grid: the header
-    /// row, only the data rows that actually hold a value, and the true
-    /// data-row count (blank rows included, so `missing_pct` still
-    /// reflects real gaps). A stray cell far outside a sheet's real data
-    /// used to force a `vec![vec![None; max_col]; max_row]` allocation -
-    /// tens of MB for one misplaced value, and an OOM if it was also far
-    /// to the right. All four spreadsheet readers now build one of these
-    /// instead, and share `into_column_profiles`.
-    struct SheetGrid {
-        /// The header row's cells, positional, `n_cols` wide. Empty iff
-        /// the sheet had no cells at all (the "skip this sheet" signal).
-        header: Vec<Option<String>>,
-        /// `(0-based data-row index, [(col, value)])` for every data row
-        /// with at least one value, in ascending row order.
-        data_rows: Vec<(usize, Vec<(usize, String)>)>,
-        /// Total data rows including blank ones (`sheet rows - 1`).
-        n_data_rows: usize,
+    /// The header row's cells a BIFF sheet reader has folded, positional.
+    type BiffHeader = Vec<Option<String>>;
+
+    /// Folds one BIFF cell (`.xls` BIFF8 / `.xlsb` BIFF12) into the
+    /// per-column state a sheet reader accumulates - row 0 into `header`,
+    /// a data row into its column's `ColumnAccumulatorState` unless
+    /// `--nrows` already caps it out - while tracking `max_row`/`max_col`
+    /// for every cell regardless. Byte-for-byte the same split
+    /// `SheetGrid::from_cells` + `into_column_profiles` did over a
+    /// resident `(row, col, value)` list, just without materializing that
+    /// list: a stray cell far outside the real data still only costs its
+    /// own `String`, never a `max_row x max_col` allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn biff_fold_cell(
+        row: u32,
+        col: u32,
+        value: String,
+        header: &mut BiffHeader,
+        states: &mut Vec<ColumnAccumulatorState>,
+        max_row: &mut i64,
+        max_col: &mut i64,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) {
+        *max_row = (*max_row).max(row as i64);
+        *max_col = (*max_col).max(col as i64);
+        let col = col as usize;
+        if row == 0 {
+            if col >= header.len() {
+                header.resize(col + 1, None);
+            }
+            header[col] = Some(value);
+        } else {
+            let data_idx = row as usize - 1;
+            if nrows.is_none_or(|limit| data_idx < limit) {
+                if col >= states.len() {
+                    states.resize_with(col + 1, ColumnAccumulatorState::new);
+                }
+                states[col].push(value, n_samples);
+            }
+        }
     }
 
-    impl SheetGrid {
-        /// `cells` yields `(0-based row, 0-based col, value)`; row 0 is
-        /// the header. `n_rows`/`n_cols` are the sheet's used-range
-        /// dimensions (each the max index seen + 1), i.e. exactly what
-        /// the dense grid this replaces was sized to.
-        fn from_cells(
-            cells: impl IntoIterator<Item = (usize, usize, String)>,
-            n_rows: usize,
-            n_cols: usize,
-        ) -> SheetGrid {
-            let mut header = vec![None; n_cols];
-            let mut by_row: BTreeMap<usize, Vec<(usize, String)>> = BTreeMap::new();
-            for (row, col, value) in cells {
-                if row == 0 {
-                    if col < n_cols {
-                        header[col] = Some(value);
-                    }
-                } else {
-                    by_row.entry(row - 1).or_default().push((col, value));
-                }
-            }
-            SheetGrid {
-                header,
-                data_rows: by_row.into_iter().collect(),
-                n_data_rows: n_rows.saturating_sub(1),
+    /// Turns the state `biff_fold_cell` accumulated into `ColumnProfile`s,
+    /// replicating `SheetGrid` + `into_column_profiles` exactly: `ncol` is
+    /// `max_col + 1`, `n_data_rows` is the 0-based max row index (blank
+    /// rows counted, so `missing_pct` still reflects real gaps), `--nrows`
+    /// caps `total`. `None` iff the sheet held no cells at all (the "skip
+    /// this sheet" signal `SheetGrid::empty()` / `is_empty_sheet` gave).
+    fn biff_finalize_profiles(
+        header: BiffHeader,
+        mut states: Vec<ColumnAccumulatorState>,
+        max_row: i64,
+        max_col: i64,
+        nrows: Option<usize>,
+    ) -> Option<Vec<ColumnProfile>> {
+        if max_row < 0 || max_col < 0 {
+            return None;
+        }
+        let ncol = (max_col + 1) as usize;
+        states.resize_with(ncol, ColumnAccumulatorState::new);
+        let mut headers: Vec<String> = vec![String::new(); ncol];
+        for (col, value) in header.into_iter().enumerate() {
+            if let (true, Some(v)) = (col < ncol, value) {
+                headers[col] = v;
             }
         }
-
-        fn empty() -> SheetGrid {
-            SheetGrid {
-                header: Vec::new(),
-                data_rows: Vec::new(),
-                n_data_rows: 0,
-            }
-        }
-
-        fn is_empty_sheet(&self) -> bool {
-            self.header.is_empty()
-        }
-
-        /// One `ColumnProfile` per header column, folding each cell value
-        /// straight into a shared `ColumnAccumulatorState` rather than
-        /// first collecting every column's values into a
-        /// `Vec<Vec<String>>` and running `profile_column` over that.
-        /// Excel's `current_type` is inferred from the values themselves
-        /// (`NaiveTypeAccumulator`, the `into_profile` path), so this
-        /// matches CSV's/fixed-width's own Tier 2 conversion byte for
-        /// byte. A blank cell/row contributes nothing but still counts
-        /// toward `total` (the row-count passed to `into_profile`).
-        fn into_column_profiles(
-            self,
-            nrows: Option<usize>,
-            n_samples: usize,
-        ) -> Vec<ColumnProfile> {
-            let headers: Vec<String> = self
-                .header
-                .into_iter()
-                .map(Option::unwrap_or_default)
-                .collect();
-            let ncol = headers.len();
-            let total = nrows.map_or(self.n_data_rows, |limit| limit.min(self.n_data_rows));
-            let mut states: Vec<ColumnAccumulatorState> =
-                (0..ncol).map(|_| ColumnAccumulatorState::new()).collect();
-            for (idx, row_cells) in self.data_rows {
-                if nrows.is_some_and(|limit| idx >= limit) {
-                    break;
-                }
-                for (col, value) in row_cells {
-                    if col < ncol {
-                        states[col].push(value, n_samples);
-                    }
-                }
-            }
+        let n_data_rows = max_row as usize; // (max_row + 1) rows - 1 header
+        let total = nrows.map_or(n_data_rows, |limit| limit.min(n_data_rows));
+        Some(
             headers
                 .into_iter()
                 .zip(states)
                 .map(|(name, state)| state.into_profile(name, total))
-                .collect()
-        }
+                .collect(),
+        )
     }
 
     /// Extracts one already-parsed `<row>` element's `(1-based row number,
@@ -50096,25 +50073,43 @@ mod xlsx_support {
     }
 
     /// Parses one worksheet's own BIFF substream (starting at the byte
-    /// offset its BOUNDSHEET8 record gave) into a dense `row x column`
-    /// grid, the same shape `xlsx_parse_sheet`/`ods_parse_sheet` already
-    /// produce. A FORMULA cell's cached value is used directly; if that
-    /// cache says "the real value is a string", the STRING record
-    /// immediately following supplies it (`fmla_pos` tracks which cell
-    /// that belongs to, since STRING carries no row/col of its own).
-    fn xls_parse_sheet(stream: &[u8], sst: &[String], is_date_by_xf: &[bool]) -> Result<SheetGrid> {
-        let mut sparse: Vec<(u32, u32, String)> = Vec::new();
+    /// offset its BOUNDSHEET8 record gave), folding each cell straight
+    /// into per-column `ColumnAccumulatorState`s via `biff_fold_cell` -
+    /// no intermediate `(row, col, value)` list or `SheetGrid`. Returns
+    /// `None` for a sheet with no cells at all. A FORMULA cell's cached
+    /// value is used directly; if that cache says "the real value is a
+    /// string", the STRING record immediately following supplies it
+    /// (`fmla_pos` tracks which cell that belongs to, since STRING
+    /// carries no row/col of its own). Assumes BIFF's usual row-ascending
+    /// record order (real writers always emit it) - a genuinely
+    /// out-of-order stream could reorder a column's `sample_values`,
+    /// where the old `SheetGrid` BTreeMap sort would not have.
+    fn xls_parse_sheet_profiles(
+        stream: &[u8],
+        sst: &[String],
+        is_date_by_xf: &[bool],
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Option<Vec<ColumnProfile>>> {
+        let mut header: BiffHeader = Vec::new();
+        let mut states: Vec<ColumnAccumulatorState> = Vec::new();
         let mut max_row: i64 = -1;
         let mut max_col: i64 = -1;
         let mut fmla_pos: (u32, u32) = (0, 0);
 
         macro_rules! record_cell {
             ($row:expr, $col:expr, $val:expr) => {{
-                let row = $row;
-                let col = $col;
-                max_row = max_row.max(row as i64);
-                max_col = max_col.max(col as i64);
-                sparse.push((row, col, $val));
+                biff_fold_cell(
+                    $row,
+                    $col,
+                    $val,
+                    &mut header,
+                    &mut states,
+                    &mut max_row,
+                    &mut max_col,
+                    nrows,
+                    n_samples,
+                );
             }};
         }
 
@@ -50167,16 +50162,8 @@ mod xlsx_support {
             }
         }
 
-        if max_row < 0 || max_col < 0 {
-            return Ok(SheetGrid::empty());
-        }
-        let cells = sparse
-            .into_iter()
-            .map(|(r, c, v)| (r as usize, c as usize, v));
-        Ok(SheetGrid::from_cells(
-            cells,
-            (max_row + 1) as usize,
-            (max_col + 1) as usize,
+        Ok(biff_finalize_profiles(
+            header, states, max_row, max_col, nrows,
         ))
     }
 
@@ -50205,11 +50192,11 @@ mod xlsx_support {
             let sheet_stream = stream
                 .get(pos..)
                 .context("BOUNDSHEET8 position past the end of the Workbook stream")?;
-            let grid = xls_parse_sheet(sheet_stream, &sst, &is_date_by_xf)?;
-            if grid.is_empty_sheet() {
+            let Some(profiles) =
+                xls_parse_sheet_profiles(sheet_stream, &sst, &is_date_by_xf, nrows, n_samples)?
+            else {
                 continue; // empty sheet (or a non-tabular one, e.g. a chart)
-            }
-            let profiles: Vec<ColumnProfile> = grid.into_column_profiles(nrows, n_samples);
+            };
             out.push((sheet_name, profiles));
         }
 
@@ -50530,11 +50517,12 @@ mod xlsx_support {
         u32::from_le_bytes([buf[4], buf[5], buf[6], 0]) as usize
     }
 
-    /// Parses one worksheet part (`xl/worksheets/sheetN.bin`) into the
-    /// same dense `row x column` grid shape every other reader in this
-    /// project produces. `BrtRowHdr` carries the current row for every
-    /// cell record that follows until the next one (cell records
-    /// themselves carry only a column); a formula cell's cached result
+    /// Parses one worksheet part (`xl/worksheets/sheetN.bin`), folding
+    /// each cell straight into per-column `ColumnAccumulatorState`s via
+    /// `biff_fold_cell` (returns `None` for a sheet with no cells).
+    /// `BrtRowHdr` carries the current row for every cell record that
+    /// follows until the next one (cell records themselves carry only a
+    /// column); a formula cell's cached result
     /// (`BrtFmlaNum`/`BrtFmlaBool`/`BrtFmlaString`/`BrtFmlaError`) is
     /// read the exact same way as its non-formula counterpart - this
     /// reader deliberately never parses the formula token stream itself,
@@ -50542,18 +50530,32 @@ mod xlsx_support {
     /// scope. `BrtCellBlank` (an explicitly-blank cell) is silently
     /// skipped, the same "absent = missing" convention every other
     /// reader in this project already uses.
-    fn xlsb_parse_sheet(data: &[u8], sst: &[String], is_date_by_xf: &[bool]) -> Result<SheetGrid> {
-        let mut sparse: Vec<(u32, u32, String)> = Vec::new();
+    fn xlsb_parse_sheet_profiles(
+        data: &[u8],
+        sst: &[String],
+        is_date_by_xf: &[bool],
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Option<Vec<ColumnProfile>>> {
+        let mut header: BiffHeader = Vec::new();
+        let mut states: Vec<ColumnAccumulatorState> = Vec::new();
         let mut max_row: i64 = -1;
         let mut max_col: i64 = -1;
         let mut row: u32 = 0;
 
         macro_rules! record_cell {
             ($col:expr, $val:expr) => {{
-                let col = $col;
-                max_row = max_row.max(row as i64);
-                max_col = max_col.max(col as i64);
-                sparse.push((row, col, $val));
+                biff_fold_cell(
+                    row,
+                    $col,
+                    $val,
+                    &mut header,
+                    &mut states,
+                    &mut max_row,
+                    &mut max_col,
+                    nrows,
+                    n_samples,
+                );
             }};
         }
 
@@ -50626,16 +50628,8 @@ mod xlsx_support {
             }
         }
 
-        if max_row < 0 || max_col < 0 {
-            return Ok(SheetGrid::empty());
-        }
-        let cells = sparse
-            .into_iter()
-            .map(|(r, c, v)| (r as usize, c as usize, v));
-        Ok(SheetGrid::from_cells(
-            cells,
-            (max_row + 1) as usize,
-            (max_col + 1) as usize,
+        Ok(biff_finalize_profiles(
+            header, states, max_row, max_col, nrows,
         ))
     }
 
@@ -50670,11 +50664,11 @@ mod xlsx_support {
             let sheet_bytes = zip
                 .read(&entry.part_path)
                 .with_context(|| format!("failed to read sheet '{}' in {path:?}", entry.name))?;
-            let grid = xlsb_parse_sheet(&sheet_bytes, &sst, &is_date_by_xf)?;
-            if grid.is_empty_sheet() {
+            let Some(profiles) =
+                xlsb_parse_sheet_profiles(&sheet_bytes, &sst, &is_date_by_xf, nrows, n_samples)?
+            else {
                 continue; // empty sheet (or a non-tabular one, e.g. a chart)
-            }
-            let profiles: Vec<ColumnProfile> = grid.into_column_profiles(nrows, n_samples);
+            };
             out.push((entry.name, profiles));
         }
 

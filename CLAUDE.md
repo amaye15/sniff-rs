@@ -5534,20 +5534,57 @@ shared-strings path `constant_memory` mode skips) crossed with
 passing) and clippy/fmt clean across default/`xlsx`/`npy`/`full`,
 established baselines.
 
+**`.xls` and `.xlsb` then dropped their `SheetGrid` intermediate.**
+`xls_parse_sheet`/`xlsb_parse_sheet` built a resident
+`Vec<(row, col, String)>` (`sparse`) that `SheetGrid::from_cells` then
+bucketed into a `BTreeMap` before `into_column_profiles` folded it - two
+full copies of every cell value on top of the already-resident record
+stream. Both now fold each cell straight into per-column
+`ColumnAccumulatorState`s via a shared `biff_fold_cell` (row 0 ->
+`header`, a data row -> its column's accumulator unless `--nrows` caps
+it, `max_row`/`max_col` tracked for every cell) and finish through
+`biff_finalize_profiles`, which reproduces `SheetGrid` + the shared
+`into_column_profiles` byte for byte (`ncol` = `max_col + 1`,
+`n_data_rows` = the 0-based max row index, `--nrows` caps `total`,
+`None` iff no cells). `SheetGrid`, `from_cells`, `is_empty_sheet`, and
+`into_column_profiles` are all deleted - nothing built one any more once
+`.ods`/`.xlsx` moved to their own byte-window folds and these two moved
+here. The one disclosed assumption: `biff_fold_cell` folds in record
+order, where `SheetGrid`'s `BTreeMap` sorted by row first - so a
+genuinely row-out-of-order BIFF stream could reorder a column's
+`sample_values`. Every real BIFF8/BIFF12 writer emits rows in ascending
+order, and no fixture or corpus file exercises anything else.
+
+This removes the `sparse` + `SheetGrid` copies (roughly 2x the cell
+data) but not the resident record stream itself - the OLE2 `Workbook`
+stream (`.xls`, the CFB reader has no per-stream streaming) and the
+whole-entry `ZipArchive::read` of each `.bin` part (`.xlsb`) both stay.
+No large-file measurement was possible - `.xls` tops out around a few MB
+in practice and no tool in this environment writes `.xlsb` at all (the
+committed fixtures are the vendored POI ones, a few KB each) - so
+verification is correctness-only, the same honest boundary the SAS7BDAT
+Tier-2 phase drew: byte-identical `--output-format json` via `diff`
+against the pre-change binary across the entire 359-file fixture corpus
+in all three output formats with `--nrows` unset/1/2/5 (4,344
+combinations), plus `xls_reader_matches_calamine_output_exactly`,
+`xlsb_reader_matches_calamine_output_exactly`, and the three
+`xlsb_reader_*` real-bug regression tests all unchanged and passing.
+Clippy/fmt clean across default/`xlsx`/`npy`/`full`, established
+baselines.
+
 **Every streamable JSON, YAML, homogeneous-records XML, `.ods`, `.xlsx`,
-and `.npz` shape now streams with no whole-document DOM or whole-entry
-buffer on top of its source bytes.** What remains materialized:
+`.xls`, `.xlsb`, and `.npz` shape now folds cells straight into the
+type-detection accumulators with no intermediate row/grid/DOM copy on
+top of its source bytes.** What remains materialized:
 - `.xlsx`'s shared-strings table (`xl/sharedStrings.xml`, parsed to a
   resident `Vec<String>`) - indexed by cell in arbitrary order, so not
   streamable; bounded by distinct-string count, not row count.
-- `.xls`/`.xlsb` still build a `SheetGrid` from a resident record stream
-  (the OLE2 `Workbook` stream / decompressed OOXML `.bin` parts, the
-  latter still via whole-entry `ZipArchive::read`). Both could fold
-  records into accumulators as they're read, but the record stream
-  itself stays resident regardless (the CFB / `ZipArchive::read` gap),
-  so the win would be smaller than `.xlsx`/`.ods` saw; `.xlsb`'s binary
-  BIFF12 `.bin` parsers would each also need their own `Read`-based
-  rework.
+- `.xls`'s OLE2 `Workbook` stream and `.xlsb`'s decompressed `.bin`
+  parts stay fully resident - `.xls` via the CFB reader (no per-stream
+  streaming), `.xlsb` via whole-entry `ZipArchive::read`. Streaming
+  either would mean a `Read`-based BIFF8 / BIFF12 record iterator (both
+  are currently `&[u8]`-slice iterators), and there's no large file of
+  either format available to measure the result against.
 - **A single TOML or YAML document, or an XML tree with a non-
   homogeneous root**: one value with no internal record boundary.
   `toml_support`/`xml_support` are still `&str`-buffer parsers for these
