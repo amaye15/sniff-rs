@@ -5502,21 +5502,52 @@ stored and DEFLATE-compressed `content.xml` entries) crossed with
 repeated-cells test unchanged and passing) and clippy/fmt clean across
 default/`xlsx`/`npy`/`full`, established baselines.
 
-**Every streamable JSON, YAML, homogeneous-records XML, `.ods`, and
-`.npz` shape now streams with no whole-document DOM or whole-entry buffer
-on top of its source bytes.** What remains materialized:
-- `.xlsx`/`.xlsb` still call `ZipArchive::read` (whole-entry `Vec<u8>`)
-  rather than `read_to_temp` - `.xlsx`'s `xlsx_parse_sheet_profiles` is
-  an `&str` byte-walk that would take the same `OdsXmlWindow`-style
-  conversion `.ods` just got (its ~150-200 MB sheet-XML residual is the
-  target); `.xlsx`'s shared-strings table and `.xlsb`'s binary `.bin`
-  record parsers would each need their own `Read`-based rework.
-- `.xls`/`.xlsb` also still build a `SheetGrid` from a resident record
-  stream (the OLE2 `Workbook` stream / decompressed OOXML `.bin` parts).
-  Both could fold records into accumulators as they're read, but the
-  record stream itself stays resident regardless (the CFB /
-  `ZipArchive::read` gap), so the win would be smaller than `.xlsx`/
-  `.ods` saw.
+**`.xlsx` (OOXML) then got the same treatment for its worksheet XML.**
+`OdsXmlWindow` was renamed `XmlByteWindow` (it was never ODS-specific)
+and `xlsx_parse_sheet_profiles` now takes `&mut XmlByteWindow<R>` instead
+of `xml: &str`; `columns_from_xlsx_ooxml` `read_to_temp`s each
+`xl/worksheets/sheetN.xml` and drives the window over it - the root/
+`<sheetData>` walk and the per-`<row>` `scan_element` -> `xml_parse_element`
+-> `xlsx_extract_row` fold are the same shape `.ods` uses. Output is
+byte-identical to the resident-`String` version, every quirk intact
+(header = row numbered 1, `n_data_rows` = largest 1-based row number
+minus 1 with blank rows counted, `--nrows` bounds folding not the
+`max_row`/`max_col` scan, a `max_col == 0` sheet still returns `None`).
+`xl/sharedStrings.xml` and `xl/styles.xml` deliberately stay whole
+`read`s - a cell references the shared-strings table by index in
+arbitrary order, so it can't be streamed; that table (bounded by unique-
+string count, not row count) is the remaining `.xlsx` residual.
+
+Measured on an 11 MB, 300,000-row `.xlsx` written by `xlsxwriter` in
+`constant_memory` mode (inline strings, so a 114 MB decompressed
+`sheet1.xml` and no shared-strings table - the case this phase actually
+targets): maxRSS 162 MB -> ~3.0 MB (~98%), peak footprint 152 MB ->
+~1.7 MB (~99%), 3 rounds. Output confirmed byte-identical via `diff`
+against the pre-change binary across the entire 359-file fixture corpus
+in all three output formats with `--nrows` unset/1/2 (3,258
+combinations), plus a 400-iteration old-vs-new fuzz over
+`openpyxl`-written `.xlsx` files (1-3 sheets, mixed string/number/bool/
+date/blank/empty cells, short rows, blank gap rows - exercising the
+shared-strings path `constant_memory` mode skips) crossed with
+`--nrows`/`--samples`/output format - zero mismatches. Full test suite
+(`xlsx_ooxml_reader_matches_calamine_output_exactly` unchanged and
+passing) and clippy/fmt clean across default/`xlsx`/`npy`/`full`,
+established baselines.
+
+**Every streamable JSON, YAML, homogeneous-records XML, `.ods`, `.xlsx`,
+and `.npz` shape now streams with no whole-document DOM or whole-entry
+buffer on top of its source bytes.** What remains materialized:
+- `.xlsx`'s shared-strings table (`xl/sharedStrings.xml`, parsed to a
+  resident `Vec<String>`) - indexed by cell in arbitrary order, so not
+  streamable; bounded by distinct-string count, not row count.
+- `.xls`/`.xlsb` still build a `SheetGrid` from a resident record stream
+  (the OLE2 `Workbook` stream / decompressed OOXML `.bin` parts, the
+  latter still via whole-entry `ZipArchive::read`). Both could fold
+  records into accumulators as they're read, but the record stream
+  itself stays resident regardless (the CFB / `ZipArchive::read` gap),
+  so the win would be smaller than `.xlsx`/`.ods` saw; `.xlsb`'s binary
+  BIFF12 `.bin` parsers would each also need their own `Read`-based
+  rework.
 - **A single TOML or YAML document, or an XML tree with a non-
   homogeneous root**: one value with no internal record boundary.
   `toml_support`/`xml_support` are still `&str`-buffer parsers for these

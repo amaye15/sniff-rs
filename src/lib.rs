@@ -48459,56 +48459,38 @@ mod xlsx_support {
     /// empty value or a cell past the header width contributes nothing.
     /// Returns `None` for a sheet with no cells at all (the "skip this
     /// sheet" signal).
-    fn xlsx_parse_sheet_profiles(
-        xml: &str,
+    fn xlsx_parse_sheet_profiles<R: std::io::Read>(
+        win: &mut XmlByteWindow<R>,
         shared_strings: &[String],
         is_date_format: &[bool],
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Option<Vec<ColumnProfile>>> {
-        let bytes = xml.as_bytes();
-        let mut pos = 0usize;
-        xml_skip_misc(bytes, &mut pos)?;
+        win.skip_misc()?;
         // Root <worksheet ...> start tag.
-        if bytes.get(pos) != Some(&b'<') {
+        if win.peek()? != Some(b'<') {
             bail!("expected the worksheet root element");
         }
-        pos += 1;
-        let _root_name = xml_parse_name(xml, &mut pos)?;
-        let _root_attrs = xml_parse_attrs(xml, &mut pos)?;
-        xml_skip_ws(bytes, &mut pos);
-        if xml_starts_with(bytes, pos, "/>") {
+        let (_root_name, _root_attrs, root_sc) = win.consume_start_tag()?;
+        if root_sc {
             return Ok(None); // <worksheet/> - nothing at all
         }
-        if bytes.get(pos) != Some(&b'>') {
-            bail!("expected '>' after the worksheet start tag");
-        }
-        pos += 1;
 
         // Walk the worksheet's children, discarding everything (dimension,
         // sheetViews, cols, ...) until <sheetData>.
         let mut sheet_data_open = false;
         loop {
-            xml_skip_misc(bytes, &mut pos)?;
-            if pos >= bytes.len() || xml_starts_with(bytes, pos, "</") {
+            win.skip_misc()?;
+            if win.peek()?.is_none() || win.starts_with("</")? {
                 break; // end of worksheet, no <sheetData>
             }
-            if xml_starts_with(bytes, pos, "<sheetData") {
-                pos += "<sheetData".len();
-                let _attrs = xml_parse_attrs(xml, &mut pos)?;
-                xml_skip_ws(bytes, &mut pos);
-                if xml_starts_with(bytes, pos, "/>") {
-                    pos += 2;
-                } else if bytes.get(pos) == Some(&b'>') {
-                    pos += 1;
-                    sheet_data_open = true;
-                } else {
-                    bail!("expected '>' or '/>' after <sheetData");
-                }
+            if win.starts_with("<sheetData")? {
+                let (_n, _a, sc) = win.consume_start_tag()?;
+                sheet_data_open = !sc;
                 break;
             }
-            // Some other child element - parse and discard its subtree.
-            let _discard = xml_parse_element(xml, &mut pos)?;
+            // Some other child element - scan past its whole subtree.
+            win.skip_element()?;
         }
 
         let mut states: Vec<ColumnAccumulatorState> = Vec::new();
@@ -48516,19 +48498,24 @@ mod xlsx_support {
         let mut max_row = 0usize;
         let mut max_col = 0usize;
         let mut rows_seen = 0usize;
+        let mut span: Vec<u8> = Vec::new();
 
         if sheet_data_open {
             loop {
-                xml_skip_misc(bytes, &mut pos)?;
-                if pos >= bytes.len() || xml_starts_with(bytes, pos, "</sheetData>") {
+                win.skip_misc()?;
+                if win.peek()?.is_none() || win.starts_with("</sheetData>")? {
                     break;
                 }
-                if bytes.get(pos) != Some(&b'<') {
+                if win.peek()? != Some(b'<') {
                     // stray text between rows - not meaningful, skip a byte
-                    pos += 1;
+                    win.discard(1)?;
                     continue;
                 }
-                let el = xml_parse_element(xml, &mut pos)?;
+                win.scan_element(&mut span)?;
+                let text =
+                    std::str::from_utf8(&span).context("worksheet XML is not valid UTF-8")?;
+                let mut p = 0usize;
+                let el = xml_parse_element(text, &mut p)?;
                 if el.name != "row" {
                     continue;
                 }
@@ -48660,13 +48647,16 @@ mod xlsx_support {
 
         let mut out = Vec::new();
         for (sheet_name, sheet_path) in sheet_paths {
-            let sheet_bytes = zip
-                .read(&sheet_path)
+            // The worksheet XML - the one genuinely large part - is
+            // streamed off a temp file through a bounded byte window,
+            // never held resident. sharedStrings/styles stay whole
+            // (a cell references them by index in arbitrary order).
+            let mut sheet_tmp = zip
+                .read_to_temp(&sheet_path)
                 .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
-            let sheet_xml = String::from_utf8(sheet_bytes)
-                .with_context(|| format!("sheet '{sheet_name}' is not valid UTF-8"))?;
+            let mut win = XmlByteWindow::new(std::io::BufReader::new(sheet_tmp.as_file_mut()));
             let Some(profiles) = xlsx_parse_sheet_profiles(
-                &sheet_xml,
+                &mut win,
                 &shared_strings,
                 &is_date_format,
                 nrows,
@@ -48768,24 +48758,25 @@ mod xlsx_support {
     /// `(element name, attributes, was-self-closing)` for one start tag.
     type OdsStartTag = (String, Vec<(String, String)>, bool);
 
-    /// A bounded byte-window over a `Read` for the ODS `content.xml`
-    /// walk - keeps at most one 64 KiB refill of unconsumed bytes plus
-    /// whatever the current `<table:table-row>` span needs, discarding
-    /// the consumed prefix. The direct sibling of `xml_support`'s own
-    /// `XmlWindow` (different feature gate, so a deliberate small
-    /// duplication) and of the JSON reader's `ByteWindow`.
-    struct OdsXmlWindow<R> {
+    /// A bounded byte-window over a `Read` for the `.ods` `content.xml`
+    /// and `.xlsx` worksheet walks - keeps at most one 64 KiB refill of
+    /// unconsumed bytes plus whatever the current row/record span needs,
+    /// discarding the consumed prefix. The direct sibling of
+    /// `xml_support`'s own `XmlWindow` (different feature gate, so a
+    /// deliberate small duplication) and of the JSON reader's
+    /// `ByteWindow`.
+    struct XmlByteWindow<R> {
         reader: R,
         buf: Vec<u8>,
         pos: usize,
         eof: bool,
     }
 
-    impl<R: std::io::Read> OdsXmlWindow<R> {
+    impl<R: std::io::Read> XmlByteWindow<R> {
         const CHUNK: usize = 64 * 1024;
 
         fn new(reader: R) -> Self {
-            OdsXmlWindow {
+            XmlByteWindow {
                 reader,
                 buf: Vec::new(),
                 pos: 0,
@@ -48804,7 +48795,7 @@ mod xlsx_support {
                 let n = self
                     .reader
                     .read(&mut self.buf[start..])
-                    .context("I/O error while reading content.xml")?;
+                    .context("I/O error while reading XML")?;
                 self.buf.truncate(start + n);
                 if n == 0 {
                     self.eof = true;
@@ -48830,7 +48821,7 @@ mod xlsx_support {
         fn take(&mut self, n: usize, out: &mut Vec<u8>) -> Result<()> {
             for _ in 0..n {
                 if self.bump(out)?.is_none() {
-                    bail!("unexpected end of content.xml");
+                    bail!("unexpected end of XML");
                 }
             }
             Ok(())
@@ -48937,7 +48928,7 @@ mod xlsx_support {
                         return Ok(());
                     }
                 } else if self.bump(out)?.is_none() {
-                    bail!("unexpected end of content.xml inside an element");
+                    bail!("unexpected end of XML inside an element");
                 }
             }
         }
@@ -48948,14 +48939,14 @@ mod xlsx_support {
         /// over the scanned tag bytes. Leaves the cursor just past `>`.
         fn consume_start_tag(&mut self) -> Result<OdsStartTag> {
             if self.peek()? != Some(b'<') {
-                bail!("expected an element start tag in content.xml");
+                bail!("expected an element start tag");
             }
             let mut tag = Vec::new();
             self.bump(&mut tag)?; // '<'
             let (mut in_dq, mut in_sq) = (false, false);
             loop {
                 let Some(b) = self.bump(&mut tag)? else {
-                    bail!("unterminated element start tag in content.xml");
+                    bail!("unterminated element start tag");
                 };
                 match b {
                     b'"' if !in_sq => in_dq = !in_dq,
@@ -48964,7 +48955,7 @@ mod xlsx_support {
                     _ => {}
                 }
             }
-            let s = std::str::from_utf8(&tag).context("content.xml is not valid UTF-8")?;
+            let s = std::str::from_utf8(&tag).context("XML is not valid UTF-8")?;
             let mut p = 1usize; // past '<'
             let name = xml_parse_name(s, &mut p)?.to_string();
             let attrs = xml_parse_attrs(s, &mut p)?;
@@ -49013,7 +49004,7 @@ mod xlsx_support {
     /// is the header; `table:number-rows-repeated` / `-columns-repeated`
     /// advance logical position without materializing an empty repeat.
     fn ods_stream_table_profiles<R: std::io::Read>(
-        win: &mut OdsXmlWindow<R>,
+        win: &mut XmlByteWindow<R>,
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
@@ -49132,7 +49123,7 @@ mod xlsx_support {
         let mut content = zip
             .read_to_temp("content.xml")
             .context("no content.xml in ODF archive")?;
-        let mut win = OdsXmlWindow::new(std::io::BufReader::new(content.as_file_mut()));
+        let mut win = XmlByteWindow::new(std::io::BufReader::new(content.as_file_mut()));
 
         let no_spreadsheet = || anyhow!("no <office:spreadsheet> element in {path:?}");
 

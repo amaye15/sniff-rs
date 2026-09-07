@@ -33,6 +33,33 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/streaming-xlsx-window` branch (Darwin arm64)
+
+`.xlsx` (OOXML) worksheet XML now streams. `OdsXmlWindow` renamed
+`XmlByteWindow` (never ODS-specific); `xlsx_parse_sheet_profiles` takes
+`&mut XmlByteWindow<R>` not `xml: &str`; `columns_from_xlsx_ooxml`
+`read_to_temp`s each `xl/worksheets/sheetN.xml` and drives the window -
+same root/`<sheetData>` walk + per-`<row>` `scan_element` ->
+`xml_parse_element` -> `xlsx_extract_row` fold as `.ods`. Byte-identical
+to the resident-`String` version (header = row 1, blank rows counted,
+`--nrows` bounds folding not the scan, `max_col == 0` -> `None`).
+`xl/sharedStrings.xml` / `xl/styles.xml` stay whole `read`s (a cell
+indexes shared strings in arbitrary order).
+
+Measured on an 11 MB, 300,000-row `.xlsx` (`xlsxwriter` `constant_memory`
+mode: inline strings, 114 MB decompressed `sheet1.xml`, no shared-strings
+table): maxRSS 162 MB -> ~3.0 MB (~98%), peak footprint 152 MB ->
+~1.7 MB (~99%), 3 rounds. Byte-identical output across the full 359-file
+corpus in all three formats with `--nrows` unset/1/2 (3,258
+combinations) plus a 400-iteration `openpyxl` fuzz (1-3 sheets, mixed
+string/number/bool/date/blank/empty cells, short rows, blank gap rows -
+the shared-strings path). Full suite
+(`xlsx_ooxml_reader_matches_calamine_output_exactly` unchanged) +
+clippy/fmt clean across default/`xlsx`/`npy`/`full`, established
+baselines. `.xls`/`.xlsb` still use whole-entry `read` + `SheetGrid`.
+
+---
+
 ## 2026-09-08 — `feat/streaming-ods-window` branch (Darwin arm64)
 
 `.ods` drops its `content.xml` residual. `columns_from_ods` now
