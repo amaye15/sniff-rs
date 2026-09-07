@@ -33,6 +33,34 @@ re-run.
 
 ---
 
+## 2026-09-08 — `feat/streaming-xml-bytes` branch (Darwin arm64)
+
+A homogeneous `<root><item>...</item>...</root>` records file now streams
+each child element straight off a `Read` with no resident source copy.
+`stream_xml_records` runs two O(1)-memory forward passes over an
+`XmlWindow` (bounded 64 KiB-refill byte window, sibling of the JSON
+reader's `ByteWindow`): pass 1 confirms the root is a `>= 2`-child
+single-tag element via a `skip_noise`/`scan_element` structural walk;
+pass 2 hands each child's complete byte span to the existing
+`xml_parse_element` -> `xml_element_to_json` -> a `JsonRecordStreamProfiler`,
+freeing each record before the next. A non-homogeneous root returns
+`Ok(false)` and falls back to the whole-DOM `xml_parse`, still the
+authority on malformed input. Two passes = the file is read twice, a
+disclosed I/O-time tradeoff.
+
+Measured on a real 101 MB, 500,000-record `<catalog><item>` file: maxRSS
+1,491 MB -> 3.1 MB (~99.8%), peak footprint 1,466 MB -> 2.0 MB (~99.9%);
+~40% slower wall time (1.95s -> 2.94s user) from the second pass + byte
+scanner. Byte-identical output across the full 359-file corpus in all
+three formats with `--nrows` unset/1/2 (3,258 combinations) plus a
+4,000-iteration old-vs-new fuzz (homogeneous / non-homogeneous /
+single-child / self-closing-root / mixed-text / comment-CDATA-PI-DOCTYPE
+/ namespace-prefixed / empty-root shapes crossed with `--nrows`/
+`--samples`/format). Full suite (two new `stream_xml_records` tests) +
+clippy/fmt clean across default/`xml`/`full`, established baselines.
+
+---
+
 ## 2026-09-08 — `feat/streaming-yaml-bytes` branch (Darwin arm64)
 
 YAML `---`-multi-document stream now reads document-at-a-time straight

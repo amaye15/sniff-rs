@@ -42956,6 +42956,352 @@ mod xml_support {
         }
     }
 
+    /// Parses one element (`<name ...>...</name>` or `<name/>`) from a
+    /// complete byte span already carved out by `stream_xml_records`'s
+    /// scanner, at `start_depth` (2 - a root child's depth in the
+    /// whole-document parse) so the `MAX_XML_DEPTH` guard fires at exactly
+    /// the same nesting a DOM parse would.
+    fn xml_parse_one_element(span: &str, start_depth: usize) -> Result<XmlElement> {
+        let bytes = span.as_bytes();
+        let mut pos = 0;
+        xml_skip_misc(bytes, &mut pos)?;
+        xml_parse_element(span, &mut pos, start_depth)
+    }
+
+    /// A bounded byte-window over a `Read` for the XML record scanner -
+    /// keeps at most one 64 KiB refill of unconsumed bytes plus whatever
+    /// the current element's span needs, discarding the consumed prefix.
+    struct XmlWindow<R> {
+        reader: R,
+        buf: Vec<u8>,
+        pos: usize,
+        eof: bool,
+    }
+
+    impl<R: std::io::Read> XmlWindow<R> {
+        const CHUNK: usize = 64 * 1024;
+
+        fn new(reader: R) -> Self {
+            XmlWindow {
+                reader,
+                buf: Vec::new(),
+                pos: 0,
+                eof: false,
+            }
+        }
+
+        /// Makes at least `need` unconsumed bytes available if the stream
+        /// isn't exhausted (used both for a single `peek` - `need` 1 - and
+        /// for multi-byte `starts_with` lookahead).
+        fn ensure(&mut self, need: usize) -> Result<()> {
+            while self.buf.len() - self.pos < need && !self.eof {
+                if self.pos > 0 {
+                    self.buf.drain(..self.pos);
+                    self.pos = 0;
+                }
+                let start = self.buf.len();
+                self.buf.resize(start + Self::CHUNK, 0);
+                let n = self
+                    .reader
+                    .read(&mut self.buf[start..])
+                    .context("I/O error while reading XML")?;
+                self.buf.truncate(start + n);
+                if n == 0 {
+                    self.eof = true;
+                }
+            }
+            Ok(())
+        }
+
+        fn peek(&mut self) -> Result<Option<u8>> {
+            self.ensure(1)?;
+            Ok(self.buf.get(self.pos).copied())
+        }
+
+        fn bump(&mut self, out: &mut Vec<u8>) -> Result<Option<u8>> {
+            let b = self.peek()?;
+            if let Some(b) = b {
+                out.push(b);
+                self.pos += 1;
+            }
+            Ok(b)
+        }
+
+        /// Advances past `n` bytes, appending them to `out`.
+        fn take(&mut self, n: usize, out: &mut Vec<u8>) -> Result<()> {
+            for _ in 0..n {
+                if self.bump(out)?.is_none() {
+                    bail!("unexpected end of XML");
+                }
+            }
+            Ok(())
+        }
+
+        fn starts_with(&mut self, needle: &str) -> Result<bool> {
+            self.ensure(needle.len())?;
+            Ok(self.buf[self.pos..].starts_with(needle.as_bytes()))
+        }
+
+        fn skip_ws(&mut self) -> Result<()> {
+            while self.peek()?.is_some_and(|b| b.is_ascii_whitespace()) {
+                self.pos += 1;
+            }
+            Ok(())
+        }
+
+        /// Copies bytes into `out` until `needle` is found; `out` then
+        /// ends with `needle`. Errors on EOF first.
+        fn copy_until(&mut self, needle: &str, out: &mut Vec<u8>) -> Result<()> {
+            loop {
+                if self.starts_with(needle)? {
+                    self.take(needle.len(), out)?;
+                    return Ok(());
+                }
+                if self.bump(out)?.is_none() {
+                    bail!("unterminated XML construct (expected {needle:?})");
+                }
+            }
+        }
+
+        /// Skips whitespace, comments, PIs and a DOCTYPE (with or without
+        /// an internal subset) - the prolog before the root element, and
+        /// also the inter-element noise between a root's children (root-
+        /// level text and CDATA are content the record shape ignores, so
+        /// they're skipped too). Stops at the next `<` that begins a tag.
+        fn skip_noise(&mut self, allow_text: bool) -> Result<()> {
+            let mut sink = Vec::new();
+            loop {
+                self.skip_ws()?;
+                if self.starts_with("<!--")? {
+                    sink.clear();
+                    self.copy_until("-->", &mut sink)?;
+                } else if self.starts_with("<?")? {
+                    sink.clear();
+                    self.copy_until("?>", &mut sink)?;
+                } else if self.starts_with("<![CDATA[")? {
+                    sink.clear();
+                    self.copy_until("]]>", &mut sink)?;
+                } else if self.starts_with("<!")? {
+                    // DOCTYPE - to `>`, or `]` then `>` for an internal subset.
+                    sink.clear();
+                    let mut saw_bracket = false;
+                    loop {
+                        match self.peek()? {
+                            None => bail!("unterminated DOCTYPE"),
+                            Some(b'[') => {
+                                saw_bracket = true;
+                                self.pos += 1;
+                            }
+                            Some(b']') if saw_bracket => {
+                                self.pos += 1;
+                                saw_bracket = false;
+                            }
+                            Some(b'>') if !saw_bracket => {
+                                self.pos += 1;
+                                break;
+                            }
+                            Some(_) => self.pos += 1,
+                        }
+                    }
+                } else if matches!(self.peek()?, Some(b'<') | None) {
+                    return Ok(());
+                } else if allow_text {
+                    // Root-level text between children - skip a run of it.
+                    while !matches!(self.peek()?, Some(b'<') | None) {
+                        self.pos += 1;
+                    }
+                } else {
+                    return Ok(()); // in the prolog, a non-`<` here is the caller's problem
+                }
+            }
+        }
+
+        /// With the cursor at `<` starting an element, copies the whole
+        /// `<name ...>...</name>` (or `<name/>`) into `out` by tracking
+        /// tag nesting depth (comments/PIs/CDATA are opaque, a `>` inside
+        /// a quoted attribute value doesn't close a tag).
+        fn scan_element(&mut self, out: &mut Vec<u8>) -> Result<()> {
+            out.clear();
+            let mut depth: usize = 0;
+            loop {
+                if self.starts_with("<!--")? {
+                    self.copy_until("-->", out)?;
+                } else if self.starts_with("<![CDATA[")? {
+                    self.copy_until("]]>", out)?;
+                } else if self.starts_with("<?")? {
+                    self.copy_until("?>", out)?;
+                } else if self.starts_with("</")? {
+                    self.take(2, out)?;
+                    self.copy_until(">", out)?;
+                    depth = depth.checked_sub(1).context("unbalanced XML close tag")?;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                } else if self.peek()? == Some(b'<') {
+                    // A start tag: copy to its unquoted `>`, tracking
+                    // whether it self-closes.
+                    self.bump(out)?; // '<'
+                    let mut in_dq = false;
+                    let mut in_sq = false;
+                    let mut last_sig = b'<';
+                    loop {
+                        let Some(b) = self.bump(out)? else {
+                            bail!("unterminated XML start tag");
+                        };
+                        match b {
+                            b'"' if !in_sq => in_dq = !in_dq,
+                            b'\'' if !in_dq => in_sq = !in_sq,
+                            b'>' if !in_dq && !in_sq => break,
+                            _ => {}
+                        }
+                        if !b.is_ascii_whitespace() && !in_dq && !in_sq {
+                            last_sig = b;
+                        }
+                    }
+                    if last_sig != b'/' {
+                        depth += 1;
+                    }
+                    if depth == 0 {
+                        return Ok(()); // a self-closing root-child element
+                    }
+                } else if self.bump(out)?.is_none() {
+                    bail!("unexpected end of XML inside an element");
+                }
+            }
+        }
+    }
+
+    /// Streams the `<root><item>...</item>...</root>` "homogeneous
+    /// records" shape straight off `path` - only the current record's
+    /// element span and tree are ever resident, never the whole file.
+    /// Two O(1)-memory forward passes: pass 1 confirms the root has >=2
+    /// element children that all share one tag; pass 2 hands each child's
+    /// byte span to `xml_parse_one_element` and folds the record into
+    /// `on_record`. Returns `Ok(false)` when the root isn't that shape
+    /// (or can't be cleanly scanned) so `columns_from_xml` can fall back
+    /// to the whole-DOM path, which stays the authority on malformed
+    /// input.
+    fn stream_xml_records(
+        path: &Path,
+        mut on_record: impl FnMut(json_support::Map) -> Result<()>,
+    ) -> Result<bool> {
+        // --- pass 1: is the root a >=2-child, all-same-tag element? ---
+        let first_tag = {
+            let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+            let mut win =
+                XmlWindow::new(std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file));
+            win.skip_noise(false)?;
+            if win.peek()? != Some(b'<') || win.starts_with("</")? {
+                return Ok(false);
+            }
+            // root start tag
+            let mut scratch = Vec::new();
+            win.bump(&mut scratch)?; // '<'
+            let (mut in_dq, mut in_sq, mut last_sig) = (false, false, b'<');
+            loop {
+                let Some(b) = win.bump(&mut scratch)? else {
+                    return Ok(false);
+                };
+                match b {
+                    b'"' if !in_sq => in_dq = !in_dq,
+                    b'\'' if !in_dq => in_sq = !in_sq,
+                    b'>' if !in_dq && !in_sq => break,
+                    _ => {}
+                }
+                if !b.is_ascii_whitespace() && !in_dq && !in_sq {
+                    last_sig = b;
+                }
+            }
+            if last_sig == b'/' {
+                return Ok(false); // self-closing root - no children
+            }
+            let mut first: Option<Vec<u8>> = None;
+            let mut count = 0usize;
+            let mut span = Vec::new();
+            loop {
+                win.skip_noise(true)?;
+                if win.starts_with("</")? || win.peek()?.is_none() {
+                    break;
+                }
+                win.scan_element(&mut span)?;
+                let name = xml_leading_tag_name(&span);
+                match &first {
+                    None => first = Some(name),
+                    Some(f) => {
+                        if *f != name {
+                            return Ok(false); // not homogeneous
+                        }
+                    }
+                }
+                count += 1;
+            }
+            if count < 2 {
+                return Ok(false);
+            }
+            first
+        };
+        let _ = first_tag;
+
+        // --- pass 2: stream each child element into a record ---
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut win = XmlWindow::new(std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file));
+        win.skip_noise(false)?;
+        {
+            let mut scratch = Vec::new();
+            win.bump(&mut scratch)?; // '<'
+            let (mut in_dq, mut in_sq) = (false, false);
+            loop {
+                let Some(b) = win.bump(&mut scratch)? else {
+                    bail!("unterminated root start tag in {path:?}");
+                };
+                match b {
+                    b'"' if !in_sq => in_dq = !in_dq,
+                    b'\'' if !in_dq => in_sq = !in_sq,
+                    b'>' if !in_dq && !in_sq => break,
+                    _ => {}
+                }
+            }
+        }
+        let mut span = Vec::new();
+        loop {
+            win.skip_noise(true)?;
+            if win.starts_with("</")? || win.peek()?.is_none() {
+                break;
+            }
+            win.scan_element(&mut span)?;
+            let text =
+                std::str::from_utf8(&span).with_context(|| format!("invalid UTF-8 in {path:?}"))?;
+            let el = xml_parse_one_element(text, 2)
+                .with_context(|| format!("failed to parse {path:?} as XML"))?;
+            let record = match xml_element_to_json(&el) {
+                JsonValue::Object(m) => m,
+                other => {
+                    let mut m = json_support::Map::new();
+                    m.insert("#text".to_string(), other);
+                    m
+                }
+            };
+            on_record(record)?;
+        }
+        Ok(true)
+    }
+
+    /// The tag name (namespace prefix stripped) of an element span the
+    /// scanner produced, i.e. the bytes after the leading `<` up to the
+    /// first whitespace, `/`, or `>`.
+    fn xml_leading_tag_name(span: &[u8]) -> Vec<u8> {
+        let rest = span.strip_prefix(b"<").unwrap_or(span);
+        let end = rest
+            .iter()
+            .position(|&b| b.is_ascii_whitespace() || b == b'/' || b == b'>')
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        match name.iter().position(|&b| b == b':') {
+            Some(i) => name[i + 1..].to_vec(),
+            None => name.to_vec(),
+        }
+    }
+
     /// If the root element's children all share one tag name (the
     /// common `<root><item>...</item><item>...</item></root>` shape),
     /// each becomes a record - mirroring the JSON reader's `[...]`
@@ -42967,42 +43313,113 @@ mod xml_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
+        // Homogeneous `<root><item/>...<item/></root>` records stream
+        // straight off the file - each child element's span parsed and
+        // folded in, then dropped. Every child is an object (a bare-text
+        // child is wrapped as `{"#text": ...}`), so the profiler's
+        // all-object-records branch reproduces `profile_json_records`
+        // exactly; `--nrows` parses every child but pushes only the
+        // first `n`.
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let streamed = stream_xml_records(path, |m| {
+            if nrows.is_none_or(|n| profiler.total < n) {
+                profiler.push(&JsonValue::Object(m));
+            }
+            Ok(())
+        })?;
+        if streamed {
+            return Ok(profiler.finish());
+        }
+
+        // A non-homogeneous root (or fewer than two element children) -
+        // the whole document is one record, and the whole-DOM parse here
+        // is also the authority on malformed input.
         let content =
             fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
         let root =
             xml_parse(&content).with_context(|| format!("failed to parse {path:?} as XML"))?;
-
-        let homogeneous = root.children.len() > 1
-            && root
-                .children
-                .iter()
-                .all(|e| e.name == root.children[0].name);
-
         let mut records: Vec<json_support::Map> = Vec::new();
-        if homogeneous {
-            for el in &root.children {
-                match xml_element_to_json(el) {
-                    JsonValue::Object(m) => records.push(m),
-                    other => {
-                        let mut m = json_support::Map::new();
-                        m.insert("#text".to_string(), other);
-                        records.push(m);
-                    }
-                }
-            }
-        } else {
-            match xml_element_to_json(&root) {
-                JsonValue::Object(m) => records.push(m),
-                _ => bail!(
-                    "expected the root XML element in {path:?} to have attributes or child elements"
-                ),
-            }
+        match xml_element_to_json(&root) {
+            JsonValue::Object(m) => records.push(m),
+            _ => bail!(
+                "expected the root XML element in {path:?} to have attributes or child elements"
+            ),
         }
-
         if let Some(n) = nrows {
             records.truncate(n);
         }
         Ok(profile_json_records(&records, n_samples))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn stream_records(doc: &str) -> (bool, Vec<JsonValue>) {
+            let mut tmp = TempFile::new().unwrap();
+            std::io::Write::write_all(&mut tmp, doc.as_bytes()).unwrap();
+            let mut out = Vec::new();
+            let ok = stream_xml_records(tmp.path(), |m| {
+                out.push(JsonValue::Object(m));
+                Ok(())
+            })
+            .unwrap();
+            (ok, out)
+        }
+
+        /// The byte-window record scanner must carve out exactly the same
+        /// child elements the whole-DOM parse sees, no matter where a
+        /// tag/attribute/text run straddles a scanner refill - checked
+        /// against `xml_parse` + `xml_element_to_json` over the same
+        /// document, for shapes with awkward inter-element noise, nested
+        /// and self-closing children, CDATA/comments/PIs, a quoted `>`
+        /// inside an attribute, and namespace-prefixed tags.
+        #[test]
+        fn stream_xml_records_matches_the_whole_dom_parse() {
+            for body in [
+                "<item id=\"0\"><n>Alice</n></item><item id=\"1\"><n>Bob</n></item>",
+                "\n  <r><a>1</a><a>2</a><m><s>x &amp; y</s></m></r>\n  <r><a>3</a></r>\n",
+                "<row/><row a=\"x &gt; y\"/><row><![CDATA[a < b]]></row>",
+                "<e:item xmlns:e=\"urn:x\"><e:v>1</e:v></e:item><e:item><e:v>2</e:v></e:item>",
+                "pre <it>1</it> mid <it>2</it> post",
+                "<it><!-- c --><k>1</k><?pi ?></it><it><k>2</k></it>",
+            ] {
+                let doc = format!("<?xml version=\"1.0\"?>\n<root>{body}</root>");
+                let (ok, streamed) = stream_records(&doc);
+                assert!(ok, "expected {doc:?} to stream as homogeneous records");
+
+                let root = xml_parse(&doc).unwrap();
+                let expected: Vec<JsonValue> = root
+                    .children
+                    .iter()
+                    .map(|el| match xml_element_to_json(el) {
+                        JsonValue::Object(m) => JsonValue::Object(m),
+                        other => {
+                            let mut m = json_support::Map::new();
+                            m.insert("#text".to_string(), other);
+                            JsonValue::Object(m)
+                        }
+                    })
+                    .collect();
+                assert_eq!(streamed, expected, "mismatch for {doc:?}");
+            }
+        }
+
+        /// A root that isn't a `>= 2`-child single-tag element must make
+        /// the scanner return `Ok(false)`, so `columns_from_xml` falls
+        /// back to the whole-DOM path.
+        #[test]
+        fn stream_xml_records_declines_non_homogeneous_roots() {
+            for doc in [
+                "<root><a>1</a><b>2</b></root>", // mixed child tags
+                "<root><only>1</only></root>",   // single child
+                "<root/>",                       // self-closing
+                "<root>plain text only</root>",  // no element children
+            ] {
+                let (ok, _) = stream_records(doc);
+                assert!(!ok, "expected {doc:?} to decline streaming");
+            }
+        }
     }
 }
 
