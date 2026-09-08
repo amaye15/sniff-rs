@@ -5572,6 +5572,41 @@ combinations), plus `xls_reader_matches_calamine_output_exactly`,
 Clippy/fmt clean across default/`xlsx`/`npy`/`full`, established
 baselines.
 
+**`.xlsb`'s worksheet `.bin` then stopped being resident too.**
+`Biff12RecordIter` (over `&[u8]`) gained a streaming sibling,
+`Biff12StreamIter<R>` - the same 1-2 byte record type + 1-4 byte LEB128
+length framing read off any `Read`, each record's body into one reused
+buffer (a `BIFF12_MAX_RECORD` = 256 MiB cap - the length varint's own
+ceiling - rejects a corrupt length before it allocates). A caller loops
+`while let Some((typ, body)) = it.next_record()?`; the body borrows the
+iterator, valid until the next call - exactly how the slice iter's
+borrow already worked in practice. `xlsb_parse_sheet_profiles` takes
+`impl Read` instead of `&[u8]` and `columns_from_xlsb` `read_to_temp`s
+each `xl/worksheets/sheetN.bin` and drives the stream iterator over it.
+`xl/workbook.bin` / `xl/sharedStrings.bin` / `xl/styles.bin` stay
+slice-based whole `read`s (small; the string table is indexed by cell in
+arbitrary order). The slice `Biff12RecordIter` is untouched - it still
+serves those three parts, and the `xlsb_reader_*` regression-test
+comment about its "every record's length is consumed" property still
+holds.
+
+This one *was* measurable, via a real POI `.xlsb` with its
+`xl/worksheets/sheet2.bin` swapped for a hand-built 89.6 MB one (300,000
+rows of `BrtRowHdr` + `BrtCellReal`/`BrtCellSt`/`BrtCellRk` records) -
+the rest of the archive (workbook, rels, styles) left intact so the
+reader accepts it: maxRSS 103-178 MB -> ~2.6 MB (~97-99%), peak
+footprint 97-172 MB -> ~1.3-1.5 MB (~99%), 3 rounds. Output
+byte-identical via `diff` against the pre-change binary across the entire
+359-file fixture corpus in all three output formats with `--nrows`
+unset/1/2/5 (4,344 combinations), plus a 200-iteration old-vs-new fuzz
+over hand-built `.xlsb` worksheet streams (1-5 columns, 0-40 rows, mixed
+`BrtCellReal`/`BrtCellRk`/`BrtCellSt`/`BrtCellBool`/`BrtCellError`/blank
+cells, blank rows, trailing rows) swapped into the same POI archive,
+crossed with `--nrows`/`--samples`/output format - zero mismatches. Full
+suite (`xlsb_reader_matches_calamine_output_exactly` and the three
+`xlsb_reader_*` regression tests unchanged) and clippy/fmt clean across
+default/`xlsx`/`npy`/`full`, established baselines.
+
 **Every streamable JSON, YAML, homogeneous-records XML, `.ods`, `.xlsx`,
 `.xls`, `.xlsb`, and `.npz` shape now folds cells straight into the
 type-detection accumulators with no intermediate row/grid/DOM copy on
@@ -5579,12 +5614,15 @@ top of its source bytes.** What remains materialized:
 - `.xlsx`'s shared-strings table (`xl/sharedStrings.xml`, parsed to a
   resident `Vec<String>`) - indexed by cell in arbitrary order, so not
   streamable; bounded by distinct-string count, not row count.
-- `.xls`'s OLE2 `Workbook` stream and `.xlsb`'s decompressed `.bin`
-  parts stay fully resident - `.xls` via the CFB reader (no per-stream
-  streaming), `.xlsb` via whole-entry `ZipArchive::read`. Streaming
-  either would mean a `Read`-based BIFF8 / BIFF12 record iterator (both
-  are currently `&[u8]`-slice iterators), and there's no large file of
-  either format available to measure the result against.
+- `.xls`'s OLE2 `Workbook` stream stays fully resident - the CFB reader
+  reads a whole named stream at once (`cfb.read_stream("Workbook")`),
+  and `xls_parse_workbook_globals` + each sheet substream need random
+  access into it (BOUNDSHEET8 gives byte positions). Streaming it would
+  mean a `Seek`-based CFB stream reader (decompress the stream to a temp
+  file, then `Seek(pos)` per sheet) plus a `Read`-based BIFF8 record
+  iterator; `.xls` tops out around a few MB in practice, and the only
+  way to write one in this environment is LibreOffice's `.xlsx` ->
+  `.xls` export, so a large fixture would itself be a build step.
 - **A single TOML or YAML document, or an XML tree with a non-
   homogeneous root**: one value with no internal record boundary.
   `toml_support`/`xml_support` are still `&str`-buffer parsers for these

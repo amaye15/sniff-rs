@@ -33,6 +33,29 @@ re-run.
 
 ---
 
+## 2026-09-09 — `feat/streaming-xlsb-bin` branch (Darwin arm64)
+
+`.xlsb`'s worksheet `.bin` stops being resident. `Biff12RecordIter` (over
+`&[u8]`) gains a streaming sibling `Biff12StreamIter<R>` - same 1-2 byte
+type + 1-4 byte LEB128 length framing off any `Read`, each body into one
+reused buffer (256 MiB cap on a corrupt length). `xlsb_parse_sheet_profiles`
+takes `impl Read`; `columns_from_xlsb` `read_to_temp`s each
+`xl/worksheets/sheetN.bin`. workbook/sharedStrings/styles stay slice-based
+whole `read`s (small; string table indexed by cell in arbitrary order).
+
+Measured on a real POI `.xlsb` with `sheet2.bin` swapped for a hand-built
+89.6 MB one (300,000 rows of BrtRowHdr + BrtCellReal/St/Rk): maxRSS
+103-178 MB -> ~2.6 MB (~97-99%), peak footprint 97-172 MB -> ~1.3-1.5 MB
+(~99%), 3 rounds. Byte-identical output across the full 359-file corpus
+in all three formats with `--nrows` unset/1/2/5 (4,344 combinations) plus
+a 200-iteration hand-built-`.xlsb`-worksheet fuzz (1-5 cols, 0-40 rows,
+mixed real/rk/string/bool/error/blank cells, blank + trailing rows). Full
+suite (`xlsb_reader_matches_calamine_output_exactly` + three
+`xlsb_reader_*` regression tests unchanged) + clippy/fmt clean across
+default/`xlsx`/`npy`/`full`, established baselines.
+
+---
+
 ## 2026-09-08 — `feat/biff-fold-cells` branch (Darwin arm64)
 
 `.xls`/`.xlsb` drop their `SheetGrid` intermediate. `xls_parse_sheet` /

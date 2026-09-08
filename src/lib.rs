@@ -50305,6 +50305,88 @@ mod xlsx_support {
         }
     }
 
+    /// The streaming sibling of `Biff12RecordIter` - the same 1-2 byte
+    /// record type + 1-4 byte LEB128 length framing, read off any `Read`
+    /// instead of indexing a resident `&[u8]`, with each record's body
+    /// read into one reused buffer. Used for a `.xlsb` worksheet part,
+    /// which is the only genuinely large `.bin` (workbook/sharedStrings/
+    /// styles all stay slice-based); a caller loops `while let
+    /// Some((typ, body)) = it.next_record()?`. The body slice borrows the
+    /// iterator, so it's valid only until the next `next_record` call -
+    /// exactly how the slice iter's borrow already worked in practice.
+    struct Biff12StreamIter<R> {
+        reader: R,
+        body: Vec<u8>,
+    }
+
+    /// A BIFF12 record's own length varint is at most 4 bytes (28 bits ->
+    /// ~256 MiB), so a value past this is a corrupt/adversarial stream,
+    /// not a real record - reject it before `resize` allocates for it.
+    const BIFF12_MAX_RECORD: usize = 256 * 1024 * 1024;
+
+    impl<R: std::io::Read> Biff12StreamIter<R> {
+        fn new(reader: R) -> Self {
+            Biff12StreamIter {
+                reader,
+                body: Vec::new(),
+            }
+        }
+
+        /// One byte, or `None` at a clean end-of-stream (between records).
+        fn read_u8_opt(&mut self) -> Result<Option<u8>> {
+            let mut b = [0u8; 1];
+            loop {
+                match self.reader.read(&mut b) {
+                    Ok(0) => return Ok(None),
+                    Ok(_) => return Ok(Some(b[0])),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e).context("I/O error reading a BIFF12 record"),
+                }
+            }
+        }
+
+        fn read_u8(&mut self) -> Result<u8> {
+            self.read_u8_opt()?
+                .context("unexpected end of BIFF12 record stream")
+        }
+
+        fn read_type_len(&mut self, first: u8) -> Result<(u16, usize)> {
+            let typ = if first & 0x80 != 0 {
+                let b2 = self.read_u8()?;
+                (first & 0x7F) as u16 | (((b2 & 0x7F) as u16) << 7)
+            } else {
+                first as u16
+            };
+            let mut b = self.read_u8()?;
+            let mut len = (b & 0x7F) as usize;
+            let mut shift = 7;
+            for _ in 1..4 {
+                if b & 0x80 == 0 {
+                    break;
+                }
+                b = self.read_u8()?;
+                len += ((b & 0x7F) as usize) << shift;
+                shift += 7;
+            }
+            Ok((typ, len))
+        }
+
+        fn next_record(&mut self) -> Result<Option<(u16, &[u8])>> {
+            let Some(first) = self.read_u8_opt()? else {
+                return Ok(None);
+            };
+            let (typ, len) = self.read_type_len(first)?;
+            if len > BIFF12_MAX_RECORD {
+                bail!("BIFF12 record body length {len} exceeds the sane maximum");
+            }
+            self.body.resize(len, 0);
+            self.reader
+                .read_exact(&mut self.body)
+                .context("truncated BIFF12 record body")?;
+            Ok(Some((typ, &self.body)))
+        }
+    }
+
     /// A BIFF12 `XLWideString`: a 4-byte character count followed by
     /// that many UTF-16LE code units - always UTF-16, never BIFF8's
     /// compressed/uncompressed split, and never spanning a CONTINUE
@@ -50530,8 +50612,8 @@ mod xlsx_support {
     /// scope. `BrtCellBlank` (an explicitly-blank cell) is silently
     /// skipped, the same "absent = missing" convention every other
     /// reader in this project already uses.
-    fn xlsb_parse_sheet_profiles(
-        data: &[u8],
+    fn xlsb_parse_sheet_profiles<R: std::io::Read>(
+        reader: R,
         sst: &[String],
         is_date_by_xf: &[bool],
         nrows: Option<usize>,
@@ -50559,8 +50641,8 @@ mod xlsx_support {
             }};
         }
 
-        for record in Biff12RecordIter::new(data) {
-            let (typ, body) = record?;
+        let mut iter = Biff12StreamIter::new(reader);
+        while let Some((typ, body)) = iter.next_record()? {
             match typ {
                 0x0000 => {
                     // BrtRowHdr
@@ -50661,11 +50743,20 @@ mod xlsx_support {
 
         let mut out = Vec::new();
         for entry in sheet_entries {
-            let sheet_bytes = zip
-                .read(&entry.part_path)
+            // The worksheet `.bin` - the one large part - streams off a
+            // temp file through the record iterator; workbook/
+            // sharedStrings/styles stay whole `read`s (small, and the
+            // string table is indexed by cell in arbitrary order).
+            let mut sheet_tmp = zip
+                .read_to_temp(&entry.part_path)
                 .with_context(|| format!("failed to read sheet '{}' in {path:?}", entry.name))?;
-            let Some(profiles) =
-                xlsb_parse_sheet_profiles(&sheet_bytes, &sst, &is_date_by_xf, nrows, n_samples)?
+            let Some(profiles) = xlsb_parse_sheet_profiles(
+                std::io::BufReader::new(sheet_tmp.as_file_mut()),
+                &sst,
+                &is_date_by_xf,
+                nrows,
+                n_samples,
+            )?
             else {
                 continue; // empty sheet (or a non-tabular one, e.g. a chart)
             };
