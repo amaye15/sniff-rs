@@ -1,0 +1,8 @@
+{
+  // VS Code's own "JSON with comments" convention - comments and a
+  // trailing comma, proving the .jsonc extension routes to the exact
+  // same reader sample.json5 already exercises.
+  "name": "sniff-rs",
+  "version": "1.0",
+  "features": ["bson", "plist", "json5", "har"],
+}

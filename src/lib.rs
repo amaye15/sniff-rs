@@ -43641,6 +43641,552 @@ fn columns_from_plist(
     )
 }
 
+// --- JSON5 / JSONC reader (opt-in via --features json5, hand-rolled -
+// deliberately a second, fully independent parser rather than extending
+// `json_support::Parser` in place. That core parser is this project's
+// single most heavily tested, adversarially-fuzzed function (see
+// CLAUDE.md's design-philosophy section) and is also the literal bridge
+// type seven other format readers recurse through - loosening its
+// grammar in place to accept comments/trailing commas/unquoted keys
+// would risk *every* one of those callers silently accepting input
+// they're not supposed to, for a relaxation only this one format ever
+// wants. A second, separately-scoped parser has no such blast radius.
+//
+// Deliberately scoped to exactly the four relaxations this format was
+// actually asked for - comments, trailing commas, unquoted object keys,
+// and single-quoted strings - not the complete JSON5 grammar. Real
+// JSON5 also permits leading `+`/bare leading-or-trailing `.`/hex
+// integer literals/`Infinity`/`NaN` as numbers, more Unicode escape
+// forms in unquoted keys, and additional Unicode whitespace/line-
+// terminator characters; none of that is implemented here, the same
+// "confident common case, disclosed gap" tradeoff `is_email`/`is_url`
+// already make elsewhere in this project. `.jsonc` (VS Code's own
+// "JSON with comments" convention - comments and trailing commas, but
+// not unquoted keys or single-quoted strings in its own stricter
+// definition) shares this exact same relaxed grammar rather than a
+// separate, narrower parser: this reader is a pure grammar superset of
+// what a `.jsonc` file would ever actually use, so accepting a little
+// more than `.jsonc` strictly requires costs nothing and avoids a
+// second near-duplicate parser for a difference no real fixture would
+// ever exercise.
+#[cfg(feature = "json5")]
+mod json5_support {
+    use super::*;
+
+    /// Same reasoning as every other hand-rolled recursive-descent
+    /// parser in this project (TOML/YAML/CBOR/MessagePack): this parser
+    /// never routes through `serde_json`'s own parse-time recursion
+    /// guard, so it needs its own. Matches `json_support::Parser`'s own
+    /// `MAX_DEPTH` (128, itself matching `serde_json`'s documented
+    /// default) rather than picking a new number.
+    const MAX_DEPTH: u32 = 128;
+
+    struct Parser<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+        depth: u32,
+    }
+
+    impl<'a> Parser<'a> {
+        fn new(s: &'a str) -> Self {
+            Parser {
+                bytes: s.as_bytes(),
+                pos: 0,
+                depth: 0,
+            }
+        }
+
+        fn peek(&self) -> Option<u8> {
+            self.bytes.get(self.pos).copied()
+        }
+
+        fn error(&self, msg: &str) -> Error {
+            anyhow!("{msg} at byte offset {}", self.pos)
+        }
+
+        /// Skips ASCII whitespace, `//` line comments, and `/* ... */`
+        /// block comments, in any interleaving - the one JSON5 grammar
+        /// extension every one of the other three relaxations needs to
+        /// sit alongside (a comment can appear anywhere plain whitespace
+        /// could).
+        fn skip_ws_and_comments(&mut self) -> Result<()> {
+            loop {
+                match self.peek() {
+                    Some(b' ' | b'\t' | b'\n' | b'\r') => self.pos += 1,
+                    Some(b'/') if self.bytes.get(self.pos + 1) == Some(&b'/') => {
+                        self.pos += 2;
+                        while let Some(b) = self.peek() {
+                            if b == b'\n' {
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                    }
+                    Some(b'/') if self.bytes.get(self.pos + 1) == Some(&b'*') => {
+                        self.pos += 2;
+                        let start = self.pos;
+                        loop {
+                            match self.peek() {
+                                None => return Err(self.error("unterminated /* comment")),
+                                Some(b'*') if self.bytes.get(self.pos + 1) == Some(&b'/') => {
+                                    self.pos += 2;
+                                    break;
+                                }
+                                _ => self.pos += 1,
+                            }
+                        }
+                        let _ = start; // only the end position matters here
+                    }
+                    _ => return Ok(()),
+                }
+            }
+        }
+
+        fn expect_byte(&mut self, b: u8, what: &str) -> Result<()> {
+            if self.peek() == Some(b) {
+                self.pos += 1;
+                Ok(())
+            } else {
+                Err(self.error(&format!("expected {what}")))
+            }
+        }
+
+        fn parse_value(&mut self) -> Result<JsonValue> {
+            self.skip_ws_and_comments()?;
+            match self.peek() {
+                Some(b'{') => self.parse_object(),
+                Some(b'[') => self.parse_array(),
+                Some(b'"') => Ok(JsonValue::from(self.parse_string(b'"')?)),
+                Some(b'\'') => Ok(JsonValue::from(self.parse_string(b'\'')?)),
+                Some(b't') => self.parse_literal("true", JsonValue::from(true)),
+                Some(b'f') => self.parse_literal("false", JsonValue::from(false)),
+                Some(b'n') => self.parse_literal("null", JsonValue::Null),
+                Some(b'-' | b'0'..=b'9') => self.parse_number(),
+                _ => Err(self.error("expected a value")),
+            }
+        }
+
+        fn parse_literal(&mut self, lit: &str, value: JsonValue) -> Result<JsonValue> {
+            if self.bytes[self.pos..].starts_with(lit.as_bytes()) {
+                self.pos += lit.len();
+                Ok(value)
+            } else {
+                Err(self.error(&format!("expected `{lit}`")))
+            }
+        }
+
+        /// Standard JSON number grammar only - deliberately not the
+        /// wider JSON5 grammar (no leading `+`, no hex, no bare leading/
+        /// trailing `.`, no `Infinity`/`NaN`), per this module's own
+        /// doc comment.
+        fn parse_number(&mut self) -> Result<JsonValue> {
+            let start = self.pos;
+            if self.peek() == Some(b'-') {
+                self.pos += 1;
+            }
+            let digits_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == digits_start {
+                return Err(self.error("expected a digit"));
+            }
+            let mut is_float = false;
+            if self.peek() == Some(b'.') {
+                is_float = true;
+                self.pos += 1;
+                let frac_start = self.pos;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+                if self.pos == frac_start {
+                    return Err(self.error("expected a digit after '.'"));
+                }
+            }
+            if matches!(self.peek(), Some(b'e' | b'E')) {
+                is_float = true;
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'+' | b'-')) {
+                    self.pos += 1;
+                }
+                let exp_start = self.pos;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+                if self.pos == exp_start {
+                    return Err(self.error("expected a digit in exponent"));
+                }
+            }
+            let text = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap();
+            if !is_float {
+                if let Ok(i) = text.parse::<i64>() {
+                    return Ok(JsonValue::from(i));
+                }
+                if let Ok(u) = text.parse::<u64>() {
+                    return Ok(JsonValue::from(u));
+                }
+            }
+            let f: f64 = text
+                .parse()
+                .map_err(|_| self.error("invalid numeric literal"))?;
+            Ok(JsonValue::from(f))
+        }
+
+        /// `quote` is `"` or `'` - both accept the identical escape
+        /// grammar (the standard JSON set, plus escaping the *other*
+        /// quote character, plus a backslash-newline line continuation
+        /// that contributes nothing to the string - a real JSON5
+        /// feature, cheap to support once escapes are being handled at
+        /// all).
+        fn parse_string(&mut self, quote: u8) -> Result<String> {
+            self.pos += 1; // opening quote
+            let mut out = String::new();
+            loop {
+                match self.peek() {
+                    None => return Err(self.error("unterminated string")),
+                    Some(b) if b == quote => {
+                        self.pos += 1;
+                        return Ok(out);
+                    }
+                    Some(b'\\') => {
+                        self.pos += 1;
+                        match self.peek() {
+                            Some(b'"') => {
+                                out.push('"');
+                                self.pos += 1;
+                            }
+                            Some(b'\'') => {
+                                out.push('\'');
+                                self.pos += 1;
+                            }
+                            Some(b'\\') => {
+                                out.push('\\');
+                                self.pos += 1;
+                            }
+                            Some(b'/') => {
+                                out.push('/');
+                                self.pos += 1;
+                            }
+                            Some(b'b') => {
+                                out.push('\u{8}');
+                                self.pos += 1;
+                            }
+                            Some(b'f') => {
+                                out.push('\u{c}');
+                                self.pos += 1;
+                            }
+                            Some(b'n') => {
+                                out.push('\n');
+                                self.pos += 1;
+                            }
+                            Some(b'r') => {
+                                out.push('\r');
+                                self.pos += 1;
+                            }
+                            Some(b't') => {
+                                out.push('\t');
+                                self.pos += 1;
+                            }
+                            Some(b'\n') => {
+                                // Line continuation - the backslash and
+                                // the newline it escapes both vanish.
+                                self.pos += 1;
+                            }
+                            Some(b'u') => {
+                                self.pos += 1;
+                                let hex = self
+                                    .bytes
+                                    .get(self.pos..self.pos + 4)
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .ok_or_else(|| self.error("truncated \\u escape"))?;
+                                let cp = u32::from_str_radix(hex, 16)
+                                    .map_err(|_| self.error("invalid \\u escape"))?;
+                                out.push(
+                                    char::from_u32(cp).ok_or_else(|| {
+                                        self.error("invalid \\u escape codepoint")
+                                    })?,
+                                );
+                                self.pos += 4;
+                            }
+                            _ => return Err(self.error("unrecognized escape sequence")),
+                        }
+                    }
+                    Some(_) => {
+                        // Bulk-copy the run of ordinary bytes up to the
+                        // next quote/backslash, the same "don't decode
+                        // one byte at a time" discipline this project's
+                        // own core JSON string parser already uses -
+                        // safe here for the identical reason: a UTF-8
+                        // continuation byte is always >= 0x80, so it can
+                        // never be mistaken for the single-byte ASCII
+                        // quote/backslash bytes this scan stops on.
+                        let start = self.pos;
+                        while let Some(b) = self.peek() {
+                            if b == quote || b == b'\\' {
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                        out.push_str(std::str::from_utf8(&self.bytes[start..self.pos]).unwrap());
+                    }
+                }
+            }
+        }
+
+        /// A bare identifier key - `[A-Za-z_$][A-Za-z0-9_$]*`, the
+        /// common-case subset of JSON5's real (Unicode-aware,
+        /// escape-supporting) `IdentifierName` grammar. A key outside
+        /// this subset still works fine quoted, the normal fallback for
+        /// every scoped-down heuristic in this project.
+        fn parse_unquoted_key(&mut self) -> Result<String> {
+            let start = self.pos;
+            match self.peek() {
+                Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b'$' => self.pos += 1,
+                _ => return Err(self.error("expected an object key")),
+            }
+            while matches!(self.peek(), Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+            {
+                self.pos += 1;
+            }
+            Ok(std::str::from_utf8(&self.bytes[start..self.pos])
+                .unwrap()
+                .to_string())
+        }
+
+        fn parse_object(&mut self) -> Result<JsonValue> {
+            self.depth += 1;
+            if self.depth > MAX_DEPTH {
+                return Err(anyhow!("JSON5 value nested past {MAX_DEPTH} levels"));
+            }
+            self.pos += 1; // '{'
+            let mut map = json_support::Map::with_capacity(8);
+            self.skip_ws_and_comments()?;
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                self.depth -= 1;
+                return Ok(JsonValue::from(map));
+            }
+            loop {
+                self.skip_ws_and_comments()?;
+                let key = match self.peek() {
+                    Some(b'"') => self.parse_string(b'"')?,
+                    Some(b'\'') => self.parse_string(b'\'')?,
+                    _ => self.parse_unquoted_key()?,
+                };
+                self.skip_ws_and_comments()?;
+                self.expect_byte(b':', "':' after object key")?;
+                let value = self.parse_value()?;
+                map.insert(key, value);
+                self.skip_ws_and_comments()?;
+                match self.peek() {
+                    Some(b',') => {
+                        self.pos += 1;
+                        self.skip_ws_and_comments()?;
+                        if self.peek() == Some(b'}') {
+                            // Trailing comma.
+                            self.pos += 1;
+                            break;
+                        }
+                    }
+                    Some(b'}') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => return Err(self.error("expected ',' or '}'")),
+                }
+            }
+            self.depth -= 1;
+            Ok(JsonValue::from(map))
+        }
+
+        fn parse_array(&mut self) -> Result<JsonValue> {
+            self.depth += 1;
+            if self.depth > MAX_DEPTH {
+                return Err(anyhow!("JSON5 value nested past {MAX_DEPTH} levels"));
+            }
+            self.pos += 1; // '['
+            let mut items = Vec::new();
+            self.skip_ws_and_comments()?;
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                self.depth -= 1;
+                return Ok(JsonValue::Array(items));
+            }
+            loop {
+                items.push(self.parse_value()?);
+                self.skip_ws_and_comments()?;
+                match self.peek() {
+                    Some(b',') => {
+                        self.pos += 1;
+                        self.skip_ws_and_comments()?;
+                        if self.peek() == Some(b']') {
+                            // Trailing comma.
+                            self.pos += 1;
+                            break;
+                        }
+                    }
+                    Some(b']') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => return Err(self.error("expected ',' or ']'")),
+                }
+            }
+            self.depth -= 1;
+            Ok(JsonValue::Array(items))
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<JsonValue> {
+        let mut parser = Parser::new(s);
+        let value = parser.parse_value()?;
+        parser.skip_ws_and_comments()?;
+        if parser.pos != parser.bytes.len() {
+            return Err(parser.error("trailing content after a complete JSON5 value"));
+        }
+        Ok(value)
+    }
+
+    /// A JSON5/JSONC file is always a single document (there's no JSON-
+    /// Lines-style concatenated-records convention for either format),
+    /// so this reads the whole file, parses it once, and applies the
+    /// same dual-mode ending every other JSON-shaped bridge format in
+    /// this project already uses: a top-level array becomes
+    /// array-of-records (or, if not every element is an object, one
+    /// `value` column); a top-level object is a single record; anything
+    /// else is the same `value`-column fallback.
+    pub(crate) fn columns_from_json5(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = parse(&text).with_context(|| format!("failed to parse {path:?} as JSON5"))?;
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        match value {
+            // Matches `stream_json_document`'s own `--nrows` behavior
+            // exactly: stop pushing (and stop counting toward `total`)
+            // the instant the cutoff is reached, rather than counting
+            // every element toward `total` while only pushing the kept
+            // ones - the latter would desync `JsonRecordStreamProfiler`'s
+            // own `pushed_count == total` invariant its dual-mode
+            // `finish()` relies on to detect "every value was an
+            // object", silently forcing the truncated read into the
+            // wrong (fallback `value`-column) shape.
+            JsonValue::Array(items) => {
+                for item in items.into_iter().take(nrows.unwrap_or(usize::MAX)) {
+                    profiler.push(&item);
+                }
+            }
+            other => profiler.push(&other),
+        }
+        Ok(profiler.finish())
+    }
+} // mod json5_support
+
+#[cfg(feature = "json5")]
+fn columns_from_json5(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    json5_support::columns_from_json5(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "json5"))]
+fn columns_from_json5(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "JSON5/JSONC support isn't compiled in - rebuild with `cargo build --release --features json5` (or --features full)"
+    )
+}
+
+// --- HAR (HTTP Archive) reader (opt-in via --features har) --- HAR is
+// just JSON with a fixed, well-known top-level shape
+// (`{"log": {"version", "creator", "entries": [...]}}`, per the HAR 1.2
+// spec) - no new parsing code at all, just extracting `log.entries` (the
+// format's own natural record array) and profiling it exactly like any
+// other array-of-objects JSON file. This reuses the always-on
+// `json_support` parser directly (the real one, not `json5_support`'s
+// relaxed sibling - a HAR file is standard JSON, no relaxed grammar
+// ever needed), so there's no new dependency and no new binary format
+// to hand-roll, only a small amount of format-specific plumbing.
+#[cfg(feature = "har")]
+mod har_support {
+    use super::*;
+
+    pub(crate) fn columns_from_har(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = json_support::from_str(&text)
+            .map_err(|e| anyhow!("{e}"))
+            .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        let not_har = || {
+            anyhow!(
+                "{path:?} doesn't look like a HAR file - expected a top-level \
+                 `log.entries` array (HAR 1.2 §2.1)"
+            )
+        };
+        // Moved, not cloned, out of the parsed document - nothing else
+        // needs `value`/`log` once their one relevant field is found.
+        let JsonValue::Object(root) = value else {
+            return Err(not_har());
+        };
+        let Some(JsonValue::Object(log)) =
+            root.into_iter().find(|(k, _)| k == "log").map(|(_, v)| v)
+        else {
+            return Err(not_har());
+        };
+        let Some(JsonValue::Array(entries)) = log
+            .into_iter()
+            .find(|(k, _)| k == "entries")
+            .map(|(_, v)| v)
+        else {
+            return Err(not_har());
+        };
+        let mut records: Vec<json_support::Map> = Vec::with_capacity(entries.len());
+        for (i, entry) in entries.into_iter().enumerate() {
+            if nrows.is_some_and(|n| i >= n) {
+                break;
+            }
+            match entry {
+                JsonValue::Object(m) => records.push(m),
+                other => bail!(
+                    "{path:?}: log.entries[{i}] is a {other:?}, not an object - \
+                     not a well-formed HAR entry"
+                ),
+            }
+        }
+        Ok(profile_json_records(&records, n_samples))
+    }
+} // mod har_support
+
+#[cfg(feature = "har")]
+fn columns_from_har(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    har_support::columns_from_har(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "har"))]
+fn columns_from_har(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "HAR support isn't compiled in - rebuild with `cargo build --release --features har` (or --features full)"
+    )
+}
+
 // --- INI reader (opt-in via --features ini, hand-rolled - see
 // `ini_support` below and CLAUDE.md's Dependency footprint section) ---
 // An INI file's sections are already "multiple named groups of key=value
@@ -47256,6 +47802,8 @@ enum InputFormat {
     Orc,
     Bson,
     Plist,
+    Json5,
+    Har,
 }
 
 impl InputFormat {
@@ -47303,6 +47851,8 @@ impl InputFormat {
             InputFormat::Orc => "orc",
             InputFormat::Bson => "bson",
             InputFormat::Plist => "plist",
+            InputFormat::Json5 => "json5",
+            InputFormat::Har => "har",
         }
     }
 }
@@ -47590,9 +48140,11 @@ fn detect_format(
             "orc" => Ok(InputFormat::Orc),
             "bson" => Ok(InputFormat::Bson),
             "plist" => Ok(InputFormat::Plist),
+            "json5" | "jsonc" => Ok(InputFormat::Json5),
+            "har" => Ok(InputFormat::Har),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, orc, bson, or plist)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, orc, bson, plist, json5, or har)"
                 )
             }
         };
@@ -47626,6 +48178,8 @@ fn detect_format(
         "orc" => Ok(InputFormat::Orc),
         "bson" => Ok(InputFormat::Bson),
         "plist" => Ok(InputFormat::Plist),
+        "json5" | "jsonc" => Ok(InputFormat::Json5),
+        "har" => Ok(InputFormat::Har),
         // The extension alone doesn't tell us - either there isn't one, or
         // it's not one of the above. Before giving up, try the file's own
         // bytes: fixed-width text and the four log formats have no magic
@@ -47637,7 +48191,7 @@ fn detect_format(
                 return Ok(format);
             }
             bail!(
-                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss|orc explicitly"
+                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss|orc|bson|plist|json5|har explicitly"
             )
         }
     }
@@ -54431,6 +54985,8 @@ fn dispatch_reader(
             InputFormat::Orc => columns_from_orc(read_path, args.nrows, args.samples)?,
             InputFormat::Bson => columns_from_bson(read_path, args.nrows, args.samples)?,
             InputFormat::Plist => columns_from_plist(read_path, args.nrows, args.samples)?,
+            InputFormat::Json5 => columns_from_json5(read_path, args.nrows, args.samples)?,
+            InputFormat::Har => columns_from_har(read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
@@ -59353,6 +59909,210 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Test-only bridge from a real `serde_json::Value` (what the real
+    /// `json5` crate deserializes into directly - it works with any
+    /// `serde::Deserialize` target, `serde_json::Value` included) to
+    /// this project's own `JsonValue`. Trivial, since both types share
+    /// the identical six-variant shape by design (see `json_support::
+    /// Value`'s own doc comment).
+    #[cfg(all(test, feature = "json5"))]
+    fn serde_json_value_to_json(v: &serde_json::Value) -> JsonValue {
+        match v {
+            serde_json::Value::Null => JsonValue::Null,
+            serde_json::Value::Bool(b) => JsonValue::from(*b),
+            serde_json::Value::Number(n) => n
+                .as_i64()
+                .map(JsonValue::from)
+                .or_else(|| n.as_u64().map(JsonValue::from))
+                .or_else(|| n.as_f64().map(JsonValue::from))
+                .unwrap_or(JsonValue::Null),
+            serde_json::Value::String(s) => JsonValue::from(s.clone()),
+            serde_json::Value::Array(items) => {
+                JsonValue::Array(items.iter().map(serde_json_value_to_json).collect())
+            }
+            serde_json::Value::Object(m) => JsonValue::Object(
+                m.iter()
+                    .map(|(k, v)| (k.clone(), serde_json_value_to_json(v)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Test-only: producing the "expected" side of `json5_reader_matches_
+    /// the_json5_crate_output_exactly` - parses via the real `json5`
+    /// crate (kept as a dev-only cross-verification oracle, see
+    /// Cargo.toml) rather than this project's own hand-rolled `json5_
+    /// support`, then applies the identical dual-mode ending every other
+    /// JSON-shaped reader in this project already uses.
+    #[cfg(all(test, feature = "json5"))]
+    fn columns_from_json5_via_json5_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let text = fs::read_to_string(path)?;
+        let value: serde_json::Value = json5::from_str(&text).map_err(|e| anyhow!("{e}"))?;
+        let value = serde_json_value_to_json(&value);
+        match value {
+            JsonValue::Array(items) if items.iter().all(JsonValue::is_object) => {
+                let records: Vec<json_support::Map> = items
+                    .into_iter()
+                    .map(|v| match v {
+                        JsonValue::Object(m) => m,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                Ok(profile_json_records(&records, n_samples))
+            }
+            JsonValue::Object(m) => Ok(profile_json_records(&[m], n_samples)),
+            other => {
+                let total = if let JsonValue::Array(items) = &other {
+                    items.len()
+                } else {
+                    1
+                };
+                let items = match other {
+                    JsonValue::Array(items) => items,
+                    single => vec![single],
+                };
+                let refs: Vec<&JsonValue> = items.iter().filter(|v| !v.is_null()).collect();
+                Ok(profile_json_path(
+                    "value".to_string(),
+                    total,
+                    refs,
+                    n_samples,
+                ))
+            }
+        }
+    }
+
+    /// Cross-verification oracle for the hand-rolled JSON5/JSONC parser
+    /// (`json5_support` - see Cargo.toml) against the real `json5`
+    /// crate, kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "json5")]
+    #[test]
+    fn json5_reader_matches_the_json5_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.json5",
+            "tests/fixtures/type_detection.json5",
+            "tests/fixtures/sample.jsonc",
+        ] {
+            let path = Path::new(f);
+            let mine = json5_support::columns_from_json5(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_json5_via_json5_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: json5-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Direct coverage of every relaxation `json5_support` adds beyond
+    /// standard JSON - comments (both `//` and `/* */`), a trailing
+    /// comma in both objects and arrays, an unquoted object key, and a
+    /// single-quoted string - in one small, hand-verified literal rather
+    /// than only through the fixture-based oracle test above, so a
+    /// regression in any one relaxation fails with a precise, minimal
+    /// reproduction.
+    #[cfg(feature = "json5")]
+    #[test]
+    fn json5_reader_handles_every_relaxation_in_one_document() {
+        let src = r#"
+            {
+                // a line comment
+                a: 1, /* a block
+                         comment */
+                'b': 'two',
+                "c": [1, 2, 3,],
+            }
+        "#;
+        let value = json5_support::parse(src).expect("valid JSON5");
+        let JsonValue::Object(m) = value else {
+            panic!("expected an object");
+        };
+        assert_eq!(m.get("a").and_then(JsonValue::as_i64), Some(1));
+        assert_eq!(m.get("b").and_then(JsonValue::as_str), Some("two"));
+        assert_eq!(
+            m.get("c").and_then(JsonValue::as_array).map(Vec::len),
+            Some(3)
+        );
+    }
+
+    /// Direct coverage of `har_support::columns_from_har`'s own
+    /// plumbing - no independent oracle crate needed (HAR is standard
+    /// JSON with a fixed shape, already exhaustively cross-verified via
+    /// `json_reader_matches_the_serde_json_crate_output_exactly`), so
+    /// this asserts directly on the real fixture: `log.entries` becomes
+    /// the record list, and its own nested `request`/`response`/
+    /// `timings` objects flatten exactly like any other nested JSON
+    /// object would.
+    #[cfg(feature = "har")]
+    #[test]
+    fn har_extracts_log_entries_as_the_record_list() {
+        let cols = har_support::columns_from_har(Path::new("tests/fixtures/sample.har"), None, 100)
+            .expect("sample.har should read cleanly");
+        let started = cols
+            .iter()
+            .find(|c| c.name == "startedDateTime")
+            .expect("startedDateTime column");
+        assert_eq!(started.ideal_type, "NaiveDate / DateTime");
+        assert_eq!(started.row_count, 2);
+
+        let url = cols
+            .iter()
+            .find(|c| c.name == "request.url")
+            .expect("request.url column - nested flattening");
+        assert_eq!(url.ideal_type, "URL");
+
+        let ip = cols
+            .iter()
+            .find(|c| c.name == "serverIPAddress")
+            .expect("serverIPAddress column");
+        assert_eq!(ip.ideal_type, "IPv4");
+    }
+
+    /// A well-formed JSON document that just isn't a HAR file (no
+    /// `log.entries` array) is a clear, disclosed error naming exactly
+    /// what's missing - not a guess, and not confused with a genuine
+    /// JSON syntax error.
+    #[cfg(feature = "har")]
+    #[test]
+    fn har_without_log_entries_is_a_clear_disclosed_error() {
+        let result = har_support::columns_from_har(
+            Path::new("tests/fixtures/edge_har_missing_entries.har"),
+            None,
+            100,
+        );
+        let err = match result {
+            Ok(_) => panic!("expected an error for a file with no log.entries array"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:?}").contains("log.entries"),
+            "expected an error naming the missing log.entries array, got: {err:?}"
+        );
     }
 
     /// Test-only: `regex` is a dev-dependency now (see Cargo.toml and

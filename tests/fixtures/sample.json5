@@ -1,0 +1,15 @@
+// A representative JSON5 document - comments, unquoted keys,
+// single-quoted strings, and trailing commas all appear here.
+{
+  id: 1,
+  name: 'Alice', // trailing line comment
+  email: "alice@example.com",
+  score: 3.14,
+  active: true,
+  tags: ['a', 'b', 'c',],
+  meta: {
+    x: 1,
+    y: 2.5,
+  }, /* a block comment,
+        spanning multiple lines */
+}

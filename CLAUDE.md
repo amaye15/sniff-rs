@@ -5,10 +5,10 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON, and
-Property List (plist) — any of them gzip- or zstd-compressed too — and
-writes Markdown, this tool's own rich JSON, or json-schema.org-standard
-JSON.
+logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON,
+Property List (plist), JSON5/JSONC, and HAR (HTTP Archive) — any of them
+gzip- or zstd-compressed too — and writes Markdown, this tool's own rich
+JSON, or json-schema.org-standard JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -66,6 +66,8 @@ every format. See "Testing" below.
 | ORC | `.orc` | `--features orc` | one section per top-level column; a nested Struct/List/Map/Union column is a disclosed placeholder (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
 | BSON | `.bson` | `--features bson` | stream of concatenated top-level documents (MongoDB's own on-disk/dump convention); always object-at-top-level, so there's no scalar/array top-level fallback the way MessagePack/CBOR need |
 | Property List (plist) | `.plist` | `--features plist` | both the XML and binary (`bplist00`) variants; a top-level `<dict>`/binary-plist root dict = one row, a top-level `<array>`/binary-plist root array = array-of-records, same dual-mode convention as YAML/TOML |
+| JSON5 / JSONC | `.json5`, `.jsonc` | `--features json5` | a deliberately independent, more narrowly-scoped relaxed-JSON parser (comments, trailing commas, unquoted object keys, single-quoted strings only - not the full JSON5 grammar); a whole document, same dual-mode convention as plain JSON |
+| HAR (HTTP Archive) | `.har` | `--features har` | plain JSON with a fixed top-level shape (HAR 1.2); `log.entries` is the natural records array, each entry's own nested `request`/`response`/`timings` objects flatten like any other nested JSON object |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -821,6 +823,49 @@ flattener**, rather than reimplementing recursion per format:
   genuinely different table) and then hex-encoded for display, the
   same "disclose the real bytes" treatment BSON's own Binary/ObjectId
   fields already get.
+- JSON5/JSONC is the one format in this list whose bridge target is this
+  project's own core `json_support::Value` type, not a second, format-
+  specific one - but it's deliberately still a second, fully independent
+  *parser* (`json5_support`) rather than a relaxed mode bolted onto the
+  core `json_support::Parser` that seven other readers already recurse
+  through. That parser is this project's single most heavily tested,
+  adversarially-fuzzed function (see the design philosophy section
+  below); loosening its grammar in place to accept comments/trailing
+  commas/unquoted keys would risk every one of its other callers
+  silently accepting input they were never meant to, for a relaxation
+  only this one format ever asked for. `json5_support` is deliberately
+  scoped to exactly four relaxations - comments (`//` and `/* */`),
+  trailing commas, unquoted object keys, and single-quoted strings - not
+  the complete JSON5 grammar (real JSON5 also permits leading `+`/bare
+  leading-or-trailing `.`/hex integers/`Infinity`/`NaN`, none of which
+  are implemented here), the same "confident common case, disclosed gap"
+  tradeoff `is_email`/`is_url` already make elsewhere in this project.
+  `.jsonc` shares this exact same relaxed grammar rather than a second,
+  narrower parser of its own - VS Code's own "JSON with comments"
+  definition (comments and trailing commas, but not unquoted keys or
+  single-quoted strings) is already a strict subset of what this reader
+  accepts, so there's nothing a real `.jsonc` file could need that this
+  grammar doesn't already cover. A JSON5/JSONC file is always a single
+  document (there's no JSON-Lines-style concatenated-records convention
+  for either), so `columns_from_json5` parses the whole file once and
+  applies the identical dual-mode ending plain JSON's own reader uses -
+  a top-level array becomes array-of-records (or a `value` column, if
+  not every element is an object), a top-level object is one record.
+- HAR (HTTP Archive) needs no bridge type or new parser at all - it's
+  standard JSON with a fixed, spec-defined top-level shape
+  (`{"log": {"version", "creator", "entries": [...]}}`, HAR 1.2 §2.1),
+  so `har_support::columns_from_har` reuses the always-on core
+  `json_support` parser directly (never `json5_support`'s relaxed
+  sibling - a real HAR file is never anything but standard JSON) and
+  just extracts `log.entries` - the format's own natural records array -
+  moving it out of the parsed document rather than cloning it, since
+  nothing else needs the rest of the document once that one field is
+  found. Each entry's own nested `request`/`response`/`timings` objects
+  flatten into dot-notation sub-columns exactly like any other nested
+  JSON object would, through the identical `profile_json_records` path
+  every other array-of-objects JSON-shaped format already uses. A
+  top-level document with no `log.entries` array is a clear, disclosed
+  error naming exactly what's missing, not a guess at some other shape.
 - XML is the one exception to "bridge via a ready-made dynamic Value type" -
   an XML element can carry attributes, text, and child elements all at
   once, which doesn't map onto a single generic enum the way
@@ -10191,6 +10236,52 @@ this project could just implement directly rather than depend on:
   attempt across every fixture, including the binary variant's date
   encoding (Apple's reference epoch, 978,307,200 seconds after the Unix
   epoch) and both formats' array-vs-dict record-shape dual mode.
+
+- **JSON5/JSONC and HAR, added in the same pass as BSON/plist above.**
+  JSON5/JSONC needed a genuine new hand-roll (`json5_support`) rather
+  than reusing anything already in the codebase, for the reason already
+  covered in the Architecture section: the core `json_support::Parser`
+  is this project's single most heavily tested function and the literal
+  bridge type seven other readers recurse through, so a relaxed grammar
+  only this one format wants got its own fully separate parser instead
+  of being bolted onto that shared one. `json5 = "0.4.1"` (the most
+  widely used pure-Rust JSON5 parser) is a `[dev-dependencies]`-only
+  cross-verification oracle, never a runtime dependency, matching every
+  other hand-rolled format in this project - confirmed via the same
+  `cargo tree --features json5 -e normal` (empty) versus `-e normal,dev`
+  (present) check every other dev-only oracle here already gets. One
+  real bug was found and fixed before this shipped, caught by directly
+  testing `--nrows` against a truncated top-level array rather than
+  assuming a mechanical translation of the dual-mode ending was
+  correct: incrementing `JsonRecordStreamProfiler`'s own `total` counter
+  directly for an element skipped past the cutoff (mirroring BSON's own
+  "decode always, keep conditionally" `nrows` convention) desyncs that
+  profiler's `pushed_count == total` invariant - the exact check its
+  `finish()` uses to decide "every value was an object" - silently
+  forcing a truncated array-of-records read into the wrong (fallback
+  `value`-column) shape instead. Fixed to match `stream_json_document`'s
+  own established pattern instead: stop pushing, and stop touching
+  `total`, the instant the cutoff is reached (`items.into_iter()
+  .take(nrows...)`) - correct because a JSON5 file's whole document has
+  to be parsed into memory before `--nrows` can mean anything for it
+  anyway (unlike BSON's own concatenated-record stream, which never
+  reads past the cutoff at all), so there's no real-I/O-bounding benefit
+  a "count every element, push only the kept ones" convention would
+  have earned here in the first place.
+
+  HAR needed no new parsing code and no new dependency at all - it's
+  standard JSON with a fixed top-level shape, so `har_support` is pure
+  plumbing over the always-on core `json_support` parser (see the
+  Architecture section above). Verified directly against a real,
+  spec-shaped capture (two entries, real `request`/`response`/`timings`
+  objects, a `serverIPAddress` field) rather than a minimal synthetic
+  shape - `startedDateTime` resolves to a real date, `request.url` to a
+  URL, `serverIPAddress` to an IPv4 address, all through the exact same
+  semantic-type heuristics every other format's own nested JSON content
+  already exercises. A well-formed JSON document missing `log.entries`
+  is a clear, disclosed error rather than either a guess at some other
+  shape or a generic JSON-parse-failure message that wouldn't actually
+  describe what's wrong with an otherwise-valid file.
 
 ## Known limitations / roadmap
 

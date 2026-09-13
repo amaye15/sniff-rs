@@ -1003,6 +1003,75 @@ fn plist_binary_variant_reads_the_same_shape_as_xml() {
     );
 }
 
+#[cfg(feature = "json5")]
+#[test]
+fn json5_reads_comments_trailing_commas_unquoted_keys_and_single_quotes() {
+    let doc = run_json("sample.json5", &[]);
+    let cols = table(&doc, "sample");
+
+    let email = column(cols, "email");
+    assert_eq!(email["ideal_type"], "Email");
+    // `name` was written as `'Alice'` (single-quoted) and `id`/`meta.x`
+    // as unquoted keys with no surrounding whitespace sensitivity - if
+    // any of comments/trailing-commas/single-quotes/unquoted-keys were
+    // mishandled, this file wouldn't have parsed as one record at all.
+    assert_eq!(email["row_count"].as_u64().unwrap(), 1);
+    assert!(
+        cols.iter().any(|c| c["name"] == "meta.x"),
+        "a nested JSON5 object should flatten into meta.* sub-columns"
+    );
+    assert!(
+        cols.iter().any(|c| c["name"] == "tags"),
+        "a JSON5 array (with a trailing comma) should become a Vec<T> column"
+    );
+}
+
+#[cfg(feature = "json5")]
+#[test]
+fn json5_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.json5", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "json5")]
+#[test]
+fn jsonc_extension_routes_to_the_same_relaxed_reader() {
+    // sample.jsonc uses only the subset of relaxations VS Code's own
+    // "JSON with comments" convention actually allows (comments, a
+    // trailing comma) - proving the .jsonc extension dispatches to the
+    // same reader sample.json5's own richer fixture already exercises.
+    let doc = run_json("sample.jsonc", &[]);
+    assert_eq!(doc["format"], "json5");
+    let cols = table(&doc, "sample");
+    assert_eq!(column(cols, "name")["current_type"], "String");
+    assert!(
+        cols.iter().any(|c| c["name"] == "features"),
+        "a JSONC array should become a Vec<T> column"
+    );
+}
+
+#[cfg(feature = "har")]
+#[test]
+fn har_extracts_log_entries_and_flattens_nested_request_response_fields() {
+    let doc = run_json("sample.har", &[]);
+    let cols = table(&doc, "sample");
+
+    let started = column(cols, "startedDateTime");
+    assert_eq!(started["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(started["row_count"].as_u64().unwrap(), 2);
+
+    assert_eq!(column(cols, "request.url")["ideal_type"], "URL");
+    assert_eq!(column(cols, "serverIPAddress")["ideal_type"], "IPv4");
+    assert_eq!(column(cols, "response.status")["current_type"], "i64");
+}
+
 #[cfg(feature = "xml")]
 #[test]
 fn xml_treats_homogeneous_children_as_records_and_attributes_as_at_columns() {
@@ -3809,6 +3878,24 @@ fn malformed_bson_fails_cleanly() {
 #[test]
 fn malformed_plist_fails_cleanly() {
     assert_fails_without_panicking("malformed_garbage.plist");
+}
+
+#[cfg(feature = "json5")]
+#[test]
+fn malformed_json5_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.json5");
+}
+
+#[cfg(feature = "har")]
+#[test]
+fn malformed_har_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.har");
+}
+
+#[cfg(feature = "har")]
+#[test]
+fn har_missing_log_entries_fails_cleanly() {
+    assert_fails_without_panicking("edge_har_missing_entries.har");
 }
 
 #[cfg(feature = "npy")]

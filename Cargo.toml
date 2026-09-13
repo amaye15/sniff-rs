@@ -15,7 +15,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har"]
 sqlite = []
 msgpack = []
 toml = []
@@ -39,6 +39,16 @@ bson = []
 # Hand-rolled, no dep - both the XML plist and binary plist (bplist00)
 # variants live in src/lib.rs's plist_support.
 plist = []
+# Hand-rolled, no dep - a deliberately independent relaxed-JSON parser
+# (comments, trailing commas, unquoted keys, single-quoted strings),
+# separate from the core json_support parser on purpose - see
+# json5_support's own doc comment in src/lib.rs. Covers both .json5 and
+# .jsonc, since .jsonc's own grammar is a strict subset.
+json5 = []
+# Hand-rolled, no dep - HAR is standard JSON with a fixed top-level
+# shape, so har_support just reuses the always-on json_support parser
+# and extracts log.entries as the records array.
+har = []
 
 [dev-dependencies]
 # Unlike every other entry in this list, `serde`/`serde_json` used to be
@@ -261,6 +271,11 @@ bson = "2"
 # most widely used pure-Rust reader/writer, kept as a dev-only oracle for
 # both the XML and binary (bplist00) variants `plist_support` hand-rolls.
 plist = "1"
+# Never a runtime dependency of this project's `json5` feature - the
+# most widely used pure-Rust JSON5 parser, kept as a dev-only oracle for
+# `json5_support`'s own deliberately-narrower (comments/trailing
+# commas/unquoted keys/single-quoted strings only) relaxed-JSON parser.
+json5 = "0.4.1"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

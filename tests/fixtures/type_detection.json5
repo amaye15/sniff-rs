@@ -1,0 +1,25 @@
+// Array-of-objects shape, exercising the same five semantic-type columns
+// every other format's own type_detection.<ext> fixture uses.
+[
+  {
+    id: 1,
+    user_uuid: '550e8400-e29b-41d4-a716-446655440000',
+    contact_email: 'alice@example.com',
+    ip_address: '192.168.1.1',
+    signup_date: '2024-01-15',
+  },
+  {
+    id: 2,
+    user_uuid: '6fa459ea-ee8a-3ca4-894e-db77e160355e',
+    contact_email: 'bob@example.org',
+    ip_address: '10.0.0.5',
+    signup_date: '2024-02-20',
+  },
+  {
+    id: 3,
+    user_uuid: '16fd2706-8baf-433b-82eb-8c7fada847da',
+    contact_email: 'carol@example.net',
+    ip_address: '203.0.113.9',
+    signup_date: '2024-03-11',
+  },
+]
