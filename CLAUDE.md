@@ -3683,6 +3683,141 @@ clippy/fmt clean throughout, and byte-identical output confirmed via
 `.ods`/`.xls`/`.xlsb`/`.npz` fixture plus both synthetic `.npz` stress
 files.
 
+An eighteenth pass, prompted by an explicit "improve speed through
+memory handling / ownership / zero-copy / algorithmic improvements, not
+SIMD" request, re-profiled JSON with `samply` (a fresh 1.5M-row, 251 MB
+JSON Lines file, six flat fields plus one nested object/array each - the
+ordinary, narrow-record shape real JSONL almost always is) and found a
+real regression hiding in plain sight: `json_support::Parser::
+parse_object`'s own duplicate-key short-circuit - the `seen_key_hashes:
+HashSet<u64, FxBuildHasher>` this document's own history already added
+specifically to fix an O(K^2) cost on wide (hundreds-of-fields) objects -
+unconditionally hashes and hash-set-inserts *every* key of *every*
+object, including the narrow six-field objects that are the overwhelming
+common shape in practice. `hashbrown::raw::RawTable<(u64, ())>::
+reserve_rehash` and the hash-set `insert`/`contains_key` calls together
+cost roughly 6% of total self-time in the fresh profile - a real cost
+this project's own `bucket_object_fields` doc comment had already named
+in a sibling hot loop ("a linear scan over half a dozen short keys is
+genuinely cheaper than hashing them"), just never carried over to this
+later-added fast path.
+
+Fixed by building the hash set lazily instead of unconditionally: below
+a `WIDE_OBJECT_THRESHOLD` (16) keys, every insert goes straight through
+`Map::insert`'s own linear scan (at most a few dozen cheap string
+comparisons total at that width, and zero heap allocation for the hash
+set at all); only once an object actually grows past the threshold is
+the set populated - in one pass over the keys already collected,
+presized to `map.len() * 4` to absorb a wide object's own further growth
+without walking through several small `RawTable` regrows one at a time -
+and used for every key from then on. A key whose hash has never been
+seen is still provably new and skips `insert`'s scan entirely, exactly
+as before; only a genuine duplicate or hash collision falls back to the
+full checked `insert`. The existing `duplicate_keys_still_dedup_in_a_
+wide_object_past_the_hash_fast_path` test (a 500-key object with a
+duplicate both early and late) already covers the mode-transition
+correctness this change depends on - a duplicate seen before the
+threshold is caught by `Map::insert`'s own scan; a duplicate seen after
+is caught because the transition populates the hash set from every key
+already present, including the one that will later repeat.
+
+Measured via a controlled alternating-binary comparison (same fresh
+1.5M-row/six-field JSONL file, byte-identical output confirmed via
+`diff` throughout): **2.29-2.31s -> 2.14-2.18s, a consistent ~6-7%**
+real-time reduction across every round. The presizing detail mattered:
+an initial version without it showed a genuine, if small (~2%), *regression*
+on a synthetic 300-field-wide JSONL file (60,000 rows) - caught the same
+way this project catches every regression, by measuring the case the
+original optimization was protecting rather than declaring victory on
+the narrow-object win alone - traced to the newly-lazy set starting from
+an empty `RawTable` at the transition point and re-growing through
+several small steps on the way to a few hundred entries, work the old
+always-hashing version never paid because it grew incrementally from
+the very first key. Presizing the set at transition time closed the gap
+back to parity (2.71-2.80s both before and after across repeated
+rounds, no consistent direction either way). Re-profiling the fixed
+binary confirmed the mechanism directly: the `RawTable`/`HashSet`
+self-time cluster this pass targeted is gone from the narrow-object
+profile, replaced by cheap `Map::insert` linear-scan self-time instead.
+Verified the same way as every pass before it: full test suite (714
+`--features full` / 353 default, including the wide-object duplicate-key
+test) unchanged and passing, clippy/fmt clean, and byte-identical output
+confirmed via `diff` against the pre-fix binary across the entire
+359-file fixture corpus in all three output formats with `--nrows`
+unset/1/2 (3,258 combinations).
+
+A nineteenth pass profiled the `.ods`/`.xlsx` byte-window readers this
+project's own streaming campaign had just added (a fresh real 271 MB
+`.ods` `content.xml`, 400,000 rows) - unaudited by any prior profiling
+pass, since they didn't exist yet when the earlier passes ran - and
+found the single largest cost cluster of this whole document's
+optimization history outside the streaming campaign itself: `XmlByteWindow::
+ensure` (17.8% of total self-time) and `XmlByteWindow::scan_element`
+(11.3%) together accounted for roughly 30% of the run. The root cause
+was structural, not a bug: every "ordinary" byte - plain element text,
+comment/CDATA/PI bodies, close-tag names, unquoted start-tag content -
+was copied one byte at a time through `bump()` -> `peek()` -> `ensure()`,
+a three-call chain per byte, for exactly the reason `parse_csv`'s own
+`InField`/`InQuotedField` rewrite already documents in this file: a long
+uninterrupted run (a spreadsheet cell's own text content, easily
+hundreds of characters) paying per-character call overhead instead of
+one bulk copy.
+
+Fixed the same way that CSV fix already established: `copy_until_lt`
+(new) bulk-copies everything up to the next `<` in one `extend_from_
+slice` per resident buffer run, refilling and continuing only when a run
+spans more than one 64 KiB window; `copy_until` (existing, used for
+comment/PI/CDATA bodies and close-tag names) got the identical
+treatment generalized to an arbitrary short needle - bulk-copy up to the
+needle's first byte, confirm the full needle only at that one candidate
+position, and fall back to copying just one byte and resuming only on
+the rare false-positive first-byte match. Both are safe with multi-byte
+UTF-8 content for the same reason `parse_csv`'s own byte-level scan
+already is: every byte these scans stop on (`<`, or a needle's own first
+byte - `-`, `?`, `]`, `>`) is single-byte ASCII, and a UTF-8 continuation
+byte is always `0x80..=0xFF`, so neither can ever be mistaken for one
+mid-character. `scan_element`'s own final catch-all arm (previously
+`self.bump(out)?.is_none()`) now calls `copy_until_lt` and only bails on
+truly zero bytes copied, preserving the exact old EOF-error timing.
+Applied identically to both `xlsx_support::XmlByteWindow` (the `.ods`/
+`.xlsx` byte-window, added by this project's own streaming campaign) and
+the standalone `xml_support::XmlWindow` (the top-level `.xml` reader's
+own, structurally identical, independently-gated copy) - the same
+"controlled duplication across independently-gated format modules" this
+project already accepts elsewhere, so both copies needed the identical
+fix rather than one being refactored to share the other's code.
+
+Measured via a controlled alternating-binary comparison, byte-identical
+output confirmed via `diff` in every case: the real 271 MB `.ods`
+`content.xml` (400,000 rows) went from **3.30-3.41s to 2.75-2.79s
+(~17-19%** faster); a real 115 MB standalone `.xml` file (500,000
+`<item>` records with a nested object and repeated array children) went
+from **2.95-2.97s to 2.08-2.17s (~28-30%** faster - the largest relative
+win of the three, consistent with XML records having proportionally
+more inter-tag text and fewer large binary/compressed sections than a
+zip-wrapped sheet); an 11 MB `.xlsx` (`xlsxwriter` `constant_memory`
+mode, 300,000 rows, inline strings) went from **2.10-2.12s to 1.81-1.82s
+(~14%** faster). Verified the same way as every pass before it: full
+test suite (including `ods_reader_matches_calamine_output_exactly`,
+`xlsx_ooxml_reader_matches_calamine_output_exactly`, and every
+`stream_xml_records_*` test - the last of which already exercises
+comments/CDATA/PIs/quoted attributes/namespace prefixes at small scale)
+unchanged and passing, plus a new
+`stream_xml_records_handles_a_text_run_spanning_multiple_window_refills`
+test (a 200,000-byte single text run and comment body, forcing the bulk-
+copy loop across several real 64 KiB refills, not just the small
+documents every other test here uses) added to lock in the boundary
+case specifically. Byte-identical output confirmed via `diff` against
+the pre-fix binary across the entire 359-file fixture corpus in all
+three output formats with `--nrows` unset/1/2/5 (4,344 combinations),
+plus a 3,000-iteration old-vs-new XML fuzz (homogeneous/non-homogeneous
+roots, comments containing dashes, CDATA containing `<`, quoted
+attributes, namespace prefixes, mixed inter-element text, a 5,000-byte
+single text field) and a 1,500-iteration old-vs-new `.ods` fuzz (multi-
+table, repeated rows/cells, a 1,200-byte text field, comments/PIs
+between rows, entity-escaped text) - zero mismatches in either. Clippy/
+fmt clean across default/`xml`/`xlsx`/`full`, established baselines.
+
 ## Streaming reads / memory footprint
 
 A deliberate, ongoing effort - prompted directly by the user, who wants

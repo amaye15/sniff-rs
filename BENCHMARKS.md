@@ -33,6 +33,60 @@ re-run.
 
 ---
 
+## 2026-09-13 — `perf/xml-window-bulk-copy` branch (Darwin arm64)
+
+`XmlByteWindow`/`XmlWindow` (the `.ods`/`.xlsx` and standalone `.xml`
+byte-window readers) stop copying ordinary text/comment/close-tag bytes
+one at a time through `bump()`->`peek()`->`ensure()`. `copy_until_lt`
+(new) bulk-copies up to the next `<` in one `extend_from_slice` per
+resident buffer run; `copy_until` (existing) gets the same treatment
+generalized to an arbitrary short needle. Same idea as `parse_csv`'s own
+`InField` rewrite, applied to both independently-gated window copies.
+`samply`-profiled: `ensure`+`scan_element` were ~30% of total self-time
+on a real 271 MB `.ods` before this fix.
+
+Measured via controlled alternating-binary comparison, byte-identical
+throughout: 271 MB `.ods` (400k rows) 3.30-3.41s -> 2.75-2.79s (~17-19%);
+115 MB standalone `.xml` (500k records) 2.95-2.97s -> 2.08-2.17s
+(~28-30%); 11 MB `.xlsx` (300k rows, inline strings) 2.10-2.12s ->
+1.81-1.82s (~14%). Byte-identical output across the full 359-file corpus
+in all three formats with `--nrows` unset/1/2/5 (4,344 combinations),
+plus a 3,000-iteration XML fuzz and 1,500-iteration `.ods` fuzz (both
+old-vs-new) - zero mismatches. New
+`stream_xml_records_handles_a_text_run_spanning_multiple_window_refills`
+test (200,000-byte run forcing multiple real 64 KiB refills). Full suite
++ clippy/fmt clean across default/`xml`/`xlsx`/`full`, established
+baselines.
+
+---
+
+## 2026-09-13 — `perf/json-narrow-object-parse` branch (Darwin arm64)
+
+`json_support::Parser::parse_object`'s duplicate-key `HashSet<u64,
+FxBuildHasher>` short-circuit (added to fix an O(K^2) cost on
+hundreds-of-fields objects) unconditionally hashed every key of every
+object, including the narrow 5-8-field objects real JSONL almost always
+has. Now built lazily: below `WIDE_OBJECT_THRESHOLD` (16) keys, every
+insert goes through `Map::insert`'s own cheap linear scan with zero hash-
+set allocation; only past the threshold is the set populated (presized
+to `map.len() * 4`) and used from then on. `samply`-profiled:
+`RawTable::reserve_rehash` + `HashSet::insert`/`contains_key` were ~6%
+of total self-time on a 1.5M-row/6-field JSONL file before this fix.
+
+Measured via controlled alternating-binary comparison, byte-identical
+throughout: 1.5M-row/6-field JSONL 2.29-2.31s -> 2.14-2.18s (~6-7%
+faster). A 300-field/60,000-row synthetic file confirmed no regression
+on the case the original fix targeted (2.71-2.80s both before and after,
+no consistent direction) - an initial version without the `map.len() *
+4` presizing showed a real ~2% regression there, caught by measuring the
+wide-object case rather than stopping at the narrow-object win. Full
+suite (including the existing wide-object duplicate-key-past-the-
+threshold test) unchanged and passing, clippy/fmt clean, byte-identical
+output across the full 359-file corpus in all three formats with
+`--nrows` unset/1/2 (3,258 combinations).
+
+---
+
 ## 2026-09-09 — `feat/streaming-xlsb-bin` branch (Darwin arm64)
 
 `.xlsb`'s worksheet `.bin` stops being resident. `Biff12RecordIter` (over

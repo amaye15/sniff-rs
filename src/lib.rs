@@ -1197,18 +1197,32 @@ mod json_support {
             let mut map = Map::with_capacity(8);
             // `Map::insert`'s duplicate-key check is a linear scan of
             // everything inserted so far, so calling it once per key
-            // makes parsing a K-field object O(K^2) - a real, measured
-            // ~2x on a file of wide (few-hundred-field) flat objects.
-            // A key whose hash has never been seen in this object is
-            // provably new, so it can skip that scan entirely; only a
-            // hash *collision* (astronomically rare for short keys in
-            // one object) or a genuine duplicate key falls back to the
-            // full checked `insert`, which still does exactly the right
-            // thing in both cases (overwrite in place / append). The set
-            // stays empty (no allocation) for the common one-or-two-key
-            // object.
-            let mut seen_key_hashes: std::collections::HashSet<u64, crate::FxBuildHasher> =
-                std::collections::HashSet::default();
+            // makes parsing a K-field object O(K^2) - real at a few
+            // hundred fields, but real-world JSON is overwhelmingly
+            // narrow (a handful of fields per record), and hashing every
+            // key to guard against a width that almost never happens is
+            // its own real cost there: a `HashSet` allocates on its first
+            // insert regardless of how few keys ever go in, and hashing
+            // (even with `FxHasher`) plus probing a handful of short keys
+            // is measurably *more* work than the linear scan it exists to
+            // avoid - the identical lesson `bucket_object_fields`'s own
+            // doc comment already draws for a sibling hot loop. So the
+            // hash set is built lazily: below `WIDE_OBJECT_THRESHOLD`
+            // keys, every insert just goes straight through `Map::insert`
+            // (its own scan is at most a few dozen cheap string
+            // comparisons total at that width); only once an object
+            // actually grows past the threshold does paying for the hash
+            // set start being worth it, so it's populated in one pass
+            // over the keys already collected and used for every key from
+            // then on. A key whose hash has never been seen is provably
+            // new and skips `insert`'s scan entirely; only a hash
+            // *collision* (astronomically rare for short keys in one
+            // object) or a genuine duplicate key falls back to the full
+            // checked `insert`, which does the right thing either way
+            // (overwrite in place / append).
+            const WIDE_OBJECT_THRESHOLD: usize = 16;
+            let mut seen_key_hashes: Option<std::collections::HashSet<u64, crate::FxBuildHasher>> =
+                None;
             self.skip_whitespace();
             if self.peek() == Some(b'}') {
                 self.pos += 1;
@@ -1228,10 +1242,34 @@ mod json_support {
                 // `Map::insert`'s own overwrite behavior, matching
                 // `serde_json`'s own confirmed "last value silently
                 // wins" duplicate-key convention.
-                if seen_key_hashes.insert(hash_object_key(&key)) {
-                    map.push_unique(key, value);
-                } else {
-                    map.insert(key, value);
+                match &mut seen_key_hashes {
+                    Some(seen) => {
+                        if seen.insert(hash_object_key(&key)) {
+                            map.push_unique(key, value);
+                        } else {
+                            map.insert(key, value);
+                        }
+                    }
+                    None => {
+                        map.insert(key, value);
+                        if map.len() > WIDE_OBJECT_THRESHOLD {
+                            // A wide object rarely stops growing right at
+                            // the threshold, so seed the table a few
+                            // multiples past what's already known to
+                            // avoid the first several rehashes an object
+                            // that ends up hundreds of fields wide would
+                            // otherwise walk through one small grow at a
+                            // time.
+                            let mut seen = std::collections::HashSet::with_capacity_and_hasher(
+                                map.len() * 4,
+                                crate::FxBuildHasher::default(),
+                            );
+                            for (k, _) in map.iter() {
+                                seen.insert(hash_object_key(k));
+                            }
+                            seen_key_hashes = Some(seen);
+                        }
+                    }
                 }
                 self.skip_whitespace();
                 match self.peek() {
@@ -43049,16 +43087,74 @@ mod xml_support {
             Ok(())
         }
 
-        /// Copies bytes into `out` until `needle` is found; `out` then
-        /// ends with `needle`. Errors on EOF first.
-        fn copy_until(&mut self, needle: &str, out: &mut Vec<u8>) -> Result<()> {
+        /// Copies bytes into `out` up to (not including) the next `<`,
+        /// refilling as needed - a bulk `extend_from_slice` per resident
+        /// run instead of one `bump` call (and its nested `peek`/`ensure`)
+        /// per byte. Text content between XML tags is typically one long
+        /// uninterrupted run, so this is the same "batch the common case"
+        /// idea `parse_csv`'s own `InField` rewrite already applied for
+        /// exactly this reason - a real, profiler-confirmed hot loop on a
+        /// large real XML file (mostly text-element content). Never
+        /// observes a partial multi-byte UTF-8 sequence as a false match,
+        /// since `<` is single-byte ASCII and a continuation byte is
+        /// always `0x80..=0xBF` - the same reasoning `parse_csv`'s own
+        /// byte-level scan already relies on.
+        fn copy_until_lt(&mut self, out: &mut Vec<u8>) -> Result<()> {
             loop {
-                if self.starts_with(needle)? {
-                    self.take(needle.len(), out)?;
-                    return Ok(());
+                self.ensure(1)?;
+                let rest = &self.buf[self.pos..];
+                if rest.is_empty() {
+                    return Ok(()); // EOF - the caller's own peek() sees it next
                 }
-                if self.bump(out)?.is_none() {
+                match rest.iter().position(|&b| b == b'<') {
+                    Some(off) => {
+                        out.extend_from_slice(&rest[..off]);
+                        self.pos += off;
+                        return Ok(());
+                    }
+                    None => {
+                        let n = rest.len();
+                        out.extend_from_slice(rest);
+                        self.pos += n;
+                    }
+                }
+            }
+        }
+
+        /// Copies bytes into `out` until `needle` is found; `out` then
+        /// ends with `needle`. Errors on EOF first. Bulk-copies every run
+        /// that doesn't even contain `needle`'s first byte instead of
+        /// testing `starts_with` one byte at a time - the same idea as
+        /// `copy_until_lt` above, generalized to an arbitrary (short,
+        /// fixed) needle: comment/PI/CDATA bodies and close-tag names are
+        /// the other long resident runs this window scans. A first-byte
+        /// match that isn't a full needle match (rare - e.g. a lone `-`
+        /// inside a comment body that isn't `-->`) falls back to copying
+        /// just that one byte and resuming the scan, exactly matching the
+        /// old byte-at-a-time loop's own behavior for that case.
+        fn copy_until(&mut self, needle: &str, out: &mut Vec<u8>) -> Result<()> {
+            let first = needle.as_bytes()[0];
+            loop {
+                self.ensure(1)?;
+                let rest = &self.buf[self.pos..];
+                if rest.is_empty() {
                     bail!("unterminated XML construct (expected {needle:?})");
+                }
+                match rest.iter().position(|&b| b == first) {
+                    Some(off) => {
+                        out.extend_from_slice(&rest[..off]);
+                        self.pos += off;
+                        if self.starts_with(needle)? {
+                            self.take(needle.len(), out)?;
+                            return Ok(());
+                        }
+                        self.bump(out)?;
+                    }
+                    None => {
+                        let n = rest.len();
+                        out.extend_from_slice(rest);
+                        self.pos += n;
+                    }
                 }
             }
         }
@@ -43164,8 +43260,12 @@ mod xml_support {
                     if depth == 0 {
                         return Ok(()); // a self-closing root-child element
                     }
-                } else if self.bump(out)?.is_none() {
-                    bail!("unexpected end of XML inside an element");
+                } else {
+                    let before = out.len();
+                    self.copy_until_lt(out)?;
+                    if out.len() == before {
+                        bail!("unexpected end of XML inside an element");
+                    }
                 }
             }
         }
@@ -43419,6 +43519,43 @@ mod xml_support {
                 let (ok, _) = stream_records(doc);
                 assert!(!ok, "expected {doc:?} to decline streaming");
             }
+        }
+
+        /// `copy_until_lt`/`copy_until` bulk-copy a run per `ensure`
+        /// refill rather than one byte at a time - this proves that loop
+        /// is correct when a single text run, a comment body, and a
+        /// close-tag name each straddle multiple 64 KiB refills, not just
+        /// the small documents the other tests here use. `'<'`/`"-->"`
+        /// bytes placed right at chunk-multiple offsets specifically
+        /// target the boundary itself.
+        #[test]
+        fn stream_xml_records_handles_a_text_run_spanning_multiple_window_refills() {
+            let long_text = "ab".repeat(100_000); // 200,000 bytes, > 3 CHUNKs
+            let doc = format!(
+                "<root><item><big>{long_text}</big><!-- {long_text} --></item><item><big>short</big></item></root>"
+            );
+            let (ok, streamed) = stream_records(&doc);
+            assert!(ok);
+            let root = xml_parse(&doc).unwrap();
+            let expected: Vec<JsonValue> = root
+                .children
+                .iter()
+                .map(|el| match xml_element_to_json(el) {
+                    JsonValue::Object(m) => JsonValue::Object(m),
+                    other => {
+                        let mut m = json_support::Map::new();
+                        m.insert("#text".to_string(), other);
+                        JsonValue::Object(m)
+                    }
+                })
+                .collect();
+            assert_eq!(streamed, expected);
+            // Also confirm the long text itself actually round-tripped
+            // intact (not truncated at a chunk boundary).
+            let JsonValue::Object(first) = &streamed[0] else {
+                panic!("expected an object");
+            };
+            assert_eq!(first.get("big"), Some(&JsonValue::String(long_text)));
         }
     }
 }
@@ -48823,14 +48960,73 @@ mod xlsx_support {
             Ok(())
         }
 
-        fn copy_until(&mut self, needle: &str, out: &mut Vec<u8>) -> Result<()> {
+        /// Copies bytes into `out` up to (not including) the next `<`,
+        /// refilling as needed - a bulk `extend_from_slice` per resident
+        /// run instead of one `bump` call (and its nested `peek`/`ensure`)
+        /// per byte. Text content between XML tags is typically one long
+        /// uninterrupted run (a spreadsheet cell's own text), so this is
+        /// the same "batch the common case" idea `parse_csv`'s own
+        /// `InField` rewrite already applied - a real, profiler-confirmed
+        /// hot loop on a large real `.ods`/`.xlsx` sheet. Never observes a
+        /// partial multi-byte UTF-8 sequence as a false match, since `<`
+        /// is single-byte ASCII and a continuation byte is always
+        /// `0x80..=0xBF` - the same reasoning `parse_csv`'s own
+        /// byte-level scan already relies on.
+        fn copy_until_lt(&mut self, out: &mut Vec<u8>) -> Result<()> {
             loop {
-                if self.starts_with(needle)? {
-                    self.take(needle.len(), out)?;
-                    return Ok(());
+                self.ensure(1)?;
+                let rest = &self.buf[self.pos..];
+                if rest.is_empty() {
+                    return Ok(()); // EOF - the caller's own peek() sees it next
                 }
-                if self.bump(out)?.is_none() {
+                match rest.iter().position(|&b| b == b'<') {
+                    Some(off) => {
+                        out.extend_from_slice(&rest[..off]);
+                        self.pos += off;
+                        return Ok(());
+                    }
+                    None => {
+                        let n = rest.len();
+                        out.extend_from_slice(rest);
+                        self.pos += n;
+                    }
+                }
+            }
+        }
+
+        /// Copies bytes into `out` until `needle` is found; `out` then
+        /// ends with `needle`. Bulk-copies every run that doesn't even
+        /// contain `needle`'s first byte instead of testing `starts_with`
+        /// one byte at a time - the same idea as `copy_until_lt` above,
+        /// generalized to an arbitrary (short, fixed) needle: comment/PI
+        /// bodies and close-tag names are the other long resident runs
+        /// this window scans. A first-byte match that isn't a full needle
+        /// match (rare) falls back to copying just that one byte and
+        /// resuming the scan, exactly matching the old byte-at-a-time
+        /// loop's own behavior for that case.
+        fn copy_until(&mut self, needle: &str, out: &mut Vec<u8>) -> Result<()> {
+            let first = needle.as_bytes()[0];
+            loop {
+                self.ensure(1)?;
+                let rest = &self.buf[self.pos..];
+                if rest.is_empty() {
                     bail!("unterminated XML construct (expected {needle:?})");
+                }
+                match rest.iter().position(|&b| b == first) {
+                    Some(off) => {
+                        out.extend_from_slice(&rest[..off]);
+                        self.pos += off;
+                        if self.starts_with(needle)? {
+                            self.take(needle.len(), out)?;
+                            return Ok(());
+                        }
+                        self.bump(out)?;
+                    }
+                    None => {
+                        let n = rest.len();
+                        out.extend_from_slice(rest);
+                        self.pos += n;
+                    }
                 }
             }
         }
@@ -48904,8 +49100,12 @@ mod xlsx_support {
                     if depth == 0 {
                         return Ok(());
                     }
-                } else if self.bump(out)?.is_none() {
-                    bail!("unexpected end of XML inside an element");
+                } else {
+                    let before = out.len();
+                    self.copy_until_lt(out)?;
+                    if out.len() == before {
+                        bail!("unexpected end of XML inside an element");
+                    }
                 }
             }
         }
