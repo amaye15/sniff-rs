@@ -1,0 +1,10 @@
+From alice@example.com Mon Jan 15 12:00:00 2024
+From: alice@example.com
+To: bob@example.com
+Subject: Folded and repeated headers
+Received: from mx1.example.com
+ by mx2.example.com; Mon, 15 Jan 2024 12:00:00 +0000
+Received: from client.example.com
+ by mx1.example.com; Mon, 15 Jan 2024 11:59:00 +0000
+
+The body.

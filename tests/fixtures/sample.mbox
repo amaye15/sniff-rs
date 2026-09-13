@@ -1,0 +1,23 @@
+From alice@example.com Mon Jan 15 12:00:00 2024
+From: Alice <alice@example.com>
+To: bob@example.com
+Subject: Hello
+Date: Mon, 15 Jan 2024 12:00:00 +0000
+
+This is message one.
+
+From bob@example.com Mon Jan 15 13:00:00 2024
+From: Bob <bob@example.com>
+To: alice@example.com
+Subject: Re: Hello
+Date: Mon, 15 Jan 2024 13:00:00 +0000
+
+This is message two.
+
+From carol@example.com Mon Jan 15 14:00:00 2024
+From: Carol <carol@example.com>
+To: alice@example.com
+Subject: Third message
+Date: Mon, 15 Jan 2024 14:00:00 +0000
+
+This is message three, the last one.

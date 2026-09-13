@@ -1,0 +1,38 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 1,
+        "user_uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "contact_email": "alice@example.com",
+        "ip_address": "192.168.1.1",
+        "signup_date": "2024-01-15"
+      },
+      "geometry": {"type": "Point", "coordinates": [-122.4194, 37.7749]}
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 2,
+        "user_uuid": "6fa459ea-ee8a-3ca4-894e-db77e160355e",
+        "contact_email": "bob@example.org",
+        "ip_address": "10.0.0.5",
+        "signup_date": "2024-02-20"
+      },
+      "geometry": {"type": "Point", "coordinates": [-73.9857, 40.7484]}
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 3,
+        "user_uuid": "16fd2706-8baf-433b-82eb-8c7fada847da",
+        "contact_email": "carol@example.net",
+        "ip_address": "203.0.113.9",
+        "signup_date": "2024-03-11"
+      },
+      "geometry": {"type": "Point", "coordinates": [2.3522, 48.8566]}
+    }
+  ]
+}

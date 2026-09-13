@@ -1,0 +1,13 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTODO
+UID:todo1@example.com
+SUMMARY:Finish the report
+DESCRIPTION:This description spans
+  two physical lines via folding.
+BEGIN:VALARM
+TRIGGER:-PT30M
+ACTION:DISPLAY
+END:VALARM
+END:VTODO
+END:VCALENDAR

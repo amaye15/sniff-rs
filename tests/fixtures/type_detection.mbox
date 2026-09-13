@@ -1,0 +1,26 @@
+From alice@example.com Mon Jan 15 12:00:00 2024
+From: alice@example.com
+To: bob@example.com
+Subject: One
+Date: Mon, 15 Jan 2024 12:00:00 +0000
+X-Real-IP: 192.168.1.1
+
+Body one.
+
+From bob@example.com Mon Jan 15 13:00:00 2024
+From: bob@example.com
+To: alice@example.com
+Subject: Two
+Date: Mon, 15 Jan 2024 13:00:00 +0000
+X-Real-IP: 10.0.0.5
+
+Body two.
+
+From carol@example.com Mon Jan 15 14:00:00 2024
+From: carol@example.com
+To: alice@example.com
+Subject: Three
+Date: Mon, 15 Jan 2024 14:00:00 +0000
+X-Real-IP: 203.0.113.9
+
+Body three.

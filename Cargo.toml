@@ -15,7 +15,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar"]
 sqlite = []
 msgpack = []
 toml = []
@@ -49,6 +49,22 @@ json5 = []
 # shape, so har_support just reuses the always-on json_support parser
 # and extracts log.entries as the records array.
 har = []
+# Hand-rolled, no dep - GeoJSON is standard JSON with a fixed top-level
+# shape too, so geojson_support reuses the always-on json_support
+# parser and extracts a FeatureCollection's own features array.
+geojson = []
+# Hand-rolled, no dep - a hand-rolled RFC 4155 mbox reader
+# (mbox_support): message-boundary detection plus a real RFC 822
+# header parser (folded headers, repeated headers pooled into arrays).
+mbox = []
+# Hand-rolled, no dep - a hand-rolled RFC 6350 vCard property-line
+# parser (vcard_support), sharing its folded-content-line grammar with
+# icalendar below but scoped to vCard's own BEGIN:VCARD/END:VCARD
+# records.
+vcard = []
+# Hand-rolled, no dep - a hand-rolled RFC 5545 iCalendar property-line
+# parser (ical_support), one record per VEVENT/VTODO component.
+icalendar = []
 
 [dev-dependencies]
 # Unlike every other entry in this list, `serde`/`serde_json` used to be
@@ -276,6 +292,28 @@ plist = "1"
 # `json5_support`'s own deliberately-narrower (comments/trailing
 # commas/unquoted keys/single-quoted strings only) relaxed-JSON parser.
 json5 = "0.4.1"
+# Never a runtime dependency of this project's `geojson` feature - the
+# established, widely used pure-Rust GeoJSON crate, kept as a dev-only
+# oracle for `geojson_support`'s own plumbing over the core JSON parser.
+# `geo-types` (its own required dependency) comes along for free but is
+# never touched directly - this project only ever reads geometry back
+# out through `geojson::Value`'s own coordinate accessors.
+geojson = "1.0.0"
+# Never a runtime dependency of this project's `vcard`/`icalendar`
+# features - a real, independent parser for both formats' shared
+# property-line grammar (RFC 6350 vCard, RFC 5545 iCalendar both build
+# on the same folded `PROPERTY;PARAM=VALUE:value` content-line syntax),
+# kept as a dev-only oracle for both `vcard_support` and `ical_support`.
+ical = "0.11.0"
+# No dev-dependency oracle for `mbox` - the only real candidate on
+# crates.io, `mbox-reader 0.2.0`, was checked directly and found to have
+# two real bugs of its own (it silently drops the last message in a
+# file, and mis-trims a plain LF-terminated envelope line by one byte -
+# see CLAUDE.md's Dependency footprint section for the full writeup), so
+# trusting it as an oracle would have taught this project's own reader
+# to reproduce those bugs just to keep a comparison test green.
+# `mbox_support` is instead verified directly against real fixture
+# content in `mbox_reader_captures_every_message_including_the_last`.
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

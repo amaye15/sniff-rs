@@ -1072,6 +1072,175 @@ fn har_extracts_log_entries_and_flattens_nested_request_response_fields() {
     assert_eq!(column(cols, "response.status")["current_type"], "i64");
 }
 
+#[cfg(feature = "geojson")]
+#[test]
+fn geojson_extracts_features_and_renders_geometry_as_wkt() {
+    let doc = run_json("sample.geojson", &[]);
+    let cols = table(&doc, "sample");
+    assert_eq!(column(cols, "name")["current_type"], "String");
+    let geometry = column(cols, "geometry");
+    // A Point and a LineString together - correctly typed as WKT
+    // Geometry, the same heuristic a hand-authored WKT text column
+    // already gets, confirming the geometry-to-WKT rendering feeds
+    // straight into this project's existing coordinate/WKT detection.
+    assert_eq!(geometry["ideal_type"], "WKT Geometry");
+}
+
+#[cfg(feature = "geojson")]
+#[test]
+fn geojson_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.geojson", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(column(cols, "geometry")["ideal_type"], "WKT Geometry");
+}
+
+#[cfg(feature = "geojson")]
+#[test]
+fn geojson_bare_geometry_becomes_one_value_column() {
+    let doc = run_json("edge_geojson_bare_geometry.geojson", &[]);
+    let cols = table(&doc, "edge_geojson_bare_geometry");
+    assert_eq!(cols.len(), 1);
+    let value = column(cols, "geometry");
+    assert_eq!(
+        value["sample_values"],
+        serde_json::json!(["POINT(1.5 2.5)"])
+    );
+}
+
+#[cfg(feature = "vcard")]
+#[test]
+fn vcard_reads_one_record_per_contact_and_recognizes_email() {
+    let doc = run_json("sample.vcf", &[]);
+    let cols = table(&doc, "sample");
+    let email = column(cols, "EMAIL");
+    assert_eq!(email["ideal_type"], "Email");
+    assert_eq!(email["row_count"].as_u64().unwrap(), 2);
+    assert_eq!(
+        column(cols, "FN")["sample_values"],
+        serde_json::json!(["Alice Anderson", "Bob Brown"])
+    );
+}
+
+#[cfg(feature = "vcard")]
+#[test]
+fn vcard_recognizes_email_date_uuid_and_ipv4_columns() {
+    let doc = run_json("type_detection.vcf", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "EMAIL")["ideal_type"], "Email");
+    assert_eq!(column(cols, "BDAY")["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(column(cols, "X-USER-UUID")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "X-IP-ADDRESS")["ideal_type"], "IPv4");
+}
+
+#[cfg(feature = "vcard")]
+#[test]
+fn vcard_unfolds_lines_unescapes_values_and_pools_repeated_properties() {
+    let doc = run_json("edge_vcard_folding_and_escapes.vcf", &[]);
+    let cols = table(&doc, "edge_vcard_folding_and_escapes");
+    assert_eq!(
+        column(cols, "NOTE")["sample_values"],
+        serde_json::json!(["This note spans two physical lines via folding."])
+    );
+    let email = column(cols, "EMAIL");
+    assert_eq!(email["current_type"], "Vec<String>");
+    assert_eq!(
+        email["sample_values"],
+        serde_json::json!(["primary@example.com", "secondary@example.com"])
+    );
+}
+
+#[cfg(feature = "icalendar")]
+#[test]
+fn icalendar_reads_one_record_per_vevent_and_isolates_nested_valarm() {
+    let doc = run_json("sample.ics", &[]);
+    let cols = table(&doc, "sample");
+    assert_eq!(column(cols, "SUMMARY")["row_count"].as_u64().unwrap(), 2);
+    // VALARM's own TRIGGER/ACTION properties belong to the nested alarm
+    // component, not the enclosing VEVENT - they must never leak in.
+    assert!(
+        !cols
+            .iter()
+            .any(|c| c["name"] == "TRIGGER" || c["name"] == "ACTION"),
+        "VALARM properties must not appear on the VEVENT record"
+    );
+}
+
+#[cfg(feature = "icalendar")]
+#[test]
+fn icalendar_recognizes_uuid_date_email_and_ipv4_columns() {
+    let doc = run_json("type_detection.ics", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "UID")["ideal_type"], "UUID");
+    assert_eq!(
+        column(cols, "DTSTART")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(column(cols, "ATTENDEE")["ideal_type"], "Email");
+    assert_eq!(column(cols, "X-IP-ADDRESS")["ideal_type"], "IPv4");
+}
+
+#[cfg(feature = "icalendar")]
+#[test]
+fn icalendar_reads_vtodo_and_unfolds_a_description() {
+    let doc = run_json("edge_icalendar_vtodo_and_folding.ics", &[]);
+    let cols = table(&doc, "edge_icalendar_vtodo_and_folding");
+    assert_eq!(
+        column(cols, "DESCRIPTION")["sample_values"],
+        serde_json::json!(["This description spans two physical lines via folding."])
+    );
+    assert!(
+        !cols.iter().any(|c| c["name"] == "TRIGGER"),
+        "VALARM properties must not appear on the VTODO record"
+    );
+}
+
+#[cfg(feature = "mbox")]
+#[test]
+fn mbox_reads_one_record_per_message_including_the_last() {
+    let doc = run_json("sample.mbox", &[]);
+    let cols = table(&doc, "sample");
+    let sender = column(cols, "envelope_sender");
+    assert_eq!(sender["ideal_type"], "Email");
+    assert_eq!(sender["row_count"].as_u64().unwrap(), 3);
+    assert_eq!(
+        sender["sample_values"],
+        serde_json::json!(["alice@example.com", "bob@example.com", "carol@example.com"])
+    );
+}
+
+#[cfg(feature = "mbox")]
+#[test]
+fn mbox_recognizes_email_date_and_ipv4_columns() {
+    let doc = run_json("type_detection.mbox", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "From")["ideal_type"], "Email");
+    assert_eq!(column(cols, "Date")["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(column(cols, "X-Real-IP")["ideal_type"], "IPv4");
+}
+
+#[cfg(feature = "mbox")]
+#[test]
+fn mbox_folds_and_pools_a_repeated_header() {
+    let doc = run_json("edge_mbox_repeated_and_folded_headers.mbox", &[]);
+    let cols = table(&doc, "edge_mbox_repeated_and_folded_headers");
+    let received = column(cols, "Received");
+    assert_eq!(received["current_type"], "Vec<String>");
+    assert_eq!(
+        received["sample_values"],
+        serde_json::json!([
+            "from mx1.example.com by mx2.example.com; Mon, 15 Jan 2024 12:00:00 +0000",
+            "from client.example.com by mx1.example.com; Mon, 15 Jan 2024 11:59:00 +0000"
+        ])
+    );
+}
+
 #[cfg(feature = "xml")]
 #[test]
 fn xml_treats_homogeneous_children_as_records_and_attributes_as_at_columns() {
@@ -3896,6 +4065,50 @@ fn malformed_har_fails_cleanly() {
 #[test]
 fn har_missing_log_entries_fails_cleanly() {
     assert_fails_without_panicking("edge_har_missing_entries.har");
+}
+
+#[cfg(feature = "geojson")]
+#[test]
+fn malformed_geojson_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.geojson");
+}
+
+// Plain readable text with no BEGIN:VCARD/BEGIN:VCALENDAR at all decodes
+// successfully as zero records - the same class of "readable text
+// happens to already be valid, structure-free input" quirk this
+// project's own malformed_garbage.msgpack fixture already documents for
+// MessagePack - so the real failure-shape fixture for both formats is an
+// unterminated block instead.
+#[cfg(feature = "vcard")]
+#[test]
+fn vcard_plain_text_with_no_structure_decodes_as_zero_records() {
+    let doc = run_json("edge_vcard_no_structure.vcf", &[]);
+    assert_eq!(table(&doc, "edge_vcard_no_structure").len(), 0);
+}
+
+#[cfg(feature = "vcard")]
+#[test]
+fn malformed_vcard_fails_cleanly() {
+    assert_fails_without_panicking("malformed_unterminated.vcf");
+}
+
+#[cfg(feature = "icalendar")]
+#[test]
+fn icalendar_plain_text_with_no_structure_decodes_as_zero_records() {
+    let doc = run_json("edge_icalendar_no_structure.ics", &[]);
+    assert_eq!(table(&doc, "edge_icalendar_no_structure").len(), 0);
+}
+
+#[cfg(feature = "icalendar")]
+#[test]
+fn malformed_icalendar_fails_cleanly() {
+    assert_fails_without_panicking("malformed_unterminated.ics");
+}
+
+#[cfg(feature = "mbox")]
+#[test]
+fn malformed_mbox_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.mbox");
 }
 
 #[cfg(feature = "npy")]

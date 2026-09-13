@@ -1,0 +1,16 @@
+BEGIN:VCARD
+VERSION:3.0
+FN:Alice Anderson
+N:Anderson;Alice;;;
+EMAIL;TYPE=work:alice@example.com
+TEL;TYPE=cell:+1-555-0100
+ORG:Acme Corp
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+FN:Bob Brown
+N:Brown;Bob;;;
+EMAIL;TYPE=home:bob@example.org
+TEL;TYPE=work:+1-555-0200
+ORG:Widgets Inc
+END:VCARD

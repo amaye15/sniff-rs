@@ -1,0 +1,9 @@
+BEGIN:VCARD
+VERSION:3.0
+FN:Folded Name Example
+NOTE:This note spans
+  two physical lines via folding.
+EMAIL:primary@example.com
+EMAIL:secondary@example.com
+ADR:;;123 Main St\, Suite 4;Springfield;IL;62701;USA
+END:VCARD

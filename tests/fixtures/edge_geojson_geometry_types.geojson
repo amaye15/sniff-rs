@@ -1,0 +1,11 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type": "Feature", "properties": {"shape": "polygon"}, "geometry": {"type": "Polygon", "coordinates": [[[0,0],[0,1],[1,1],[1,0],[0,0]]]}},
+    {"type": "Feature", "properties": {"shape": "multipolygon"}, "geometry": {"type": "MultiPolygon", "coordinates": [[[[0,0],[0,1],[1,1],[0,0]]],[[[2,2],[2,3],[3,3],[2,2]]]]}},
+    {"type": "Feature", "properties": {"shape": "multipoint"}, "geometry": {"type": "MultiPoint", "coordinates": [[0,0],[1,1]]}},
+    {"type": "Feature", "properties": {"shape": "multilinestring"}, "geometry": {"type": "MultiLineString", "coordinates": [[[0,0],[1,1]],[[2,2],[3,3]]]}},
+    {"type": "Feature", "properties": {"shape": "collection"}, "geometry": {"type": "GeometryCollection", "geometries": [{"type": "Point", "coordinates": [0,0]}, {"type": "LineString", "coordinates": [[0,0],[1,1]]}]}},
+    {"type": "Feature", "properties": {"shape": "unlocated"}, "geometry": null}
+  ]
+}

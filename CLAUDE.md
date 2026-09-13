@@ -6,9 +6,10 @@ missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
 logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON,
-Property List (plist), JSON5/JSONC, and HAR (HTTP Archive) — any of them
-gzip- or zstd-compressed too — and writes Markdown, this tool's own rich
-JSON, or json-schema.org-standard JSON.
+Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
+vCard, and iCalendar — any of them gzip- or zstd-compressed too — and
+writes Markdown, this tool's own rich JSON, or json-schema.org-standard
+JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -68,6 +69,10 @@ every format. See "Testing" below.
 | Property List (plist) | `.plist` | `--features plist` | both the XML and binary (`bplist00`) variants; a top-level `<dict>`/binary-plist root dict = one row, a top-level `<array>`/binary-plist root array = array-of-records, same dual-mode convention as YAML/TOML |
 | JSON5 / JSONC | `.json5`, `.jsonc` | `--features json5` | a deliberately independent, more narrowly-scoped relaxed-JSON parser (comments, trailing commas, unquoted object keys, single-quoted strings only - not the full JSON5 grammar); a whole document, same dual-mode convention as plain JSON |
 | HAR (HTTP Archive) | `.har` | `--features har` | plain JSON with a fixed top-level shape (HAR 1.2); `log.entries` is the natural records array, each entry's own nested `request`/`response`/`timings` objects flatten like any other nested JSON object |
+| GeoJSON | `.geojson` | `--features geojson` | plain JSON with a fixed top-level shape (RFC 7946); a `FeatureCollection`'s `features` array is the natural records array, one `Feature` or a bare `Geometry` profiles as a single record; each feature's own geometry renders as WKT text, which this tool's own coordinate/WKT heuristics then recognize automatically |
+| vCard | `.vcf` | `--features vcard` | one record per `BEGIN:VCARD`/`END:VCARD` block (RFC 6350); a repeated property (multiple `EMAIL`/`TEL` lines) pools into an array column, the same convention this tool's INI reader already uses for a repeated key |
+| iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
+| MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -866,6 +871,79 @@ flattener**, rather than reimplementing recursion per format:
   every other array-of-objects JSON-shaped format already uses. A
   top-level document with no `log.entries` array is a clear, disclosed
   error naming exactly what's missing, not a guess at some other shape.
+- GeoJSON is HAR's own sibling in shape - standard JSON with a fixed,
+  spec-defined top-level shape (RFC 7946), so `geojson_support` needs no
+  new parser either, only format-specific plumbing built on the always-on
+  core `json_support` parser. The one real piece of work is rendering
+  each Feature's own `geometry` as WKT text (`geometry_to_wkt`, built
+  directly off the raw parsed JSON shape rather than a second, GeoJSON-
+  specific value type) - Point/LineString/Polygon/MultiPoint/
+  MultiLineString/MultiPolygon all map onto their own WKT keyword
+  directly, and GeoJSON's own `[longitude, latitude]` coordinate order is
+  already WKT's own `(x y)` order, so no reordering is ever needed.
+  Rendering geometry as text this way is what lets this project's own
+  existing coordinate/WKT heuristics (see the design philosophy section
+  below) recognize a geometry column as `WKT Geometry` automatically,
+  with zero GeoJSON-specific type-detection code needed at all - the
+  same "bridge into the existing engine, don't reimplement it" principle
+  behind every other nested-format reader in this list.
+  `GeometryCollection` is rendered too (recursing depth-guarded, `MAX_
+  GEOMETRY_DEPTH`), even though this project's own `is_wkt_geometry`
+  deliberately never recognizes it as WKT (its body legitimately nests
+  other geometry keywords, not just coordinate characters - see that
+  check's own entry in the design philosophy section) - the rendered
+  text is still correct, it just falls back to a plain `String`
+  ideal_type, the same disclosed boundary that heuristic already
+  documents for hand-authored WKT text. `FeatureCollection.features` is
+  the natural records array (each Feature's own `properties` become its
+  columns, `geometry`/`id` are added alongside them); a bare `Feature` or
+  a bare `Geometry` at the top level (both legal per RFC 7946 §3) profile
+  as a single record/single `geometry` column respectively, the same
+  three-way dispatch HAR's own reader doesn't need only because HAR has
+  just the one legal top-level shape.
+- vCard and iCalendar share one low-level grammar module
+  (`vobject_support`, gated on *either* feature needing it) rather than
+  being duplicated - RFC 5545 (iCalendar) §3.1 states the same folded
+  "content line" syntax RFC 6350 (vCard) §3.2 already defines, almost
+  verbatim, since iCalendar's own format is explicitly derived from
+  vCard's. This is the "zero divergence, so share" case, not the "real
+  divergence, so duplicate" case the two independently-scoped XML
+  parsers already are elsewhere in this list (see that pair's own
+  Dependency footprint writeup for the distinction) - `unfold_lines`/
+  `parse_property_line`/`unescape_value`/`insert_pooling` behave
+  identically for both formats, with nothing that needs to diverge.
+  `vcard_support` itself is almost all plumbing on top of that shared
+  module: one record per `BEGIN:VCARD`/`END:VCARD` block, a repeated
+  property (multiple `EMAIL`/`TEL` lines) pooling into an array the same
+  way this project's own INI reader already pools a repeated key.
+  `ical_support` needs one more real piece - a stack tracking which
+  component is currently open, so a property only ever attaches to the
+  innermost `VEVENT`/`VTODO` frame if that's genuinely what's open right
+  now, and never to an enclosing event when the actual current frame is
+  a nested `VALARM` (or any other component this reader doesn't turn
+  into its own records) - the same "isolate what's out of scope, don't
+  let it corrupt what is" treatment this project already gives an
+  unsupported nested Parquet column or a `.npz` array that can't be
+  read. Individual property *parameters* (`;TYPE=work`, `;TZID=...`) are
+  parsed only far enough to be skipped correctly - never surfaced as
+  their own columns, a deliberate, disclosed scope boundary rather than
+  an oversight.
+- MBOX (`mbox_support`) is architecturally the simplest hand-roll in
+  this list - a message boundary is found with a byte-level scan (a
+  `From ` line at the very start of the file, or immediately after a
+  blank line - never merely because some line happens to start with
+  those five characters, which is what actually distinguishes a genuine
+  boundary from a `From ` line occurring naturally inside a message's
+  own body: every correctly-writing mbox tool is required to quote/
+  escape a body line like that, which is the entire reason the mboxo/
+  mboxrd/mboxcl2 quoting conventions exist), then each message's own
+  RFC 822 headers (with header folding, and a repeated header like
+  `Received:` pooling into an array the same way vCard/iCalendar's
+  shared module already does) become that message's own record. No MIME
+  multipart decoding at all - a `multipart/*` body's own boundary-
+  delimited parts stay one opaque `body` string, the same "isolate
+  what's out of scope" scope boundary the iCalendar reader's own VALARM
+  handling already draws.
 - XML is the one exception to "bridge via a ready-made dynamic Value type" -
   an XML element can carry attributes, text, and child elements all at
   once, which doesn't map onto a single generic enum the way
@@ -10282,6 +10360,59 @@ this project could just implement directly rather than depend on:
   is a clear, disclosed error rather than either a guess at some other
   shape or a generic JSON-parse-failure message that wouldn't actually
   describe what's wrong with an otherwise-valid file.
+
+- **GeoJSON, vCard, iCalendar, and MBOX, added in the same pass.**
+  GeoJSON needed no new dependency (`geojson_support` is plumbing over
+  the always-on core JSON parser, like HAR); `geojson = "1.0.0"` (the
+  established pure-Rust GeoJSON crate) is a `[dev-dependencies]`-only
+  cross-verification oracle, confirmed via the same `cargo tree
+  --features geojson -e normal` (empty) versus `-e normal,dev` (present)
+  check every other dev-only oracle in this document already gets. The
+  oracle test builds a genuinely independent second WKT-rendering
+  function off the crate's own typed `GeometryValue` tree (not a second
+  call into this project's own `geometry_to_wkt`), so agreement between
+  the two is real cross-verification, not a tautology - it passed on the
+  first attempt, including `GeometryCollection` recursion and a `null`
+  geometry.
+
+  `ical = "0.11.0"` is a second dev-only oracle, shared by both `vcard`
+  and `icalendar`'s own oracle tests, for the identical reason
+  `vobject_support` is shared by their real readers: both formats'
+  content-line grammar is genuinely the same. Both oracle comparisons
+  passed cleanly against real, hand-authored fixtures on the first
+  attempt (line folding, backslash-escaped values, repeated properties,
+  and - for iCalendar - a `VALARM` nested inside a `VEVENT`/`VTODO`,
+  confirming the crate's own component tree already keeps nested
+  components structurally separate the same way this project's own
+  stack-based `ical_support` does).
+
+  MBOX is the one format in this batch with no trustworthy Rust oracle
+  crate available, found out the hard way rather than assumed: the only
+  real candidate on crates.io, `mbox-reader = "0.2.0"`, was checked
+  directly before being trusted (the same "verify, don't assume"
+  discipline this document's own history is built on) by feeding it
+  this project's own real 3-message `sample.mbox` fixture through a
+  small throwaway harness - and it has two real bugs. First, its own
+  boundary-scanning loop (`MboxReader::next`) never flushes the final
+  pending entry once the scan reaches EOF without finding one more
+  `From ` line - it silently drops the *last* message in any file,
+  confirmed directly: 3 real messages in, only 2 entries out. Second,
+  its `Start::new` constructor slices the envelope line as `&bytes[..pos
+  - 1]` - a hardcoded assumption that the line is CRLF-terminated and
+  the trailing byte before the real line-ending needs trimming - which
+  silently eats the *last real character* of a plain LF-only envelope
+  line instead (confirmed: a real `"...2024"` date came back as
+  `"...202"`). Trusting this crate as a full oracle would have silently
+  taught this project's own (already correct) reader to reproduce both
+  bugs just to keep an oracle-comparison test green - the opposite of
+  what an oracle is for. `mbox-reader` was dropped from the
+  oracle-comparison role entirely; `mbox_reader_captures_every_message_
+  including_the_last` instead asserts directly against real fixture
+  content, specifically proving all three messages (not just the first
+  two a buggy scanner would find) are captured correctly. `mbox-reader`
+  itself was removed from Cargo.toml rather than kept as an unused
+  dependency once this was found - there was nothing left for it to
+  usefully verify.
 
 ## Known limitations / roadmap
 

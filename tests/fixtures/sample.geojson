@@ -1,0 +1,17 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "properties": {"name": "Golden Gate Bridge", "opened": "1937-05-27"},
+      "geometry": {"type": "Point", "coordinates": [-122.4783, 37.8199]}
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "properties": {"name": "A short trail", "opened": "1990-01-01"},
+      "geometry": {"type": "LineString", "coordinates": [[-122.4, 37.8], [-122.41, 37.81]]}
+    }
+  ]
+}

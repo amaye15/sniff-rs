@@ -3499,6 +3499,18 @@ const DATE_FORMATS: &[&str] = &[
     // Compact/"Basic" ISO 8601 - no punctuation at all, e.g. common in
     // generated filenames and log timestamps: "20240115T100000".
     "%Y%m%dT%H%M%S",
+    // The identical compact form with a literal UTC "Z" suffix - RFC
+    // 5545 (iCalendar) §3.3.5's own "DATE-TIME with UTC time" form,
+    // e.g. "20240115T090000Z", found while adding this project's own
+    // iCalendar reader: a real DTSTART/DTEND value in this exact shape
+    // otherwise matched no candidate at all and fell through to a plain
+    // `String`, the same class of gap RFC 2822's own literal-"GMT"-zone
+    // variant already closed for RSS feeds. Kept as a separate entry
+    // rather than folding the trailing "Z" into the form above - a
+    // column mixing the Z-suffixed and bare forms correctly matches
+    // neither, the same "no partial credit" rule this project applies
+    // everywhere else in `DATE_FORMATS`.
+    "%Y%m%dT%H%M%SZ",
 ];
 
 /// Candidate time-of-day formats, tried the same way DATE_FORMATS is: first
@@ -44187,6 +44199,845 @@ fn columns_from_har(
     )
 }
 
+// --- GeoJSON reader (opt-in via --features geojson) --- Standard JSON
+// with a fixed, spec-defined top-level shape (RFC 7946) - the shared core
+// `json_support` parser handles the actual JSON syntax entirely (never
+// `json5_support`'s relaxed sibling; a real GeoJSON file is always
+// standard JSON), so this module's only real job is the format-specific
+// plumbing: picking a record shape from the three legal top-level types
+// (FeatureCollection/Feature/a bare Geometry) and rendering each
+// Feature's own geometry as WKT text rather than leaving it as raw,
+// unflattened coordinate-array JSON - matching the design philosophy
+// section's own coordinate/WKT heuristics, which are what pick this
+// project's `WKT Geometry` ideal_type up automatically once the geometry
+// is in that form.
+#[cfg(feature = "geojson")]
+mod geojson_support {
+    use super::*;
+
+    /// Guards `geometry_to_wkt`'s own recursion (only `GeometryCollection`
+    /// can nest) - in practice always well under this, since the
+    /// underlying JSON parse already caps total document nesting at 128
+    /// levels (`json_support::Parser::MAX_DEPTH`), so a `GeometryCollection`
+    /// this deep could never have parsed as JSON in the first place. Kept
+    /// as its own explicit, cheap guard anyway - the same "defense in
+    /// depth, not just relying on an upstream cap" discipline this
+    /// project already applies to some of its own nested nested-format
+    /// readers.
+    const MAX_GEOMETRY_DEPTH: u32 = 64;
+
+    fn format_coord(c: f64) -> String {
+        // Same "no meaningless trailing .0" convention this project's
+        // own float rendering already uses everywhere else.
+        if c.fract() == 0.0 && c.abs() < 1e15 {
+            format!("{c:.0}")
+        } else {
+            c.to_string()
+        }
+    }
+
+    fn position_from_json(v: &JsonValue) -> Result<Vec<f64>> {
+        v.as_array()
+            .context("expected a GeoJSON position (an array of numbers)")?
+            .iter()
+            .map(|c| c.as_f64().context("a GeoJSON coordinate must be numeric"))
+            .collect()
+    }
+
+    fn format_position(p: &[f64]) -> String {
+        p.iter()
+            .map(|c| format_coord(*c))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn format_positions(ps: &[Vec<f64>]) -> String {
+        ps.iter()
+            .map(|p| format_position(p))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn format_rings(rings: &[Vec<Vec<f64>>]) -> String {
+        rings
+            .iter()
+            .map(|r| format!("({})", format_positions(r)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn coordinates_array<'a>(v: &'a JsonValue, geometry_type: &str) -> Result<&'a Vec<JsonValue>> {
+        v.get("coordinates")
+            .and_then(JsonValue::as_array)
+            .with_context(|| {
+                format!("a GeoJSON {geometry_type} is missing its own \"coordinates\" array")
+            })
+    }
+
+    /// Renders one GeoJSON geometry object (`{"type": "...", "coordinates":
+    /// [...]}`, or `{"type": "GeometryCollection", "geometries": [...]}`)
+    /// as WKT text - built directly off the raw parsed JSON shape rather
+    /// than needing a second, GeoJSON-specific value type, since every
+    /// geometry's own JSON shape already carries everything this needs.
+    /// Coordinate order is passed through unchanged (GeoJSON's own
+    /// `[longitude, latitude]` order is already WKT's own `(x y)` order -
+    /// no reordering is ever needed). `GeometryCollection` is rendered
+    /// too, even though this project's own `is_wkt_geometry` heuristic
+    /// deliberately never recognizes it as WKT (its body legitimately
+    /// nests other geometry keywords, not just coordinate characters -
+    /// see that check's own doc comment) - the text is still correct and
+    /// informative, it just falls back to a plain `String` ideal_type
+    /// rather than `WKT Geometry`, the same disclosed boundary that
+    /// heuristic already documents for hand-authored WKT text.
+    fn geometry_to_wkt(v: &JsonValue, depth: u32) -> Result<String> {
+        if depth > MAX_GEOMETRY_DEPTH {
+            bail!("GeoJSON geometry nested past {MAX_GEOMETRY_DEPTH} levels");
+        }
+        let ty = v
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .context("a GeoJSON geometry is missing its own \"type\"")?;
+        match ty {
+            "Point" => {
+                let coords = v
+                    .get("coordinates")
+                    .context("a GeoJSON Point is missing its own \"coordinates\"")?;
+                Ok(format!(
+                    "POINT({})",
+                    format_position(&position_from_json(coords)?)
+                ))
+            }
+            "MultiPoint" => {
+                let positions: Vec<Vec<f64>> = coordinates_array(v, "MultiPoint")?
+                    .iter()
+                    .map(position_from_json)
+                    .collect::<Result<_>>()?;
+                Ok(format!("MULTIPOINT({})", format_positions(&positions)))
+            }
+            "LineString" => {
+                let positions: Vec<Vec<f64>> = coordinates_array(v, "LineString")?
+                    .iter()
+                    .map(position_from_json)
+                    .collect::<Result<_>>()?;
+                Ok(format!("LINESTRING({})", format_positions(&positions)))
+            }
+            "MultiLineString" => {
+                let lines: Vec<String> = coordinates_array(v, "MultiLineString")?
+                    .iter()
+                    .map(|l| {
+                        let positions: Vec<Vec<f64>> = l
+                            .as_array()
+                            .context(
+                                "a MultiLineString element must be a LineString coordinate array",
+                            )?
+                            .iter()
+                            .map(position_from_json)
+                            .collect::<Result<_>>()?;
+                        Ok(format!("({})", format_positions(&positions)))
+                    })
+                    .collect::<Result<_>>()?;
+                Ok(format!("MULTILINESTRING({})", lines.join(", ")))
+            }
+            "Polygon" => {
+                let rings: Vec<Vec<Vec<f64>>> = coordinates_array(v, "Polygon")?
+                    .iter()
+                    .map(|r| {
+                        r.as_array()
+                            .context("a Polygon ring must be an array of positions")?
+                            .iter()
+                            .map(position_from_json)
+                            .collect::<Result<_>>()
+                    })
+                    .collect::<Result<_>>()?;
+                Ok(format!("POLYGON({})", format_rings(&rings)))
+            }
+            "MultiPolygon" => {
+                let polys: Vec<String> = coordinates_array(v, "MultiPolygon")?
+                    .iter()
+                    .map(|p| {
+                        let rings: Vec<Vec<Vec<f64>>> = p
+                            .as_array()
+                            .context("a MultiPolygon element must be a Polygon coordinate array")?
+                            .iter()
+                            .map(|r| {
+                                r.as_array()
+                                    .context("a Polygon ring must be an array of positions")?
+                                    .iter()
+                                    .map(position_from_json)
+                                    .collect::<Result<_>>()
+                            })
+                            .collect::<Result<_>>()?;
+                        Ok(format!("({})", format_rings(&rings)))
+                    })
+                    .collect::<Result<_>>()?;
+                Ok(format!("MULTIPOLYGON({})", polys.join(", ")))
+            }
+            "GeometryCollection" => {
+                let geoms = v
+                    .get("geometries")
+                    .and_then(JsonValue::as_array)
+                    .context("a GeometryCollection is missing its own \"geometries\" array")?;
+                let parts: Vec<String> = geoms
+                    .iter()
+                    .map(|g| geometry_to_wkt(g, depth + 1))
+                    .collect::<Result<_>>()?;
+                Ok(format!("GEOMETRYCOLLECTION({})", parts.join(", ")))
+            }
+            other => bail!("unrecognized GeoJSON geometry type \"{other}\" (RFC 7946 §3.1)"),
+        }
+    }
+
+    /// Moves `key`'s value out of `map` (if present), the same "nothing
+    /// else needs the rest of the document" discipline `har_support`
+    /// already established for its own `log.entries` extraction.
+    fn take_field(map: json_support::Map, key: &str) -> Option<JsonValue> {
+        map.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// One Feature's own `properties` become the record's columns; its
+    /// `geometry` becomes a `geometry` column of WKT text (or genuinely
+    /// missing, for a Feature whose `geometry` is JSON `null` - a real,
+    /// spec-legal "unlocated feature" per RFC 7946 §3.2); its optional
+    /// `id` becomes an `id` column, kept as whatever JSON type it already
+    /// is (a string or a number, per spec) rather than coerced.
+    fn feature_to_record(feature: JsonValue) -> Result<json_support::Map> {
+        let JsonValue::Object(obj) = feature else {
+            bail!("a GeoJSON Feature must be a JSON object (RFC 7946 §3.2)");
+        };
+        let mut properties = None;
+        let mut geometry = None;
+        let mut id = None;
+        for (k, v) in obj.into_iter() {
+            match k.as_str() {
+                "properties" => properties = Some(v),
+                "geometry" => geometry = Some(v),
+                "id" => id = Some(v),
+                _ => {} // bbox and any other Feature-level field aren't surfaced
+            }
+        }
+        let mut map = match properties {
+            Some(JsonValue::Object(m)) => m,
+            None | Some(JsonValue::Null) => json_support::Map::new(),
+            Some(_) => bail!("a GeoJSON Feature's \"properties\" must be an object or null"),
+        };
+        if let Some(geom) = geometry {
+            let rendered = match geom {
+                JsonValue::Null => JsonValue::Null,
+                other => JsonValue::from(geometry_to_wkt(&other, 0)?),
+            };
+            map.insert("geometry".to_string(), rendered);
+        }
+        if let Some(id) = id {
+            map.insert("id".to_string(), id);
+        }
+        Ok(map)
+    }
+
+    pub(crate) fn columns_from_geojson(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = json_support::from_str(&text)
+            .map_err(|e| anyhow!("{e}"))
+            .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        let JsonValue::Object(root) = value else {
+            bail!(
+                "{path:?} doesn't look like a GeoJSON document - expected a top-level JSON object (RFC 7946 §3)"
+            );
+        };
+        let ty = root
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .with_context(|| {
+                format!("{path:?} is missing its own top-level \"type\" field (RFC 7946 §3)")
+            })?;
+        match ty.as_str() {
+            "FeatureCollection" => {
+                let features = match take_field(root, "features") {
+                    Some(JsonValue::Array(items)) => items,
+                    _ => bail!(
+                        "{path:?}'s FeatureCollection is missing its own \"features\" array (RFC 7946 §3.3)"
+                    ),
+                };
+                let mut records = Vec::with_capacity(features.len());
+                for (i, feature) in features.into_iter().enumerate() {
+                    if nrows.is_some_and(|n| i >= n) {
+                        break;
+                    }
+                    records.push(feature_to_record(feature).with_context(|| {
+                        format!("{path:?}: features[{i}] isn't a well-formed GeoJSON Feature")
+                    })?);
+                }
+                Ok(profile_json_records(&records, n_samples))
+            }
+            "Feature" => {
+                let record = feature_to_record(JsonValue::Object(root))
+                    .with_context(|| format!("{path:?} isn't a well-formed GeoJSON Feature"))?;
+                Ok(profile_json_records(&[record], n_samples))
+            }
+            // Every other legal top-level "type" is a bare Geometry
+            // (Point/LineString/Polygon/MultiPoint/MultiLineString/
+            // MultiPolygon/GeometryCollection, RFC 7946 §3.1) - no
+            // properties to extract, just the one geometry itself,
+            // profiled the same "no field names, but still a genuine
+            // single column" way a top-level scalar/array is elsewhere
+            // in this project.
+            _ => {
+                let wkt = geometry_to_wkt(&JsonValue::Object(root), 0)
+                    .with_context(|| format!("{path:?} isn't a well-formed GeoJSON document"))?;
+                let value = JsonValue::from(wkt);
+                Ok(profile_json_path(
+                    "geometry".to_string(),
+                    1,
+                    vec![&value],
+                    n_samples,
+                ))
+            }
+        }
+    }
+} // mod geojson_support
+
+#[cfg(feature = "geojson")]
+fn columns_from_geojson(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    geojson_support::columns_from_geojson(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "geojson"))]
+fn columns_from_geojson(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "GeoJSON support isn't compiled in - rebuild with `cargo build --release --features geojson` (or --features full)"
+    )
+}
+
+// --- Shared vCard/iCalendar content-line grammar (opt-in via --features
+// vcard and/or --features icalendar) --- Both formats inherit the
+// identical low-level "content line" syntax (a folded `PROPERTY[;PARAM=
+// VALUE...]:value` line, RFC 6350 §3.2 for vCard and RFC 5545 §3.1 for
+// iCalendar state the same rule almost verbatim - iCalendar's own RFC
+// explicitly derives from vCard's), so this one shared module - gated on
+// *either* feature needing it - serves both readers rather than being
+// duplicated the way this project's two independently-diverging XML
+// parsers are (see that pair's own writeup in CLAUDE.md's Dependency
+// footprint section for when duplication is the right call instead of
+// this one).
+//
+// Deliberately out of scope: individual parameters (`;TYPE=work`,
+// `;TZID=...`) are parsed only far enough to be skipped correctly (so
+// they don't corrupt where the real value starts) - never surfaced as
+// their own columns. A property repeated with different parameters
+// (two `TEL` lines, one `;TYPE=work` and one `;TYPE=cell`) still pools
+// into one array column under its own property name, the same
+// "disclosed, not silently narrowed" simplification this project's own
+// INI reader already makes for its own repeated-key convention.
+#[cfg(any(feature = "vcard", feature = "icalendar"))]
+mod vobject_support {
+    use super::*;
+
+    /// Un-folds RFC 5545/6350 content lines: a logical line may be split
+    /// across several physical lines, with every continuation line after
+    /// the first beginning with exactly one space or horizontal tab
+    /// (stripped here, not kept as part of the value). A genuinely blank
+    /// line never carries fold continuation of its own and is dropped
+    /// outright - it only ever separates unrelated content in these
+    /// formats (vCard has no comparable meaning for one at all; a real
+    /// iCalendar file occasionally has one between components, though
+    /// the spec doesn't require it). Accepts a bare `\n` alongside the
+    /// spec's own `\r\n`, the same leniency this project's other
+    /// hand-rolled line-oriented readers already extend.
+    pub(crate) fn unfold_lines(text: &str) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for raw in text.lines() {
+            let raw = raw.strip_suffix('\r').unwrap_or(raw);
+            if raw.is_empty() {
+                continue;
+            }
+            if (raw.starts_with(' ') || raw.starts_with('\t')) && !lines.is_empty() {
+                lines.last_mut().unwrap().push_str(&raw[1..]);
+            } else {
+                lines.push(raw.to_string());
+            }
+        }
+        lines
+    }
+
+    pub(crate) struct ParsedProperty {
+        pub(crate) name: String,
+        pub(crate) value: String,
+    }
+
+    /// Splits one already-unfolded content line into its property name
+    /// and raw (still-escaped) value, skipping past any `;`-delimited
+    /// parameters in between - correctly, not just by searching for the
+    /// first `:` byte, since a quoted parameter value (`;X-FOO="a:b"`)
+    /// can legally contain a colon of its own that must not be mistaken
+    /// for the name/value separator. The property name is upper-cased
+    /// (both RFC 6350 and RFC 5545 define property names as case-
+    /// insensitive), giving every reader built on this module one
+    /// stable, canonical column-name convention regardless of how a
+    /// particular file happened to write it.
+    pub(crate) fn parse_property_line(line: &str) -> Result<ParsedProperty> {
+        let bytes = line.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() && bytes[pos] != b';' && bytes[pos] != b':' {
+            pos += 1;
+        }
+        if pos == 0 {
+            bail!("missing a property name in content line: {line:?}");
+        }
+        let name = line[..pos].to_ascii_uppercase();
+        let mut in_quotes = false;
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'"' => in_quotes = !in_quotes,
+                b':' if !in_quotes => break,
+                _ => {}
+            }
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            bail!("missing the ':' separating parameters from a value in content line: {line:?}");
+        }
+        Ok(ParsedProperty {
+            name,
+            value: line[pos + 1..].to_string(),
+        })
+    }
+
+    /// RFC 6350 §3.4 / RFC 5545 §3.3.11's shared backslash-escape
+    /// grammar: `\\`, `\,`, `\;`, and `\n`/`\N` (a literal newline inside
+    /// an otherwise single-line value - used constantly by real vCard
+    /// `NOTE`/`ADR` fields and iCalendar `DESCRIPTION` fields). Any other
+    /// backslash-escaped character is kept literally (backslash and
+    /// all) rather than silently dropping the backslash - a real, if
+    /// non-conformant, escape a lenient real-world file might still
+    /// contain shouldn't lose information it wasn't asked to lose.
+    pub(crate) fn unescape_value(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') | Some('N') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(',') => out.push(','),
+                Some(';') => out.push(';'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    /// Inserts `(name, value)` into `map`, pooling a repeated property
+    /// into an array - the same convention this project's own INI
+    /// reader already uses for a repeated `key=value` line.
+    pub(crate) fn insert_pooling(map: &mut json_support::Map, name: String, value: JsonValue) {
+        match map.get_mut(&name) {
+            Some(JsonValue::Array(arr)) => arr.push(value),
+            Some(existing) => {
+                let prev = std::mem::replace(existing, JsonValue::Null);
+                *existing = JsonValue::Array(vec![prev, value]);
+            }
+            None => {
+                map.insert(name, value);
+            }
+        }
+    }
+} // mod vobject_support
+
+// --- vCard reader (opt-in via --features vcard) --- One record per
+// `BEGIN:VCARD` ... `END:VCARD` block (RFC 6350 §6.1) - vCard has no
+// further nesting of its own, so every content line inside a block
+// contributes directly to that block's own record.
+#[cfg(feature = "vcard")]
+mod vcard_support {
+    use super::vobject_support::{
+        insert_pooling, parse_property_line, unescape_value, unfold_lines,
+    };
+    use super::*;
+
+    pub(crate) fn columns_from_vcard(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let lines = unfold_lines(&text);
+        let mut records: Vec<json_support::Map> = Vec::new();
+        let mut current: Option<json_support::Map> = None;
+        for line in &lines {
+            if line.eq_ignore_ascii_case("BEGIN:VCARD") {
+                if current.is_some() {
+                    bail!(
+                        "{path:?}: a new BEGIN:VCARD started before the previous one's END:VCARD"
+                    );
+                }
+                current = Some(json_support::Map::new());
+                continue;
+            }
+            if line.eq_ignore_ascii_case("END:VCARD") {
+                let map = current
+                    .take()
+                    .with_context(|| format!("{path:?}: END:VCARD with no matching BEGIN:VCARD"))?;
+                records.push(map);
+                continue;
+            }
+            let Some(map) = current.as_mut() else {
+                continue; // content outside any BEGIN/END block is ignored
+            };
+            let prop = parse_property_line(line)
+                .with_context(|| format!("{path:?}: malformed vCard property line"))?;
+            // BEGIN/VERSION/END are structural, not real contact data -
+            // VERSION in particular is the same "1" constant on every
+            // card in a file, never worth surfacing as a column.
+            if prop.name == "VERSION" {
+                continue;
+            }
+            insert_pooling(map, prop.name, JsonValue::from(unescape_value(&prop.value)));
+        }
+        if current.is_some() {
+            bail!("{path:?}: unterminated VCARD block (missing END:VCARD)");
+        }
+        // A whole-document parse (like TOML/JSON5's own single-document
+        // shapes) - every card is still fully parsed regardless of
+        // `--nrows` (so a malformed card past the cutoff still surfaces
+        // as an error), only the kept set is capped afterward.
+        records.truncate(nrows.unwrap_or(usize::MAX));
+        Ok(profile_json_records(&records, n_samples))
+    }
+} // mod vcard_support
+
+#[cfg(feature = "vcard")]
+fn columns_from_vcard(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    vcard_support::columns_from_vcard(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "vcard"))]
+fn columns_from_vcard(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "vCard support isn't compiled in - rebuild with `cargo build --release --features vcard` (or --features full)"
+    )
+}
+
+// --- iCalendar reader (opt-in via --features icalendar) --- One record
+// per VEVENT or VTODO component (RFC 5545 §3.6.1/§3.6.2) - the two
+// component types real calendar data is actually made of. A calendar's
+// own top-level properties (PRODID, VERSION, ...) and every other
+// component type (VALARM, VTIMEZONE, VJOURNAL, VFREEBUSY, and their own
+// STANDARD/DAYLIGHT sub-blocks) are structurally recognized (so nesting
+// stays correct and a property inside one is never misattributed to an
+// enclosing VEVENT/VTODO) but not themselves surfaced as columns or
+// records - the same "isolate what's out of scope, don't let it corrupt
+// what is" treatment this project already gives an unsupported nested
+// Parquet column or a `.npz` array that can't be read.
+#[cfg(feature = "icalendar")]
+mod ical_support {
+    use super::vobject_support::{
+        insert_pooling, parse_property_line, unescape_value, unfold_lines,
+    };
+    use super::*;
+
+    enum Frame {
+        Record(json_support::Map),
+        Other(String),
+    }
+
+    pub(crate) fn columns_from_ical(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let lines = unfold_lines(&text);
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut records: Vec<json_support::Map> = Vec::new();
+        for line in &lines {
+            if let Some(name) = line
+                .strip_prefix("BEGIN:")
+                .or_else(|| line.strip_prefix("begin:"))
+            {
+                let name = name.to_ascii_uppercase();
+                if name == "VEVENT" || name == "VTODO" {
+                    stack.push(Frame::Record(json_support::Map::new()));
+                } else {
+                    stack.push(Frame::Other(name));
+                }
+                continue;
+            }
+            if let Some(name) = line
+                .strip_prefix("END:")
+                .or_else(|| line.strip_prefix("end:"))
+            {
+                let name = name.to_ascii_uppercase();
+                let frame = stack.pop().with_context(|| {
+                    format!("{path:?}: END:{name} with no matching BEGIN:{name}")
+                })?;
+                match frame {
+                    Frame::Record(map) => {
+                        if name != "VEVENT" && name != "VTODO" {
+                            bail!(
+                                "{path:?}: END:{name} doesn't match its own BEGIN (a VEVENT/VTODO)"
+                            );
+                        }
+                        records.push(map);
+                    }
+                    Frame::Other(open_name) => {
+                        if open_name != name {
+                            bail!(
+                                "{path:?}: END:{name} doesn't match the currently open BEGIN:{open_name}"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            match stack.last_mut() {
+                Some(Frame::Record(map)) => {
+                    let prop = parse_property_line(line)
+                        .with_context(|| format!("{path:?}: malformed iCalendar property line"))?;
+                    insert_pooling(map, prop.name, JsonValue::from(unescape_value(&prop.value)));
+                }
+                // A property belonging to VCALENDAR itself, or to a
+                // component this reader doesn't turn into its own
+                // records (VALARM, VTIMEZONE, ...) - not surfaced, per
+                // this module's own documented scope.
+                Some(Frame::Other(_)) | None => {}
+            }
+        }
+        if !stack.is_empty() {
+            bail!("{path:?}: unterminated component (missing an END: line)");
+        }
+        records.truncate(nrows.unwrap_or(usize::MAX));
+        Ok(profile_json_records(&records, n_samples))
+    }
+} // mod ical_support
+
+#[cfg(feature = "icalendar")]
+fn columns_from_ical(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    ical_support::columns_from_ical(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "icalendar"))]
+fn columns_from_ical(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "iCalendar support isn't compiled in - rebuild with `cargo build --release --features icalendar` (or --features full)"
+    )
+}
+
+// --- MBOX reader (opt-in via --features mbox, hand-rolled RFC 4155
+// reader) --- One record per message. Message boundaries are found the
+// same way real mbox-writing/reading tools do (Python's own `mailbox`
+// module included): a line starting with `From ` (the "From_" envelope
+// separator - never itself a real RFC 822 header, despite the
+// resemblance) counts as a new message boundary only at the very start
+// of the file, or immediately after a blank line - never merely because
+// some line happens to start with those five characters. This is what
+// actually distinguishes a genuine boundary from a `From ` line that
+// occurs naturally inside a message's own body: every correctly-writing
+// mbox tool is required to quote/escape a body line like that
+// specifically so it can't be confused with a real separator (the
+// mboxo/mboxrd/mboxcl2 quoting conventions all exist for this one
+// reason) - so requiring the preceding blank line is the real rule, not
+// an arbitrary tightening of it.
+#[cfg(feature = "mbox")]
+mod mbox_support {
+    use super::*;
+
+    fn split_messages(content: &str) -> Vec<&str> {
+        let bytes = content.as_bytes();
+        let mut boundaries = vec![0usize];
+        let mut prev_blank = true;
+        let mut line_start = 0usize;
+        for i in 0..=bytes.len() {
+            if i == bytes.len() || bytes[i] == b'\n' {
+                let line = content[line_start..i]
+                    .strip_suffix('\r')
+                    .unwrap_or(&content[line_start..i]);
+                if prev_blank && line.starts_with("From ") && line_start != 0 {
+                    boundaries.push(line_start);
+                }
+                prev_blank = line.is_empty();
+                line_start = i + 1;
+            }
+        }
+        let mut messages = Vec::with_capacity(boundaries.len());
+        for w in boundaries.windows(2) {
+            messages.push(&content[w[0]..w[1]]);
+        }
+        if let Some(&last) = boundaries.last()
+            && last < content.len()
+        {
+            messages.push(&content[last..]);
+        }
+        messages
+    }
+
+    struct ParsedMessage {
+        envelope_sender: String,
+        envelope_date: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    /// RFC 822 headers only - deliberately no MIME multipart decoding
+    /// (a `multipart/*` body's own boundary-delimited parts are kept as
+    /// one opaque `body` blob, not recursed into), the same "isolate
+    /// what's out of scope" scope boundary the iCalendar/vCard readers
+    /// above draw for their own unsupported nested components.
+    fn parse_message(msg: &str) -> Result<ParsedMessage> {
+        let mut lines = msg.lines();
+        let envelope_line = lines.next().context("empty message")?;
+        let rest = envelope_line
+            .strip_prefix("From ")
+            .context("message doesn't start with a 'From ' envelope line")?;
+        let mut parts = rest.splitn(2, ' ');
+        let envelope_sender = parts.next().unwrap_or("").to_string();
+        let envelope_date = parts.next().unwrap_or("").trim().to_string();
+
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut body_lines: Vec<&str> = Vec::new();
+        let mut in_headers = true;
+        for line in lines {
+            if !in_headers {
+                body_lines.push(line);
+                continue;
+            }
+            if line.is_empty() {
+                in_headers = false;
+                continue;
+            }
+            if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
+                // RFC 822 §3.1.1 header folding.
+                let last = headers.last_mut().unwrap();
+                last.1.push(' ');
+                last.1.push_str(line.trim_start());
+                continue;
+            }
+            match line.split_once(':') {
+                Some((name, value)) => {
+                    headers.push((name.trim().to_string(), value.trim().to_string()))
+                }
+                None => bail!("malformed header line (missing ':'): {line:?}"),
+            }
+        }
+        Ok(ParsedMessage {
+            envelope_sender,
+            envelope_date,
+            headers,
+            body: body_lines.join("\n"),
+        })
+    }
+
+    fn message_to_record(msg: ParsedMessage) -> json_support::Map {
+        let mut map = json_support::Map::with_capacity(msg.headers.len() + 3);
+        map.insert(
+            "envelope_sender".to_string(),
+            JsonValue::from(msg.envelope_sender),
+        );
+        map.insert(
+            "envelope_date".to_string(),
+            JsonValue::from(msg.envelope_date),
+        );
+        // Exact-name pooling, matching this project's own INI reader -
+        // real header names are conventionally written consistently
+        // within one message even though RFC 822 itself treats them as
+        // case-insensitive, so this is the same "correct for the
+        // overwhelming common case" tradeoff `is_email`/`is_url` already
+        // make elsewhere in this project.
+        for (name, value) in msg.headers {
+            match map.get_mut(&name) {
+                Some(JsonValue::Array(arr)) => arr.push(JsonValue::from(value)),
+                Some(existing) => {
+                    let prev = std::mem::replace(existing, JsonValue::Null);
+                    *existing = JsonValue::Array(vec![prev, JsonValue::from(value)]);
+                }
+                None => {
+                    map.insert(name, JsonValue::from(value));
+                }
+            }
+        }
+        map.insert("body".to_string(), JsonValue::from(msg.body));
+        map
+    }
+
+    pub(crate) fn columns_from_mbox(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        if !content.trim_start().starts_with("From ") {
+            bail!(
+                "{path:?} doesn't look like an mbox file - expected the first message to start with a 'From ' envelope line (RFC 4155)"
+            );
+        }
+        let mut records = Vec::new();
+        for (i, msg) in split_messages(&content).into_iter().enumerate() {
+            if nrows.is_some_and(|n| i >= n) {
+                break;
+            }
+            let parsed = parse_message(msg)
+                .with_context(|| format!("{path:?}: malformed message #{}", i + 1))?;
+            records.push(message_to_record(parsed));
+        }
+        Ok(profile_json_records(&records, n_samples))
+    }
+} // mod mbox_support
+
+#[cfg(feature = "mbox")]
+fn columns_from_mbox(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    mbox_support::columns_from_mbox(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "mbox"))]
+fn columns_from_mbox(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "MBOX support isn't compiled in - rebuild with `cargo build --release --features mbox` (or --features full)"
+    )
+}
+
 // --- INI reader (opt-in via --features ini, hand-rolled - see
 // `ini_support` below and CLAUDE.md's Dependency footprint section) ---
 // An INI file's sections are already "multiple named groups of key=value
@@ -47804,6 +48655,10 @@ enum InputFormat {
     Plist,
     Json5,
     Har,
+    GeoJson,
+    Mbox,
+    Vcard,
+    Ical,
 }
 
 impl InputFormat {
@@ -47853,6 +48708,10 @@ impl InputFormat {
             InputFormat::Plist => "plist",
             InputFormat::Json5 => "json5",
             InputFormat::Har => "har",
+            InputFormat::GeoJson => "geojson",
+            InputFormat::Mbox => "mbox",
+            InputFormat::Vcard => "vcard",
+            InputFormat::Ical => "icalendar",
         }
     }
 }
@@ -48142,9 +49001,13 @@ fn detect_format(
             "plist" => Ok(InputFormat::Plist),
             "json5" | "jsonc" => Ok(InputFormat::Json5),
             "har" => Ok(InputFormat::Har),
+            "geojson" => Ok(InputFormat::GeoJson),
+            "mbox" => Ok(InputFormat::Mbox),
+            "vcard" | "vcf" => Ok(InputFormat::Vcard),
+            "icalendar" | "ical" | "ics" => Ok(InputFormat::Ical),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, orc, bson, plist, json5, or har)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, orc, bson, plist, json5, har, geojson, mbox, vcard, or icalendar)"
                 )
             }
         };
@@ -48180,6 +49043,10 @@ fn detect_format(
         "plist" => Ok(InputFormat::Plist),
         "json5" | "jsonc" => Ok(InputFormat::Json5),
         "har" => Ok(InputFormat::Har),
+        "geojson" => Ok(InputFormat::GeoJson),
+        "mbox" => Ok(InputFormat::Mbox),
+        "vcf" => Ok(InputFormat::Vcard),
+        "ics" => Ok(InputFormat::Ical),
         // The extension alone doesn't tell us - either there isn't one, or
         // it's not one of the above. Before giving up, try the file's own
         // bytes: fixed-width text and the four log formats have no magic
@@ -48191,7 +49058,7 @@ fn detect_format(
                 return Ok(format);
             }
             bail!(
-                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss|orc|bson|plist|json5|har explicitly"
+                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss|orc|bson|plist|json5|har|geojson|mbox|vcard|icalendar explicitly"
             )
         }
     }
@@ -54987,6 +55854,10 @@ fn dispatch_reader(
             InputFormat::Plist => columns_from_plist(read_path, args.nrows, args.samples)?,
             InputFormat::Json5 => columns_from_json5(read_path, args.nrows, args.samples)?,
             InputFormat::Har => columns_from_har(read_path, args.nrows, args.samples)?,
+            InputFormat::GeoJson => columns_from_geojson(read_path, args.nrows, args.samples)?,
+            InputFormat::Mbox => columns_from_mbox(read_path, args.nrows, args.samples)?,
+            InputFormat::Vcard => columns_from_vcard(read_path, args.nrows, args.samples)?,
+            InputFormat::Ical => columns_from_ical(read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
@@ -59913,11 +60784,12 @@ mod tests {
 
     /// Test-only bridge from a real `serde_json::Value` (what the real
     /// `json5` crate deserializes into directly - it works with any
-    /// `serde::Deserialize` target, `serde_json::Value` included) to
-    /// this project's own `JsonValue`. Trivial, since both types share
-    /// the identical six-variant shape by design (see `json_support::
-    /// Value`'s own doc comment).
-    #[cfg(all(test, feature = "json5"))]
+    /// `serde::Deserialize` target, `serde_json::Value` included - and
+    /// what the real `geojson` crate's own `properties`/`id` fields are
+    /// typed as too) to this project's own `JsonValue`. Trivial, since
+    /// both types share the identical six-variant shape by design (see
+    /// `json_support::Value`'s own doc comment).
+    #[cfg(all(test, any(feature = "json5", feature = "geojson")))]
     fn serde_json_value_to_json(v: &serde_json::Value) -> JsonValue {
         match v {
             serde_json::Value::Null => JsonValue::Null,
@@ -60113,6 +60985,355 @@ mod tests {
             format!("{err:?}").contains("log.entries"),
             "expected an error naming the missing log.entries array, got: {err:?}"
         );
+    }
+
+    /// Test-only: renders a `geojson` crate `GeometryValue` as WKT text,
+    /// mirroring `geojson_support::geometry_to_wkt`'s own algorithm but
+    /// built off the real crate's own typed geometry tree instead of raw
+    /// JSON - a genuinely independent second implementation, not just a
+    /// second call into the same code, so agreement between the two is
+    /// real evidence rather than a tautology.
+    #[cfg(all(test, feature = "geojson"))]
+    fn geojson_geometry_value_to_wkt(v: &geojson::GeometryValue) -> String {
+        fn fmt_coord(c: f64) -> String {
+            if c.fract() == 0.0 && c.abs() < 1e15 {
+                format!("{c:.0}")
+            } else {
+                c.to_string()
+            }
+        }
+        fn fmt_pos(p: &geojson::Position) -> String {
+            p.as_slice()
+                .iter()
+                .map(|c| fmt_coord(*c))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        fn fmt_positions(ps: &[geojson::Position]) -> String {
+            ps.iter().map(fmt_pos).collect::<Vec<_>>().join(", ")
+        }
+        fn fmt_rings(rings: &[Vec<geojson::Position>]) -> String {
+            rings
+                .iter()
+                .map(|r| format!("({})", fmt_positions(r)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        use geojson::GeometryValue as GV;
+        match v {
+            GV::Point { coordinates } => format!("POINT({})", fmt_pos(coordinates)),
+            GV::MultiPoint { coordinates } => format!("MULTIPOINT({})", fmt_positions(coordinates)),
+            GV::LineString { coordinates } => format!("LINESTRING({})", fmt_positions(coordinates)),
+            GV::MultiLineString { coordinates } => {
+                let parts: Vec<String> = coordinates
+                    .iter()
+                    .map(|l| format!("({})", fmt_positions(l)))
+                    .collect();
+                format!("MULTILINESTRING({})", parts.join(", "))
+            }
+            GV::Polygon { coordinates } => format!("POLYGON({})", fmt_rings(coordinates)),
+            GV::MultiPolygon { coordinates } => {
+                let parts: Vec<String> = coordinates
+                    .iter()
+                    .map(|p| format!("({})", fmt_rings(p)))
+                    .collect();
+                format!("MULTIPOLYGON({})", parts.join(", "))
+            }
+            GV::GeometryCollection { geometries } => {
+                let parts: Vec<String> = geometries
+                    .iter()
+                    .map(|g| geojson_geometry_value_to_wkt(&g.value))
+                    .collect();
+                format!("GEOMETRYCOLLECTION({})", parts.join(", "))
+            }
+        }
+    }
+
+    /// Test-only: producing the "expected" side of `geojson_reader_
+    /// matches_the_geojson_crate_output_exactly` - parses via the real
+    /// `geojson` crate (kept as a dev-only cross-verification oracle,
+    /// see Cargo.toml) rather than this project's own hand-rolled
+    /// `geojson_support`.
+    #[cfg(all(test, feature = "geojson"))]
+    fn columns_from_geojson_via_geojson_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let text = fs::read_to_string(path)?;
+        let doc: geojson::GeoJson = text.parse().map_err(|e| anyhow!("{e}"))?;
+        let feature_to_map = |f: &geojson::Feature| -> json_support::Map {
+            let mut map = json_support::Map::new();
+            if let Some(props) = &f.properties {
+                for (k, v) in props {
+                    map.insert(k.clone(), serde_json_value_to_json(v));
+                }
+            }
+            if let Some(geom) = &f.geometry {
+                map.insert(
+                    "geometry".to_string(),
+                    JsonValue::from(geojson_geometry_value_to_wkt(&geom.value)),
+                );
+            }
+            if let Some(id) = &f.id {
+                let idv = match id {
+                    geojson::feature::Id::String(s) => JsonValue::from(s.clone()),
+                    geojson::feature::Id::Number(n) => {
+                        serde_json_value_to_json(&serde_json::Value::Number(n.clone()))
+                    }
+                };
+                map.insert("id".to_string(), idv);
+            }
+            map
+        };
+        match doc {
+            geojson::GeoJson::FeatureCollection(fc) => {
+                let records: Vec<json_support::Map> =
+                    fc.features.iter().map(feature_to_map).collect();
+                Ok(profile_json_records(&records, n_samples))
+            }
+            geojson::GeoJson::Feature(f) => {
+                Ok(profile_json_records(&[feature_to_map(&f)], n_samples))
+            }
+            geojson::GeoJson::Geometry(g) => {
+                let wkt = geojson_geometry_value_to_wkt(&g.value);
+                let value = JsonValue::from(wkt);
+                Ok(profile_json_path(
+                    "geometry".to_string(),
+                    1,
+                    vec![&value],
+                    n_samples,
+                ))
+            }
+        }
+    }
+
+    /// Cross-verification oracle for the hand-rolled GeoJSON reader
+    /// (`geojson_support` - see Cargo.toml) against the real `geojson`
+    /// crate, kept as a dev-only dependency for exactly this purpose.
+    #[cfg(feature = "geojson")]
+    #[test]
+    fn geojson_reader_matches_the_geojson_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.geojson",
+            "tests/fixtures/type_detection.geojson",
+            "tests/fixtures/edge_geojson_bare_geometry.geojson",
+            "tests/fixtures/edge_geojson_geometry_types.geojson",
+        ] {
+            let path = Path::new(f);
+            let mine = geojson_support::columns_from_geojson(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_geojson_via_geojson_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: geojson-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Test-only: producing the "expected" side of the vCard/iCalendar
+    /// oracle tests - reads via the real `ical` crate (kept as a
+    /// dev-only cross-verification oracle for both formats' shared
+    /// content-line grammar, see Cargo.toml) rather than this project's
+    /// own hand-rolled `vobject_support`/`vcard_support`/`ical_support`.
+    /// `ical::property::Property` already upper-cases the name and
+    /// leaves the value's own escaping untouched (confirmed directly
+    /// against its own source), so only the escape-unquoting and
+    /// repeated-property pooling this project's own reader does are
+    /// reproduced here.
+    #[cfg(all(test, feature = "vcard"))]
+    fn columns_from_vcard_via_ical_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = fs::File::open(path)?;
+        let reader = ical::VcardParser::new(std::io::BufReader::new(file));
+        let mut records: Vec<json_support::Map> = Vec::new();
+        for contact in reader {
+            let contact = contact.map_err(|e| anyhow!("{e}"))?;
+            let mut map = json_support::Map::new();
+            for prop in contact.properties {
+                if prop.name == "VERSION" {
+                    continue;
+                }
+                let value = prop.value.unwrap_or_default();
+                let value = JsonValue::from(vobject_support::unescape_value(&value));
+                vobject_support::insert_pooling(&mut map, prop.name, value);
+            }
+            records.push(map);
+        }
+        Ok(profile_json_records(&records, n_samples))
+    }
+
+    /// Cross-verification oracle for the hand-rolled vCard reader
+    /// (`vcard_support`) against the real `ical` crate, kept as a
+    /// dev-only dependency for exactly this purpose.
+    #[cfg(feature = "vcard")]
+    #[test]
+    fn vcard_reader_matches_the_ical_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.vcf",
+            "tests/fixtures/type_detection.vcf",
+            "tests/fixtures/edge_vcard_folding_and_escapes.vcf",
+        ] {
+            let path = Path::new(f);
+            let mine = vcard_support::columns_from_vcard(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_vcard_via_ical_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: ical-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Test-only: producing the "expected" side of the iCalendar oracle
+    /// test - reads via the real `ical` crate's own `IcalParser`, which
+    /// already does the real BEGIN/END component-nesting work
+    /// (`IcalCalendar.events`/`.todos`, with `VALARM`/other nested
+    /// components kept structurally separate rather than flattened in),
+    /// so this only needs to walk its two record-producing component
+    /// lists the same way `ical_support` does.
+    #[cfg(all(test, feature = "icalendar"))]
+    fn columns_from_ical_via_ical_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = fs::File::open(path)?;
+        let reader = ical::IcalParser::new(std::io::BufReader::new(file));
+        let props_to_map = |props: Vec<ical::property::Property>| -> json_support::Map {
+            let mut map = json_support::Map::new();
+            for prop in props {
+                let value = prop.value.unwrap_or_default();
+                let value = JsonValue::from(vobject_support::unescape_value(&value));
+                vobject_support::insert_pooling(&mut map, prop.name, value);
+            }
+            map
+        };
+        let mut records: Vec<json_support::Map> = Vec::new();
+        for calendar in reader {
+            let calendar = calendar.map_err(|e| anyhow!("{e}"))?;
+            for event in calendar.events {
+                records.push(props_to_map(event.properties));
+            }
+            for todo in calendar.todos {
+                records.push(props_to_map(todo.properties));
+            }
+        }
+        Ok(profile_json_records(&records, n_samples))
+    }
+
+    /// Cross-verification oracle for the hand-rolled iCalendar reader
+    /// (`ical_support`) against the real `ical` crate, kept as a
+    /// dev-only dependency for exactly this purpose.
+    #[cfg(feature = "icalendar")]
+    #[test]
+    fn ical_reader_matches_the_ical_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.ics",
+            "tests/fixtures/type_detection.ics",
+            "tests/fixtures/edge_icalendar_vtodo_and_folding.ics",
+        ] {
+            let path = Path::new(f);
+            let mine = ical_support::columns_from_ical(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_ical_via_ical_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: ical-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Direct coverage of `mbox_support`'s own plumbing. No independent
+    /// Rust oracle crate is trusted here for the full comparison: the
+    /// only real candidate on crates.io, `mbox-reader 0.2.0`, was
+    /// checked directly (not assumed reliable) and found to have two
+    /// real bugs of its own - it silently drops the very last message in
+    /// a file (its own boundary-scanning loop never flushes the final
+    /// pending entry once the scan reaches EOF) and it mis-trims a
+    /// plain LF-terminated envelope line by one byte (`&bytes[..pos -
+    /// 1]` assumes a CRLF terminator unconditionally, chopping the real
+    /// last character off an LF-only file's own envelope date) - both
+    /// confirmed by feeding it this project's own real 3-message
+    /// `sample.mbox` fixture and observing only 2 messages come back,
+    /// with the second one's own date string missing its final digit.
+    /// Trusting it as a full oracle would silently teach this project's
+    /// own (correct) reader to reproduce those same two bugs. Verified
+    /// directly against real fixture content instead - including,
+    /// specifically, that the reader captures every message (matching
+    /// this project's own "verify against real behavior, not a
+    /// convenient but unverified dependency" discipline throughout).
+    #[cfg(feature = "mbox")]
+    #[test]
+    fn mbox_reader_captures_every_message_including_the_last() {
+        let cols =
+            mbox_support::columns_from_mbox(Path::new("tests/fixtures/sample.mbox"), None, 100)
+                .expect("sample.mbox should read cleanly");
+        let sender = cols
+            .iter()
+            .find(|c| c.name == "envelope_sender")
+            .expect("envelope_sender column");
+        assert_eq!(sender.ideal_type, "Email");
+        assert_eq!(
+            sender.row_count, 3,
+            "all three messages, including the last, must be captured"
+        );
+        assert_eq!(
+            sender.sample_values,
+            vec!["alice@example.com", "bob@example.com", "carol@example.com"]
+        );
+
+        let subject = cols
+            .iter()
+            .find(|c| c.name == "Subject")
+            .expect("Subject column");
+        assert_eq!(
+            subject.sample_values,
+            vec!["Hello", "Re: Hello", "Third message"]
+        );
+
+        let date = cols.iter().find(|c| c.name == "Date").expect("Date column");
+        assert_eq!(date.ideal_type, "NaiveDate / DateTime");
     }
 
     /// Test-only: `regex` is a dev-dependency now (see Cargo.toml and
