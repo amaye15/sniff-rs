@@ -15,7 +15,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist"]
 sqlite = []
 msgpack = []
 toml = []
@@ -32,6 +32,13 @@ stata = []
 sas7bdat = []
 spss = []
 orc = []
+# Hand-rolled, no dep - see src/lib.rs's bson_support for the writeup and
+# CLAUDE.md's Dependency footprint section. The real `bson` crate is a
+# dev-only cross-verification oracle (see [dev-dependencies]).
+bson = []
+# Hand-rolled, no dep - both the XML plist and binary plist (bplist00)
+# variants live in src/lib.rs's plist_support.
+plist = []
 
 [dev-dependencies]
 # Unlike every other entry in this list, `serde`/`serde_json` used to be
@@ -243,6 +250,17 @@ orc-rust = { version = "0.8.0", default-features = false }
 # (SPSS) - so it needs its own explicitly-versioned, renamed handle for
 # the same reason `arrow57` does above.
 arrow58 = { package = "arrow", version = "58", default-features = false }
+# The official MongoDB Rust driver's own BSON crate - never a runtime
+# dependency of this project's `bson` feature (see `bson_support` in
+# src/lib.rs), kept only as a genuinely independent cross-verification
+# oracle in `bson_reader_matches_the_bson_crate_output_exactly`
+# (`#[cfg(all(test, feature = "bson"))]`).
+bson = "2"
+# Apple's own plist format has no single obvious reference crate the way
+# most other hand-rolled formats in this project do - `plist` is the
+# most widely used pure-Rust reader/writer, kept as a dev-only oracle for
+# both the XML and binary (bplist00) variants `plist_support` hand-rolls.
+plist = "1"
 
 # harness = false on every target below: Criterion supplies its own `main`,
 # replacing the default libtest harness (which doesn't understand

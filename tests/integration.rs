@@ -897,6 +897,112 @@ fn cbor_reads_concatenated_records_and_preserves_string_types() {
     assert!((age["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01);
 }
 
+#[cfg(feature = "bson")]
+#[test]
+fn bson_reads_concatenated_documents_and_resolves_semantic_types() {
+    let doc = run_json("sample.bson", &[]);
+    let cols = table(&doc, "sample");
+
+    let email = column(cols, "email");
+    assert_eq!(email["ideal_type"], "Email");
+
+    let created = column(cols, "created");
+    assert_eq!(created["ideal_type"], "NaiveDate / DateTime");
+
+    // Decimal128 is bridged to a plain numeric string, not left as
+    // unusable Debug output the way apache-avro's own equivalent
+    // logical type was before this project's Avro reader fixed the
+    // identical class of bug - see decimal128_to_string_matches_pymongo_
+    // across_edge_cases for the dedicated bit-level coverage.
+    let amount = column(cols, "amount");
+    assert_eq!(amount["ideal_type"], "f64");
+    assert_eq!(
+        amount["sample_values"],
+        serde_json::json!(["123.45", "-0.001"])
+    );
+
+    // A nested BSON document flattens into dot-notation sub-columns just
+    // like a nested JSON object does - the same bridge-to-JsonValue
+    // architecture every other nested format in this project shares.
+    assert!(
+        cols.iter().any(|c| c["name"] == "meta.x"),
+        "a nested BSON document should flatten into meta.* sub-columns"
+    );
+}
+
+#[cfg(feature = "bson")]
+#[test]
+fn bson_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.bson", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "plist")]
+#[test]
+fn plist_xml_single_dict_profiles_as_one_record() {
+    // A plist's own most common single-document shape - the whole file
+    // is one top-level <dict> - profiles as a single record, the same
+    // "whole document = one row" choice TOML's own single-document
+    // shape already makes.
+    let doc = run_json("sample.plist", &[]);
+    let cols = table(&doc, "sample");
+
+    let email = column(cols, "email");
+    assert_eq!(email["ideal_type"], "Email");
+    assert_eq!(email["row_count"].as_u64().unwrap(), 1);
+
+    assert!(
+        cols.iter().any(|c| c["name"] == "meta.x"),
+        "a nested plist dict should flatten into meta.* sub-columns"
+    );
+    assert!(
+        cols.iter().any(|c| c["name"] == "tags"),
+        "a plist array should become a Vec<T> column"
+    );
+}
+
+#[cfg(feature = "plist")]
+#[test]
+fn plist_recognizes_uuid_email_ipv4_and_date_columns() {
+    // A top-level <array> of <dict>s is the array-of-records shape,
+    // mirroring the "top-level sequence = array of records" choice
+    // YAML's own dual-mode reader already makes.
+    let doc = run_json("type_detection.plist", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[cfg(feature = "plist")]
+#[test]
+fn plist_binary_variant_reads_the_same_shape_as_xml() {
+    // The exact same array-of-dicts content as type_detection.plist,
+    // encoded as a binary bplist00 file instead of XML - proving the
+    // binary-plist parser (object table + offset table + trailer) reads
+    // identically to its XML sibling, not just that it doesn't crash.
+    let doc = run_json("edge_plist_binary_type_detection.plist", &[]);
+    let cols = table(&doc, "edge_plist_binary_type_detection");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
 #[cfg(feature = "xml")]
 #[test]
 fn xml_treats_homogeneous_children_as_records_and_attributes_as_at_columns() {
@@ -3691,6 +3797,18 @@ fn malformed_cbor_fails_cleanly() {
 #[test]
 fn malformed_xml_fails_cleanly() {
     assert_fails_without_panicking("malformed_garbage.xml");
+}
+
+#[cfg(feature = "bson")]
+#[test]
+fn malformed_bson_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.bson");
+}
+
+#[cfg(feature = "plist")]
+#[test]
+fn malformed_plist_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.plist");
 }
 
 #[cfg(feature = "npy")]

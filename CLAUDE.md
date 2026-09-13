@@ -5,9 +5,10 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, and ORC — any of
-them gzip- or zstd-compressed too — and writes Markdown, this tool's own
-rich JSON, or json-schema.org-standard JSON.
+logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON, and
+Property List (plist) — any of them gzip- or zstd-compressed too — and
+writes Markdown, this tool's own rich JSON, or json-schema.org-standard
+JSON.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -63,6 +64,8 @@ every format. See "Testing" below.
 | SAS7BDAT | `.sas7bdat` | `--features sas7bdat` | `current_type` from the file's own declared type; SAS stores nearly all numerics as doubles, so `ideal_type` often narrows further |
 | SPSS | `.sav`, `.zsav` | `--features spss` | a native SPSS date/time/datetime variable is stored as a plain numeric offset, so `current_type` stays `f64` while `ideal_type` narrows to a real date once it's rendered; `.zsav` (zlib-compressed) is a disclosed, not-yet-supported error - see below |
 | ORC | `.orc` | `--features orc` | one section per top-level column; a nested Struct/List/Map/Union column is a disclosed placeholder (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
+| BSON | `.bson` | `--features bson` | stream of concatenated top-level documents (MongoDB's own on-disk/dump convention); always object-at-top-level, so there's no scalar/array top-level fallback the way MessagePack/CBOR need |
+| Property List (plist) | `.plist` | `--features plist` | both the XML and binary (`bplist00`) variants; a top-level `<dict>`/binary-plist root dict = one row, a top-level `<array>`/binary-plist root array = array-of-records, same dual-mode convention as YAML/TOML |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -757,6 +760,67 @@ flattener**, rather than reimplementing recursion per format:
   `ciborium` crate): a stream of concatenated self-delimiting top-level
   values, or a single top-level array's elements. Same convention, same
   ~15 lines beyond the value-conversion helper.
+- BSON is the one nested format with no top-level-scalar/top-level-array
+  fallback to consider at all - every BSON value at the wire level is
+  either a scalar *inside* a document or a full document, never a bare
+  top-level scalar the way a JSON/MessagePack/CBOR file's own reader has
+  to account for - so `bson_support::columns_from_bson` is the simplest
+  of this family: read one concatenated top-level document at a time
+  (`read_one_document`, mirroring MessagePack/CBOR's own one-value-at-
+  a-time stream read) straight into `json_support::Value` via
+  `decode_document`/`decode_element_value` in a single pass (no
+  intermediate BSON-specific value type, the same one-pass-bridge
+  precedent Avro's own decimal/logical-type resolution already
+  established, since the tag byte already tells the decoder everything
+  it needs as it reads). ObjectId and Binary both render as their raw
+  bytes' lowercase hex encoding (the same "disclose the real bytes
+  rather than guess at structure" fallback this project's NumPy reader
+  already uses for an unrepresentable field); UTC datetime reuses the
+  same `EpochDateTime` machinery Avro/Parquet's own millisecond
+  timestamps already render through; Decimal128 is hand-decoded per
+  IEEE 754-2008's binary integer decimal (BID) encoding rather than
+  pulled in as a bignum dependency, the same "just enough arithmetic,
+  not a general-purpose library" scope Avro's own decimal-to-string
+  conversion already keeps (see the Dependency footprint section's own
+  writeup of the real bit-layout bug this decoder shipped with and the
+  fix that followed, found and corrected via genuine `pymongo` byte-
+  level verification rather than research alone); a Timestamp (the
+  internal replication/sharding type, not a UTC datetime) is genuinely
+  compound, so it renders as a small `{"t", "i"}` object instead of
+  being forced into one scalar, the same choice Arrow IPC's own
+  Interval type already makes for a comparably compound value.
+- Property List (plist) is the other exception to "bridge via a ready-
+  made dynamic Value type," for the identical structural reason XML
+  is: Apple's own format has two genuinely different on-disk
+  encodings - an XML variant (a fixed, small element vocabulary:
+  `plist`/`dict`/`key`/`array`/`string`/`integer`/`real`/`true`/
+  `false`/`date`/`data`) and a binary variant (`bplist00` magic, an
+  object table plus an offset table plus a 32-byte trailer, every
+  object marker-byte-tagged) - so `plist_support` hand-rolls both
+  parsers independently rather than reusing the `xml` feature's own
+  general-purpose XML reader (which would create a cross-feature
+  dependency this project avoids elsewhere too, e.g. the OOXML/ODF
+  parser inside `xlsx_support` staying separate from the general-
+  purpose `xml_support`). Both variants bridge straight to
+  `json_support::Value`; `profile_root_value` then picks the record
+  shape the exact same way YAML's own dual-mode reader already does -
+  a top-level dict is one record, a top-level array is an array of
+  records, anything else falls back to the same "no field names, but
+  still a genuine single column" `value`-column convention every other
+  format in this list already uses for its own top-level-scalar case.
+  A binary plist's own date type (an `f64` offset from Apple's
+  reference epoch, 2001-01-01 - 978,307,200 seconds after the Unix
+  epoch) reuses the same `EpochDateTime` machinery BSON's own UTC
+  datetime already renders through, once that one fixed-offset
+  subtraction is applied - the same "reuse already-verified civil-
+  calendar arithmetic rather than re-derive it a second time" choice
+  this project's dBase/Stata readers already made for their own
+  Julian-day-based dates. An XML plist's `<data>` element is base64-
+  decoded (RFC 4648 §4 - a real, independent hand-roll from the
+  already-existing `base64url_decode`, since JWT's own alphabet is a
+  genuinely different table) and then hex-encoded for display, the
+  same "disclose the real bytes" treatment BSON's own Binary/ObjectId
+  fields already get.
 - XML is the one exception to "bridge via a ready-made dynamic Value type" -
   an XML element can carry attributes, text, and child elements all at
   once, which doesn't map onto a single generic enum the way
@@ -10061,6 +10125,72 @@ this project could just implement directly rather than depend on:
   full -e normal` (empty of both) versus `-e normal,dev` (both present),
   the same structural verification every other crate in this document's
   history got before being trusted as truly moved.
+
+- **BSON and Property List (plist), the two newest formats added to this
+  project - both hand-rolled from the start**, the same "never a runtime
+  dependency to begin with" shape as `ambers`(SPSS)/`orc-rust`(ORC)
+  rather than a crate this project ever depended on and later replaced.
+  `bson = "2"` (the official MongoDB Rust driver's own BSON crate) and
+  `plist = "1"` (the most widely used pure-Rust plist reader/writer) are
+  both `[dev-dependencies]` only, kept purely as cross-verification
+  oracles (`bson_reader_matches_the_bson_crate_output_exactly`,
+  `plist_reader_matches_the_plist_crate_output_exactly`) - confirmed via
+  the same `cargo tree --features bson,plist -e normal` (empty of both)
+  versus `-e normal,dev` (both present) check every other dev-only-oracle
+  crate in this document already gets.
+
+  BSON's own binary integer decimal (Decimal128) encoding produced this
+  reader's one real, genuinely subtle bug, found the same way this
+  project's own design philosophy insists on for every hand-rolled
+  binary decoder: checked against real encoded values, not trusted from
+  research alone. A first attempt derived the bit layout from reading
+  (not copying - the tool used to research this refuses verbatim
+  reproduction of copyrighted reference source) `libbson`'s own
+  `bson_decimal128_to_string`, and every offset it produced was silently
+  wrong by exactly 32 bits (`>> 26` instead of `>> 58` for the
+  combination field, e.g.) - a real `"123.45"` decoded as
+  `"1.2345E-6172"`, caught immediately by smoke-testing a real
+  `pymongo`-generated file rather than trusting the research. Every
+  offset was re-derived by hand-decoding `pymongo`'s own independently-
+  encoded bytes for a battery of real values until the arithmetic
+  matched exactly - see `decimal128_to_string`'s own doc comment for the
+  full corrected offset list. The same investigation also disproved a
+  second research-derived claim along the way ("zero always renders as
+  a bare `0`" - contradicted directly by `pymongo`'s own
+  `str(Decimal128("0.00"))` returning `"0.00"`, not `"0"`), fixed by
+  letting zero flow through the exact same scientific/plain-notation
+  formatting every other value uses rather than special-casing it.
+
+  A third, smaller bug was found later, while writing this function's
+  own dedicated edge-case tests rather than assumed correct from the
+  first two fixes: the combination field's "leading digit 8 or 9"
+  alternate encoding (values 24..=29) was being decoded as a real,
+  bit-accurate significand - but direct calculation shows that range's
+  *smallest* possible value (4 × 2^111) already exceeds decimal128's own
+  maximum valid 34-digit coefficient (10^34 - 1), meaning no legitimate
+  encoder can ever actually emit this combination range for an in-bounds
+  value - it's reachable only via corrupted or deliberately adversarial
+  bytes. Confirmed empirically before fixing it, not just derived:
+  feeding a wide, random sample of raw bytes with the combination field
+  forced into this exact range to `pymongo`'s own `Decimal128.from_bid`
+  showed it always renders the significand as a bare `0` (sign and
+  exponent still decode correctly) - never a real 8/9-leading-digit
+  value - so this reader now reproduces that same observed degradation
+  instead of computing a technically-bit-accurate but always-too-large,
+  never-real number. All three findings are locked in permanently via
+  `decimal128_to_string_matches_pymongo_across_edge_cases`, a direct
+  unit test covering zero, negative zero, a typical fraction, both
+  finite-magnitude extremes, a 34-digit maximum-precision significand,
+  both infinities, NaN, and two raw-byte constructions of the
+  always-out-of-range combination-field range (one positive, one
+  negative-signed) - every expected string independently verified
+  against `pymongo` before being hardcoded.
+
+  Property List's own hand-roll needed no equivalent correctness fix -
+  both variants matched the `plist` crate's own output on the first
+  attempt across every fixture, including the binary variant's date
+  encoding (Apple's reference epoch, 978,307,200 seconds after the Unix
+  epoch) and both formats' array-vs-dict record-shape dual mode.
 
 ## Known limitations / roadmap
 

@@ -42366,6 +42366,1281 @@ fn columns_from_cbor(
     )
 }
 
+// --- BSON reader (opt-in via --features bson, hand-rolled) ---
+// MongoDB's own binary JSON encoding: a stream of concatenated top-level
+// documents on disk (the same "many self-delimiting records back to back"
+// convention MessagePack/CBOR already use for their own data-file shape),
+// bridged straight into `json_support::Value` in one pass - the same
+// direct-bridge shape Avro's own reader uses, since nothing here needs a
+// two-step schema-plus-value resolution the way Avro's logical types do.
+// Unlike JSON/MessagePack/CBOR, a BSON document is *always* an object at
+// the top level (the wire format has no bare-scalar or top-level-array
+// shape at all), so this reader needs none of those three readers' own
+// "is this really a top-level array of records" fallback - every
+// document decodes straight into `profile_json_records`'s own shape.
+#[cfg(feature = "bson")]
+mod bson_support {
+    use super::*;
+    use std::io::Read;
+
+    /// Same recursion-safety reasoning as `msgpack_support`/`cbor_support`:
+    /// a BSON-decoded `Value` tree bypasses `serde_json`'s own parse-time
+    /// recursion guard entirely (there's no JSON text involved at all), so
+    /// this reader's own recursive `decode_document`/`decode_array` need
+    /// their own depth cap. Matches the identical 256 both siblings
+    /// already settled on for the same underlying risk (a debug build's
+    /// larger, uninlined stack frames overflowing well under a naive
+    /// four-figure limit).
+    const MAX_DEPTH: u32 = 256;
+
+    /// A pre-allocation cap for one binary/string field's buffer - BSON's
+    /// own length fields are a plain `i32`, so a handful of bytes could
+    /// otherwise claim close to 2 GiB and force a huge upfront allocation
+    /// before a single real byte backs it up. MongoDB's own documented
+    /// document-size limit is 16 MiB; this is deliberately well past that
+    /// (generous headroom for a legitimate large field, the same
+    /// "generous, not tight" cap this project already uses elsewhere,
+    /// e.g. Stata's `MAX_ROW_LEN`) while still rejecting a wildly
+    /// implausible claimed length outright.
+    const PREALLOC_MAX: usize = 64 * 1024 * 1024;
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// A null-terminated UTF-8 string (BSON's own `cstring` production) -
+    /// used for element names and a few legacy field types. BSON cstrings
+    /// are documented to never contain an embedded NUL, so scanning for
+    /// the first `0x00` byte is always the real terminator, never part of
+    /// the content itself.
+    fn read_cstring(data: &[u8], pos: &mut usize) -> Result<String> {
+        let start = *pos;
+        let end = data[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|i| start + i)
+            .context("unterminated BSON cstring")?;
+        let s = std::str::from_utf8(&data[start..end])
+            .context("BSON cstring is not valid UTF-8")?
+            .to_string();
+        *pos = end + 1;
+        Ok(s)
+    }
+
+    fn read_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
+        let b = data.get(*pos..*pos + 4).context("truncated BSON int32")?;
+        *pos += 4;
+        Ok(i32::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    fn read_i64(data: &[u8], pos: &mut usize) -> Result<i64> {
+        let b = data.get(*pos..*pos + 8).context("truncated BSON int64")?;
+        *pos += 8;
+        Ok(i64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    fn read_f64(data: &[u8], pos: &mut usize) -> Result<f64> {
+        let b = data.get(*pos..*pos + 8).context("truncated BSON double")?;
+        *pos += 8;
+        Ok(f64::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
+        let b = data.get(*pos..*pos + n).context("truncated BSON data")?;
+        *pos += n;
+        Ok(b)
+    }
+
+    /// A length-prefixed BSON `string`: a 4-byte byte-count (*including*
+    /// the trailing NUL) followed by that many UTF-8 bytes, the last of
+    /// which must be the NUL. Used for the `string` element type, and for
+    /// the (deprecated) JavaScript-code and symbol types, which share the
+    /// identical on-disk shape.
+    fn read_string(data: &[u8], pos: &mut usize) -> Result<String> {
+        let len = read_i32(data, pos)?;
+        if len < 1 || (len as usize) > PREALLOC_MAX {
+            bail!("invalid BSON string length {len}");
+        }
+        let len = len as usize;
+        let bytes = read_bytes(data, pos, len)?;
+        if bytes.last() != Some(&0) {
+            bail!("BSON string is not NUL-terminated");
+        }
+        Ok(std::str::from_utf8(&bytes[..len - 1])
+            .context("BSON string is not valid UTF-8")?
+            .to_string())
+    }
+
+    /// A BSON Decimal128 value's 16 bytes, split into the low and high
+    /// 64-bit words (`high` holds bits 64-127 - the sign/combination/
+    /// exponent end; `low` holds bits 0-63) per IEEE 754-2008's binary
+    /// integer decimal (BID) encoding, the variant the BSON spec's own
+    /// text says to use (not the alternative densely-packed-decimal
+    /// encoding) - byte order is little-endian, like every other BSON
+    /// type.
+    ///
+    /// The overall shape (a 5-bit combination field selecting between the
+    /// normal case, the "leading significand digit 8/9" alternate case,
+    /// and the two special values; a 14-bit biased exponent; a 113-bit
+    /// significand assembled from four 32-bit words) came from reading
+    /// the `libbson` reference implementation's own `bson_decimal128_to_
+    /// string`. The *exact* bit offsets did not survive that reading
+    /// intact, though, and this is worth recording rather than quietly
+    /// fixed: a first attempt used the offsets as read (combination at
+    /// `(high >> 26) & 0x1f`, e.g.) and produced a plausible-*looking*
+    /// but silently wrong result (a real `123.45` decoded as
+    /// `1.2345E-6172`) - caught immediately, not eventually, because this
+    /// project's own discipline is to check a hand-rolled binary decoder
+    /// against real encoded values before trusting it, not after
+    /// shipping it. Every offset below was instead derived by hand-
+    /// decoding `pymongo`'s own independently-encoded bytes for a battery
+    /// of real values (zero, negative zero with a real difference in
+    /// output, positive and negative exponents, a 34-digit maximum
+    /// significand, the leading-8/9 alternate encoding, NaN, and both
+    /// Infinity signs) bit by bit until the arithmetic matched - every
+    /// field here sits exactly 32 bits higher in `high` than a literal
+    /// reading of the reference source would suggest (`>> 58` for the
+    /// combination field, not `>> 26`; `>> 49`/`>> 47` for the two
+    /// exponent cases, not `>> 17`/`>> 15`; `>> 46` for the significand's
+    /// own top bits, not `>> 14`), which is consistent with the
+    /// reference's own arithmetic operating on a 32-bit half-word this
+    /// port's 64-bit `high` doesn't have a matching split for. The zero-
+    /// rendering rule was wrong too on a first pass for the identical
+    /// reason (a plausible-sounding claim - "zero always prints bare
+    /// `0`" - that `pymongo` itself disproves: `Decimal128("0.00")`
+    /// stringifies as `"0.00"`, not `"0"`) - fixed by *not* special-
+    /// casing zero at all and simply running it through the exact same
+    /// scientific/plain-notation logic every other value uses, with a
+    /// single digit "0" standing in for its (empty) significant-digit
+    /// sequence.
+    ///
+    /// A third bug, found later while writing this function's own
+    /// dedicated edge-case tests rather than assumed away: combination
+    /// values 24..=29 (the "leading digit 8 or 9" alternate encoding)
+    /// were originally decoded as a real, bit-accurate significand, but
+    /// direct calculation shows that range's *smallest* possible value
+    /// (4 * 2^111) already exceeds decimal128's own maximum valid
+    /// 34-digit coefficient (10^34 - 1), so no legitimate encoder can
+    /// ever actually emit this combination range for an in-bounds value;
+    /// it's reachable only via corrupted or deliberately adversarial
+    /// bytes. Confirmed empirically, not just derived: feeding a wide,
+    /// random sample of raw bytes with the combination field forced into
+    /// this exact range to MongoDB's own `pymongo` driver
+    /// (`Decimal128.from_bid`) showed it always renders the significand
+    /// as a bare `0` here (sign and exponent still decode normally),
+    /// never a real 8/9-leading-digit value, so `force_zero_significand`
+    /// now reproduces that same observed degradation instead of
+    /// computing a technically-bit-accurate but always-too-large,
+    /// never-real number.
+    ///
+    /// Deliberately out of scope: a NaN's own diagnostic payload bits
+    /// (rendered as bare `"NaN"` regardless) - genuinely never populated
+    /// by any real encoder this project could find to check against.
+    pub(crate) fn decimal128_to_string(bytes: &[u8]) -> Result<String> {
+        let low = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let high = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+
+        let negative = (high >> 63) & 1 == 1;
+        let combination = (high >> 58) & 0x1f;
+
+        let (biased_exponent, significand_msb, force_zero_significand): (i64, u64, bool) =
+            if (combination >> 3) == 3 {
+                if combination == 0x1e {
+                    return Ok(if negative {
+                        "-Infinity".to_string()
+                    } else {
+                        "Infinity".to_string()
+                    });
+                }
+                if combination == 0x1f {
+                    return Ok("NaN".to_string());
+                }
+                // combination 24..=29: IEEE754-2008's own bit layout for
+                // this range is well-defined (an implicit leading
+                // significand of 0b100 plus one more explicit bit, then
+                // the same 110-bit trailing field) - but its *smallest*
+                // representable value, 4 * 2^111, already exceeds
+                // decimal128's own maximum valid 34-digit coefficient
+                // (10^34 - 1 = 9.99...e33, well under 2^113 <= anything
+                // this range can produce - checked by direct
+                // calculation, not assumed). No legitimate encoder can
+                // ever emit this combination range for a real, in-range
+                // value, which is exactly what this project's first
+                // attempt at this function got wrong: it decoded a
+                // technically bit-accurate, but always too-large and
+                // never-real, significand out of these bits instead of
+                // recognizing the range as inherently out of bounds.
+                // Verified empirically, not just derived, before fixing
+                // it: feeding a wide, random sample of raw bytes with
+                // the combination field forced into this exact range to
+                // MongoDB's own `pymongo` driver (`Decimal128.from_bid`)
+                // showed it *always* renders the significand as a bare
+                // "0" here - sign and exponent still decode normally,
+                // but never a real 8/9-leading digit value - confirming
+                // this is how a genuine reference decoder degrades this
+                // out-of-range case, not an arbitrary choice.
+                (((high >> 47) & 0x3fff) as i64, 0, true)
+            } else {
+                (((high >> 49) & 0x3fff) as i64, (high >> 46) & 0x7, false)
+            };
+        let exponent = biased_exponent - 6176;
+
+        // Reassemble the 128-bit significand as four 32-bit words, most
+        // significant first: `parts[0]` holds its own top 18 bits (14
+        // bits from `high` just below the exponent field, plus
+        // `significand_msb`'s own contribution shifted above them),
+        // `parts[1]` the rest of `high`, `parts[2]`/`parts[3]` all of
+        // `low`. `force_zero_significand` (the always-out-of-range
+        // combination 24..=29 case above) skips reading any of these
+        // bits at all, matching the reference decoder's own observed
+        // "render 0" behavior rather than assembling a number that can
+        // never be a real value in the first place.
+        let mut parts: [u32; 4] = if force_zero_significand {
+            [0, 0, 0, 0]
+        } else {
+            [
+                (((high >> 32) & 0x3fff) as u32) + (((significand_msb & 0xf) as u32) << 14),
+                high as u32,
+                (low >> 32) as u32,
+                low as u32,
+            ]
+        };
+
+        // Convert the 128-bit integer to decimal by repeated division by
+        // 10^9 (four 32-bit words need at most 4 such divisions to fully
+        // drain - decimal128's own 34-digit format maximum comfortably
+        // fits in 36 = 4*9 digits of headroom), most-significant chunk
+        // last - each chunk is zero-padded into its own 9-digit window of
+        // an all-zero buffer, skipping the digit-fill step entirely for a
+        // chunk that comes out zero (the buffer's already zero there).
+        let mut digits = [0u8; 36];
+        for chunk in 0..4 {
+            let mut remainder: u64 = 0;
+            for part in parts.iter_mut() {
+                let dividend = (remainder << 32) | u64::from(*part);
+                *part = (dividend / 1_000_000_000) as u32;
+                remainder = dividend % 1_000_000_000;
+            }
+            if remainder == 0 {
+                continue;
+            }
+            let window = &mut digits[(3 - chunk) * 9..(3 - chunk) * 9 + 9];
+            for slot in window.iter_mut().rev() {
+                *slot = (remainder % 10) as u8;
+                remainder /= 10;
+            }
+        }
+
+        // A zero significand isn't special-cased - it flows through the
+        // exact same scientific/plain-notation logic below as any other
+        // value, with a single "0" digit standing in for what would
+        // otherwise be its (empty) significant-digit sequence. This is
+        // what makes `Decimal128("0.00")` correctly render as `"0.00"`
+        // rather than losing its own declared precision.
+        let first_nonzero = digits.iter().position(|&d| d != 0).unwrap_or(35);
+        let sig_digits = &digits[first_nonzero..];
+        let num_digits = sig_digits.len() as i64;
+        let digit_str: String = sig_digits.iter().map(|&d| (b'0' + d) as char).collect();
+
+        let mut out = String::new();
+        if negative {
+            out.push('-');
+        }
+        let scientific_exponent = num_digits - 1 + exponent;
+        if scientific_exponent < -6 || exponent > 0 {
+            out.push(digit_str.as_bytes()[0] as char);
+            if digit_str.len() > 1 {
+                out.push('.');
+                out.push_str(&digit_str[1..]);
+            }
+            out.push('E');
+            if scientific_exponent >= 0 {
+                out.push('+');
+            }
+            out.push_str(&scientific_exponent.to_string());
+        } else if exponent >= 0 {
+            // Only reachable with exponent == 0 here (exponent > 0 always
+            // takes the scientific branch above) - the plain digit string
+            // with no trailing zeros to add and no decimal point needed.
+            out.push_str(&digit_str);
+        } else {
+            let radix_position = num_digits + exponent;
+            if radix_position > 0 {
+                let split = radix_position as usize;
+                out.push_str(&digit_str[..split]);
+                out.push('.');
+                out.push_str(&digit_str[split..]);
+            } else {
+                out.push_str("0.");
+                for _ in 0..(-radix_position) {
+                    out.push('0');
+                }
+                out.push_str(&digit_str);
+            }
+        }
+        Ok(out)
+    }
+
+    /// One BSON document's worth of `(key, value)` pairs - the `i32`
+    /// total-length prefix, then a run of `<type byte><cstring name>
+    /// <value>` elements, terminated by a bare `0x00` byte - plus how many
+    /// bytes of `data` that document actually occupied (its own declared
+    /// length), so a caller decoding an embedded document/array element
+    /// (where `data` is "the rest of the enclosing document from here
+    /// on", not sliced down to an exact end) knows exactly how far to
+    /// advance past it without re-parsing the length prefix a second
+    /// time. `decode_document`'s own declared-length check is a real,
+    /// corruption-catching cross-check against where the terminator
+    /// actually landed, not just bookkeeping.
+    fn decode_document(data: &[u8], depth: u32) -> Result<(json_support::Map, usize)> {
+        if depth > MAX_DEPTH {
+            bail!("BSON document nested past {MAX_DEPTH} levels");
+        }
+        let mut pos = 0usize;
+        let declared_len = read_i32(data, &mut pos)?;
+        if declared_len < 5 || (declared_len as usize) > data.len() {
+            bail!("invalid or truncated BSON document (declared length {declared_len})");
+        }
+        let doc_end = declared_len as usize;
+        let mut map = json_support::Map::with_capacity(8);
+        loop {
+            if pos >= doc_end {
+                bail!("unterminated BSON document (missing 0x00 terminator)");
+            }
+            let tag = data[pos];
+            pos += 1;
+            if tag == 0x00 {
+                break;
+            }
+            let key = read_cstring(data, &mut pos)?;
+            let value = decode_element_value(tag, data, &mut pos, depth)?;
+            map.insert(key, value);
+        }
+        if pos != doc_end {
+            bail!("BSON document body did not match its own declared length");
+        }
+        Ok((map, doc_end))
+    }
+
+    /// A BSON `array` is wire-identical to a `document` whose keys are the
+    /// ascending string indices "0", "1", "2", ... - decode it exactly
+    /// that way and keep only the values, in the order they were written.
+    /// A real BSON writer always emits ascending indices, so this doesn't
+    /// re-validate the key text itself against its position - the same
+    /// "trust the structure, not an incidental key spelling" latitude
+    /// this project's own INI reader already takes for a comparably minor
+    /// convention.
+    fn decode_array(data: &[u8], depth: u32) -> Result<(Vec<JsonValue>, usize)> {
+        let (map, len) = decode_document(data, depth)?;
+        Ok((map.into_iter().map(|(_, v)| v).collect(), len))
+    }
+
+    /// Decodes one element's value given its type tag, advancing `pos`
+    /// past exactly that value's own bytes. `data` is the *enclosing*
+    /// document's full byte range (not sliced down per-element), since an
+    /// embedded document/array's own length prefix is what bounds it, not
+    /// anything the caller needs to compute up front.
+    fn decode_element_value(
+        tag: u8,
+        data: &[u8],
+        pos: &mut usize,
+        depth: u32,
+    ) -> Result<JsonValue> {
+        match tag {
+            0x01 => Ok(JsonValue::from(read_f64(data, pos)?)),
+            0x02 => Ok(JsonValue::from(read_string(data, pos)?)),
+            0x03 => {
+                let (doc, len) = decode_document(&data[*pos..], depth + 1)?;
+                *pos += len;
+                Ok(JsonValue::from(doc))
+            }
+            0x04 => {
+                let (arr, len) = decode_array(&data[*pos..], depth + 1)?;
+                *pos += len;
+                Ok(JsonValue::from(arr))
+            }
+            0x05 => {
+                let len = read_i32(data, pos)?;
+                if len < 0 || (len as usize) > PREALLOC_MAX {
+                    bail!("invalid BSON binary length {len}");
+                }
+                let len = len as usize;
+                let _subtype = *data.get(*pos).context("truncated BSON binary subtype")?;
+                *pos += 1;
+                let bytes = read_bytes(data, pos, len)?;
+                // The raw payload's own meaning depends entirely on its
+                // subtype (UUID, MD5, a driver-specific blob, ...) that
+                // this reader doesn't interpret - a hex dump discloses
+                // the real bytes without guessing at a structure, the
+                // same fallback this project's NumPy reader already uses
+                // for a field it can't render as a simple value.
+                Ok(JsonValue::from(hex_encode(bytes)))
+            }
+            0x06 => Ok(JsonValue::Null), // undefined (deprecated)
+            0x07 => {
+                // ObjectId: 12 raw bytes, rendered as the canonical
+                // 24-lowercase-hex-character form every MongoDB driver
+                // already uses to display one.
+                let bytes = read_bytes(data, pos, 12)?;
+                Ok(JsonValue::from(hex_encode(bytes)))
+            }
+            0x08 => {
+                let b = *data.get(*pos).context("truncated BSON boolean")?;
+                *pos += 1;
+                Ok(JsonValue::from(b != 0))
+            }
+            0x09 => {
+                let ms = read_i64(data, pos)?;
+                Ok(EpochDateTime::from_unix_millis(ms)
+                    .map_or(JsonValue::Null, |dt| JsonValue::from(dt.format_t_frac(3))))
+            }
+            0x0A => Ok(JsonValue::Null),
+            0x0B => {
+                // Regex: two cstrings (pattern, then options) - rendered
+                // as the conventional `/pattern/options` slash notation.
+                let pattern = read_cstring(data, pos)?;
+                let options = read_cstring(data, pos)?;
+                Ok(JsonValue::from(format!("/{pattern}/{options}")))
+            }
+            0x0C => {
+                // DBPointer (deprecated): a string namespace followed by
+                // a 12-byte ObjectId.
+                let ns = read_string(data, pos)?;
+                let oid = read_bytes(data, pos, 12)?;
+                Ok(JsonValue::from(format!("{ns}:{}", hex_encode(oid))))
+            }
+            0x0D | 0x0E => Ok(JsonValue::from(read_string(data, pos)?)), // JS code / symbol (both deprecated)
+            0x0F => {
+                // JS code with scope (deprecated): i32 total length, then
+                // a string (the code) and a document (its scope) - only
+                // the code itself is kept, the same "cached value only,
+                // not the full structure" scope this project's Avro
+                // reader already gives its own rarer logical types.
+                let _total_len = read_i32(data, pos)?;
+                let code = read_string(data, pos)?;
+                let (_scope, scope_len) = decode_document(&data[*pos..], depth + 1)?;
+                *pos += scope_len;
+                Ok(JsonValue::from(code))
+            }
+            0x10 => Ok(JsonValue::from(i64::from(read_i32(data, pos)?))),
+            0x11 => {
+                // Timestamp: an internal replication/sharding type - a
+                // 4-byte increment then a 4-byte seconds-since-epoch,
+                // both little-endian unsigned - genuinely compound, so
+                // rendered as a small object naming its own two real
+                // fields rather than forced into one scalar (the same
+                // choice this project's Arrow IPC reader already makes
+                // for its own Interval type).
+                let inc = u32::from_le_bytes(read_bytes(data, pos, 4)?.try_into().unwrap());
+                let secs = u32::from_le_bytes(read_bytes(data, pos, 4)?.try_into().unwrap());
+                let mut m = json_support::Map::with_capacity(2);
+                m.insert("t".to_string(), JsonValue::from(i64::from(secs)));
+                m.insert("i".to_string(), JsonValue::from(i64::from(inc)));
+                Ok(JsonValue::from(m))
+            }
+            0x12 => Ok(JsonValue::from(read_i64(data, pos)?)),
+            0x13 => {
+                let bytes = read_bytes(data, pos, 16)?;
+                Ok(JsonValue::from(decimal128_to_string(bytes)?))
+            }
+            0xFF => Ok(JsonValue::from("MinKey")),
+            0x7F => Ok(JsonValue::from("MaxKey")),
+            other => bail!("unrecognized BSON element type 0x{other:02x}"),
+        }
+    }
+
+    /// Reads one complete top-level document's raw bytes off `reader`
+    /// (its own `i32` length prefix tells this function exactly how many
+    /// more bytes to read), or `None` at a clean end-of-file between
+    /// documents. Streams off a plain `Read` the same way `msgpack_
+    /// support`/`cbor_support` do - a whole document has to be resident
+    /// to be decoded (BSON's own element layout isn't forward-streamable
+    /// below the document level), but never more than one document at a
+    /// time, and a `--nrows`-past-the-limit truncated/corrupt trailing
+    /// document still surfaces as a real error, matching every other
+    /// concatenated-records reader in this project.
+    fn read_one_document<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+        let mut len_bytes = [0u8; 4];
+        let mut filled = 0usize;
+        while filled < 4 {
+            let n = reader
+                .read(&mut len_bytes[filled..])
+                .context("I/O error while reading BSON")?;
+            if n == 0 {
+                if filled == 0 {
+                    return Ok(None); // clean EOF between documents
+                }
+                bail!("truncated BSON document length prefix");
+            }
+            filled += n;
+        }
+        let declared_len = i32::from_le_bytes(len_bytes);
+        if declared_len < 5 || (declared_len as usize) > PREALLOC_MAX {
+            bail!("invalid or implausible BSON document length {declared_len}");
+        }
+        let mut buf = vec![0u8; declared_len as usize];
+        buf[0..4].copy_from_slice(&len_bytes);
+        reader
+            .read_exact(&mut buf[4..])
+            .context("truncated BSON document body")?;
+        Ok(Some(buf))
+    }
+
+    /// Reads a stream of top-level BSON documents, concatenated back to
+    /// back - the standard shape for a BSON *data file* (as opposed to
+    /// one document embedded inside some other container). Every document
+    /// is a genuine object by construction (BSON has no top-level-scalar
+    /// or top-level-array shape at all), so - unlike JSON/MessagePack/
+    /// CBOR's own readers - there's no "is this really an array of
+    /// records" fallback to consider here.
+    pub(crate) fn columns_from_bson(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        while let Some(bytes) =
+            read_one_document(&mut reader).with_context(|| format!("failed reading {path:?}"))?
+        {
+            let (map, _) = decode_document(&bytes, 0)
+                .with_context(|| format!("failed decoding a BSON document from {path:?}"))?;
+            if nrows.is_none_or(|n| profiler.total < n) {
+                profiler.push(&JsonValue::from(map));
+            } else {
+                profiler.total += 1;
+            }
+        }
+        Ok(profiler.finish())
+    }
+} // mod bson_support
+
+#[cfg(feature = "bson")]
+fn columns_from_bson(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bson_support::columns_from_bson(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "bson"))]
+fn columns_from_bson(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "BSON support isn't compiled in - rebuild with `cargo build --release --features bson` (or --features full)"
+    )
+}
+
+// --- Property List (plist) reader (opt-in via --features plist,
+// hand-rolled) ---
+// Apple's own config/data serialization format, in either of its two real
+// on-disk shapes: the XML variant (a small, fixed element vocabulary -
+// `dict`/`array`/`string`/`integer`/`real`/`true`/`false`/`date`/`data` -
+// wrapped in a `<plist>` root) and the binary variant (`bplist00`, a
+// compact object table + offset table + trailer). Both bridge to
+// `json_support::Value` and pick a record shape the same way YAML/TOML
+// already do for their own single-document formats: a top-level `dict`
+// profiles as one record, a top-level `array` as one record per element,
+// anything else as a single `value` column.
+#[cfg(feature = "plist")]
+mod plist_support {
+    use super::*;
+
+    const MAX_DEPTH: u32 = 512;
+
+    // --- Standard base64 (RFC 4648 4) decode - plist's own `<data>`
+    // element and, for symmetry, the binary variant's hex re-encoding of
+    // the same bytes need this; this project already hand-rolls the
+    // *url-safe* alphabet (RFC 4648 5) for JWT decoding, but that
+    // alphabet's `-`/`_` in place of `+`/`/` makes it a genuinely
+    // different table, not reusable here.
+    fn base64_decode(s: &str) -> Result<Vec<u8>> {
+        fn sextet(c: u8) -> Option<u8> {
+            match c {
+                b'A'..=b'Z' => Some(c - b'A'),
+                b'a'..=b'z' => Some(c - b'a' + 26),
+                b'0'..=b'9' => Some(c - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        }
+        // Real plist writers wrap a `<data>` element's base64 text across
+        // several lines - whitespace is never significant in base64, so
+        // it's stripped before decoding rather than treated as a bad
+        // character.
+        let stripped: Vec<u8> = s
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+            .collect();
+        let mut out = Vec::with_capacity(stripped.len() * 3 / 4);
+        let mut buf: u32 = 0;
+        let mut bits = 0u32;
+        for b in stripped {
+            let sx = sextet(b).with_context(|| format!("invalid base64 byte {b:#04x}"))?;
+            buf = (buf << 6) | u32::from(sx);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        Ok(out)
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    // =====================================================================
+    // XML plist
+    // =====================================================================
+    // A deliberately minimal, purpose-built parser for plist's own small,
+    // fixed element vocabulary - not a general XML parser (this project's
+    // `xml` feature already has one of those, independently gated, and
+    // reaching for it here would make `plist` secretly depend on `xml`
+    // being enabled too). No namespaces, no processing instructions past
+    // the leading `<?xml ...?>`, no DTD internal subset (a real plist
+    // DOCTYPE is always the single-line, no-internal-subset form) - the
+    // same "just enough for this format's own real grammar" scope this
+    // project's `ini_support` and the OOXML-scoped half of `xml_support`
+    // already keep for comparably small formats.
+
+    fn xp_skip_ws(bytes: &[u8], pos: &mut usize) {
+        while bytes.get(*pos).is_some_and(|b| b.is_ascii_whitespace()) {
+            *pos += 1;
+        }
+    }
+
+    fn xp_skip_prolog(input: &str, pos: &mut usize) -> Result<()> {
+        let bytes = input.as_bytes();
+        loop {
+            xp_skip_ws(bytes, pos);
+            if bytes[*pos..].starts_with(b"<?") {
+                let end = input[*pos..]
+                    .find("?>")
+                    .context("unterminated XML declaration/processing instruction")?;
+                *pos += end + 2;
+            } else if bytes[*pos..].starts_with(b"<!--") {
+                let end = input[*pos..]
+                    .find("-->")
+                    .context("unterminated XML comment")?;
+                *pos += end + 3;
+            } else if bytes[*pos..].starts_with(b"<!") {
+                // DOCTYPE - a real plist one never has an internal
+                // subset, so the next unquoted '>' always ends it.
+                let end = input[*pos..].find('>').context("unterminated DOCTYPE")?;
+                *pos += end + 1;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    fn xp_decode_entities(s: &str) -> String {
+        if !s.contains('&') {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '&' {
+                out.push(c);
+                continue;
+            }
+            let mut ent = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == ';' {
+                    break;
+                }
+                ent.push(c2);
+            }
+            match ent.as_str() {
+                "amp" => out.push('&'),
+                "lt" => out.push('<'),
+                "gt" => out.push('>'),
+                "quot" => out.push('"'),
+                "apos" => out.push('\''),
+                _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                    if let Ok(cp) = u32::from_str_radix(&ent[2..], 16)
+                        && let Some(c) = char::from_u32(cp)
+                    {
+                        out.push(c);
+                    }
+                }
+                _ if ent.starts_with('#') => {
+                    if let Ok(cp) = ent[1..].parse::<u32>()
+                        && let Some(c) = char::from_u32(cp)
+                    {
+                        out.push(c);
+                    }
+                }
+                _ => {
+                    // An unrecognized entity - put it back verbatim
+                    // rather than silently dropping content.
+                    out.push('&');
+                    out.push_str(&ent);
+                    out.push(';');
+                }
+            }
+        }
+        out
+    }
+
+    /// Reads a tag name (letters/digits/`:`/`-`/`_`) starting right after
+    /// the `<`/`</` this function's caller already consumed.
+    fn xp_read_name<'a>(input: &'a str, pos: &mut usize) -> Result<&'a str> {
+        let bytes = input.as_bytes();
+        let start = *pos;
+        while bytes
+            .get(*pos)
+            .is_some_and(|&b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_'))
+        {
+            *pos += 1;
+        }
+        if *pos == start {
+            bail!("expected an XML element name");
+        }
+        Ok(&input[start..*pos])
+    }
+
+    /// Skips past a start tag's attributes (quote-aware, so a `>` inside
+    /// an attribute value doesn't end the tag early) - this reader never
+    /// needs an attribute's actual value, only whether the tag turned out
+    /// to be self-closing. Leaves `*pos` just past the `>`/`/>`.
+    fn xp_skip_attrs(input: &str, pos: &mut usize) -> Result<bool> {
+        let bytes = input.as_bytes();
+        let (mut in_dq, mut in_sq) = (false, false);
+        loop {
+            let b = *bytes.get(*pos).context("unterminated start tag")?;
+            match b {
+                b'"' if !in_sq => in_dq = !in_dq,
+                b'\'' if !in_dq => in_sq = !in_sq,
+                b'>' if !in_dq && !in_sq => {
+                    *pos += 1;
+                    let self_closing = bytes[..*pos - 1]
+                        .iter()
+                        .rposition(|&b| !b.is_ascii_whitespace())
+                        == Some(*pos - 2)
+                        && bytes[*pos - 2] == b'/';
+                    return Ok(self_closing);
+                }
+                _ => {}
+            }
+            *pos += 1;
+        }
+    }
+
+    /// Reads raw text content up to (and consuming) `</name>`, decoding
+    /// entities. plist element content is never expected to itself
+    /// contain nested elements except for `dict`/`array` (handled
+    /// separately by `xp_parse_value`), so a plain "scan for `<`" is
+    /// always the real closing tag here.
+    fn xp_read_text_and_close(input: &str, pos: &mut usize, name: &str) -> Result<String> {
+        let start = *pos;
+        let end = input[*pos..]
+            .find('<')
+            .context("unterminated element (expected text then a closing tag)")?;
+        let text = xp_decode_entities(&input[start..start + end]);
+        *pos = start + end;
+        let bytes = input.as_bytes();
+        if bytes.get(*pos..*pos + 2) != Some(b"</") {
+            bail!("expected a closing tag for <{name}>");
+        }
+        *pos += 2;
+        let close_name = xp_read_name(input, pos)?;
+        if close_name != name {
+            bail!("mismatched plist tags: <{name}> closed by </{close_name}>");
+        }
+        xp_skip_ws(bytes, pos);
+        if bytes.get(*pos) != Some(&b'>') {
+            bail!("expected '>' to close </{name}>");
+        }
+        *pos += 1;
+        Ok(text)
+    }
+
+    fn xp_parse_value(input: &str, pos: &mut usize, depth: u32) -> Result<JsonValue> {
+        if depth > MAX_DEPTH {
+            bail!("plist value nested past {MAX_DEPTH} levels");
+        }
+        let bytes = input.as_bytes();
+        xp_skip_ws(bytes, pos);
+        if bytes.get(*pos) != Some(&b'<') {
+            bail!("expected a plist value element");
+        }
+        *pos += 1;
+        let name = xp_read_name(input, pos)?.to_string();
+        let self_closing = xp_skip_attrs(input, pos)?;
+
+        if self_closing {
+            return Ok(match name.as_str() {
+                "true" => JsonValue::from(true),
+                "false" => JsonValue::from(false),
+                "string" => JsonValue::from(""),
+                "data" => JsonValue::from(""),
+                "dict" => JsonValue::from(json_support::Map::new()),
+                "array" => JsonValue::from(Vec::<JsonValue>::new()),
+                other => bail!("unrecognized empty plist element <{other}/>"),
+            });
+        }
+
+        match name.as_str() {
+            "true" => {
+                xp_read_text_and_close(input, pos, "true")?;
+                Ok(JsonValue::from(true))
+            }
+            "false" => {
+                xp_read_text_and_close(input, pos, "false")?;
+                Ok(JsonValue::from(false))
+            }
+            "string" => Ok(JsonValue::from(xp_read_text_and_close(
+                input, pos, "string",
+            )?)),
+            "date" => Ok(JsonValue::from(xp_read_text_and_close(input, pos, "date")?)),
+            "integer" => {
+                let text = xp_read_text_and_close(input, pos, "integer")?;
+                text.trim()
+                    .parse::<i64>()
+                    .map(JsonValue::from)
+                    .with_context(|| format!("invalid plist <integer>{text}</integer>"))
+            }
+            "real" => {
+                let text = xp_read_text_and_close(input, pos, "real")?;
+                text.trim()
+                    .parse::<f64>()
+                    .map(JsonValue::from)
+                    .with_context(|| format!("invalid plist <real>{text}</real>"))
+            }
+            "data" => {
+                let text = xp_read_text_and_close(input, pos, "data")?;
+                Ok(JsonValue::from(hex_encode(&base64_decode(&text)?)))
+            }
+            "array" => {
+                let mut items = Vec::new();
+                loop {
+                    xp_skip_ws(bytes, pos);
+                    if bytes[*pos..].starts_with(b"</array>") {
+                        *pos += "</array>".len();
+                        break;
+                    }
+                    items.push(xp_parse_value(input, pos, depth + 1)?);
+                }
+                Ok(JsonValue::from(items))
+            }
+            "dict" => {
+                let mut map = json_support::Map::with_capacity(8);
+                loop {
+                    xp_skip_ws(bytes, pos);
+                    if bytes[*pos..].starts_with(b"</dict>") {
+                        *pos += "</dict>".len();
+                        break;
+                    }
+                    if bytes.get(*pos..*pos + 5) != Some(b"<key>") {
+                        bail!("expected <key> inside a plist <dict>");
+                    }
+                    *pos += "<key>".len();
+                    let key = xp_read_text_and_close_from_after_open(input, pos, "key")?;
+                    let value = xp_parse_value(input, pos, depth + 1)?;
+                    map.insert(key, value);
+                }
+                Ok(JsonValue::from(map))
+            }
+            other => bail!("unrecognized plist element <{other}>"),
+        }
+    }
+
+    /// Like `xp_read_text_and_close`, but for a caller (`<key>` inside a
+    /// `<dict>`) that already consumed the *whole* opening tag itself
+    /// (including its own `>`), rather than just the name.
+    fn xp_read_text_and_close_from_after_open(
+        input: &str,
+        pos: &mut usize,
+        name: &str,
+    ) -> Result<String> {
+        let start = *pos;
+        let end = input[*pos..]
+            .find('<')
+            .context("unterminated <key> (expected text then </key>)")?;
+        let text = xp_decode_entities(&input[start..start + end]);
+        *pos = start + end;
+        let close = format!("</{name}>");
+        if !input[*pos..].starts_with(&close) {
+            bail!("expected {close}");
+        }
+        *pos += close.len();
+        Ok(text)
+    }
+
+    fn parse_xml_plist(input: &str) -> Result<JsonValue> {
+        let mut pos = 0usize;
+        xp_skip_prolog(input, &mut pos)?;
+        if input.as_bytes().get(pos) != Some(&b'<') {
+            bail!("expected the <plist> root element");
+        }
+        pos += 1;
+        let root_name = xp_read_name(input, &mut pos)?.to_string();
+        if root_name != "plist" {
+            bail!("expected a <plist> root element, found <{root_name}>");
+        }
+        let self_closing = xp_skip_attrs(input, &mut pos)?;
+        if self_closing {
+            bail!("<plist/> has no value to profile");
+        }
+        let value = xp_parse_value(input, &mut pos, 0)?;
+        xp_skip_ws(input.as_bytes(), &mut pos);
+        if !input[pos..].starts_with("</plist>") {
+            bail!("expected </plist> after the root value");
+        }
+        Ok(value)
+    }
+
+    // =====================================================================
+    // Binary plist (bplist00)
+    // =====================================================================
+    // [CFBinaryPList.c]/Apple's own (unpublished but widely reverse-
+    // engineered and cross-implemented) format: an 8-byte "bplist00"
+    // magic, then a flat object table (each object self-describing via a
+    // 1-byte marker), an offset table giving each object's own byte
+    // position, and a fixed 32-byte trailer at the very end of the file
+    // naming the table sizes and the top-level object's own index. Every
+    // marker byte/bit-width/epoch constant below was checked against the
+    // `plist` crate's own binary reader before being trusted, then
+    // verified against both that crate's and Python's independent
+    // `plistlib`'s output on real generated files - the same "read a
+    // reference implementation, then verify against real values" rigor
+    // this project already applies to every other hand-rolled binary
+    // format.
+    struct Bplist<'a> {
+        data: &'a [u8],
+        offset_size: u8,
+        ref_size: u8,
+        num_objects: u64,
+        top_object: u64,
+        offset_table_start: u64,
+    }
+
+    fn read_uint_be(data: &[u8], pos: usize, n: usize) -> Result<u64> {
+        let b = data.get(pos..pos + n).context("truncated bplist integer")?;
+        let mut v: u64 = 0;
+        for &byte in b {
+            v = (v << 8) | u64::from(byte);
+        }
+        Ok(v)
+    }
+
+    impl<'a> Bplist<'a> {
+        fn open(data: &'a [u8]) -> Result<Self> {
+            if data.len() < 40 || !data.starts_with(b"bplist0") {
+                bail!("not a binary plist (missing 'bplist0' magic)");
+            }
+            let trailer = &data[data.len() - 32..];
+            let offset_size = trailer[6];
+            let ref_size = trailer[7];
+            let num_objects = read_uint_be(trailer, 8, 8)?;
+            let top_object = read_uint_be(trailer, 16, 8)?;
+            let offset_table_start = read_uint_be(trailer, 24, 8)?;
+            if !(1..=8).contains(&offset_size) || !(1..=8).contains(&ref_size) {
+                bail!("invalid bplist offset/ref byte width");
+            }
+            if top_object >= num_objects {
+                bail!("bplist top-level object index out of range");
+            }
+            let offset_table_end = offset_table_start
+                .checked_add(num_objects.saturating_mul(u64::from(offset_size)))
+                .context("bplist offset table size overflows")?;
+            if offset_table_end > data.len() as u64 {
+                bail!("bplist offset table runs past the end of the file");
+            }
+            Ok(Bplist {
+                data,
+                offset_size,
+                ref_size,
+                num_objects,
+                top_object,
+                offset_table_start,
+            })
+        }
+
+        fn object_offset(&self, index: u64) -> Result<usize> {
+            if index >= self.num_objects {
+                bail!("bplist object reference {index} out of range");
+            }
+            let pos = self.offset_table_start + index * u64::from(self.offset_size);
+            Ok(read_uint_be(self.data, pos as usize, self.offset_size as usize)? as usize)
+        }
+
+        /// Reads one object-ref array (used for array/set/dict members) -
+        /// `count` refs, each `self.ref_size` bytes, big-endian.
+        fn read_refs(&self, pos: &mut usize, count: u64) -> Result<Vec<u64>> {
+            let mut out = Vec::with_capacity(count.min(1 << 20) as usize);
+            for _ in 0..count {
+                out.push(read_uint_be(self.data, *pos, self.ref_size as usize)?);
+                *pos += self.ref_size as usize;
+            }
+            Ok(out)
+        }
+
+        /// A marker byte's low nibble either *is* the element count, or -
+        /// when it's `0xF` - signals that an `int`-marker object
+        /// immediately follows carrying the real count (used whenever a
+        /// count wouldn't fit in 4 bits: strings/data over 14
+        /// units/bytes, arrays/dicts over 14 entries).
+        fn read_count(&self, pos: &mut usize, low_nibble: u8) -> Result<u64> {
+            if low_nibble != 0x0F {
+                return Ok(u64::from(low_nibble));
+            }
+            let marker = *self.data.get(*pos).context("truncated bplist count")?;
+            if marker >> 4 != 0x1 {
+                bail!("expected an int marker for an extended bplist count");
+            }
+            *pos += 1;
+            let n = 1usize << (marker & 0x0F);
+            let v = read_uint_be(self.data, *pos, n)?;
+            *pos += n;
+            Ok(v)
+        }
+
+        fn read_object(&self, index: u64, depth: u32) -> Result<JsonValue> {
+            if depth > MAX_DEPTH {
+                bail!("bplist object nested past {MAX_DEPTH} levels");
+            }
+            let mut pos = self.object_offset(index)?;
+            let marker = *self.data.get(pos).context("truncated bplist object")?;
+            pos += 1;
+            let hi = marker >> 4;
+            let lo = marker & 0x0F;
+            match hi {
+                0x0 => match marker {
+                    0x00 => Ok(JsonValue::Null),
+                    0x08 => Ok(JsonValue::from(false)),
+                    0x09 => Ok(JsonValue::from(true)),
+                    _ => Ok(JsonValue::Null), // fill byte / unused - absent = missing
+                },
+                0x1 => {
+                    // int: 2^lo bytes, big-endian. Only the 8-byte form is
+                    // ever actually signed per the format's own
+                    // convention (verified against the `plist` crate);
+                    // narrower widths are always non-negative in
+                    // practice, so reading them as unsigned and widening
+                    // to i64 is exact.
+                    let n = 1usize << lo;
+                    let raw = self
+                        .data
+                        .get(pos..pos + n)
+                        .context("truncated bplist int")?;
+                    let v: i64 = if n == 8 {
+                        i64::from_be_bytes(raw.try_into().unwrap())
+                    } else {
+                        read_uint_be(self.data, pos, n)? as i64
+                    };
+                    Ok(JsonValue::from(v))
+                }
+                0x2 => {
+                    let n = 1usize << lo;
+                    let raw = self
+                        .data
+                        .get(pos..pos + n)
+                        .context("truncated bplist real")?;
+                    let v = match n {
+                        4 => f64::from(f32::from_be_bytes(raw.try_into().unwrap())),
+                        8 => f64::from_be_bytes(raw.try_into().unwrap()),
+                        _ => bail!("unsupported bplist real width {n}"),
+                    };
+                    Ok(JsonValue::from(v))
+                }
+                0x3 => {
+                    // date: always an 8-byte big-endian f64, seconds
+                    // since the Cocoa/Apple reference date 2001-01-01
+                    // 00:00:00 UTC - 978,307,200 seconds after the Unix
+                    // epoch.
+                    let raw = self
+                        .data
+                        .get(pos..pos + 8)
+                        .context("truncated bplist date")?;
+                    let secs_since_2001 = f64::from_be_bytes(raw.try_into().unwrap());
+                    let unix_secs = secs_since_2001 + 978_307_200.0;
+                    let whole = unix_secs.floor();
+                    let nanos = ((unix_secs - whole) * 1e9)
+                        .round()
+                        .clamp(0.0, 999_999_999.0) as u32;
+                    Ok(EpochDateTime::from_unix_seconds(whole as i64, nanos)
+                        .map_or(JsonValue::Null, |dt| JsonValue::from(dt.format_t_frac(3))))
+                }
+                0x4 => {
+                    let mut p = pos;
+                    let len = self.read_count(&mut p, lo)? as usize;
+                    let bytes = self.data.get(p..p + len).context("truncated bplist data")?;
+                    Ok(JsonValue::from(hex_encode(bytes)))
+                }
+                0x5 => {
+                    // ASCII string: `count` single-byte characters.
+                    let mut p = pos;
+                    let len = self.read_count(&mut p, lo)? as usize;
+                    let bytes = self
+                        .data
+                        .get(p..p + len)
+                        .context("truncated bplist ASCII string")?;
+                    Ok(JsonValue::from(
+                        bytes.iter().map(|&b| b as char).collect::<String>(),
+                    ))
+                }
+                0x6 => {
+                    // Unicode string: `count` UTF-16BE code units.
+                    let mut p = pos;
+                    let len = self.read_count(&mut p, lo)? as usize;
+                    let bytes = self
+                        .data
+                        .get(p..p + len * 2)
+                        .context("truncated bplist Unicode string")?;
+                    let units: Vec<u16> = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_be_bytes(*c))
+                        .collect();
+                    let s: String = char::decode_utf16(units)
+                        .map(|r| r.unwrap_or('\u{FFFD}'))
+                        .collect();
+                    Ok(JsonValue::from(s))
+                }
+                0xA => {
+                    let mut p = pos;
+                    let count = self.read_count(&mut p, lo)?;
+                    let refs = self.read_refs(&mut p, count)?;
+                    let items = refs
+                        .into_iter()
+                        .map(|r| self.read_object(r, depth + 1))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(JsonValue::from(items))
+                }
+                0xD => {
+                    let mut p = pos;
+                    let count = self.read_count(&mut p, lo)?;
+                    let key_refs = self.read_refs(&mut p, count)?;
+                    let val_refs = self.read_refs(&mut p, count)?;
+                    let mut map = json_support::Map::with_capacity(count.min(64) as usize);
+                    for (kref, vref) in key_refs.into_iter().zip(val_refs) {
+                        let key = match self.read_object(kref, depth + 1)? {
+                            JsonValue::String(s) => s,
+                            other => other.to_string(),
+                        };
+                        let value = self.read_object(vref, depth + 1)?;
+                        map.insert(key, value);
+                    }
+                    Ok(JsonValue::from(map))
+                }
+                // UID (0x8, used by NSKeyedArchiver's object-graph
+                // plists) and Set (0xC) are real but genuinely rare
+                // shapes this reader doesn't have a verification fixture
+                // for - a disclosed, narrow boundary rather than a guess,
+                // the same "no fixture, no trust" line this project
+                // already draws elsewhere (old-style BIFF2-5 `.xls`,
+                // Parquet's own LZO gap).
+                other => bail!("unsupported bplist object type (marker high nibble {other:#x})"),
+            }
+        }
+
+        fn top_value(&self) -> Result<JsonValue> {
+            self.read_object(self.top_object, 0)
+        }
+    }
+
+    fn parse_binary_plist(data: &[u8]) -> Result<JsonValue> {
+        Bplist::open(data)?.top_value()
+    }
+
+    /// Picks a record shape the same way YAML/TOML already do for their
+    /// own single-document formats: a top-level `dict` is one record; a
+    /// top-level `array` is one record per element; anything else (a
+    /// bare string/number/bool/date at the plist's own root - unusual,
+    /// but legal) is a single `value` column, the same fallback JSON/
+    /// YAML/MessagePack/CBOR all already share.
+    fn profile_root_value(
+        value: JsonValue,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Vec<ColumnProfile> {
+        match value {
+            JsonValue::Array(items) => {
+                let mut items = items;
+                if let Some(n) = nrows {
+                    items.truncate(n);
+                }
+                let all_objects = !items.is_empty() && items.iter().all(JsonValue::is_object);
+                if all_objects {
+                    let records: Vec<json_support::Map> = items
+                        .into_iter()
+                        .map(|v| match v {
+                            JsonValue::Object(m) => m,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    profile_json_records(&records, n_samples)
+                } else {
+                    let total = items.len();
+                    let refs: Vec<&JsonValue> = items.iter().filter(|v| !v.is_null()).collect();
+                    profile_json_path("value".to_string(), total, refs, n_samples)
+                }
+            }
+            JsonValue::Object(m) => profile_json_records(std::slice::from_ref(&m), n_samples),
+            JsonValue::Null => Vec::new(),
+            other => profile_json_path("value".to_string(), 1, vec![&other], n_samples),
+        }
+    }
+
+    pub(crate) fn columns_from_plist(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = if bytes.starts_with(b"bplist0") {
+            parse_binary_plist(&bytes)
+                .with_context(|| format!("failed to parse {path:?} as a binary plist"))?
+        } else {
+            let text = std::str::from_utf8(&bytes)
+                .with_context(|| format!("{path:?} is not valid UTF-8"))?;
+            parse_xml_plist(text)
+                .with_context(|| format!("failed to parse {path:?} as an XML plist"))?
+        };
+        Ok(profile_root_value(value, nrows, n_samples))
+    }
+} // mod plist_support
+
+#[cfg(feature = "plist")]
+fn columns_from_plist(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    plist_support::columns_from_plist(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "plist"))]
+fn columns_from_plist(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "Property List support isn't compiled in - rebuild with `cargo build --release --features plist` (or --features full)"
+    )
+}
+
 // --- INI reader (opt-in via --features ini, hand-rolled - see
 // `ini_support` below and CLAUDE.md's Dependency footprint section) ---
 // An INI file's sections are already "multiple named groups of key=value
@@ -45979,6 +47254,8 @@ enum InputFormat {
     Sas7bdat,
     Spss,
     Orc,
+    Bson,
+    Plist,
 }
 
 impl InputFormat {
@@ -46024,6 +47301,8 @@ impl InputFormat {
             InputFormat::Sas7bdat => "sas7bdat",
             InputFormat::Spss => "spss",
             InputFormat::Orc => "orc",
+            InputFormat::Bson => "bson",
+            InputFormat::Plist => "plist",
         }
     }
 }
@@ -46098,6 +47377,18 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
     }
     if head.starts_with(b"\x93NUMPY") {
         return Some(InputFormat::Npy);
+    }
+    if head.starts_with(b"bplist0") {
+        // Apple's binary plist container: an 8-byte magic, "bplist"
+        // followed by a 2-digit format version - every real binary
+        // plist this project could find (system files, `defaults`/
+        // `plutil` output, this project's own generated fixtures) uses
+        // version "00", the only version Apple's own format has ever
+        // shipped. Matched as this 7-byte prefix rather than the full
+        // 8 bytes so a hypothetical future version digit still hits
+        // this branch rather than silently falling through to "no
+        // signature found".
+        return Some(InputFormat::Plist);
     }
     if head.len() >= 32 && head[..32] == SAS7BDAT_MAGIC[..] {
         return Some(InputFormat::Sas7bdat);
@@ -46238,6 +47529,20 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
             && let Some(&next) = head.get(idx + 1)
             && (next.is_ascii_alphabetic() || next == b'_' || next == b'?')
         {
+            // The XML plist variant is, structurally, a real XML
+            // document (its own `<?xml ...?>` declaration and `<plist>`
+            // root would otherwise match the generic XML check right
+            // below this one) - checked first via its own DOCTYPE/root
+            // tag, both fixed strings every real XML plist writer emits
+            // (Apple's own `PropertyList-1.0.dtd` reference, or a bare
+            // `<plist version="...">` root for a writer that omits the
+            // DOCTYPE), so a plist is never misdetected as generic XML.
+            if slice_contains(&head, b"<!DOCTYPE plist")
+                || slice_contains(&head, b"<plist ")
+                || slice_contains(&head, b"<plist>")
+            {
+                return Some(InputFormat::Plist);
+            }
             return Some(InputFormat::Xml);
         }
     }
@@ -46283,9 +47588,11 @@ fn detect_format(
             "sas7bdat" | "sas" => Ok(InputFormat::Sas7bdat),
             "spss" | "sav" | "zsav" => Ok(InputFormat::Spss),
             "orc" => Ok(InputFormat::Orc),
+            "bson" => Ok(InputFormat::Bson),
+            "plist" => Ok(InputFormat::Plist),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, or orc)"
+                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, orc, bson, or plist)"
                 )
             }
         };
@@ -46317,6 +47624,8 @@ fn detect_format(
         "sas7bdat" => Ok(InputFormat::Sas7bdat),
         "sav" | "zsav" => Ok(InputFormat::Spss),
         "orc" => Ok(InputFormat::Orc),
+        "bson" => Ok(InputFormat::Bson),
+        "plist" => Ok(InputFormat::Plist),
         // The extension alone doesn't tell us - either there isn't one, or
         // it's not one of the above. Before giving up, try the file's own
         // bytes: fixed-width text and the four log formats have no magic
@@ -53120,6 +54429,8 @@ fn dispatch_reader(
             InputFormat::Sas7bdat => columns_from_sas7bdat(read_path, args.nrows, args.samples)?,
             InputFormat::Spss => columns_from_spss(read_path, args.nrows, args.samples)?,
             InputFormat::Orc => columns_from_orc(read_path, args.nrows, args.samples)?,
+            InputFormat::Bson => columns_from_bson(read_path, args.nrows, args.samples)?,
+            InputFormat::Plist => columns_from_plist(read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
@@ -57693,6 +59004,331 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
             let theirs = columns_from_cbor_via_ciborium(path, 100)
                 .unwrap_or_else(|e| panic!("{f}: ciborium-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Direct edge-case coverage for `bson_support::decimal128_to_string`,
+    /// every expected string independently verified against MongoDB's own
+    /// `pymongo` driver (`bson.decimal128.Decimal128`) before being
+    /// trusted - not derived from this function's own arithmetic. Covers
+    /// zero and negative zero (a real, distinguishable difference this
+    /// project's own zero-rendering fix depends on), a typical positive
+    /// and negative fraction, the maximum and minimum finite magnitudes,
+    /// a 34-digit maximum-precision significand, both infinities, NaN,
+    /// and the combination-field range (24..=29) this function's own
+    /// third documented bug lives in - two raw-byte cases (one positive,
+    /// one negative-signed) built directly rather than through any
+    /// encoder, since no legitimate encoder can ever produce that range
+    /// (see this function's own doc comment), each cross-checked against
+    /// `pymongo`'s `Decimal128.from_bid` before being hardcoded here.
+    #[cfg(feature = "bson")]
+    #[test]
+    fn decimal128_to_string_matches_pymongo_across_edge_cases() {
+        let cases: &[(&str, &str)] = &[
+            ("00000000000000000000000000004030", "0"),
+            ("00000000000000000000000000003c30", "0.00"),
+            ("000000000000000000000000000040b0", "-0"),
+            ("39300000000000000000000000003c30", "123.45"),
+            ("01000000000000000000000000003ab0", "-0.001"),
+            ("0000000000000000000000000000007c", "NaN"),
+            ("00000000000000000000000000000078", "Infinity"),
+            ("000000000000000000000000000000f8", "-Infinity"),
+            (
+                "ffffffff638e8d37c087adbe09edff5f",
+                "9.999999999999999999999999999999999E+6144",
+            ),
+            (
+                "ffffffff638e8d37c087adbe09edffdf",
+                "-9.999999999999999999999999999999999E+6144",
+            ),
+            ("05000000000000000000000000000000", "5E-6176"),
+            (
+                "f2af967ed05c82de3297ff6fde3c4030",
+                "1234567890123456789012345678901234",
+            ),
+            // Combination field forced into 24..=29 (the always-out-of-
+            // range "leading digit 8/9" encoding) - see this function's
+            // own doc comment for why every legitimate encoder avoids
+            // this range, and why "0" (not a real 8/9-leading digit) is
+            // the correct, reference-matched answer.
+            ("6c080717373b819a068f32b7a6b38b6b", "0E-265"),
+            ("78563412efbeadde00000000000032e8", "-0E-1980"),
+        ];
+        for (hex, expected) in cases {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let got = bson_support::decimal128_to_string(&bytes)
+                .unwrap_or_else(|e| panic!("{hex}: decode failed: {e:?}"));
+            assert_eq!(&got, expected, "bid {hex}");
+        }
+    }
+
+    /// Test-only bridge from a real `bson::Bson` value tree (the official
+    /// MongoDB Rust driver's own dynamic value type) to this project's
+    /// `JsonValue`, matching `bson_support::decode_element_value`'s own
+    /// rendering conventions exactly (hex-dumped ObjectId/Binary, `/pat/
+    /// opts` regex notation, a Timestamp as a small `{t, i}` object, only
+    /// the code kept from JS-with-scope, `MinKey`/`MaxKey` as bare
+    /// strings) so the two can be compared value-for-value.
+    #[cfg(all(test, feature = "bson"))]
+    fn bson_value_to_json(v: &bson::Bson) -> JsonValue {
+        use bson::Bson;
+        match v {
+            Bson::Double(f) => {
+                json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            Bson::String(s) => JsonValue::from(s.clone()),
+            Bson::Array(items) => JsonValue::Array(items.iter().map(bson_value_to_json).collect()),
+            Bson::Document(doc) => JsonValue::Object(
+                doc.iter()
+                    .map(|(k, v)| (k.clone(), bson_value_to_json(v)))
+                    .collect(),
+            ),
+            Bson::Boolean(b) => JsonValue::from(*b),
+            Bson::Null | Bson::Undefined => JsonValue::Null,
+            Bson::RegularExpression(re) => {
+                JsonValue::from(format!("/{}/{}", re.pattern, re.options))
+            }
+            Bson::JavaScriptCode(s) => JsonValue::from(s.clone()),
+            Bson::JavaScriptCodeWithScope(js) => JsonValue::from(js.code.clone()),
+            Bson::Int32(i) => JsonValue::from(i64::from(*i)),
+            Bson::Int64(i) => JsonValue::from(*i),
+            Bson::Timestamp(ts) => {
+                let mut m = json_support::Map::with_capacity(2);
+                m.insert("t".to_string(), JsonValue::from(i64::from(ts.time)));
+                m.insert("i".to_string(), JsonValue::from(i64::from(ts.increment)));
+                JsonValue::from(m)
+            }
+            Bson::Binary(b) => JsonValue::from(
+                b.bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            ),
+            Bson::ObjectId(oid) => JsonValue::from(oid.to_string()),
+            Bson::DateTime(dt) => EpochDateTime::from_unix_millis(dt.timestamp_millis())
+                .map_or(JsonValue::Null, |d| JsonValue::from(d.format_t_frac(3))),
+            Bson::Symbol(s) => JsonValue::from(s.clone()),
+            Bson::Decimal128(d) => JsonValue::from(d.to_string()),
+            Bson::MaxKey => JsonValue::from("MaxKey"),
+            Bson::MinKey => JsonValue::from("MinKey"),
+            Bson::DbPointer(_) => JsonValue::from("(dbpointer)"),
+        }
+    }
+
+    /// Test-only: producing the "expected" side of `bson_reader_matches_
+    /// the_bson_crate_output_exactly` - reads a stream of concatenated
+    /// top-level documents via the real `bson` crate (kept as a dev-only
+    /// cross-verification oracle, see Cargo.toml) rather than this
+    /// project's own hand-rolled `bson_support`.
+    #[cfg(all(test, feature = "bson"))]
+    fn columns_from_bson_via_bson_crate(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        loop {
+            match bson::Document::from_reader(&mut reader) {
+                Ok(doc) => profiler.push(&bson_value_to_json(&bson::Bson::Document(doc))),
+                Err(bson::de::Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            }
+        }
+        Ok(profiler.finish())
+    }
+
+    /// Cross-verification oracle for the hand-rolled BSON decoder
+    /// (`bson_support` - see Cargo.toml) against the real `bson` crate
+    /// (the official MongoDB Rust driver's own crate), kept as a dev-only
+    /// dependency for exactly this purpose.
+    #[cfg(feature = "bson")]
+    #[test]
+    fn bson_reader_matches_the_bson_crate_output_exactly() {
+        for f in [
+            "tests/fixtures/sample.bson",
+            "tests/fixtures/type_detection.bson",
+        ] {
+            let path = Path::new(f);
+            let mine = bson_support::columns_from_bson(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_bson_via_bson_crate(path, 100)
+                .unwrap_or_else(|e| panic!("{f}: bson-crate-based oracle failed: {e:?}"));
+
+            assert_eq!(
+                mine.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                theirs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                "{f}: column names differ"
+            );
+            for (m, t) in mine.iter().zip(theirs.iter()) {
+                assert_eq!(
+                    m.current_type, t.current_type,
+                    "{f} col '{}': current_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.ideal_type, t.ideal_type,
+                    "{f} col '{}': ideal_type",
+                    m.name
+                );
+                assert_eq!(
+                    m.sample_values, t.sample_values,
+                    "{f} col '{}': sample_values",
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Test-only bridge from a real `plist::Value` (the widely-used pure-
+    /// Rust `plist` crate's own dynamic value type) to this project's
+    /// `JsonValue`. `binary_style_dates` selects which of this project's
+    /// own two, deliberately different, date renderings to match - the
+    /// XML reader keeps the literal `<date>` text (a `Z`-suffixed ISO
+    /// 8601 string), while the binary reader converts Apple's own
+    /// reference-date `f64` offset through this project's `EpochDateTime`
+    /// machinery (no `Z` suffix, matching Avro/Parquet's own timestamp
+    /// convention) - see `plist_support`'s own `xp_read_value`/`Bplist::
+    /// read_object` for the two real call sites this mirrors.
+    #[cfg(all(test, feature = "plist"))]
+    fn plist_value_to_json(v: &plist::Value, binary_style_dates: bool) -> JsonValue {
+        match v {
+            plist::Value::Array(items) => JsonValue::Array(
+                items
+                    .iter()
+                    .map(|v| plist_value_to_json(v, binary_style_dates))
+                    .collect(),
+            ),
+            plist::Value::Dictionary(dict) => JsonValue::Object(
+                dict.iter()
+                    .map(|(k, v)| (k.clone(), plist_value_to_json(v, binary_style_dates)))
+                    .collect(),
+            ),
+            plist::Value::Boolean(b) => JsonValue::from(*b),
+            plist::Value::Data(bytes) => {
+                JsonValue::from(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            }
+            plist::Value::Date(d) => {
+                if binary_style_dates {
+                    let dur = std::time::SystemTime::from(*d)
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    EpochDateTime::from_unix_seconds(dur.as_secs() as i64, dur.subsec_nanos())
+                        .map_or(JsonValue::Null, |dt| JsonValue::from(dt.format_t_frac(3)))
+                } else {
+                    JsonValue::from(d.to_xml_format())
+                }
+            }
+            plist::Value::Real(f) => {
+                json_support::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
+            }
+            plist::Value::Integer(i) => i
+                .as_signed()
+                .map(JsonValue::from)
+                .or_else(|| i.as_unsigned().map(JsonValue::from))
+                .unwrap_or(JsonValue::Null),
+            plist::Value::String(s) => JsonValue::from(s.clone()),
+            plist::Value::Uid(_) => JsonValue::from("(uid)"),
+            _ => JsonValue::Null,
+        }
+    }
+
+    /// Test-only: producing the "expected" side of `plist_reader_matches_
+    /// the_plist_crate_output_exactly` - reads via the real `plist` crate
+    /// (kept as a dev-only cross-verification oracle, see Cargo.toml)
+    /// rather than this project's own hand-rolled `plist_support`, then
+    /// applies the identical dual-mode (dict -> one record, array ->
+    /// array-of-records) record-shape choice `plist_support::profile_
+    /// root_value` makes.
+    #[cfg(all(test, feature = "plist"))]
+    fn columns_from_plist_via_plist_crate(
+        path: &Path,
+        n_samples: usize,
+        binary_style_dates: bool,
+    ) -> Result<Vec<ColumnProfile>> {
+        let value = plist::Value::from_file(path)?;
+        let json = plist_value_to_json(&value, binary_style_dates);
+        match json {
+            JsonValue::Array(items) if items.iter().all(JsonValue::is_object) => {
+                let records: Vec<json_support::Map> = items
+                    .into_iter()
+                    .map(|v| match v {
+                        JsonValue::Object(m) => m,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                Ok(profile_json_records(&records, n_samples))
+            }
+            JsonValue::Object(m) => Ok(profile_json_records(&[m], n_samples)),
+            other => {
+                let total = if let JsonValue::Array(items) = &other {
+                    items.len()
+                } else {
+                    1
+                };
+                let items = match other {
+                    JsonValue::Array(items) => items,
+                    single => vec![single],
+                };
+                let refs: Vec<&JsonValue> = items.iter().filter(|v| !v.is_null()).collect();
+                Ok(profile_json_path(
+                    "value".to_string(),
+                    total,
+                    refs,
+                    n_samples,
+                ))
+            }
+        }
+    }
+
+    /// Cross-verification oracle for the hand-rolled plist reader
+    /// (`plist_support` - both the XML and binary `bplist00` variants)
+    /// against the real `plist` crate, kept as a dev-only dependency for
+    /// exactly this purpose.
+    #[cfg(feature = "plist")]
+    #[test]
+    fn plist_reader_matches_the_plist_crate_output_exactly() {
+        for (f, binary_style_dates) in [
+            ("tests/fixtures/sample.plist", false),
+            ("tests/fixtures/type_detection.plist", false),
+            (
+                "tests/fixtures/edge_plist_binary_type_detection.plist",
+                true,
+            ),
+        ] {
+            let path = Path::new(f);
+            let mine = plist_support::columns_from_plist(path, None, 100)
+                .unwrap_or_else(|e| panic!("{f}: hand-rolled reader failed: {e:?}"));
+            let theirs = columns_from_plist_via_plist_crate(path, 100, binary_style_dates)
+                .unwrap_or_else(|e| panic!("{f}: plist-crate-based oracle failed: {e:?}"));
 
             assert_eq!(
                 mine.iter().map(|c| &c.name).collect::<Vec<_>>(),

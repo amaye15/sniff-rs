@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>active</key>
+	<true/>
+	<key>blob</key>
+	<data>
+	aGVsbG8=
+	</data>
+	<key>created</key>
+	<date>2023-01-01T12:00:00Z</date>
+	<key>email</key>
+	<string>alice@example.com</string>
+	<key>id</key>
+	<integer>1</integer>
+	<key>meta</key>
+	<dict>
+		<key>x</key>
+		<integer>1</integer>
+		<key>y</key>
+		<real>2.5</real>
+	</dict>
+	<key>name</key>
+	<string>Alice</string>
+	<key>score</key>
+	<real>3.14</real>
+	<key>tags</key>
+	<array>
+		<string>a</string>
+		<string>b</string>
+		<string>c</string>
+	</array>
+</dict>
+</plist>
