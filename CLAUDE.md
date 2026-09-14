@@ -316,9 +316,10 @@ be *run* rather than read. `--sql-mode` picks between two genuinely
 different shapes: `inline` (the default) and `staging` (the original
 shape, kept for large files - see below). `staging` mode already works
 for every format (it never embeds per-row data, so there's no format-
-specific row-source to build); `inline` mode covers CSV, TSV, and
-fixed-width text so far - every other format transparently falls back to
-`staging` with a disclosed stderr note (`--sql-mode inline` given
+specific row-source to build); `inline` mode covers CSV, TSV, fixed-width
+text, Common/Combined Log Format, and syslog (RFC 3164/5424) so far -
+every other format transparently falls back to `staging` with a
+disclosed stderr note (`--sql-mode inline` given
 *explicitly* on an unsupported format is a hard error instead, naming the
 gap - downgrading what was explicitly asked for would be the wrong kind
 of quiet).
@@ -332,13 +333,13 @@ into three structurally different shapes for this purpose, and each
 needs its own real design, not just repeating the same pattern:
 
 1. **The rest of the flat, fixed-column, one-row-per-record tier**
-   (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy, Common/Combined Log,
-   syslog) - CSV/TSV/fixed-width already prove the shape
-   (`InlineRowSink`/`ColumnAccumulatorState`'s own generalized `accept`),
-   but each of these needs its own real "read one row a second time"
-   plumbing (a binary-format re-parse, not just a text re-scan) and its
-   own end-to-end verification against a real engine before being
-   trusted.
+   (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy) - CSV/TSV/fixed-width and,
+   as of Phase 2, Common/Combined Log Format and syslog (RFC 3164/5424)
+   all already prove the shape (`InlineRowSink`/`ColumnAccumulatorState`'s
+   own generalized `accept`), but each of the six remaining formats needs
+   its own real "read one row a second time" plumbing (a genuine binary-
+   format re-parse, not just a text re-scan) and its own end-to-end
+   verification against a real engine before being trusted.
 2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
    `dispatch_reader` already returns `Vec<(String, Vec<ColumnProfile>)>`
    for these; `render_sql`'s inline branch currently assumes exactly one
@@ -615,6 +616,60 @@ fabricated `0` - matches the source file exactly. Also verified as a pure
 generalization, not a behavior change, for the already-shipped CSV/TSV
 case: `diff` confirmed byte-identical inline SQL output against the
 pre-refactor binary across the entire CSV/TSV fixture corpus.
+
+**Phase 2: Common/Combined Log Format and syslog (RFC 3164/5424).**
+Picked next as the closest remaining structural match to fixed-width -
+both are already plain, line-oriented, one-record-per-line text formats
+(`BufReader::lines()`, no binary decoding), the identical shape
+`columns_from_weblog`/`columns_from_syslog` already use for Pass 1. The
+one genuine design gap this phase closed: unlike CSV/fixed-width, none
+of these four log grammars has a header row at all - every line is a
+data record - so feeding a log line straight into `InlineRowSink::accept`
+under the CSV/fixed-width assumption (`record_index == resolved_skip_rows`
+means "the header row, skip it") would silently drop the very first
+record. `InlineRowSink` gained a `has_header: bool` field (`true` for
+CSV/fixed-width, `false` for the four log formats), gating that branch so
+a headerless row-source's first record is treated as an ordinary data row
+like every other.
+
+Rather than duplicate `weblog_support`/`syslog_support`'s own hand-rolled
+line-grammar parsers a second time, each module's existing per-record
+parsing logic (previously inlined directly in `columns_from_weblog`'s/
+`columns_from_syslog`'s own loop body) was extracted into a private
+`parse_record_values(line, ..., line_no) -> Result<Vec<Option<String>>>`
+helper, so the profiling reader and the new `--sql-mode inline` second
+pass (`stream_weblog_rows_for_sql`/`stream_syslog_rows_for_sql`, both
+`pub(crate)`) share one parsing implementation instead of risking two
+independently-written copies drifting apart - a pure extraction, verified
+as such by the complete existing weblog/syslog test suite passing
+unchanged with zero test modifications needed. `render_sql_inline_flat`
+gained two new small wrapper functions (`render_sql_inline_flat_weblog`/
+`render_sql_inline_flat_syslog`), each `#[cfg(feature = "weblog"/"syslog")]`
+-gated with the same "rebuild with --features" stub every other optional
+format's own reader already has - safe to call unconditionally from the
+otherwise-unguarded `render_sql_inline_flat`, since reaching either match
+arm at all already requires the real profiling reader (itself feature-
+gated identically) to have succeeded first. `render_sql`'s own
+`inline_supported` check, and `--load-into`'s matching format-validation
+check, both gained the four new variants.
+
+Verified against a real, installed SQLite build with **no separate load
+step**, across all four formats (`sample_combined.log`/`sample_common.log`
+via `--format combined-log`/`common-log`, `sample_rfc3164.log`/
+`sample_rfc5424.log` via `--format syslog`/`syslog5424`, each piped
+straight into `--load-into sqlite:...`): every real value from the
+fixture - including a request's split `method`/`path`/`protocol`
+columns, syslog's decoded `facility`/`severity` names, and every one of
+the formats' own `-`/nilvalue placeholders landing as a genuine `NULL`,
+not the literal sentinel text - matched the source lines exactly when
+queried back out. Also verified as a pure extraction, not a behavior
+change, for the already-shipped CSV/TSV/fixed-width case: `diff`
+confirmed byte-identical inline SQL output against the pre-Phase-2
+binary. Clean across every individually plausible feature combination
+(default, `weblog`, `syslog`, `full`), matching each one's own
+established baseline exactly - the new integration tests are themselves
+`#[cfg(feature = "weblog"/"syslog")]`-gated, since `--format common-log`/
+`syslog`/etc. dispatch to a real reader that only exists in those builds.
 
 ## Directory-input batch mode
 

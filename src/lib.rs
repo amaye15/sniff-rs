@@ -6394,6 +6394,57 @@ mod weblog_support {
         if s == "-" { None } else { Some(s.to_string()) }
     }
 
+    /// Parses one already-read line into its record's values, in the
+    /// exact column order `columns_from_weblog`/`render_sql_inline_flat`'s
+    /// own weblog row-source both rely on (host, ident, authuser,
+    /// timestamp, method, path, protocol, status, bytes[, referer,
+    /// user_agent]) - factored out so the profiling reader below and the
+    /// `--sql-mode inline` second pass share the identical parsing logic
+    /// rather than risking two independently-written copies drifting
+    /// apart.
+    fn parse_record_values(
+        line: &str,
+        combined: bool,
+        line_no: usize,
+    ) -> Result<Vec<Option<String>>> {
+        let format_name = if combined {
+            "Combined Log"
+        } else {
+            "Common Log"
+        };
+        let caps = parse_line(line, combined).ok_or_else(|| {
+            anyhow!(
+                "line {} doesn't match {format_name} Format: {line:?}",
+                line_no + 1
+            )
+        })?;
+
+        let (method, req_path, protocol) = match parse_request_line(caps[4]) {
+            Some((m, p, pr)) => (
+                Some(m.to_string()),
+                Some(p.to_string()),
+                Some(pr.to_string()),
+            ),
+            None => (None, None, None),
+        };
+        let mut values = vec![
+            dash_to_none(caps[0]),
+            dash_to_none(caps[1]),
+            dash_to_none(caps[2]),
+            Some(caps[3].to_string()),
+            method,
+            req_path,
+            protocol,
+            dash_to_none(caps[5]),
+            dash_to_none(caps[6]),
+        ];
+        if combined {
+            values.push(dash_to_none(caps[7]));
+            values.push(dash_to_none(caps[8]));
+        }
+        Ok(values)
+    }
+
     /// Streams `path` a line at a time via `BufReader::lines()` rather
     /// than `fs::read_to_string`-ing the whole file - a Common/Combined
     /// Log Format line, like fixed-width text, is a complete, independent
@@ -6438,41 +6489,7 @@ mod weblog_support {
             if nrows.is_some_and(|limit| total >= limit) {
                 break;
             }
-            let format_name = if combined {
-                "Combined Log"
-            } else {
-                "Common Log"
-            };
-            let caps = parse_line(&line, combined).ok_or_else(|| {
-                anyhow!(
-                    "line {} doesn't match {format_name} Format: {line:?}",
-                    line_no + 1
-                )
-            })?;
-
-            let (method, req_path, protocol) = match parse_request_line(caps[4]) {
-                Some((m, p, pr)) => (
-                    Some(m.to_string()),
-                    Some(p.to_string()),
-                    Some(pr.to_string()),
-                ),
-                None => (None, None, None),
-            };
-            let mut values = vec![
-                dash_to_none(caps[0]),
-                dash_to_none(caps[1]),
-                dash_to_none(caps[2]),
-                Some(caps[3].to_string()),
-                method,
-                req_path,
-                protocol,
-                dash_to_none(caps[5]),
-                dash_to_none(caps[6]),
-            ];
-            if combined {
-                values.push(dash_to_none(caps[7]));
-                values.push(dash_to_none(caps[8]));
-            }
+            let values = parse_record_values(&line, combined, line_no)?;
             for (col_idx, value) in values.into_iter().enumerate() {
                 raw[col_idx].push(value);
             }
@@ -6500,6 +6517,38 @@ mod weblog_support {
             });
         }
         Ok(columns)
+    }
+
+    /// The weblog row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass: identical line-reading/parsing to
+    /// `columns_from_weblog` above (via the shared `parse_record_values`),
+    /// but folds each record straight into `sink.accept` instead of a
+    /// per-column accumulator. Common/Combined Log has no header row at
+    /// all - every line is a data record, unlike CSV/fixed-width - so
+    /// `sink.has_header` must already be `false` for this row-source
+    /// (set by `render_sql_inline_flat`'s own construction site), or the
+    /// very first record would be silently misread as a header line.
+    pub(crate) fn stream_weblog_rows_for_sql(
+        path: &Path,
+        combined: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        use std::io::BufRead;
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let lines = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines();
+
+        for (line_no, line) in lines.enumerate() {
+            if sink.done {
+                break;
+            }
+            let line = line.with_context(|| format!("failed to read {path:?}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let values = parse_record_values(&line, combined, line_no)?;
+            sink.accept(values)?;
+        }
+        Ok(())
     }
 } // mod weblog_support
 
@@ -6851,6 +6900,65 @@ mod syslog_support {
         Some((pri, timestamp, hostname, tag, pid, message))
     }
 
+    /// Parses one already-read line into its record's values, in the
+    /// exact column order `columns_from_syslog`/`render_sql_inline_flat`'s
+    /// own syslog row-source both rely on - factored out so the profiling
+    /// reader below and the `--sql-mode inline` second pass share the
+    /// identical parsing logic rather than risking two independently-
+    /// written copies drifting apart.
+    fn parse_record_values(
+        line: &str,
+        rfc5424: bool,
+        line_no: usize,
+    ) -> Result<Vec<Option<String>>> {
+        let format_name = if rfc5424 { "RFC 5424" } else { "RFC 3164" };
+
+        if rfc5424 {
+            let caps = parse_rfc5424_line(line).ok_or_else(|| {
+                anyhow!(
+                    "line {} doesn't match syslog {format_name}: {line:?}",
+                    line_no + 1
+                )
+            })?;
+            let pri: u32 = caps[0]
+                .parse()
+                .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
+            Ok(vec![
+                Some(syslog_facility_name(pri)),
+                Some(syslog_severity_name(pri)),
+                Some(caps[1].to_string()),
+                Some(caps[2].to_string()),
+                dash_to_none(caps[3]),
+                dash_to_none(caps[4]),
+                dash_to_none(caps[5]),
+                dash_to_none(caps[6]),
+                dash_to_none(caps[7]),
+                Some(caps[8].to_string()),
+            ])
+        } else {
+            let (pri, timestamp, hostname, tag, pid, message) = parse_rfc3164_line(line)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "line {} doesn't match syslog {format_name}: {line:?}",
+                        line_no + 1
+                    )
+                })?;
+            let pri: Option<u32> = pri
+                .map(str::parse)
+                .transpose()
+                .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
+            Ok(vec![
+                pri.map(syslog_facility_name),
+                pri.map(syslog_severity_name),
+                Some(timestamp.to_string()),
+                Some(hostname.to_string()),
+                Some(tag.to_string()),
+                pid.map(str::to_string),
+                Some(message.to_string()),
+            ])
+        }
+    }
+
     /// Streams `path` a line at a time - see `columns_from_weblog`'s own
     /// doc comment for why a syslog line, like a web access log line, is
     /// safely streamable with nothing more than `BufRead::lines()`.
@@ -6898,52 +7006,7 @@ mod syslog_support {
             if nrows.is_some_and(|limit| total >= limit) {
                 break;
             }
-            let format_name = if rfc5424 { "RFC 5424" } else { "RFC 3164" };
-
-            let values: Vec<Option<String>> = if rfc5424 {
-                let caps = parse_rfc5424_line(&line).ok_or_else(|| {
-                    anyhow!(
-                        "line {} doesn't match syslog {format_name}: {line:?}",
-                        line_no + 1
-                    )
-                })?;
-                let pri: u32 = caps[0]
-                    .parse()
-                    .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
-                vec![
-                    Some(syslog_facility_name(pri)),
-                    Some(syslog_severity_name(pri)),
-                    Some(caps[1].to_string()),
-                    Some(caps[2].to_string()),
-                    dash_to_none(caps[3]),
-                    dash_to_none(caps[4]),
-                    dash_to_none(caps[5]),
-                    dash_to_none(caps[6]),
-                    dash_to_none(caps[7]),
-                    Some(caps[8].to_string()),
-                ]
-            } else {
-                let (pri, timestamp, hostname, tag, pid, message) = parse_rfc3164_line(&line)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "line {} doesn't match syslog {format_name}: {line:?}",
-                            line_no + 1
-                        )
-                    })?;
-                let pri: Option<u32> = pri
-                    .map(str::parse)
-                    .transpose()
-                    .with_context(|| format!("line {}: PRI isn't a number", line_no + 1))?;
-                vec![
-                    pri.map(syslog_facility_name),
-                    pri.map(syslog_severity_name),
-                    Some(timestamp.to_string()),
-                    Some(hostname.to_string()),
-                    Some(tag.to_string()),
-                    pid.map(str::to_string),
-                    Some(message.to_string()),
-                ]
-            };
+            let values = parse_record_values(&line, rfc5424, line_no)?;
             for (col_idx, value) in values.into_iter().enumerate() {
                 raw[col_idx].push(value);
             }
@@ -6971,6 +7034,34 @@ mod syslog_support {
             });
         }
         Ok(columns)
+    }
+
+    /// The syslog row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass - see `stream_weblog_rows_for_sql`'s own doc
+    /// comment for why `sink.has_header` must already be `false` here
+    /// too: neither RFC 3164 nor RFC 5424 has a header line, every line
+    /// is a data record.
+    pub(crate) fn stream_syslog_rows_for_sql(
+        path: &Path,
+        rfc5424: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        use std::io::BufRead;
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let lines = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines();
+
+        for (line_no, line) in lines.enumerate() {
+            if sink.done {
+                break;
+            }
+            let line = line.with_context(|| format!("failed to read {path:?}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let values = parse_record_values(&line, rfc5424, line_no)?;
+            sink.accept(values)?;
+        }
+        Ok(())
     }
 } // mod syslog_support
 
@@ -50962,6 +51053,14 @@ fn sql_literal_for_value(raw: &str, ideal_type: &str) -> String {
 /// handles correctly with no special-casing needed.
 struct InlineRowSink<'a> {
     resolved_skip_rows: usize,
+    // Whether this row-source's records include a leading header row at
+    // all. CSV/fixed-width both do (record_index == resolved_skip_rows
+    // names the header); Common/Combined Log and syslog have no header
+    // concept whatsoever - every line is a data record - so treating
+    // their first record as a header would silently drop it. See
+    // `render_sql_inline_flat`'s own construction site for which formats
+    // set this to `false`.
+    has_header: bool,
     nrows: Option<usize>,
     header_len: usize,
     ideal_types: &'a [&'a str],
@@ -51009,7 +51108,7 @@ impl InlineRowSink<'_> {
         if self.record_index < self.resolved_skip_rows {
             // A skipped leading row - discarded, never even reaching the
             // header or a data row.
-        } else if self.record_index == self.resolved_skip_rows {
+        } else if self.has_header && self.record_index == self.resolved_skip_rows {
             // The header row itself - already reflected in `ideal_types`
             // via the real profiling pass, not a data row to emit; only
             // its width is worth a sanity check here.
@@ -51201,8 +51300,20 @@ fn render_sql_inline_flat(
     // is written lazily instead, only once real row content follows.
     writeln!(sink, "\n);")?;
 
+    // Common/Combined Log and syslog have no header row at all - every
+    // line is a data record - unlike CSV/fixed-width, which both name
+    // their header via `resolved_skip_rows`. See `InlineRowSink::
+    // has_header`'s own doc comment.
+    let has_header = !matches!(
+        format,
+        InputFormat::CommonLog
+            | InputFormat::CombinedLog
+            | InputFormat::Syslog
+            | InputFormat::Syslog5424
+    );
     let mut sink = InlineRowSink {
         resolved_skip_rows,
+        has_header,
         nrows: args.nrows,
         header_len: profiles.len(),
         ideal_types: &ideal_types,
@@ -51225,6 +51336,10 @@ fn render_sql_inline_flat(
             })?;
             render_sql_inline_flat_fixed_width(read_path, widths, &mut sink)?;
         }
+        InputFormat::CommonLog => render_sql_inline_flat_weblog(read_path, false, &mut sink)?,
+        InputFormat::CombinedLog => render_sql_inline_flat_weblog(read_path, true, &mut sink)?,
+        InputFormat::Syslog => render_sql_inline_flat_syslog(read_path, false, &mut sink)?,
+        InputFormat::Syslog5424 => render_sql_inline_flat_syslog(read_path, true, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -51238,6 +51353,59 @@ fn render_sql_inline_flat(
     }
 
     sink.flush_batch()
+}
+
+/// The Common/Combined Log Format row-source for `render_sql_inline_flat`,
+/// delegating to `weblog_support`'s own streaming parser (see that
+/// module's `stream_weblog_rows_for_sql`), gated behind `--features
+/// weblog` the same way `columns_from_weblog` already is. Safe to call
+/// unconditionally from `render_sql_inline_flat` even in a non-`weblog`
+/// build: this is only ever reached for `InputFormat::CommonLog`/
+/// `CombinedLog`, and dispatching those formats at all already requires
+/// the real `columns_from_weblog` profiling reader to have succeeded
+/// first - which itself bails with an actionable "rebuild with
+/// --features weblog" error long before rendering ever starts.
+#[cfg(feature = "weblog")]
+fn render_sql_inline_flat_weblog(
+    read_path: &Path,
+    combined: bool,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    weblog_support::stream_weblog_rows_for_sql(read_path, combined, sink)
+}
+
+#[cfg(not(feature = "weblog"))]
+fn render_sql_inline_flat_weblog(
+    _read_path: &Path,
+    _combined: bool,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "weblog support isn't compiled in - rebuild with `cargo build --release --features weblog` (or --features full)"
+    )
+}
+
+/// The syslog row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`syslog` build.
+#[cfg(feature = "syslog")]
+fn render_sql_inline_flat_syslog(
+    read_path: &Path,
+    rfc5424: bool,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    syslog_support::stream_syslog_rows_for_sql(read_path, rfc5424, sink)
+}
+
+#[cfg(not(feature = "syslog"))]
+fn render_sql_inline_flat_syslog(
+    _read_path: &Path,
+    _rfc5424: bool,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "syslog support isn't compiled in - rebuild with `cargo build --release --features syslog` (or --features full)"
+    )
 }
 
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
@@ -51350,18 +51518,24 @@ fn render_sql(
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier - see
     // `render_sql_inline_flat`'s own doc comment for the full list this
-    // is expected to grow into (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy,
-    // the log formats) one fully-verified format at a time, matching
-    // this project's own established multi-format-campaign practice.
+    // is expected to grow into (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy)
+    // one fully-verified format at a time, matching this project's own
+    // established multi-format-campaign practice.
     let inline_supported = matches!(
         format,
-        InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
+        InputFormat::Csv
+            | InputFormat::Tsv
+            | InputFormat::FixedWidth
+            | InputFormat::CommonLog
+            | InputFormat::CombinedLog
+            | InputFormat::Syslog
+            | InputFormat::Syslog5424
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424 are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -58033,11 +58207,17 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if load_target.is_some()
         && !matches!(
             format,
-            InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
+            InputFormat::Csv
+                | InputFormat::Tsv
+                | InputFormat::FixedWidth
+                | InputFormat::CommonLog
+                | InputFormat::CombinedLog
+                | InputFormat::Syslog
+                | InputFormat::Syslog5424
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424 are supported so far",
             format.as_str()
         );
     }

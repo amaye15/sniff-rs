@@ -801,6 +801,102 @@ fn load_into_accepts_fixed_width_text() {
 }
 
 #[test]
+#[cfg(feature = "weblog")]
+fn sql_output_inline_mode_supports_combined_log() {
+    // Phase 2 of the "any format" rollout: inline mode now covers
+    // Common/Combined Log Format and syslog too, not just CSV/TSV/
+    // fixed-width - all four are headerless (every line is a data
+    // record), unlike CSV/fixed-width's own header row.
+    let sql = run_sql("sample_combined.log", &["--format", "combined-log"]);
+    assert!(!sql.contains("CREATE TABLE \"sample_combined_staging\""));
+    assert!(sql.contains("CREATE TABLE \"sample_combined\""));
+    assert!(sql.contains("INSERT INTO \"sample_combined\""));
+    // A real value from the fixture's very first line - if the headerless
+    // row-source mistakenly treated it as a header, it would never appear
+    // as literal data at all.
+    assert!(sql.contains("'127.0.0.1'"));
+    assert!(sql.contains("'frank'"));
+    assert!(sql.contains("'GET'"));
+    // The fixture's own "-" placeholders (ident/authuser/referer on the
+    // second and third lines) resolve to a bare NULL, not the literal
+    // sentinel text.
+    assert!(sql.contains(", NULL,") || sql.contains(", NULL)"));
+}
+
+#[test]
+#[cfg(feature = "weblog")]
+fn sql_output_inline_mode_supports_common_log() {
+    let sql = run_sql("sample_common.log", &["--format", "common-log"]);
+    assert!(sql.contains("CREATE TABLE \"sample_common\""));
+    assert!(sql.contains("INSERT INTO \"sample_common\""));
+    assert!(sql.contains("'192.168.1.5'"));
+}
+
+#[test]
+#[cfg(feature = "syslog")]
+fn sql_output_inline_mode_supports_syslog_rfc3164() {
+    let sql = run_sql("sample_rfc3164.log", &["--format", "syslog"]);
+    assert!(sql.contains("CREATE TABLE \"sample_rfc3164\""));
+    assert!(sql.contains("INSERT INTO \"sample_rfc3164\""));
+    // PRI is decoded into real facility/severity names, not left as a
+    // raw number - the first line's <34> is auth/critical.
+    assert!(sql.contains("'auth'"));
+    assert!(sql.contains("'critical'"));
+    assert!(sql.contains("'mymachine'"));
+}
+
+#[test]
+#[cfg(feature = "syslog")]
+fn sql_output_inline_mode_supports_syslog_rfc5424() {
+    let sql = run_sql("sample_rfc5424.log", &["--format", "syslog5424"]);
+    assert!(sql.contains("CREATE TABLE \"sample_rfc5424\""));
+    assert!(sql.contains("INSERT INTO \"sample_rfc5424\""));
+    assert!(sql.contains("'mymachine.example.com'"));
+    // The second line's own nilvalue ("-") app_name/procid/msgid/
+    // structured_data fields resolve to NULL, not the literal "-".
+    assert!(!sql.contains("'-'"));
+}
+
+#[test]
+#[cfg(feature = "weblog")]
+fn sql_output_inline_mode_log_formats_respect_nrows() {
+    let sql = run_sql(
+        "sample_combined.log",
+        &["--format", "combined-log", "--nrows", "1"],
+    );
+    assert!(sql.contains("'127.0.0.1'"));
+    assert!(!sql.contains("'192.168.1.5'"));
+    assert!(!sql.contains("'203.0.113.9'"));
+}
+
+#[test]
+fn load_into_accepts_log_formats() {
+    // Same structural check as load_into_accepts_fixed_width_text above,
+    // for the newly-supported log formats.
+    for fmt in ["common-log", "combined-log", "syslog", "syslog5424"] {
+        let output = Command::new(bin())
+            .args([
+                fixture("sample_rfc3164.log").to_str().unwrap(),
+                "--format",
+                fmt,
+                "--output-format",
+                "sql",
+                "--load-into",
+                "bogus",
+            ])
+            .output()
+            .expect("failed to run binary");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(&format!("isn't available yet for {fmt}")),
+            "unexpected rejection for {fmt}: {stderr}"
+        );
+        assert!(stderr.contains("must be in the form <engine>:<target>"));
+    }
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no
