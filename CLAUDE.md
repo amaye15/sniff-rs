@@ -314,14 +314,48 @@ guessing:
 SQL script (`sql`) — a fourth rendering, and the only one that's meant to
 be *run* rather than read. `--sql-mode` picks between two genuinely
 different shapes: `inline` (the default) and `staging` (the original
-shape, kept for large files - see below). Both are CSV/TSV-only so far;
-every other format transparently falls back to `staging` with a disclosed
-stderr note (`--sql-mode inline` given *explicitly* on an unsupported
-format is a hard error instead, naming the gap - downgrading what was
-explicitly asked for would be the wrong kind of quiet). Extending inline
-mode to the remaining ~28 formats is explicit, disclosed future work (see
-the Streaming section's own "one format at a time" precedent for how
-every other multi-format campaign in this project has always rolled out).
+shape, kept for large files - see below). `staging` mode already works
+for every format (it never embeds per-row data, so there's no format-
+specific row-source to build); `inline` mode covers CSV, TSV, and
+fixed-width text so far - every other format transparently falls back to
+`staging` with a disclosed stderr note (`--sql-mode inline` given
+*explicitly* on an unsupported format is a hard error instead, naming the
+gap - downgrading what was explicitly asked for would be the wrong kind
+of quiet).
+
+Extending inline mode further is explicit, disclosed, staged future
+work, following this project's own "one format at a time, fully verified"
+precedent (see the Streaming section's own history for how every other
+multi-format campaign here has always rolled out) rather than one large
+unverified jump to "every format." sniff-rs's ~30 input formats split
+into three structurally different shapes for this purpose, and each
+needs its own real design, not just repeating the same pattern:
+
+1. **The rest of the flat, fixed-column, one-row-per-record tier**
+   (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy, Common/Combined Log,
+   syslog) - CSV/TSV/fixed-width already prove the shape
+   (`InlineRowSink`/`ColumnAccumulatorState`'s own generalized `accept`),
+   but each of these needs its own real "read one row a second time"
+   plumbing (a binary-format re-parse, not just a text re-scan) and its
+   own end-to-end verification against a real engine before being
+   trusted.
+2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
+   `dispatch_reader` already returns `Vec<(String, Vec<ColumnProfile>)>`
+   for these; `render_sql`'s inline branch currently assumes exactly one
+   table (`tables.iter().next()`), which needs to become a genuine
+   per-table loop, each table getting its own `CREATE TABLE`/`INSERT`
+   pair, reusing whichever row-source its own format tier ultimately
+   supports.
+3. **The recursively-nested, JSON-bridge tier** (JSON, YAML, TOML, Avro,
+   MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
+   iCalendar, MBOX) - the hardest tier: there's no existing function that
+   flattens a *single* record into a flat row matching the dot-notation
+   column set `JsonPathAccumulator` already produces (that accumulator
+   only ever absorbs values incrementally across *all* records at once).
+   A pooled array column (`Vec<T>`) is also fundamentally one-to-many
+   relative to its parent record, not one more scalar cell, and needs a
+   settled text serialization for a single row's own cell before this
+   tier can start.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -530,6 +564,57 @@ known a real one follows (`InlineCsvRowSink::separator_written`) - a zero
 trailing. Verified as a pure refactor, not a behavior change: `diff`
 confirmed byte-identical output against the pre-refactor binary across
 the entire CSV/TSV fixture corpus.
+
+**Phase 1 of "extend inline mode beyond CSV/TSV": fixed-width text.**
+Prompted directly by the user wanting inline mode to "work for any
+format" - a genuinely large, three-tier undertaking (see the tiered
+roadmap above), so this phase deliberately covers exactly one new format,
+chosen to prove the *generalized* emitter abstraction works for a second,
+independently-shaped format rather than just adding one line to a list.
+`InlineCsvRowSink` is generalized to `InlineRowSink`, whose `accept` now
+takes `Vec<Option<String>>` instead of a raw `Vec<String>` - `None` means
+"known missing" (bypasses text-based sentinel detection entirely, a
+bypass no current caller needs yet but future native-null formats like
+Stata/SAS7BDAT/SPSS will), and `Some(raw)` still runs through
+`sql_literal_for_value` (renamed from `sql_literal_for_csv_value` - the
+logic was always format-agnostic, only the name was CSV-specific) exactly
+as before. `render_sql_inline_csv` is renamed `render_sql_inline_flat`
+and gains a small per-format front end: everything from `CREATE TABLE`
+through constructing `InlineRowSink` stays unchanged and format-agnostic;
+only the "how do I get the next row" loop is now a `match` on
+`InputFormat`, with a new `render_sql_inline_flat_fixed_width` function
+alongside the existing `render_sql_inline_flat_csv` one, calling
+`BufReader::lines()`+`slice_fixed_width` - the identical loop
+`columns_from_fixed_width` already runs for Pass 1, reused as a genuine
+second pass over the same file for Pass 2, deliberately replicating that
+function's own subtle asymmetry (the header line is never blank-checked,
+only data lines are) rather than accidentally diverging from it.
+`render_sql`'s own `inline_supported` check gains `| InputFormat::
+FixedWidth`.
+
+Refactoring this surfaced a real, pre-existing bug, not introduced by
+this phase but found while generalizing past it: the old code hardcoded
+`let delim = if matches!(format, InputFormat::Tsv) { '\t' } else { ',' };`
+for inline mode's own CSV row-source, completely ignoring a user-supplied
+`--delimiter` - Pass 1 (`dispatch_reader`) correctly used `args.delimiter
+.unwrap_or(...)`, but Pass 2 silently used the hardcoded default
+regardless, so a `--delimiter ';'` CSV would profile correctly but emit
+inline SQL parsed against the wrong separator. Fixed by moving delimiter
+resolution inside `render_sql_inline_flat`'s own per-format dispatch,
+matching `dispatch_reader`'s own logic exactly - confirmed directly by
+generating inline SQL for a semicolon-delimited file with `--delimiter
+';'` and checking the resulting `CREATE TABLE`/`INSERT` both split into
+the correct number of columns.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `--format fixed-width --widths ... --output-format sql
+--load-into sqlite:...` on `tests/fixtures/sample.fwf`, querying the
+resulting table back out and confirming every real value - including the
+fixture's one genuinely blank `age` field landing as a real `NULL`, not a
+fabricated `0` - matches the source file exactly. Also verified as a pure
+generalization, not a behavior change, for the already-shipped CSV/TSV
+case: `diff` confirmed byte-identical inline SQL output against the
+pre-refactor binary across the entire CSV/TSV fixture corpus.
 
 ## Directory-input batch mode
 

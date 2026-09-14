@@ -733,6 +733,74 @@ fn sql_output_inline_mode_disambiguates_a_duplicate_csv_header_column() {
 }
 
 #[test]
+fn sql_output_inline_mode_supports_fixed_width_text() {
+    // Phase 1 of the "any format" rollout: inline mode now covers
+    // fixed-width text too, not just CSV/TSV - same shape as the CSV
+    // inline test above (no staging table, real literal data embedded
+    // directly), just reached via --format fixed-width --widths instead
+    // of extension-based detection.
+    let sql = run_sql(
+        "sample.fwf",
+        &["--format", "fixed-width", "--widths", "8,4,9,8"],
+    );
+    assert!(!sql.contains("CREATE TABLE \"sample_staging\""));
+    assert!(sql.contains("CREATE TABLE \"sample\""));
+    assert!(sql.contains("INSERT INTO \"sample\""));
+    // Real values from the fixture appear verbatim as literals.
+    assert!(sql.contains("'U1001'"));
+    assert!(sql.contains("'gold'"));
+    // The fixture's one genuinely blank "age" field is a bare NULL, not
+    // a fabricated 0.
+    assert!(sql.contains(", NULL,") || sql.contains(", NULL)"));
+}
+
+#[test]
+fn sql_output_inline_mode_fixed_width_respects_nrows() {
+    let sql = run_sql(
+        "sample.fwf",
+        &[
+            "--format",
+            "fixed-width",
+            "--widths",
+            "8,4,9,8",
+            "--nrows",
+            "1",
+        ],
+    );
+    assert!(sql.contains("'U1001'"));
+    assert!(!sql.contains("'U1002'"));
+    assert!(!sql.contains("'U1003'"));
+}
+
+#[test]
+fn load_into_accepts_fixed_width_text() {
+    // --load-into no longer rejects fixed-width now that inline mode
+    // supports it - validated structurally (a malformed target still
+    // errors, but with the *target* error, never the
+    // "isn't available yet for fixed-width" format-rejection message),
+    // matching this project's standing precedent of never spawning a
+    // real external database process inside `cargo test`.
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.fwf").to_str().unwrap(),
+            "--format",
+            "fixed-width",
+            "--widths",
+            "8,4,9,8",
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for fixed-width"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

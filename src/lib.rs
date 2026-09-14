@@ -2934,7 +2934,7 @@ struct Args {
     /// --output-format sql only: "inline" (the default when unset - the
     /// whole dataset is embedded as literal INSERT statements, so the
     /// script needs no separate load step at all on SQLite/DuckDB/
-    /// PostgreSQL/MySQL - see render_sql_inline_csv) or "staging" (the
+    /// PostgreSQL/MySQL - see render_sql_inline_flat) or "staging" (the
     /// original shape: a raw TEXT staging table plus a per-engine load-
     /// command comment block and a CAST-based INSERT, better suited to a
     /// file too large to comfortably embed as literal SQL - see
@@ -50695,7 +50695,7 @@ fn sql_load_hint(
 /// a per-engine load-command comment block, and a `CAST`-based `INSERT
 /// ... SELECT`. This is the original, still-supported shape - unchanged
 /// since it first shipped, and untouched by the newer, now-default
-/// `--sql-mode inline` (`render_sql_inline_csv`) added alongside it -
+/// `--sql-mode inline` (`render_sql_inline_flat`) added alongside it -
 /// better suited to a file too large to comfortably embed as literal SQL
 /// (see `render_sql`, the dispatcher between the two modes).
 fn render_sql_staging(
@@ -50871,12 +50871,17 @@ fn sql_bool_literal(trimmed: &str) -> &'static str {
     }
 }
 
-/// Formats one raw CSV field as the literal that goes inside an inline
+/// Formats one raw field as the literal that goes inside an inline
 /// `INSERT ... VALUES (...)` tuple, using the column's already-finalized
-/// `ideal_type` from the real profiling pass. A value already known to be
-/// missing becomes a bare `NULL` (reusing the exact same
-/// `is_missing_sentinel` check `CsvColumnAccumulator::accept` already
-/// applied in the profiling pass, so a value profiled as missing there is
+/// `ideal_type` from the real profiling pass. Shared by every flat,
+/// text-based row-source `InlineRowSink` reads from (today: CSV/TSV,
+/// fixed-width text) - a format with a genuinely *native* null (a binary
+/// missing marker with no text form at all) skips this function entirely
+/// for that value, passing `None` straight into `InlineRowSink::accept`
+/// instead. A value already known to be missing becomes a bare `NULL`
+/// (reusing the exact same `is_missing_sentinel` check
+/// `CsvColumnAccumulator::accept`/`columns_from_fixed_width` already
+/// apply in the profiling pass, so a value profiled as missing there is
 /// *always* `NULL` here, never re-litigated differently); a numeric
 /// column's value is run through the same `normalize_numeric_str` cleanup
 /// that let it resolve to a numeric type at all, then emitted unquoted -
@@ -50891,7 +50896,7 @@ fn sql_bool_literal(trimmed: &str) -> &'static str {
 /// date/time value, kept as its own raw ISO text, and a `Vec<T>`/
 /// `mixed(...)` column, which can't actually occur for a flat CSV cell in
 /// the first place - is a plain quoted string.
-fn sql_literal_for_csv_value(raw: &str, ideal_type: &str) -> String {
+fn sql_literal_for_value(raw: &str, ideal_type: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() || is_missing_sentinel(trimmed) {
         return "NULL".to_string();
@@ -50931,17 +50936,31 @@ fn sql_literal_for_csv_value(raw: &str, ideal_type: &str) -> String {
     }
 }
 
-/// The `--sql-mode inline` counterpart to `CsvColumnAccumulator`: instead
-/// of folding each row into a per-column type-detection accumulator, this
-/// folds each row into a batched `INSERT ... VALUES` statement, writing
-/// each completed batch straight to `sink` as soon as it fills rather
-/// than accumulating the whole script in memory first - the entire point
-/// of this being a sink and not a `String` (see `render_sql_inline_csv`'s
-/// own doc comment). Mirrors `CsvColumnAccumulator::accept`'s exact
-/// three-way `record_index` branch (skip a leading row / the header row /
-/// a real data row) so this second pass over the same file can never
-/// disagree with the first pass about which row is which.
-struct InlineCsvRowSink<'a> {
+/// The `--sql-mode inline` counterpart to `CsvColumnAccumulator`/
+/// `ColumnAccumulatorState`: instead of folding each row into a
+/// per-column type-detection accumulator, this folds each row into a
+/// batched `INSERT ... VALUES` statement, writing each completed batch
+/// straight to `sink` as soon as it fills rather than accumulating the
+/// whole script in memory first - the entire point of this being a sink
+/// and not a `String` (see `render_sql_inline_flat`'s own doc comment).
+/// Generalized from a CSV-only version (`InlineCsvRowSink`) once
+/// fixed-width text needed the identical batching/formatting logic with
+/// a different row source underneath: `accept` takes a
+/// `Vec<Option<String>>` rather than a raw `Vec<String>` specifically so
+/// a *future* row-source with a genuinely native null (a binary missing
+/// marker with no text form - Stata's `.`, SAS7BDAT/SPSS's own declared-
+/// missing values, ...) can pass `None` directly, bypassing
+/// `sql_literal_for_value`'s own text-based `is_missing_sentinel` check
+/// entirely; every row-source today (CSV/TSV, fixed-width) still always
+/// passes `Some(field)` and lets that check do the work, exactly
+/// preserving today's behavior. Mirrors `CsvColumnAccumulator::accept`'s
+/// exact three-way `record_index` branch (skip a leading row / the
+/// header row / a real data row) so this second pass over the same file
+/// can never disagree with the first pass about which row is which -
+/// `resolved_skip_rows` is simply always `0` for a format with no
+/// `--skip-rows` concept (fixed-width), which this same branch already
+/// handles correctly with no special-casing needed.
+struct InlineRowSink<'a> {
     resolved_skip_rows: usize,
     nrows: Option<usize>,
     header_len: usize,
@@ -50966,7 +50985,7 @@ struct InlineCsvRowSink<'a> {
     done: bool,
 }
 
-impl InlineCsvRowSink<'_> {
+impl InlineRowSink<'_> {
     fn flush_batch(&mut self) -> Result<()> {
         if self.batch.is_empty() {
             return Ok(());
@@ -50986,7 +51005,7 @@ impl InlineCsvRowSink<'_> {
         Ok(())
     }
 
-    fn accept(&mut self, record: Vec<String>) -> Result<()> {
+    fn accept(&mut self, record: Vec<Option<String>>) -> Result<()> {
         if self.record_index < self.resolved_skip_rows {
             // A skipped leading row - discarded, never even reaching the
             // header or a data row.
@@ -50996,7 +51015,7 @@ impl InlineCsvRowSink<'_> {
             // its width is worth a sanity check here.
             if record.len() != self.header_len {
                 bail!(
-                    "CSV error: header row has {} fields, but profiling found {} columns",
+                    "header row has {} fields, but profiling found {} columns",
                     record.len(),
                     self.header_len
                 );
@@ -51006,7 +51025,7 @@ impl InlineCsvRowSink<'_> {
         } else {
             if record.len() != self.header_len {
                 bail!(
-                    "CSV error: found record with {} fields, but the header has {} fields",
+                    "found a record with {} fields, but the header has {} fields",
                     record.len(),
                     self.header_len
                 );
@@ -51014,7 +51033,10 @@ impl InlineCsvRowSink<'_> {
             let tuple = record
                 .iter()
                 .zip(self.ideal_types.iter())
-                .map(|(v, t)| sql_literal_for_csv_value(v, t))
+                .map(|(v, t)| match v {
+                    None => "NULL".to_string(),
+                    Some(raw) => sql_literal_for_value(raw, t),
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             self.batch.push(format!("    ({tuple})"));
@@ -51066,18 +51088,25 @@ fn sql_unique_column_names(profiles: &[ColumnProfile]) -> Vec<String> {
         .collect()
 }
 
-/// Builds the inline-mode script for one CSV/TSV table, writing it
-/// straight to `sink` (a file, stdout, or - for `--load-into` - a
-/// subprocess's own stdin) as it's produced, rather than building the
+/// Builds the inline-mode script for one table of a flat, fixed-column,
+/// one-row-per-record format (today: CSV/TSV, fixed-width text - see
+/// `render_sql`'s own `inline_supported` check for the exact list),
+/// writing it straight to `sink` (a file, stdout, or a subprocess's own
+/// stdin for `--load-into`) as it's produced, rather than building the
 /// whole thing as one `String` first: a single `CREATE TABLE` using the
 /// same types `--sql-mode staging` already uses (`sql_column_type` -
 /// unchanged, already verified correct for exactly the four engines this
-/// mode targets), then a second, independent pass over `read_path` (via
-/// the exact same `stream_utf8_chunks`/`csv_feed_chunk` primitives the
-/// real profiling pass already streams through - not a second, divergent
-/// CSV parser) that folds each row straight into batched `INSERT ...
-/// VALUES` statements through `InlineCsvRowSink`, each one flushed to
-/// `sink` the moment it fills. A second pass over the file is
+/// mode targets), then a second, independent pass over `read_path` that
+/// folds each row straight into batched `INSERT ... VALUES` statements
+/// through `InlineRowSink`, each one flushed to `sink` the moment it
+/// fills. Only the "how do I get the next row" loop actually differs per
+/// format - a small `match` on `format` below - reusing each format's
+/// own already-proven-out parsing primitives (CSV/TSV:
+/// `stream_utf8_chunks`+`csv_feed_chunk`, the exact ones the real
+/// profiling pass already streams through; fixed-width:
+/// `BufReader::lines()`+`slice_fixed_width`, the exact loop
+/// `columns_from_fixed_width` already runs) rather than a second,
+/// divergent parser for either. A second pass over the file is
 /// unavoidable, not a shortcut skipped: `ColumnProfile` never retains raw
 /// per-row values by design (the entire point of this project's own
 /// incremental-accumulator streaming work), so the only way to know both
@@ -51090,14 +51119,14 @@ fn sql_unique_column_names(profiles: &[ColumnProfile]) -> Vec<String> {
 /// shape this project's entire "Streaming reads / memory footprint"
 /// effort exists to eliminate everywhere else.
 #[allow(clippy::too_many_arguments)]
-fn render_sql_inline_csv(
+fn render_sql_inline_flat(
     file_name: &str,
     table_name: &str,
     profiles: &[ColumnProfile],
+    format: &InputFormat,
     read_path: &Path,
-    delim: char,
     resolved_skip_rows: usize,
-    nrows: Option<usize>,
+    args: &Args,
     sink: &mut dyn std::io::Write,
 ) -> Result<()> {
     let clean_file_name = file_name.replace(['\n', '\r'], " ");
@@ -51167,14 +51196,14 @@ fn render_sql_inline_csv(
             .join(",\n"),
     )?;
     // Deliberately just one trailing newline here, not a blank-line
-    // separator - see InlineCsvRowSink::flush_batch's own doc comment on
+    // separator - see InlineRowSink::flush_batch's own doc comment on
     // separator_written for why the blank line before the first INSERT
     // is written lazily instead, only once real row content follows.
     writeln!(sink, "\n);")?;
 
-    let mut sink = InlineCsvRowSink {
+    let mut sink = InlineRowSink {
         resolved_skip_rows,
-        nrows,
+        nrows: args.nrows,
         header_len: profiles.len(),
         ideal_types: &ideal_types,
         quoted_table: &quoted_table,
@@ -51187,6 +51216,42 @@ fn render_sql_inline_csv(
         done: false,
     };
 
+    match format {
+        InputFormat::FixedWidth => {
+            let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
+                anyhow!(
+                    "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
+                )
+            })?;
+            render_sql_inline_flat_fixed_width(read_path, widths, &mut sink)?;
+        }
+        _ => {
+            // CSV/TSV - every other format `render_sql`'s own
+            // `inline_supported` check allows through to this function.
+            let delim = if matches!(format, InputFormat::Tsv) {
+                args.delimiter.unwrap_or('\t')
+            } else {
+                args.delimiter.unwrap_or(',')
+            };
+            render_sql_inline_flat_csv(read_path, delim, &mut sink)?;
+        }
+    }
+
+    sink.flush_batch()
+}
+
+/// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
+/// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
+/// primitives the real profiling pass already uses, feeding each
+/// completed record into `sink.accept` (every field wrapped `Some(...)`,
+/// since `sql_literal_for_value`'s own `is_missing_sentinel` check
+/// resolves which ones are actually missing, exactly as it already did
+/// before this function existed).
+fn render_sql_inline_flat_csv(
+    read_path: &Path,
+    delim: char,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
     let mut csv_state = CsvState::StartRecord;
     let mut field = String::new();
     let mut record: Vec<String> = Vec::new();
@@ -51210,7 +51275,7 @@ fn render_sql_inline_csv(
             &mut csv_state,
             &mut field,
             &mut record,
-            &mut |r| sink.accept(r),
+            &mut |r| sink.accept(r.into_iter().map(Some).collect()),
         )?;
         Ok(!sink.done)
     })?;
@@ -51220,10 +51285,45 @@ fn render_sql_inline_csv(
     // pending" check `columns_from_csv` itself uses.
     if !sink.done && csv_state != CsvState::StartRecord {
         record.push(std::mem::take(&mut field));
-        sink.accept(std::mem::take(&mut record))?;
+        sink.accept(std::mem::take(&mut record).into_iter().map(Some).collect())?;
     }
 
-    sink.flush_batch()
+    Ok(())
+}
+
+/// The fixed-width row-source for `render_sql_inline_flat`: re-streams
+/// `read_path` via the exact same `BufReader::lines()`+`slice_fixed_width`
+/// loop `columns_from_fixed_width` already runs (`src/lib.rs`, this
+/// format's own profiling reader), feeding each line into `sink.accept`.
+/// The header line (index 0) is *never* blank-checked, matching
+/// `columns_from_fixed_width`'s own asymmetry exactly (its header comes
+/// from an unconditional `lines.next()` before the data loop's own
+/// blank-line skip ever runs) - only a data line (index > 0) that's
+/// entirely blank is skipped, the same "e.g. a trailing blank line at
+/// EOF" case that reader's own comment already documents.
+fn render_sql_inline_flat_fixed_width(
+    read_path: &Path,
+    widths: &[usize],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    use std::io::BufRead;
+    let file =
+        fs::File::open(read_path).with_context(|| format!("failed to open {read_path:?}"))?;
+    let lines = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines();
+    let mut scratch: Vec<char> = Vec::new();
+
+    for (idx, line) in lines.enumerate() {
+        if sink.done {
+            break;
+        }
+        let line = line.with_context(|| format!("failed to read {read_path:?}"))?;
+        if idx > 0 && line.trim().is_empty() {
+            continue; // e.g. a trailing blank line at EOF
+        }
+        let fields = slice_fixed_width(&line, widths, &mut scratch);
+        sink.accept(fields.into_iter().map(Some).collect())?;
+    }
+    Ok(())
 }
 
 /// The dispatcher between `--sql-mode inline` (new default) and
@@ -51235,7 +51335,7 @@ fn render_sql_inline_csv(
 /// small, row-count-independent `String` internally (that function is
 /// untouched; there's no genuine memory concern to fix there) and writes
 /// it to `sink` in one shot, while the inline branch hands `sink`
-/// straight to `render_sql_inline_csv`, which streams every row into it
+/// straight to `render_sql_inline_flat`, which streams every row into it
 /// directly instead of ever materializing the whole script in memory.
 fn render_sql(
     file_name: &str,
@@ -51248,12 +51348,20 @@ fn render_sql(
 ) -> Result<()> {
     let explicit = args.sql_mode.is_some();
     let mode = resolved_sql_mode(args)?;
-    let inline_supported = matches!(format, InputFormat::Csv | InputFormat::Tsv);
+    // The flat, fixed-column, one-row-per-record tier - see
+    // `render_sql_inline_flat`'s own doc comment for the full list this
+    // is expected to grow into (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy,
+    // the log formats) one fully-verified format at a time, matching
+    // this project's own established multi-format-campaign practice.
+    let inline_supported = matches!(
+        format,
+        InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
+    );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -51271,26 +51379,22 @@ fn render_sql(
             Ok(())
         }
         SqlMode::Inline => {
-            let delim = if matches!(format, InputFormat::Tsv) {
-                '\t'
-            } else {
-                ','
-            };
-            // CSV/TSV always produce exactly one implicit table (see
-            // `dispatch_reader`'s own `std::iter::once((file_stem,
-            // profiles))` for every non-multi-table format).
+            // Every format in `inline_supported` always produces exactly
+            // one implicit table (see `dispatch_reader`'s own
+            // `std::iter::once((file_stem, profiles))` for every
+            // non-multi-table format).
             let (table_name, profiles) = tables
                 .iter()
                 .next()
                 .ok_or_else(|| anyhow!("no table to render as SQL"))?;
-            render_sql_inline_csv(
+            render_sql_inline_flat(
                 file_name,
                 table_name,
                 profiles,
+                format,
                 read_path,
-                delim,
                 resolved_skip_rows,
-                args.nrows,
+                args,
                 sink,
             )
         }
@@ -57663,7 +57767,7 @@ fn dispatch_reader(
     // Only CSV/TSV ever set this to anything but 0 - it's the already-
     // resolved `skip_rows` (explicit `--skip-rows`, or auto-detected via
     // `detect_preamble_rows`), threaded back out so a second pass over
-    // the same file (`render_sql_inline_csv`'s own re-read) can reuse the
+    // the same file (`render_sql_inline_flat`'s own re-read) can reuse the
     // identical value instead of calling `resolve_skip_rows` a second
     // time - which would both cost a second preamble scan and print its
     // "detected N preamble row(s)..." stderr note twice for one run.
@@ -57926,9 +58030,14 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         .to_string_lossy()
         .into_owned();
 
-    if load_target.is_some() && !matches!(format, InputFormat::Csv | InputFormat::Tsv) {
+    if load_target.is_some()
+        && !matches!(
+            format,
+            InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
+        )
+    {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width are supported so far",
             format.as_str()
         );
     }
@@ -65289,15 +65398,15 @@ mod tests {
     }
 
     #[test]
-    fn sql_literal_for_csv_value_maps_a_missing_sentinel_to_a_bare_null() {
+    fn sql_literal_for_value_maps_a_missing_sentinel_to_a_bare_null() {
         for sentinel in ["", "NA", "n/a", "NULL", "-", "unknown", "  "] {
-            assert_eq!(sql_literal_for_csv_value(sentinel, "i64"), "NULL");
-            assert_eq!(sql_literal_for_csv_value(sentinel, "String"), "NULL");
+            assert_eq!(sql_literal_for_value(sentinel, "i64"), "NULL");
+            assert_eq!(sql_literal_for_value(sentinel, "String"), "NULL");
         }
     }
 
     #[test]
-    fn sql_literal_for_csv_value_quotes_a_non_finite_float_instead_of_a_bare_token() {
+    fn sql_literal_for_value_quotes_a_non_finite_float_instead_of_a_bare_token() {
         // Regression test for a real bug found by piping generated SQL
         // into a real sqlite3 build: a bare, unquoted `inf`/`-inf`/`nan`
         // token is not valid SQL numeric-literal syntax at all - SQLite
@@ -65309,10 +65418,10 @@ mod tests {
         // own default), so it resolves to NULL before ever reaching the
         // f64 branch at all, the same as it's excluded from typing
         // entirely in the real CSV reader's own Pass 1.
-        assert_eq!(sql_literal_for_csv_value("Infinity", "f64"), "'Infinity'");
-        assert_eq!(sql_literal_for_csv_value("-inf", "f64"), "'-inf'");
+        assert_eq!(sql_literal_for_value("Infinity", "f64"), "'Infinity'");
+        assert_eq!(sql_literal_for_value("-inf", "f64"), "'-inf'");
         // An ordinary finite float is untouched (still unquoted).
-        assert_eq!(sql_literal_for_csv_value("120.50", "f64"), "120.50");
+        assert_eq!(sql_literal_for_value("120.50", "f64"), "120.50");
     }
 
     #[test]
@@ -65360,56 +65469,53 @@ mod tests {
     }
 
     #[test]
-    fn sql_literal_for_csv_value_decodes_a_base_prefixed_int_literal_to_decimal() {
+    fn sql_literal_for_value_decodes_a_base_prefixed_int_literal_to_decimal() {
         // Regression test for a real bug found by eyeballing generated
         // SQL against a real `hex_value` column: ideal_type "i64" doesn't
         // always mean the raw text is already a plain ANSI decimal
         // numeral - parse_prefixed_int is the one grammar check that
         // resolves to "i64" from a "0x"/"0b"/"0o"-prefixed literal, which
         // isn't a numeric literal every SQL engine accepts unquoted.
-        assert_eq!(sql_literal_for_csv_value("0x1A", "i64"), "26");
-        assert_eq!(sql_literal_for_csv_value("0xFF", "i64"), "255");
-        assert_eq!(sql_literal_for_csv_value("0b1010", "i64"), "10");
-        assert_eq!(sql_literal_for_csv_value("0o17", "i64"), "15");
+        assert_eq!(sql_literal_for_value("0x1A", "i64"), "26");
+        assert_eq!(sql_literal_for_value("0xFF", "i64"), "255");
+        assert_eq!(sql_literal_for_value("0b1010", "i64"), "10");
+        assert_eq!(sql_literal_for_value("0o17", "i64"), "15");
         // An ordinary plain decimal integer is untouched.
-        assert_eq!(sql_literal_for_csv_value("42", "i64"), "42");
+        assert_eq!(sql_literal_for_value("42", "i64"), "42");
     }
 
     #[test]
-    fn sql_literal_for_csv_value_strips_currency_and_thousands_separators() {
-        assert_eq!(sql_literal_for_csv_value("$1,234.56", "f64"), "1234.56");
-        assert_eq!(sql_literal_for_csv_value("(45.00)", "f64"), "-45.00");
+    fn sql_literal_for_value_strips_currency_and_thousands_separators() {
+        assert_eq!(sql_literal_for_value("$1,234.56", "f64"), "1234.56");
+        assert_eq!(sql_literal_for_value("(45.00)", "f64"), "-45.00");
     }
 
     #[test]
-    fn sql_literal_for_csv_value_maps_every_is_bool_word_spelling_to_true_or_false() {
+    fn sql_literal_for_value_maps_every_is_bool_word_spelling_to_true_or_false() {
         for word in ["true", "TRUE", "yes", "Y", "on"] {
-            assert_eq!(sql_literal_for_csv_value(word, "bool"), "TRUE");
+            assert_eq!(sql_literal_for_value(word, "bool"), "TRUE");
         }
         for word in ["false", "FALSE", "no", "N", "off"] {
-            assert_eq!(sql_literal_for_csv_value(word, "bool"), "FALSE");
+            assert_eq!(sql_literal_for_value(word, "bool"), "FALSE");
         }
     }
 
     #[test]
-    fn sql_literal_for_csv_value_quotes_a_date_time_value_as_plain_text_with_no_cast() {
+    fn sql_literal_for_value_quotes_a_date_time_value_as_plain_text_with_no_cast() {
         // Inline mode never emits a CAST at all for date/time values (see
         // this project's own real, confirmed SQLite CAST-to-NUMERIC-
         // affinity truncation bug for --sql-mode staging) - a literal
         // constant assigned straight into a TIMESTAMP/TIME column is
         // safe, so the value is just a plain quoted string here.
         assert_eq!(
-            sql_literal_for_csv_value("2024-01-15T09:00:00Z", "NaiveDate / DateTime"),
+            sql_literal_for_value("2024-01-15T09:00:00Z", "NaiveDate / DateTime"),
             "'2024-01-15T09:00:00Z'"
         );
-        assert_eq!(
-            sql_literal_for_csv_value("it's fine", "String"),
-            "'it''s fine'"
-        );
+        assert_eq!(sql_literal_for_value("it's fine", "String"), "'it''s fine'");
     }
 
     #[test]
-    fn render_sql_inline_csv_embeds_literal_insert_data_with_no_staging_table() {
+    fn render_sql_inline_flat_embeds_literal_insert_data_with_no_staging_table() {
         let profiles = vec![
             ColumnProfile {
                 name: "id".to_string(),
@@ -65440,15 +65546,16 @@ mod tests {
         let csv_path = dir.join("people.csv");
         fs::write(&csv_path, "id,email\n1,a@example.com\n2,NA\n").unwrap();
 
+        let args = Args::parse_from(&["people.csv".to_string()]).unwrap();
         let mut buf: Vec<u8> = Vec::new();
-        render_sql_inline_csv(
+        render_sql_inline_flat(
             "people.csv",
             "people",
             &profiles,
+            &InputFormat::Csv,
             &csv_path,
-            ',',
             0,
-            None,
+            &args,
             &mut buf,
         )
         .unwrap();
@@ -65469,13 +65576,13 @@ mod tests {
     }
 
     #[test]
-    fn render_sql_inline_csv_never_writes_a_trailing_blank_line() {
+    fn render_sql_inline_flat_never_writes_a_trailing_blank_line() {
         // Regression test for the streaming-sink rewrite: the old
         // String-returning version trimmed trailing newlines post-hoc
         // (`sql.truncate(sql.trim_end_matches('\n')...)`), which can't
         // work against a sink already written to - the fix has to never
         // write the trailing blank line in the first place (see
-        // InlineCsvRowSink::separator_written's own doc comment).
+        // InlineRowSink::separator_written's own doc comment).
         let profiles = vec![ColumnProfile {
             name: "id".to_string(),
             current_type: "i64".to_string(),
@@ -65492,12 +65599,23 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let csv_path = dir.join("t.csv");
+        let args = Args::parse_from(&["t.csv".to_string()]).unwrap();
 
         // Zero data rows - flush_batch's own lazy separator must never
         // fire, so the script ends right after "CREATE TABLE ... );".
         fs::write(&csv_path, "id\n").unwrap();
         let mut buf: Vec<u8> = Vec::new();
-        render_sql_inline_csv("t.csv", "t", &profiles, &csv_path, ',', 0, None, &mut buf).unwrap();
+        render_sql_inline_flat(
+            "t.csv",
+            "t",
+            &profiles,
+            &InputFormat::Csv,
+            &csv_path,
+            0,
+            &args,
+            &mut buf,
+        )
+        .unwrap();
         let sql = String::from_utf8(buf).unwrap();
         assert!(sql.ends_with(");\n"));
         assert!(!sql.ends_with(");\n\n"));
@@ -65506,7 +65624,17 @@ mod tests {
         // trailing blank line after the one INSERT statement.
         fs::write(&csv_path, "id\n1\n").unwrap();
         let mut buf: Vec<u8> = Vec::new();
-        render_sql_inline_csv("t.csv", "t", &profiles, &csv_path, ',', 0, None, &mut buf).unwrap();
+        render_sql_inline_flat(
+            "t.csv",
+            "t",
+            &profiles,
+            &InputFormat::Csv,
+            &csv_path,
+            0,
+            &args,
+            &mut buf,
+        )
+        .unwrap();
         let sql = String::from_utf8(buf).unwrap();
         fs::remove_dir_all(&dir).ok();
         assert!(sql.ends_with(";\n"));
