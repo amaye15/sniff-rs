@@ -897,6 +897,55 @@ fn load_into_accepts_log_formats() {
 }
 
 #[test]
+#[cfg(feature = "dbase")]
+fn sql_output_inline_mode_supports_dbase() {
+    // Phase 3 of the "any format" rollout: the first declared-type
+    // binary format, not just a plain-text row-source - proves
+    // InlineRowSink's Vec<Option<String>> row shape and the "decode
+    // always, keep conditionally" nrows convention both carry over
+    // cleanly to a real binary reader, not just text ones.
+    let sql = run_sql("sample.dbf", &[]);
+    assert!(!sql.contains("CREATE TABLE \"sample_staging\""));
+    assert!(sql.contains("CREATE TABLE \"sample\""));
+    assert!(sql.contains("INSERT INTO \"sample\""));
+    assert!(sql.contains("'U1001'"));
+    assert!(sql.contains("1250.5"));
+}
+
+#[test]
+#[cfg(feature = "dbase")]
+fn sql_output_inline_mode_dbase_skips_soft_deleted_records() {
+    // dBase's own "marked for deletion" convention: a soft-deleted
+    // record must be excluded from the emitted INSERT data exactly as
+    // it already is from profiling - proven by checking the row that
+    // was deleted (Bob) is genuinely absent while the two kept rows
+    // (Alice, Carol) both appear.
+    let sql = run_sql("edge_dbase_deleted_records.dbf", &[]);
+    assert!(sql.contains("'Alice'"));
+    assert!(sql.contains("'Carol'"));
+    assert!(!sql.contains("'Bob'"));
+}
+
+#[test]
+#[cfg(feature = "dbase")]
+fn load_into_accepts_dbase() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.dbf").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for dbase"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

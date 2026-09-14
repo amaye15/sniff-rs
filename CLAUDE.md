@@ -317,8 +317,8 @@ different shapes: `inline` (the default) and `staging` (the original
 shape, kept for large files - see below). `staging` mode already works
 for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers CSV, TSV, fixed-width
-text, Common/Combined Log Format, and syslog (RFC 3164/5424) so far -
-every other format transparently falls back to `staging` with a
+text, Common/Combined Log Format, syslog (RFC 3164/5424), and dBase so
+far - every other format transparently falls back to `staging` with a
 disclosed stderr note (`--sql-mode inline` given
 *explicitly* on an unsupported format is a hard error instead, naming the
 gap - downgrading what was explicitly asked for would be the wrong kind
@@ -333,12 +333,13 @@ into three structurally different shapes for this purpose, and each
 needs its own real design, not just repeating the same pattern:
 
 1. **The rest of the flat, fixed-column, one-row-per-record tier**
-   (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy) - CSV/TSV/fixed-width and,
-   as of Phase 2, Common/Combined Log Format and syslog (RFC 3164/5424)
-   all already prove the shape (`InlineRowSink`/`ColumnAccumulatorState`'s
-   own generalized `accept`), but each of the six remaining formats needs
-   its own real "read one row a second time" plumbing (a genuine binary-
-   format re-parse, not just a text re-scan) and its own end-to-end
+   (Stata, SAS7BDAT, SPSS, ORC, NumPy) - CSV/TSV/fixed-width, Common/
+   Combined Log Format, syslog (RFC 3164/5424), and, as of Phase 3,
+   dBase all already prove the shape (`InlineRowSink`/
+   `ColumnAccumulatorState`'s own generalized `accept`), including a
+   genuine binary re-parse for a declared-type format now that dBase is
+   done - but each of the five remaining formats still needs its own
+   real "read one row a second time" plumbing and its own end-to-end
    verification against a real engine before being trusted.
 2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
    `dispatch_reader` already returns `Vec<(String, Vec<ColumnProfile>)>`
@@ -670,6 +671,53 @@ binary. Clean across every individually plausible feature combination
 established baseline exactly - the new integration tests are themselves
 `#[cfg(feature = "weblog"/"syslog")]`-gated, since `--format common-log`/
 `syslog`/etc. dispatch to a real reader that only exists in those builds.
+
+**Phase 3: dBase - the first declared-type binary format in this tier,**
+not just another plain-text row-source. `dbase_support`'s own header/
+field-descriptor-table reading (the Visual FoxPro backlink adjustment,
+the memo-field rejection, the field-table-terminator-then-seek dance, the
+record-size recomputation from the field table rather than the header's
+own declared size) was factored out of `columns_from_dbase` into a shared
+`open_dbase_for_records`, so the profiling reader and the new
+`stream_dbase_rows_for_sql` second pass can't drift apart on that setup
+logic - a pure extraction, verified by the complete existing dBase test
+suite passing unchanged with zero test modifications needed.
+
+The real design decision this phase settled: whether the SQL row-source
+should stop reading early once enough rows have been emitted (the same
+real-I/O-bounding shape every text row-source so far uses), or replicate
+`columns_from_dbase`'s own deliberate "decode every non-deleted record
+regardless of `nrows`, only *accumulate* conditionally" choice (see the
+Architecture section's dBase entry) instead. The latter won, for
+consistency: a malformed record past the `--nrows` cutoff should surface
+the identical error on both passes over the same file, not error during
+profiling but silently succeed during SQL generation just because
+generation stopped reading sooner. `stream_dbase_rows_for_sql` simply
+calls `sink.accept` for every decoded, non-deleted record with no
+cutoff-awareness of its own at all - `InlineRowSink`'s own existing
+`nrows`-vs-`emitted` check already caps what actually gets emitted as
+literal SQL, the identical split realized on the SQL side instead of the
+accumulator side. dBase has no header row and no `--skip-rows` concept,
+so this also needed `InlineRowSink::has_header` flipped from a negative
+list (everything except the log formats) to a positive one (only CSV/
+TSV/fixed-width) - simpler, and means the next headerless format to join
+this tier needs no change to that line at all, only its own match arm.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.dbf --output-format sql --load-into sqlite:...`, querying
+the resulting table back out and confirming every real value (including
+a `Numeric` field's declared-`f64`-but-really-integer gap surviving
+intact, and the fixture's own date field) matches the source file
+exactly; separately, `edge_dbase_deleted_records.dbf` confirmed a soft-
+deleted record is excluded from the emitted `INSERT` data exactly as it
+already is from profiling - the deleted record's own name never appears
+in the generated SQL at all, while both kept records do. Also verified
+as a pure extraction, not a behavior change, for the already-shipped
+CSV/TSV/fixed-width/log-format case: `diff` confirmed byte-identical
+inline SQL output against the pre-Phase-3 binary. Clean across default/
+`dbase`/`full`, matching each one's own established baseline exactly -
+the two new dBase-specific tests are `#[cfg(feature = "dbase")]`-gated,
+matching the log formats' own precedent.
 
 ## Directory-input batch mode
 

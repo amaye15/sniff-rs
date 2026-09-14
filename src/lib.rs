@@ -7485,11 +7485,23 @@ mod dbase_support {
         })
     }
 
-    pub(crate) fn columns_from_dbase(
-        path: &Path,
-        nrows: Option<usize>,
-        n_samples: usize,
-    ) -> Result<Vec<ColumnProfile>> {
+    /// `(reader, header, text_mode, fields, record_data_len)` - named
+    /// here purely to keep `open_dbase_for_records`'s signature readable
+    /// (`clippy::type_complexity`).
+    type DbaseRecordSource = (BufReader<File>, Header, TextMode, Vec<FieldInfo>, usize);
+
+    /// Opens `path`, reads its header and field-descriptor table, and
+    /// seeks the returned reader to the first record - every step
+    /// `columns_from_dbase` and the `--sql-mode inline` second pass
+    /// (`stream_dbase_rows_for_sql`) both need identically before either
+    /// one starts its own per-record loop. Factored out so those two
+    /// loops can't drift apart on the header/field-table logic itself
+    /// (the Visual FoxPro backlink adjustment, the memo-field rejection,
+    /// the field-table-terminator-then-seek dance, the record-size
+    /// recomputation from the field table rather than the header's own
+    /// declared size) while still reading their own record bytes
+    /// independently below.
+    fn open_dbase_for_records(path: &Path) -> Result<DbaseRecordSource> {
         let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
         let mut r = BufReader::new(file);
 
@@ -7541,6 +7553,16 @@ mod dbase_support {
         // (sometimes inconsistent) declared record size - matching
         // `open_dbase`'s own `record_size` recomputation exactly.
         let record_data_len: usize = fields.iter().map(|f| f.field_length as usize).sum();
+
+        Ok((r, header, text_mode, fields, record_data_len))
+    }
+
+    pub(crate) fn columns_from_dbase(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let (mut r, header, text_mode, fields, record_data_len) = open_dbase_for_records(path)?;
 
         // One `Vec<Option<String>>` accumulator per field, filled
         // positionally as each record is decoded - not one `HashMap<String,
@@ -7618,6 +7640,55 @@ mod dbase_support {
             })
             .collect();
         Ok(columns)
+    }
+
+    /// The dBase row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass, sharing `open_dbase_for_records` with
+    /// `columns_from_dbase` above. Deliberately mirrors that function's
+    /// own "decode every non-deleted record regardless of `nrows`" choice
+    /// rather than stopping early once `sink` has emitted enough rows - a
+    /// malformed record past the cutoff should surface the identical
+    /// error on both passes over the same file, not error in Pass 1 but
+    /// silently succeed in Pass 2 just because this pass stopped reading
+    /// sooner. `sink.accept` is simply called for every decoded record;
+    /// `InlineRowSink`'s own `nrows`-vs-`emitted` check already caps what
+    /// actually gets emitted as literal SQL, the identical "decode
+    /// always, keep conditionally" split `columns_from_dbase` already
+    /// uses for its own accumulators, just realized on the SQL side
+    /// instead. dBase has no header row and no `--skip-rows` concept, so
+    /// `sink.has_header` must already be `false` (set by `render_sql_
+    /// inline_flat`'s own construction site) or the very first record
+    /// would be silently misread as a header line.
+    pub(crate) fn stream_dbase_rows_for_sql(
+        path: &Path,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let (mut r, header, text_mode, fields, record_data_len) = open_dbase_for_records(path)?;
+
+        let mut deletion_flag = [0u8; 1];
+        let mut record_buf = vec![0u8; record_data_len];
+        for _ in 0..header.num_records {
+            r.read_exact(&mut deletion_flag)
+                .context("failed reading a dBase record's deletion flag")?;
+            if deletion_flag[0] == 0x2A {
+                r.seek(SeekFrom::Current(record_data_len as i64))
+                    .context("failed skipping a deleted dBase record")?;
+                continue;
+            }
+            r.read_exact(&mut record_buf)
+                .context("failed reading a dBase record")?;
+
+            let mut pos = 0usize;
+            let mut row: Vec<Option<String>> = Vec::with_capacity(fields.len());
+            for f in &fields {
+                let field_bytes = &record_buf[pos..pos + f.field_length as usize];
+                pos += f.field_length as usize;
+                let value = read_field_value(f, field_bytes, text_mode)?;
+                row.push(value_to_string(&value));
+            }
+            sink.accept(row)?;
+        }
+        Ok(())
     }
 } // mod dbase_support
 
@@ -51300,16 +51371,18 @@ fn render_sql_inline_flat(
     // is written lazily instead, only once real row content follows.
     writeln!(sink, "\n);")?;
 
-    // Common/Combined Log and syslog have no header row at all - every
-    // line is a data record - unlike CSV/fixed-width, which both name
-    // their header via `resolved_skip_rows`. See `InlineRowSink::
-    // has_header`'s own doc comment.
-    let has_header = !matches!(
+    // CSV/TSV/fixed-width are the only formats in this tier with a real
+    // header row at all - every other flat format (the log formats, and
+    // every declared-type binary format joining this tier one at a time:
+    // dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy) has no header concept
+    // whatsoever, every record is a data record. See `InlineRowSink::
+    // has_header`'s own doc comment. Written as a positive list rather
+    // than "everything except the log formats" specifically so adding
+    // the next headerless format here needs no change to this line at
+    // all - only its own new match arm below.
+    let has_header = matches!(
         format,
-        InputFormat::CommonLog
-            | InputFormat::CombinedLog
-            | InputFormat::Syslog
-            | InputFormat::Syslog5424
+        InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
     );
     let mut sink = InlineRowSink {
         resolved_skip_rows,
@@ -51340,6 +51413,7 @@ fn render_sql_inline_flat(
         InputFormat::CombinedLog => render_sql_inline_flat_weblog(read_path, true, &mut sink)?,
         InputFormat::Syslog => render_sql_inline_flat_syslog(read_path, false, &mut sink)?,
         InputFormat::Syslog5424 => render_sql_inline_flat_syslog(read_path, true, &mut sink)?,
+        InputFormat::Dbase => render_sql_inline_flat_dbase(read_path, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -51405,6 +51479,21 @@ fn render_sql_inline_flat_syslog(
 ) -> Result<()> {
     bail!(
         "syslog support isn't compiled in - rebuild with `cargo build --release --features syslog` (or --features full)"
+    )
+}
+
+/// The dBase row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`dbase` build.
+#[cfg(feature = "dbase")]
+fn render_sql_inline_flat_dbase(read_path: &Path, sink: &mut InlineRowSink<'_>) -> Result<()> {
+    dbase_support::stream_dbase_rows_for_sql(read_path, sink)
+}
+
+#[cfg(not(feature = "dbase"))]
+fn render_sql_inline_flat_dbase(_read_path: &Path, _sink: &mut InlineRowSink<'_>) -> Result<()> {
+    bail!(
+        "dBase support isn't compiled in - rebuild with `cargo build --release --features dbase` (or --features full)"
     )
 }
 
@@ -51518,8 +51607,8 @@ fn render_sql(
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier - see
     // `render_sql_inline_flat`'s own doc comment for the full list this
-    // is expected to grow into (dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy)
-    // one fully-verified format at a time, matching this project's own
+    // is expected to grow into (Stata, SAS7BDAT, SPSS, ORC, NumPy) one
+    // fully-verified format at a time, matching this project's own
     // established multi-format-campaign practice.
     let inline_supported = matches!(
         format,
@@ -51530,12 +51619,13 @@ fn render_sql(
             | InputFormat::CombinedLog
             | InputFormat::Syslog
             | InputFormat::Syslog5424
+            | InputFormat::Dbase
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424 are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -58214,10 +58304,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::CombinedLog
                 | InputFormat::Syslog
                 | InputFormat::Syslog5424
+                | InputFormat::Dbase
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424 are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase are supported so far",
             format.as_str()
         );
     }
