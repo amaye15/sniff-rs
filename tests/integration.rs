@@ -57,6 +57,24 @@ fn run_json(fixture_name: &str, extra_args: &[&str]) -> serde_json::Value {
     run_with_format(fixture_name, "json", extra_args)
 }
 
+/// Runs the binary against a fixture with --output-format sql, writing to
+/// stdout ("-"), and returns the raw generated SQL text.
+fn run_sql(fixture_name: &str, extra_args: &[&str]) -> String {
+    let path = fixture(fixture_name);
+    let mut args: Vec<&str> = vec![path.to_str().unwrap(), "-", "--output-format", "sql"];
+    args.extend_from_slice(extra_args);
+    let output = Command::new(bin())
+        .args(&args)
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "binary exited with an error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("stdout was not valid UTF-8")
+}
+
 fn table<'a>(doc: &'a serde_json::Value, name: &str) -> &'a Vec<serde_json::Value> {
     doc["tables"][name]
         .as_array()
@@ -407,6 +425,107 @@ fn markdown_output_ends_with_exactly_one_newline() {
         !content.ends_with("\n\n"),
         "should not have a trailing blank line"
     );
+}
+
+#[test]
+fn sql_output_creates_a_staging_table_a_typed_table_and_a_cast_insert() {
+    let sql = run_sql("type_detection.csv", &[]);
+
+    assert!(sql.contains("CREATE TABLE \"type_detection_staging\""));
+    assert!(sql.contains("CREATE TABLE \"type_detection\""));
+    assert!(sql.contains("INSERT INTO \"type_detection\""));
+    assert!(sql.contains("FROM \"type_detection_staging\""));
+
+    // Every staging column is TEXT, regardless of the real ideal_type -
+    // it exists purely so a bulk-text loader (see the Load comment
+    // block) can fill it with no type errors.
+    assert!(sql.contains("\"user_uuid\" TEXT"));
+
+    // The typed table uses a real type per ideal_type, and casts it back
+    // out of the staging table's TEXT column.
+    assert!(sql.contains("\"user_uuid\" VARCHAR(36) NOT NULL"));
+    assert!(sql.contains("AS VARCHAR(36))"));
+    assert!(sql.contains("\"id\" BIGINT NOT NULL"));
+    assert!(sql.contains("AS BIGINT)"));
+
+    // The per-engine Load comment names all four common engines, since
+    // there's no ANSI-standard way to read a file from disk at all.
+    assert!(sql.contains("DuckDB:"));
+    assert!(sql.contains("PostgreSQL"));
+    assert!(sql.contains("SQLite"));
+    assert!(sql.contains("MySQL:"));
+}
+
+#[test]
+fn sql_output_never_casts_date_or_time_columns_directly() {
+    // Regression test for a real bug found by actually running the
+    // generated SQL against a real SQLite build (see
+    // sql_cast_expr_skips_cast_for_date_and_time_to_avoid_the_sqlite_
+    // truncation_bug's own doc comment in src/lib.rs for the full
+    // root-cause writeup): CAST(text AS TIMESTAMP/TIME) silently
+    // truncates a real value to its leading digits on SQLite, since
+    // SQLite has no native temporal type. The fix means the generated
+    // SQL must never emit "AS TIMESTAMP)" or "AS TIME)" anywhere.
+    let sql = run_sql("type_detection.csv", &[]);
+    assert!(sql.contains("\"created_at\" TIMESTAMP NOT NULL"));
+    assert!(sql.contains("\"checkin_time\" TIME NOT NULL"));
+    // The header's own disclosure comment quotes "AS TIMESTAMP)" as an
+    // example of the bug being avoided, so only the runnable SQL lines
+    // (skipping "--" comments) are checked here.
+    let runnable: String = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!runnable.contains("AS TIMESTAMP)"));
+    assert!(!runnable.contains("AS TIME)"));
+}
+
+#[test]
+fn sql_output_treats_a_missing_sentinel_as_null_in_the_cast_expression() {
+    // Regression test for a second real bug found the same way: a
+    // literal "NA"/"null"/"-" staged as plain TEXT doesn't fail a
+    // numeric CAST - confirmed directly on SQLite, CAST('NA' AS BIGINT)
+    // silently succeeds as a fabricated 0 rather than erroring.
+    let sql = run_sql("type_detection.csv", &[]);
+    assert!(sql.contains("LOWER(TRIM(\"age\"))"));
+    assert!(sql.contains("'na'"));
+    assert!(sql.contains("'null'"));
+    assert!(sql.contains("THEN NULL ELSE TRIM(\"age\") END"));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sql_output_handles_a_multi_table_source_with_one_pair_of_tables_per_table() {
+    // SQLite (like Excel/INI/.npz) can produce more than one table from a
+    // single source file - each one needs its own independent staging/
+    // typed table pair, not a single shared staging table.
+    let sql = run_sql("sample.sqlite", &[]);
+    assert!(sql.contains("CREATE TABLE \"events_staging\""));
+    assert!(sql.contains("CREATE TABLE \"events\""));
+    assert!(sql.contains("CREATE TABLE \"users_staging\""));
+    assert!(sql.contains("CREATE TABLE \"users\""));
+}
+
+#[test]
+fn sql_output_default_extension_is_dictionary_sql() {
+    // Copies the fixture into a scratch tempdir first (rather than
+    // pointing the binary straight at the committed fixture with no
+    // output path) so the *default*-named output lands in that same
+    // auto-cleaned tempdir instead of next to the real fixture - default
+    // naming always writes beside the *input* file, never the CWD.
+    let (dir, input) = copy_fixture_as("type_detection.csv", "type_detection.csv");
+    let status = Command::new(bin())
+        .args([input.to_str().unwrap(), "--output-format", "sql"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let default_out = dir.path().join("type_detection.dictionary.sql");
+    let content = std::fs::read_to_string(&default_out)
+        .unwrap_or_else(|e| panic!("expected {default_out:?} to exist: {e}"));
+    assert!(content.starts_with("-- Data dictionary for"));
+    assert!(content.ends_with('\n'));
+    assert!(!content.ends_with("\n\n"));
 }
 
 #[test]

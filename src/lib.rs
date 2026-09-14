@@ -2868,9 +2868,12 @@ mod json_support {
 /// row per column, with a current type, a heuristic "ideal" type
 /// suggestion, missing %, sample values, and a blank Description field to
 /// fill in by hand. Output is Markdown tables (default), this tool's own
-/// rich JSON (--output-format json), or
-/// json-schema.org-vocabulary JSON (--output-format json-schema); any of
-/// the three can be written to stdout by passing "-" as the output path.
+/// rich JSON (--output-format json),
+/// json-schema.org-vocabulary JSON (--output-format json-schema), or a
+/// runnable SQL script (--output-format sql - see render_sql) that creates
+/// a properly-typed table per table and casts a raw staging copy into it;
+/// any of the four can be written to stdout by passing "-" as the output
+/// path.
 /// SQLite files (one table per database table), Excel workbooks (one
 /// table per sheet), INI files (one table per section), and .npz archives
 /// (one table per named array) can produce multiple tables; every other
@@ -2924,8 +2927,9 @@ struct Args {
     /// counts (e.g. --widths 10,5,20) - there's no delimiter to split on, so
     /// this format only runs when widths are given explicitly
     widths: Option<Vec<usize>>,
-    /// Output format: md (markdown tables), json (this tool's own rich shape), or
-    /// json-schema (json-schema.org vocabulary, for schema-consuming tools)
+    /// Output format: md (markdown tables), json (this tool's own rich shape),
+    /// json-schema (json-schema.org vocabulary, for schema-consuming tools), or
+    /// sql (a runnable SQL script - see render_sql)
     output_format: String,
 }
 
@@ -2970,7 +2974,7 @@ OPTIONS:
         --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
         --widths <N,N,...>      Column widths for --format fixed-width, comma-separated -
                                 single-file mode only
-        --output-format <FMT>   md (default), json, or json-schema
+        --output-format <FMT>   md (default), json, json-schema, or sql
         --output-dir <DIR>      Directory-input mode only: where per-file outputs are
                                 written, mirroring the input's own subdirectory structure.
                                 Defaults to writing each output next to its own source file.
@@ -50390,6 +50394,378 @@ fn render_json_schema(
     Ok(json_support::to_pretty_string(&doc))
 }
 
+// --- SQL script output (--output-format sql) ---
+// A fourth, runnable rendering alongside Markdown/JSON/JSON-Schema: for
+// each table, a raw TEXT-typed staging table, a properly-typed real
+// table (types from ideal_type, nullability from missing_pct - the same
+// two signals json_schema_property already turns into a schema), and an
+// `INSERT INTO ... SELECT CAST(...) FROM staging` that converts the
+// staged text into the real types.
+//
+// The one thing this format genuinely can't do is embed a single,
+// engine-agnostic way to load the source file's own bytes into that
+// staging table - there is no ANSI-standard SQL statement that names a
+// file on disk at all. Every real engine has its own incompatible
+// extension for this (DuckDB's read_csv_auto/read_json_auto/
+// read_parquet, PostgreSQL's COPY/\copy, SQLite's .import meta-command,
+// MySQL's LOAD DATA INFILE). Rather than fake portability by silently
+// picking one dialect and calling the result universal, or embed this
+// tool's own handful of `--samples` values as if they were the real
+// dataset, the load step is a clearly-labeled comment block naming the
+// staging table and each of the four common engines' own command - a
+// disclosed gap, not a guessed-at one, the same "confident common case,
+// disclosed boundary" discipline every heuristic in this project already
+// follows. What *is* genuinely portable, and the actual value of this
+// output format: the `CREATE TABLE`s themselves (types every one of
+// SQLite/DuckDB/PostgreSQL/MySQL already understands) and the
+// `INSERT ... SELECT CAST(...)` step, built entirely from standard ANSI
+// `CAST`/`CASE`/`NULLIF`/`TRIM` - the actual "convert to the correct
+// type" logic this output format exists to hand over.
+
+/// A double-quoted SQL identifier - the ANSI-standard form SQLite/
+/// DuckDB/PostgreSQL all accept natively. MySQL needs `SET
+/// sql_mode='ANSI_QUOTES';` first, or a find/replace of `"` for `` ` ``,
+/// disclosed in the script's own header comment rather than silently
+/// worked around. A literal `"` inside a name (e.g. a column pulled
+/// from hand-authored JSON) is escaped by doubling it, the same
+/// convention every one of these dialects already uses for an embedded
+/// quote in a quoted identifier.
+fn sql_quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Maps an `ideal_type` label to a portable `CREATE TABLE` column type -
+/// deliberately conservative (`TEXT` over a length-bounded `VARCHAR(n)`
+/// for anything without a format-guaranteed maximum length), since a
+/// length-constrained `VARCHAR` would make PostgreSQL/MySQL reject a
+/// longer real value during the `INSERT` below. This is a separate
+/// mapping from `json_schema_scalar_type` rather than a shared one - a
+/// JSON Schema type keyword and a SQL column type are different enough
+/// vocabularies (no SQL engine has a `format: uuid` keyword) that a
+/// shared table would need its own translation layer regardless.
+fn sql_column_type(ideal_type: &str) -> &'static str {
+    match ideal_type {
+        "i64" => "BIGINT",
+        "f64" => "DOUBLE PRECISION",
+        "bool" => "BOOLEAN",
+        "NaiveDate / DateTime" => "TIMESTAMP",
+        "NaiveTime" => "TIME",
+        "UUID" => "VARCHAR(36)",
+        "IPv4" => "VARCHAR(15)",
+        "IPv6" => "VARCHAR(45)",
+        "CIDR" => "VARCHAR(43)",
+        "MAC Address" => "VARCHAR(17)",
+        "IBAN" => "VARCHAR(34)",
+        "Credit Card Number" => "VARCHAR(19)",
+        "ISBN-10" => "VARCHAR(10)",
+        "ISBN-13" | "EAN-13 / UPC-A" => "VARCHAR(13)",
+        "IMEI" => "VARCHAR(15)",
+        "VIN" => "VARCHAR(17)",
+        "ULID" => "VARCHAR(26)",
+        "Hex Color" => "VARCHAR(9)",
+        "SemVer" => "VARCHAR(32)",
+        "Geographic Coordinates" => "VARCHAR(64)",
+        "Cron Expression" => "VARCHAR(64)",
+        // Email/URL/JWT/WKT Geometry/String/"enum / category"/
+        // "mixed(...)"/Vec<T>/anything unrecognized: no format-
+        // guaranteed maximum length, so TEXT rather than a VARCHAR that
+        // risks truncating - or outright rejecting - a real value.
+        _ => "TEXT",
+    }
+}
+
+/// Builds the `SELECT`-list expression that casts one already-`TEXT`
+/// staging column into its final typed column, for the `INSERT INTO ...
+/// SELECT ... FROM staging` step. Every branch is standard ANSI SQL
+/// (`CAST`/`CASE`/`NULLIF`/`TRIM`), so the same expression runs
+/// unmodified on SQLite/DuckDB/PostgreSQL/MySQL.
+/// The SQL equivalent of `is_missing_sentinel` (see that constant's own
+/// doc comment for the reasoning behind this exact token list), plus a
+/// genuine empty string - used to turn a staged value into a real `NULL`
+/// before a numeric/date/time expression runs. Without this, a literal
+/// `"NA"`/`"null"`/`"-"`/etc. staged as plain `TEXT` doesn't error out of
+/// a numeric `CAST` the way a human might expect - confirmed directly on
+/// SQLite, `CAST('NA' AS BIGINT)` silently succeeds as `0`, a fabricated
+/// value indistinguishable from a genuine reading of zero. That's exactly
+/// the "missing values never fake a type change" bug class this
+/// project's own CSV/TSV/fixed-width readers already guard against in
+/// Rust (see `is_missing_sentinel`'s own doc comment) - this reproduces
+/// the identical guard in the generated SQL rather than leaving it as a
+/// silent gap between what the Rust reader promises and what this output
+/// format actually does.
+fn sql_null_if_missing(quoted_col: &str) -> String {
+    let sentinels = MISSING_SENTINELS
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "(CASE WHEN LOWER(TRIM({quoted_col})) IN ('', {sentinels}) THEN NULL ELSE TRIM({quoted_col}) END)"
+    )
+}
+
+fn sql_cast_expr(quoted_col: &str, ideal_type: &str) -> String {
+    // A boolean's raw staged text can be any of this tool's own
+    // recognized bool-word spellings (true/false/yes/no/y/n/on/off/1/0 -
+    // see is_bool_word) - a bare `CAST(... AS BOOLEAN)` doesn't
+    // understand most of those in any dialect, so this normalizes them
+    // explicitly via CASE/WHEN rather than leaning on one dialect's own
+    // lenient boolean cast.
+    if ideal_type == "bool" {
+        return format!(
+            "CASE WHEN LOWER(TRIM({quoted_col})) IN ('true', 't', 'yes', 'y', 'on', '1') THEN TRUE \
+             WHEN LOWER(TRIM({quoted_col})) IN ('false', 'f', 'no', 'n', 'off', '0') THEN FALSE \
+             ELSE NULL END"
+        );
+    }
+
+    // A pooled array (Vec<T>) or a mixed(...) column stays exactly the
+    // raw staged text - there's no SQL array type portable across every
+    // dialect (PostgreSQL has one, SQLite/MySQL don't), and a mixed
+    // column has no single type left to cast to in the first place.
+    if ideal_type.starts_with("Vec<") || ideal_type.starts_with("mixed(") {
+        return quoted_col.to_string();
+    }
+
+    // Date/time columns deliberately skip an explicit CAST - confirmed
+    // directly against a real SQLite build, not assumed: SQLite has no
+    // native temporal storage class at all, so `TIMESTAMP`/`TIME` (like
+    // any type name it doesn't recognize) resolves to NUMERIC affinity,
+    // and `CAST(x AS <NUMERIC-affinity type>)` uses SQLite's own
+    // *numeric-prefix-extraction* algorithm - `CAST('2024-01-15T09:00:00'
+    // AS TIMESTAMP)` silently truncates to the integer `2024` rather than
+    // erroring or preserving the string. A plain, uncast assignment into
+    // a column *declared* NUMERIC-affinity uses a different, safer SQLite
+    // rule instead (convert only if the *entire* value is a well-formed
+    // number, otherwise store the text unchanged) - verified to leave a
+    // real ISO date/time value completely intact. The destination
+    // column's own declared TIMESTAMP/TIME type (see sql_column_type)
+    // still gives PostgreSQL/DuckDB/MySQL users a genuine temporal
+    // column; this only changes how the *value gets there*, not what the
+    // column itself is.
+    if ideal_type == "NaiveDate / DateTime" || ideal_type == "NaiveTime" {
+        return sql_null_if_missing(quoted_col);
+    }
+
+    let ty = sql_column_type(ideal_type);
+    if ty == "TEXT" {
+        // Already a string (String/enum-category, or a precise-grammar
+        // string type like Email/URL/UUID/JWT/WKT Geometry) - select as
+        // -is rather than a CAST that would be a pure no-op.
+        quoted_col.to_string()
+    } else {
+        // sql_null_if_missing turns a blank or sentinel staged value
+        // into a real NULL before the CAST runs, rather than letting a
+        // literal "NA"/"-"/etc. fail (or, worse, silently succeed as a
+        // fabricated 0) the numeric cast - the same "missing values
+        // never fake a type change" principle this project already
+        // applies everywhere else, expressed as portable SQL instead of
+        // Rust.
+        format!("CAST({} AS {ty})", sql_null_if_missing(quoted_col))
+    }
+}
+
+/// A commented block naming the four common engines' own file-loading
+/// commands for one staging table - see this section's own header
+/// comment for why no single, portable statement can do this. Only CSV/
+/// TSV/JSON/Parquet get a real per-engine command; every other format's
+/// own engine-native reader (or lack of one) varies too much to usefully
+/// spell out here, so it gets a shorter, honest fallback instead of a
+/// guessed-at one.
+fn sql_load_hint(
+    format: &InputFormat,
+    file_name: &str,
+    staging_table: &str,
+    delim: char,
+) -> String {
+    let file_name = file_name.replace(['\n', '\r'], " ");
+    let bare_table = staging_table.trim_matches('"');
+    let mut s = format!(
+        "-- Load {file_name} into {staging_table} - pick the command for your engine.\n\
+         -- There is no ANSI-standard SQL statement that reads a file from\n\
+         -- disk, so this one step is necessarily engine-specific; everything\n\
+         -- after it (the INSERT ... SELECT CAST(...) below) is portable ANSI\n\
+         -- SQL and runs unmodified on every engine.\n"
+    );
+    match format {
+        InputFormat::Csv | InputFormat::Tsv => {
+            s.push_str(&format!(
+                "--\n\
+                 -- DuckDB:\n\
+                 --   INSERT INTO {staging_table} SELECT * FROM read_csv_auto('{file_name}', header=true, all_varchar=true, delim='{delim}');\n\
+                 --\n\
+                 -- PostgreSQL (psql):\n\
+                 --   \\copy {staging_table} FROM '{file_name}' WITH (FORMAT csv, HEADER true, DELIMITER '{delim}');\n\
+                 --\n\
+                 -- SQLite (sqlite3 CLI):\n\
+                 --   .mode csv\n\
+                 --   .separator '{delim}'\n\
+                 --   .import --skip 1 {file_name} {bare_table}\n\
+                 --\n\
+                 -- MySQL:\n\
+                 --   LOAD DATA LOCAL INFILE '{file_name}'\n\
+                 --   INTO TABLE {bare_table}\n\
+                 --   FIELDS TERMINATED BY '{delim}' OPTIONALLY ENCLOSED BY '\"'\n\
+                 --   LINES TERMINATED BY '\\n'\n\
+                 --   IGNORE 1 LINES;\n"
+            ));
+        }
+        InputFormat::Json => {
+            s.push_str(&format!(
+                "--\n\
+                 -- DuckDB:\n\
+                 --   INSERT INTO {staging_table} SELECT * FROM read_json_auto('{file_name}');\n\
+                 --\n\
+                 -- PostgreSQL/SQLite/MySQL have no built-in per-record JSON\n\
+                 -- file loader - load each record into one raw text/json\n\
+                 -- column first (via each engine's own bulk-text-load command\n\
+                 -- above), then expand it with that engine's own JSON\n\
+                 -- functions (PostgreSQL: jsonb_populate_record; MySQL:\n\
+                 -- JSON_TABLE; SQLite: json_each/->>).\n"
+            ));
+        }
+        InputFormat::Parquet => {
+            s.push_str(&format!(
+                "--\n\
+                 -- DuckDB:\n\
+                 --   INSERT INTO {staging_table} SELECT * FROM read_parquet('{file_name}');\n\
+                 --\n\
+                 -- PostgreSQL: needs the parquet_fdw or pg_parquet extension.\n\
+                 -- SQLite: needs the sqlite-parquet-vtable extension.\n\
+                 -- MySQL: no native Parquet reader - convert to CSV first.\n"
+            ));
+        }
+        other => {
+            s.push_str(&format!(
+                "--\n\
+                 -- sniff-rs detected this file as \"{fmt}\". None of the four\n\
+                 -- common engines load this format identically, so there's no\n\
+                 -- single command to show here - consult your own engine's\n\
+                 -- documentation (several can read CSV/JSON/Parquet natively;\n\
+                 -- converting this file to one of those first is often the\n\
+                 -- simplest path), or load it into {staging_table} however\n\
+                 -- your own tooling already does today.\n",
+                fmt = other.as_str(),
+            ));
+        }
+    }
+    s
+}
+
+fn render_sql(
+    file_name: &str,
+    format: &InputFormat,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> String {
+    let clean_file_name = file_name.replace(['\n', '\r'], " ");
+    let mut sql = format!(
+        "-- Data dictionary for {clean_file_name} (format: {fmt})\n\
+         -- Generated by sniff-rs --output-format sql\n\
+         --\n\
+         -- Portable across SQLite/DuckDB/PostgreSQL/MySQL except the one\n\
+         -- place that genuinely can't be made so: loading the source file's\n\
+         -- own bytes, which has no ANSI-standard syntax at all - see each\n\
+         -- table's own \"Load\" comment block below for the per-engine\n\
+         -- command. MySQL users also need `SET sql_mode='ANSI_QUOTES';`\n\
+         -- first (or a find/replace of \" for `) - every identifier below is\n\
+         -- double-quoted, the ANSI-standard form SQLite/DuckDB/PostgreSQL\n\
+         -- already accept with no setup at all.\n\
+         --\n\
+         -- Two disclosed scope boundaries, not silently guessed at:\n\
+         -- 1) The CAST expressions below assume already-clean numeric/\n\
+         --    date/time text (bare digits, no currency symbol, thousands\n\
+         --    separator, parenthesized negative, or trailing '%'). If a\n\
+         --    column's own `notes` in this tool's other output formats\n\
+         --    mention stripping any of those, add the equivalent REPLACE()\n\
+         --    calls here before the CAST.\n\
+         -- 2) Date/time columns are inserted from their original text with\n\
+         --    no explicit CAST at all, relying on the destination column's\n\
+         --    own declared type to coerce it - deliberately, because\n\
+         --    SQLite has no native temporal type, and CAST(text AS\n\
+         --    TIMESTAMP/TIME) there silently truncates a real value to\n\
+         --    just its leading digits (confirmed directly, not assumed:\n\
+         --    CAST('2024-01-15T09:00:00' AS TIMESTAMP) becomes the\n\
+         --    integer 2024) rather than erroring or preserving it.\n\n",
+        fmt = format.as_str(),
+    );
+
+    let delim = if matches!(format, InputFormat::Tsv) {
+        '\t'
+    } else {
+        ','
+    };
+
+    for (table_name, profiles) in tables {
+        sql.push_str(&format!(
+            "-- === {} ===\n\n",
+            table_name.replace(['\n', '\r'], " ")
+        ));
+
+        if profiles.is_empty() {
+            sql.push_str("-- (no columns - nothing to create)\n\n");
+            continue;
+        }
+
+        let quoted_table = sql_quote_ident(table_name);
+        let staging_table = sql_quote_ident(&format!("{table_name}_staging"));
+
+        // Raw staging table - every column TEXT, so any bulk-text loader
+        // (see the Load comment below) can fill it with no type errors
+        // regardless of what the real values look like.
+        sql.push_str(&format!("CREATE TABLE {staging_table} (\n"));
+        sql.push_str(
+            &profiles
+                .iter()
+                .map(|p| format!("    {} TEXT", sql_quote_ident(&p.name)))
+                .collect::<Vec<_>>()
+                .join(",\n"),
+        );
+        sql.push_str("\n);\n\n");
+
+        sql.push_str(&sql_load_hint(format, file_name, &staging_table, delim));
+        sql.push('\n');
+
+        // The real, typed table.
+        sql.push_str(&format!("CREATE TABLE {quoted_table} (\n"));
+        sql.push_str(
+            &profiles
+                .iter()
+                .map(|p| {
+                    let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
+                    format!(
+                        "    {} {}{nullability}",
+                        sql_quote_ident(&p.name),
+                        sql_column_type(&p.ideal_type)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",\n"),
+        );
+        sql.push_str("\n);\n\n");
+
+        // The portable part: cast every staged TEXT value into its real
+        // type in one INSERT ... SELECT, using nothing but standard
+        // CAST/CASE/NULLIF/TRIM - see sql_cast_expr's own doc comment.
+        let insert_cols = profiles
+            .iter()
+            .map(|p| sql_quote_ident(&p.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select_cols = profiles
+            .iter()
+            .map(|p| sql_cast_expr(&sql_quote_ident(&p.name), &p.ideal_type))
+            .collect::<Vec<_>>()
+            .join(",\n    ");
+        sql.push_str(&format!(
+            "INSERT INTO {quoted_table} ({insert_cols})\nSELECT\n    {select_cols}\nFROM {staging_table};\n\n"
+        ));
+    }
+
+    sql.truncate(sql.trim_end_matches('\n').len());
+    sql.push('\n');
+    sql
+}
+
 // --- Hand-rolled DEFLATE (RFC 1951) + gzip (RFC 1952) decoder ---
 // gzip is the one compression format this project reads unconditionally
 // (no --features gate - see below), so it's the one place hand-rolling
@@ -56570,6 +56946,7 @@ enum OutputFormat {
     Markdown,
     Json,
     JsonSchema,
+    Sql,
 }
 
 impl OutputFormat {
@@ -56578,9 +56955,10 @@ impl OutputFormat {
             "md" | "markdown" => Ok(OutputFormat::Markdown),
             "json" => Ok(OutputFormat::Json),
             "json-schema" | "jsonschema" => Ok(OutputFormat::JsonSchema),
-            other => {
-                bail!("unrecognized --output-format '{other}' (expected md, json, or json-schema)")
-            }
+            "sql" => Ok(OutputFormat::Sql),
+            other => bail!(
+                "unrecognized --output-format '{other}' (expected md, json, json-schema, or sql)"
+            ),
         }
     }
 }
@@ -56592,6 +56970,7 @@ fn default_ext(output_format: &OutputFormat) -> &'static str {
         OutputFormat::Markdown => "dictionary.md",
         OutputFormat::Json => "dictionary.json",
         OutputFormat::JsonSchema => "dictionary.schema.json",
+        OutputFormat::Sql => "dictionary.sql",
     }
 }
 
@@ -56708,6 +57087,7 @@ fn render_output(
         OutputFormat::Markdown => render_markdown(file_name, &format, tables),
         OutputFormat::Json => render_json(file_name, &format, tables)?,
         OutputFormat::JsonSchema => render_json_schema(file_name, tables)?,
+        OutputFormat::Sql => render_sql(file_name, &format, tables),
     })
 }
 
@@ -56871,10 +57251,11 @@ fn batch_output_path(
 /// run was given explicitly is untouched by this check - directory mode
 /// only ever produces default-named output itself, so this only needs to
 /// recognize the shape *this feature* can create.
-const OWN_OUTPUT_SUFFIXES: [&str; 3] = [
+const OWN_OUTPUT_SUFFIXES: [&str; 4] = [
     ".dictionary.md",
     ".dictionary.json",
     ".dictionary.schema.json",
+    ".dictionary.sql",
 ];
 
 fn looks_like_own_output(path: &Path) -> bool {
@@ -56904,7 +57285,12 @@ fn looks_like_own_output(path: &Path) -> bool {
 fn directory_index_file_name(output_format: &OutputFormat) -> &'static str {
     match output_format {
         OutputFormat::Markdown => "_index.dictionary.md",
-        OutputFormat::Json | OutputFormat::JsonSchema => "_index.dictionary.json",
+        // sql shares the JSON manifest for the same reason json-schema
+        // already does - a file manifest has no natural SQL shape of its
+        // own either, so there's no third/fourth rendering worth building.
+        OutputFormat::Json | OutputFormat::JsonSchema | OutputFormat::Sql => {
+            "_index.dictionary.json"
+        }
     }
 }
 
@@ -57027,8 +57413,9 @@ fn render_directory_index(
     md
 }
 
-/// Renders the top-level directory index as JSON (`--output-format json`
-/// or `json-schema`, per `directory_index_file_name`'s own doc comment) -
+/// Renders the top-level directory index as JSON (`--output-format json`,
+/// `json-schema`, or `sql`, per `directory_index_file_name`'s own doc
+/// comment) -
 /// the same information `render_directory_index` shows a human, in a
 /// shape a script can consume directly (e.g. filtering `entries` by
 /// `tables` with `jq`). Deliberately *not* capped at `MAX_TOC_ENTRIES`
@@ -57219,13 +57606,15 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             total_tables,
             total_columns,
         ),
-        OutputFormat::Json | OutputFormat::JsonSchema => render_directory_index_json(
-            dir,
-            &index_entries,
-            &unrecognized,
-            total_tables,
-            total_columns,
-        ),
+        OutputFormat::Json | OutputFormat::JsonSchema | OutputFormat::Sql => {
+            render_directory_index_json(
+                dir,
+                &index_entries,
+                &unrecognized,
+                total_tables,
+                total_columns,
+            )
+        }
     };
     fs::write(&index_path, &index_content)
         .with_context(|| format!("failed to write {index_path:?}"))?;
@@ -63918,5 +64307,131 @@ mod tests {
         );
         assert_eq!(md.matches("| f").count(), MAX_TOC_ENTRIES);
         assert!(md.contains("…and 7 more file(s) not shown here"));
+    }
+
+    // --- --output-format sql ---
+
+    #[test]
+    fn sql_quote_ident_escapes_an_embedded_double_quote() {
+        assert_eq!(sql_quote_ident("id"), "\"id\"");
+        assert_eq!(sql_quote_ident("Order Details"), "\"Order Details\"");
+        assert_eq!(sql_quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn sql_column_type_maps_every_precise_grammar_type_to_a_bounded_varchar() {
+        assert_eq!(sql_column_type("i64"), "BIGINT");
+        assert_eq!(sql_column_type("f64"), "DOUBLE PRECISION");
+        assert_eq!(sql_column_type("bool"), "BOOLEAN");
+        assert_eq!(sql_column_type("NaiveDate / DateTime"), "TIMESTAMP");
+        assert_eq!(sql_column_type("NaiveTime"), "TIME");
+        assert_eq!(sql_column_type("UUID"), "VARCHAR(36)");
+        assert_eq!(sql_column_type("IPv4"), "VARCHAR(15)");
+        // Open-ended string types (no format-guaranteed maximum length)
+        // fall back to TEXT rather than a truncating VARCHAR(n).
+        assert_eq!(sql_column_type("String"), "TEXT");
+        assert_eq!(sql_column_type("enum / category"), "TEXT");
+        assert_eq!(sql_column_type("Email"), "TEXT");
+        assert_eq!(sql_column_type("mixed(String: 1, i64: 2)"), "TEXT");
+        assert_eq!(sql_column_type("Vec<String>"), "TEXT");
+    }
+
+    #[test]
+    fn sql_cast_expr_normalizes_every_recognized_bool_word_via_case_when() {
+        let expr = sql_cast_expr("\"active\"", "bool");
+        assert!(expr.starts_with("CASE WHEN"));
+        assert!(expr.contains("'true', 't', 'yes', 'y', 'on', '1'"));
+        assert!(expr.contains("'false', 'f', 'no', 'n', 'off', '0'"));
+        assert!(expr.ends_with("ELSE NULL END"));
+    }
+
+    #[test]
+    fn sql_cast_expr_leaves_a_pooled_array_or_mixed_column_as_raw_text() {
+        assert_eq!(sql_cast_expr("\"tags\"", "Vec<String>"), "\"tags\"");
+        assert_eq!(sql_cast_expr("\"x\"", "mixed(String: 1, i64: 2)"), "\"x\"");
+    }
+
+    #[test]
+    fn sql_cast_expr_skips_cast_for_date_and_time_to_avoid_the_sqlite_truncation_bug() {
+        // Regression test for a real bug found by actually running the
+        // generated SQL against a real SQLite build: CAST(text AS
+        // TIMESTAMP/TIME) resolves to NUMERIC affinity in SQLite (it has
+        // no native temporal type), and SQLite's own CAST-to-NUMERIC
+        // algorithm silently extracts a leading numeric prefix rather
+        // than validating the whole string -
+        // CAST('2024-01-15T09:00:00' AS TIMESTAMP) becomes the integer
+        // 2024, not an error and not the original string. The fix is to
+        // never emit an explicit CAST for these two ideal_types at all -
+        // confirmed directly (not assumed) that a plain, uncast
+        // assignment into a NUMERIC-affinity column instead uses
+        // SQLite's safer "only convert a *complete* well-formed number"
+        // rule, which correctly preserves a real date/time value intact.
+        let date_expr = sql_cast_expr("\"d\"", "NaiveDate / DateTime");
+        let time_expr = sql_cast_expr("\"t\"", "NaiveTime");
+        assert!(!date_expr.contains("CAST"));
+        assert!(!time_expr.contains("CAST"));
+    }
+
+    #[test]
+    fn sql_cast_expr_treats_a_missing_sentinel_as_null_not_a_fabricated_value() {
+        // Regression test for a second real bug found the same way: a
+        // literal "NA"/"null"/"-" staged as plain TEXT doesn't fail a
+        // numeric CAST the way a human might expect - confirmed directly
+        // on SQLite, CAST('NA' AS BIGINT) silently succeeds as 0, a
+        // fabricated value indistinguishable from a genuine reading of
+        // zero. sql_null_if_missing (mirroring is_missing_sentinel) has
+        // to intercept this before the CAST runs.
+        let expr = sql_cast_expr("\"age\"", "i64");
+        assert!(expr.contains("CAST("));
+        for sentinel in MISSING_SENTINELS {
+            assert!(
+                expr.contains(&format!("'{sentinel}'")),
+                "missing sentinel {sentinel:?} not present in generated CAST expression"
+            );
+        }
+    }
+
+    #[test]
+    fn render_sql_produces_a_staging_table_a_typed_table_and_a_cast_insert() {
+        let profiles = vec![
+            ColumnProfile {
+                name: "id".to_string(),
+                current_type: "i64".to_string(),
+                ideal_type: "i64".to_string(),
+                description: String::new(),
+                missing_pct: 0.0,
+                sample_values: vec!["1".to_string()],
+                notes: String::new(),
+                row_count: 1,
+            },
+            ColumnProfile {
+                name: "email".to_string(),
+                current_type: "String".to_string(),
+                ideal_type: "Email".to_string(),
+                description: String::new(),
+                missing_pct: 12.5,
+                sample_values: vec!["a@example.com".to_string()],
+                notes: "matches email address format".to_string(),
+                row_count: 1,
+            },
+        ];
+        let mut tables = BTreeMap::new();
+        tables.insert("people".to_string(), profiles);
+
+        let sql = render_sql("people.csv", &InputFormat::Csv, &tables);
+
+        assert!(sql.contains("CREATE TABLE \"people_staging\""));
+        assert!(sql.contains("CREATE TABLE \"people\""));
+        assert!(sql.contains("\"id\" BIGINT NOT NULL"));
+        // A nullable column (missing_pct > 0) gets no NOT NULL, the same
+        // signal json_schema_property already uses for its own ["type",
+        // "null"] union.
+        assert!(!sql.contains("\"email\" TEXT NOT NULL"));
+        assert!(sql.contains("\"email\" TEXT\n") || sql.contains("\"email\" TEXT,"));
+        assert!(sql.contains("INSERT INTO \"people\""));
+        assert!(sql.contains("FROM \"people_staging\""));
+        // DuckDB's own read_csv_auto is one of the disclosed per-engine
+        // load commands for csv/tsv.
+        assert!(sql.contains("read_csv_auto('people.csv'"));
     }
 }

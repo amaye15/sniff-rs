@@ -8,8 +8,9 @@ CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
 logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON,
 Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
 vCard, and iCalendar — any of them gzip- or zstd-compressed too — and
-writes Markdown, this tool's own rich JSON, or json-schema.org-standard
-JSON.
+writes Markdown, this tool's own rich JSON, json-schema.org-standard
+JSON, or a runnable SQL script that creates a properly-typed table per
+table and casts a raw staging copy into it.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -226,11 +227,11 @@ extensionless/misnamed paths and running the compiled binary against them.
 
 ## Output formats
 
-`--output-format md` (default), `--output-format json`, or
-`--output-format json-schema`. Pass `-` as the output path to write to
-stdout instead of a file — the status line (`N tables, M columns -> ...`)
-always goes to stderr, so stdout stays pure data for piping
-(`... | jq .`, `... > out.json`).
+`--output-format md` (default), `--output-format json`,
+`--output-format json-schema`, or `--output-format sql`. Pass `-` as the
+output path to write to stdout instead of a file — the status line (`N
+tables, M columns -> ...`) always goes to stderr, so stdout stays pure
+data for piping (`... | jq .`, `... > out.json`, `... | sqlite3 out.db`).
 
 JSON shape (`json`) — every format renders through the same structure, so a
 consumer never needs to special-case SQLite's/Excel's multiple tables vs.
@@ -309,6 +310,79 @@ guessing:
   }
 }
 ```
+
+SQL script (`sql`) — a fourth rendering, and the only one that's meant to
+be *run* rather than read: for each table, a raw all-`TEXT` staging
+table, a properly-typed real table (types from `ideal_type`, nullability
+from `missing_pct` — the same two signals `json-schema`'s own rendering
+already turns into a schema), and an `INSERT INTO ... SELECT CAST(...)
+FROM staging` that converts the staged text into the real types.
+
+There is deliberately no attempt to fake a single, engine-agnostic way to
+load the source file's own bytes into that staging table — no such thing
+exists in standard SQL. Every real engine has its own incompatible
+extension for reading a file from disk (DuckDB's `read_csv_auto`/
+`read_json_auto`/`read_parquet`, PostgreSQL's `COPY`/`\copy`, SQLite's
+`.import` meta-command, MySQL's `LOAD DATA INFILE`), so rather than
+silently pick one and call it universal, the script's own comments spell
+out all four next to each staging table, naming exactly which one the
+user needs for their own engine. What *is* genuinely portable, and the
+actual value of this format: the `CREATE TABLE`s themselves (types every
+one of SQLite/DuckDB/PostgreSQL/MySQL already understands) and the
+`INSERT ... SELECT CAST(...)` step, built entirely from standard ANSI
+`CAST`/`CASE`/`NULLIF`/`TRIM` — every identifier is double-quoted (the
+ANSI-standard form SQLite/DuckDB/PostgreSQL already accept; MySQL needs
+`SET sql_mode='ANSI_QUOTES';` first, disclosed in the script's own header
+comment).
+
+Two real bugs were found — and fixed — by actually running the generated
+SQL against a real SQLite build rather than trusting the design on paper,
+the same "verify against real behavior" discipline this file holds every
+heuristic to:
+
+- **`CAST(text AS TIMESTAMP/TIME)` silently truncated a real date/time
+  value to just its leading digits on SQLite** — SQLite has no native
+  temporal storage class at all, so an unrecognized type name like
+  `TIMESTAMP` resolves to its catch-all NUMERIC affinity, and SQLite's
+  own `CAST`-to-NUMERIC algorithm extracts a *leading numeric prefix*
+  rather than validating the whole string: confirmed directly,
+  `CAST('2024-01-15T09:00:00' AS TIMESTAMP)` becomes the bare integer
+  `2024`, not an error and not the original value. Fixed by never
+  emitting an explicit `CAST` for date/time columns at all — a plain,
+  uncast assignment into a column *declared* `TIMESTAMP`/`TIME` uses a
+  different, safer SQLite rule instead (convert only if the *entire*
+  value is a well-formed number, otherwise store the text unchanged),
+  verified to leave a real ISO date/time value completely intact. The
+  destination column's own declared type still gives PostgreSQL/DuckDB/
+  MySQL users a genuine temporal column; only how the value gets there
+  changed, not what the column itself is.
+- **A missing-value sentinel (`"NA"`, `"null"`, `"-"`, ...) staged as
+  plain text didn't fail a numeric `CAST` the way a human might expect** —
+  confirmed directly, `CAST('NA' AS BIGINT)` silently succeeds as `0` on
+  SQLite, a fabricated value indistinguishable from a genuine reading of
+  zero, exactly the "missing values never fake a type change" bug class
+  this project's own CSV/TSV/fixed-width readers already guard against in
+  Rust (see `is_missing_sentinel`'s own entry in the design philosophy
+  section above). `sql_null_if_missing` reproduces the identical guard in
+  SQL — every one of `MISSING_SENTINELS`' own tokens (plus a genuine empty
+  string) is turned into a real `NULL` via a `CASE`/`WHEN` before any
+  numeric/date/time value is used, so a sentinel can never be
+  misread as data.
+
+Two scope boundaries are disclosed directly in the script's own header
+rather than silently assumed away: the `CAST` expressions assume already-
+clean numeric text (no currency symbol, thousands separator, parenthesized
+negative, or trailing `%` — this project's own `normalize_numeric_str`
+heuristics aren't reproduced in SQL, so a column whose `notes` mention
+stripping any of those needs a manual `REPLACE()` added before the
+`CAST`), and a pooled array (`Vec<T>`) or a `mixed(...)` column is kept as
+its raw staged text rather than forced into a native SQL array type (no
+type portable across all four engines exists — PostgreSQL has one,
+SQLite/MySQL don't). Verified end-to-end against a real, installed
+SQLite build (staging load via `.import`, then the generated `CREATE
+TABLE`/`INSERT ... SELECT CAST(...)` run verbatim) across a plain CSV, a
+multi-table SQLite source, and a YAML-sourced boolean column — not just
+unit-tested against the generated text.
 
 ## Directory-input batch mode
 
