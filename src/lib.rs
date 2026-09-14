@@ -61432,6 +61432,7 @@ mod tests {
         for f in [
             "tests/fixtures/sample.bson",
             "tests/fixtures/type_detection.bson",
+            "tests/fixtures/edge_bson_rare_types.bson",
         ] {
             let path = Path::new(f);
             let mine = bson_support::columns_from_bson(path, None, 100)
@@ -61951,6 +61952,7 @@ mod tests {
             "tests/fixtures/type_detection.geojson",
             "tests/fixtures/edge_geojson_bare_geometry.geojson",
             "tests/fixtures/edge_geojson_geometry_types.geojson",
+            "tests/fixtures/edge_geojson_bare_feature.geojson",
         ] {
             let path = Path::new(f);
             let mine = geojson_support::columns_from_geojson(path, None, 100)

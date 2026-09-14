@@ -1,0 +1,6 @@
+{
+  "type": "Feature",
+  "id": "feature-1",
+  "properties": {"name": "Statue of Liberty", "opened": "1886-10-28"},
+  "geometry": {"type": "Point", "coordinates": [-74.0445, 40.6892]}
+}

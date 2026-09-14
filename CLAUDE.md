@@ -10521,6 +10521,79 @@ this project could just implement directly rather than depend on:
   dependency once this was found - there was nothing left for it to
   usefully verify.
 
+**A follow-up coverage audit across the eight newly-added formats**
+(prompted by an explicit "make sure there's assets and tests for
+everything" request) checked every one of BSON/plist/JSON5/JSONC/HAR/
+GeoJSON/vCard/iCalendar/MBOX against this project's own established
+per-format fixture checklist (`sample.<ext>`, `type_detection.<ext>`,
+`malformed_garbage.<ext>` or its documented alternative, `edge_*.<ext>`
+structurally-valid-but-unusual shapes) - listing every committed fixture
+per format and diffing against that checklist, not assumed complete.
+Found and closed six real gaps, none of them functional bugs (every
+decoder's underlying logic was already correct; the gap in each case was
+purely a missing permanent fixture/test):
+- **HAR had no `type_detection.har`** - the one new format missing this
+  standard convention entirely. `type_detection.har` (three `log.entries`
+  each carrying a `startedDateTime`, a `request.url`, a `serverIPAddress`,
+  and underscore-prefixed `_userUuid`/`_contactEmail` fields, HAR's own
+  spec having no natural top-level slot for all five semantic types at
+  once) and `har_recognizes_uuid_email_ipv4_and_date_columns` close it.
+- **GeoJSON had no fixture for a bare top-level `Feature`** - a real,
+  RFC 7946 §3-legal shape with its own dispatch branch in the reader,
+  previously exercised by zero committed fixtures even though the
+  sibling bare-`Geometry` and `FeatureCollection` shapes both already
+  had one. `edge_geojson_bare_feature.geojson` (added to
+  `geojson_reader_matches_the_geojson_crate_output_exactly`'s own file
+  list - the existing `geojson::GeoJson::Feature(f)` oracle-bridge arm
+  needed no code change at all) and
+  `geojson_bare_feature_profiles_as_one_record` close it.
+- **BSON had zero fixture/test coverage for its rarer element types** -
+  Regex (0x0B), the internal Timestamp type (0x11, not a UTC datetime),
+  MinKey (0xFF), MaxKey (0x7F), JS code (0x0D), and a literal null.
+  `edge_bson_rare_types.bson` (built via `pymongo`, one field of each
+  type) was independently decoded both by pymongo's own `bson.decode()`
+  and the compiled binary before being trusted - every rendering matched
+  this reader's own already-documented conventions exactly (`"/{pattern}/
+  {options}"` slash notation for Regex, a flattened `{t, i}` struct for
+  Timestamp, bare `"MinKey"`/`"MaxKey"` strings, code-only text for JS
+  code, 100%-missing for the null). Added to
+  `bson_reader_matches_the_bson_crate_output_exactly`'s file list (the
+  oracle's own `bson_value_to_json` already handled every one of these
+  variants correctly) plus a dedicated
+  `bson_rare_element_types_render_per_documented_conventions` test.
+- **No committed regression fixture locked in JSON5's own hardest
+  adversarial case** - a comment containing stray `]`/`{`/`"` characters
+  inside an array element, the exact shape `json5_support::ByteWindow::
+  scan_value`'s own doc comment discloses as the reason comments have to
+  be recognized and copied through verbatim rather than depth-/string-
+  tracked. Previously verified only ad hoc, on an uncommitted scratch
+  file, during the streaming-conversion phase. `edge_json5_comment_with_
+  stray_brackets.json5` and `json5_comment_containing_stray_brackets_
+  and_quotes_does_not_corrupt_the_scan` make it permanent.
+- **No MBOX fixture exercised genuine CRLF line endings** - the reader's
+  own doc comments claim a `\r\n`-terminated boundary/header is accepted
+  alongside a bare `\n`, but every existing committed `.mbox` fixture
+  only ever used LF, so that claim had never actually been checked
+  against real CRLF bytes. `edge_mbox_crlf_line_endings.mbox` (built with
+  a Python script emitting genuine `0x0D 0x0A` throughout) and
+  `mbox_accepts_genuine_crlf_line_endings` confirm two real messages
+  parse cleanly with no stray `\r` leaking into any header value.
+- **No fixture exercised multiple concatenated top-level `VCALENDAR`
+  blocks in one `.ics` file** - `ical_support`'s own stack-based frame
+  tracking has no special-casing that would prevent this, but it had
+  never actually been tested; every existing fixture has exactly one
+  `VCALENDAR` block. `edge_icalendar_multiple_vcalendar_blocks.ics` (two
+  independent `VCALENDAR`/`VEVENT` blocks back to back) and
+  `icalendar_reads_multiple_concatenated_vcalendar_blocks` confirm both
+  events are read correctly as two records.
+
+Verified the same way as every other change in this document: full test
+suite (398 `--features full` / 215 default-build tests, six new) passing
+unchanged, clippy/fmt clean on both builds matching established
+baselines exactly (the same pre-existing `chunks_exact`/question-mark
+clippy findings from a newer clippy version, confirmed identical on
+unmodified `main`).
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

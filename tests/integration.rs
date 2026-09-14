@@ -944,6 +944,61 @@ fn bson_recognizes_uuid_email_ipv4_and_date_columns() {
     );
 }
 
+#[cfg(feature = "bson")]
+#[test]
+fn bson_rare_element_types_render_per_documented_conventions() {
+    // Covers BSON element types no other committed fixture exercised:
+    // Regex (0x0B), Timestamp (0x11, the internal replication type, not
+    // a UTC datetime), MinKey (0xFF), MaxKey (0x7F), JS code (0x0D), and
+    // a literal null - each independently verified against pymongo's own
+    // decode of the same encoded bytes before this fixture was committed
+    // (see bson_support::decode_element_value's own doc comments for the
+    // documented rendering each of these is checked against here).
+    let doc = run_json("edge_bson_rare_types.bson", &[]);
+    let cols = table(&doc, "edge_bson_rare_types");
+
+    // "/{pattern}/{options}" slash notation; flags=2 (case-insensitive)
+    // correctly maps to the "i" option string.
+    assert_eq!(
+        column(cols, "a_regex")["sample_values"],
+        serde_json::json!(["/^foo/i"])
+    );
+
+    // The internal Timestamp type is genuinely compound (t + i), so it
+    // flattens into two sub-columns rather than being forced into one
+    // scalar - the same choice this project's Arrow IPC reader makes for
+    // its own compound Interval type.
+    assert_eq!(
+        column(cols, "a_timestamp.t")["sample_values"],
+        serde_json::json!(["1700000000"])
+    );
+    assert_eq!(
+        column(cols, "a_timestamp.i")["sample_values"],
+        serde_json::json!(["5"])
+    );
+
+    assert_eq!(
+        column(cols, "a_minkey")["sample_values"],
+        serde_json::json!(["MinKey"])
+    );
+    assert_eq!(
+        column(cols, "a_maxkey")["sample_values"],
+        serde_json::json!(["MaxKey"])
+    );
+
+    // JS-code-with-scope (0x0F) / plain JS code (0x0D) both keep only the
+    // code text, discarding any scope document.
+    assert_eq!(
+        column(cols, "a_code")["sample_values"],
+        serde_json::json!(["function() { return 1; }"])
+    );
+
+    // A literal null value is filtered out like any other reader's
+    // missing value - 100% missing, not a spurious type.
+    let a_null = column(cols, "a_null");
+    assert!((a_null["missing_pct"].as_f64().unwrap() - 100.0).abs() < 0.01);
+}
+
 #[cfg(feature = "plist")]
 #[test]
 fn plist_xml_single_dict_profiles_as_one_record() {
@@ -1072,6 +1127,20 @@ fn har_extracts_log_entries_and_flattens_nested_request_response_fields() {
     assert_eq!(column(cols, "response.status")["current_type"], "i64");
 }
 
+#[cfg(feature = "har")]
+#[test]
+fn har_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.har", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(
+        column(cols, "startedDateTime")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(column(cols, "serverIPAddress")["ideal_type"], "IPv4");
+    assert_eq!(column(cols, "_userUuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "_contactEmail")["ideal_type"], "Email");
+}
+
 #[cfg(feature = "geojson")]
 #[test]
 fn geojson_extracts_features_and_renders_geometry_as_wkt() {
@@ -1111,6 +1180,24 @@ fn geojson_bare_geometry_becomes_one_value_column() {
     assert_eq!(
         value["sample_values"],
         serde_json::json!(["POINT(1.5 2.5)"])
+    );
+}
+
+#[cfg(feature = "geojson")]
+#[test]
+fn geojson_bare_feature_profiles_as_one_record() {
+    // A top-level Feature (not wrapped in a FeatureCollection) is a
+    // real, spec-legal shape (RFC 7946 §3) with its own dispatch branch
+    // in the reader - previously exercised by no committed fixture at
+    // all, unlike the sibling bare-Geometry and FeatureCollection shapes.
+    let doc = run_json("edge_geojson_bare_feature.geojson", &[]);
+    let cols = table(&doc, "edge_geojson_bare_feature");
+    assert_eq!(column(cols, "name")["row_count"].as_u64().unwrap(), 1);
+    assert_eq!(column(cols, "opened")["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(column(cols, "geometry")["ideal_type"], "WKT Geometry");
+    assert_eq!(
+        column(cols, "id")["sample_values"],
+        serde_json::json!(["feature-1"])
     );
 }
 
@@ -1201,6 +1288,28 @@ fn icalendar_reads_vtodo_and_unfolds_a_description() {
     );
 }
 
+#[cfg(feature = "icalendar")]
+#[test]
+fn icalendar_reads_multiple_concatenated_vcalendar_blocks() {
+    // ical_support has no special-casing preventing more than one
+    // top-level VCALENDAR block in a single .ics file, and its
+    // stack-based frame tracking should already handle this correctly -
+    // but until this fixture, nothing actually exercised it: every other
+    // committed fixture has exactly one VCALENDAR block.
+    let doc = run_json("edge_icalendar_multiple_vcalendar_blocks.ics", &[]);
+    let cols = table(&doc, "edge_icalendar_multiple_vcalendar_blocks");
+    let uid = column(cols, "UID");
+    assert_eq!(uid["row_count"].as_u64().unwrap(), 2);
+    assert_eq!(
+        uid["sample_values"],
+        serde_json::json!(["event1@example.com", "event2@example.com"])
+    );
+    assert_eq!(
+        column(cols, "SUMMARY")["sample_values"],
+        serde_json::json!(["First calendar's event", "Second calendar's event"])
+    );
+}
+
 #[cfg(feature = "mbox")]
 #[test]
 fn mbox_reads_one_record_per_message_including_the_last() {
@@ -1238,6 +1347,57 @@ fn mbox_folds_and_pools_a_repeated_header() {
             "from mx1.example.com by mx2.example.com; Mon, 15 Jan 2024 12:00:00 +0000",
             "from client.example.com by mx1.example.com; Mon, 15 Jan 2024 11:59:00 +0000"
         ])
+    );
+}
+
+#[cfg(feature = "mbox")]
+#[test]
+fn mbox_accepts_genuine_crlf_line_endings() {
+    // The reader's own doc comments claim CRLF is accepted alongside a
+    // bare \n, but until this fixture that claim was never checked
+    // against real CRLF-terminated bytes - every other committed mbox
+    // fixture only ever used LF. Confirms both messages are recognized,
+    // headers fold/parse cleanly with no stray \r leaking into values,
+    // and the last message (no trailing boundary after it) still reads.
+    let doc = run_json("edge_mbox_crlf_line_endings.mbox", &[]);
+    let cols = table(&doc, "edge_mbox_crlf_line_endings");
+    let sender = column(cols, "envelope_sender");
+    assert_eq!(sender["row_count"].as_u64().unwrap(), 2);
+    assert_eq!(
+        sender["sample_values"],
+        serde_json::json!(["alice@example.com", "bob@example.com"])
+    );
+    let subject = column(cols, "Subject");
+    assert_eq!(
+        subject["sample_values"],
+        serde_json::json!(["Hello CRLF", "Re: Hello CRLF"])
+    );
+    for v in subject["sample_values"].as_array().unwrap() {
+        assert!(
+            !v.as_str().unwrap().contains('\r'),
+            "a stray \\r leaked into a header value"
+        );
+    }
+}
+
+#[cfg(feature = "json5")]
+#[test]
+fn json5_comment_containing_stray_brackets_and_quotes_does_not_corrupt_the_scan() {
+    // json5_support::ByteWindow::scan_value's own doc comment discloses
+    // exactly this adversarial shape: a comment inside an array element
+    // containing `]`/`{`/`"` characters could corrupt a naive depth/
+    // string scan if comments weren't recognized and copied through
+    // verbatim rather than being depth- or string-tracked. Verified ad
+    // hoc during the streaming-conversion phase but never locked in as a
+    // permanent fixture until now.
+    let doc = run_json("edge_json5_comment_with_stray_brackets.json5", &[]);
+    let cols = table(&doc, "edge_json5_comment_with_stray_brackets");
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"].as_u64().unwrap(), 2);
+    assert_eq!(id["sample_values"], serde_json::json!(["1", "2"]));
+    assert_eq!(
+        column(cols, "name")["sample_values"],
+        serde_json::json!(["Alice", "Bob"])
     );
 }
 

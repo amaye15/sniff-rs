@@ -1,0 +1,11 @@
+[
+  {
+    // this comment has a stray ] bracket, a { brace, and a "quote" too
+    id: 1,
+    name: 'Alice',
+  },
+  {
+    id: 2,
+    name: 'Bob', // another stray ] } " right here
+  },
+]
