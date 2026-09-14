@@ -316,13 +316,14 @@ be *run* rather than read. `--sql-mode` picks between two genuinely
 different shapes: `inline` (the default) and `staging` (the original
 shape, kept for large files - see below). `staging` mode already works
 for every format (it never embeds per-row data, so there's no format-
-specific row-source to build); `inline` mode covers CSV, TSV, fixed-width
-text, Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
-SAS7BDAT, SPSS, and ORC so far - every other format transparently falls
-back to `staging` with a disclosed stderr note (`--sql-mode inline` given
-*explicitly* on an unsupported format is a hard error instead, naming the
-gap - downgrading what was explicitly asked for would be the wrong kind
-of quiet).
+specific row-source to build); `inline` mode covers the entire flat,
+fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
+Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
+SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - every other format
+transparently falls back to `staging` with a disclosed stderr note
+(`--sql-mode inline` given *explicitly* on an unsupported format is a
+hard error instead, naming the gap - downgrading what was explicitly
+asked for would be the wrong kind of quiet).
 
 Extending inline mode further is explicit, disclosed, staged future
 work, following this project's own "one format at a time, fully verified"
@@ -332,16 +333,18 @@ unverified jump to "every format." sniff-rs's ~30 input formats split
 into three structurally different shapes for this purpose, and each
 needs its own real design, not just repeating the same pattern:
 
-1. **The rest of the flat, fixed-column, one-row-per-record tier**
-   (NumPy is all that's left) - CSV/TSV/fixed-width, Common/Combined Log
-   Format, syslog (RFC 3164/5424), dBase, Stata, SAS7BDAT, SPSS, and, as
-   of Phase 7, ORC all already prove the shape (`InlineRowSink`/
-   `ColumnAccumulatorState`'s own generalized `accept`), including five
-   genuine binary re-parses for declared-type formats and, for ORC
-   specifically, the tier's first columnar-to-row transpose - but NumPy
-   still needs its own real "read one row a second time" plumbing and
-   its own end-to-end verification against a real engine before being
-   trusted.
+1. **The flat, fixed-column, one-row-per-record tier - done as of
+   Phase 8.** CSV/TSV/fixed-width, Common/Combined Log Format, syslog
+   (RFC 3164/5424), dBase, Stata, SAS7BDAT, SPSS, ORC, and NumPy all
+   share the same `InlineRowSink`/`ColumnAccumulatorState`-based
+   `accept` shape, each format contributing its own `open_<format>_for_
+   records` extraction plus a `stream_<format>_rows_for_sql` reusing that
+   format's own existing decode logic - six genuine binary re-parses for
+   declared-type formats, ORC's own columnar-to-row transpose, and each
+   format's SQL row-source deliberately matching *that format's own*
+   real `nrows`-handling behavior (real-I/O-bounding vs. dBase's
+   deliberate decode-always) rather than one convention applied
+   uniformly regardless of what the format actually does.
 2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
    `dispatch_reader` already returns `Vec<(String, Vec<ColumnProfile>)>`
    for these; `render_sql`'s inline branch currently assumes exactly one
@@ -881,6 +884,61 @@ gated.
 
 With Phase 7, every remaining format in the flat, fixed-column,
 one-row-per-record tier except NumPy is done.
+
+**Phase 8: NumPy (`.npy` only - `.npz` stays deferred to the multi-table
+tier, see below) - the final format in this tier.** Mirrors `columns_
+from_npy_reader`'s own three-way dispatch exactly (structured/record
+dtype; row-major or 1D; Fortran-order multi-column), sharing the
+identical decode function (`npy_value_to_string`) and per-branch layout
+reasoning, just folding each decoded row straight into `sink.accept`
+instead of a per-column accumulator - no new decode logic needed at all,
+the same shape SAS7BDAT's own port already had. NumPy has no native
+missing-value concept whatsoever (every element is always present - see
+this format's own Architecture-section entry), so every value is wrapped
+`Some(...)`, the same CSV/fixed-width/log-format convention rather than
+the `Option`-per-field convention dBase/Stata/SAS7BDAT/SPSS's own real
+missing markers need.
+
+The three branches split on `nrows` behavior exactly as `columns_from_
+npy_reader` itself already does, rather than one uniform rule: the
+record and row-major/1D branches match the real-I/O-bounding convention
+(`rows_to_read` caps what's ever read from disk, checked per row); the
+Fortran-order branch matches that same function's own disclosed
+exception instead (the whole array body is read regardless of `nrows`,
+since a stride-scattered column-major layout can't have its unneeded
+trailing rows skipped without real seek support, which a `.npz` entry's
+own decompression stream doesn't have).
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `type_detection.npy --output-format sql --load-into sqlite:...`
+(the structured/record dtype - NumPy's own closest equivalent to a real
+table) confirmed every row intact; `edge_npy_plain_1d.npy` (a bare 1D
+array, one `value` column) and `sample_matrix.npy` (a 2D row-major array,
+positional `col_0..col_N` columns) both confirmed correct; a fresh,
+throwaway Fortran-order 2D array (generated directly with `numpy`, since
+no committed fixture uses this layout) confirmed the column-major-to-row
+transpose produces the identical row values a row-major array would,
+with `--nrows` correctly trimming the *kept* output rather than bounding
+real I/O for this one branch, exactly as disclosed; `--nrows 2` on the
+structured-dtype fixture confirmed real-I/O bounding for that branch
+instead. Also verified as a pure re-use of existing decode logic, not a
+behavior change, for every already-shipped format: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-8 binary. Clean
+across default/`npy`/`full`, matching each one's own established
+baseline exactly - the four new NumPy-specific tests are `#[cfg(feature
+= "npy")]`-gated.
+
+**With Phase 8, the entire flat, fixed-column, one-row-per-record tier
+is done**: CSV, TSV, fixed-width text, Common/Combined Log Format,
+syslog (RFC 3164/5424), dBase, Stata, SAS7BDAT, SPSS, ORC, and NumPy
+(`.npy`) all support `--sql-mode inline`. The two remaining tiers - the
+multi-table tier (SQLite, the Excel family, INI, `.npz`) and the
+recursively-nested, JSON-bridge tier (JSON, YAML, TOML, Avro,
+MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
+iCalendar, MBOX) - remain explicit, not-yet-started future phases, each
+needing its own genuinely new design rather than a repeat of this tier's
+own "extract shared setup, share the decode logic" pattern (see this
+section's own tiered roadmap above for what each one actually needs).
 
 ## Directory-input batch mode
 

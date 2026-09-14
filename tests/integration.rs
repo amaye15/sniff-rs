@@ -1190,6 +1190,64 @@ fn load_into_accepts_orc() {
 }
 
 #[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_supports_npy_structured_dtype() {
+    // Phase 8 (the final phase of the flat-tier rollout): a structured/
+    // record dtype, NumPy's own closest equivalent to a real table -
+    // read via the same one-record-at-a-time streaming loop the
+    // profiling reader already uses.
+    let sql = run_sql("type_detection.npy", &[]);
+    assert!(!sql.contains("CREATE TABLE \"type_detection_staging\""));
+    assert!(sql.contains("CREATE TABLE \"type_detection\""));
+    assert!(sql.contains("INSERT INTO \"type_detection\""));
+    assert!(sql.contains("'550e8400-e29b-41d4-a716-446655440000'"));
+}
+
+#[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_npy_plain_1d_and_2d_arrays() {
+    // A plain (unnamed) 1D array becomes a single "value" column; a 2D
+    // array becomes positional col_0..col_N columns - the same dual-mode
+    // convention a headerless CSV already gets.
+    let one_d = run_sql("edge_npy_plain_1d.npy", &[]);
+    assert!(one_d.contains("CREATE TABLE \"edge_npy_plain_1d\" (\n    \"value\""));
+    assert!(one_d.contains("(1.5)"));
+
+    let two_d = run_sql("sample_matrix.npy", &[]);
+    assert!(two_d.contains("\"col_0\""));
+    assert!(two_d.contains("\"col_1\""));
+    assert!(two_d.contains("(1.5, 2.5, 3.5)"));
+}
+
+#[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_npy_respects_nrows() {
+    let sql = run_sql("type_detection.npy", &["--nrows", "2"]);
+    assert!(sql.contains("(1, "));
+    assert!(sql.contains("(2, "));
+    assert!(!sql.contains("(3, "));
+}
+
+#[test]
+#[cfg(feature = "npy")]
+fn load_into_accepts_npy() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.npy").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for npy"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

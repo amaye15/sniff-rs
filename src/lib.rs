@@ -48543,6 +48543,165 @@ mod npy_support {
         columns_from_npy_reader(header, reader, nrows, n_samples)
     }
 
+    /// The `.npy` row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass - mirrors `columns_from_npy_reader`'s own
+    /// three-way dispatch (structured/record dtype, row-major or 1D,
+    /// Fortran-order multi-column) exactly, folding each decoded row
+    /// straight into `sink.accept` instead of a per-column accumulator.
+    /// NumPy has no native missing-value concept at all (every element
+    /// is always present, see this format's own Architecture-section
+    /// entry), so every value is wrapped `Some(...)` - the same
+    /// convention CSV/fixed-width/the log formats already use, letting
+    /// `sql_literal_for_value`'s own text-based sentinel check do the
+    /// (rare, coincidental) work if a value's rendered text ever happens
+    /// to match one. The row-major/record branches match `columns_from_
+    /// npy_reader`'s own real-I/O-bounding `nrows` behavior (`rows_to_
+    /// read` caps how many rows are ever read from disk); the Fortran-
+    /// order branch matches its own disclosed exception instead (the
+    /// whole array body is read regardless of `nrows`, since a
+    /// `.npz`-entry reader can't seek to skip the unneeded trailing rows
+    /// of each column). `.npy` has no header row and no `--skip-rows`
+    /// concept, so `sink.has_header` must already be `false`.
+    pub(crate) fn stream_npy_rows_for_sql(
+        path: &Path,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = BufReader::new(file);
+        let header = read_npy_header(&mut reader)
+            .with_context(|| format!("failed to parse {path:?} as a .npy file"))?;
+        stream_npy_reader_rows_for_sql(header, reader, nrows, sink)
+    }
+
+    fn stream_npy_reader_rows_for_sql<R: std::io::Read>(
+        header: NpyHeader,
+        mut reader: R,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let NpyHeader {
+            dtype,
+            shape,
+            order,
+        } = header;
+        if dtype.uses_pickled_array() {
+            bail!(
+                "this array uses numpy's pickled 'object' dtype, which isn't a fixed byte layout \
+                 this tool can read - re-save it with a concrete dtype"
+            );
+        }
+
+        let fields: Vec<Field> = match &dtype {
+            DType::Record(fields) => fields.clone(),
+            other => vec![Field {
+                name: "value".to_string(),
+                dtype: other.clone(),
+            }],
+        };
+        let is_record = matches!(dtype, DType::Record(_));
+
+        let n_cols = if is_record {
+            1
+        } else {
+            match shape.len() {
+                0 | 1 => 1,
+                2 => usize::try_from(shape[1]).context("array width overflows usize")?,
+                n => bail!(
+                    "a {n}-dimensional plain (non-structured) array has no natural row/column \
+                     reading - only 1D, 2D, or a structured (record) dtype are supported"
+                ),
+            }
+        };
+        let n_rows = usize::try_from(shape.first().copied().unwrap_or(1))
+            .context("array length overflows usize")?;
+
+        let field_sizes: Vec<usize> = fields
+            .iter()
+            .map(|f| {
+                f.dtype
+                    .num_bytes()
+                    .with_context(|| format!("field '{}' has no fixed byte size", f.name))
+            })
+            .collect::<Result<_>>()?;
+
+        let rows_to_read = nrows.map_or(n_rows, |limit| limit.min(n_rows));
+
+        if is_record {
+            let record_size: usize = field_sizes.iter().sum();
+            let mut buf = vec![0u8; record_size];
+            for row in 0..rows_to_read {
+                if sink.done {
+                    break;
+                }
+                reader
+                    .read_exact(&mut buf)
+                    .with_context(|| format!("failed reading row {row}"))?;
+                let mut offset = 0;
+                let mut values: Vec<Option<String>> = Vec::with_capacity(fields.len());
+                for (field, size) in fields.iter().zip(&field_sizes) {
+                    values.push(Some(npy_value_to_string(
+                        &field.dtype,
+                        &buf[offset..offset + size],
+                    )));
+                    offset += size;
+                }
+                sink.accept(values)?;
+            }
+        } else if order == Order::C || n_cols <= 1 {
+            let elem_size = field_sizes[0];
+            let mut buf = vec![0u8; n_cols * elem_size];
+            for row in 0..rows_to_read {
+                if sink.done {
+                    break;
+                }
+                reader
+                    .read_exact(&mut buf)
+                    .with_context(|| format!("failed reading row {row}"))?;
+                let values: Vec<Option<String>> = (0..n_cols)
+                    .map(|col_idx| {
+                        let start = col_idx * elem_size;
+                        Some(npy_value_to_string(
+                            &fields[0].dtype,
+                            &buf[start..start + elem_size],
+                        ))
+                    })
+                    .collect();
+                sink.accept(values)?;
+            }
+        } else {
+            // Fortran (column-major) order with more than one column - see
+            // `columns_from_npy_reader`'s own matching branch for why this
+            // stays a disclosed whole-buffer read rather than streaming.
+            let elem_size = field_sizes[0];
+            let total_elems = n_rows * n_cols;
+            let mut buf = vec![0u8; total_elems * elem_size];
+            reader.read_exact(&mut buf).with_context(|| {
+                format!("failed reading the array body ({total_elems} elements)")
+            })?;
+            for row in 0..rows_to_read {
+                if sink.done {
+                    break;
+                }
+                let values: Vec<Option<String>> = (0..n_cols)
+                    .map(|col_idx| {
+                        let flat_index = col_idx * n_rows + row;
+                        let start = flat_index * elem_size;
+                        Some(npy_value_to_string(
+                            &fields[0].dtype,
+                            &buf[start..start + elem_size],
+                        ))
+                    })
+                    .collect();
+                sink.accept(values)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Numpy's own convention for which zip entries count as arrays inside
     /// an `.npz` (mirrors `npyz::npz::array_name_from_file_name`): case-
     /// sensitive `.npy` suffix, with an interior null byte (if any)
@@ -51836,6 +51995,7 @@ fn render_sql_inline_flat(
         InputFormat::Sas7bdat => render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?,
         InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
         InputFormat::Orc => render_sql_inline_flat_orc(read_path, args.nrows, &mut sink)?,
+        InputFormat::Npy => render_sql_inline_flat_npy(read_path, args.nrows, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52001,6 +52161,31 @@ fn render_sql_inline_flat_orc(
     )
 }
 
+/// The `.npy` row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`npy` build. Like SAS7BDAT/
+/// ORC, this also threads `nrows` straight through (see `stream_npy_
+/// rows_for_sql`'s own doc comment for why).
+#[cfg(feature = "npy")]
+fn render_sql_inline_flat_npy(
+    read_path: &Path,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    npy_support::stream_npy_rows_for_sql(read_path, nrows, sink)
+}
+
+#[cfg(not(feature = "npy"))]
+fn render_sql_inline_flat_npy(
+    _read_path: &Path,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "NumPy support isn't compiled in - rebuild with `cargo build --release --features npy` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -52111,9 +52296,9 @@ fn render_sql(
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier - see
     // `render_sql_inline_flat`'s own doc comment for the full list this
-    // is expected to grow into (NumPy) one fully-verified format at a
-    // time, matching this project's own established multi-format-
-    // campaign practice.
+    // covers - the flat, fixed-column, one-row-per-record tier is
+    // complete as of NumPy; the multi-table and nested/JSON-bridge tiers
+    // remain explicit, not-yet-started future phases (see CLAUDE.md).
     let inline_supported = matches!(
         format,
         InputFormat::Csv
@@ -52128,12 +52313,13 @@ fn render_sql(
             | InputFormat::Sas7bdat
             | InputFormat::Spss
             | InputFormat::Orc
+            | InputFormat::Npy
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -58817,10 +59003,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Sas7bdat
                 | InputFormat::Spss
                 | InputFormat::Orc
+                | InputFormat::Npy
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy are supported so far",
             format.as_str()
         );
     }
