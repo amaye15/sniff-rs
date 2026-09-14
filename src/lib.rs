@@ -48770,6 +48770,48 @@ mod npy_support {
         }
         Ok(out)
     }
+
+    /// The `.npz` row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass, for one named array at a time - decompresses
+    /// the requested entry to a temp file exactly the way `columns_from_
+    /// npz` already does (`ZipArchive::read_to_temp` + `read_npy_header`),
+    /// then hands it straight to the *already-shipped* `stream_npy_
+    /// reader_rows_for_sql` - the identical `.npy`-array decode logic
+    /// `.npy` files themselves use, since a `.npz` entry's own content is
+    /// byte-for-byte an ordinary `.npy` stream once decompressed. No new
+    /// decode logic at all, only the archive/entry-resolution glue.
+    ///
+    /// An array that can't be profiled at all (the same disclosed-
+    /// placeholder shape `columns_from_npz` already gives a genuinely
+    /// 3-D array like MNIST's own `x_train`/`x_test`) has no honest
+    /// literal to emit - re-attempting the read here and surfacing
+    /// whatever error it hits directly, rather than a guess, the same
+    /// "no data to emit" boundary SQLite's own `WITHOUT ROWID` check and
+    /// ORC's own nested-column check already established.
+    pub(crate) fn stream_npz_array_rows_for_sql(
+        path: &Path,
+        array_name: &str,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut archive = zip_support::ZipArchive::open(path)
+            .with_context(|| format!("failed to open {path:?} as a .npz archive"))?;
+        let entry_name = archive
+            .names()
+            .find_map(|entry_name| {
+                (array_name_from_entry_name(entry_name) == Some(array_name))
+                    .then(|| entry_name.to_string())
+            })
+            .with_context(|| format!("array '{array_name}' not found in {path:?}"))?;
+
+        let mut tmp = archive
+            .read_to_temp(&entry_name)
+            .with_context(|| format!("failed reading array '{array_name}' from {path:?}"))?;
+        let header = read_npy_header(tmp.as_file_mut()).with_context(|| {
+            format!("failed to parse array '{array_name}' in {path:?} as .npy data")
+        })?;
+        stream_npy_reader_rows_for_sql(header, tmp.as_file_mut(), nrows, sink)
+    }
 } // mod npy_support
 
 #[cfg(feature = "npy")]
@@ -52167,6 +52209,9 @@ fn render_sql_inline_flat(
         InputFormat::Sqlite => {
             render_sql_inline_flat_sqlite(read_path, table_name, args.nrows, &mut sink)?
         }
+        InputFormat::Npz => {
+            render_sql_inline_flat_npz(read_path, table_name, args.nrows, &mut sink)?
+        }
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52385,6 +52430,33 @@ fn render_sql_inline_flat_sqlite(
     )
 }
 
+/// The `.npz` row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_sqlite`'s own doc comment for why `table_name`
+/// (here, an array name) genuinely selects which of the archive's
+/// several arrays to read, and `render_sql_inline_flat_weblog`'s own for
+/// why this is safe to call unconditionally even in a non-`npy` build.
+#[cfg(feature = "npy")]
+fn render_sql_inline_flat_npz(
+    read_path: &Path,
+    array_name: &str,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    npy_support::stream_npz_array_rows_for_sql(read_path, array_name, nrows, sink)
+}
+
+#[cfg(not(feature = "npy"))]
+fn render_sql_inline_flat_npz(
+    _read_path: &Path,
+    _array_name: &str,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "NumPy support isn't compiled in - rebuild with `cargo build --release --features npy` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -52513,12 +52585,13 @@ fn render_sql(
             | InputFormat::Orc
             | InputFormat::Npy
             | InputFormat::Sqlite
+            | InputFormat::Npz
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -59214,10 +59287,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Orc
                 | InputFormat::Npy
                 | InputFormat::Sqlite
+                | InputFormat::Npz
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz are supported so far",
             format.as_str()
         );
     }

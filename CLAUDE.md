@@ -319,9 +319,10 @@ for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers the entire flat,
 fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
-SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus SQLite, the first format
-in the multi-table tier, so far. Every other format transparently falls
-back to `staging` with a disclosed stderr note (`--sql-mode inline`
+SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus SQLite and `.npz`, the
+first two formats in the multi-table tier, so far. Every other format
+transparently falls back to `staging` with a disclosed stderr note
+(`--sql-mode inline`
 given *explicitly* on an unsupported format is a hard error instead,
 naming the gap - downgrading what was explicitly asked for would be the
 wrong kind of quiet).
@@ -346,15 +347,16 @@ needs its own real design, not just repeating the same pattern:
    real `nrows`-handling behavior (real-I/O-bounding vs. dBase's
    deliberate decode-always) rather than one convention applied
    uniformly regardless of what the format actually does.
-2. **The multi-table tier** (SQLite - done as of Phase 9 - the Excel
-   family, INI, and `.npz` remain) - `dispatch_reader` already returns
+2. **The multi-table tier** (SQLite and `.npz` done as of Phases 9-10 -
+   the Excel family and INI remain) - `dispatch_reader` already returns
    `Vec<(String, Vec<ColumnProfile>)>` for these; `render_sql`'s inline
    branch now loops over every table (no longer just `tables.iter()
    .next()`), each table getting its own `CREATE TABLE`/`INSERT` pair
    sharing one file-level header comment, reusing whichever row-source
    its own format tier ultimately supports (SQLite reused its own
-   existing per-row-callback reader directly; Excel/INI/`.npz` each
-   still need their own).
+   existing per-row-callback reader directly; `.npz` reused Phase 8's
+   own `.npy` row-source per array with zero new decode logic; Excel/
+   INI each still need their own).
 3. **The recursively-nested, JSON-bridge tier** (JSON, YAML, TOML, Avro,
    MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
    iCalendar, MBOX) - the hardest tier: there's no existing function that
@@ -1039,12 +1041,50 @@ surfaced it. Clean across default/`sqlite`/`full`, matching each one's
 own established baseline exactly - the new SQLite-specific and
 sentinel-regression tests are gated behind their respective features.
 
+**Phase 10: `.npz` - the second multi-table format, and the most
+tractable one, since it needed no new decode logic at all.** A `.npz`
+archive is just several named `.npy` streams, so `stream_npz_array_rows_
+for_sql` reuses `zip_support::ZipArchive::read_to_temp` + `read_npy_
+header` (the identical setup `columns_from_npz` already uses per array)
+and then hands the decompressed temp file straight to Phase 8's own
+`stream_npy_reader_rows_for_sql` unchanged - a `.npz` entry's content is
+byte-for-byte an ordinary `.npy` stream once decompressed, so there was
+no format-specific row logic left to write, only the archive/entry-
+resolution glue. The one real decision this phase made: an array that
+can't be profiled at all (the same disclosed-placeholder shape
+`columns_from_npz` already gives a genuinely 3-D array like MNIST's own
+`x_train`/`x_test`) has no honest literal to emit, so re-attempting the
+read and surfacing whatever error it hits directly is the right
+response - the same "no data to emit" boundary SQLite's own `WITHOUT
+ROWID` check and ORC's own nested-column check already established,
+just reached here by simply not catching the error rather than a new
+check of its own.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.npz --output-format sql --load-into sqlite:...` loaded
+both of its named arrays (`users`, `scores`) correctly under one shared
+header comment; `edge_npz_fortran.npz` confirmed its Fortran-order
+array's own column-major-to-row transpose (already proven correct for
+plain `.npy` files in Phase 8) produces identical row values to its
+row-major sibling in the same archive; `edge_npz_mixed_readable_and_
+unreadable.npz` confirmed the genuinely-3-D `images` array correctly
+aborts with the same disclosed "no natural row/column reading" error
+rather than a guess (which - the same "fail fast, don't roll back prior
+output" behavior every earlier row-source error already has - happens
+before the archive's other, perfectly readable array is ever reached,
+since tables are processed in name order); `--nrows 2` confirmed to
+bound each array independently. Also verified as a pure re-use of
+existing decode logic, not a behavior change: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-10 binary across
+every already-shipped format. Clean across default/`npy`/`full`,
+matching each one's own established baseline exactly.
+
 Remaining in the multi-table tier: the Excel family (`.xlsx`/`.xls`/
-`.xlsb`/`.ods`), INI, and `.npz` - each an explicit, not-yet-started
-future phase. The recursively-nested, JSON-bridge tier (JSON, YAML,
-TOML, Avro, MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON,
-vCard, iCalendar, MBOX) remains entirely unstarted too (see this
-section's own tiered roadmap above for what each one actually needs).
+`.xlsb`/`.ods`) and INI - each an explicit, not-yet-started future
+phase. The recursively-nested, JSON-bridge tier (JSON, YAML, TOML, Avro,
+MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
+iCalendar, MBOX) remains entirely unstarted too (see this section's own
+tiered roadmap above for what each one actually needs).
 
 ## Directory-input batch mode
 

@@ -1358,6 +1358,84 @@ fn load_into_accepts_sqlite() {
 }
 
 #[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_supports_npz_multi_array() {
+    // Phase 10 of the "any format" rollout: .npz is many named .npy
+    // arrays, reusing the already-shipped .npy row-source directly per
+    // array (no new decode logic, only the archive/entry glue) - the
+    // second format in the multi-table tier, sharing one header comment
+    // across all of the archive's arrays.
+    let sql = run_sql("sample.npz", &[]);
+    assert_eq!(sql.matches("-- Data dictionary for").count(), 1);
+    assert!(sql.contains("CREATE TABLE \"users\""));
+    assert!(sql.contains("CREATE TABLE \"scores\""));
+    assert!(sql.contains("INSERT INTO \"users\""));
+    assert!(sql.contains("INSERT INTO \"scores\""));
+    assert!(sql.contains("'U1001'"));
+}
+
+#[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_npz_fortran_and_c_order_arrays_agree() {
+    // A Fortran-order array's own column-major-to-row transpose must
+    // produce the identical row values a row-major array does for the
+    // same logical data.
+    let sql = run_sql("edge_npz_fortran.npz", &[]);
+    assert!(sql.contains("(1, 2)"));
+    assert!(sql.contains("(3, 4)"));
+}
+
+#[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_npz_rejects_an_unreadable_array() {
+    // A genuinely 3-D array has no honest literal to emit at all (the
+    // same disclosed-placeholder shape --output-format json already
+    // gives it) - a clear, actionable error, not a guess.
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_npz_mixed_readable_and_unreadable.npz")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no natural row/column reading"));
+}
+
+#[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_npz_respects_nrows_per_array() {
+    let sql = run_sql("sample.npz", &["--nrows", "2"]);
+    assert!(sql.contains("'U1001'"));
+    assert!(sql.contains("'U1002'"));
+    assert!(!sql.contains("'U1003'"));
+}
+
+#[test]
+#[cfg(feature = "npy")]
+fn load_into_accepts_npz() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.npz").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for npz"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no
