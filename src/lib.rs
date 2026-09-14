@@ -49084,6 +49084,59 @@ fn columns_from_xlsx(
     )
 }
 
+/// The Excel-family row-source for `render_sql_inline_flat`'s
+/// `--sql-mode inline` second pass, for one sheet at a time - the same
+/// real-content dispatch `columns_from_xlsx` itself uses (checked here a
+/// second time rather than threaded through as a parameter, since the
+/// sub-format actually present in `path` is exactly what tells this
+/// function which of the four independent row-sources to call), then
+/// delegates to whichever of `.xlsx`/`.xlsb`/`.ods`/`.xls`'s own row-
+/// source matches. All four are equally correct entry points reached
+/// from this one dispatcher, the same "one `InputFormat::Xlsx` tag,
+/// several real formats underneath it" shape `columns_from_xlsx` already
+/// established for profiling.
+#[cfg(feature = "xlsx")]
+fn render_sql_inline_flat_xlsx(
+    read_path: &Path,
+    sheet_name: &str,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    if let Ok(zip) = zip_support::ZipArchive::open(read_path) {
+        let names: Vec<&str> = zip.names().collect();
+        if names.contains(&"xl/workbook.xml") {
+            return xlsx_support::stream_xlsx_ooxml_sheet_rows_for_sql(read_path, sheet_name, sink);
+        }
+        if names.contains(&"xl/workbook.bin") {
+            return xlsx_support::stream_xlsb_sheet_rows_for_sql(read_path, sheet_name, sink);
+        }
+        if names.contains(&"content.xml") && names.contains(&"mimetype") {
+            return xlsx_support::stream_ods_sheet_rows_for_sql(read_path, sheet_name, sink);
+        }
+    }
+    if let Ok(cfb) = xlsx_support::CfbFile::open(read_path)
+        && (cfb.has_stream("Workbook") || cfb.has_stream("Book"))
+    {
+        return xlsx_support::stream_xls_sheet_rows_for_sql(read_path, sheet_name, sink);
+    }
+    bail!(
+        "{read_path:?} doesn't match a recognized .xlsx/.xlsb/.ods ZIP structure or .xls OLE2 \
+         structure - if this is genuinely one of those formats, its internal layout doesn't \
+         match what this reader expects (a corrupted file, or an .xlsb written by an unusual \
+         tool, are the most likely causes)"
+    )
+}
+
+#[cfg(not(feature = "xlsx"))]
+fn render_sql_inline_flat_xlsx(
+    _read_path: &Path,
+    _sheet_name: &str,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "Excel support isn't compiled in - rebuild with `cargo build --release --features xlsx` (or --features full)"
+    )
+}
+
 // --- SQLite reader (opt-in via --features sqlite) ---
 // A single file can hold multiple tables, so this returns one profile list
 // per table rather than a flat column list. SQLite's dynamic typing means a
@@ -52263,6 +52316,7 @@ fn render_sql_inline_flat(
             render_sql_inline_flat_npz(read_path, table_name, args.nrows, &mut sink)?
         }
         InputFormat::Ini => render_sql_inline_flat_ini(read_path, table_name, &mut sink)?,
+        InputFormat::Xlsx => render_sql_inline_flat_xlsx(read_path, table_name, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52642,9 +52696,10 @@ fn render_sql(
     let explicit = args.sql_mode.is_some();
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier is complete as of
-    // NumPy; SQLite is the first format in the multi-table tier (Excel,
-    // INI, `.npz` remain explicit, not-yet-started future phases, along
-    // with the entire nested/JSON-bridge tier - see CLAUDE.md).
+    // NumPy; the multi-table tier (SQLite, `.npz`, INI, and now the Excel
+    // family) is complete as of Xlsx - only the entire nested/JSON-bridge
+    // tier remains as an explicit, not-yet-started future phase (see
+    // CLAUDE.md).
     let inline_supported = matches!(
         format,
         InputFormat::Csv
@@ -52663,12 +52718,13 @@ fn render_sql(
             | InputFormat::Sqlite
             | InputFormat::Npz
             | InputFormat::Ini
+            | InputFormat::Xlsx
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -54572,6 +54628,95 @@ mod xlsx_support {
         ))
     }
 
+    /// The OOXML (`.xlsx`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass, for one sheet at a time - the same
+    /// row-by-row byte-window streaming `xlsx_parse_sheet_profiles`
+    /// already does (via `xlsx_extract_row`), just folding each row's
+    /// cells into `sink.accept` instead of a per-column accumulator.
+    /// `sink.header_len` (already known from Pass 1's own profiled column
+    /// count) sizes every row directly, so this needs no `max_col`
+    /// tracking of its own at all - a cell whose column index falls past
+    /// the header's own width contributes nothing, the same "extra cell
+    /// past header width is ignored" convention every other flat reader
+    /// in this project already uses. The header row (`row_num == 1`) is
+    /// consumed and discarded here directly, never routed through
+    /// `sink.accept` at all - `sink.has_header` is `false` for this
+    /// format (see that field's own doc comment), so this row-source
+    /// owns the header-skip itself instead. Unlike `xlsx_parse_sheet_
+    /// profiles` (which must scan every row to find the sheet's real
+    /// `max_row`/`max_col`), this can stop the instant `sink.done` is
+    /// set - a real, if minor, win `--nrows` didn't get from the
+    /// profiling pass itself.
+    fn xlsx_stream_sheet_rows_for_sql<R: std::io::Read>(
+        win: &mut XmlByteWindow<R>,
+        shared_strings: &[String],
+        is_date_format: &[bool],
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        win.skip_misc()?;
+        if win.peek()? != Some(b'<') {
+            bail!("expected the worksheet root element");
+        }
+        let (_root_name, _root_attrs, root_sc) = win.consume_start_tag()?;
+        if root_sc {
+            return Ok(()); // <worksheet/> - nothing at all
+        }
+
+        let mut sheet_data_open = false;
+        loop {
+            win.skip_misc()?;
+            if win.peek()?.is_none() || win.starts_with("</")? {
+                break;
+            }
+            if win.starts_with("<sheetData")? {
+                let (_n, _a, sc) = win.consume_start_tag()?;
+                sheet_data_open = !sc;
+                break;
+            }
+            win.skip_element()?;
+        }
+
+        if !sheet_data_open {
+            return Ok(());
+        }
+
+        let mut rows_seen = 0usize;
+        let mut span: Vec<u8> = Vec::new();
+        loop {
+            if sink.done {
+                break;
+            }
+            win.skip_misc()?;
+            if win.peek()?.is_none() || win.starts_with("</sheetData>")? {
+                break;
+            }
+            if win.peek()? != Some(b'<') {
+                win.discard(1)?;
+                continue;
+            }
+            win.scan_element(&mut span)?;
+            let text = std::str::from_utf8(&span).context("worksheet XML is not valid UTF-8")?;
+            let mut p = 0usize;
+            let el = xml_parse_element(text, &mut p)?;
+            if el.name != "row" {
+                continue;
+            }
+            rows_seen += 1;
+            let (row_num, cells) = xlsx_extract_row(el, shared_strings, is_date_format, rows_seen);
+            if row_num == 1 {
+                continue; // the header row - already reflected in `profiles`
+            }
+            let mut row: Vec<Option<String>> = vec![None; sink.header_len];
+            for (col_idx, value) in cells {
+                if col_idx < row.len() && !value.is_empty() {
+                    row[col_idx] = Some(value);
+                }
+            }
+            sink.accept(row)?;
+        }
+        Ok(())
+    }
+
     /// A workbook's own `xl/workbook.xml` names sheets by a relationship id
     /// (`r:id`), and `xl/_rels/workbook.xml.rels` resolves that id to the
     /// worksheet's actual archive path - a `Target` that's sometimes absolute
@@ -54673,6 +54818,51 @@ mod xlsx_support {
             bail!("no non-empty sheets found in {path:?}");
         }
         Ok(out)
+    }
+
+    /// The OOXML (`.xlsx`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass - re-resolves the requested sheet's
+    /// own archive path and re-reads `sharedStrings.xml`/`styles.xml`
+    /// exactly like `columns_from_xlsx_ooxml` does, then streams that one
+    /// sheet's own rows via `xlsx_stream_sheet_rows_for_sql`.
+    pub(crate) fn stream_xlsx_ooxml_sheet_rows_for_sql(
+        path: &Path,
+        sheet_name: &str,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut zip = ZipArchive::open(path)?;
+
+        let workbook_xml = String::from_utf8(zip.read("xl/workbook.xml")?)
+            .context("xl/workbook.xml is not valid UTF-8")?;
+        let rels_xml = String::from_utf8(zip.read("xl/_rels/workbook.xml.rels")?)
+            .context("xl/_rels/workbook.xml.rels is not valid UTF-8")?;
+        let sheet_paths = xlsx_resolve_sheet_paths(&workbook_xml, &rels_xml)?;
+        let sheet_path = sheet_paths
+            .into_iter()
+            .find_map(|(name, sheet_path)| (name == sheet_name).then_some(sheet_path))
+            .with_context(|| format!("sheet '{sheet_name}' not found in {path:?}"))?;
+
+        let shared_strings = match zip.read("xl/sharedStrings.xml") {
+            Ok(bytes) => {
+                let text =
+                    String::from_utf8(bytes).context("xl/sharedStrings.xml is not valid UTF-8")?;
+                xlsx_parse_shared_strings(&text)?
+            }
+            Err(_) => Vec::new(),
+        };
+        let is_date_format = match zip.read("xl/styles.xml") {
+            Ok(bytes) => {
+                let text = String::from_utf8(bytes).context("xl/styles.xml is not valid UTF-8")?;
+                xlsx_parse_styles(&text)?
+            }
+            Err(_) => Vec::new(),
+        };
+
+        let mut sheet_tmp = zip
+            .read_to_temp(&sheet_path)
+            .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
+        let mut win = XmlByteWindow::new(std::io::BufReader::new(sheet_tmp.as_file_mut()));
+        xlsx_stream_sheet_rows_for_sql(&mut win, &shared_strings, &is_date_format, sink)
     }
 
     // --- Hand-rolled ODF (.ods) reader ---
@@ -55176,6 +55366,217 @@ mod xlsx_support {
             .zip(states)
             .map(|(name, state)| state.into_profile(name, total))
             .collect())
+    }
+
+    /// The ODF (`.ods`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass, for one `<table:table>` at a
+    /// time - the same streaming shape `ods_stream_table_profiles` uses,
+    /// folding each row into `sink.accept` instead of a per-column
+    /// accumulator.
+    ///
+    /// The one genuinely new piece of state this needs that the
+    /// profiling version doesn't: `ods_stream_table_profiles` can afford
+    /// to defer deciding whether a run of entirely-blank repeated rows
+    /// "counts" until it sees whether a *later* real row extends
+    /// `max_row` past it (a trailing blank block never does, so it's
+    /// invisible in the final `n_data_rows` - see that function's own
+    /// doc comment) - but this row-source has already committed each
+    /// row to `sink.accept` the instant it's read, and can't un-emit a
+    /// row later. So a run of blank rows is *held* in `pending_blank_
+    /// rows` (a count, not materialized) rather than emitted immediately:
+    /// if a later real row proves the run wasn't trailing after all,
+    /// every pending blank row is flushed as a genuine all-`NULL` row
+    /// right before it (preserving positional/count parity with
+    /// `n_data_rows`, so a column profiling declared `NOT NULL` - fully
+    /// populated across every *real* row - never receives a phantom
+    /// `NULL` from a row that was never really "in" the table); if the
+    /// table ends first, the pending count is simply discarded,
+    /// reproducing "trailing blank rows invisible" exactly.
+    fn ods_stream_table_rows_for_sql<R: std::io::Read>(
+        win: &mut XmlByteWindow<R>,
+        path: &Path,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut row_pos = 0usize;
+        let mut span: Vec<u8> = Vec::new();
+        let mut pending_blank_rows = 0usize;
+
+        loop {
+            if sink.done {
+                break;
+            }
+            win.skip_misc()?;
+            if win.starts_with("</table:table>")? {
+                win.discard("</table:table>".len())?;
+                break;
+            }
+            match win.peek()? {
+                None => break,
+                Some(b'<') => {}
+                Some(_) => {
+                    win.discard(1)?;
+                    continue;
+                }
+            }
+            win.scan_element(&mut span)?;
+            let text = std::str::from_utf8(&span)
+                .with_context(|| format!("content.xml in {path:?} is not valid UTF-8"))?;
+            let mut p = 0usize;
+            let row_el = xml_parse_element(text, &mut p)?;
+            if row_el.name != "table:table-row" {
+                continue;
+            }
+
+            let row_repeat = ods_repeat_count(
+                &row_el,
+                "table:number-rows-repeated",
+                ODS_MAX_ROWS.saturating_sub(row_pos),
+            );
+
+            let mut col_pos = 0usize;
+            let mut row_cells: Vec<(usize, String)> = Vec::new();
+            for cell_el in row_el
+                .children_named("table:table-cell")
+                .chain(row_el.children_named("table:covered-table-cell"))
+            {
+                let col_repeat = ods_repeat_count(
+                    cell_el,
+                    "table:number-columns-repeated",
+                    ODS_MAX_COLUMNS.saturating_sub(col_pos),
+                );
+                if let Some(value) = ods_cell_text(cell_el) {
+                    for i in 0..col_repeat {
+                        row_cells.push((col_pos + i, value.clone()));
+                    }
+                }
+                col_pos += col_repeat;
+            }
+
+            if row_cells.is_empty() {
+                // Row 0 of this block, if present, is the header - never
+                // a data row, so it never contributes to the pending count.
+                let data_rows_here = if row_pos == 0 {
+                    row_repeat.saturating_sub(1)
+                } else {
+                    row_repeat
+                };
+                pending_blank_rows += data_rows_here;
+                row_pos += row_repeat;
+                continue;
+            }
+
+            for r in 0..row_repeat {
+                if sink.done {
+                    break;
+                }
+                let logical = row_pos + r;
+                if logical == 0 {
+                    continue; // the header row - already reflected in `profiles`
+                }
+                while pending_blank_rows > 0 && !sink.done {
+                    sink.accept(vec![None; sink.header_len])?;
+                    pending_blank_rows -= 1;
+                }
+                if sink.done {
+                    break;
+                }
+                let mut row: Vec<Option<String>> = vec![None; sink.header_len];
+                for (col, val) in &row_cells {
+                    if *col < row.len() {
+                        row[*col] = Some(val.clone());
+                    }
+                }
+                sink.accept(row)?;
+            }
+            row_pos += row_repeat;
+        }
+        Ok(())
+    }
+
+    /// The ODF (`.ods`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass - re-walks `content.xml`'s own
+    /// `<office:document-content>` -> `<office:body>` -> `<office:
+    /// spreadsheet>` container path exactly like `columns_from_ods` does,
+    /// then streams the requested `<table:table>`'s own rows via
+    /// `ods_stream_table_rows_for_sql`.
+    pub(crate) fn stream_ods_sheet_rows_for_sql(
+        path: &Path,
+        sheet_name: &str,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut zip = ZipArchive::open(path)?;
+        let mut content = zip
+            .read_to_temp("content.xml")
+            .context("no content.xml in ODF archive")?;
+        let mut win = XmlByteWindow::new(std::io::BufReader::new(content.as_file_mut()));
+
+        let no_spreadsheet = || anyhow!("no <office:spreadsheet> element in {path:?}");
+
+        win.skip_misc()?;
+        let (_root, _root_attrs, root_sc) = win.consume_start_tag()?;
+        if root_sc {
+            return Err(no_spreadsheet());
+        }
+
+        for (container, close_tag) in [
+            ("office:body", "</office:document-content>"),
+            ("office:spreadsheet", "</office:body>"),
+        ] {
+            let mut entered = false;
+            loop {
+                win.skip_misc()?;
+                if win.peek()?.is_none() || win.starts_with(close_tag)? {
+                    break;
+                }
+                if win.peek()? != Some(b'<') {
+                    win.discard(1)?;
+                    continue;
+                }
+                if win.peek_element_name()? == container {
+                    let (_n, _a, sc) = win.consume_start_tag()?;
+                    entered = !sc;
+                    break;
+                }
+                win.skip_element()?;
+            }
+            if !entered {
+                return Err(no_spreadsheet());
+            }
+        }
+
+        loop {
+            win.skip_misc()?;
+            if win.peek()?.is_none() || win.starts_with("</office:spreadsheet>")? {
+                bail!("sheet '{sheet_name}' not found in {path:?}");
+            }
+            if win.peek()? != Some(b'<') {
+                win.discard(1)?;
+                continue;
+            }
+            if win.peek_element_name()? == "table:table" {
+                let (_n, attrs, sc) = win.consume_start_tag()?;
+                let name = attrs
+                    .iter()
+                    .find(|(k, _)| k == "table:name")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "Sheet1".to_string());
+                if name != sheet_name {
+                    if !sc {
+                        // Skip past this non-matching table's own close tag
+                        // by scanning it as a throwaway profile pass would -
+                        // reuse the existing skip-shaped streaming reader
+                        // with no row-sources attached, just discarding.
+                        ods_stream_table_profiles(&mut win, path, Some(0), 0)?;
+                    }
+                    continue;
+                }
+                if sc {
+                    return Ok(()); // an empty table - zero rows, nothing to emit
+                }
+                return ods_stream_table_rows_for_sql(&mut win, path, sink);
+            }
+            win.skip_element()?;
+        }
     }
 
     pub(crate) fn columns_from_ods(
@@ -56159,6 +56560,150 @@ mod xlsx_support {
         })
     }
 
+    /// Shared row-assembly state for both BIFF8 (`.xls`) and BIFF12
+    /// (`.xlsb`) SQL row-sources - neither format has a per-row marker
+    /// guaranteed to fire for a genuinely blank row (BIFF8 has no row
+    /// marker at all; BIFF12's own `BrtRowHdr` isn't written for a row
+    /// with nothing in it either), so a blank row sitting between two
+    /// real ones never produces a decoded cell of its own. Both formats'
+    /// own profiling readers (`biff_fold_cell`) still count such a row as
+    /// part of the table anyway, since `n_data_rows = max_row` is derived
+    /// purely from the *highest* row number any cell ever names - so this
+    /// reproduces that by tracking `last_emitted_row`: the instant a cell
+    /// names a row more than one past the last row actually emitted, the
+    /// gap is filled with genuine all-`NULL` rows first. There's no
+    /// equivalent *trailing*-blank-row ambiguity to worry about here the
+    /// way ODF's own `ods_stream_table_rows_for_sql` has, since `max_row`
+    /// can never extend past the last row a real cell actually named.
+    /// Relies on the same "every real BIFF8/BIFF12 writer emits rows in
+    /// ascending order" assumption already disclosed elsewhere in this
+    /// reader for `sample_values` ordering. Doesn't bound real I/O via
+    /// `sink.done` - matching both profiling readers' own pre-existing
+    /// behavior, `--nrows` here only ever trims the *kept* output.
+    struct BiffRowBuilder {
+        current_row: Option<u32>,
+        row_buf: Vec<Option<String>>,
+        last_emitted_row: u32,
+    }
+
+    impl BiffRowBuilder {
+        fn new() -> Self {
+            BiffRowBuilder {
+                current_row: None,
+                row_buf: Vec::new(),
+                last_emitted_row: 0,
+            }
+        }
+
+        fn accept_cell(
+            &mut self,
+            row: u32,
+            col: u32,
+            val: String,
+            sink: &mut InlineRowSink<'_>,
+        ) -> Result<()> {
+            if row == 0 {
+                return Ok(()); // the header row - already reflected in `profiles`
+            }
+            if self.current_row != Some(row) {
+                if let Some(prev_row) = self.current_row.take() {
+                    if !sink.done {
+                        sink.accept(std::mem::take(&mut self.row_buf))?;
+                    }
+                    self.last_emitted_row = prev_row;
+                }
+                for gap_row in (self.last_emitted_row + 1)..row {
+                    if sink.done {
+                        break;
+                    }
+                    sink.accept(vec![None; sink.header_len])?;
+                    self.last_emitted_row = gap_row;
+                }
+                self.current_row = Some(row);
+                self.row_buf = vec![None; sink.header_len];
+            }
+            let col = col as usize;
+            if col < self.row_buf.len() {
+                self.row_buf[col] = Some(val);
+            }
+            Ok(())
+        }
+
+        fn finish(mut self, sink: &mut InlineRowSink<'_>) -> Result<()> {
+            if self.current_row.is_some() && !sink.done {
+                sink.accept(std::mem::take(&mut self.row_buf))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Walks every cell-bearing record in one BIFF8 worksheet substream,
+    /// calling `on_cell(row, col, value)` for each decoded cell in file
+    /// order - factored out of `xls_parse_sheet_profiles`'s own former
+    /// inline loop (a pure extraction, verified byte-identical) so the
+    /// `--sql-mode inline` second pass (`xls_stream_sheet_rows_for_sql`)
+    /// can drive the identical per-record decode logic with a different
+    /// destination for each cell, instead of risking a second,
+    /// independently-written copy of this dispatch drifting apart from
+    /// the original.
+    fn xls_walk_sheet_cells(
+        stream: &[u8],
+        sst: &[String],
+        is_date_by_xf: &[bool],
+        mut on_cell: impl FnMut(u32, u32, String) -> Result<()>,
+    ) -> Result<()> {
+        let mut fmla_pos: (u32, u32) = (0, 0);
+        for record in (XlsRecordIter { stream }) {
+            let r = record?;
+            match r.typ {
+                0x0203 => {
+                    let (row, col, val) = xls_parse_number(r.data, is_date_by_xf)?;
+                    on_cell(row, col, val)?;
+                }
+                0x027E => {
+                    let (row, col, val) = xls_parse_rk(r.data, is_date_by_xf)?;
+                    on_cell(row, col, val)?;
+                }
+                0x00BD => {
+                    for (row, col, val) in xls_parse_mul_rk(r.data, is_date_by_xf)? {
+                        on_cell(row, col, val)?;
+                    }
+                }
+                0x0204 | 0x00D6 => {
+                    let (row, col, val) = xls_parse_label(r.data)?;
+                    on_cell(row, col, val)?;
+                }
+                0x00FD => {
+                    if let Some((row, col, val)) = xls_parse_label_sst(r.data, sst)? {
+                        on_cell(row, col, val)?;
+                    }
+                }
+                0x0205 => {
+                    let (row, col, val) = xls_parse_bool_err(r.data)?;
+                    on_cell(row, col, val)?;
+                }
+                0x0006 => {
+                    let d = r.data.get(0..14).context("truncated FORMULA record")?;
+                    let row = xls_read_u16(d, 0)? as u32;
+                    let col = xls_read_u16(d, 2)? as u32;
+                    fmla_pos = (row, col);
+                    let ifmt = xls_read_u16(d, 4)? as usize;
+                    let is_date = is_date_by_xf.get(ifmt).copied().unwrap_or(false);
+                    if let Some(val) = xls_parse_formula_value(&d[6..14], is_date)? {
+                        on_cell(row, col, val)?;
+                    }
+                }
+                0x0207 => {
+                    let val = xls_parse_unicode_string(r.data)?;
+                    on_cell(fmla_pos.0, fmla_pos.1, val)?;
+                }
+                0x000A => break, // EOF of this worksheet's substream
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Parses one worksheet's own BIFF substream (starting at the byte
     /// offset its BOUNDSHEET8 record gave), folding each cell straight
     /// into per-column `ColumnAccumulatorState`s via `biff_fold_cell` -
@@ -56182,76 +56727,45 @@ mod xlsx_support {
         let mut states: Vec<ColumnAccumulatorState> = Vec::new();
         let mut max_row: i64 = -1;
         let mut max_col: i64 = -1;
-        let mut fmla_pos: (u32, u32) = (0, 0);
 
-        macro_rules! record_cell {
-            ($row:expr, $col:expr, $val:expr) => {{
-                biff_fold_cell(
-                    $row,
-                    $col,
-                    $val,
-                    &mut header,
-                    &mut states,
-                    &mut max_row,
-                    &mut max_col,
-                    nrows,
-                    n_samples,
-                );
-            }};
-        }
-
-        for record in (XlsRecordIter { stream }) {
-            let r = record?;
-            match r.typ {
-                0x0203 => {
-                    let (row, col, val) = xls_parse_number(r.data, is_date_by_xf)?;
-                    record_cell!(row, col, val);
-                }
-                0x027E => {
-                    let (row, col, val) = xls_parse_rk(r.data, is_date_by_xf)?;
-                    record_cell!(row, col, val);
-                }
-                0x00BD => {
-                    for (row, col, val) in xls_parse_mul_rk(r.data, is_date_by_xf)? {
-                        record_cell!(row, col, val);
-                    }
-                }
-                0x0204 | 0x00D6 => {
-                    let (row, col, val) = xls_parse_label(r.data)?;
-                    record_cell!(row, col, val);
-                }
-                0x00FD => {
-                    if let Some((row, col, val)) = xls_parse_label_sst(r.data, sst)? {
-                        record_cell!(row, col, val);
-                    }
-                }
-                0x0205 => {
-                    let (row, col, val) = xls_parse_bool_err(r.data)?;
-                    record_cell!(row, col, val);
-                }
-                0x0006 => {
-                    let d = r.data.get(0..14).context("truncated FORMULA record")?;
-                    let row = xls_read_u16(d, 0)? as u32;
-                    let col = xls_read_u16(d, 2)? as u32;
-                    fmla_pos = (row, col);
-                    let ifmt = xls_read_u16(d, 4)? as usize;
-                    let is_date = is_date_by_xf.get(ifmt).copied().unwrap_or(false);
-                    if let Some(val) = xls_parse_formula_value(&d[6..14], is_date)? {
-                        record_cell!(row, col, val);
-                    }
-                }
-                0x0207 => {
-                    let val = xls_parse_unicode_string(r.data)?;
-                    record_cell!(fmla_pos.0, fmla_pos.1, val);
-                }
-                0x000A => break, // EOF of this worksheet's substream
-                _ => {}
-            }
-        }
+        xls_walk_sheet_cells(stream, sst, is_date_by_xf, |row, col, val| {
+            biff_fold_cell(
+                row,
+                col,
+                val,
+                &mut header,
+                &mut states,
+                &mut max_row,
+                &mut max_col,
+                nrows,
+                n_samples,
+            );
+            Ok(())
+        })?;
 
         Ok(biff_finalize_profiles(
             header, states, max_row, max_col, nrows,
         ))
+    }
+
+    /// The BIFF8 (`.xls`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass, for one sheet's already-extracted
+    /// substream at a time - reuses `xls_walk_sheet_cells` directly, the
+    /// same per-record decode dispatch `xls_parse_sheet_profiles` itself
+    /// uses, just assembling complete rows via `BiffRowBuilder` (see its
+    /// own doc comment for why a blank row needs real handling here)
+    /// instead of folding into a per-column accumulator.
+    fn xls_stream_sheet_rows_for_sql(
+        stream: &[u8],
+        sst: &[String],
+        is_date_by_xf: &[bool],
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut builder = BiffRowBuilder::new();
+        xls_walk_sheet_cells(stream, sst, is_date_by_xf, |row, col, val| {
+            builder.accept_cell(row, col, val, sink)
+        })?;
+        builder.finish(sink)
     }
 
     pub(crate) fn columns_from_xls(
@@ -56291,6 +56805,36 @@ mod xlsx_support {
             bail!("no non-empty sheets found in {path:?}");
         }
         Ok(out)
+    }
+
+    /// The BIFF8 (`.xls`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass - re-opens the CFB container,
+    /// re-parses the workbook globals, and streams the requested sheet's
+    /// own cells via `xls_stream_sheet_rows_for_sql`.
+    pub(crate) fn stream_xls_sheet_rows_for_sql(
+        path: &Path,
+        sheet_name: &str,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut cfb = CfbFile::open(path)?;
+        let stream = cfb
+            .read_stream("Workbook")
+            .or_else(|_| cfb.read_stream("Book"))
+            .context("no 'Workbook'/'Book' stream in this OLE2 file - not a valid .xls")?;
+
+        let XlsWorkbookGlobals {
+            sheet_positions,
+            sst,
+            is_date_by_xf,
+        } = xls_parse_workbook_globals(&stream)?;
+        let pos = sheet_positions
+            .into_iter()
+            .find_map(|(pos, name)| (name == sheet_name).then_some(pos))
+            .with_context(|| format!("sheet '{sheet_name}' not found in {path:?}"))?;
+        let sheet_stream = stream
+            .get(pos..)
+            .context("BOUNDSHEET8 position past the end of the Workbook stream")?;
+        xls_stream_sheet_rows_for_sql(sheet_stream, &sst, &is_date_by_xf, sink)
     }
 
     // --- Hand-rolled BIFF12 (.xlsb) reader ---
@@ -56686,9 +57230,13 @@ mod xlsx_support {
         u32::from_le_bytes([buf[4], buf[5], buf[6], 0]) as usize
     }
 
-    /// Parses one worksheet part (`xl/worksheets/sheetN.bin`), folding
-    /// each cell straight into per-column `ColumnAccumulatorState`s via
-    /// `biff_fold_cell` (returns `None` for a sheet with no cells).
+    /// Walks every cell-bearing record in one worksheet part
+    /// (`xl/worksheets/sheetN.bin`), calling `on_cell(row, col, value)`
+    /// for each decoded cell - factored out of `xlsb_parse_sheet_
+    /// profiles`'s own former inline loop (a pure extraction, verified
+    /// byte-identical) so the `--sql-mode inline` second pass (`xlsb_
+    /// stream_sheet_rows_for_sql`) can drive the identical per-record
+    /// decode logic with a different destination for each cell.
     /// `BrtRowHdr` carries the current row for every cell record that
     /// follows until the next one (cell records themselves carry only a
     /// column); a formula cell's cached result
@@ -56699,35 +57247,13 @@ mod xlsx_support {
     /// scope. `BrtCellBlank` (an explicitly-blank cell) is silently
     /// skipped, the same "absent = missing" convention every other
     /// reader in this project already uses.
-    fn xlsb_parse_sheet_profiles<R: std::io::Read>(
+    fn xlsb_walk_sheet_cells<R: std::io::Read>(
         reader: R,
         sst: &[String],
         is_date_by_xf: &[bool],
-        nrows: Option<usize>,
-        n_samples: usize,
-    ) -> Result<Option<Vec<ColumnProfile>>> {
-        let mut header: BiffHeader = Vec::new();
-        let mut states: Vec<ColumnAccumulatorState> = Vec::new();
-        let mut max_row: i64 = -1;
-        let mut max_col: i64 = -1;
+        mut on_cell: impl FnMut(u32, u32, String) -> Result<()>,
+    ) -> Result<()> {
         let mut row: u32 = 0;
-
-        macro_rules! record_cell {
-            ($col:expr, $val:expr) => {{
-                biff_fold_cell(
-                    row,
-                    $col,
-                    $val,
-                    &mut header,
-                    &mut states,
-                    &mut max_row,
-                    &mut max_col,
-                    nrows,
-                    n_samples,
-                );
-            }};
-        }
-
         let mut iter = Biff12StreamIter::new(reader);
         while let Some((typ, body)) = iter.next_record()? {
             match typ {
@@ -56746,7 +57272,7 @@ mod xlsx_support {
                     let val: [u8; 4] = d[8..12].try_into().unwrap();
                     let v = xls_rk_decode(val)?;
                     let is_date = is_date_by_xf.get(style_ref).copied().unwrap_or(false);
-                    record_cell!(col, xls_numeric_cell_text(v, is_date));
+                    on_cell(row, col, xls_numeric_cell_text(v, is_date))?;
                 }
                 0x0003 | 0x000B => {
                     // BrtCellError | BrtFmlaError
@@ -56754,7 +57280,7 @@ mod xlsx_support {
                         .get(0..9)
                         .context("truncated BIFF12 error cell record")?;
                     let col = xls_read_u32(d, 0)?;
-                    record_cell!(col, xls_error_code_to_string(d[8])?);
+                    on_cell(row, col, xls_error_code_to_string(d[8])?)?;
                 }
                 0x0004 | 0x000A => {
                     // BrtCellBool | BrtFmlaBool
@@ -56762,7 +57288,7 @@ mod xlsx_support {
                         .get(0..9)
                         .context("truncated BIFF12 bool cell record")?;
                     let col = xls_read_u32(d, 0)?;
-                    record_cell!(col, (d[8] != 0).to_string());
+                    on_cell(row, col, (d[8] != 0).to_string())?;
                 }
                 0x0005 | 0x0009 => {
                     // BrtCellReal | BrtFmlaNum
@@ -56773,7 +57299,7 @@ mod xlsx_support {
                     let style_ref = xlsb_cell_style_ref(d);
                     let v = xls_read_f64(d, 8)?;
                     let is_date = is_date_by_xf.get(style_ref).copied().unwrap_or(false);
-                    record_cell!(col, xls_numeric_cell_text(v, is_date));
+                    on_cell(row, col, xls_numeric_cell_text(v, is_date))?;
                 }
                 0x0006 | 0x0008 => {
                     // BrtCellSt | BrtFmlaString
@@ -56782,7 +57308,7 @@ mod xlsx_support {
                         body.get(8..)
                             .context("truncated BIFF12 string cell record")?,
                     )?;
-                    record_cell!(col, s);
+                    on_cell(row, col, s)?;
                 }
                 0x0007 => {
                     // BrtCellIsst
@@ -56790,16 +57316,67 @@ mod xlsx_support {
                     let col = xls_read_u32(d, 0)?;
                     let idx = xls_read_u32(d, 8)? as usize;
                     if let Some(s) = sst.get(idx) {
-                        record_cell!(col, s.clone());
+                        on_cell(row, col, s.clone())?;
                     }
                 }
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Parses one worksheet part (`xl/worksheets/sheetN.bin`), folding
+    /// each cell straight into per-column `ColumnAccumulatorState`s via
+    /// `biff_fold_cell` (returns `None` for a sheet with no cells).
+    fn xlsb_parse_sheet_profiles<R: std::io::Read>(
+        reader: R,
+        sst: &[String],
+        is_date_by_xf: &[bool],
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Option<Vec<ColumnProfile>>> {
+        let mut header: BiffHeader = Vec::new();
+        let mut states: Vec<ColumnAccumulatorState> = Vec::new();
+        let mut max_row: i64 = -1;
+        let mut max_col: i64 = -1;
+
+        xlsb_walk_sheet_cells(reader, sst, is_date_by_xf, |row, col, val| {
+            biff_fold_cell(
+                row,
+                col,
+                val,
+                &mut header,
+                &mut states,
+                &mut max_row,
+                &mut max_col,
+                nrows,
+                n_samples,
+            );
+            Ok(())
+        })?;
 
         Ok(biff_finalize_profiles(
             header, states, max_row, max_col, nrows,
         ))
+    }
+
+    /// The BIFF12 (`.xlsb`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass, for one worksheet part at a time -
+    /// reuses `xlsb_walk_sheet_cells` directly, assembling complete rows
+    /// via the same `BiffRowBuilder` the `.xls` row-source uses (see its
+    /// own doc comment for why a blank row needs real handling here too -
+    /// `BrtRowHdr` isn't written for a row with nothing in it either).
+    fn xlsb_stream_sheet_rows_for_sql<R: std::io::Read>(
+        reader: R,
+        sst: &[String],
+        is_date_by_xf: &[bool],
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut builder = BiffRowBuilder::new();
+        xlsb_walk_sheet_cells(reader, sst, is_date_by_xf, |row, col, val| {
+            builder.accept_cell(row, col, val, sink)
+        })?;
+        builder.finish(sink)
     }
 
     pub(crate) fn columns_from_xlsb(
@@ -56854,6 +57431,50 @@ mod xlsx_support {
             bail!("no non-empty sheets found in {path:?}");
         }
         Ok(out)
+    }
+
+    /// The BIFF12 (`.xlsb`) row-source for `render_sql_inline_flat`'s
+    /// `--sql-mode inline` second pass - re-resolves the requested
+    /// sheet's own archive part and re-reads `sharedStrings.bin`/
+    /// `styles.bin` exactly like `columns_from_xlsb` does, then streams
+    /// that one worksheet part's own rows via `xlsb_stream_sheet_rows_
+    /// for_sql`.
+    pub(crate) fn stream_xlsb_sheet_rows_for_sql(
+        path: &Path,
+        sheet_name: &str,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut zip = ZipArchive::open(path)?;
+
+        let rels_xml = String::from_utf8(zip.read("xl/_rels/workbook.bin.rels")?)
+            .context("xl/_rels/workbook.bin.rels is not valid UTF-8")?;
+        let relationships = xlsb_parse_relationships(&rels_xml)?;
+
+        let workbook_bin = zip.read("xl/workbook.bin")?;
+        let sheet_entries = xlsb_parse_workbook(&workbook_bin, &relationships)?;
+        let part_path = sheet_entries
+            .into_iter()
+            .find_map(|entry| (entry.name == sheet_name).then_some(entry.part_path))
+            .with_context(|| format!("sheet '{sheet_name}' not found in {path:?}"))?;
+
+        let sst = match zip.read("xl/sharedStrings.bin") {
+            Ok(bytes) => xlsb_parse_shared_strings(&bytes)?,
+            Err(_) => Vec::new(),
+        };
+        let is_date_by_xf = match zip.read("xl/styles.bin") {
+            Ok(bytes) => xlsb_parse_styles(&bytes)?,
+            Err(_) => Vec::new(),
+        };
+
+        let mut sheet_tmp = zip
+            .read_to_temp(&part_path)
+            .with_context(|| format!("failed to read sheet '{sheet_name}' in {path:?}"))?;
+        xlsb_stream_sheet_rows_for_sql(
+            std::io::BufReader::new(sheet_tmp.as_file_mut()),
+            &sst,
+            &is_date_by_xf,
+            sink,
+        )
     }
 } // mod xlsx_support
 
@@ -59366,10 +59987,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Sqlite
                 | InputFormat::Npz
                 | InputFormat::Ini
+                | InputFormat::Xlsx
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx are supported so far",
             format.as_str()
         );
     }

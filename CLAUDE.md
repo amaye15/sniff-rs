@@ -319,9 +319,10 @@ for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers the entire flat,
 fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
-SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus SQLite, `.npz`, and INI,
-three of the four formats in the multi-table tier, so far. Every other
-format transparently falls back to `staging` with a disclosed stderr
+SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
+tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
+`.xlsb`/`.ods`). Every other format transparently falls back to `staging`
+with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
 asked for would be the wrong kind of quiet).
@@ -346,19 +347,23 @@ needs its own real design, not just repeating the same pattern:
    real `nrows`-handling behavior (real-I/O-bounding vs. dBase's
    deliberate decode-always) rather than one convention applied
    uniformly regardless of what the format actually does.
-2. **The multi-table tier** (SQLite, `.npz`, and INI done as of Phases
-   9-11 - only the Excel family remains) - `dispatch_reader` already
-   returns `Vec<(String, Vec<ColumnProfile>)>` for these; `render_sql`'s
-   inline branch now loops over every table (no longer just `tables
-   .iter().next()`), each table getting its own `CREATE TABLE`/`INSERT`
-   pair sharing one file-level header comment, reusing whichever row-
-   source its own format tier ultimately supports (SQLite reused its own
-   existing per-row-callback reader directly; `.npz` reused Phase 8's
-   own `.npy` row-source per array with zero new decode logic; INI
-   needed its own real design - a section's own one-record-per-table
-   shape, with a repeated key disclosed as needing `--sql-mode staging`
-   rather than guessing at a pooled-array serialization; Excel still
-   needs its own, across all four of its independent sub-readers).
+2. **The multi-table tier - done as of Phase 12.** SQLite, `.npz`, INI,
+   and the Excel family (`.xlsx`/`.xls`/`.xlsb`/`.ods`) all support
+   `--sql-mode inline`. `dispatch_reader` already returns
+   `Vec<(String, Vec<ColumnProfile>)>` for these; `render_sql`'s inline
+   branch loops over every table (no longer just `tables.iter().next()`),
+   each table getting its own `CREATE TABLE`/`INSERT` pair sharing one
+   file-level header comment, reusing whichever row-source its own
+   format tier ultimately supports (SQLite reused its own existing
+   per-row-callback reader directly; `.npz` reused Phase 8's own `.npy`
+   row-source per array with zero new decode logic; INI needed its own
+   real design - a section's own one-record-per-table shape, with a
+   repeated key disclosed as needing `--sql-mode staging` rather than
+   guessing at a pooled-array serialization; Excel needed the largest
+   new design of the four, given its four independent sub-readers - two
+   genuinely different blank-row-reconstruction strategies for ODS's
+   real trailing-ambiguity problem versus BIFF's middle-gap-only
+   problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier** (JSON, YAML, TOML, Avro,
    MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
    iCalendar, MBOX) - the hardest tier: there's no existing function that
@@ -1127,13 +1132,96 @@ byte-identical inline SQL output against the pre-Phase-11 binary. Clean
 across default/`ini`/`full`, matching each one's own established
 baseline exactly.
 
-Remaining in the multi-table tier: the Excel family (`.xlsx`/`.xls`/
-`.xlsb`/`.ods`) - the last format in this tier, and the largest
-remaining chunk given its four independent sub-readers. The
-recursively-nested, JSON-bridge tier (JSON, YAML, TOML, Avro,
-MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
-iCalendar, MBOX) remains entirely unstarted too (see this section's own
-tiered roadmap above for what each one actually needs).
+**Phase 12: the Excel family (`.xlsx`/`.xls`/`.xlsb`/`.ods`) - the last
+format in the multi-table tier, and the largest single phase in this
+campaign, since `InputFormat::Xlsx` covers four independent sub-readers
+dispatched by real content-sniffing (`columns_from_xlsx`'s own ZIP-entry-
+name/CFB-stream-name checks - see the Architecture section) rather than
+one shared decode path.** Each sub-reader needed its own "read one row a
+second time" row-source, mirrored exactly by a new top-level
+`render_sql_inline_flat_xlsx` dispatcher matching `columns_from_xlsx`'s
+own dispatch order (OOXML `xl/workbook.xml` -> BIFF12 `xl/workbook.bin`
+-> ODF `content.xml`+`mimetype` -> BIFF8 CFB `Workbook`/`Book` stream ->
+a disclosed error naming the four recognized structures if none match).
+
+Two of the four sub-readers needed a genuinely new design, not just a
+mechanical port of the existing pattern, because Excel's own binary/XML
+layouts don't disclose a blank row's existence the same way twice:
+
+- **ODF (`stream_ods_sheet_rows_for_sql`) has a real, structural
+  trailing-blank-row ambiguity** a streaming row-source can't resolve the
+  way `ods_stream_table_profiles` (the profiling reader) already does,
+  since that reader gets to see the *whole* table before deciding how
+  many rows it really had, while a streaming row-source can't un-emit an
+  already-written `INSERT` row once it turns out to have been trailing
+  padding. `pending_blank_rows: usize` defers a run of entirely-blank
+  repeated `<table:table-row>` elements instead of emitting them
+  immediately - flushed as genuine all-`NULL` rows only once a *later*
+  real row proves the run wasn't trailing, and discarded entirely if the
+  table ends first - reproducing the profiling reader's own "trailing
+  blank rows invisible" property exactly rather than a plausible-looking
+  approximation of it.
+- **BIFF (.xls/.xlsb) has a different missing-marker problem: no
+  per-row marker for a blank row at all**, only individual cell records -
+  a shared `struct BiffRowBuilder` (used by both `.xls`'s and `.xlsb`'s
+  own row-sources, since both formats share the identical "cell records
+  only" structural shape) fills a *middle* gap immediately via
+  `last_emitted_row` tracking, with no deferral needed at all - unlike
+  ODS, a BIFF stream's `max_row` can never extend past the last row a
+  real cell actually named, so there's no trailing-ambiguity case to
+  defer for in the first place. Recognizing these as two genuinely
+  different problems (not one blank-row problem in four different
+  binary encodings) is what kept this phase from either over-generalizing
+  a single mechanism that doesn't fit both shapes, or duplicating the
+  same logic four times with no shared abstraction at all.
+
+`.xls`'s and `.xlsb`'s own cell-walking loops (`xls_walk_sheet_cells`/
+`xlsb_walk_sheet_cells`) were each extracted from their existing
+`xls_parse_sheet_profiles`/`xlsb_parse_sheet_profiles` profiling readers
+as pure refactors first - verified via the complete existing test suite
+showing byte-identical pass counts before/after each extraction - so the
+new SQL row-source and the existing profiling reader share the identical
+cell-decoding logic rather than risking two independently-written copies
+drifting apart, the same "extract, don't duplicate" discipline every
+other phase in this campaign already established.
+
+Verified against a real, installed SQLite build with **no separate load
+step**, across all four sub-formats: `multi_sheet.xlsx`/`multi_sheet_lo
+.xls --output-format sql --load-into sqlite:...` both loaded their two
+real sheets (`customers`/`products`) correctly under one shared header
+comment; `sample.ods`/`edge_ods_repeated_cells.ods` confirmed real values
+survive intact and a genuinely blank middle cell lands as a real `NULL`
+(not a fabricated empty string or a row-shifted value), directly proving
+the `pending_blank_rows` design; `edge_xlsx_native_date_cells.xlsx`/
+`edge_xls_native_date_cells.xls` both confirmed a native date/datetime
+cell resolves to a real ISO string, not Excel's own raw day-count serial;
+`edge_xls_formula_and_error.xls` confirmed a cached `#DIV/0!` formula
+error survives as real text; all four `poi_*.xlsb` fixtures (Apache POI's
+own real, vendored `.xlsb` files - see that fixture family's own
+provenance) loaded correctly, including `poi_various.xlsb`'s own
+`BrtFmlaError` cell resolving to `#NAME?` and `poi_date.xlsb`'s own
+zero-data-row sheet (a date used as the header, no rows below it)
+producing a clean `CREATE TABLE` with no trailing `INSERT` at all; and
+`--nrows 1` on `multi_sheet.xlsx` confirmed each sheet is bounded
+independently. Also verified as behavior-preserving for every
+already-shipped format: `diff` confirmed byte-identical inline SQL
+output against the pre-Phase-12 binary across the entire 154-file
+fixture corpus for every previously-shipped format. Clean across
+default/`xlsx`/`full`, matching each one's own established baseline
+exactly (the same pre-existing `chunks_exact`/question-mark clippy
+findings from a newer clippy version, confirmed identical on unmodified
+`main`).
+
+**With Phase 12, the entire multi-table tier is done**: SQLite, `.npz`,
+INI, and now the whole Excel family (`.xlsx`/`.xls`/`.xlsb`/`.ods`) all
+support `--sql-mode inline`. Only the recursively-nested, JSON-bridge
+tier (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML, BSON, plist,
+JSON5, HAR, GeoJSON, vCard, iCalendar, MBOX) remains - the hardest tier,
+needing a brand-new single-record flattener (nothing today flattens one
+record into a flat row matching `JsonPathAccumulator`'s dot-notation
+columns) plus a decision on how a pooled `Vec<T>` column serializes into
+one row's cell (see this section's own tiered roadmap above for the
+full accounting of what each format in this tier still needs).
 
 ## Directory-input batch mode
 

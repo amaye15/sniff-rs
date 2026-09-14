@@ -1508,6 +1508,99 @@ fn load_into_accepts_ini() {
 }
 
 #[test]
+#[cfg(feature = "xlsx")]
+fn sql_output_inline_mode_supports_xlsx_multi_sheet() {
+    // Phase 12 of the "any format" rollout, and the fourth/last format in
+    // the multi-table tier: an OOXML workbook's sheets each get their own
+    // CREATE TABLE/INSERT pair sharing one file-level header comment,
+    // exactly like SQLite's/`.npz`'s/INI's own tables already do.
+    let sql = run_sql("multi_sheet.xlsx", &[]);
+    assert_eq!(sql.matches("-- Data dictionary for").count(), 1);
+    assert!(sql.contains("CREATE TABLE \"customers\""));
+    assert!(sql.contains("CREATE TABLE \"products\""));
+    assert!(sql.contains("'Alice'"));
+    assert!(sql.contains("'SKU-1'"));
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn sql_output_inline_mode_supports_ods() {
+    let sql = run_sql("sample.ods", &[]);
+    assert!(sql.contains("CREATE TABLE \"Sheet1\""));
+    assert!(sql.contains("'alice'"));
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn sql_output_inline_mode_ods_fills_a_blank_row_gap_with_real_nulls() {
+    // A genuinely blank cell in the middle of real ODS data must land as
+    // a real NULL, not a fabricated empty string or a row-shifted value -
+    // the deferred pending_blank_rows design's whole point.
+    let sql = run_sql("edge_ods_repeated_cells.ods", &[]);
+    let values = sql
+        .split("INSERT INTO")
+        .nth(1)
+        .expect("no INSERT statement found");
+    assert!(values.contains("NULL"));
+    assert!(values.contains("'bob'"));
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn sql_output_inline_mode_supports_xls() {
+    let sql = run_sql("multi_sheet_lo.xls", &[]);
+    assert_eq!(sql.matches("-- Data dictionary for").count(), 1);
+    assert!(sql.contains("CREATE TABLE \"customers\""));
+    assert!(sql.contains("CREATE TABLE \"products\""));
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn sql_output_inline_mode_xls_native_date_cells_resolve_to_real_dates() {
+    let sql = run_sql("edge_xls_native_date_cells.xls", &[]);
+    assert!(sql.contains("'2024-01-15'"));
+    // Excel's own raw day-count serial for this date (45306) must never
+    // appear - only the resolved ISO date string.
+    assert!(!sql.contains("45306"));
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn sql_output_inline_mode_supports_xlsb() {
+    let sql = run_sql("poi_sample.xlsb", &[]);
+    assert!(sql.contains("CREATE TABLE"));
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn sql_output_inline_mode_xlsx_respects_nrows_per_sheet() {
+    let sql = run_sql("multi_sheet.xlsx", &["--nrows", "1"]);
+    assert!(sql.contains("'Alice'"));
+    assert!(!sql.contains("'Bob'"));
+    assert!(sql.contains("'SKU-1'"));
+    assert!(!sql.contains("'SKU-2'"));
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn load_into_accepts_xlsx() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.xlsx").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for xlsx"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no
