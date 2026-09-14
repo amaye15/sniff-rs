@@ -319,13 +319,12 @@ for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers the entire flat,
 fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
-SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus SQLite and `.npz`, the
-first two formats in the multi-table tier, so far. Every other format
-transparently falls back to `staging` with a disclosed stderr note
-(`--sql-mode inline`
-given *explicitly* on an unsupported format is a hard error instead,
-naming the gap - downgrading what was explicitly asked for would be the
-wrong kind of quiet).
+SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus SQLite, `.npz`, and INI,
+three of the four formats in the multi-table tier, so far. Every other
+format transparently falls back to `staging` with a disclosed stderr
+note (`--sql-mode inline` given *explicitly* on an unsupported format is
+a hard error instead, naming the gap - downgrading what was explicitly
+asked for would be the wrong kind of quiet).
 
 Extending inline mode further is explicit, disclosed, staged future
 work, following this project's own "one format at a time, fully verified"
@@ -347,16 +346,19 @@ needs its own real design, not just repeating the same pattern:
    real `nrows`-handling behavior (real-I/O-bounding vs. dBase's
    deliberate decode-always) rather than one convention applied
    uniformly regardless of what the format actually does.
-2. **The multi-table tier** (SQLite and `.npz` done as of Phases 9-10 -
-   the Excel family and INI remain) - `dispatch_reader` already returns
-   `Vec<(String, Vec<ColumnProfile>)>` for these; `render_sql`'s inline
-   branch now loops over every table (no longer just `tables.iter()
-   .next()`), each table getting its own `CREATE TABLE`/`INSERT` pair
-   sharing one file-level header comment, reusing whichever row-source
-   its own format tier ultimately supports (SQLite reused its own
+2. **The multi-table tier** (SQLite, `.npz`, and INI done as of Phases
+   9-11 - only the Excel family remains) - `dispatch_reader` already
+   returns `Vec<(String, Vec<ColumnProfile>)>` for these; `render_sql`'s
+   inline branch now loops over every table (no longer just `tables
+   .iter().next()`), each table getting its own `CREATE TABLE`/`INSERT`
+   pair sharing one file-level header comment, reusing whichever row-
+   source its own format tier ultimately supports (SQLite reused its own
    existing per-row-callback reader directly; `.npz` reused Phase 8's
-   own `.npy` row-source per array with zero new decode logic; Excel/
-   INI each still need their own).
+   own `.npy` row-source per array with zero new decode logic; INI
+   needed its own real design - a section's own one-record-per-table
+   shape, with a repeated key disclosed as needing `--sql-mode staging`
+   rather than guessing at a pooled-array serialization; Excel still
+   needs its own, across all four of its independent sub-readers).
 3. **The recursively-nested, JSON-bridge tier** (JSON, YAML, TOML, Avro,
    MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
    iCalendar, MBOX) - the hardest tier: there's no existing function that
@@ -1079,9 +1081,56 @@ byte-identical inline SQL output against the pre-Phase-10 binary across
 every already-shipped format. Clean across default/`npy`/`full`,
 matching each one's own established baseline exactly.
 
+**Phase 11: INI - the third multi-table format, and the first whose
+"table" has no repeating-row concept at all.** An INI section already
+profiles as exactly one record (`profile_json_records(&[record], ...)`,
+`total = 1`), so `stream_ini_section_row_for_sql` re-parses the file,
+finds the requested section by name, and builds exactly one row - one
+value per first-seen key, in the identical order `columns_from_ini`'s
+own field-bucketing loop already establishes.
+
+The real design question this phase settled: INI permits a key to repeat
+within one section, which `columns_from_ini` already pools into a
+`Vec<T>` column for profiling - but a pooled array has no single cell to
+honestly embed as a literal, the same not-yet-settled question this
+project's own nested/JSON-bridge tier still needs a real answer for.
+Rather than block this phase on that harder tier's design, or guess at a
+throwaway serialization now that a later, more principled decision might
+have to walk back, `stream_ini_section_row_for_sql` detects a repeated
+key with a single linear scan and bails with a clear, actionable error
+naming the section and the key - the same "confident common case,
+disclosed gap" boundary SQLite's own `WITHOUT ROWID` check and ORC's own
+nested-column check already established, just reached here by a section-
+level property instead of a table- or column-level one. Every section
+with no repeated key - the overwhelming common case for a real INI file,
+confirmed by every real fixture this project has swept in its own
+real-world-corpus validation (`php.ini-production`, a real `smb.conf`) -
+still works.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `type_detection.ini --output-format sql --load-into sqlite:...`
+loaded its one section cleanly; `edge_ini_duplicate_key_diff_section.ini`
+(two sections, the *same* key name repeated across - not within -
+sections, a legal, non-pooling shape) confirmed both tables load
+independently under one shared header comment; `edge_ini_quoting_and_
+escapes.ini` confirmed every quoting/escaping convention (tab/newline
+escapes, an escaped embedded quote, a colon-delimited pair) survives
+intact, including a genuinely empty value (`Key7=`) rendering as a real
+empty-string literal rather than a fabricated `NULL` - the same Phase 9
+sentinel/empty-string fix applying correctly here too, confirmed
+directly by checking `Key7 IS NULL` (false) and `length(Key7)` (`0`)
+against the loaded database; `sample.ini`'s own real `[database]`
+section (a genuinely repeated `tag` key) confirmed the disclosed error
+fires and names both the section and the key. Also verified as
+behavior-preserving for every already-shipped format: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-11 binary. Clean
+across default/`ini`/`full`, matching each one's own established
+baseline exactly.
+
 Remaining in the multi-table tier: the Excel family (`.xlsx`/`.xls`/
-`.xlsb`/`.ods`) and INI - each an explicit, not-yet-started future
-phase. The recursively-nested, JSON-bridge tier (JSON, YAML, TOML, Avro,
+`.xlsb`/`.ods`) - the last format in this tier, and the largest
+remaining chunk given its four independent sub-readers. The
+recursively-nested, JSON-bridge tier (JSON, YAML, TOML, Avro,
 MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
 iCalendar, MBOX) remains entirely unstarted too (see this section's own
 tiered roadmap above for what each one actually needs).

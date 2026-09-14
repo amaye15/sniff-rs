@@ -46675,6 +46675,56 @@ mod ini_support {
 
         Ok(sections)
     }
+
+    /// The INI row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass - re-parses `path` and re-derives one
+    /// section's own single record, the same "whole document/section as
+    /// one row" shape `columns_from_ini` already established (an INI
+    /// section has no repeating-row concept at all, so its "table" is
+    /// always exactly one profiled record).
+    ///
+    /// A repeated key (which `columns_from_ini` already pools into a
+    /// `Vec<T>` column for profiling) has no single cell to honestly
+    /// embed as a literal - the same not-yet-settled pooled-array-to-
+    /// cell question the nested/JSON-bridge tier's own future phase
+    /// still needs to answer - so this bails with a clear, actionable
+    /// error naming the section and the repeated key, rather than a
+    /// guess, matching the "no honest literal to emit" boundary SQLite's
+    /// `WITHOUT ROWID` check and ORC's nested-column check already
+    /// established for their own, differently-caused gaps. Every section
+    /// with no repeated key - the overwhelming common case - still works.
+    pub(crate) fn stream_ini_section_row_for_sql(
+        path: &Path,
+        section_name: &str,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let sections =
+            parse_ini(&content).with_context(|| format!("failed to parse {path:?} as INI"))?;
+
+        let props = sections
+            .into_iter()
+            .find_map(|(name, props)| {
+                let resolved = name.unwrap_or_else(|| "(default)".to_string());
+                (!props.is_empty() && resolved == section_name).then_some(props)
+            })
+            .with_context(|| format!("section '{section_name}' not found in {path:?}"))?;
+
+        let mut values: Vec<Option<String>> = Vec::with_capacity(props.len());
+        let mut seen: HashSet<&str, FxBuildHasher> = HashSet::default();
+        for (k, v) in &props {
+            if !seen.insert(k.as_str()) {
+                bail!(
+                    "--sql-mode inline can't emit real data for INI section \"{section_name}\" - \
+                     its \"{k}\" key repeats (pools into an array column for profiling), which \
+                     has no single cell to embed as a literal yet; use --sql-mode staging instead"
+                );
+            }
+            values.push(Some(v.clone()));
+        }
+        sink.accept(values)
+    }
 }
 
 #[cfg(feature = "ini")]
@@ -52212,6 +52262,7 @@ fn render_sql_inline_flat(
         InputFormat::Npz => {
             render_sql_inline_flat_npz(read_path, table_name, args.nrows, &mut sink)?
         }
+        InputFormat::Ini => render_sql_inline_flat_ini(read_path, table_name, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52457,6 +52508,31 @@ fn render_sql_inline_flat_npz(
     )
 }
 
+/// The INI row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_sqlite`'s own doc comment for why `table_name`
+/// (here, a section name) genuinely selects which of the file's several
+/// sections to read, and `render_sql_inline_flat_weblog`'s own for why
+/// this is safe to call unconditionally even in a non-`ini` build.
+#[cfg(feature = "ini")]
+fn render_sql_inline_flat_ini(
+    read_path: &Path,
+    table_name: &str,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    ini_support::stream_ini_section_row_for_sql(read_path, table_name, sink)
+}
+
+#[cfg(not(feature = "ini"))]
+fn render_sql_inline_flat_ini(
+    _read_path: &Path,
+    _table_name: &str,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "INI support isn't compiled in - rebuild with `cargo build --release --features ini` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -52586,12 +52662,13 @@ fn render_sql(
             | InputFormat::Npy
             | InputFormat::Sqlite
             | InputFormat::Npz
+            | InputFormat::Ini
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -59288,10 +59365,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Npy
                 | InputFormat::Sqlite
                 | InputFormat::Npz
+                | InputFormat::Ini
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini are supported so far",
             format.as_str()
         );
     }

@@ -1436,6 +1436,78 @@ fn load_into_accepts_npz() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
+fn sql_output_inline_mode_supports_ini_multi_section() {
+    // Phase 11 of the "any format" rollout, and the third format in the
+    // multi-table tier: an INI section has no repeating-row concept at
+    // all, so its "table" is always exactly one profiled record - a
+    // section with no repeated key still emits one real INSERT row.
+    let sql = run_sql("edge_ini_duplicate_key_diff_section.ini", &[]);
+    assert_eq!(sql.matches("-- Data dictionary for").count(), 1);
+    assert!(sql.contains("CREATE TABLE \"section1\""));
+    assert!(sql.contains("CREATE TABLE \"section2\""));
+    assert!(sql.contains("'value1'"));
+    assert!(sql.contains("'value2'"));
+    assert!(sql.contains("'value3'"));
+}
+
+#[test]
+#[cfg(feature = "ini")]
+fn sql_output_inline_mode_ini_preserves_a_genuinely_empty_value() {
+    // A real, present-but-empty INI value (Key7= in this fixture) must
+    // render as a real empty string literal, not a fabricated NULL -
+    // the same sentinel/empty-string bug class Phase 9 already fixed
+    // for every other native-null-or-no-null format.
+    let sql = run_sql("edge_ini_quoting_and_escapes.ini", &[]);
+    let values = sql
+        .split("INSERT INTO")
+        .nth(1)
+        .expect("no INSERT statement found");
+    assert!(values.contains("''"));
+    assert!(!values.contains("NULL"));
+}
+
+#[test]
+#[cfg(feature = "ini")]
+fn sql_output_inline_mode_ini_rejects_a_section_with_a_repeated_key() {
+    // A repeated key pools into a Vec<T> column for profiling, which has
+    // no single cell to honestly embed as a literal - a clear,
+    // actionable error naming the section and the key, not a guess.
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.ini").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("its \"tag\" key repeats"));
+    assert!(stderr.contains("\"database\""));
+}
+
+#[test]
+#[cfg(feature = "ini")]
+fn load_into_accepts_ini() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.ini").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for ini"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no
