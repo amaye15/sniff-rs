@@ -312,33 +312,134 @@ guessing:
 ```
 
 SQL script (`sql`) — a fourth rendering, and the only one that's meant to
-be *run* rather than read: for each table, a raw all-`TEXT` staging
-table, a properly-typed real table (types from `ideal_type`, nullability
-from `missing_pct` — the same two signals `json-schema`'s own rendering
-already turns into a schema), and an `INSERT INTO ... SELECT CAST(...)
-FROM staging` that converts the staged text into the real types.
+be *run* rather than read. `--sql-mode` picks between two genuinely
+different shapes: `inline` (the default) and `staging` (the original
+shape, kept for large files - see below). Both are CSV/TSV-only so far;
+every other format transparently falls back to `staging` with a disclosed
+stderr note (`--sql-mode inline` given *explicitly* on an unsupported
+format is a hard error instead, naming the gap - downgrading what was
+explicitly asked for would be the wrong kind of quiet). Extending inline
+mode to the remaining ~28 formats is explicit, disclosed future work (see
+the Streaming section's own "one format at a time" precedent for how
+every other multi-format campaign in this project has always rolled out).
 
-There is deliberately no attempt to fake a single, engine-agnostic way to
-load the source file's own bytes into that staging table — no such thing
-exists in standard SQL. Every real engine has its own incompatible
+**`--sql-mode inline` (default): the whole dataset embedded as literal
+`INSERT` statements, so the script needs no separate load step at all.**
+Prompted by the user wanting the SQL output to work "out of the box, zero
+setup" - research into that goal found the real fix isn't a smarter load
+command, it's removing the load step entirely: a bare `INSERT INTO t
+(...) VALUES (...), (...);` runs unmodified on *any* real SQL engine with
+no extension, no file I/O, no per-engine syntax at all - the exact
+convention `pg_dump`/`mysqldump`/`sqlite3 .dump` already use for a
+portable SQL data file, so this isn't a novel idea, just the right one.
+Since sniff-rs already has a hand-rolled reader for every one of its 30
+input formats, it can act as its own universal "adapter": read the data
+once in Rust (reusing the exact same `stream_utf8_chunks`/`csv_feed_chunk`
+primitives the real profiling pass already streams through, in a genuine
+second pass over the file now that final column types are known -
+`ColumnProfile` never retains raw per-row values by design, the entire
+point of this project's own incremental-accumulator streaming work, so
+there's no way around looking at the file twice), and re-emit it as SQL
+literals the engine never has to go fetch from anywhere.
+
+This also removes the root cause of `--sql-mode staging`'s own two bugs
+(below) rather than working around them: a literal constant is coerced
+by the engine using the target column's real type at `INSERT` time, and
+a value already known to be missing (or already run through
+`normalize_numeric_str`) is resolved once, in Rust, during generation -
+there's no runtime `CAST`/`CASE` expression left in the SQL for either to
+go wrong in. `render_sql_inline_csv`/`sql_literal_for_csv_value` do the
+work; `InlineCsvRowSink` folds each row into batched `INSERT ... VALUES`
+statements (capped at 500 rows/statement, comfortably under SQL Server's
+documented 1000-row multi-row-`VALUES` limit even though SQL Server isn't
+a verified target yet - cheap insurance).
+
+Four real bugs were found - and fixed - by actually piping the generated
+SQL into a real, installed SQLite build across the *entire* committed
+CSV/TSV fixture corpus, not just a couple of hand-picked files - the same
+"verify against real behavior, don't trust the design on paper" discipline
+this file holds every heuristic to, this time applied to a new output
+format instead of a new reader:
+
+- **A base-prefixed integer literal (`"0x1A"`, `ideal_type` still just
+  `"i64"`) was emitted as the raw text `0x1A`, unquoted** - not a numeric
+  literal every engine accepts (`parse_prefixed_int` is the one grammar
+  check that resolves to `"i64"` without the raw text already being a
+  plain ANSI decimal numeral). Fixed by decoding it and re-emitting the
+  decimal value (`26`) instead.
+- **A genuinely duplicate or blank CSV header column** (found via two
+  real fixtures, `edge_csv_duplicate_column_names.csv` and
+  `edge_csv_long_preamble.csv`'s own real header once its leading
+  preamble rows are skipped) **produced two identically-named columns in
+  one `CREATE TABLE`** - a hard, universal SQL error
+  (`duplicate column name`), since SQL requires column-name uniqueness
+  in a way this project's own permissive CSV reader never has to.
+  `sql_unique_column_names` assigns every column a guaranteed-unique,
+  non-empty SQL identifier (a repeat gets a `_2`/`_3`/... suffix, a blank
+  name becomes `"column"` first) without touching `profiles` itself -
+  every other output format already tolerates a duplicate/blank name
+  fine, so this is purely a SQL-identifier-space concern.
+- **A non-finite float (`"Infinity"`, `"-inf"` - Rust's own
+  `f64::from_str` accepts these, and this project deliberately still
+  resolves such a column to `f64` rather than rejecting it) was emitted
+  as a bare, unquoted token** - not valid SQL numeric-literal syntax at
+  all; SQLite parses a bare `inf` as an *identifier* and fails outright
+  ("no such column: inf"). Fixed by falling back to a quoted string,
+  which PostgreSQL/DuckDB both recognize as a real IEEE value once
+  assigned into a float column (SQLite, which has no such input parsing,
+  stores it as plain text instead - a real, disclosed difference for an
+  already-rare, already-disclosed-in-Rust-output edge case, not a
+  silent syntax break). `"nan"` deliberately isn't part of this fix -
+  it's already one of this project's own `MISSING_SENTINELS` tokens
+  (matching pandas' own default), so it resolves to `NULL` before ever
+  reaching this branch, consistent with the real CSV reader's own Pass 1.
+- **A genuine embedded NUL byte in a value corrupted the rest of the
+  script** when piped straight into the real `sqlite3` CLI (its own line
+  reading treats `\0` as a terminator) - not an engine-specific SQL
+  quirk at all, a property of a `.sql` script being plain text in the
+  first place, the same way a raw NUL corrupts virtually any text-based
+  tool's own line/string handling. Fixed by stripping it before building
+  a string literal - a byte with no real data-loss story here, unlike
+  every other value this project's own type-detection heuristics
+  actually care about.
+
+Two scope boundaries are disclosed directly in the script's own header:
+a numeric literal assumes the same cleanup that let the column resolve
+to a numeric type at all (currency symbols/thousands separators/
+parenthesized negatives/a trailing `%` - see `normalize_numeric_str`),
+and this mode's four-engine target list (SQLite/DuckDB/PostgreSQL/MySQL)
+is exactly what's been verified, not a claim about every SQL engine that
+exists - genuinely covering Oracle/SQL Server surfaces *new* correctness
+traps research already found (Oracle has no native boolean or
+`TRUE`/`FALSE` literal before Oracle 23ai; SQL Server's `TIMESTAMP` type
+doesn't mean "date and time" at all - it's a deprecated synonym for
+`ROWVERSION`, a binary change-counter), and neither engine is installed
+in this environment to verify against, so widening to them is left as
+explicit, disclosed future work rather than an unverified guess.
+
+**`--sql-mode staging` (the original shape, kept for a file too large to
+comfortably embed as literal SQL)**: for each table, a raw all-`TEXT`
+staging table, a properly-typed real table (types from `ideal_type`,
+nullability from `missing_pct` — the same two signals `json-schema`'s own
+rendering already turns into a schema), and an `INSERT INTO ... SELECT
+CAST(...) FROM staging` that converts the staged text into the real
+types. There is deliberately no attempt to fake a single, engine-agnostic
+way to load the source file's own bytes into that staging table — no such
+thing exists in standard SQL. Every real engine has its own incompatible
 extension for reading a file from disk (DuckDB's `read_csv_auto`/
 `read_json_auto`/`read_parquet`, PostgreSQL's `COPY`/`\copy`, SQLite's
 `.import` meta-command, MySQL's `LOAD DATA INFILE`), so rather than
 silently pick one and call it universal, the script's own comments spell
 out all four next to each staging table, naming exactly which one the
-user needs for their own engine. What *is* genuinely portable, and the
-actual value of this format: the `CREATE TABLE`s themselves (types every
-one of SQLite/DuckDB/PostgreSQL/MySQL already understands) and the
-`INSERT ... SELECT CAST(...)` step, built entirely from standard ANSI
-`CAST`/`CASE`/`NULLIF`/`TRIM` — every identifier is double-quoted (the
-ANSI-standard form SQLite/DuckDB/PostgreSQL already accept; MySQL needs
-`SET sql_mode='ANSI_QUOTES';` first, disclosed in the script's own header
-comment).
+user needs for their own engine. What *is* genuinely portable: the
+`CREATE TABLE`s themselves and the `INSERT ... SELECT CAST(...)` step,
+built entirely from standard ANSI `CAST`/`CASE`/`NULLIF`/`TRIM` — every
+identifier is double-quoted (the ANSI-standard form SQLite/DuckDB/
+PostgreSQL already accept; MySQL needs `SET sql_mode='ANSI_QUOTES';`
+first, disclosed in the script's own header comment).
 
-Two real bugs were found — and fixed — by actually running the generated
-SQL against a real SQLite build rather than trusting the design on paper,
-the same "verify against real behavior" discipline this file holds every
-heuristic to:
+Two real bugs were found — and fixed — in this mode too, by actually
+running the generated SQL against a real SQLite build:
 
 - **`CAST(text AS TIMESTAMP/TIME)` silently truncated a real date/time
   value to just its leading digits on SQLite** — SQLite has no native
@@ -352,10 +453,7 @@ heuristic to:
   uncast assignment into a column *declared* `TIMESTAMP`/`TIME` uses a
   different, safer SQLite rule instead (convert only if the *entire*
   value is a well-formed number, otherwise store the text unchanged),
-  verified to leave a real ISO date/time value completely intact. The
-  destination column's own declared type still gives PostgreSQL/DuckDB/
-  MySQL users a genuine temporal column; only how the value gets there
-  changed, not what the column itself is.
+  verified to leave a real ISO date/time value completely intact.
 - **A missing-value sentinel (`"NA"`, `"null"`, `"-"`, ...) staged as
   plain text didn't fail a numeric `CAST` the way a human might expect** —
   confirmed directly, `CAST('NA' AS BIGINT)` silently succeeds as `0` on
@@ -369,20 +467,18 @@ heuristic to:
   numeric/date/time value is used, so a sentinel can never be
   misread as data.
 
-Two scope boundaries are disclosed directly in the script's own header
-rather than silently assumed away: the `CAST` expressions assume already-
-clean numeric text (no currency symbol, thousands separator, parenthesized
-negative, or trailing `%` — this project's own `normalize_numeric_str`
-heuristics aren't reproduced in SQL, so a column whose `notes` mention
-stripping any of those needs a manual `REPLACE()` added before the
-`CAST`), and a pooled array (`Vec<T>`) or a `mixed(...)` column is kept as
-its raw staged text rather than forced into a native SQL array type (no
-type portable across all four engines exists — PostgreSQL has one,
-SQLite/MySQL don't). Verified end-to-end against a real, installed
-SQLite build (staging load via `.import`, then the generated `CREATE
-TABLE`/`INSERT ... SELECT CAST(...)` run verbatim) across a plain CSV, a
-multi-table SQLite source, and a YAML-sourced boolean column — not just
-unit-tested against the generated text.
+Staging mode's own scope boundaries (the same numeric-formatting-noise
+assumption as inline mode, plus a pooled array/`mixed(...)` column kept
+as raw staged text rather than forced into a native SQL array type) are
+unchanged and still disclosed in its own header comment.
+
+Both modes verified end-to-end against a real, installed SQLite build —
+inline mode across the *entire* committed CSV/TSV fixture corpus (piped
+straight in with zero setup, no load step of any kind), staging mode
+across a plain CSV, a multi-table SQLite source, and a YAML-sourced
+boolean column (staging load via `.import`, then the generated `CREATE
+TABLE`/`INSERT ... SELECT CAST(...)` run verbatim) — not just unit-tested
+against the generated text either way.
 
 ## Directory-input batch mode
 

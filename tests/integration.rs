@@ -429,7 +429,10 @@ fn markdown_output_ends_with_exactly_one_newline() {
 
 #[test]
 fn sql_output_creates_a_staging_table_a_typed_table_and_a_cast_insert() {
-    let sql = run_sql("type_detection.csv", &[]);
+    // --sql-mode staging is no longer the default (see the inline-mode
+    // tests below) but stays fully supported, unchanged, for a file too
+    // large to comfortably embed as literal SQL.
+    let sql = run_sql("type_detection.csv", &["--sql-mode", "staging"]);
 
     assert!(sql.contains("CREATE TABLE \"type_detection_staging\""));
     assert!(sql.contains("CREATE TABLE \"type_detection\""));
@@ -466,7 +469,7 @@ fn sql_output_never_casts_date_or_time_columns_directly() {
     // truncates a real value to its leading digits on SQLite, since
     // SQLite has no native temporal type. The fix means the generated
     // SQL must never emit "AS TIMESTAMP)" or "AS TIME)" anywhere.
-    let sql = run_sql("type_detection.csv", &[]);
+    let sql = run_sql("type_detection.csv", &["--sql-mode", "staging"]);
     assert!(sql.contains("\"created_at\" TIMESTAMP NOT NULL"));
     assert!(sql.contains("\"checkin_time\" TIME NOT NULL"));
     // The header's own disclosure comment quotes "AS TIMESTAMP)" as an
@@ -487,7 +490,7 @@ fn sql_output_treats_a_missing_sentinel_as_null_in_the_cast_expression() {
     // literal "NA"/"null"/"-" staged as plain TEXT doesn't fail a
     // numeric CAST - confirmed directly on SQLite, CAST('NA' AS BIGINT)
     // silently succeeds as a fabricated 0 rather than erroring.
-    let sql = run_sql("type_detection.csv", &[]);
+    let sql = run_sql("type_detection.csv", &["--sql-mode", "staging"]);
     assert!(sql.contains("LOWER(TRIM(\"age\"))"));
     assert!(sql.contains("'na'"));
     assert!(sql.contains("'null'"));
@@ -499,12 +502,121 @@ fn sql_output_treats_a_missing_sentinel_as_null_in_the_cast_expression() {
 fn sql_output_handles_a_multi_table_source_with_one_pair_of_tables_per_table() {
     // SQLite (like Excel/INI/.npz) can produce more than one table from a
     // single source file - each one needs its own independent staging/
-    // typed table pair, not a single shared staging table.
-    let sql = run_sql("sample.sqlite", &[]);
+    // typed table pair, not a single shared staging table. SQLite input
+    // isn't CSV/TSV, so inline mode isn't available for it yet anyway
+    // (see the fallback tests below) - --sql-mode staging is explicit
+    // here to keep this test focused on the multi-table shape itself.
+    let sql = run_sql("sample.sqlite", &["--sql-mode", "staging"]);
     assert!(sql.contains("CREATE TABLE \"events_staging\""));
     assert!(sql.contains("CREATE TABLE \"events\""));
     assert!(sql.contains("CREATE TABLE \"users_staging\""));
     assert!(sql.contains("CREATE TABLE \"users\""));
+}
+
+#[test]
+fn sql_output_inline_mode_is_the_default_and_embeds_real_literal_data() {
+    // --sql-mode inline is the new default (no flag needed at all) for
+    // CSV/TSV: the whole dataset is embedded as literal INSERT values, so
+    // there's no staging table and no per-engine load-command comment
+    // block at all - genuinely nothing left to load.
+    let sql = run_sql("type_detection.csv", &[]);
+    assert!(!sql.contains("CREATE TABLE \"type_detection_staging\""));
+    assert!(!sql.contains("read_csv_auto"));
+    assert!(!sql.contains("LOAD DATA LOCAL INFILE"));
+    assert!(sql.contains("CREATE TABLE \"type_detection\""));
+    assert!(sql.contains("INSERT INTO \"type_detection\""));
+    // A real, known value from the fixture appears verbatim as a quoted
+    // literal - the data itself, not a reference to the source file.
+    assert!(sql.contains("'550e8400-e29b-41d4-a716-446655440000'"));
+    // A genuinely missing value (the fixture's own "NA"/"null" age
+    // entries) is a bare NULL, not a fabricated 0 and not the sentinel
+    // text itself.
+    assert!(sql.contains(", NULL,") || sql.contains(", NULL)"));
+}
+
+#[test]
+fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
+    // No --sql-mode given, on a format inline mode doesn't support yet
+    // (only csv/tsv so far) - falls back to staging mode automatically
+    // (with a disclosed stderr note, checked separately below) rather
+    // than erroring or silently producing something different.
+    let sql = run_sql("nested_typed.jsonl", &[]);
+    assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
+}
+
+#[test]
+fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
+    let output = Command::new(bin())
+        .args([
+            fixture("nested_typed.jsonl").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("inline SQL mode isn't available yet for json"));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
+    // Asking for --sql-mode inline explicitly on a format that can't do
+    // it yet is a hard, actionable error - unlike the silent fallback
+    // above, downgrading what was explicitly asked for would be the
+    // wrong kind of quiet.
+    let output = Command::new(bin())
+        .args([
+            fixture("nested_typed.jsonl").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+            "--sql-mode",
+            "inline",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--sql-mode inline isn't available yet for json"));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+fn sql_output_rejects_an_unrecognized_sql_mode() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.csv").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+            "--sql-mode",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unrecognized --sql-mode 'bogus'"));
+}
+
+#[test]
+fn sql_output_inline_mode_disambiguates_a_duplicate_csv_header_column() {
+    // Regression test for a real bug found by piping generated inline
+    // SQL into a real sqlite3 build: a genuinely duplicate CSV header
+    // ("id,name,name,age") produced two identically-named columns in one
+    // CREATE TABLE, a hard SQL error ("duplicate column name: name") on
+    // every real engine, not just SQLite - SQL identifier uniqueness is
+    // a real constraint this project's own permissive CSV reader doesn't
+    // share. The second occurrence gets a "_2" suffix instead.
+    let sql = run_sql("edge_csv_duplicate_column_names.csv", &[]);
+    assert!(sql.contains("\"name\" TEXT NOT NULL"));
+    assert!(sql.contains("\"name_2\" TEXT NOT NULL"));
+    assert!(sql.contains(
+        "INSERT INTO \"edge_csv_duplicate_column_names\" (\"id\", \"name\", \"name_2\", \"age\")"
+    ));
 }
 
 #[test]
