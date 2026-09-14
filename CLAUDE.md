@@ -5954,6 +5954,113 @@ top of its source bytes.** What remains materialized:
   source-text copy on top is bounded by one document's size, and these
   inputs are rarely large enough for it to matter.
 
+**The eight formats added in the BSON/plist/JSON5/HAR and GeoJSON/vCard/
+iCalendar/MBOX passes got the identical streaming treatment as a direct
+follow-up**, prompted by a user question ("are these new formats
+streaming like the others?") whose honest answer at the time was "only
+BSON is" - every other one of the eight read the whole file into memory
+via `fs::read`/`fs::read_to_string` and profiled through the older
+whole-slice `profile_json_records`/`profile_json_path` rather than the
+incremental accumulator engine. Converted in one pass, each verified the
+same way as every earlier streaming phase in this section - real
+300,000-row synthetic files (30-55 MB each), a controlled old-vs-new
+binary comparison, byte-identical `--output-format json` output
+confirmed via `diff`, and a 300-600-iteration bit-flip fuzz pass per
+format with zero panics:
+
+- **GeoJSON and HAR** share one new core primitive,
+  `json_support::stream_nested_array` - the sibling of `stream_top_level`
+  for the "array nested one or more keys deep inside a wrapping object"
+  shape (`log.entries` for HAR, `features` for GeoJSON) rather than a
+  bare top-level array. It descends through a fixed key path via the
+  same byte-span "find where a value ends, don't parse what it means"
+  technique `stream_top_level`'s own `ByteWindow` already uses, skipping
+  every sibling key's own value the identical way, and returns `Ok(false)`
+  (not an error) if the path isn't found in an otherwise well-formed
+  object - GeoJSON uses this to fall back to a whole-file read for its
+  other two legal top-level shapes (a bare `Feature`, a bare `Geometry` -
+  both inherently single-record documents with nothing to stream
+  regardless); HAR, which has no other legal shape, turns `false` into
+  its own disclosed error. Measured on a real 45 MB/300,000-feature
+  GeoJSON file: maxRSS 601 MB -> 2.7 MB (~99.5%), peak footprint 585 MB
+  -> 1.6 MB (~99.7%); a 32 MB/100,000-entry HAR file: maxRSS 269 MB ->
+  2.4 MB (~99.1%), peak footprint 265 MB -> 1.3 MB (~99.5%).
+- **vCard and iCalendar** share a new streaming line-unfolder,
+  `vobject_support::UnfoldingLines` (replacing the old `unfold_lines`,
+  which built a `Vec<String>` of every logical line in the document up
+  front) - an `Iterator` over a `BufRead` that un-folds RFC 5545/6350
+  continuation lines with only a single physical line of lookahead
+  buffered, never the whole file. Both readers already folded each
+  completed record into a `Vec` before profiling; that became a direct
+  push into `JsonRecordStreamProfiler` the instant a card's `END:VCARD`
+  or an event's `END:VEVENT`/`END:VTODO` is found. `--nrows` now stops
+  reading the file entirely once enough records are kept (the same
+  real-I/O-bounding early stop weblog/syslog's own readers already have)
+  - for iCalendar this meant threading a `stopped_early` flag through to
+  skip the "is anything left unterminated" check afterward, since a real
+  file's own enclosing `VCALENDAR` is necessarily still open on the
+  stack at that point. Measured on real 200,000-record files (~20 MB
+  each): vCard maxRSS 180 MB -> 2.7 MB (~98.5%); iCalendar maxRSS 170 MB
+  -> 2.7 MB (~98.4%).
+- **MBOX** streams a line at a time via `BufRead::lines()` (the same
+  mechanism weblog/syslog already use), folding one message's own
+  accumulated headers/body into the profiler the instant the next
+  message's own `From ` boundary is found (or at EOF, for the last
+  message) - never a whole-file `String` or a `Vec` of every message's
+  own byte range the way the pre-conversion reader built. `--nrows`
+  gets the same real-I/O-bounding early stop. Measured on a real 48 MB/
+  200,000-message file: maxRSS 231 MB -> 2.4 MB (~99.0%).
+- **JSON5/JSONC** got its own byte-window scanner, a second, independent
+  copy of `json_support::ByteWindow`'s technique rather than a shared
+  one (matching this module's own established "deliberately separate
+  parser" scoping) - with one genuinely new piece of complexity neither
+  core-JSON scanner needs: a JSON5 comment can legally appear *inside*
+  an object or array's own span (`{a: 1, // note\n b: 2}`), and a naive
+  depth/string scanner with no comment awareness could be corrupted by a
+  stray bracket or quote character inside that comment's own text - so
+  `scan_value` recognizes and copies `//`/`/* */` comments through
+  verbatim without ever depth- or string-tracking their content. Only a
+  top-level *array* streams (the one JSON5 shape realistically large -
+  a config list, not a config object); a top-level object or scalar
+  falls back to a whole-file read, the same boundary TOML's own single-
+  document shape already has. Verified directly against a hand-built
+  adversarial case (comments containing stray `]`/`{`/`"` characters,
+  nested inside an array element) before trusting it, cross-checked
+  against Python's own independent `json5` package. Measured on a real
+  18 MB/300,000-element file: maxRSS 186 MB -> 2.5 MB (~98.7%).
+- **Property List** is the one format in this batch with a genuine,
+  disclosed non-streaming boundary rather than an unattempted one: the
+  binary (`bplist00`) variant's own trailer - the sole source for its
+  object/offset table's location - lives in the *last* 32 bytes of the
+  file, and any object can reference any other by index regardless of
+  file position, so there is no forward-only traversal order this
+  format's own design permits at all; the whole file must be resident to
+  resolve even one reference. A top-level XML `<dict>` (by far the most
+  common real plist shape - preferences files, `Info.plist`) is a
+  second, differently-caused non-streaming case: it's already a single
+  record, the same "single document" boundary TOML's own shape already
+  has. Only a top-level XML `<array>` actually streams - found via a
+  bounded 64 KiB prefix read (a real file's own prolog plus `<plist ...>`
+  opening tag are always tiny), which locates where the array begins and
+  confirms it really is one before seeking a fresh reader there and
+  streaming its children one at a time with a dedicated `XmlValueWindow`.
+  That scanner needs no "are we inside a string" tracking the way JSON's
+  own span scanners require: XML's grammar guarantees a literal `<`/`>`
+  byte can never appear inside a tag's own markup or a leaf element's
+  text content (both require the `&lt;`/`&gt;` entities instead,
+  confirmed directly against this module's own existing `xp_parse_value`,
+  which never itself tolerates a raw `<`/`>` in text content either) -
+  so a plain tag-depth count is enough. Measured on a real 55 MB/
+  300,000-element top-level array: maxRSS 256 MB -> 2.5 MB (~99.0%);
+  wall time rose modestly (0.39s -> 0.48s, the two-pass prefix-then-seek
+  cost), an honestly-reported tradeoff for the memory win, the same
+  asymmetry this project's own zstd streaming phase already accepted for
+  an analogous reason. A committed 367 KB fixture with 2,000 records
+  (`edge_plist_array_spans_multiple_window_refills.plist`) locks in
+  correctness across several real internal buffer refills, the same
+  "small but big enough to force the boundary case" discipline
+  `edge_gzip_multi_flush.csv.gz` already established.
+
 ## Cloud-platform file compatibility
 
 This tool never touches the network - no cloud SDKs, no credentials, no

@@ -1655,6 +1655,199 @@ mod json_support {
                 }
             }
         }
+
+        /// Reads one JSON string literal at the current position (which
+        /// must be `"`), with escapes decoded - used by `stream_nested_
+        /// array`'s own key-matching loop, which needs the string's real
+        /// value to compare against a known field name, unlike
+        /// `scan_value`'s own span-only tracking. Byte-safe for
+        /// multi-byte UTF-8 content: every unescaped byte is pushed
+        /// straight through (a continuation byte is always `>= 0x80`,
+        /// never one of the single-byte ASCII structural characters this
+        /// scan branches on), and a `\uXXXX` escape's resulting
+        /// codepoint is encoded to UTF-8 before being appended - the
+        /// same "decode once, byte-safe" discipline this project's other
+        /// hand-rolled string scanners already use.
+        // Only reachable via `stream_nested_array`, which every one of
+        // its own callers (geojson_support/har_support) gates behind
+        // its own optional feature - genuinely unused in the bare
+        // default build.
+        #[allow(dead_code)]
+        fn scan_string(&mut self) -> std::result::Result<String, ParseError> {
+            if self.bump()? != Some(b'"') {
+                return Err(self.err("expected '\"' to start a JSON string"));
+            }
+            let mut bytes: Vec<u8> = Vec::new();
+            loop {
+                match self.bump()? {
+                    None => return Err(self.err("unexpected end of input inside a JSON string")),
+                    Some(b'"') => {
+                        return String::from_utf8(bytes)
+                            .map_err(|_| self.err("invalid UTF-8 in JSON string"));
+                    }
+                    Some(b'\\') => match self.bump()? {
+                        Some(b'"') => bytes.push(b'"'),
+                        Some(b'\\') => bytes.push(b'\\'),
+                        Some(b'/') => bytes.push(b'/'),
+                        Some(b'b') => bytes.push(0x08),
+                        Some(b'f') => bytes.push(0x0c),
+                        Some(b'n') => bytes.push(b'\n'),
+                        Some(b'r') => bytes.push(b'\r'),
+                        Some(b't') => bytes.push(b'\t'),
+                        Some(b'u') => {
+                            let mut cp: u32 = 0;
+                            for _ in 0..4 {
+                                let d = self
+                                    .bump()?
+                                    .ok_or_else(|| self.err("truncated \\u escape"))?;
+                                let digit = (d as char)
+                                    .to_digit(16)
+                                    .ok_or_else(|| self.err("invalid \\u escape"))?;
+                                cp = cp * 16 + digit;
+                            }
+                            match char::from_u32(cp) {
+                                Some(c) => {
+                                    let mut buf = [0u8; 4];
+                                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                                }
+                                None => return Err(self.err("invalid \\u escape codepoint")),
+                            }
+                        }
+                        _ => return Err(self.err("invalid escape sequence in JSON string")),
+                    },
+                    Some(b) => bytes.push(b),
+                }
+            }
+        }
+    }
+
+    impl ParseError {
+        /// Lets a caller outside this module (a format reader built on
+        /// `stream_nested_array`, whose own record-building can fail for
+        /// reasons this parser knows nothing about - a `Feature` whose
+        /// `properties` isn't an object, say) signal its own error
+        /// through the same channel `on_value` already reports parse
+        /// errors through, rather than needing a second, parallel error
+        /// path.
+        // Only reachable from geojson_support/har_support, each behind
+        // its own optional feature - genuinely unused in the bare
+        // default build.
+        #[allow(dead_code)]
+        pub(crate) fn custom(message: impl Into<String>) -> Self {
+            ParseError {
+                message: message.into(),
+                line: 0,
+                column: 0,
+            }
+        }
+    }
+
+    /// Streams the array found by descending through a fixed sequence of
+    /// object keys from the document's own top level (e.g. `&["log",
+    /// "entries"]` for HAR, `&["features"]` for GeoJSON) - the same
+    /// technique `stream_top_level` already uses for a bare top-level
+    /// array, just preceded by a "find the right key, skip every other
+    /// one" object walk. A sibling key's own value is skipped via the
+    /// same byte-span scan `scan_value` already does for a whole
+    /// top-level value - its content is never parsed, only walked past -
+    /// so a large, unrelated sibling field costs a linear scan of its
+    /// own bytes, never an allocation proportional to its size.
+    ///
+    /// Returns `Ok(false)` (not an error) if the top-level value is a
+    /// well-formed JSON object but the requested path isn't found in it,
+    /// which callers that have another shape to fall back to (GeoJSON's
+    /// own bare-Feature/bare-Geometry top-level shapes, which have no
+    /// `"features"` key at all) use to decide whether to retry as a
+    /// whole document; a caller with no fallback (HAR) treats `false` as
+    /// its own format-specific error instead.
+    ///
+    /// Once the target array is found and fully streamed, this returns
+    /// immediately without validating whatever the rest of the document
+    /// contains - a narrower guarantee than `stream_top_level`'s own
+    /// "the whole document must be well-formed" contract, accepted here
+    /// since nothing past the one field this project's own readers
+    /// actually need would ever surface as a meaningful error anyway.
+    // Only reachable from geojson_support/har_support, each behind its
+    // own optional feature - genuinely unused in the bare default build.
+    #[allow(dead_code)]
+    pub(crate) fn stream_nested_array<R: std::io::Read>(
+        reader: R,
+        path: &[&str],
+        mut on_value: impl FnMut(Value) -> std::result::Result<(), ParseError>,
+    ) -> std::result::Result<bool, ParseError> {
+        fn descend<R: std::io::Read>(
+            win: &mut ByteWindow<R>,
+            span: &mut Vec<u8>,
+            path: &[&str],
+            on_value: &mut impl FnMut(Value) -> std::result::Result<(), ParseError>,
+        ) -> std::result::Result<bool, ParseError> {
+            win.skip_ws()?;
+            if win.bump()? != Some(b'{') {
+                return Err(win.err(format!(
+                    "expected a JSON object while looking for \"{}\"",
+                    path[0]
+                )));
+            }
+            win.skip_ws()?;
+            if win.peek()? == Some(b'}') {
+                win.pos += 1;
+                return Ok(false); // empty object - path not found
+            }
+            loop {
+                win.skip_ws()?;
+                let key = win.scan_string()?;
+                win.skip_ws()?;
+                if win.bump()? != Some(b':') {
+                    return Err(win.err("expected ':' after an object key"));
+                }
+                win.skip_ws()?;
+                let mut matched = false;
+                if key == path[0] {
+                    if path.len() == 1 {
+                        if win.bump()? != Some(b'[') {
+                            return Err(win.err(format!("expected \"{key}\" to be an array")));
+                        }
+                        win.skip_ws()?;
+                        if win.peek()? == Some(b']') {
+                            win.pos += 1;
+                        } else {
+                            loop {
+                                win.scan_value(span)?;
+                                let s = std::str::from_utf8(span).map_err(|e| ParseError {
+                                    message: format!("invalid UTF-8 in JSON: {e}"),
+                                    line: 0,
+                                    column: 0,
+                                })?;
+                                on_value(from_str(s)?)?;
+                                win.skip_ws()?;
+                                match win.bump()? {
+                                    Some(b',') => win.skip_ws()?,
+                                    Some(b']') => break,
+                                    _ => return Err(win.err("expected ',' or ']' in a JSON array")),
+                                }
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    matched = descend(win, span, &path[1..], on_value)?;
+                } else {
+                    win.scan_value(span)?; // not the field we're looking for - skip it
+                }
+                if matched {
+                    return Ok(true);
+                }
+                win.skip_ws()?;
+                match win.bump()? {
+                    Some(b',') => continue,
+                    Some(b'}') => return Ok(false),
+                    _ => return Err(win.err("expected ',' or '}' in a JSON object")),
+                }
+            }
+        }
+
+        let mut win = ByteWindow::new(reader);
+        let mut span: Vec<u8> = Vec::new();
+        descend(&mut win, &mut span, path, &mut on_value)
     }
 
     /// Reads a JSON document straight off a byte stream, handing each
@@ -43320,6 +43513,223 @@ mod plist_support {
         Ok(value)
     }
 
+    /// Finds where the root value starts within a bounded *prefix* of an
+    /// XML plist file (the prolog plus the `<plist ...>` opening tag are
+    /// always tiny in any real file, so a fixed-size prefix is enough to
+    /// find this without reading the whole document) and whether that
+    /// value looks like a top-level `<array>` - the one XML-plist shape
+    /// actually worth streaming (a top-level `<dict>`, by far the most
+    /// common real plist shape - preferences files, `Info.plist`, ... -
+    /// is a single record with nothing to stream regardless, the same
+    /// "single document" boundary this project's own TOML reader already
+    /// accepts). Returns `Ok(None)` rather than an error if the prefix
+    /// wasn't long enough to resolve this (an unusually large prolog, or
+    /// a genuine syntax error near the start) - the caller's own
+    /// whole-file fallback will re-discover and correctly report a real
+    /// error either way, so nothing is lost by not surfacing it here.
+    fn xp_find_root_array_start(prefix: &str) -> Option<usize> {
+        let mut pos = 0usize;
+        xp_skip_prolog(prefix, &mut pos).ok()?;
+        if prefix.as_bytes().get(pos) != Some(&b'<') {
+            return None;
+        }
+        pos += 1;
+        let root_name = xp_read_name(prefix, &mut pos).ok()?.to_string();
+        if root_name != "plist" {
+            return None;
+        }
+        let self_closing = xp_skip_attrs(prefix, &mut pos).ok()?;
+        if self_closing {
+            return None;
+        }
+        xp_skip_ws(prefix.as_bytes(), &mut pos);
+        let looks_like_array = prefix[pos..].starts_with("<array")
+            && matches!(
+                prefix.as_bytes().get(pos + 6),
+                Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/')
+            );
+        looks_like_array.then_some(pos)
+    }
+
+    /// A bounded byte-window over a `Read`, scoped to streaming one XML
+    /// plist `<array>`'s own children - the XML-flavored sibling of
+    /// `json_support`/`json5_support`'s own `ByteWindow`s, kept as its
+    /// own separate copy for the identical "independently-gated modules,
+    /// no shared dependency" reason those two are already separate from
+    /// each other.
+    struct XmlValueWindow<R> {
+        reader: R,
+        buf: Vec<u8>,
+        pos: usize,
+        eof: bool,
+    }
+
+    impl<R: std::io::Read> XmlValueWindow<R> {
+        const CHUNK: usize = 64 * 1024;
+
+        fn new(reader: R) -> Self {
+            XmlValueWindow {
+                reader,
+                buf: Vec::new(),
+                pos: 0,
+                eof: false,
+            }
+        }
+
+        fn fill(&mut self, need: usize) -> Result<()> {
+            while self.buf.len() - self.pos < need && !self.eof {
+                if self.pos > 0 {
+                    self.buf.drain(..self.pos);
+                    self.pos = 0;
+                }
+                let start = self.buf.len();
+                self.buf.resize(start + Self::CHUNK, 0);
+                match self.reader.read(&mut self.buf[start..]) {
+                    Ok(0) => {
+                        self.buf.truncate(start);
+                        self.eof = true;
+                    }
+                    Ok(n) => self.buf.truncate(start + n),
+                    Err(e) => bail!("I/O error while reading plist: {e}"),
+                }
+            }
+            Ok(())
+        }
+
+        fn peek_at(&mut self, offset: usize) -> Result<Option<u8>> {
+            self.fill(offset + 1)?;
+            Ok(self.buf.get(self.pos + offset).copied())
+        }
+
+        fn peek(&mut self) -> Result<Option<u8>> {
+            self.peek_at(0)
+        }
+
+        fn bump(&mut self) -> Result<Option<u8>> {
+            let b = self.peek()?;
+            if b.is_some() {
+                self.pos += 1;
+            }
+            Ok(b)
+        }
+
+        fn skip_ws(&mut self) -> Result<()> {
+            while matches!(self.peek()?, Some(b) if b.is_ascii_whitespace()) {
+                self.pos += 1;
+            }
+            Ok(())
+        }
+
+        fn expect_bytes(&mut self, expected: &[u8]) -> Result<()> {
+            for &e in expected {
+                if self.bump()? != Some(e) {
+                    bail!(
+                        "expected {:?} while streaming a plist array",
+                        std::str::from_utf8(expected).unwrap_or("<tag>")
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        /// Consumes exactly one value element's bytes into `out` -
+        /// `<dict>...</dict>`, `<array>...</array>`, `<string>...
+        /// </string>`, or a self-closing `<true/>` - via a plain
+        /// tag-depth count. Safe with no "are we inside a string"
+        /// tracking the way JSON's own span scanners need: XML's own
+        /// grammar guarantees a literal, un-escaped `<`/`>` byte can
+        /// never appear inside a tag's own markup or a leaf element's
+        /// text content (both require the `&lt;`/`&gt;` entities
+        /// instead) - confirmed directly against this module's own
+        /// `xp_parse_value`/`xp_read_text_and_close`, which never
+        /// themselves tolerate a raw `<`/`>` in text content either, so
+        /// this scanner's scope matches the already-established grammar
+        /// exactly, not a looser or stricter one.
+        fn scan_value(&mut self, out: &mut Vec<u8>) -> Result<()> {
+            out.clear();
+            self.skip_ws()?;
+            if self.peek()? != Some(b'<') {
+                bail!("expected a plist value element");
+            }
+            let mut depth: i64 = 0;
+            loop {
+                match self.peek()? {
+                    None => bail!("unexpected end of input inside a plist value"),
+                    Some(b'<') => {
+                        let tag_start = out.len();
+                        out.push(self.bump()?.unwrap());
+                        loop {
+                            match self.bump()? {
+                                None => bail!("unterminated tag inside a plist value"),
+                                Some(b'>') => {
+                                    out.push(b'>');
+                                    break;
+                                }
+                                Some(b) => out.push(b),
+                            }
+                        }
+                        let tag = &out[tag_start..];
+                        let is_close = tag.get(1) == Some(&b'/');
+                        let is_self_closing = tag.len() >= 2 && tag[tag.len() - 2] == b'/';
+                        if is_close {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Ok(());
+                            }
+                        } else if is_self_closing {
+                            if depth == 0 {
+                                return Ok(());
+                            }
+                        } else {
+                            depth += 1;
+                        }
+                    }
+                    Some(_) => out.push(self.bump()?.unwrap()),
+                }
+            }
+        }
+    }
+
+    /// Streams a top-level plist `<array>`'s own children one at a time,
+    /// starting right at the array's own opening `<array...>` tag -
+    /// peak memory is the bounded read window plus one child's own
+    /// span/tree, never the whole document (a real, large plist-backed
+    /// export - e.g. a serialized array of records - can hold many
+    /// thousands of entries).
+    fn stream_xml_plist_array<R: std::io::Read>(
+        reader: R,
+        mut on_value: impl FnMut(JsonValue) -> Result<()>,
+    ) -> Result<()> {
+        let mut win = XmlValueWindow::new(reader);
+        win.skip_ws()?;
+        win.expect_bytes(b"<array")?;
+        let mut self_closing = false;
+        loop {
+            match win.bump()? {
+                None => bail!("unterminated <array> tag"),
+                Some(b'>') => break,
+                Some(b'/') => self_closing = true,
+                Some(_) => {}
+            }
+        }
+        if self_closing {
+            return Ok(());
+        }
+        let mut span: Vec<u8> = Vec::new();
+        loop {
+            win.skip_ws()?;
+            if win.peek()? == Some(b'<') && win.peek_at(1)? == Some(b'/') {
+                win.expect_bytes(b"</array>")?;
+                break;
+            }
+            win.scan_value(&mut span)?;
+            let s = std::str::from_utf8(&span).context("invalid UTF-8 in plist")?;
+            let mut p = 0usize;
+            on_value(xp_parse_value(s, &mut p, 0)?)?;
+        }
+        Ok(())
+    }
+
     // =====================================================================
     // Binary plist (bplist00)
     // =====================================================================
@@ -43614,13 +44024,81 @@ mod plist_support {
         }
     }
 
+    /// A bounded prefix, just large enough to comfortably hold any real
+    /// file's prolog plus its `<plist ...>` opening tag (both always
+    /// tiny), used only to decide whether the streaming array path
+    /// applies - never a claim about how large a real plist document
+    /// can be.
+    const ROOT_PREFIX_LEN: usize = 64 * 1024;
+
+    /// Binary plist's own layout makes genuine streaming architecturally
+    /// impossible, not just unattempted: its trailer - the authoritative
+    /// source for the object/offset table's own location - lives in the
+    /// *last* 32 bytes of the file, and any object can reference any
+    /// other regardless of file position (an object table is a flat
+    /// list resolved by index, not by document order). There is no
+    /// "read forward, discard what's already consumed" traversal order
+    /// this format's own design permits - the whole file has to be
+    /// resident to resolve any reference at all. A top-level `<dict>` in
+    /// the XML variant (by far the most common real plist shape -
+    /// preferences files, `Info.plist`, ...) is the other case with
+    /// nothing to stream, for an entirely different reason: it's already
+    /// a single record, the same "single document" boundary this
+    /// project's own TOML reader already accepts. Only a top-level XML
+    /// `<array>` actually streams.
     pub(crate) fn columns_from_plist(
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
+        use std::io::{Read, Seek};
+
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut magic = [0u8; 8];
+        let n = file
+            .read(&mut magic)
+            .with_context(|| format!("failed to read {path:?}"))?;
+        file.rewind()
+            .with_context(|| format!("failed to seek {path:?}"))?;
+        let is_binary = magic[..n].starts_with(b"bplist0");
+
+        if !is_binary {
+            let mut prefix = vec![0u8; ROOT_PREFIX_LEN];
+            let mut filled = 0usize;
+            loop {
+                let r = file
+                    .read(&mut prefix[filled..])
+                    .with_context(|| format!("failed to read {path:?}"))?;
+                if r == 0 || filled + r == prefix.len() {
+                    filled += r;
+                    break;
+                }
+                filled += r;
+            }
+            prefix.truncate(filled);
+            let array_start = std::str::from_utf8(&prefix)
+                .ok()
+                .and_then(xp_find_root_array_start);
+            if let Some(start) = array_start {
+                file.seek(std::io::SeekFrom::Start(start as u64))
+                    .with_context(|| format!("failed to seek {path:?}"))?;
+                let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+                let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+                let mut seen = 0usize;
+                stream_xml_plist_array(reader, |v| {
+                    if nrows.is_none_or(|n| seen < n) {
+                        profiler.push(&v);
+                    }
+                    seen += 1;
+                    Ok(())
+                })
+                .with_context(|| format!("failed to parse {path:?} as an XML plist"))?;
+                return Ok(profiler.finish());
+            }
+        }
+
         let bytes = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
-        let value = if bytes.starts_with(b"bplist0") {
+        let value = if is_binary {
             parse_binary_plist(&bytes)
                 .with_context(|| format!("failed to parse {path:?} as a binary plist"))?
         } else {
@@ -44059,39 +44537,280 @@ mod json5_support {
         Ok(value)
     }
 
+    /// A bounded byte-window over a `Read`, the JSON5-grammar-aware
+    /// sibling of `json_support::ByteWindow` (kept as a genuinely
+    /// separate copy rather than shared, matching this module's own
+    /// "deliberately independent parser" scoping - see this module's own
+    /// leading doc comment). `scan_value` here has to do real,
+    /// non-trivial extra work its core-JSON counterpart never needs:
+    /// a JSON5 comment can legally appear *inside* an object or array's
+    /// own span (`{a: 1, // note\n b: 2}`), and a naive depth/string
+    /// scan with no comment awareness could be corrupted by a stray
+    /// bracket or quote character inside that comment's own text -
+    /// comments are recognized and copied through verbatim (not
+    /// stripped; the per-element re-parse via `parse` already knows how
+    /// to skip them) without ever being depth- or string-tracked.
+    struct ByteWindow<R> {
+        reader: R,
+        buf: Vec<u8>,
+        pos: usize,
+        eof: bool,
+    }
+
+    impl<R: std::io::Read> ByteWindow<R> {
+        const CHUNK: usize = 64 * 1024;
+
+        fn new(reader: R) -> Self {
+            ByteWindow {
+                reader,
+                buf: Vec::new(),
+                pos: 0,
+                eof: false,
+            }
+        }
+
+        /// Ensures at least `need` unconsumed bytes are buffered from
+        /// `pos`, or that EOF has genuinely been reached - lets `peek_at`
+        /// look more than one byte ahead (needed to recognize a `//`/`/*`
+        /// comment opener) without over-reading past what's really there.
+        fn fill(&mut self, need: usize) -> Result<()> {
+            while self.buf.len() - self.pos < need && !self.eof {
+                if self.pos > 0 {
+                    self.buf.drain(..self.pos);
+                    self.pos = 0;
+                }
+                let start = self.buf.len();
+                self.buf.resize(start + Self::CHUNK, 0);
+                match self.reader.read(&mut self.buf[start..]) {
+                    Ok(0) => {
+                        self.buf.truncate(start);
+                        self.eof = true;
+                    }
+                    Ok(n) => self.buf.truncate(start + n),
+                    Err(e) => bail!("I/O error while reading JSON5: {e}"),
+                }
+            }
+            Ok(())
+        }
+
+        fn peek_at(&mut self, offset: usize) -> Result<Option<u8>> {
+            self.fill(offset + 1)?;
+            Ok(self.buf.get(self.pos + offset).copied())
+        }
+
+        fn peek(&mut self) -> Result<Option<u8>> {
+            self.peek_at(0)
+        }
+
+        fn bump(&mut self) -> Result<Option<u8>> {
+            let b = self.peek()?;
+            if b.is_some() {
+                self.pos += 1;
+            }
+            Ok(b)
+        }
+
+        fn skip_ws_and_comments(&mut self) -> Result<()> {
+            loop {
+                match self.peek()? {
+                    Some(b' ' | b'\t' | b'\n' | b'\r') => self.pos += 1,
+                    Some(b'/') if self.peek_at(1)? == Some(b'/') => {
+                        self.pos += 2;
+                        while !matches!(self.peek()?, None | Some(b'\n')) {
+                            self.pos += 1;
+                        }
+                    }
+                    Some(b'/') if self.peek_at(1)? == Some(b'*') => {
+                        self.pos += 2;
+                        loop {
+                            match self.peek()? {
+                                None => bail!("unterminated /* comment"),
+                                Some(b'*') if self.peek_at(1)? == Some(b'/') => {
+                                    self.pos += 2;
+                                    break;
+                                }
+                                _ => self.pos += 1,
+                            }
+                        }
+                    }
+                    _ => return Ok(()),
+                }
+            }
+        }
+
+        /// Consumes exactly one complete JSON5 value's bytes into `out`
+        /// (comments included verbatim), by tracking string state and
+        /// `{}`/`[]` nesting depth - the same "find where it ends, don't
+        /// parse what it means" technique `json_support::ByteWindow::
+        /// scan_value` already uses, plus comment recognition (see this
+        /// struct's own doc comment for why that's needed here and not
+        /// there). The caller hands `out` to `parse` for the real,
+        /// validating parse.
+        fn scan_value(&mut self, out: &mut Vec<u8>) -> Result<()> {
+            out.clear();
+            let mut depth: i64 = 0;
+            let mut in_string: Option<u8> = None;
+            let mut escaped = false;
+            loop {
+                if in_string.is_none() {
+                    if self.peek()? == Some(b'/') && self.peek_at(1)? == Some(b'/') {
+                        out.push(self.bump()?.unwrap());
+                        out.push(self.bump()?.unwrap());
+                        while !matches!(self.peek()?, None | Some(b'\n')) {
+                            out.push(self.bump()?.unwrap());
+                        }
+                        continue;
+                    }
+                    if self.peek()? == Some(b'/') && self.peek_at(1)? == Some(b'*') {
+                        out.push(self.bump()?.unwrap());
+                        out.push(self.bump()?.unwrap());
+                        loop {
+                            match self.peek()? {
+                                None => bail!("unterminated /* comment"),
+                                Some(b'*') if self.peek_at(1)? == Some(b'/') => {
+                                    out.push(self.bump()?.unwrap());
+                                    out.push(self.bump()?.unwrap());
+                                    break;
+                                }
+                                _ => out.push(self.bump()?.unwrap()),
+                            }
+                        }
+                        continue;
+                    }
+                }
+                match self.peek()? {
+                    None => {
+                        if in_string.is_some() || depth != 0 || out.is_empty() {
+                            bail!("unexpected end of input inside a JSON5 value");
+                        }
+                        return Ok(());
+                    }
+                    Some(b) => {
+                        if in_string.is_none()
+                            && depth == 0
+                            && !out.is_empty()
+                            && matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
+                        {
+                            return Ok(());
+                        }
+                        self.pos += 1;
+                        out.push(b);
+                        if let Some(q) = in_string {
+                            if escaped {
+                                escaped = false;
+                            } else if b == b'\\' {
+                                escaped = true;
+                            } else if b == q {
+                                in_string = None;
+                            }
+                        } else {
+                            match b {
+                                b'"' | b'\'' => in_string = Some(b),
+                                b'{' | b'[' => depth += 1,
+                                b'}' | b']' => {
+                                    depth -= 1;
+                                    if depth < 0 {
+                                        bail!("unbalanced ']' or '}}' in JSON5");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Streams a top-level JSON5 array element by element straight off a
+    /// `Read`, handing each to `on_value` and freeing it before reading
+    /// the next - peak memory is the bounded read window plus one
+    /// element's own span/tree, never the whole document. Returns
+    /// `Ok(false)` without consuming anything if the document doesn't
+    /// open with `[` (once comments/whitespace are skipped) - the
+    /// top-level object/scalar shapes have no array to stream and stay a
+    /// disclosed whole-buffer read, the same "single document, nothing
+    /// to stream" boundary this project's own TOML reader already
+    /// accepts for its own single-document shape.
+    fn stream_top_level_array<R: std::io::Read>(
+        reader: R,
+        mut on_value: impl FnMut(JsonValue) -> Result<()>,
+    ) -> Result<bool> {
+        let mut win = ByteWindow::new(reader);
+        win.skip_ws_and_comments()?;
+        if win.peek()? != Some(b'[') {
+            return Ok(false);
+        }
+        win.pos += 1;
+        win.skip_ws_and_comments()?;
+        if win.peek()? == Some(b']') {
+            win.pos += 1;
+            return Ok(true);
+        }
+        let mut span: Vec<u8> = Vec::new();
+        loop {
+            win.scan_value(&mut span)?;
+            let s = std::str::from_utf8(&span).context("invalid UTF-8 in JSON5")?;
+            on_value(parse(s)?)?;
+            win.skip_ws_and_comments()?;
+            match win.bump()? {
+                Some(b',') => win.skip_ws_and_comments()?,
+                Some(b']') => break,
+                _ => bail!("expected ',' or ']' in a JSON5 array"),
+            }
+            // A trailing comma right before ']' - the same relaxation
+            // this module's own in-memory `parse_array` already grants.
+            if win.peek()? == Some(b']') {
+                win.pos += 1;
+                break;
+            }
+        }
+        Ok(true)
+    }
+
     /// A JSON5/JSONC file is always a single document (there's no JSON-
-    /// Lines-style concatenated-records convention for either format),
-    /// so this reads the whole file, parses it once, and applies the
-    /// same dual-mode ending every other JSON-shaped bridge format in
-    /// this project already uses: a top-level array becomes
-    /// array-of-records (or, if not every element is an object, one
-    /// `value` column); a top-level object is a single record; anything
+    /// Lines-style concatenated-records convention for either format).
+    /// A top-level array streams element by element via `stream_top_
+    /// level_array` (the one shape genuinely worth streaming - a config
+    /// *list* can realistically be large where a single config *object*
+    /// rarely is); anything else (a top-level object, or a bare scalar)
+    /// falls back to reading the whole file once, matching the dual-mode
+    /// ending every other JSON-shaped bridge format in this project
+    /// already uses: a top-level object is a single record, anything
     /// else is the same `value`-column fallback.
     pub(crate) fn columns_from_json5(
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let mut seen = 0usize;
+        // Matches `stream_json_document`'s own `--nrows` behavior
+        // exactly: stop pushing (and stop counting toward `total`) the
+        // instant the cutoff is reached, rather than counting every
+        // element toward `total` while only pushing the kept ones - the
+        // latter would desync `JsonRecordStreamProfiler`'s own `pushed_
+        // count == total` invariant its dual-mode `finish()` relies on
+        // to detect "every value was an object", silently forcing the
+        // truncated read into the wrong (fallback `value`-column) shape.
+        let is_array = stream_top_level_array(reader, |v| {
+            if nrows.is_none_or(|n| seen < n) {
+                profiler.push(&v);
+            }
+            seen += 1;
+            Ok(())
+        })
+        .with_context(|| format!("failed to parse {path:?} as JSON5"))?;
+        if is_array {
+            return Ok(profiler.finish());
+        }
+
         let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
         let value = parse(&text).with_context(|| format!("failed to parse {path:?} as JSON5"))?;
         let mut profiler = JsonRecordStreamProfiler::new(n_samples);
-        match value {
-            // Matches `stream_json_document`'s own `--nrows` behavior
-            // exactly: stop pushing (and stop counting toward `total`)
-            // the instant the cutoff is reached, rather than counting
-            // every element toward `total` while only pushing the kept
-            // ones - the latter would desync `JsonRecordStreamProfiler`'s
-            // own `pushed_count == total` invariant its dual-mode
-            // `finish()` relies on to detect "every value was an
-            // object", silently forcing the truncated read into the
-            // wrong (fallback `value`-column) shape.
-            JsonValue::Array(items) => {
-                for item in items.into_iter().take(nrows.unwrap_or(usize::MAX)) {
-                    profiler.push(&item);
-                }
-            }
-            other => profiler.push(&other),
-        }
+        profiler.push(&value);
         Ok(profiler.finish())
     }
 } // mod json5_support
@@ -44130,52 +44849,42 @@ fn columns_from_json5(
 mod har_support {
     use super::*;
 
+    /// Streams `log.entries` straight off a `BufReader` via `json_
+    /// support::stream_nested_array` - peak memory is the bounded read
+    /// window plus one entry's own span/tree/accumulator, never the
+    /// whole capture (a real HAR file from a long browser session can
+    /// easily hold thousands of entries, each carrying full request/
+    /// response headers and bodies).
     pub(crate) fn columns_from_har(
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        let value = json_support::from_str(&text)
-            .map_err(|e| anyhow!("{e}"))
-            .with_context(|| format!("failed to parse {path:?} as JSON"))?;
-        let not_har = || {
-            anyhow!(
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let mut seen = 0usize;
+        let found = json_support::stream_nested_array(reader, &["log", "entries"], |v| match v {
+            JsonValue::Object(_) => {
+                if nrows.is_none_or(|n| seen < n) {
+                    profiler.push(&v);
+                }
+                seen += 1;
+                Ok(())
+            }
+            other => Err(json_support::ParseError::custom(format!(
+                "log.entries[{seen}] is a {other:?}, not an object - not a well-formed HAR entry"
+            ))),
+        })
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        if !found {
+            bail!(
                 "{path:?} doesn't look like a HAR file - expected a top-level \
                  `log.entries` array (HAR 1.2 §2.1)"
-            )
-        };
-        // Moved, not cloned, out of the parsed document - nothing else
-        // needs `value`/`log` once their one relevant field is found.
-        let JsonValue::Object(root) = value else {
-            return Err(not_har());
-        };
-        let Some(JsonValue::Object(log)) =
-            root.into_iter().find(|(k, _)| k == "log").map(|(_, v)| v)
-        else {
-            return Err(not_har());
-        };
-        let Some(JsonValue::Array(entries)) = log
-            .into_iter()
-            .find(|(k, _)| k == "entries")
-            .map(|(_, v)| v)
-        else {
-            return Err(not_har());
-        };
-        let mut records: Vec<json_support::Map> = Vec::with_capacity(entries.len());
-        for (i, entry) in entries.into_iter().enumerate() {
-            if nrows.is_some_and(|n| i >= n) {
-                break;
-            }
-            match entry {
-                JsonValue::Object(m) => records.push(m),
-                other => bail!(
-                    "{path:?}: log.entries[{i}] is a {other:?}, not an object - \
-                     not a well-formed HAR entry"
-                ),
-            }
+            );
         }
-        Ok(profile_json_records(&records, n_samples))
+        Ok(profiler.finish())
     }
 } // mod har_support
 
@@ -44387,13 +45096,6 @@ mod geojson_support {
         }
     }
 
-    /// Moves `key`'s value out of `map` (if present), the same "nothing
-    /// else needs the rest of the document" discipline `har_support`
-    /// already established for its own `log.entries` extraction.
-    fn take_field(map: json_support::Map, key: &str) -> Option<JsonValue> {
-        map.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    }
-
     /// One Feature's own `properties` become the record's columns; its
     /// `geometry` becomes a `geometry` column of WKT text (or genuinely
     /// missing, for a Feature whose `geometry` is JSON `null` - a real,
@@ -44433,11 +45135,44 @@ mod geojson_support {
         Ok(map)
     }
 
+    /// Streams straight off a `BufReader` via `json_support::stream_
+    /// nested_array`, trying the `FeatureCollection` shape first (the
+    /// one genuinely large-file case in practice - a real GIS export can
+    /// hold many thousands of features) without ever materializing the
+    /// whole document: peak memory is the bounded read window plus one
+    /// feature's own span/tree/accumulator, never the whole file. If
+    /// `"features"` genuinely isn't present (a well-formed document, but
+    /// a bare `Feature` or bare `Geometry` at the top level instead -
+    /// both legal per RFC 7946 §3, and both inherently single-record
+    /// documents with nothing to stream regardless), this falls back to
+    /// a whole-document read the same way TOML/a single YAML document
+    /// already do for their own single-document shapes - a second,
+    /// disclosed pass over the file, not a zero-cost fallback, but one
+    /// that only real, non-`FeatureCollection` documents ever pay.
     pub(crate) fn columns_from_geojson(
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let mut seen = 0usize;
+        let found = json_support::stream_nested_array(reader, &["features"], |v| {
+            if nrows.is_none_or(|n| seen < n) {
+                let record = feature_to_record(v)
+                    .map_err(|e| json_support::ParseError::custom(format!("{e:?}")))?;
+                profiler.push(&JsonValue::from(record));
+            }
+            seen += 1;
+            Ok(())
+        })
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        if found {
+            return Ok(profiler.finish());
+        }
+
         let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
         let value = json_support::from_str(&text)
             .map_err(|e| anyhow!("{e}"))
@@ -44455,24 +45190,12 @@ mod geojson_support {
                 format!("{path:?} is missing its own top-level \"type\" field (RFC 7946 §3)")
             })?;
         match ty.as_str() {
-            "FeatureCollection" => {
-                let features = match take_field(root, "features") {
-                    Some(JsonValue::Array(items)) => items,
-                    _ => bail!(
-                        "{path:?}'s FeatureCollection is missing its own \"features\" array (RFC 7946 §3.3)"
-                    ),
-                };
-                let mut records = Vec::with_capacity(features.len());
-                for (i, feature) in features.into_iter().enumerate() {
-                    if nrows.is_some_and(|n| i >= n) {
-                        break;
-                    }
-                    records.push(feature_to_record(feature).with_context(|| {
-                        format!("{path:?}: features[{i}] isn't a well-formed GeoJSON Feature")
-                    })?);
-                }
-                Ok(profile_json_records(&records, n_samples))
-            }
+            // Reached only if "features" truly isn't present at all - a
+            // genuinely malformed FeatureCollection (the well-formed
+            // case already streamed and returned above).
+            "FeatureCollection" => bail!(
+                "{path:?}'s FeatureCollection is missing its own \"features\" array (RFC 7946 §3.3)"
+            ),
             "Feature" => {
                 let record = feature_to_record(JsonValue::Object(root))
                     .with_context(|| format!("{path:?} isn't a well-formed GeoJSON Feature"))?;
@@ -44544,31 +45267,78 @@ fn columns_from_geojson(
 mod vobject_support {
     use super::*;
 
-    /// Un-folds RFC 5545/6350 content lines: a logical line may be split
-    /// across several physical lines, with every continuation line after
-    /// the first beginning with exactly one space or horizontal tab
-    /// (stripped here, not kept as part of the value). A genuinely blank
-    /// line never carries fold continuation of its own and is dropped
-    /// outright - it only ever separates unrelated content in these
-    /// formats (vCard has no comparable meaning for one at all; a real
-    /// iCalendar file occasionally has one between components, though
-    /// the spec doesn't require it). Accepts a bare `\n` alongside the
-    /// spec's own `\r\n`, the same leniency this project's other
-    /// hand-rolled line-oriented readers already extend.
-    pub(crate) fn unfold_lines(text: &str) -> Vec<String> {
-        let mut lines: Vec<String> = Vec::new();
-        for raw in text.lines() {
-            let raw = raw.strip_suffix('\r').unwrap_or(raw);
-            if raw.is_empty() {
-                continue;
-            }
-            if (raw.starts_with(' ') || raw.starts_with('\t')) && !lines.is_empty() {
-                lines.last_mut().unwrap().push_str(&raw[1..]);
-            } else {
-                lines.push(raw.to_string());
+    /// Streams RFC 5545/6350 content lines one at a time off a
+    /// `BufRead`, un-folding continuations as it goes: a logical line
+    /// may be split across several physical lines, with every
+    /// continuation line after the first beginning with exactly one
+    /// space or horizontal tab (stripped here, not kept as part of the
+    /// value). Never holds more than one already-unfolded logical line
+    /// (plus a single physical line of lookahead, needed to tell "this
+    /// next line is a continuation" from "this next line starts a new
+    /// property") in memory at once - the whole-file `Vec<String>` this
+    /// replaced held every logical line of the entire document
+    /// resident, real memory a large real address book or calendar
+    /// export could actually need. A genuinely blank physical line never
+    /// carries fold continuation of its own and is skipped outright - it
+    /// only ever separates unrelated content in these formats (vCard has
+    /// no comparable meaning for one at all; a real iCalendar file
+    /// occasionally has one between components, though the spec doesn't
+    /// require it). Accepts a bare `\n` alongside the spec's own
+    /// `\r\n`, the same leniency this project's other hand-rolled
+    /// line-oriented readers already extend.
+    pub(crate) struct UnfoldingLines<R> {
+        lines: std::io::Lines<R>,
+        pending: Option<String>,
+    }
+
+    impl<R: std::io::BufRead> UnfoldingLines<R> {
+        pub(crate) fn new(reader: R) -> Self {
+            UnfoldingLines {
+                lines: reader.lines(),
+                pending: None,
             }
         }
-        lines
+
+        fn next_physical(&mut self) -> Result<Option<String>> {
+            match self.pending.take() {
+                Some(line) => Ok(Some(line)),
+                None => self.lines.next().transpose().context("I/O error"),
+            }
+        }
+    }
+
+    impl<R: std::io::BufRead> Iterator for UnfoldingLines<R> {
+        type Item = Result<String>;
+
+        fn next(&mut self) -> Option<Result<String>> {
+            let mut logical = loop {
+                let first = match self.next_physical() {
+                    Ok(Some(l)) => l,
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(e)),
+                };
+                let first = first.strip_suffix('\r').unwrap_or(&first).to_string();
+                if !first.is_empty() {
+                    break first;
+                }
+            };
+            loop {
+                match self.next_physical() {
+                    Ok(Some(next)) => {
+                        let trimmed = next.strip_suffix('\r').unwrap_or(&next);
+                        if trimmed.starts_with(' ') || trimmed.starts_with('\t') {
+                            logical.push_str(&trimmed[1..]);
+                        } else {
+                            self.pending = Some(next);
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            Some(Ok(logical))
+        }
     }
 
     pub(crate) struct ParsedProperty {
@@ -44669,20 +45439,33 @@ mod vobject_support {
 #[cfg(feature = "vcard")]
 mod vcard_support {
     use super::vobject_support::{
-        insert_pooling, parse_property_line, unescape_value, unfold_lines,
+        UnfoldingLines, insert_pooling, parse_property_line, unescape_value,
     };
     use super::*;
 
+    /// Streams the file a line at a time via `UnfoldingLines`, folding
+    /// each completed card straight into the incremental profiler the
+    /// instant its own `END:VCARD` is found - peak memory is one
+    /// in-progress card's own accumulated properties plus the
+    /// accumulator tree, never the whole address book (a real exported
+    /// contacts database can hold many thousands of cards). `--nrows`
+    /// stops reading the file entirely once enough cards have been kept,
+    /// the same real-I/O-bounding early stop this project's other
+    /// streaming readers already give it.
     pub(crate) fn columns_from_vcard(
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        let lines = unfold_lines(&text);
-        let mut records: Vec<json_support::Map> = Vec::new();
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let lines = UnfoldingLines::new(reader);
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let mut seen = 0usize;
         let mut current: Option<json_support::Map> = None;
-        for line in &lines {
+
+        for line in lines {
+            let line = line?;
             if line.eq_ignore_ascii_case("BEGIN:VCARD") {
                 if current.is_some() {
                     bail!(
@@ -44696,13 +45479,19 @@ mod vcard_support {
                 let map = current
                     .take()
                     .with_context(|| format!("{path:?}: END:VCARD with no matching BEGIN:VCARD"))?;
-                records.push(map);
+                if nrows.is_none_or(|n| seen < n) {
+                    profiler.push(&JsonValue::from(map));
+                }
+                seen += 1;
+                if nrows.is_some_and(|n| seen >= n) {
+                    break;
+                }
                 continue;
             }
             let Some(map) = current.as_mut() else {
                 continue; // content outside any BEGIN/END block is ignored
             };
-            let prop = parse_property_line(line)
+            let prop = parse_property_line(&line)
                 .with_context(|| format!("{path:?}: malformed vCard property line"))?;
             // BEGIN/VERSION/END are structural, not real contact data -
             // VERSION in particular is the same "1" constant on every
@@ -44715,12 +45504,7 @@ mod vcard_support {
         if current.is_some() {
             bail!("{path:?}: unterminated VCARD block (missing END:VCARD)");
         }
-        // A whole-document parse (like TOML/JSON5's own single-document
-        // shapes) - every card is still fully parsed regardless of
-        // `--nrows` (so a malformed card past the cutoff still surfaces
-        // as an error), only the kept set is capped afterward.
-        records.truncate(nrows.unwrap_or(usize::MAX));
-        Ok(profile_json_records(&records, n_samples))
+        Ok(profiler.finish())
     }
 } // mod vcard_support
 
@@ -44758,7 +45542,7 @@ fn columns_from_vcard(
 #[cfg(feature = "icalendar")]
 mod ical_support {
     use super::vobject_support::{
-        insert_pooling, parse_property_line, unescape_value, unfold_lines,
+        UnfoldingLines, insert_pooling, parse_property_line, unescape_value,
     };
     use super::*;
 
@@ -44767,16 +45551,37 @@ mod ical_support {
         Other(String),
     }
 
+    /// Streams the file a line at a time via `UnfoldingLines`, folding
+    /// each completed `VEVENT`/`VTODO` straight into the incremental
+    /// profiler the instant its own `END:` is found - peak memory is the
+    /// current component-nesting stack (bounded by real nesting depth,
+    /// never by file size) plus one in-progress record, never the whole
+    /// calendar (a real shared calendar export can hold many thousands
+    /// of events). `--nrows` stops reading the file entirely once enough
+    /// records have been kept, the same real-I/O-bounding early stop
+    /// this project's other streaming readers already give it - the
+    /// enclosing `VCALENDAR`/any other still-open component is
+    /// necessarily left on the stack at that point (a real file has
+    /// its own `END:VCALENDAR` still to come), so the usual "is
+    /// anything left unterminated" check below is skipped specifically
+    /// when the stop was `--nrows`-driven, the same "a malformed line
+    /// past the cutoff is never even read" tradeoff CSV/weblog's own
+    /// early-stop readers already accept.
     pub(crate) fn columns_from_ical(
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        let lines = unfold_lines(&text);
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let lines = UnfoldingLines::new(reader);
         let mut stack: Vec<Frame> = Vec::new();
-        let mut records: Vec<json_support::Map> = Vec::new();
-        for line in &lines {
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let mut seen = 0usize;
+        let mut stopped_early = false;
+
+        'lines: for line in lines {
+            let line = line?;
             if let Some(name) = line
                 .strip_prefix("BEGIN:")
                 .or_else(|| line.strip_prefix("begin:"))
@@ -44804,7 +45609,14 @@ mod ical_support {
                                 "{path:?}: END:{name} doesn't match its own BEGIN (a VEVENT/VTODO)"
                             );
                         }
-                        records.push(map);
+                        if nrows.is_none_or(|n| seen < n) {
+                            profiler.push(&JsonValue::from(map));
+                        }
+                        seen += 1;
+                        if nrows.is_some_and(|n| seen >= n) {
+                            stopped_early = true;
+                            break 'lines;
+                        }
                     }
                     Frame::Other(open_name) => {
                         if open_name != name {
@@ -44818,7 +45630,7 @@ mod ical_support {
             }
             match stack.last_mut() {
                 Some(Frame::Record(map)) => {
-                    let prop = parse_property_line(line)
+                    let prop = parse_property_line(&line)
                         .with_context(|| format!("{path:?}: malformed iCalendar property line"))?;
                     insert_pooling(map, prop.name, JsonValue::from(unescape_value(&prop.value)));
                 }
@@ -44829,11 +45641,10 @@ mod ical_support {
                 Some(Frame::Other(_)) | None => {}
             }
         }
-        if !stack.is_empty() {
+        if !stopped_early && !stack.is_empty() {
             bail!("{path:?}: unterminated component (missing an END: line)");
         }
-        records.truncate(nrows.unwrap_or(usize::MAX));
-        Ok(profile_json_records(&records, n_samples))
+        Ok(profiler.finish())
     }
 } // mod ical_support
 
@@ -44875,146 +45686,164 @@ fn columns_from_ical(
 #[cfg(feature = "mbox")]
 mod mbox_support {
     use super::*;
+    use std::io::BufRead;
 
-    fn split_messages(content: &str) -> Vec<&str> {
-        let bytes = content.as_bytes();
-        let mut boundaries = vec![0usize];
-        let mut prev_blank = true;
-        let mut line_start = 0usize;
-        for i in 0..=bytes.len() {
-            if i == bytes.len() || bytes[i] == b'\n' {
-                let line = content[line_start..i]
-                    .strip_suffix('\r')
-                    .unwrap_or(&content[line_start..i]);
-                if prev_blank && line.starts_with("From ") && line_start != 0 {
-                    boundaries.push(line_start);
-                }
-                prev_blank = line.is_empty();
-                line_start = i + 1;
-            }
-        }
-        let mut messages = Vec::with_capacity(boundaries.len());
-        for w in boundaries.windows(2) {
-            messages.push(&content[w[0]..w[1]]);
-        }
-        if let Some(&last) = boundaries.last()
-            && last < content.len()
-        {
-            messages.push(&content[last..]);
-        }
-        messages
-    }
-
-    struct ParsedMessage {
+    /// One message's worth of state, built up incrementally one line at
+    /// a time as `columns_from_mbox` streams the file - never a whole
+    /// message string held in memory at once, matching the "one record
+    /// at a time" shape every other streaming reader in this project
+    /// already uses.
+    struct MessageBuilder {
         envelope_sender: String,
         envelope_date: String,
         headers: Vec<(String, String)>,
-        body: String,
+        body_lines: Vec<String>,
+        in_headers: bool,
     }
 
-    /// RFC 822 headers only - deliberately no MIME multipart decoding
-    /// (a `multipart/*` body's own boundary-delimited parts are kept as
-    /// one opaque `body` blob, not recursed into), the same "isolate
-    /// what's out of scope" scope boundary the iCalendar/vCard readers
-    /// above draw for their own unsupported nested components.
-    fn parse_message(msg: &str) -> Result<ParsedMessage> {
-        let mut lines = msg.lines();
-        let envelope_line = lines.next().context("empty message")?;
-        let rest = envelope_line
-            .strip_prefix("From ")
-            .context("message doesn't start with a 'From ' envelope line")?;
-        let mut parts = rest.splitn(2, ' ');
-        let envelope_sender = parts.next().unwrap_or("").to_string();
-        let envelope_date = parts.next().unwrap_or("").trim().to_string();
+    impl MessageBuilder {
+        /// `envelope_line` is already confirmed to start with `"From "`
+        /// by the caller (that's what identified this as a new message
+        /// boundary in the first place), so this never fails.
+        fn new(envelope_line: &str) -> Self {
+            let rest = envelope_line.strip_prefix("From ").unwrap_or("");
+            let mut parts = rest.splitn(2, ' ');
+            MessageBuilder {
+                envelope_sender: parts.next().unwrap_or("").to_string(),
+                envelope_date: parts.next().unwrap_or("").trim().to_string(),
+                headers: Vec::new(),
+                body_lines: Vec::new(),
+                in_headers: true,
+            }
+        }
 
-        let mut headers: Vec<(String, String)> = Vec::new();
-        let mut body_lines: Vec<&str> = Vec::new();
-        let mut in_headers = true;
-        for line in lines {
-            if !in_headers {
-                body_lines.push(line);
-                continue;
+        /// RFC 822 headers only - deliberately no MIME multipart
+        /// decoding (a `multipart/*` body's own boundary-delimited
+        /// parts are kept as one opaque `body` blob, not recursed into),
+        /// the same "isolate what's out of scope" boundary the
+        /// iCalendar/vCard readers above draw for their own unsupported
+        /// nested components.
+        fn add_line(&mut self, line: &str) -> Result<()> {
+            if !self.in_headers {
+                self.body_lines.push(line.to_string());
+                return Ok(());
             }
             if line.is_empty() {
-                in_headers = false;
-                continue;
+                self.in_headers = false;
+                return Ok(());
             }
-            if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
+            if (line.starts_with(' ') || line.starts_with('\t')) && !self.headers.is_empty() {
                 // RFC 822 §3.1.1 header folding.
-                let last = headers.last_mut().unwrap();
+                let last = self.headers.last_mut().unwrap();
                 last.1.push(' ');
                 last.1.push_str(line.trim_start());
-                continue;
+                return Ok(());
             }
             match line.split_once(':') {
-                Some((name, value)) => {
-                    headers.push((name.trim().to_string(), value.trim().to_string()))
-                }
+                Some((name, value)) => self
+                    .headers
+                    .push((name.trim().to_string(), value.trim().to_string())),
                 None => bail!("malformed header line (missing ':'): {line:?}"),
             }
+            Ok(())
         }
-        Ok(ParsedMessage {
-            envelope_sender,
-            envelope_date,
-            headers,
-            body: body_lines.join("\n"),
-        })
-    }
 
-    fn message_to_record(msg: ParsedMessage) -> json_support::Map {
-        let mut map = json_support::Map::with_capacity(msg.headers.len() + 3);
-        map.insert(
-            "envelope_sender".to_string(),
-            JsonValue::from(msg.envelope_sender),
-        );
-        map.insert(
-            "envelope_date".to_string(),
-            JsonValue::from(msg.envelope_date),
-        );
-        // Exact-name pooling, matching this project's own INI reader -
-        // real header names are conventionally written consistently
-        // within one message even though RFC 822 itself treats them as
-        // case-insensitive, so this is the same "correct for the
-        // overwhelming common case" tradeoff `is_email`/`is_url` already
-        // make elsewhere in this project.
-        for (name, value) in msg.headers {
-            match map.get_mut(&name) {
-                Some(JsonValue::Array(arr)) => arr.push(JsonValue::from(value)),
-                Some(existing) => {
-                    let prev = std::mem::replace(existing, JsonValue::Null);
-                    *existing = JsonValue::Array(vec![prev, JsonValue::from(value)]);
-                }
-                None => {
-                    map.insert(name, JsonValue::from(value));
+        fn finish(self) -> json_support::Map {
+            let mut map = json_support::Map::with_capacity(self.headers.len() + 3);
+            map.insert(
+                "envelope_sender".to_string(),
+                JsonValue::from(self.envelope_sender),
+            );
+            map.insert(
+                "envelope_date".to_string(),
+                JsonValue::from(self.envelope_date),
+            );
+            // Exact-name pooling, matching this project's own INI
+            // reader - real header names are conventionally written
+            // consistently within one message even though RFC 822
+            // itself treats them as case-insensitive, so this is the
+            // same "correct for the overwhelming common case" tradeoff
+            // `is_email`/`is_url` already make elsewhere in this
+            // project.
+            for (name, value) in self.headers {
+                match map.get_mut(&name) {
+                    Some(JsonValue::Array(arr)) => arr.push(JsonValue::from(value)),
+                    Some(existing) => {
+                        let prev = std::mem::replace(existing, JsonValue::Null);
+                        *existing = JsonValue::Array(vec![prev, JsonValue::from(value)]);
+                    }
+                    None => {
+                        map.insert(name, JsonValue::from(value));
+                    }
                 }
             }
+            map.insert(
+                "body".to_string(),
+                JsonValue::from(self.body_lines.join("\n")),
+            );
+            map
         }
-        map.insert("body".to_string(), JsonValue::from(msg.body));
-        map
     }
 
+    /// Streams the file a line at a time via `BufRead::lines()` (the
+    /// same mechanism this project's own weblog/syslog readers already
+    /// use), folding each completed message straight into the
+    /// incremental profiler the instant its own boundary is found -
+    /// peak memory is one in-progress message's own accumulated lines
+    /// plus the accumulator tree, never the whole archive (a real mail
+    /// export can easily run into the gigabytes). `--nrows` gets the
+    /// same real-I/O-bounding early stop weblog/syslog's own readers
+    /// already give it: once enough messages have been kept, this stops
+    /// reading the file entirely rather than continuing to scan (and
+    /// discard) the rest of it.
     pub(crate) fn columns_from_mbox(
         path: &Path,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let content =
-            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        if !content.trim_start().starts_with("From ") {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let mut seen = 0usize;
+        let mut current: Option<MessageBuilder> = None;
+        let mut prev_blank = true; // the start of the file counts as "preceded by a blank line"
+        let mut any_message = false;
+
+        for line in reader.lines() {
+            let line = line.with_context(|| format!("I/O error while reading {path:?}"))?;
+            let line = line.strip_suffix('\r').unwrap_or(&line).to_string();
+            if prev_blank && line.starts_with("From ") {
+                if let Some(builder) = current.take() {
+                    profiler.push(&JsonValue::from(builder.finish()));
+                    seen += 1;
+                    if nrows.is_some_and(|n| seen >= n) {
+                        any_message = true;
+                        break;
+                    }
+                }
+                any_message = true;
+                current = Some(MessageBuilder::new(&line));
+                prev_blank = false;
+                continue;
+            }
+            prev_blank = line.is_empty();
+            if let Some(builder) = current.as_mut() {
+                builder
+                    .add_line(&line)
+                    .with_context(|| format!("{path:?}: malformed message #{}", seen + 1))?;
+            }
+        }
+        if let Some(builder) = current.take() {
+            profiler.push(&JsonValue::from(builder.finish()));
+        }
+
+        if !any_message {
             bail!(
                 "{path:?} doesn't look like an mbox file - expected the first message to start with a 'From ' envelope line (RFC 4155)"
             );
         }
-        let mut records = Vec::new();
-        for (i, msg) in split_messages(&content).into_iter().enumerate() {
-            if nrows.is_some_and(|n| i >= n) {
-                break;
-            }
-            let parsed = parse_message(msg)
-                .with_context(|| format!("{path:?}: malformed message #{}", i + 1))?;
-            records.push(message_to_record(parsed));
-        }
-        Ok(profile_json_records(&records, n_samples))
+        Ok(profiler.finish())
     }
 } // mod mbox_support
 
@@ -60749,6 +61578,10 @@ mod tests {
             (
                 "tests/fixtures/edge_plist_binary_type_detection.plist",
                 true,
+            ),
+            (
+                "tests/fixtures/edge_plist_array_spans_multiple_window_refills.plist",
+                false,
             ),
         ] {
             let path = Path::new(f);
