@@ -992,6 +992,52 @@ fn load_into_accepts_stata() {
 }
 
 #[test]
+#[cfg(feature = "sas7bdat")]
+fn sql_output_inline_mode_supports_sas7bdat() {
+    // Phase 5 of the "any format" rollout: a third declared-type binary
+    // format, and the third whose profiling reader's real nrows behavior
+    // (collect_rows bounds real page/subheader reads via its own `limit`
+    // parameter, matching Stata's own real-I/O-bounding shape) had to be
+    // checked and matched rather than assumed.
+    let sql = run_sql("sas7bdat_people_nonascii.sas7bdat", &[]);
+    assert!(!sql.contains("CREATE TABLE \"sas7bdat_people_nonascii_staging\""));
+    assert!(sql.contains("CREATE TABLE \"sas7bdat_people_nonascii\""));
+    assert!(sql.contains("INSERT INTO \"sas7bdat_people_nonascii\""));
+    // A real, non-ASCII value from the fixture survives intact.
+    assert!(sql.contains("'é'"));
+}
+
+#[test]
+#[cfg(feature = "sas7bdat")]
+fn sql_output_inline_mode_sas7bdat_respects_nrows() {
+    let sql = run_sql("sas7bdat_people_nonascii.sas7bdat", &["--nrows", "2"]);
+    assert!(sql.contains("(1, "));
+    assert!(sql.contains("(2, "));
+    assert!(!sql.contains("(3, "));
+}
+
+#[test]
+#[cfg(feature = "sas7bdat")]
+fn load_into_accepts_sas7bdat() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sas7bdat_people_nonascii.sas7bdat")
+                .to_str()
+                .unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for sas7bdat"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

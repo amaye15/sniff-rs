@@ -317,12 +317,12 @@ different shapes: `inline` (the default) and `staging` (the original
 shape, kept for large files - see below). `staging` mode already works
 for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers CSV, TSV, fixed-width
-text, Common/Combined Log Format, syslog (RFC 3164/5424), dBase, and
-Stata so far - every other format transparently falls back to `staging`
-with a disclosed stderr note (`--sql-mode inline` given *explicitly* on
-an unsupported format is a hard error instead, naming the gap -
-downgrading what was explicitly asked for would be the wrong kind of
-quiet).
+text, Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
+and SAS7BDAT so far - every other format transparently falls back to
+`staging` with a disclosed stderr note (`--sql-mode inline` given
+*explicitly* on an unsupported format is a hard error instead, naming the
+gap - downgrading what was explicitly asked for would be the wrong kind
+of quiet).
 
 Extending inline mode further is explicit, disclosed, staged future
 work, following this project's own "one format at a time, fully verified"
@@ -333,13 +333,13 @@ into three structurally different shapes for this purpose, and each
 needs its own real design, not just repeating the same pattern:
 
 1. **The rest of the flat, fixed-column, one-row-per-record tier**
-   (SAS7BDAT, SPSS, ORC, NumPy) - CSV/TSV/fixed-width, Common/Combined
-   Log Format, syslog (RFC 3164/5424), dBase, and, as of Phase 4, Stata
-   all already prove the shape (`InlineRowSink`/`ColumnAccumulatorState`'s
-   own generalized `accept`), including two genuine binary re-parses for
-   declared-type formats now that dBase and Stata are both done - but
-   each of the four remaining formats still needs its own
-   real "read one row a second time" plumbing and its own end-to-end
+   (SPSS, ORC, NumPy) - CSV/TSV/fixed-width, Common/Combined Log Format,
+   syslog (RFC 3164/5424), dBase, Stata, and, as of Phase 5, SAS7BDAT all
+   already prove the shape (`InlineRowSink`/`ColumnAccumulatorState`'s
+   own generalized `accept`), including three genuine binary re-parses
+   for declared-type formats now that dBase/Stata/SAS7BDAT are all done -
+   but each of the three remaining formats still needs its own real
+   "read one row a second time" plumbing and its own end-to-end
    verification against a real engine before being trusted.
 2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
    `dispatch_reader` already returns `Vec<(String, Vec<ColumnProfile>)>`
@@ -750,6 +750,42 @@ every already-shipped format: `diff` confirmed byte-identical inline SQL
 output against the pre-Phase-4 binary. Clean across default/`stata`/
 `full`, matching each one's own established baseline exactly - the three
 new Stata-specific tests are `#[cfg(feature = "stata")]`-gated.
+
+**Phase 5: SAS7BDAT - the smoothest port of this tier so far**, since its
+own profiling reader (`columns_from_sas7bdat`) already decodes rows
+through a per-row *callback* (`collect_rows(..., on_row: impl FnMut(&[u8])
+-> Result<u64>)`, a Tier 2 streaming-memory design already in place before
+this phase started - see the Architecture section's own SAS7BDAT entry).
+That meant no new "read one row" loop had to be written at all: the
+shared setup (`open_sas7bdat_for_records`, extracted from
+`columns_from_sas7bdat` the same way as every prior format in this tier)
+already resolves everything `collect_rows` needs, and the new
+`stream_sas7bdat_rows_for_sql` just calls `collect_rows` a second time
+with a different callback - decode each cell into the row's own
+`Vec<Option<String>>` and call `sink.accept`, instead of folding into a
+`ColumnAccumulatorState`. `collect_rows` already bounds real page/
+subheader reads via its own `limit` parameter (breaking out of the page
+loop entirely once enough rows are produced) - the same real-I/O-bounding
+shape Stata's own profiling reader already has - so `nrows` threads
+straight through unchanged, no `sink.done`-based early exit needed. A
+genuinely zero-variable SAS7BDAT dataset (a real, if rare, shape this
+reader already tolerates) is handled the same way on both passes:
+`open_sas7bdat_for_records` returns `Ok(None)`, and the SQL row-source
+just emits zero rows.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sas7bdat_people_nonascii.sas7bdat --output-format sql
+--load-into sqlite:...` (the one real, non-synthetic SAS7BDAT fixture
+this project has, since no tool anywhere in this environment can *write*
+one - see the Dependency footprint section's own SAS7BDAT entry),
+querying the resulting table back out and confirming every one of its 5
+real rows - including a non-ASCII `GENDER` value (`é`) - survived intact;
+`--nrows 2` confirmed to emit only the first two rows. Also verified as a
+pure extraction, not a behavior change, for every already-shipped format:
+`diff` confirmed byte-identical inline SQL output against the
+pre-Phase-5 binary. Clean across default/`sas7bdat`/`full`, matching each
+one's own established baseline exactly - the three new SAS7BDAT-specific
+tests are `#[cfg(feature = "sas7bdat")]`-gated.
 
 ## Directory-input batch mode
 

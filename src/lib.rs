@@ -10094,11 +10094,29 @@ mod sas7bdat_support {
         })
     }
 
-    pub(crate) fn columns_from_sas7bdat(
-        path: &Path,
-        nrows: Option<usize>,
-        n_samples: usize,
-    ) -> Result<Vec<ColumnProfile>> {
+    /// `(file, header, row_info, compression, decoder, names, logical_types,
+    /// columns_raw)` - named here purely to keep `open_sas7bdat_for_records`'s
+    /// signature readable (`clippy::type_complexity`).
+    type Sas7bdatRecordSource = (
+        fs::File,
+        Header,
+        RowInfo,
+        CompressionKind,
+        TextDecoder,
+        Vec<String>,
+        Vec<LogicalType>,
+        Vec<ColumnRaw>,
+    );
+
+    /// Opens `path`, reads its header and metadata, and resolves
+    /// everything needed to start decoding rows - shared by
+    /// `columns_from_sas7bdat` and the `--sql-mode inline` second pass
+    /// (`stream_sas7bdat_rows_for_sql`) so neither can drift from the
+    /// other. Returns `Ok(None)` for a genuinely zero-variable dataset
+    /// (a legitimate, if rare, real shape - see `columns_from_sas7bdat`'s
+    /// own comment) - there's nothing for either caller to do with a file
+    /// like that beyond producing an empty column/row list.
+    fn open_sas7bdat_for_records(path: &Path) -> Result<Option<Sas7bdatRecordSource>> {
         let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
         // Only a small, fixed-size prefix is ever needed for the header
         // itself - `Read::take` rather than a fixed-size `read_exact` so
@@ -10134,11 +10152,7 @@ mod sas7bdat_support {
         let mut columns_raw = meta.columns;
         columns_raw.truncate(column_count);
         if columns_raw.is_empty() {
-            // A genuinely zero-variable dataset - a legitimate, if rare,
-            // shape (confirmed against the oracle on a real fixture)
-            // rather than a corrupted file, so it profiles to an empty
-            // column list rather than erroring.
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         let compression = match meta.text_store.resolve(row_info.compression_ref) {
@@ -10169,6 +10183,41 @@ mod sas7bdat_support {
                 infer_logical_type(c.type_code, format.as_deref())
             })
             .collect();
+
+        Ok(Some((
+            file,
+            header,
+            row_info,
+            compression,
+            decoder,
+            names,
+            logical_types,
+            columns_raw,
+        )))
+    }
+
+    pub(crate) fn columns_from_sas7bdat(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let Some((
+            mut file,
+            header,
+            row_info,
+            compression,
+            decoder,
+            names,
+            logical_types,
+            columns_raw,
+        )) = open_sas7bdat_for_records(path)?
+        else {
+            // A genuinely zero-variable dataset - a legitimate, if rare,
+            // shape (confirmed against the oracle on a real fixture)
+            // rather than a corrupted file, so it profiles to an empty
+            // column list rather than erroring.
+            return Ok(Vec::new());
+        };
 
         let n_cols = columns_raw.len();
         let mut states: Vec<ColumnAccumulatorState> =
@@ -10214,6 +10263,67 @@ mod sas7bdat_support {
             })
             .collect();
         Ok(profiles)
+    }
+
+    /// The SAS7BDAT row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass, sharing `open_sas7bdat_for_records` and
+    /// `collect_rows` with `columns_from_sas7bdat` above - `collect_rows`
+    /// already bounds real page/subheader reads via its own `limit`
+    /// parameter (it breaks out of the page loop entirely once enough
+    /// rows have been produced), the same real-I/O-bounding convention
+    /// Stata's own profiling reader already has, so this passes `nrows`
+    /// straight through unchanged rather than needing a `sink.done`-based
+    /// early exit of its own. SAS7BDAT has no header row and no
+    /// `--skip-rows` concept, so `sink.has_header` must already be
+    /// `false`. A genuinely zero-variable dataset produces zero rows
+    /// (nothing to emit into an already-empty `CREATE TABLE`).
+    pub(crate) fn stream_sas7bdat_rows_for_sql(
+        path: &Path,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let Some((
+            mut file,
+            header,
+            row_info,
+            compression,
+            decoder,
+            _names,
+            logical_types,
+            columns_raw,
+        )) = open_sas7bdat_for_records(path)?
+        else {
+            return Ok(());
+        };
+
+        let n_cols = columns_raw.len();
+        let mut rows_seen: u64 = 0;
+        collect_rows(
+            &mut file,
+            &header,
+            row_info.row_length,
+            row_info.total_rows,
+            row_info.rows_per_page,
+            compression,
+            nrows,
+            path,
+            |row: &[u8]| -> Result<u64> {
+                let mut values: Vec<Option<String>> = Vec::with_capacity(n_cols);
+                for i in 0..n_cols {
+                    values.push(cell_to_string(
+                        logical_types[i],
+                        &columns_raw[i],
+                        row,
+                        header.endianness,
+                        decoder,
+                    )?);
+                }
+                sink.accept(values)?;
+                rows_seen += 1;
+                Ok(rows_seen)
+            },
+        )?;
+        Ok(())
     }
 } // mod sas7bdat_support
 
@@ -51487,6 +51597,7 @@ fn render_sql_inline_flat(
         InputFormat::Syslog5424 => render_sql_inline_flat_syslog(read_path, true, &mut sink)?,
         InputFormat::Dbase => render_sql_inline_flat_dbase(read_path, &mut sink)?,
         InputFormat::Stata => render_sql_inline_flat_stata(read_path, &mut sink)?,
+        InputFormat::Sas7bdat => render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -51582,6 +51693,33 @@ fn render_sql_inline_flat_stata(read_path: &Path, sink: &mut InlineRowSink<'_>) 
 fn render_sql_inline_flat_stata(_read_path: &Path, _sink: &mut InlineRowSink<'_>) -> Result<()> {
     bail!(
         "Stata support isn't compiled in - rebuild with `cargo build --release --features stata` (or --features full)"
+    )
+}
+
+/// The SAS7BDAT row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`sas7bdat` build. Unlike
+/// the other wrappers in this list, this one also threads `nrows`
+/// straight through to `collect_rows` (see `stream_sas7bdat_rows_for_sql`'s
+/// own doc comment for why that function needs it directly rather than
+/// relying on `sink.done`).
+#[cfg(feature = "sas7bdat")]
+fn render_sql_inline_flat_sas7bdat(
+    read_path: &Path,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    sas7bdat_support::stream_sas7bdat_rows_for_sql(read_path, nrows, sink)
+}
+
+#[cfg(not(feature = "sas7bdat"))]
+fn render_sql_inline_flat_sas7bdat(
+    _read_path: &Path,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "SAS7BDAT support isn't compiled in - rebuild with `cargo build --release --features sas7bdat` (or --features full)"
     )
 }
 
@@ -51695,9 +51833,9 @@ fn render_sql(
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier - see
     // `render_sql_inline_flat`'s own doc comment for the full list this
-    // is expected to grow into (SAS7BDAT, SPSS, ORC, NumPy) one
-    // fully-verified format at a time, matching this project's own
-    // established multi-format-campaign practice.
+    // is expected to grow into (SPSS, ORC, NumPy) one fully-verified
+    // format at a time, matching this project's own established
+    // multi-format-campaign practice.
     let inline_supported = matches!(
         format,
         InputFormat::Csv
@@ -51709,12 +51847,13 @@ fn render_sql(
             | InputFormat::Syslog5424
             | InputFormat::Dbase
             | InputFormat::Stata
+            | InputFormat::Sas7bdat
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -58395,10 +58534,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Syslog5424
                 | InputFormat::Dbase
                 | InputFormat::Stata
+                | InputFormat::Sas7bdat
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat are supported so far",
             format.as_str()
         );
     }
