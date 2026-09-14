@@ -480,6 +480,57 @@ boolean column (staging load via `.import`, then the generated `CREATE
 TABLE`/`INSERT ... SELECT CAST(...)` run verbatim) — not just unit-tested
 against the generated text either way.
 
+**`--load-into <engine>:<target>`** collapses "generate a `.sql` file,
+then separately pipe it into an engine" into one command: `sniff-rs
+data.csv --output-format sql --load-into sqlite:mydb.db` spawns that
+engine's own CLI (`sqlite3`/`duckdb`/`psql`/`mysql` - inferred either from
+an explicit `engine:target` prefix or a full connection URI's own scheme,
+e.g. `postgresql://user@host/db`) with its stdin piped, and streams the
+generated SQL straight into it - no intermediate file at all. Its stdout/
+stderr are inherited, so the target's own prompts, row-count messages,
+and any real SQL errors show through immediately, exactly as if the user
+had typed `sqlite3 mydb.db < script.sql` themselves; a non-zero exit is
+surfaced as an error pointing at that already-shown output rather than
+re-diagnosed. Deliberately no new Rust dependency - sniff-rs pipes into
+each engine's own already-installed client rather than linking a database
+driver of its own, the same "hand-roll or shell out, don't add a runtime
+dependency" discipline this project holds everywhere else, at the honest
+cost of requiring that CLI tool to already be on `PATH` (a clear,
+actionable error if `spawn()` fails, naming the missing tool). Validated
+before any real work starts: requires `--output-format sql` with the
+resolved mode being `inline` (never `staging`, whose whole design assumes
+a separate manual load step - piping its output would create the tables
+with zero rows actually loaded, a silent, misleading "success"), requires
+a format inline mode already supports (today: CSV/TSV), and can't combine
+with an explicit output path (including `-`) since the SQL has nowhere
+else to go once it's streaming into the subprocess. Single-file mode
+only - directory mode rejects it outright, the same way it already
+rejects `--format`/`--widths`, since loading many files' tables into one
+target sequentially is a different, unscoped feature.
+
+Building `--load-into` surfaced a real, pre-existing architecture gap
+worth fixing at the same time: `render_sql_inline_csv` used to build the
+*entire* generated script (every literal `INSERT` row included) as one
+`String` in memory before it was ever written out - for a huge CSV,
+exactly the unbounded-memory shape this project's whole "Streaming reads
+/ memory footprint" effort exists to eliminate everywhere else, and
+piping into a subprocess only works well if the SQL is genuinely streamed
+to it as it's produced. Fixed by converting `render_sql`/
+`render_sql_inline_csv`/`InlineCsvRowSink` to write directly to a `Write`
+sink (a file, stdout, or - new - a subprocess's own stdin) instead of
+returning a `String`; `render_sql_staging` is untouched (it never embeds
+per-row data, so there's no genuine memory concern to fix there), and
+`render_output` (md/json/json-schema) is untouched too, for the same
+reason - none of those three scale with row count either. The old post-
+hoc trailing-newline trim (`sql.truncate(sql.trim_end_matches('\n')...)`)
+can't work against a sink already written to, so it's replaced by never
+writing the separator blank line before the first `INSERT` until it's
+known a real one follows (`InlineCsvRowSink::separator_written`) - a zero
+-row table ends cleanly right after `CREATE TABLE ... );` with nothing
+trailing. Verified as a pure refactor, not a behavior change: `diff`
+confirmed byte-identical output against the pre-refactor binary across
+the entire CSV/TSV fixture corpus.
+
 ## Directory-input batch mode
 
 Pointing `sniff-rs` at a directory instead of a file switches to batch

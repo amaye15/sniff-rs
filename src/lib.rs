@@ -2946,6 +2946,15 @@ struct Args {
     /// disclosed fallback to staging) - a defaulted `String` can't
     /// distinguish those two cases after the fact.
     sql_mode: Option<String>,
+    /// `--load-into <engine>:<target>` (e.g. `sqlite:mydb.db`,
+    /// `postgres:mydb`, or a full connection URI) - pipes the generated
+    /// SQL directly into that engine's own CLI (see `LoadTarget`/
+    /// `spawn_load_target`) instead of writing a `.sql` file at all.
+    /// Single-file mode only, requires `--output-format sql` with the
+    /// resolved mode being `inline` (never `staging` - see
+    /// `run_single_file`'s own validation for why), and only for a
+    /// format inline mode already supports.
+    load_into: Option<String>,
 }
 
 const HELP_TEXT: &str = r#"sniff-rs - profile a data file and produce a data dictionary
@@ -2993,6 +3002,12 @@ OPTIONS:
         --sql-mode <MODE>       --output-format sql only: inline (default - no load
                                 step needed) or staging (raw-text staging table +
                                 per-engine load hint, for a file too large to embed)
+        --load-into <TARGET>    --output-format sql --sql-mode inline only: pipe the
+                                generated SQL directly into <engine>:<target> (e.g.
+                                sqlite:mydb.db, postgres:mydb, mysql:mydb,
+                                duckdb:mydb.duckdb, or a full connection URI) via that
+                                engine's own installed CLI - no .sql file written at all.
+                                Single-file mode only.
         --output-dir <DIR>      Directory-input mode only: where per-file outputs are
                                 written, mirroring the input's own subdirectory structure.
                                 Defaults to writing each output next to its own source file.
@@ -3025,6 +3040,7 @@ impl Args {
         let mut widths: Option<Vec<usize>> = None;
         let mut output_format = "md".to_string();
         let mut sql_mode: Option<String> = None;
+        let mut load_into: Option<String> = None;
         let mut output_dir: Option<PathBuf> = None;
         let mut positionals: Vec<String> = Vec::new();
 
@@ -3100,6 +3116,7 @@ impl Args {
                     }
                     "output-format" => output_format = value(&mut i)?,
                     "sql-mode" => sql_mode = Some(value(&mut i)?),
+                    "load-into" => load_into = Some(value(&mut i)?),
                     "output-dir" => output_dir = Some(PathBuf::from(value(&mut i)?)),
                     other => bail!("unrecognized flag --{other}"),
                 }
@@ -3136,6 +3153,7 @@ impl Args {
             widths,
             output_format,
             sql_mode,
+            load_into,
         })
     }
 }
@@ -50915,9 +50933,11 @@ fn sql_literal_for_csv_value(raw: &str, ideal_type: &str) -> String {
 
 /// The `--sql-mode inline` counterpart to `CsvColumnAccumulator`: instead
 /// of folding each row into a per-column type-detection accumulator, this
-/// folds each row into a batched `INSERT ... VALUES` statement, using the
-/// already-finalized column types (`ideal_types`) the real profiling pass
-/// already produced. Mirrors `CsvColumnAccumulator::accept`'s exact
+/// folds each row into a batched `INSERT ... VALUES` statement, writing
+/// each completed batch straight to `sink` as soon as it fills rather
+/// than accumulating the whole script in memory first - the entire point
+/// of this being a sink and not a `String` (see `render_sql_inline_csv`'s
+/// own doc comment). Mirrors `CsvColumnAccumulator::accept`'s exact
 /// three-way `record_index` branch (skip a leading row / the header row /
 /// a real data row) so this second pass over the same file can never
 /// disagree with the first pass about which row is which.
@@ -50931,22 +50951,39 @@ struct InlineCsvRowSink<'a> {
     record_index: usize,
     emitted: usize,
     batch: Vec<String>,
-    sql: String,
+    sink: &'a mut dyn std::io::Write,
+    // Lazily writes exactly one blank-line separator, the instant before
+    // the *first* real INSERT statement is written - not one per flush,
+    // and never at all for a table with zero data rows. This is what
+    // replaces the old whole-`String` version's post-hoc
+    // `sql.truncate(sql.trim_end_matches('\n')...)` trailing-newline
+    // trim: a sink that's already been written to can't have bytes
+    // un-written from it, so "never write a trailing blank line" has to
+    // be enforced by never writing the separator until it's known
+    // something real follows it, rather than writing it eagerly and
+    // trimming afterward.
+    separator_written: bool,
     done: bool,
 }
 
 impl InlineCsvRowSink<'_> {
-    fn flush_batch(&mut self) {
+    fn flush_batch(&mut self) -> Result<()> {
         if self.batch.is_empty() {
-            return;
+            return Ok(());
         }
-        self.sql.push_str(&format!(
-            "INSERT INTO {} ({}) VALUES\n{}\n;\n",
+        if !self.separator_written {
+            writeln!(self.sink)?;
+            self.separator_written = true;
+        }
+        writeln!(
+            self.sink,
+            "INSERT INTO {} ({}) VALUES\n{}\n;",
             self.quoted_table,
             self.insert_cols,
             self.batch.join(",\n")
-        ));
+        )?;
         self.batch.clear();
+        Ok(())
     }
 
     fn accept(&mut self, record: Vec<String>) -> Result<()> {
@@ -50983,7 +51020,7 @@ impl InlineCsvRowSink<'_> {
             self.batch.push(format!("    ({tuple})"));
             self.emitted += 1;
             if self.batch.len() >= SQL_INLINE_BATCH_SIZE {
-                self.flush_batch();
+                self.flush_batch()?;
             }
             if self.nrows.is_some_and(|limit| self.emitted >= limit) {
                 self.done = true;
@@ -51029,20 +51066,30 @@ fn sql_unique_column_names(profiles: &[ColumnProfile]) -> Vec<String> {
         .collect()
 }
 
-/// Builds the inline-mode script for one CSV/TSV table: a single
-/// `CREATE TABLE` using the same types `--sql-mode staging` already uses
-/// (`sql_column_type` - unchanged, already verified correct for exactly
-/// the four engines this mode targets), then a second, independent pass
-/// over `read_path` (via the exact same `stream_utf8_chunks`/
-/// `csv_feed_chunk` primitives the real profiling pass already streams
-/// through - not a second, divergent CSV parser) that folds each row
-/// straight into batched `INSERT ... VALUES` statements through
-/// `InlineCsvRowSink`. A second pass is unavoidable, not a shortcut
-/// skipped: `ColumnProfile` never retains raw per-row values by design
-/// (the entire point of this project's own incremental-accumulator
-/// streaming work), so the only way to know both "what type is this
-/// column" and "what did every row actually contain" is to look at the
-/// file twice - once to profile, once to emit.
+/// Builds the inline-mode script for one CSV/TSV table, writing it
+/// straight to `sink` (a file, stdout, or - for `--load-into` - a
+/// subprocess's own stdin) as it's produced, rather than building the
+/// whole thing as one `String` first: a single `CREATE TABLE` using the
+/// same types `--sql-mode staging` already uses (`sql_column_type` -
+/// unchanged, already verified correct for exactly the four engines this
+/// mode targets), then a second, independent pass over `read_path` (via
+/// the exact same `stream_utf8_chunks`/`csv_feed_chunk` primitives the
+/// real profiling pass already streams through - not a second, divergent
+/// CSV parser) that folds each row straight into batched `INSERT ...
+/// VALUES` statements through `InlineCsvRowSink`, each one flushed to
+/// `sink` the moment it fills. A second pass over the file is
+/// unavoidable, not a shortcut skipped: `ColumnProfile` never retains raw
+/// per-row values by design (the entire point of this project's own
+/// incremental-accumulator streaming work), so the only way to know both
+/// "what type is this column" and "what did every row actually contain"
+/// is to look at the file twice - once to profile, once to emit. Writing
+/// straight to `sink` instead of returning a `String` closes a real,
+/// pre-existing gap in that same discipline: the whole generated script
+/// (every literal `INSERT` row included) used to be held in memory as
+/// one `String` before ever touching disk, exactly the unbounded-memory
+/// shape this project's entire "Streaming reads / memory footprint"
+/// effort exists to eliminate everywhere else.
+#[allow(clippy::too_many_arguments)]
 fn render_sql_inline_csv(
     file_name: &str,
     table_name: &str,
@@ -51051,7 +51098,8 @@ fn render_sql_inline_csv(
     delim: char,
     resolved_skip_rows: usize,
     nrows: Option<usize>,
-) -> Result<String> {
+    sink: &mut dyn std::io::Write,
+) -> Result<()> {
     let clean_file_name = file_name.replace(['\n', '\r'], " ");
     let quoted_table = sql_quote_ident(table_name);
     // See sql_unique_column_names' own doc comment - a real CSV header
@@ -51064,7 +51112,8 @@ fn render_sql_inline_csv(
         .join(", ");
     let ideal_types: Vec<&str> = profiles.iter().map(|p| p.ideal_type.as_str()).collect();
 
-    let mut sql = format!(
+    write!(
+        sink,
         "-- Data dictionary for {clean_file_name}\n\
          -- Generated by sniff-rs --output-format sql --sql-mode inline\n\
          --\n\
@@ -51097,11 +51146,13 @@ fn render_sql_inline_csv(
          -- negatives/a trailing '%' - see normalize_numeric_str) - a raw\n\
          -- value this project's own heuristics couldn't already parse as\n\
          -- numeric was never going to resolve to i64/f64 in the first place.\n\n"
-    );
+    )?;
 
-    sql.push_str(&format!("CREATE TABLE {quoted_table} (\n"));
-    sql.push_str(
-        &profiles
+    writeln!(sink, "CREATE TABLE {quoted_table} (")?;
+    write!(
+        sink,
+        "{}",
+        profiles
             .iter()
             .zip(column_names.iter())
             .map(|(p, name)| {
@@ -51114,8 +51165,12 @@ fn render_sql_inline_csv(
             })
             .collect::<Vec<_>>()
             .join(",\n"),
-    );
-    sql.push_str("\n);\n\n");
+    )?;
+    // Deliberately just one trailing newline here, not a blank-line
+    // separator - see InlineCsvRowSink::flush_batch's own doc comment on
+    // separator_written for why the blank line before the first INSERT
+    // is written lazily instead, only once real row content follows.
+    writeln!(sink, "\n);")?;
 
     let mut sink = InlineCsvRowSink {
         resolved_skip_rows,
@@ -51127,7 +51182,8 @@ fn render_sql_inline_csv(
         record_index: 0,
         emitted: 0,
         batch: Vec::new(),
-        sql,
+        sink,
+        separator_written: false,
         done: false,
     };
 
@@ -51167,18 +51223,20 @@ fn render_sql_inline_csv(
         sink.accept(std::mem::take(&mut record))?;
     }
 
-    sink.flush_batch();
-    let mut sql = sink.sql;
-    sql.truncate(sql.trim_end_matches('\n').len());
-    sql.push('\n');
-    Ok(sql)
+    sink.flush_batch()
 }
 
 /// The dispatcher between `--sql-mode inline` (new default) and
 /// `--sql-mode staging` (the original, unchanged shape) - see the
 /// `Args::sql_mode` field's own doc comment for why this needs to know
 /// whether `--sql-mode` was actually given on the command line, not just
-/// its resolved value.
+/// its resolved value. Writes straight to `sink` rather than returning a
+/// `String` - the staging branch still builds `render_sql_staging`'s own
+/// small, row-count-independent `String` internally (that function is
+/// untouched; there's no genuine memory concern to fix there) and writes
+/// it to `sink` in one shot, while the inline branch hands `sink`
+/// straight to `render_sql_inline_csv`, which streams every row into it
+/// directly instead of ever materializing the whole script in memory.
 fn render_sql(
     file_name: &str,
     format: &InputFormat,
@@ -51186,12 +51244,10 @@ fn render_sql(
     read_path: &Path,
     resolved_skip_rows: usize,
     args: &Args,
-) -> Result<String> {
+    sink: &mut dyn std::io::Write,
+) -> Result<()> {
     let explicit = args.sql_mode.is_some();
-    let mode = match &args.sql_mode {
-        Some(s) => SqlMode::parse(s)?,
-        None => SqlMode::Inline,
-    };
+    let mode = resolved_sql_mode(args)?;
     let inline_supported = matches!(format, InputFormat::Csv | InputFormat::Tsv);
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
@@ -51205,11 +51261,15 @@ fn render_sql(
             "inline SQL mode isn't available yet for {} - using --sql-mode staging instead",
             format.as_str()
         );
-        return Ok(render_sql_staging(file_name, format, tables));
+        sink.write_all(render_sql_staging(file_name, format, tables).as_bytes())?;
+        return Ok(());
     }
 
     match mode {
-        SqlMode::Staging => Ok(render_sql_staging(file_name, format, tables)),
+        SqlMode::Staging => {
+            sink.write_all(render_sql_staging(file_name, format, tables).as_bytes())?;
+            Ok(())
+        }
         SqlMode::Inline => {
             let delim = if matches!(format, InputFormat::Tsv) {
                 '\t'
@@ -51231,6 +51291,7 @@ fn render_sql(
                 delim,
                 resolved_skip_rows,
                 args.nrows,
+                sink,
             )
         }
     }
@@ -57450,6 +57511,124 @@ impl SqlMode {
     }
 }
 
+/// Resolves `Args::sql_mode` to a real `SqlMode`, defaulting to `Inline`
+/// when the flag wasn't given at all - shared by `render_sql`'s own
+/// mode dispatch and `--load-into`'s validation in `run_single_file`, so
+/// the two can never disagree about what "no --sql-mode given" resolves
+/// to.
+fn resolved_sql_mode(args: &Args) -> Result<SqlMode> {
+    match &args.sql_mode {
+        Some(s) => SqlMode::parse(s),
+        None => Ok(SqlMode::Inline),
+    }
+}
+
+/// `--load-into <engine>:<target>` - which CLI tool to spawn and pipe the
+/// generated SQL into. Deliberately not a new Rust dependency: sniff-rs
+/// pipes into each engine's own already-installed client, the same way
+/// pg_dump/mysqldump-style output has always been consumed, rather than
+/// linking a database driver of its own (see CLAUDE.md's Dependency
+/// footprint section for why this project treats adding a *write*-
+/// capable runtime dependency as a real, deliberate decision, not a
+/// default reach).
+enum LoadEngine {
+    Sqlite,
+    DuckDb,
+    Postgres,
+    MySql,
+}
+
+impl LoadEngine {
+    /// The CLI binary this engine spawns - must already be installed and
+    /// on `PATH`; sniff-rs never bundles or installs one itself.
+    fn command_name(&self) -> &'static str {
+        match self {
+            LoadEngine::Sqlite => "sqlite3",
+            LoadEngine::DuckDb => "duckdb",
+            LoadEngine::Postgres => "psql",
+            LoadEngine::MySql => "mysql",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "sqlite" | "sqlite3" => Ok(LoadEngine::Sqlite),
+            "duckdb" => Ok(LoadEngine::DuckDb),
+            "postgres" | "postgresql" | "psql" => Ok(LoadEngine::Postgres),
+            "mysql" => Ok(LoadEngine::MySql),
+            other => bail!(
+                "--load-into: unrecognized engine '{other}' (expected sqlite, duckdb, postgres, or mysql)"
+            ),
+        }
+    }
+}
+
+/// A parsed `--load-into` value: which engine, and what to pass as that
+/// engine's own single positional connection argument (a file path for
+/// sqlite/duckdb, a database name or a full connection string for
+/// postgres/mysql).
+struct LoadTarget {
+    engine: LoadEngine,
+    target: String,
+}
+
+impl LoadTarget {
+    fn parse(s: &str) -> Result<Self> {
+        // A value already shaped like a URI ("postgresql://user@host/db")
+        // is detected via "://" and passed through to the target CLI
+        // *verbatim*, with the engine inferred from its own scheme -
+        // splitting naively on the first ':' would otherwise mangle a
+        // URI (cutting "postgresql://user@host/db" into engine
+        // "postgresql" and a broken target "//user@host/db" with the
+        // scheme itself lost). Anything else is the simpler
+        // "engine:target" form (sqlite:mydb.db, postgres:mydb).
+        if let Some(scheme_end) = s.find("://") {
+            let scheme = &s[..scheme_end];
+            let engine = LoadEngine::parse(scheme)?;
+            return Ok(LoadTarget {
+                engine,
+                target: s.to_string(),
+            });
+        }
+        let Some((engine_str, target)) = s.split_once(':') else {
+            bail!(
+                "--load-into '{s}' must be in the form <engine>:<target> (e.g. sqlite:mydb.db, postgres:mydb, mysql:mydb, duckdb:mydb.duckdb) or a full connection URI (e.g. postgresql://user@host/db)"
+            );
+        };
+        let engine = LoadEngine::parse(engine_str)?;
+        if target.is_empty() {
+            bail!(
+                "--load-into '{s}' is missing a target after the ':' (a file path for sqlite/duckdb, a database name or connection string for postgres/mysql)"
+            );
+        }
+        Ok(LoadTarget {
+            engine,
+            target: target.to_string(),
+        })
+    }
+}
+
+/// Spawns the target engine's own CLI with its stdin piped, so the
+/// generated SQL can be streamed straight into it - the same thing typing
+/// `sqlite3 mydb.db < script.sql` does by hand, just without the
+/// intermediate file. stdout/stderr are inherited so the tool's own
+/// prompts, row-count messages, and any real SQL errors show through
+/// directly and immediately, exactly as they would running it yourself.
+fn spawn_load_target(target: &LoadTarget) -> Result<std::process::Child> {
+    let cmd_name = target.engine.command_name();
+    std::process::Command::new(cmd_name)
+        .arg(&target.target)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch `{cmd_name}` for --load-into - is it installed and on PATH? sniff-rs pipes the generated SQL into its stdin rather than implementing a database driver of its own, so {cmd_name} itself has to already be available"
+            )
+        })
+}
+
 /// The output file's extension for a given `--output-format`, shared by
 /// both single-file default naming and directory-mode's own naming.
 fn default_ext(output_format: &OutputFormat) -> &'static str {
@@ -57573,34 +57752,29 @@ fn dispatch_reader(
     Ok((tables, resolved_skip_rows))
 }
 
-/// Renders the shared table shape into one of the four output formats -
-/// also shared between single-file and directory-batch mode. `read_path`/
-/// `args`/`resolved_skip_rows` are only ever used by `--output-format sql
-/// --sql-mode inline` (see `render_sql`), which needs to re-read the
-/// original file a second time now that final column types are known;
-/// every other output format ignores them entirely.
-#[allow(clippy::too_many_arguments)]
+/// Renders the shared table shape into one of the three `String`-
+/// returning output formats - also shared between single-file and
+/// directory-batch mode. `--output-format sql` is deliberately *not*
+/// handled here: `run_single_file`/`run_directory` call `render_sql`
+/// directly against a `Write` sink instead, since a SQL script's own
+/// size scales with row count (every literal `INSERT`), unlike a data
+/// dictionary's (always one entry per *column*) - see `render_sql_inline
+/// _csv`'s own doc comment for why that difference is exactly what
+/// motivated streaming it straight to its destination rather than ever
+/// building it as one `String` first.
 fn render_output(
     file_name: &str,
     format: InputFormat,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
     output_format: &OutputFormat,
-    read_path: &Path,
-    resolved_skip_rows: usize,
-    args: &Args,
 ) -> Result<String> {
     Ok(match output_format {
         OutputFormat::Markdown => render_markdown(file_name, &format, tables),
         OutputFormat::Json => render_json(file_name, &format, tables)?,
         OutputFormat::JsonSchema => render_json_schema(file_name, tables)?,
-        OutputFormat::Sql => render_sql(
-            file_name,
-            &format,
-            tables,
-            read_path,
-            resolved_skip_rows,
-            args,
-        )?,
+        OutputFormat::Sql => unreachable!(
+            "--output-format sql is handled directly by run_single_file/run_directory, never through render_output - see this function's own doc comment"
+        ),
     })
 }
 
@@ -57615,10 +57789,128 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// `--output-format sql`'s own destination logic for single-file mode:
+/// pipe into a `--load-into` target's own CLI, write to stdout, or write
+/// to a file - the one output format that streams straight to its
+/// destination as rows are produced instead of building a `String`
+/// first (see `render_output`'s own doc comment for why).
+#[allow(clippy::too_many_arguments)]
+fn run_sql_output(
+    args: &Args,
+    output_format: &OutputFormat,
+    file_name: &str,
+    format: InputFormat,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    read_path: &Path,
+    logical_path: &Path,
+    resolved_skip_rows: usize,
+    load_target: Option<&LoadTarget>,
+    table_count: usize,
+    col_count: usize,
+) -> Result<()> {
+    if let Some(target) = load_target {
+        let mut child = spawn_load_target(target)?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("stdin was requested as piped at spawn time");
+        render_sql(
+            file_name,
+            &format,
+            tables,
+            read_path,
+            resolved_skip_rows,
+            args,
+            &mut stdin,
+        )?;
+        // Close stdin so the child sees EOF and can finish processing
+        // before wait() below - otherwise it would sit blocked reading
+        // more input that's never coming. If render_sql itself errored
+        // above, this whole function already returned before reaching
+        // here; stdin still gets closed by Rust's own normal scope-exit
+        // drop either way, letting the child exit on its own (unwaited,
+        // but not left running - this process is about to exit too).
+        drop(stdin);
+        let status = child.wait().with_context(|| {
+            format!(
+                "failed waiting for {} to finish",
+                target.engine.command_name()
+            )
+        })?;
+        if !status.success() {
+            bail!(
+                "{} exited with a non-zero status while loading the data - see its own output above for the real error",
+                target.engine.command_name()
+            );
+        }
+        eprintln!(
+            "{table_count} tables, {col_count} columns -> loaded into {} via {}",
+            target.target,
+            target.engine.command_name()
+        );
+    } else if args.output_path.as_deref() == Some(Path::new("-")) {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        render_sql(
+            file_name,
+            &format,
+            tables,
+            read_path,
+            resolved_skip_rows,
+            args,
+            &mut lock,
+        )?;
+        eprintln!("{table_count} tables, {col_count} columns -> (stdout)");
+    } else {
+        let output_path = args
+            .output_path
+            .clone()
+            .unwrap_or_else(|| logical_path.with_extension(default_ext(output_format)));
+        let mut file = fs::File::create(&output_path)
+            .with_context(|| format!("failed to write {output_path:?}"))?;
+        render_sql(
+            file_name,
+            &format,
+            tables,
+            read_path,
+            resolved_skip_rows,
+            args,
+            &mut file,
+        )?;
+        eprintln!(
+            "{table_count} tables, {col_count} columns -> {}",
+            output_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if args.output_dir.is_some() {
         bail!("--output-dir only applies when the input path is a directory");
     }
+
+    // --load-into's own validation, before any real work (decompression,
+    // reading) even starts - every check here is answerable from args
+    // alone.
+    let load_target = if let Some(load_into) = &args.load_into {
+        if !matches!(output_format, OutputFormat::Sql) {
+            bail!("--load-into requires --output-format sql");
+        }
+        if matches!(resolved_sql_mode(args)?, SqlMode::Staging) {
+            bail!(
+                "--load-into requires --sql-mode inline (the default) - --sql-mode staging assumes a separate manual load step --load-into can't perform automatically, since it would create the tables with zero rows actually loaded"
+            );
+        }
+        if args.output_path.is_some() {
+            bail!(
+                "--load-into can't be combined with an output path - the generated SQL streams directly into the target engine's own stdin instead of a file"
+            );
+        }
+        Some(LoadTarget::parse(load_into)?)
+    } else {
+        None
+    };
 
     // data.csv.gz reads exactly like data.csv from here on: read_path points
     // at the real (decompressed) bytes every reader below opens, logical_path
@@ -57634,19 +57926,34 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         .to_string_lossy()
         .into_owned();
 
-    let (tables, resolved_skip_rows) = dispatch_reader(&read_path, &logical_path, format, args)?;
-    let rendered = render_output(
-        &file_name,
-        format,
-        &tables,
-        output_format,
-        &read_path,
-        resolved_skip_rows,
-        args,
-    )?;
+    if load_target.is_some() && !matches!(format, InputFormat::Csv | InputFormat::Tsv) {
+        bail!(
+            "--load-into isn't available yet for {} - only csv/tsv are supported so far",
+            format.as_str()
+        );
+    }
 
+    let (tables, resolved_skip_rows) = dispatch_reader(&read_path, &logical_path, format, args)?;
     let table_count = tables.len();
     let col_count: usize = tables.values().map(Vec::len).sum();
+
+    if matches!(output_format, OutputFormat::Sql) {
+        return run_sql_output(
+            args,
+            output_format,
+            &file_name,
+            format,
+            &tables,
+            &read_path,
+            &logical_path,
+            resolved_skip_rows,
+            load_target.as_ref(),
+            table_count,
+            col_count,
+        );
+    }
+
+    let rendered = render_output(&file_name, format, &tables, output_format)?;
 
     // '-' means "write to stdout" - and when it does, the status line goes to
     // stderr so stdout stays pure output a script or agent can pipe directly
@@ -58016,6 +58323,11 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             "--widths only applies to --format fixed-width, which is never auto-detected and so is unreachable in directory mode"
         );
     }
+    if args.load_into.is_some() {
+        bail!(
+            "--load-into is single-file mode only - loading many files' worth of tables into one target sequentially is a different, unscoped feature; run it on a single file instead"
+        );
+    }
 
     let mut files = Vec::new();
     collect_files_sorted(dir, &mut files)?;
@@ -58072,15 +58384,6 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let rendered = render_output(
-                &file_name,
-                format,
-                &tables,
-                output_format,
-                &read_path,
-                resolved_skip_rows,
-                args,
-            )?;
 
             let output_path = batch_output_path(
                 dir,
@@ -58093,8 +58396,28 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create directory {parent:?}"))?;
             }
-            fs::write(&output_path, &rendered)
-                .with_context(|| format!("failed to write {output_path:?}"))?;
+
+            // --output-format sql streams straight to the destination
+            // file (see render_output's own doc comment for why) rather
+            // than going through the String-returning render_output path
+            // every other format uses.
+            if matches!(output_format, OutputFormat::Sql) {
+                let mut out_file = fs::File::create(&output_path)
+                    .with_context(|| format!("failed to write {output_path:?}"))?;
+                render_sql(
+                    &file_name,
+                    &format,
+                    &tables,
+                    &read_path,
+                    resolved_skip_rows,
+                    args,
+                    &mut out_file,
+                )?;
+            } else {
+                let rendered = render_output(&file_name, format, &tables, output_format)?;
+                fs::write(&output_path, &rendered)
+                    .with_context(|| format!("failed to write {output_path:?}"))?;
+            }
 
             let table_count = tables.len();
             let col_count: usize = tables.values().map(Vec::len).sum();
@@ -65117,9 +65440,20 @@ mod tests {
         let csv_path = dir.join("people.csv");
         fs::write(&csv_path, "id,email\n1,a@example.com\n2,NA\n").unwrap();
 
-        let sql = render_sql_inline_csv("people.csv", "people", &profiles, &csv_path, ',', 0, None)
-            .unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        render_sql_inline_csv(
+            "people.csv",
+            "people",
+            &profiles,
+            &csv_path,
+            ',',
+            0,
+            None,
+            &mut buf,
+        )
+        .unwrap();
         fs::remove_dir_all(&dir).ok();
+        let sql = String::from_utf8(buf).unwrap();
 
         // The header comment itself mentions "--sql-mode staging" as an
         // alternative for large files, so check for the absence of an
@@ -65132,5 +65466,84 @@ mod tests {
         assert!(!sql.contains("\"email\" TEXT NOT NULL"));
         assert!(sql.contains("(1, 'a@example.com')"));
         assert!(sql.contains("(2, NULL)"));
+    }
+
+    #[test]
+    fn render_sql_inline_csv_never_writes_a_trailing_blank_line() {
+        // Regression test for the streaming-sink rewrite: the old
+        // String-returning version trimmed trailing newlines post-hoc
+        // (`sql.truncate(sql.trim_end_matches('\n')...)`), which can't
+        // work against a sink already written to - the fix has to never
+        // write the trailing blank line in the first place (see
+        // InlineCsvRowSink::separator_written's own doc comment).
+        let profiles = vec![ColumnProfile {
+            name: "id".to_string(),
+            current_type: "i64".to_string(),
+            ideal_type: "i64".to_string(),
+            description: String::new(),
+            missing_pct: 0.0,
+            sample_values: vec!["1".to_string()],
+            notes: String::new(),
+            row_count: 1,
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "sniff-rs-sql-inline-trailing-newline-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("t.csv");
+
+        // Zero data rows - flush_batch's own lazy separator must never
+        // fire, so the script ends right after "CREATE TABLE ... );".
+        fs::write(&csv_path, "id\n").unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        render_sql_inline_csv("t.csv", "t", &profiles, &csv_path, ',', 0, None, &mut buf).unwrap();
+        let sql = String::from_utf8(buf).unwrap();
+        assert!(sql.ends_with(");\n"));
+        assert!(!sql.ends_with(");\n\n"));
+
+        // One data row - the lazy separator fires exactly once, still no
+        // trailing blank line after the one INSERT statement.
+        fs::write(&csv_path, "id\n1\n").unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        render_sql_inline_csv("t.csv", "t", &profiles, &csv_path, ',', 0, None, &mut buf).unwrap();
+        let sql = String::from_utf8(buf).unwrap();
+        fs::remove_dir_all(&dir).ok();
+        assert!(sql.ends_with(";\n"));
+        assert!(!sql.ends_with(";\n\n"));
+        assert!(sql.contains(");\n\nINSERT INTO"));
+    }
+
+    #[test]
+    fn load_target_parse_accepts_the_engine_colon_target_form() {
+        let t = LoadTarget::parse("sqlite:mydb.db").unwrap();
+        assert!(matches!(t.engine, LoadEngine::Sqlite));
+        assert_eq!(t.target, "mydb.db");
+        assert_eq!(t.engine.command_name(), "sqlite3");
+
+        let t = LoadTarget::parse("postgres:mydb").unwrap();
+        assert!(matches!(t.engine, LoadEngine::Postgres));
+        assert_eq!(t.engine.command_name(), "psql");
+
+        let t = LoadTarget::parse("DuckDB:mydb.duckdb").unwrap();
+        assert!(matches!(t.engine, LoadEngine::DuckDb));
+    }
+
+    #[test]
+    fn load_target_parse_infers_the_engine_from_a_full_connection_uri() {
+        // A naive split on the first ':' would mangle this into engine
+        // "postgresql" and a broken target "//user@host/db" with the
+        // scheme itself lost - the whole URI must be detected and passed
+        // through verbatim instead.
+        let t = LoadTarget::parse("postgresql://user@host/db").unwrap();
+        assert!(matches!(t.engine, LoadEngine::Postgres));
+        assert_eq!(t.target, "postgresql://user@host/db");
+    }
+
+    #[test]
+    fn load_target_parse_rejects_a_missing_colon_an_empty_target_or_an_unknown_engine() {
+        assert!(LoadTarget::parse("bogus").is_err());
+        assert!(LoadTarget::parse("sqlite:").is_err());
+        assert!(LoadTarget::parse("oracle:mydb").is_err());
     }
 }

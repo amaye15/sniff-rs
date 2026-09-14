@@ -603,6 +603,119 @@ fn sql_output_rejects_an_unrecognized_sql_mode() {
 }
 
 #[test]
+fn load_into_requires_output_format_sql() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.csv").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+            "--load-into",
+            "sqlite:/tmp/whatever.db",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--load-into requires --output-format sql"));
+}
+
+#[test]
+fn load_into_rejects_sql_mode_staging() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.csv").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+            "--sql-mode",
+            "staging",
+            "--load-into",
+            "sqlite:/tmp/whatever.db",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--load-into requires --sql-mode inline"));
+}
+
+#[test]
+fn load_into_rejects_a_combined_output_path() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.csv").to_str().unwrap(),
+            "out.sql",
+            "--output-format",
+            "sql",
+            "--load-into",
+            "sqlite:/tmp/whatever.db",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--load-into can't be combined with an output path"));
+}
+
+#[test]
+fn load_into_rejects_an_unsupported_input_format() {
+    // No output-path positional at all - the way --load-into is actually
+    // meant to be used ("-" is itself an explicit output path, and is
+    // correctly rejected in combination with --load-into by a separate
+    // check, exercised by load_into_rejects_a_combined_output_path).
+    let output = Command::new(bin())
+        .args([
+            fixture("nested_typed.jsonl").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "sqlite:/tmp/whatever.db",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--load-into isn't available yet for json"));
+}
+
+#[test]
+fn load_into_rejects_a_malformed_target() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.csv").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+fn load_into_is_rejected_in_directory_mode() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("sample.csv")).unwrap();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "sqlite:/tmp/whatever.db",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--load-into is single-file mode only"));
+}
+
+#[test]
 fn sql_output_inline_mode_disambiguates_a_duplicate_csv_header_column() {
     // Regression test for a real bug found by piping generated inline
     // SQL into a real sqlite3 build: a genuinely duplicate CSV header
