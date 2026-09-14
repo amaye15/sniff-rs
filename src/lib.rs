@@ -11138,6 +11138,109 @@ mod spss_support {
     /// count, instead of a `Vec<Vec<Option<String>>>` held for every case,
     /// bypassing `ColumnInput`/`profile_column` entirely - the Tier 2 win
     /// CLAUDE.md's "Streaming reads / memory footprint" section describes.
+    /// Decodes one variable's own value out of one already-read row's
+    /// slots - factored out of `read_cases`'s own per-row loop so the
+    /// profiling reader and the `--sql-mode inline` second pass
+    /// (`stream_spss_rows_for_sql`) share the identical numeric/string/
+    /// very-long-string decode logic rather than risking two
+    /// independently-written copies drifting apart.
+    fn decode_case_value(
+        var: &VariableRecord,
+        row_slots: &[[u8; 8]],
+        dict: &Dictionary,
+    ) -> Result<Option<String>> {
+        Ok(match &var.var_type {
+            VarType::Numeric => {
+                let raw = row_slots
+                    .get(var.slot_index)
+                    .context("SPSS case data is missing a numeric variable's own slot")?;
+                let bits = u64::from_le_bytes(*raw);
+                let v = f64::from_bits(bits);
+                if bits == SYSMIS_BITS || var.missing_values.excludes_numeric(v) {
+                    None
+                } else {
+                    Some(format_numeric_value(var.format_type, v))
+                }
+            }
+            VarType::Str(width) => {
+                let mut buf = Vec::with_capacity(*width);
+                if var.n_segments <= 1 {
+                    let n_slots = width.div_ceil(8);
+                    for i in 0..n_slots {
+                        if let Some(s) = row_slots.get(var.slot_index + i) {
+                            buf.extend_from_slice(s);
+                        }
+                    }
+                } else {
+                    // Very long string: each segment stores up to 255
+                    // useful bytes in 32 slots (256 bytes) of data space;
+                    // truncating the whole buffer down to the running
+                    // useful-byte total after each segment strips that
+                    // segment's own trailing slot-alignment padding
+                    // before the next segment's bytes are appended -
+                    // verified against `ambers`'s own `push_string_from_
+                    // raw_slots`.
+                    let mut slot = var.slot_index;
+                    let mut remaining = *width;
+                    let mut cumulative = 0usize;
+                    for _ in 0..var.n_segments {
+                        let seg_useful = remaining.min(255);
+                        let n_slots = seg_useful.div_ceil(8);
+                        for i in 0..n_slots {
+                            if let Some(s) = row_slots.get(slot + i) {
+                                buf.extend_from_slice(s);
+                            }
+                        }
+                        cumulative += seg_useful;
+                        buf.truncate(cumulative);
+                        remaining = remaining.saturating_sub(255);
+                        slot += 32;
+                    }
+                }
+                buf.truncate(*width);
+                let raw8 = row_slots.get(var.slot_index).map(|s| s.as_slice());
+                let is_missing = raw8.is_some_and(|r| var.missing_values.excludes_string(r));
+                if is_missing {
+                    None
+                } else {
+                    let trimmed = trim_trailing_padding(&buf);
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            decode_text(dict.text_encoding, trimmed)
+                                .unwrap_or_else(|_| String::from_utf8_lossy(trimmed).into_owned()),
+                        )
+                    }
+                }
+            }
+        })
+    }
+
+    /// Reads one full row's worth of raw 8-byte slots off `source`, or
+    /// `Ok(None)` at a clean end of the case data (no partial row
+    /// pending). Factored out of `read_cases`'s own loop so the SQL
+    /// row-source can reuse the identical "how do I know a row boundary
+    /// versus a genuine mid-row truncation" logic.
+    fn read_row_slots<R: Read>(
+        source: &mut CaseSource<R>,
+        slots_per_row: usize,
+    ) -> Result<Option<Vec<[u8; 8]>>> {
+        let mut row_slots: Vec<[u8; 8]> = Vec::with_capacity(slots_per_row);
+        for _ in 0..slots_per_row {
+            match source.next_slot()? {
+                Some(bytes) => row_slots.push(bytes),
+                None => {
+                    if row_slots.is_empty() {
+                        return Ok(None);
+                    }
+                    bail!("SPSS case data ends mid-row");
+                }
+            }
+        }
+        Ok(Some(row_slots))
+    }
+
     fn read_cases<R: Read>(
         mut source: CaseSource<R>,
         dict: &Dictionary,
@@ -11151,92 +11254,16 @@ mod spss_support {
         let mut total = 0usize;
         let slots_per_row = dict.header.nominal_case_size;
 
-        'rows: loop {
+        loop {
             if nrows.is_some_and(|limit| total >= limit) {
                 break;
             }
-            let mut row_slots: Vec<[u8; 8]> = Vec::with_capacity(slots_per_row);
-            for _ in 0..slots_per_row {
-                match source.next_slot()? {
-                    Some(bytes) => row_slots.push(bytes),
-                    None => {
-                        if row_slots.is_empty() {
-                            break 'rows;
-                        }
-                        bail!("SPSS case data ends mid-row");
-                    }
-                }
-            }
+            let Some(row_slots) = read_row_slots(&mut source, slots_per_row)? else {
+                break;
+            };
 
             for (col_idx, var) in visible.iter().enumerate() {
-                let value = match &var.var_type {
-                    VarType::Numeric => {
-                        let raw = row_slots
-                            .get(var.slot_index)
-                            .context("SPSS case data is missing a numeric variable's own slot")?;
-                        let bits = u64::from_le_bytes(*raw);
-                        let v = f64::from_bits(bits);
-                        if bits == SYSMIS_BITS || var.missing_values.excludes_numeric(v) {
-                            None
-                        } else {
-                            Some(format_numeric_value(var.format_type, v))
-                        }
-                    }
-                    VarType::Str(width) => {
-                        let mut buf = Vec::with_capacity(*width);
-                        if var.n_segments <= 1 {
-                            let n_slots = width.div_ceil(8);
-                            for i in 0..n_slots {
-                                if let Some(s) = row_slots.get(var.slot_index + i) {
-                                    buf.extend_from_slice(s);
-                                }
-                            }
-                        } else {
-                            // Very long string: each segment stores up to
-                            // 255 useful bytes in 32 slots (256 bytes) of
-                            // data space; truncating the whole buffer down
-                            // to the running useful-byte total after each
-                            // segment strips that segment's own trailing
-                            // slot-alignment padding before the next
-                            // segment's bytes are appended - verified
-                            // against `ambers`'s own `push_string_from_
-                            // raw_slots`.
-                            let mut slot = var.slot_index;
-                            let mut remaining = *width;
-                            let mut cumulative = 0usize;
-                            for _ in 0..var.n_segments {
-                                let seg_useful = remaining.min(255);
-                                let n_slots = seg_useful.div_ceil(8);
-                                for i in 0..n_slots {
-                                    if let Some(s) = row_slots.get(slot + i) {
-                                        buf.extend_from_slice(s);
-                                    }
-                                }
-                                cumulative += seg_useful;
-                                buf.truncate(cumulative);
-                                remaining = remaining.saturating_sub(255);
-                                slot += 32;
-                            }
-                        }
-                        buf.truncate(*width);
-                        let raw8 = row_slots.get(var.slot_index).map(|s| s.as_slice());
-                        let is_missing =
-                            raw8.is_some_and(|r| var.missing_values.excludes_string(r));
-                        if is_missing {
-                            None
-                        } else {
-                            let trimmed = trim_trailing_padding(&buf);
-                            if trimmed.is_empty() {
-                                None
-                            } else {
-                                Some(decode_text(dict.text_encoding, trimmed).unwrap_or_else(
-                                    |_| String::from_utf8_lossy(trimmed).into_owned(),
-                                ))
-                            }
-                        }
-                    }
-                };
-                if let Some(s) = value {
+                if let Some(s) = decode_case_value(var, &row_slots, dict)? {
                     col_states[col_idx].push(s, n_samples);
                 }
             }
@@ -11244,6 +11271,58 @@ mod spss_support {
         }
 
         Ok((col_states, total))
+    }
+
+    /// The SPSS row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass - reuses `read_dictionary`/`read_row_slots`/
+    /// `decode_case_value` directly, the same shared pieces `read_cases`
+    /// itself now builds on. Matches `read_cases`'s own real-I/O-bounding
+    /// `nrows` behavior (stops reading further rows once the limit is
+    /// reached, checked before each row) rather than dBase's "decode
+    /// always" convention - the same per-format check every prior row-
+    /// source in this tier has made. `.zsav` (zlib-compressed) files are
+    /// rejected the identical way profiling already rejects them. SPSS
+    /// has no header row and no `--skip-rows` concept, so
+    /// `sink.has_header` must already be `false`.
+    pub(crate) fn stream_spss_rows_for_sql(
+        path: &Path,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = std::fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = std::io::BufReader::new(file);
+        let dict = read_dictionary(&mut r)?;
+
+        if dict.header.compression == Compression::Zlib {
+            bail!(
+                "SPSS .zsav (zlib-compressed) files aren't supported by this reader yet - \
+                 rebuild the file as an uncompressed or default-compressed .sav"
+            );
+        }
+        let mut source = match dict.header.compression {
+            Compression::None => CaseSource::Raw(r),
+            Compression::Bytecode => {
+                CaseSource::Bytecode(BytecodeDecompressor::new(r, dict.header.bias))
+            }
+            Compression::Zlib => unreachable!("handled above"),
+        };
+
+        let visible: Vec<&VariableRecord> = dict.variables.iter().filter(|v| !v.is_ghost).collect();
+        let slots_per_row = dict.header.nominal_case_size;
+
+        loop {
+            if sink.done {
+                break;
+            }
+            let Some(row_slots) = read_row_slots(&mut source, slots_per_row)? else {
+                break;
+            };
+            let mut values: Vec<Option<String>> = Vec::with_capacity(visible.len());
+            for var in &visible {
+                values.push(decode_case_value(var, &row_slots, &dict)?);
+            }
+            sink.accept(values)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn columns_from_spss(
@@ -51598,6 +51677,7 @@ fn render_sql_inline_flat(
         InputFormat::Dbase => render_sql_inline_flat_dbase(read_path, &mut sink)?,
         InputFormat::Stata => render_sql_inline_flat_stata(read_path, &mut sink)?,
         InputFormat::Sas7bdat => render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?,
+        InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -51723,6 +51803,21 @@ fn render_sql_inline_flat_sas7bdat(
     )
 }
 
+/// The SPSS row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`spss` build.
+#[cfg(feature = "spss")]
+fn render_sql_inline_flat_spss(read_path: &Path, sink: &mut InlineRowSink<'_>) -> Result<()> {
+    spss_support::stream_spss_rows_for_sql(read_path, sink)
+}
+
+#[cfg(not(feature = "spss"))]
+fn render_sql_inline_flat_spss(_read_path: &Path, _sink: &mut InlineRowSink<'_>) -> Result<()> {
+    bail!(
+        "SPSS support isn't compiled in - rebuild with `cargo build --release --features spss` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -51833,9 +51928,9 @@ fn render_sql(
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier - see
     // `render_sql_inline_flat`'s own doc comment for the full list this
-    // is expected to grow into (SPSS, ORC, NumPy) one fully-verified
-    // format at a time, matching this project's own established
-    // multi-format-campaign practice.
+    // is expected to grow into (ORC, NumPy) one fully-verified format at
+    // a time, matching this project's own established multi-format-
+    // campaign practice.
     let inline_supported = matches!(
         format,
         InputFormat::Csv
@@ -51848,12 +51943,13 @@ fn render_sql(
             | InputFormat::Dbase
             | InputFormat::Stata
             | InputFormat::Sas7bdat
+            | InputFormat::Spss
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -58535,10 +58631,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Dbase
                 | InputFormat::Stata
                 | InputFormat::Sas7bdat
+                | InputFormat::Spss
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss are supported so far",
             format.as_str()
         );
     }

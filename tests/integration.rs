@@ -1038,6 +1038,69 @@ fn load_into_accepts_sas7bdat() {
 }
 
 #[test]
+#[cfg(feature = "spss")]
+fn sql_output_inline_mode_supports_spss() {
+    // Phase 6 of the "any format" rollout: a fourth declared-type binary
+    // format, and the one whose own reader already needed a real
+    // "decode one variable's value out of a row's slots" extraction to
+    // share between the accumulator loop and the new SQL row-source.
+    let sql = run_sql("type_detection.sav", &[]);
+    assert!(!sql.contains("CREATE TABLE \"type_detection_staging\""));
+    assert!(sql.contains("CREATE TABLE \"type_detection\""));
+    assert!(sql.contains("INSERT INTO \"type_detection\""));
+    // A real UUID value from the fixture appears verbatim.
+    assert!(sql.contains("'550e8400-e29b-41d4-a716-446655440000'"));
+    // The native SPSS date variable renders as a real ISO date string,
+    // not the raw numeric offset SPSS stores it as.
+    assert!(sql.contains("'2024-01-15'"));
+}
+
+#[test]
+#[cfg(feature = "spss")]
+fn sql_output_inline_mode_spss_handles_bytecode_compression_and_long_strings() {
+    // Real fixture coverage for the two format-specific wrinkles this
+    // row-source's shared decode helper has to get right: SPSS's own
+    // "bytecode" RLE compression, and a "very long string" reconstructed
+    // across multiple 32-slot segments.
+    let compressed = run_sql("edge_spss_bytecode_compressed.sav", &[]);
+    assert!(compressed.contains("'red'"));
+
+    let long_string = run_sql("edge_spss_very_long_string.sav", &[]);
+    // The reconstructed 300-byte value (spanning multiple 32-slot
+    // segments) round-trips as one unbroken quoted literal, not
+    // truncated at a segment boundary.
+    assert!(long_string.contains(&"A".repeat(300)));
+}
+
+#[test]
+#[cfg(feature = "spss")]
+fn sql_output_inline_mode_spss_respects_nrows() {
+    let sql = run_sql("type_detection.sav", &["--nrows", "2"]);
+    assert!(sql.contains("(1, "));
+    assert!(sql.contains("(2, "));
+    assert!(!sql.contains("(3, "));
+}
+
+#[test]
+#[cfg(feature = "spss")]
+fn load_into_accepts_spss() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.sav").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for spss"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

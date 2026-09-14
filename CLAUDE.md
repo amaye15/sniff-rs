@@ -318,8 +318,8 @@ shape, kept for large files - see below). `staging` mode already works
 for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers CSV, TSV, fixed-width
 text, Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
-and SAS7BDAT so far - every other format transparently falls back to
-`staging` with a disclosed stderr note (`--sql-mode inline` given
+SAS7BDAT, and SPSS so far - every other format transparently falls back
+to `staging` with a disclosed stderr note (`--sql-mode inline` given
 *explicitly* on an unsupported format is a hard error instead, naming the
 gap - downgrading what was explicitly asked for would be the wrong kind
 of quiet).
@@ -333,12 +333,12 @@ into three structurally different shapes for this purpose, and each
 needs its own real design, not just repeating the same pattern:
 
 1. **The rest of the flat, fixed-column, one-row-per-record tier**
-   (SPSS, ORC, NumPy) - CSV/TSV/fixed-width, Common/Combined Log Format,
-   syslog (RFC 3164/5424), dBase, Stata, and, as of Phase 5, SAS7BDAT all
+   (ORC, NumPy) - CSV/TSV/fixed-width, Common/Combined Log Format, syslog
+   (RFC 3164/5424), dBase, Stata, SAS7BDAT, and, as of Phase 6, SPSS all
    already prove the shape (`InlineRowSink`/`ColumnAccumulatorState`'s
-   own generalized `accept`), including three genuine binary re-parses
-   for declared-type formats now that dBase/Stata/SAS7BDAT are all done -
-   but each of the three remaining formats still needs its own real
+   own generalized `accept`), including four genuine binary re-parses
+   for declared-type formats now that dBase/Stata/SAS7BDAT/SPSS are all
+   done - but each of the two remaining formats still needs its own real
    "read one row a second time" plumbing and its own end-to-end
    verification against a real engine before being trusted.
 2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
@@ -786,6 +786,42 @@ pure extraction, not a behavior change, for every already-shipped format:
 pre-Phase-5 binary. Clean across default/`sas7bdat`/`full`, matching each
 one's own established baseline exactly - the three new SAS7BDAT-specific
 tests are `#[cfg(feature = "sas7bdat")]`-gated.
+
+**Phase 6: SPSS.** `read_cases`'s own per-variable value decode (numeric/
+string, including the multi-segment "very long string" reconstruction)
+was extracted into a shared `decode_case_value`, and its own "read one
+row's worth of raw 8-byte slots, or a clean end-of-data" logic into a
+shared `read_row_slots` - both reused directly by the new `stream_spss_
+rows_for_sql`, the same "share the decode logic, don't duplicate it"
+approach dBase/Stata/SAS7BDAT's own extractions already established.
+Unlike SAS7BDAT's `collect_rows` (which already took the SQL row-source's
+future needs as a plain byte-slice callback), `read_cases` builds its own
+`Vec<ColumnAccumulatorState>` inline, so this phase needed a real, if
+small, decomposition rather than reusing an existing callback outright.
+The new row-source matches `read_cases`'s own real-I/O-bounding `nrows`
+behavior (checked before each row is read) the same way Stata's and
+SAS7BDAT's own row-sources already do, and rejects a `.zsav` (zlib-
+compressed) file with the identical disclosed error the profiling reader
+already gives - defensively duplicated rather than actually reachable via
+the CLI, since Pass 1 always rejects a `.zsav` file before Pass 2 is ever
+called for it.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `type_detection.sav --output-format sql --load-into sqlite:...`,
+confirming a real UUID value and the native SPSS date variable (stored on
+disk as a plain numeric offset, resolved through `format_numeric_value`
+into a real ISO date string) both survived intact; separately,
+`edge_spss_bytecode_compressed.sav` (SPSS's own "bytecode" RLE
+compression) and `edge_spss_very_long_string.sav` (a 300-byte value
+reconstructed across multiple 32-slot segments, round-tripping as one
+unbroken quoted literal rather than truncating at a segment boundary)
+both loaded and queried back correctly; `--nrows 2` confirmed to emit
+only the first two rows. Also verified as a pure extraction, not a
+behavior change, for every already-shipped format: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-6 binary. Clean
+across default/`spss`/`full`, matching each one's own established
+baseline exactly - the four new SPSS-specific tests are `#[cfg(feature =
+"spss")]`-gated.
 
 ## Directory-input batch mode
 
