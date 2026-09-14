@@ -1101,6 +1101,95 @@ fn load_into_accepts_spss() {
 }
 
 #[test]
+#[cfg(feature = "orc")]
+fn sql_output_inline_mode_supports_orc() {
+    // Phase 7 of the "any format" rollout: a fifth declared-type binary
+    // format - and, unlike every prior format in this tier, ORC's own
+    // storage is genuinely columnar (per-stripe, one column at a time),
+    // so its row-source has to transpose decoded columns back into rows
+    // rather than just reading a row's bytes directly.
+    let sql = run_sql("type_detection.orc", &[]);
+    assert!(!sql.contains("CREATE TABLE \"type_detection_staging\""));
+    assert!(sql.contains("CREATE TABLE \"type_detection\""));
+    assert!(sql.contains("INSERT INTO \"type_detection\""));
+    assert!(sql.contains("'550e8400-e29b-41d4-a716-446655440000'"));
+}
+
+#[test]
+#[cfg(feature = "orc")]
+fn sql_output_inline_mode_orc_handles_every_compression_codec_and_missing_values() {
+    for f in [
+        "edge_orc_compression_none",
+        "edge_orc_compression_zlib",
+        "edge_orc_compression_snappy",
+        "edge_orc_compression_lz4",
+        "edge_orc_compression_zstd",
+    ] {
+        let sql = run_sql(&format!("{f}.orc"), &[]);
+        assert!(
+            sql.contains("'row-0-padding-padding-padding'"),
+            "codec fixture {f} didn't decode correctly: {sql}"
+        );
+    }
+    // A genuinely missing value (this fixture's own "name" field on one
+    // row) lands as a bare NULL, positionally correct - not shifted into
+    // the wrong row or column by the columnar-to-row transpose.
+    let missing = run_sql("edge_orc_missing_values.orc", &[]);
+    assert!(missing.contains(", NULL)") || missing.contains(", NULL,"));
+}
+
+#[test]
+#[cfg(feature = "orc")]
+fn sql_output_inline_mode_orc_rejects_a_file_with_a_nested_column() {
+    // A Struct/List/Map/Union column has no scalar value to embed as a
+    // literal at all (it's a disclosed placeholder in every other output
+    // format) - a clear, actionable error naming the column, not a
+    // guess, not a silently-wrong NULL that would violate that column's
+    // own NOT NULL constraint.
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_orc_edge_cases.orc").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for ORC column"));
+    assert!(stderr.contains("tags"));
+}
+
+#[test]
+#[cfg(feature = "orc")]
+fn sql_output_inline_mode_orc_respects_nrows() {
+    let sql = run_sql("type_detection.orc", &["--nrows", "2"]);
+    assert!(sql.contains("(1, "));
+    assert!(sql.contains("(2, "));
+    assert!(!sql.contains("(3, "));
+}
+
+#[test]
+#[cfg(feature = "orc")]
+fn load_into_accepts_orc() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.orc").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for orc"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

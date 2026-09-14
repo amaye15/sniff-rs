@@ -13098,11 +13098,26 @@ mod orc_support {
     /// or adversarial file's claimed section sizes.
     const MAX_SECTION_LEN: u64 = 1024 * 1024 * 1024;
 
-    pub(crate) fn columns_from_orc(
-        path: &Path,
-        nrows: Option<usize>,
-        n_samples: usize,
-    ) -> Result<Vec<ColumnProfile>> {
+    struct TopLevelColumn {
+        name: String,
+        column_id: u32,
+        kind: OrcTypeKind,
+        precision: Option<u32>,
+        scale: Option<u32>,
+    }
+
+    /// `(file, postscript, footer, top_level_columns)` - named here
+    /// purely to keep `open_orc_for_records`'s signature readable
+    /// (`clippy::type_complexity`).
+    type OrcRecordSource = (std::fs::File, PostScript, OrcFooter, Vec<TopLevelColumn>);
+
+    /// Reads the header, postscript, and footer, and resolves the root
+    /// struct's own top-level column list - everything `columns_from_orc`
+    /// and the `--sql-mode inline` second pass (`stream_orc_rows_for_sql`)
+    /// both need identically before either one starts walking stripes.
+    /// Factored out so neither can drift from the other on this setup
+    /// logic.
+    fn open_orc_for_records(path: &Path) -> Result<OrcRecordSource> {
         let mut file =
             std::fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
         let file_len = file
@@ -13169,13 +13184,6 @@ mod orc_support {
             );
         }
 
-        struct TopLevelColumn {
-            name: String,
-            column_id: u32,
-            kind: OrcTypeKind,
-            precision: Option<u32>,
-            scale: Option<u32>,
-        }
         let mut top_level: Vec<TopLevelColumn> = Vec::with_capacity(root.subtypes.len());
         for (i, &column_id) in root.subtypes.iter().enumerate() {
             let name = root
@@ -13195,6 +13203,16 @@ mod orc_support {
                 scale: ty.scale,
             });
         }
+
+        Ok((file, postscript, footer, top_level))
+    }
+
+    pub(crate) fn columns_from_orc(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let (mut file, postscript, footer, top_level) = open_orc_for_records(path)?;
 
         // One incremental type-detection accumulator per top-level column,
         // fed value-by-value stripe by stripe rather than collecting a
@@ -13382,6 +13400,145 @@ mod orc_support {
             ));
         }
         Ok(out)
+    }
+
+    /// The ORC row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass, sharing `open_orc_for_records` with
+    /// `columns_from_orc` above and reusing `read_scalar_column` directly,
+    /// with no new decode logic at all - just a different destination for
+    /// the decoded values.
+    ///
+    /// One real, disclosed scope boundary this function has that no
+    /// other row-source in this tier needs: a Struct/List/Map/Union or
+    /// unrecognized top-level column has no real data to emit at all (it
+    /// profiles as a disclosed placeholder - see `columns_from_orc`'s own
+    /// `placeholder_notes` handling above), so a file containing one
+    /// can't honestly be rendered as literal `INSERT` rows the way every
+    /// other column in this tier's own formats can. Checked once, up
+    /// front, before any stripe is touched, with a clear, actionable
+    /// error naming the column - not a guess, and not a silent `NULL`
+    /// that would either violate that column's own `NOT NULL` constraint
+    /// (a placeholder column's `missing_pct` is unconditionally `0.0`)
+    /// or corrupt the row shape.
+    ///
+    /// `--nrows` matches `columns_from_orc`'s own real-I/O-bounding
+    /// behavior (checked before each stripe is read from disk, the same
+    /// "one stripe is the streaming floor" shape the Architecture
+    /// section's own ORC entry already documents) rather than dBase's
+    /// "decode always" convention. ORC has no header row and no
+    /// `--skip-rows` concept, so `sink.has_header` must already be
+    /// `false`.
+    pub(crate) fn stream_orc_rows_for_sql(
+        path: &Path,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let (mut file, postscript, footer, top_level) = open_orc_for_records(path)?;
+
+        if let Some(bad) = top_level
+            .iter()
+            .find(|c| c.kind.is_compound() || matches!(c.kind, OrcTypeKind::Other(_)))
+        {
+            bail!(
+                "--sql-mode inline can't emit real data for ORC column \"{}\" ({:?}) - it has no \
+                 scalar value to embed as a literal (see this column's own disclosed placeholder \
+                 note in --output-format json); use --sql-mode staging instead",
+                bad.name,
+                bad.kind
+            );
+        }
+
+        let wanted_column_ids: HashSet<u32, FxBuildHasher> =
+            top_level.iter().map(|c| c.column_id).collect();
+        let mut row_count: usize = 0;
+
+        'stripes: for stripe_info in &footer.stripes {
+            if sink.done || nrows.is_some_and(|limit| row_count >= limit) {
+                break;
+            }
+            if stripe_info.footer_length > MAX_SECTION_LEN {
+                bail!("ORC stripe declares an implausible footer length");
+            }
+            let footer_offset =
+                stripe_info.offset + stripe_info.index_length + stripe_info.data_length;
+            file.seek(SeekFrom::Start(footer_offset))
+                .context("failed to seek to ORC stripe footer")?;
+            let mut stripe_footer_compressed = vec![0u8; stripe_info.footer_length as usize];
+            file.read_exact(&mut stripe_footer_compressed)
+                .context("failed to read ORC stripe footer")?;
+            let stripe_footer_bytes =
+                decompress_orc_bytes(postscript.compression, &stripe_footer_compressed)?;
+            let stripe_footer = parse_stripe_footer(&stripe_footer_bytes)?;
+
+            let mut stream_offset = stripe_info.offset;
+            let mut raw_streams: HashMap<(u32, OrcStreamKind), Vec<u8>> = HashMap::new();
+            for stream in &stripe_footer.streams {
+                if stream.length > MAX_SECTION_LEN {
+                    bail!("ORC stripe declares an implausible stream length");
+                }
+                let wanted = wanted_column_ids.contains(&stream.column)
+                    && !stream.kind.eq(&OrcStreamKind::Other);
+                if wanted {
+                    file.seek(SeekFrom::Start(stream_offset))
+                        .context("failed to seek to ORC stream")?;
+                    let mut raw = vec![0u8; stream.length as usize];
+                    file.read_exact(&mut raw)
+                        .context("failed to read ORC stream")?;
+                    let decompressed = decompress_orc_bytes(postscript.compression, &raw)?;
+                    raw_streams.insert((stream.column, stream.kind), decompressed);
+                }
+                stream_offset += stream.length;
+            }
+
+            let num_rows = stripe_info.number_of_rows as usize;
+            let mut column_iters: Vec<std::vec::IntoIter<Option<String>>> =
+                Vec::with_capacity(top_level.len());
+            for col in &top_level {
+                let encoding = stripe_footer
+                    .columns
+                    .get(col.column_id as usize)
+                    .context("ORC stripe footer is missing a column encoding entry")?;
+                let streams = ColumnStreams {
+                    present: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Present))
+                        .map(Vec::as_slice),
+                    data: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Data))
+                        .map(Vec::as_slice),
+                    length: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Length))
+                        .map(Vec::as_slice),
+                    secondary: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::Secondary))
+                        .map(Vec::as_slice),
+                    dictionary_data: raw_streams
+                        .get(&(col.column_id, OrcStreamKind::DictionaryData))
+                        .map(Vec::as_slice),
+                };
+                let values = read_scalar_column(
+                    col.kind,
+                    encoding,
+                    &streams,
+                    num_rows,
+                    col.precision,
+                    col.scale,
+                )?;
+                column_iters.push(values.into_iter());
+            }
+
+            for _ in 0..num_rows {
+                if sink.done {
+                    break 'stripes;
+                }
+                let row: Vec<Option<String>> = column_iters
+                    .iter_mut()
+                    .map(|it| it.next().flatten())
+                    .collect();
+                sink.accept(row)?;
+            }
+            row_count += num_rows;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -51678,6 +51835,7 @@ fn render_sql_inline_flat(
         InputFormat::Stata => render_sql_inline_flat_stata(read_path, &mut sink)?,
         InputFormat::Sas7bdat => render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?,
         InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
+        InputFormat::Orc => render_sql_inline_flat_orc(read_path, args.nrows, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -51818,6 +51976,31 @@ fn render_sql_inline_flat_spss(_read_path: &Path, _sink: &mut InlineRowSink<'_>)
     )
 }
 
+/// The ORC row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`orc` build. Like SAS7BDAT,
+/// this also threads `nrows` straight through (see `stream_orc_rows_for_
+/// sql`'s own doc comment for why).
+#[cfg(feature = "orc")]
+fn render_sql_inline_flat_orc(
+    read_path: &Path,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    orc_support::stream_orc_rows_for_sql(read_path, nrows, sink)
+}
+
+#[cfg(not(feature = "orc"))]
+fn render_sql_inline_flat_orc(
+    _read_path: &Path,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "ORC support isn't compiled in - rebuild with `cargo build --release --features orc` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -51928,8 +52111,8 @@ fn render_sql(
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier - see
     // `render_sql_inline_flat`'s own doc comment for the full list this
-    // is expected to grow into (ORC, NumPy) one fully-verified format at
-    // a time, matching this project's own established multi-format-
+    // is expected to grow into (NumPy) one fully-verified format at a
+    // time, matching this project's own established multi-format-
     // campaign practice.
     let inline_supported = matches!(
         format,
@@ -51944,12 +52127,13 @@ fn render_sql(
             | InputFormat::Stata
             | InputFormat::Sas7bdat
             | InputFormat::Spss
+            | InputFormat::Orc
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -58632,10 +58816,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Stata
                 | InputFormat::Sas7bdat
                 | InputFormat::Spss
+                | InputFormat::Orc
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc are supported so far",
             format.as_str()
         );
     }

@@ -318,8 +318,8 @@ shape, kept for large files - see below). `staging` mode already works
 for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers CSV, TSV, fixed-width
 text, Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
-SAS7BDAT, and SPSS so far - every other format transparently falls back
-to `staging` with a disclosed stderr note (`--sql-mode inline` given
+SAS7BDAT, SPSS, and ORC so far - every other format transparently falls
+back to `staging` with a disclosed stderr note (`--sql-mode inline` given
 *explicitly* on an unsupported format is a hard error instead, naming the
 gap - downgrading what was explicitly asked for would be the wrong kind
 of quiet).
@@ -333,14 +333,15 @@ into three structurally different shapes for this purpose, and each
 needs its own real design, not just repeating the same pattern:
 
 1. **The rest of the flat, fixed-column, one-row-per-record tier**
-   (ORC, NumPy) - CSV/TSV/fixed-width, Common/Combined Log Format, syslog
-   (RFC 3164/5424), dBase, Stata, SAS7BDAT, and, as of Phase 6, SPSS all
-   already prove the shape (`InlineRowSink`/`ColumnAccumulatorState`'s
-   own generalized `accept`), including four genuine binary re-parses
-   for declared-type formats now that dBase/Stata/SAS7BDAT/SPSS are all
-   done - but each of the two remaining formats still needs its own real
-   "read one row a second time" plumbing and its own end-to-end
-   verification against a real engine before being trusted.
+   (NumPy is all that's left) - CSV/TSV/fixed-width, Common/Combined Log
+   Format, syslog (RFC 3164/5424), dBase, Stata, SAS7BDAT, SPSS, and, as
+   of Phase 7, ORC all already prove the shape (`InlineRowSink`/
+   `ColumnAccumulatorState`'s own generalized `accept`), including five
+   genuine binary re-parses for declared-type formats and, for ORC
+   specifically, the tier's first columnar-to-row transpose - but NumPy
+   still needs its own real "read one row a second time" plumbing and
+   its own end-to-end verification against a real engine before being
+   trusted.
 2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
    `dispatch_reader` already returns `Vec<(String, Vec<ColumnProfile>)>`
    for these; `render_sql`'s inline branch currently assumes exactly one
@@ -822,6 +823,64 @@ byte-identical inline SQL output against the pre-Phase-6 binary. Clean
 across default/`spss`/`full`, matching each one's own established
 baseline exactly - the four new SPSS-specific tests are `#[cfg(feature =
 "spss")]`-gated.
+
+**Phase 7: ORC - the first genuinely columnar format in this tier**, and
+the one that needed a real new piece of logic none of the prior five
+formats did: every other row-source so far reads one record's bytes
+directly off disk, but ORC's own on-disk layout decodes a whole stripe
+*one column at a time* (`read_scalar_column` returns a `Vec<Option<
+String>>` covering every row of that stripe for a single column - see
+the Architecture section's own ORC entry), so producing a single row's
+`Vec<Option<String>>` means transposing several already-decoded columns
+back into rows. `stream_orc_rows_for_sql` decodes every top-level
+column's stripe-wide values into its own `std::vec::IntoIter`, then walks
+`0..num_rows` pulling one value from each column's iterator per row
+(`it.next().flatten()` - `Option<Option<String>>` flattened to
+`Option<String>`, so a column that somehow underflows the row count
+degrades to a missing value rather than panicking). The shared setup
+(`open_orc_for_records`, hoisting the previously function-local
+`TopLevelColumn` struct to module scope) is extracted the same way as
+every prior format's own `open_<format>_for_records`.
+
+This phase also surfaced a genuine design question none of the other
+five formats had: an ORC file can have a top-level Struct/List/Map/Union
+column (or an unrecognized type), which profiles as a disclosed
+placeholder with no real values at all (see `columns_from_orc`'s own
+`placeholder_notes` handling) - there is no honest literal to embed for
+such a column, and staying silent with a bare `NULL` would either
+corrupt the row shape or violate that column's own `NOT NULL` constraint
+(a placeholder column's `missing_pct` is unconditionally `0.0`). Rather
+than a per-*format* gate (ORC files without any nested column are
+perfectly renderable), this is a per-*file* check inside `stream_orc_
+rows_for_sql` itself, run once before any stripe is touched: a file with
+such a column gets a clear, actionable error naming the offending column
+and its ORC type, pointing at `--sql-mode staging` instead - the same
+"confident common case, disclosed gap" boundary this project draws
+everywhere else (compare `GEOMETRYCOLLECTION`'s own exclusion from the
+WKT check, or LZO's own permanently-declined status). `--nrows` matches
+`columns_from_orc`'s own real-I/O-bounding behavior (checked before each
+stripe, the same "one stripe is the streaming floor" shape already
+documented) rather than dBase's "decode always" convention.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `type_detection.orc --output-format sql --load-into sqlite:...`
+confirmed every row and the native ORC date column intact; every one of
+the five real compression codecs (none/ZLIB/Snappy/LZ4/Zstd) confirmed to
+decode identically through the new row-source; `edge_orc_missing_values
+.orc` confirmed a genuinely missing value lands as a positionally-correct
+`NULL` (not shifted into the wrong row/column by the columnar-to-row
+transpose); `edge_orc_edge_cases.orc` (a real Struct/List pair of
+columns) confirmed to produce the disclosed "can't emit real data for ORC
+column" error naming the actual offending column; `--nrows 2` confirmed
+to emit only the first two rows. Also verified as a pure extraction, not
+a behavior change, for every already-shipped format: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-7 binary. Clean
+across default/`orc`/`full`, matching each one's own established baseline
+exactly - the five new ORC-specific tests are `#[cfg(feature = "orc")]`-
+gated.
+
+With Phase 7, every remaining format in the flat, fixed-column,
+one-row-per-record tier except NumPy is done.
 
 ## Directory-input batch mode
 
