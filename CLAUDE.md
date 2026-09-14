@@ -317,12 +317,12 @@ different shapes: `inline` (the default) and `staging` (the original
 shape, kept for large files - see below). `staging` mode already works
 for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers CSV, TSV, fixed-width
-text, Common/Combined Log Format, syslog (RFC 3164/5424), and dBase so
-far - every other format transparently falls back to `staging` with a
-disclosed stderr note (`--sql-mode inline` given
-*explicitly* on an unsupported format is a hard error instead, naming the
-gap - downgrading what was explicitly asked for would be the wrong kind
-of quiet).
+text, Common/Combined Log Format, syslog (RFC 3164/5424), dBase, and
+Stata so far - every other format transparently falls back to `staging`
+with a disclosed stderr note (`--sql-mode inline` given *explicitly* on
+an unsupported format is a hard error instead, naming the gap -
+downgrading what was explicitly asked for would be the wrong kind of
+quiet).
 
 Extending inline mode further is explicit, disclosed, staged future
 work, following this project's own "one format at a time, fully verified"
@@ -333,12 +333,12 @@ into three structurally different shapes for this purpose, and each
 needs its own real design, not just repeating the same pattern:
 
 1. **The rest of the flat, fixed-column, one-row-per-record tier**
-   (Stata, SAS7BDAT, SPSS, ORC, NumPy) - CSV/TSV/fixed-width, Common/
-   Combined Log Format, syslog (RFC 3164/5424), and, as of Phase 3,
-   dBase all already prove the shape (`InlineRowSink`/
-   `ColumnAccumulatorState`'s own generalized `accept`), including a
-   genuine binary re-parse for a declared-type format now that dBase is
-   done - but each of the five remaining formats still needs its own
+   (SAS7BDAT, SPSS, ORC, NumPy) - CSV/TSV/fixed-width, Common/Combined
+   Log Format, syslog (RFC 3164/5424), dBase, and, as of Phase 4, Stata
+   all already prove the shape (`InlineRowSink`/`ColumnAccumulatorState`'s
+   own generalized `accept`), including two genuine binary re-parses for
+   declared-type formats now that dBase and Stata are both done - but
+   each of the four remaining formats still needs its own
    real "read one row a second time" plumbing and its own end-to-end
    verification against a real engine before being trusted.
 2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
@@ -718,6 +718,38 @@ inline SQL output against the pre-Phase-3 binary. Clean across default/
 `dbase`/`full`, matching each one's own established baseline exactly -
 the two new dBase-specific tests are `#[cfg(feature = "dbase")]`-gated,
 matching the log formats' own precedent.
+
+**Phase 4: Stata.** Followed dBase's own shape (`open_stata_for_records`
+extracted out of `columns_from_stata` exactly the way `open_dbase_for_
+records` was, sharing the header/schema/characteristics/`<data>`-tag
+setup between the profiling reader and the new `stream_stata_rows_for_
+sql` second pass), but settled its own version of the "decode always vs.
+stop early" question the *opposite* way from dBase, and for a principled
+reason rather than a coin flip: `columns_from_stata`'s own profiling loop
+already checks `nrows` *before* reading each observation
+(`if nrows.is_some_and(...) { break; }`) - unlike dBase, which decodes
+every non-deleted record regardless of `nrows` to preserve consistent
+error-surfacing past the cutoff (see that reader's own Architecture-
+section entry for why). Since Stata's own profiling reader already
+doesn't have that property, there's nothing for the SQL row-source to
+preserve by decoding past the cutoff either - `stream_stata_rows_for_sql`
+checks `sink.done` before reading each row and breaks early, the same
+real-I/O-bounding convention CSV/fixed-width/the log formats already use.
+The general rule this establishes for the remaining formats in this
+tier: each new format's SQL row-source matches *that format's own*
+profiling reader's real nrows-handling behavior, not a single fixed
+convention applied uniformly regardless of what the format actually does.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.dta --output-format sql --load-into sqlite:...`, with the
+fixture's own Stata `.` missing marker on one row's `age` field
+confirmed to land as a genuine `NULL` when queried back out, not a
+fabricated `0`; `--nrows 1` confirmed to emit only the first row's own
+data. Also verified as a pure extraction, not a behavior change, for
+every already-shipped format: `diff` confirmed byte-identical inline SQL
+output against the pre-Phase-4 binary. Clean across default/`stata`/
+`full`, matching each one's own established baseline exactly - the three
+new Stata-specific tests are `#[cfg(feature = "stata")]`-gated.
 
 ## Directory-input batch mode
 

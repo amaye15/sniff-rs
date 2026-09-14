@@ -946,6 +946,52 @@ fn load_into_accepts_dbase() {
 }
 
 #[test]
+#[cfg(feature = "stata")]
+fn sql_output_inline_mode_supports_stata() {
+    // Phase 4 of the "any format" rollout: a second declared-type binary
+    // format, this time one whose own profiling reader already bounds
+    // real I/O via `nrows` (unlike dBase's own "decode always" choice) -
+    // proving the row-source correctly matches whichever real behavior
+    // its own format's profiling reader actually has.
+    let sql = run_sql("sample.dta", &[]);
+    assert!(!sql.contains("CREATE TABLE \"sample_staging\""));
+    assert!(sql.contains("CREATE TABLE \"sample\""));
+    assert!(sql.contains("INSERT INTO \"sample\""));
+    assert!(sql.contains("'U1001'"));
+    // The fixture's own Stata "." missing marker on one row's age field
+    // resolves to a bare NULL, not a fabricated 0.
+    assert!(sql.contains(", NULL,") || sql.contains(", NULL)"));
+}
+
+#[test]
+#[cfg(feature = "stata")]
+fn sql_output_inline_mode_stata_respects_nrows() {
+    let sql = run_sql("sample.dta", &["--nrows", "1"]);
+    assert!(sql.contains("'U1001'"));
+    assert!(!sql.contains("'U1002'"));
+    assert!(!sql.contains("'U1003'"));
+}
+
+#[test]
+#[cfg(feature = "stata")]
+fn load_into_accepts_stata() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.dta").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for stata"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

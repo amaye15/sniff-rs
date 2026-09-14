@@ -8492,11 +8492,19 @@ mod stata_support {
         })
     }
 
-    pub(crate) fn columns_from_stata(
-        path: &Path,
-        nrows: Option<usize>,
-        n_samples: usize,
-    ) -> Result<Vec<ColumnProfile>> {
+    /// `(reader, preamble, variable_types, variable_names, row_len, utf8)`,
+    /// named here purely to keep `open_stata_for_records`'s signature
+    /// readable (`clippy::type_complexity`).
+    type StataRecordSource = (R, Preamble, Vec<VariableType>, Vec<String>, usize, bool);
+
+    /// Reads everything before the first observation row - the header,
+    /// the variable schema, the characteristics section, and (for the
+    /// XML-tagged 117+ container) the `<data>` tag - leaving the returned
+    /// reader positioned to read observations one at a time. Shared by
+    /// `columns_from_stata` and the `--sql-mode inline` second pass
+    /// (`stream_stata_rows_for_sql`) so neither can drift from the other
+    /// on this setup logic.
+    fn open_stata_for_records(path: &Path) -> Result<StataRecordSource> {
         let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
         let mut r = R {
             inner: BufReader::new(file),
@@ -8520,6 +8528,17 @@ mod stata_support {
         }
 
         let utf8 = preamble.release.default_encoding_is_utf8();
+        Ok((r, preamble, variable_types, variable_names, row_len, utf8))
+    }
+
+    pub(crate) fn columns_from_stata(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let (mut r, preamble, variable_types, variable_names, row_len, utf8) =
+            open_stata_for_records(path)?;
+
         // One `ColumnAccumulatorState` per variable (the same shared,
         // bounded-footprint accumulator CSV/fixed-width/dBase already
         // use) instead of a `Vec<Option<String>>` held for every record,
@@ -8569,6 +8588,59 @@ mod stata_support {
             })
             .collect();
         Ok(columns)
+    }
+
+    /// The Stata row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass, sharing `open_stata_for_records` with
+    /// `columns_from_stata` above. Unlike dBase's own row-source (which
+    /// deliberately decodes every record regardless of `nrows` to match
+    /// that reader's own error-surfacing behavior), Stata's *profiling*
+    /// reader already stops reading further observations the moment
+    /// `nrows` is reached (`if nrows.is_some_and(...) { break; }`,
+    /// checked before each row is even read) - so this row-source
+    /// matches that same real-I/O-bounding convention instead, checking
+    /// `sink.done` before reading each row exactly like the CSV/fixed-
+    /// width/log-format row-sources already do. dBase has no such
+    /// early-exit in its own profiling loop (see that reader's own
+    /// entry in the design philosophy/Architecture sections for why),
+    /// which is *why* its own row-source needed the opposite choice -
+    /// each format's SQL row-source always matches its own profiling
+    /// reader's real behavior, not a single fixed convention applied
+    /// uniformly. Stata has no header row and no `--skip-rows` concept,
+    /// so `sink.has_header` must already be `false`.
+    pub(crate) fn stream_stata_rows_for_sql(
+        path: &Path,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let (mut r, preamble, variable_types, _variable_names, row_len, utf8) =
+            open_stata_for_records(path)?;
+
+        for _ in 0..preamble.observation_count {
+            if sink.done {
+                break;
+            }
+            let row_bytes = r
+                .read_exact_buf(row_len)
+                .with_context(|| format!("failed reading a record from {path:?}"))?;
+            let mut offset = 0;
+            let mut row: Vec<Option<String>> = Vec::with_capacity(variable_types.len());
+            for vt in &variable_types {
+                let width = vt.width();
+                let field_bytes = &row_bytes[offset..offset + width];
+                offset += width;
+                let value = decode_value(
+                    field_bytes,
+                    *vt,
+                    preamble.release,
+                    preamble.byte_order,
+                    utf8,
+                )
+                .with_context(|| format!("failed decoding a record from {path:?}"))?;
+                row.push(value);
+            }
+            sink.accept(row)?;
+        }
+        Ok(())
     }
 } // mod stata_support
 
@@ -51414,6 +51486,7 @@ fn render_sql_inline_flat(
         InputFormat::Syslog => render_sql_inline_flat_syslog(read_path, false, &mut sink)?,
         InputFormat::Syslog5424 => render_sql_inline_flat_syslog(read_path, true, &mut sink)?,
         InputFormat::Dbase => render_sql_inline_flat_dbase(read_path, &mut sink)?,
+        InputFormat::Stata => render_sql_inline_flat_stata(read_path, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -51494,6 +51567,21 @@ fn render_sql_inline_flat_dbase(read_path: &Path, sink: &mut InlineRowSink<'_>) 
 fn render_sql_inline_flat_dbase(_read_path: &Path, _sink: &mut InlineRowSink<'_>) -> Result<()> {
     bail!(
         "dBase support isn't compiled in - rebuild with `cargo build --release --features dbase` (or --features full)"
+    )
+}
+
+/// The Stata row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`stata` build.
+#[cfg(feature = "stata")]
+fn render_sql_inline_flat_stata(read_path: &Path, sink: &mut InlineRowSink<'_>) -> Result<()> {
+    stata_support::stream_stata_rows_for_sql(read_path, sink)
+}
+
+#[cfg(not(feature = "stata"))]
+fn render_sql_inline_flat_stata(_read_path: &Path, _sink: &mut InlineRowSink<'_>) -> Result<()> {
+    bail!(
+        "Stata support isn't compiled in - rebuild with `cargo build --release --features stata` (or --features full)"
     )
 }
 
@@ -51607,7 +51695,7 @@ fn render_sql(
     let mode = resolved_sql_mode(args)?;
     // The flat, fixed-column, one-row-per-record tier - see
     // `render_sql_inline_flat`'s own doc comment for the full list this
-    // is expected to grow into (Stata, SAS7BDAT, SPSS, ORC, NumPy) one
+    // is expected to grow into (SAS7BDAT, SPSS, ORC, NumPy) one
     // fully-verified format at a time, matching this project's own
     // established multi-format-campaign practice.
     let inline_supported = matches!(
@@ -51620,12 +51708,13 @@ fn render_sql(
             | InputFormat::Syslog
             | InputFormat::Syslog5424
             | InputFormat::Dbase
+            | InputFormat::Stata
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -58305,10 +58394,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Syslog
                 | InputFormat::Syslog5424
                 | InputFormat::Dbase
+                | InputFormat::Stata
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata are supported so far",
             format.as_str()
         );
     }
