@@ -50163,6 +50163,85 @@ mod sqlite_support {
         Ok(profiles)
     }
 
+    /// The SQLite row-source for `render_sql_inline_flat`'s `--sql-mode
+    /// inline` second pass, one table at a time - reuses `read_schema`/
+    /// `parse_create_table`/`collect_table_rows`/`apply_affinity`/
+    /// `value_to_string` directly, the same pieces `profile_table` itself
+    /// already builds on, just folding each decoded row into `sink.accept`
+    /// instead of a per-column accumulator. `value_to_string` still wants
+    /// a `&mut SqlKindCounts` to tally into - a throwaway scratch
+    /// accumulator that's never read back, since this row-source only
+    /// needs each value's own string form, not a `current_type` summary.
+    ///
+    /// A `WITHOUT ROWID` table gets the identical disclosed error
+    /// `profile_table` already gives (checked the same way, before
+    /// `collect_table_rows` is ever called) rather than a guess - the
+    /// same "no honest literal to emit" boundary ORC's own compound-
+    /// column check already draws for a different reason. `collect_
+    /// table_rows` already bounds real page reads via its own `limit`
+    /// parameter (the same real-I/O-bounding shape Stata/SAS7BDAT/SPSS's
+    /// own row-sources already have), so `nrows` threads straight
+    /// through unchanged. SQLite has no header row and no `--skip-rows`
+    /// concept, so `sink.has_header` must already be `false`.
+    pub(crate) fn stream_sqlite_table_rows_for_sql(
+        path: &Path,
+        table_name: &str,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        check_no_pending_wal(path)?;
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut header_buf = [0u8; 100];
+        file.read_exact(&mut header_buf)
+            .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+        let header = read_header(&header_buf, path)?;
+
+        let entries = read_schema(&mut file, &header, path)?;
+        let entry = entries
+            .iter()
+            .find(|e| e.name == table_name)
+            .with_context(|| format!("table '{table_name}' not found in {path:?}"))?;
+
+        let parsed = parse_create_table(&entry.sql)?;
+        if parsed.without_rowid {
+            bail!(
+                "--sql-mode inline can't emit real data for SQLite table \"{table_name}\" - it \
+                 uses WITHOUT ROWID storage, which isn't supported; use --sql-mode staging instead"
+            );
+        }
+
+        let n_cols = parsed.columns.len();
+        let mut dummy_counts = SqlKindCounts::default();
+        let mut count = 0usize;
+        let mut on_row = |rowid: i64, payload: Vec<u8>| -> Result<()> {
+            let values = decode_record(&payload)?;
+            let mut row: Vec<Option<String>> = Vec::with_capacity(n_cols);
+            for i in 0..n_cols {
+                let value = values.get(i).cloned().unwrap_or(Value::Null);
+                let value = if Some(i) == parsed.rowid_alias_index && matches!(value, Value::Null) {
+                    Value::Integer(rowid)
+                } else {
+                    value
+                };
+                let value = apply_affinity(value, parsed.real_affinity[i]);
+                row.push(value_to_string(&value, &mut dummy_counts));
+            }
+            sink.accept(row)
+        };
+        collect_table_rows(
+            &mut file,
+            entry.rootpage,
+            header.page_size,
+            header.usable_size,
+            path,
+            0,
+            nrows,
+            &mut count,
+            &mut on_row,
+        )
+        .with_context(|| format!("failed reading rows for table '{table_name}'"))
+    }
+
     pub(crate) fn columns_from_sqlite(
         path: &Path,
         nrows: Option<usize>,
@@ -51675,6 +51754,52 @@ fn sql_literal_for_value(raw: &str, ideal_type: &str) -> String {
     }
 }
 
+/// The counterpart to `sql_literal_for_value` for a row-source whose
+/// underlying reader already has a genuine native-null concept (dBase,
+/// Stata, SAS7BDAT, SPSS, SQLite - every format in this campaign that
+/// hands `InlineRowSink::accept` a real `Option<String>` rather than
+/// always wrapping raw text as `Some(...)`): formats `raw` purely by
+/// `ideal_type`, deliberately **without** re-running `is_missing_
+/// sentinel`/the empty-string check `sql_literal_for_value` itself needs.
+///
+/// Found as a real, reproducible bug rather than reasoned out in
+/// advance - a real SQLite fixture (`sample.sqlite`'s own `events.amount`
+/// column, a genuine `mixed(...)` column with a real stored value of
+/// literal text `"unknown"`) piped straight into a real installed SQLite
+/// build failed with `NOT NULL constraint failed: events.amount`, because
+/// the *old*, shared `sql_literal_for_value` unconditionally re-checked
+/// `is_missing_sentinel("unknown")` - true, since `"unknown"` is one of
+/// this project's own `MISSING_SENTINELS` - and silently turned a real,
+/// present database value into a fabricated `NULL`. That check is only
+/// ever correct for a format with no native null at all (CSV/TSV/fixed-
+/// width/the log formats), where matching a sentinel word is the *only*
+/// signal available; for a format whose reader already resolved
+/// missingness precisely (`None` means genuinely absent, `Some(raw)`
+/// means a real value however unusual its text happens to look), re-
+/// guessing from the text a second time can only ever make a *correct*
+/// answer wrong - the exact "missing values never fake a type change"
+/// principle this project holds everywhere else, just pointed at this
+/// function's own opposite failure mode. `InlineRowSink::values_pre_
+/// resolved` is what picks between the two functions per row-source.
+fn sql_literal_for_resolved_value(raw: &str, ideal_type: &str) -> String {
+    let trimmed = raw.trim();
+    match ideal_type {
+        "i64" => match parse_prefixed_int(trimmed) {
+            Some(n) => n.to_string(),
+            None => normalize_numeric_str(trimmed).0.into_owned(),
+        },
+        "f64" => {
+            let cleaned = normalize_numeric_str(trimmed).0.into_owned();
+            match cleaned.parse::<f64>() {
+                Ok(f) if f.is_finite() => cleaned,
+                _ => sql_string_literal(&cleaned),
+            }
+        }
+        "bool" => sql_bool_literal(trimmed).to_string(),
+        _ => sql_string_literal(trimmed),
+    }
+}
+
 /// The `--sql-mode inline` counterpart to `CsvColumnAccumulator`/
 /// `ColumnAccumulatorState`: instead of folding each row into a
 /// per-column type-detection accumulator, this folds each row into a
@@ -51709,6 +51834,18 @@ struct InlineRowSink<'a> {
     // `render_sql_inline_flat`'s own construction site for which formats
     // set this to `false`.
     has_header: bool,
+    // Whether this row-source's own reader already has a genuine
+    // native-null concept - `None` means truly absent, `Some(raw)` means
+    // a real, present value however unusual its text happens to look
+    // (dBase, Stata, SAS7BDAT, SPSS, SQLite). When `true`, a `Some(raw)`
+    // value is formatted via `sql_literal_for_resolved_value` (no
+    // re-guessing missingness from the text); when `false` (CSV/TSV/
+    // fixed-width/the log formats, none of which have a native null at
+    // all), `Some(raw)` still goes through `sql_literal_for_value`'s own
+    // `is_missing_sentinel`/empty-string check, exactly as before. See
+    // `sql_literal_for_resolved_value`'s own doc comment for the real,
+    // reproducible bug this flag exists to fix.
+    values_pre_resolved: bool,
     nrows: Option<usize>,
     header_len: usize,
     ideal_types: &'a [&'a str],
@@ -51782,6 +51919,7 @@ impl InlineRowSink<'_> {
                 .zip(self.ideal_types.iter())
                 .map(|(v, t)| match v {
                     None => "NULL".to_string(),
+                    Some(raw) if self.values_pre_resolved => sql_literal_for_resolved_value(raw, t),
                     Some(raw) => sql_literal_for_value(raw, t),
                 })
                 .collect::<Vec<_>>()
@@ -51875,6 +52013,7 @@ fn render_sql_inline_flat(
     resolved_skip_rows: usize,
     args: &Args,
     sink: &mut dyn std::io::Write,
+    is_first_table: bool,
 ) -> Result<()> {
     let clean_file_name = file_name.replace(['\n', '\r'], " ");
     let quoted_table = sql_quote_ident(table_name);
@@ -51888,41 +52027,53 @@ fn render_sql_inline_flat(
         .join(", ");
     let ideal_types: Vec<&str> = profiles.iter().map(|p| p.ideal_type.as_str()).collect();
 
-    write!(
-        sink,
-        "-- Data dictionary for {clean_file_name}\n\
-         -- Generated by sniff-rs --output-format sql --sql-mode inline\n\
-         --\n\
-         -- The whole dataset is embedded below as literal INSERT statements -\n\
-         -- there is no load step at all, and no file for the engine to find on\n\
-         -- disk: run this script directly on SQLite, DuckDB, PostgreSQL, or\n\
-         -- MySQL and it just works. Any real SQL engine can execute a bare\n\
-         -- INSERT ... VALUES (...) - the same convention pg_dump/mysqldump/\n\
-         -- `sqlite3 .dump` already use for a portable SQL data file - so this\n\
-         -- isn't limited to just those four; they're simply the four this\n\
-         -- project has actually verified end to end against a real engine.\n\
-         --\n\
-         -- For a file too large to comfortably embed as literal SQL, see\n\
-         -- --sql-mode staging instead: a raw-text staging table plus a\n\
-         -- per-engine bulk-load command, better suited to a real bulk load\n\
-         -- than millions of individual INSERT statements.\n\
-         --\n\
-         -- Every identifier below is double-quoted, the ANSI-standard form\n\
-         -- SQLite/DuckDB/PostgreSQL already accept with no setup; MySQL needs\n\
-         -- `SET sql_mode='ANSI_QUOTES';` first (or a find/replace of \" for `).\n\
-         -- MySQL's own default sql_mode also treats a bare backslash inside a\n\
-         -- string literal as an escape character, unlike the other three\n\
-         -- engines - a value containing a literal backslash needs\n\
-         -- `NO_BACKSLASH_ESCAPES` added to that same SET, or it round-trips\n\
-         -- incorrectly on MySQL specifically.\n\
-         --\n\
-         -- One disclosed scope boundary: a numeric literal below assumes the\n\
-         -- same cleanup that let this column resolve to a numeric type at all\n\
-         -- (stripped currency symbols/thousands separators/parenthesized\n\
-         -- negatives/a trailing '%' - see normalize_numeric_str) - a raw\n\
-         -- value this project's own heuristics couldn't already parse as\n\
-         -- numeric was never going to resolve to i64/f64 in the first place.\n\n"
-    )?;
+    // Written once per *file*, not once per table - a multi-table source
+    // (SQLite, the first format in this campaign's own multi-table tier)
+    // would otherwise repeat this entire comment block once per table,
+    // which is correct but needlessly noisy for a database with dozens
+    // of tables.
+    if is_first_table {
+        write!(
+            sink,
+            "-- Data dictionary for {clean_file_name}\n\
+             -- Generated by sniff-rs --output-format sql --sql-mode inline\n\
+             --\n\
+             -- The whole dataset is embedded below as literal INSERT statements -\n\
+             -- there is no load step at all, and no file for the engine to find on\n\
+             -- disk: run this script directly on SQLite, DuckDB, PostgreSQL, or\n\
+             -- MySQL and it just works. Any real SQL engine can execute a bare\n\
+             -- INSERT ... VALUES (...) - the same convention pg_dump/mysqldump/\n\
+             -- `sqlite3 .dump` already use for a portable SQL data file - so this\n\
+             -- isn't limited to just those four; they're simply the four this\n\
+             -- project has actually verified end to end against a real engine.\n\
+             --\n\
+             -- For a file too large to comfortably embed as literal SQL, see\n\
+             -- --sql-mode staging instead: a raw-text staging table plus a\n\
+             -- per-engine bulk-load command, better suited to a real bulk load\n\
+             -- than millions of individual INSERT statements.\n\
+             --\n\
+             -- Every identifier below is double-quoted, the ANSI-standard form\n\
+             -- SQLite/DuckDB/PostgreSQL already accept with no setup; MySQL needs\n\
+             -- `SET sql_mode='ANSI_QUOTES';` first (or a find/replace of \" for `).\n\
+             -- MySQL's own default sql_mode also treats a bare backslash inside a\n\
+             -- string literal as an escape character, unlike the other three\n\
+             -- engines - a value containing a literal backslash needs\n\
+             -- `NO_BACKSLASH_ESCAPES` added to that same SET, or it round-trips\n\
+             -- incorrectly on MySQL specifically.\n\
+             --\n\
+             -- One disclosed scope boundary: a numeric literal below assumes the\n\
+             -- same cleanup that let this column resolve to a numeric type at all\n\
+             -- (stripped currency symbols/thousands separators/parenthesized\n\
+             -- negatives/a trailing '%' - see normalize_numeric_str) - a raw\n\
+             -- value this project's own heuristics couldn't already parse as\n\
+             -- numeric was never going to resolve to i64/f64 in the first place.\n\n"
+        )?;
+    } else {
+        // A later table in the same multi-table file still gets a blank
+        // line separating it from whatever the previous table's own
+        // INSERT statements ended with.
+        writeln!(sink)?;
+    }
 
     writeln!(sink, "CREATE TABLE {quoted_table} (")?;
     write!(
@@ -51961,9 +52112,26 @@ fn render_sql_inline_flat(
         format,
         InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
     );
+    // CSV/TSV/fixed-width are also the *only* formats in this tier with
+    // no native-null concept whatsoever - every other row-source already
+    // resolves missingness precisely at the reader level (a decoded
+    // `None`, a `-`/nilvalue placeholder, a PRESENT-stream bit, or - for
+    // NumPy - simply never being missing at all) before it ever reaches
+    // `InlineRowSink::accept`, so re-guessing from the rendered text via
+    // `is_missing_sentinel` a second time can only make a correct answer
+    // wrong. See `sql_literal_for_resolved_value`'s own doc comment for
+    // the real bug this flag was added to fix. A negative list on
+    // purpose, mirroring `has_header`'s own positive one: these three
+    // are the fixed, closed set that can never gain a `None` from their
+    // own row-source, everything else already can.
+    let values_pre_resolved = !matches!(
+        format,
+        InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
+    );
     let mut sink = InlineRowSink {
         resolved_skip_rows,
         has_header,
+        values_pre_resolved,
         nrows: args.nrows,
         header_len: profiles.len(),
         ideal_types: &ideal_types,
@@ -51996,6 +52164,9 @@ fn render_sql_inline_flat(
         InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
         InputFormat::Orc => render_sql_inline_flat_orc(read_path, args.nrows, &mut sink)?,
         InputFormat::Npy => render_sql_inline_flat_npy(read_path, args.nrows, &mut sink)?,
+        InputFormat::Sqlite => {
+            render_sql_inline_flat_sqlite(read_path, table_name, args.nrows, &mut sink)?
+        }
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52186,6 +52357,34 @@ fn render_sql_inline_flat_npy(
     )
 }
 
+/// The SQLite row-source for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_weblog`'s own doc comment for why this is
+/// safe to call unconditionally even in a non-`sqlite` build. The first
+/// multi-table format in this campaign: unlike every wrapper above,
+/// `table_name` here genuinely selects *which* of the source file's
+/// several tables to read, not just the SQL identifier to emit.
+#[cfg(feature = "sqlite")]
+fn render_sql_inline_flat_sqlite(
+    read_path: &Path,
+    table_name: &str,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    sqlite_support::stream_sqlite_table_rows_for_sql(read_path, table_name, nrows, sink)
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn render_sql_inline_flat_sqlite(
+    _read_path: &Path,
+    _table_name: &str,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "SQLite support isn't compiled in - rebuild with `cargo build --release --features sqlite` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -52294,11 +52493,10 @@ fn render_sql(
 ) -> Result<()> {
     let explicit = args.sql_mode.is_some();
     let mode = resolved_sql_mode(args)?;
-    // The flat, fixed-column, one-row-per-record tier - see
-    // `render_sql_inline_flat`'s own doc comment for the full list this
-    // covers - the flat, fixed-column, one-row-per-record tier is
-    // complete as of NumPy; the multi-table and nested/JSON-bridge tiers
-    // remain explicit, not-yet-started future phases (see CLAUDE.md).
+    // The flat, fixed-column, one-row-per-record tier is complete as of
+    // NumPy; SQLite is the first format in the multi-table tier (Excel,
+    // INI, `.npz` remain explicit, not-yet-started future phases, along
+    // with the entire nested/JSON-bridge tier - see CLAUDE.md).
     let inline_supported = matches!(
         format,
         InputFormat::Csv
@@ -52314,12 +52512,13 @@ fn render_sql(
             | InputFormat::Spss
             | InputFormat::Orc
             | InputFormat::Npy
+            | InputFormat::Sqlite
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -52337,24 +52536,34 @@ fn render_sql(
             Ok(())
         }
         SqlMode::Inline => {
-            // Every format in `inline_supported` always produces exactly
-            // one implicit table (see `dispatch_reader`'s own
-            // `std::iter::once((file_stem, profiles))` for every
-            // non-multi-table format).
-            let (table_name, profiles) = tables
-                .iter()
-                .next()
-                .ok_or_else(|| anyhow!("no table to render as SQL"))?;
-            render_sql_inline_flat(
-                file_name,
-                table_name,
-                profiles,
-                format,
-                read_path,
-                resolved_skip_rows,
-                args,
-                sink,
-            )
+            // Every flat-tier format produces exactly one implicit table
+            // (see `dispatch_reader`'s own `std::iter::once((file_stem,
+            // profiles))`), so this loop runs exactly once for those -
+            // but SQLite (the multi-table tier's first format) can
+            // genuinely have several, each needing its own `CREATE
+            // TABLE`/`INSERT` pair reusing the identical row-source
+            // dispatch below, just resolving to *that* table's own data
+            // (`render_sql_inline_flat`'s own `table_name` parameter,
+            // previously only used for the SQL identifier itself, now
+            // also tells a multi-table format's row-source which table
+            // to actually read).
+            if tables.is_empty() {
+                bail!("no table to render as SQL");
+            }
+            for (i, (table_name, profiles)) in tables.iter().enumerate() {
+                render_sql_inline_flat(
+                    file_name,
+                    table_name,
+                    profiles,
+                    format,
+                    read_path,
+                    resolved_skip_rows,
+                    args,
+                    sink,
+                    i == 0,
+                )?;
+            }
+            Ok(())
         }
     }
 }
@@ -59004,10 +59213,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Spss
                 | InputFormat::Orc
                 | InputFormat::Npy
+                | InputFormat::Sqlite
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite are supported so far",
             format.as_str()
         );
     }
@@ -66527,6 +66737,7 @@ mod tests {
             0,
             &args,
             &mut buf,
+            true,
         )
         .unwrap();
         fs::remove_dir_all(&dir).ok();
@@ -66584,6 +66795,7 @@ mod tests {
             0,
             &args,
             &mut buf,
+            true,
         )
         .unwrap();
         let sql = String::from_utf8(buf).unwrap();
@@ -66603,6 +66815,7 @@ mod tests {
             0,
             &args,
             &mut buf,
+            true,
         )
         .unwrap();
         let sql = String::from_utf8(buf).unwrap();

@@ -319,11 +319,12 @@ for every format (it never embeds per-row data, so there's no format-
 specific row-source to build); `inline` mode covers the entire flat,
 fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
-SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - every other format
-transparently falls back to `staging` with a disclosed stderr note
-(`--sql-mode inline` given *explicitly* on an unsupported format is a
-hard error instead, naming the gap - downgrading what was explicitly
-asked for would be the wrong kind of quiet).
+SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus SQLite, the first format
+in the multi-table tier, so far. Every other format transparently falls
+back to `staging` with a disclosed stderr note (`--sql-mode inline`
+given *explicitly* on an unsupported format is a hard error instead,
+naming the gap - downgrading what was explicitly asked for would be the
+wrong kind of quiet).
 
 Extending inline mode further is explicit, disclosed, staged future
 work, following this project's own "one format at a time, fully verified"
@@ -345,13 +346,15 @@ needs its own real design, not just repeating the same pattern:
    real `nrows`-handling behavior (real-I/O-bounding vs. dBase's
    deliberate decode-always) rather than one convention applied
    uniformly regardless of what the format actually does.
-2. **The multi-table tier** (SQLite, the Excel family, INI, `.npz`) -
-   `dispatch_reader` already returns `Vec<(String, Vec<ColumnProfile>)>`
-   for these; `render_sql`'s inline branch currently assumes exactly one
-   table (`tables.iter().next()`), which needs to become a genuine
-   per-table loop, each table getting its own `CREATE TABLE`/`INSERT`
-   pair, reusing whichever row-source its own format tier ultimately
-   supports.
+2. **The multi-table tier** (SQLite - done as of Phase 9 - the Excel
+   family, INI, and `.npz` remain) - `dispatch_reader` already returns
+   `Vec<(String, Vec<ColumnProfile>)>` for these; `render_sql`'s inline
+   branch now loops over every table (no longer just `tables.iter()
+   .next()`), each table getting its own `CREATE TABLE`/`INSERT` pair
+   sharing one file-level header comment, reusing whichever row-source
+   its own format tier ultimately supports (SQLite reused its own
+   existing per-row-callback reader directly; Excel/INI/`.npz` each
+   still need their own).
 3. **The recursively-nested, JSON-bridge tier** (JSON, YAML, TOML, Avro,
    MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
    iCalendar, MBOX) - the hardest tier: there's no existing function that
@@ -931,13 +934,116 @@ baseline exactly - the four new NumPy-specific tests are `#[cfg(feature
 **With Phase 8, the entire flat, fixed-column, one-row-per-record tier
 is done**: CSV, TSV, fixed-width text, Common/Combined Log Format,
 syslog (RFC 3164/5424), dBase, Stata, SAS7BDAT, SPSS, ORC, and NumPy
-(`.npy`) all support `--sql-mode inline`. The two remaining tiers - the
-multi-table tier (SQLite, the Excel family, INI, `.npz`) and the
-recursively-nested, JSON-bridge tier (JSON, YAML, TOML, Avro,
-MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
-iCalendar, MBOX) - remain explicit, not-yet-started future phases, each
-needing its own genuinely new design rather than a repeat of this tier's
-own "extract shared setup, share the decode logic" pattern (see this
+(`.npy`) all support `--sql-mode inline`.
+
+**Phase 9: SQLite - the first format in the multi-table tier, and the
+first genuine architectural change since Phase 1.** Every prior phase's
+table was implicit (`dispatch_reader`'s own `std::iter::once((file_stem,
+profiles))`), so `render_sql`'s own inline branch only ever grabbed
+`tables.iter().next()`. SQLite can genuinely have several tables, so that
+branch became a real loop over every entry in `tables`, calling
+`render_sql_inline_flat` once per table - `render_sql_inline_flat`
+itself gained an `is_first_table: bool` parameter so its own header
+comment block (`-- Data dictionary for ...`) is written exactly once per
+*file*, not once per *table* (a database with dozens of tables would
+otherwise repeat that whole ~30-line comment once per table); a later
+table gets a plain blank-line separator instead. `table_name` -
+previously only used for the SQL identifier itself - now also tells a
+multi-table row-source *which* table to actually read.
+
+`stream_sqlite_table_rows_for_sql` reuses `read_schema`/`parse_create_
+table`/`collect_table_rows`/`apply_affinity`/`value_to_string` directly,
+the same pieces `profile_table` itself already builds on, resolving the
+requested table by name and folding each decoded row into `sink.accept`
+instead of a per-column accumulator. A `WITHOUT ROWID` table gets the
+identical disclosed error `profile_table` already gives (there's no
+honest literal to embed - the same "no data to emit" boundary ORC's own
+compound-column check already established for a different reason).
+`collect_table_rows` already bounds real page reads via its own `limit`
+parameter, so `nrows` threads straight through unchanged, matching
+Stata/SAS7BDAT/SPSS's own real-I/O-bounding row-sources.
+
+**This phase also found, and fixed, a real, more far-reaching bug than
+anything specific to SQLite** - the kind of finding this project's own
+"verify against a real engine, don't trust the design on paper"
+discipline exists to catch. Piping `sample.sqlite`'s own generated inline
+SQL into a real, installed SQLite build failed outright:
+`NOT NULL constraint failed: events.amount`. The cause: `sql_literal_for_
+value` (shared by *every* row-source in this campaign) unconditionally
+re-runs `is_missing_sentinel` against a value's own rendered text, even
+for a row-source whose reader had *already* resolved missingness
+precisely (`None` for genuinely absent, `Some(raw)` for a real, present
+value). `events.amount` genuinely stores the literal text `"unknown"` in
+one row - real, present data, not a missing value - but `"unknown"` is
+also one of this project's own `MISSING_SENTINELS` (matching pandas'
+convention), so the shared formatter silently turned a real value into a
+fabricated `NULL`, tripping the very `NOT NULL` constraint the (correct)
+`missing_pct` had declared.
+
+Checking whether this was SQLite-specific or something broader (rather
+than patching only the one fixture that happened to surface it) found it
+was broader: **every row-source that already hands `InlineRowSink::
+accept` a genuine `Option<String>` - not just SQLite, but dBase, Stata,
+SAS7BDAT, SPSS, the log formats' own `-`/nilvalue-driven `dash_to_none`,
+and ORC's own PRESENT-stream-driven nulls - had the identical latent
+flaw**, just never triggered by any committed fixture's own real content
+happening to match a sentinel word. NumPy's row-source had a related but
+distinct version of the same problem: NumPy has *no* missing-value
+concept at all (every element is always present), so wrapping every
+value `Some(...)` and letting the shared sentinel check "coincidentally"
+do the right thing (as this document's own Phase 8 entry previously,
+incorrectly, described as an acceptable convention) was itself already
+wrong - a real NumPy string field containing literal `"NA"` would have
+been silently nulled too. Only CSV, TSV, and fixed-width text are
+*correctly* served by the sentinel check, because they're the only three
+formats with no native-null representation whatsoever - guessing from
+text is the *only* signal available to them, not a redundant second
+guess on top of an already-resolved answer.
+
+Fixed with a new `sql_literal_for_resolved_value` (identical to
+`sql_literal_for_value` except it never re-runs `is_missing_sentinel`/
+the empty-string check at all) and a new `InlineRowSink::values_pre_
+resolved: bool` flag picking between the two - a negative list mirroring
+`has_header`'s own positive one (`!matches!(format, Csv | Tsv |
+FixedWidth)`), so every format already shipped in this tier except those
+three now correctly trusts its own reader's already-resolved answer
+instead of re-litigating it from rendered text.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.sqlite --output-format sql --load-into sqlite:...` now
+loads both tables cleanly, with `events.amount`'s own real `"unknown"`
+value surviving intact and `users.age`'s own genuine missing value (a
+real `NULL`) still correctly rendering as `NULL`; `edge_sqlite_without_
+rowid.sqlite` confirmed the disclosed error fires and names the table;
+`edge_sqlite_overflow_pages.sqlite` confirmed a genuine 15,000-byte
+overflow-page `TEXT` value round-trips at full length; `edge_sqlite_
+table_level_primary_key.sqlite`/`edge_sqlite_view_excluded.sqlite`/
+`edge_zero_rows.sqlite` all loaded correctly (a view is never treated as
+a table, a zero-row table produces a clean `CREATE TABLE` with no
+trailing `INSERT` at all); `--nrows 2` confirmed to bound each table
+independently. The sentinel-value fix was verified directly, not just
+inferred from the SQLite case: a fresh, throwaway Common/Combined Log
+line (a real `"unknown"` user-agent alongside a genuine `"-"` referer)
+and a new committed NumPy fixture
+(`edge_npy_sentinel_like_values.npy`, values `"unknown"`/`"NA"`/`"real"`)
+both confirmed every real value survives while a genuine placeholder
+still becomes `NULL`. Also verified as behavior-preserving for CSV/TSV/
+fixed-width text (the three formats where the sentinel check is still
+correct): `diff` confirmed byte-identical inline SQL output against the
+pre-Phase-9 binary across the entire fixture corpus for every
+already-shipped format - none of the *committed* fixtures happen to
+contain a real value that coincidentally matches a sentinel word, which
+is exactly why this bug shipped unnoticed through eight prior phases
+until a real multi-table SQLite fixture's own genuine data finally
+surfaced it. Clean across default/`sqlite`/`full`, matching each one's
+own established baseline exactly - the new SQLite-specific and
+sentinel-regression tests are gated behind their respective features.
+
+Remaining in the multi-table tier: the Excel family (`.xlsx`/`.xls`/
+`.xlsb`/`.ods`), INI, and `.npz` - each an explicit, not-yet-started
+future phase. The recursively-nested, JSON-bridge tier (JSON, YAML,
+TOML, Avro, MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON,
+vCard, iCalendar, MBOX) remains entirely unstarted too (see this
 section's own tiered roadmap above for what each one actually needs).
 
 ## Directory-input batch mode

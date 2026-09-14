@@ -1248,6 +1248,116 @@ fn load_into_accepts_npy() {
 }
 
 #[test]
+#[cfg(feature = "npy")]
+fn sql_output_inline_mode_npy_preserves_sentinel_like_real_values() {
+    // Regression test for a real bug found while building the multi-table
+    // tier's first format (SQLite): a row-source whose reader already has
+    // no missing-value concept at all (NumPy) - or a genuine native-null
+    // concept that's already fully resolved (dBase/Stata/SAS7BDAT/SPSS/
+    // SQLite/the log formats' own "-" nilvalue) - used to have its real,
+    // present values re-checked against `is_missing_sentinel` a second
+    // time, silently turning a real value that happens to read as "NA" or
+    // "unknown" into a fabricated NULL. All three of this fixture's real
+    // string values - including two that are themselves missing-value
+    // sentinel words - must survive as real text.
+    let sql = run_sql("edge_npy_sentinel_like_values.npy", &[]);
+    assert!(sql.contains("('unknown')"));
+    assert!(sql.contains("('NA')"));
+    assert!(sql.contains("('real')"));
+    assert!(!sql.contains("(NULL)"));
+}
+
+#[test]
+#[cfg(feature = "weblog")]
+fn sql_output_inline_mode_weblog_preserves_sentinel_like_real_values() {
+    // Same regression as the NumPy test above, for a format whose reader
+    // already has a real, precisely-resolved native-null concept (Common/
+    // Combined Log's own "-" nilvalue, via `dash_to_none`) - a genuine
+    // "-" referer must still become NULL, but a genuine "unknown" user
+    // agent must survive as real text, not also be nulled by a second,
+    // redundant sentinel guess.
+    let sql = run_sql(
+        "edge_weblog_sentinel_like_value.log",
+        &["--format", "combined-log"],
+    );
+    assert!(sql.contains("'unknown'"));
+    assert!(sql.contains(", NULL,") || sql.contains(", NULL)"));
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn sql_output_inline_mode_supports_sqlite_multi_table() {
+    // Phase 9 of the "any format" rollout, and the first format in the
+    // multi-table tier: render_sql's own inline loop now emits one
+    // CREATE TABLE/INSERT pair per table, sharing one header comment
+    // block for the whole file (written once, not once per table).
+    let sql = run_sql("sample.sqlite", &[]);
+    assert_eq!(sql.matches("-- Data dictionary for").count(), 1);
+    assert!(sql.contains("CREATE TABLE \"users\""));
+    assert!(sql.contains("CREATE TABLE \"events\""));
+    assert!(sql.contains("INSERT INTO \"users\""));
+    assert!(sql.contains("INSERT INTO \"events\""));
+    assert!(!sql.contains("_staging\""));
+    // The real regression this phase found: events.amount's own genuine
+    // "unknown" text value must survive, not be nulled by the same
+    // sentinel-guessing bug the two tests above lock in for other formats.
+    assert!(sql.contains("'unknown'"));
+    // users.age's own genuine SQL NULL (a real missing value, U1004's
+    // row) must still become a bare NULL.
+    assert!(sql.contains(", NULL,") || sql.contains(", NULL)"));
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn sql_output_inline_mode_sqlite_rejects_a_without_rowid_table() {
+    // A WITHOUT ROWID table has no honest literal to embed (the same
+    // "no honest literal" boundary ORC's own nested-column check already
+    // draws) - a clear, actionable error naming the table, not a guess.
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_sqlite_without_rowid.sqlite")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WITHOUT ROWID"));
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn sql_output_inline_mode_sqlite_respects_nrows_per_table() {
+    let sql = run_sql("sample.sqlite", &["--nrows", "2"]);
+    assert!(sql.contains("'U1001'"));
+    assert!(sql.contains("'U1002'"));
+    assert!(!sql.contains("'U1003'"));
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn load_into_accepts_sqlite() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.sqlite").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for sqlite"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no
