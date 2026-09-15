@@ -48114,6 +48114,46 @@ mod xml_support {
         Ok(profile_json_records(&records, n_samples))
     }
 
+    /// The XML row-source for `render_sql_inline_flat` (Phase 18, the
+    /// seventh format in the recursively-nested, JSON-bridge tier) - a
+    /// mechanical mirror of `columns_from_xml`'s own dual-mode dispatch
+    /// just above: a homogeneous `<root><item/>...</root>` document
+    /// streams each child straight into `json_emit_row_for_sql` via the
+    /// same `stream_xml_records` scanner (which already parses every
+    /// child regardless of `--nrows`, matching Pass 1's own "scan
+    /// everything, keep only the first `n`" convention - `sink.accept`'s
+    /// own cap handles the rest); a non-homogeneous root falls back to
+    /// the whole-DOM parse as one single record, exactly like TOML's own
+    /// one-document-one-row shape. Always in records mode - neither
+    /// branch ever produces a `"value"`-prefixed column (see `columns_
+    /// from_xml`'s own doc comment), so `json_bridge_columns_and_mode`'s
+    /// generic detection needs no XML-specific reasoning either.
+    pub(crate) fn stream_xml_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let streamed = stream_xml_records(path, |m| {
+            json_emit_row_for_sql(&JsonValue::Object(m), columns, records_mode, sink)
+        })?;
+        if streamed {
+            return Ok(());
+        }
+
+        let content =
+            fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let root =
+            xml_parse(&content).with_context(|| format!("failed to parse {path:?} as XML"))?;
+        let record = match xml_element_to_json(&root) {
+            JsonValue::Object(m) => m,
+            _ => bail!(
+                "expected the root XML element in {path:?} to have attributes or child elements"
+            ),
+        };
+        json_emit_row_for_sql(&JsonValue::Object(record), columns, records_mode, sink)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -52669,6 +52709,7 @@ fn render_sql_inline_flat(
             | InputFormat::MsgPack
             | InputFormat::Cbor
             | InputFormat::Avro
+            | InputFormat::Xml
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -52907,6 +52948,7 @@ fn render_sql_inline_flat(
         InputFormat::MsgPack => render_sql_inline_flat_msgpack(read_path, profiles, &mut sink)?,
         InputFormat::Cbor => render_sql_inline_flat_cbor(read_path, profiles, &mut sink)?,
         InputFormat::Avro => render_sql_inline_flat_avro(read_path, profiles, &mut sink)?,
+        InputFormat::Xml => render_sql_inline_flat_xml(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53371,6 +53413,31 @@ fn render_sql_inline_flat_avro(
     )
 }
 
+/// The XML row-source wrapper for `render_sql_inline_flat` (Phase 18) -
+/// see `render_sql_inline_flat_toml`'s own doc comment; identical shape,
+/// just driven by `xml_support::stream_xml_rows_for_sql`'s own dual-mode
+/// dispatch instead.
+#[cfg(feature = "xml")]
+fn render_sql_inline_flat_xml(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    xml_support::stream_xml_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "xml"))]
+fn render_sql_inline_flat_xml(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "XML support isn't compiled in - rebuild with `cargo build --release --features xml` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53512,12 +53579,13 @@ fn render_sql(
             | InputFormat::MsgPack
             | InputFormat::Cbor
             | InputFormat::Avro
+            | InputFormat::Xml
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -60787,10 +60855,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::MsgPack
                 | InputFormat::Cbor
                 | InputFormat::Avro
+                | InputFormat::Xml
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml are supported so far",
             format.as_str()
         );
     }

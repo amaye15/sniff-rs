@@ -550,25 +550,25 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 }
 
 #[test]
-#[cfg(feature = "xml")]
+#[cfg(feature = "bson")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
-    // JSON, YAML, TOML, MessagePack, CBOR, and Avro are now inline-
-    // supported (Phases 13-17), so XML is used here instead as a format
-    // that still genuinely isn't. Falls back to staging mode
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, and XML are now inline-
+    // supported (Phases 13-18), so BSON is used here instead as a
+    // format that still genuinely isn't. Falls back to staging mode
     // automatically (with a disclosed stderr note, checked separately
     // below) rather than erroring or silently producing something
     // different.
-    let sql = run_sql("sample.xml", &[]);
+    let sql = run_sql("sample.bson", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "xml")]
+#[cfg(feature = "bson")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.xml").to_str().unwrap(),
+            fixture("sample.bson").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -577,12 +577,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for xml"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for bson"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "xml")]
+#[cfg(feature = "bson")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -590,7 +590,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.xml").to_str().unwrap(),
+            fixture("sample.bson").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -601,7 +601,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for xml"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for bson"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -702,18 +702,18 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "xml")]
+#[cfg(feature = "bson")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
-    // JSON, YAML, TOML, MessagePack, CBOR, and Avro are now inline-
-    // supported (Phases 13-17), so XML stands in as a format that still
-    // genuinely isn't.
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, and XML are now inline-
+    // supported (Phases 13-18), so BSON stands in as a format that
+    // still genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.xml").to_str().unwrap(),
+            fixture("sample.bson").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -723,7 +723,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for xml"));
+    assert!(stderr.contains("--load-into isn't available yet for bson"));
 }
 
 #[test]
@@ -1991,6 +1991,85 @@ fn load_into_accepts_avro() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for avro"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "xml")]
+fn sql_output_inline_mode_supports_homogeneous_xml_records() {
+    // Phase 18 of the "any format" rollout, and the seventh format in
+    // the recursively-nested, JSON-bridge tier - sample.xml's own real
+    // homogeneous <user>...</user> records (with @-prefixed attribute
+    // columns) exercise the stream_xml_records path directly.
+    let sql = run_sql("sample.xml", &[]);
+    assert!(sql.contains("\"@id\""));
+    assert!(sql.contains("\"@active\""));
+    assert!(sql.contains("'U1001'"));
+    assert!(sql.contains("TRUE") || sql.contains("FALSE"));
+}
+
+#[test]
+#[cfg(feature = "xml")]
+fn sql_output_inline_mode_xml_non_homogeneous_root_is_a_single_record() {
+    // A non-homogeneous/deeply-nested root falls back to the whole-DOM
+    // parse as one single record, the same choice TOML's own whole-
+    // document shape already makes.
+    let sql = run_sql("edge_xml_deeply_nested_10.xml", &[]);
+    assert!(sql.contains(
+        "\"level9.level8.level7.level6.level5.level4.level3.level2.level1.level0.value\""
+    ));
+    assert!(sql.contains("'deep'"));
+}
+
+#[test]
+#[cfg(feature = "xml")]
+fn sql_output_inline_mode_xml_rejects_repeated_child_elements_as_an_array_of_objects() {
+    // A repeated same-tag child element (<order> appearing more than
+    // once under one <person>) pools into an array-of-objects column,
+    // exactly the one-to-many shape this tier's own upfront check exists
+    // to catch.
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_xml_sql_inline_array_of_objects.xml")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for field \"order\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+#[cfg(feature = "xml")]
+fn sql_output_inline_mode_xml_respects_nrows() {
+    let sql = run_sql("sample.xml", &["--nrows", "2"]);
+    assert!(sql.contains("'U1001'"));
+    assert!(sql.contains("'U1002'"));
+    assert!(!sql.contains("'U1003'"));
+}
+
+#[test]
+#[cfg(feature = "xml")]
+fn load_into_accepts_xml() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.xml").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for xml"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 

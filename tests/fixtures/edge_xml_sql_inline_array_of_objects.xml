@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<root>
+  <person id="1">
+    <name>Alice</name>
+    <order><amount>10</amount></order>
+    <order><amount>20</amount></order>
+  </person>
+  <person id="2">
+    <name>Bob</name>
+    <order><amount>5</amount></order>
+  </person>
+</root>
