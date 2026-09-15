@@ -2968,6 +2968,51 @@ hand-written `.ini` files rather than spawning a real database engine CLI,
 matching this project's own standing rule that no automated `cargo test`
 depends on an external database tool being installed.
 
+**A follow-up pass added a committed fixture-pair corpus and a real
+edge-case sweep**, the same "reviewable without reading test code"
+discipline every other format's own fixture corpus already gets in this
+project, rather than leaving every scenario built on the fly under a
+`TempDir`. `tests/fixtures/diff_old.json`/`diff_new.json` is one
+hand-crafted single-table dictionary pair (both named `"customers"`)
+deliberately exercising all eight `DiffChange` shapes and both
+`Compatibility` outcomes at once - a rename, a removed column, a safe
+numeric widening, a breaking narrowing (`String -> i64`), a column
+crossing the missing-% `0.0` boundary in each direction, and a nullable
+vs. non-nullable added column - so `render_diff_resolution_sql`'s real
+`ALTER TABLE` output for it could be checked directly against a real,
+installed SQLite build (a generated `ADD COLUMN` statement applied
+cleanly) as well as asserted in the automated suite.
+`diff_old_multitable.json`/`diff_new_multitable.json` locks in real
+by-name multi-table matching (a table removed, a table added, a column
+added to a table present in both) as a permanent asset alongside the
+`.ini`-built dynamic version above. Five more small fixtures cover
+`DiffColumn::from_json`'s own edge cases directly - a document with no
+top-level `"tables"` key at all, a table whose value isn't an array
+(the same shape a `json-schema` document's `tables.<name>` object
+produces, previously only reachable indirectly through a real
+`--output-format json-schema` run), a column entry that isn't a JSON
+object, a column entry missing its required `"name"` field, and a
+genuinely invalid (non-JSON) document - each with its own test asserting
+the specific, actionable error message rather than just "it failed."
+A `diff_sparse_columns.json`/`diff_sparse_columns_new.json` pair (columns
+omitting every optional field, plus a `sample_values` array deliberately
+mixing numbers/booleans/`null` in with real strings) proves
+`DiffColumn::from_json`'s own defaulting and non-string-filtering logic
+doesn't itself manufacture a spurious diff entry - the shared "label"
+column, identical once its non-string samples are filtered out on both
+sides, must produce zero entries. Rounded out with direct unit tests on
+the greedy rename-matching algorithm (three candidates, only one truly
+matching pair, proving the other two don't get cross-wired into a wrong
+rename), the exact inclusive/exclusive edges of the missing-%
+`MISSING_PCT_NOTE_THRESHOLD` boundary, `render_diff_markdown`'s own
+`escape_md` reuse for a table/column name containing a literal `|`, and
+`render_diff_json`'s per-kind extra fields for `TypeChanged`/
+`MissingPctChanged` (the earlier pass had only checked this for
+`ColumnRemoved`) - plus CLI-parsing edge cases (`--flag=value` inline
+form, an unrecognized flag, a missing `--resolution-sql` value, an extra
+positional argument, `--help`, writing the report to an explicit output
+path instead of stdout, and comparing a dictionary against itself).
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:

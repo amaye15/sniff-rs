@@ -1,0 +1,78 @@
+{
+  "file": "customers_old.csv",
+  "format": "csv",
+  "tables": {
+    "customers": [
+      {
+        "name": "id",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["1", "2", "3"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "name",
+        "current_type": "String",
+        "ideal_type": "String",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["alice", "bob", "carol"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "legacy_score",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["10", "20", "30"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "signup_year",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["2020", "2021", "2022"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "status",
+        "current_type": "String",
+        "ideal_type": "String",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["active", "inactive", "active"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "phone",
+        "current_type": "String",
+        "ideal_type": "String",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["555-0100", "555-0101", "555-0102"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "verified",
+        "current_type": "bool",
+        "ideal_type": "bool",
+        "description": "",
+        "missing_pct": 20.0,
+        "sample_values": ["true", "false"],
+        "notes": "",
+        "row_count": 3
+      }
+    ]
+  }
+}

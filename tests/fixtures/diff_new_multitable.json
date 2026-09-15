@@ -1,0 +1,60 @@
+{
+  "file": "warehouse_new.sqlite",
+  "format": "sqlite",
+  "tables": {
+    "payments": [
+      {
+        "name": "id",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["1", "2"],
+        "notes": "",
+        "row_count": 2
+      },
+      {
+        "name": "amount",
+        "current_type": "f64",
+        "ideal_type": "f64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["9.99", "14.50"],
+        "notes": "",
+        "row_count": 2
+      }
+    ],
+    "users": [
+      {
+        "name": "id",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["1", "2"],
+        "notes": "",
+        "row_count": 2
+      },
+      {
+        "name": "name",
+        "current_type": "String",
+        "ideal_type": "String",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["alice", "bob"],
+        "notes": "",
+        "row_count": 2
+      },
+      {
+        "name": "email",
+        "current_type": "String",
+        "ideal_type": "Email",
+        "description": "",
+        "missing_pct": 5.0,
+        "sample_values": ["alice@example.com"],
+        "notes": "",
+        "row_count": 2
+      }
+    ]
+  }
+}

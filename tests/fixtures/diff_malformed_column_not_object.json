@@ -1,0 +1,6 @@
+{
+  "file": "fake.json",
+  "tables": {
+    "t": ["not an object", 42]
+  }
+}

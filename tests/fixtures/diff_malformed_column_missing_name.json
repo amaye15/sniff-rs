@@ -1,0 +1,6 @@
+{
+  "file": "fake.json",
+  "tables": {
+    "t": [{ "ideal_type": "i64" }]
+  }
+}

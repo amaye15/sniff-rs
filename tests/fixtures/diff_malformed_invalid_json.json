@@ -1,0 +1,3 @@
+this is not JSON at all - a plain text file with a .json extension, the
+same "readable text, wrong structure" convention every other format's own
+malformed_garbage.<ext> fixture already uses.

@@ -64404,6 +64404,228 @@ mod diff_tests {
         assert_eq!(args.output_format, "md");
         assert!(!args.fail_on_breaking);
     }
+
+    #[test]
+    fn diff_args_parse_from_accepts_the_inline_equals_form() {
+        let args = DiffArgs::parse_from(&[
+            "old.json".to_string(),
+            "new.json".to_string(),
+            "--output-format=json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args.output_format, "json");
+    }
+
+    #[test]
+    fn diff_args_parse_from_rejects_an_unrecognized_flag_and_an_extra_positional() {
+        assert!(
+            DiffArgs::parse_from(&[
+                "old.json".to_string(),
+                "new.json".to_string(),
+                "--bogus".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            DiffArgs::parse_from(&[
+                "old.json".to_string(),
+                "new.json".to_string(),
+                "out.md".to_string(),
+                "extra".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn diff_args_parse_from_requires_a_value_for_resolution_sql() {
+        assert!(
+            DiffArgs::parse_from(&[
+                "old.json".to_string(),
+                "new.json".to_string(),
+                "--resolution-sql".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn diff_output_format_rejects_an_unrecognized_value() {
+        assert!(DiffOutputFormat::parse("bogus").is_err());
+        assert!(DiffOutputFormat::parse("md").is_ok());
+        assert!(DiffOutputFormat::parse("JSON").is_ok());
+    }
+
+    #[test]
+    fn diff_column_from_json_defaults_missing_optional_fields_and_filters_non_string_samples() {
+        let v = json_support::from_str(
+            r#"{"name": "label", "ideal_type": "String", "sample_values": [1, true, null, "x", "y"]}"#,
+        )
+        .unwrap();
+        let col = DiffColumn::from_json(&v).unwrap();
+        assert_eq!(col.name, "label");
+        assert_eq!(col.ideal_type, "String");
+        assert_eq!(col.current_type, "");
+        assert_eq!(col.missing_pct, 0.0);
+        assert_eq!(col.sample_values, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn diff_column_from_json_rejects_a_non_object_entry_or_a_missing_name() {
+        let not_object = json_support::from_str(r#""just a string""#).unwrap();
+        assert!(DiffColumn::from_json(&not_object).is_err());
+
+        let missing_name = json_support::from_str(r#"{"ideal_type": "i64"}"#).unwrap();
+        assert!(DiffColumn::from_json(&missing_name).is_err());
+    }
+
+    #[test]
+    fn diff_table_columns_greedy_matching_picks_the_best_rename_and_leaves_the_rest_as_add_remove()
+    {
+        // Two removed names could each plausibly match "b_new" by type
+        // alone, but only "b_old" shares its full sample-value set - the
+        // greedy match must pick that pairing and leave "a_old"/"c_new"
+        // as a genuine remove/add, not cross-wire them.
+        let old = vec![
+            col("a_old", "String", 0.0, &["zzz", "yyy"]),
+            col("b_old", "String", 0.0, &["p", "q", "r"]),
+        ];
+        let new = vec![
+            col("b_new", "String", 0.0, &["p", "q", "r"]),
+            col("c_new", "String", 0.0, &["totally", "different"]),
+        ];
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        let renames: Vec<&DiffEntry> = entries
+            .iter()
+            .filter(|e| matches!(e.change, DiffChange::ColumnRenamed { .. }))
+            .collect();
+        assert_eq!(renames.len(), 1);
+        let DiffChange::ColumnRenamed { from, to, .. } = &renames[0].change else {
+            unreachable!()
+        };
+        assert_eq!(from, "b_old");
+        assert_eq!(to, "b_new");
+        assert!(entries.iter().any(|e| e.column.as_deref() == Some("a_old")
+            && matches!(e.change, DiffChange::ColumnRemoved { .. })));
+        assert!(entries.iter().any(|e| e.column.as_deref() == Some("c_new")
+            && matches!(e.change, DiffChange::ColumnAdded { .. })));
+    }
+
+    #[test]
+    fn classify_missing_pct_change_boundary_is_inclusive_at_the_threshold() {
+        // Exactly at MISSING_PCT_NOTE_THRESHOLD (10.0): flagged.
+        assert!(classify_missing_pct_change(5.0, 15.0).is_some());
+        // Just under it: not flagged.
+        assert_eq!(classify_missing_pct_change(5.0, 14.9), None);
+    }
+
+    #[test]
+    fn classify_missing_pct_change_is_none_when_nothing_meaningfully_changed() {
+        assert_eq!(classify_missing_pct_change(0.0, 0.0), None);
+        assert_eq!(classify_missing_pct_change(12.3, 12.3), None);
+    }
+
+    #[test]
+    fn render_diff_markdown_escapes_special_characters_in_table_and_column_names() {
+        let report = DiffReport {
+            entries: vec![DiffEntry {
+                table: "we|ird".to_string(),
+                sql_table: Some("we|ird".to_string()),
+                column: Some("pi|pe".to_string()),
+                change: DiffChange::ColumnRemoved {
+                    ideal_type: "String".to_string(),
+                },
+                compatibility: Compatibility::Breaking,
+                reason: "col|umn removed".to_string(),
+            }],
+        };
+        let md = render_diff_markdown(Path::new("old.json"), Path::new("new.json"), &report);
+        // escape_md must have turned every literal '|' into an escaped
+        // form so the generated Markdown table isn't corrupted by a
+        // real column/table/reason value that happens to contain one.
+        assert!(!md.contains("| we|ird |") && !md.contains("we|ird\n"));
+        assert!(md.contains("we\\|ird") || md.contains("we&#124;ird"));
+    }
+
+    #[test]
+    fn render_diff_json_carries_every_change_kinds_own_extra_fields() {
+        let report = DiffReport {
+            entries: vec![
+                DiffEntry {
+                    table: "t".to_string(),
+                    sql_table: Some("t".to_string()),
+                    column: Some("a".to_string()),
+                    change: DiffChange::TypeChanged {
+                        old_current: "i64".to_string(),
+                        new_current: "f64".to_string(),
+                        old_ideal: "i64".to_string(),
+                        new_ideal: "f64".to_string(),
+                    },
+                    compatibility: Compatibility::Safe,
+                    reason: "widened".to_string(),
+                },
+                DiffEntry {
+                    table: "t".to_string(),
+                    sql_table: Some("t".to_string()),
+                    column: Some("b".to_string()),
+                    change: DiffChange::MissingPctChanged { old: 0.0, new: 5.0 },
+                    compatibility: Compatibility::Safe,
+                    reason: "became nullable".to_string(),
+                },
+            ],
+        };
+        let json = render_diff_json(Path::new("old.json"), Path::new("new.json"), &report);
+        let doc = json_support::from_str(&json).unwrap();
+        let changes = doc.get("changes").unwrap().as_array().unwrap();
+        let type_changed = changes
+            .iter()
+            .find(|c| c.get("column").and_then(JsonValue::as_str) == Some("a"))
+            .unwrap();
+        assert_eq!(
+            type_changed
+                .get("new_ideal_type")
+                .and_then(JsonValue::as_str),
+            Some("f64")
+        );
+        let missing_changed = changes
+            .iter()
+            .find(|c| c.get("column").and_then(JsonValue::as_str) == Some("b"))
+            .unwrap();
+        assert_eq!(
+            missing_changed
+                .get("new_missing_pct")
+                .and_then(JsonValue::as_f64),
+            Some(5.0)
+        );
+    }
+
+    #[test]
+    fn render_diff_resolution_sql_discloses_when_no_safe_changes_exist() {
+        let report = DiffReport {
+            entries: vec![DiffEntry {
+                table: "t".to_string(),
+                sql_table: Some("t".to_string()),
+                column: Some("gone".to_string()),
+                change: DiffChange::ColumnRemoved {
+                    ideal_type: "String".to_string(),
+                },
+                compatibility: Compatibility::Breaking,
+                reason: "dropped".to_string(),
+            }],
+        };
+        let sql = render_diff_resolution_sql(&report);
+        assert!(sql.contains("No safe, auto-generatable changes found."));
+        assert!(!sql.contains("ALTER TABLE \"t\" ADD"));
+    }
+
+    #[test]
+    fn diff_dictionaries_reports_nothing_for_two_identical_tables() {
+        let mut old = BTreeMap::new();
+        old.insert("t".to_string(), vec![col("id", "i64", 0.0, &["1", "2"])]);
+        let new = old.clone();
+        let report = diff_dictionaries(&old, &new);
+        assert!(report.entries.is_empty());
+    }
 }
 
 // --- Unit tests for the heuristic engine ---

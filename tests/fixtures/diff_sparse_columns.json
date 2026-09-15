@@ -1,0 +1,9 @@
+{
+  "file": "sparse.csv",
+  "tables": {
+    "t": [
+      { "name": "id", "ideal_type": "i64" },
+      { "name": "label", "ideal_type": "String", "sample_values": [1, true, null, "x", "y"] }
+    ]
+  }
+}

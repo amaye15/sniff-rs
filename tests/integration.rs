@@ -10731,3 +10731,255 @@ fn diff_multi_table_dictionaries_match_tables_by_name() {
         report.contains("users") && report.contains("email") && report.contains("column added")
     );
 }
+
+// --- `sniff-rs diff` - committed fixture pairs, exercising every change
+// kind and classification at once, plus malformed/degenerate inputs.
+// These are permanent, reviewable assets (see CLAUDE.md's own "reviewable
+// without reading test code" convention for every other format's fixture
+// corpus) rather than only ever built on the fly under a TempDir.
+
+fn run_diff_json_fixtures(old: &str, new: &str, extra_args: &[&str]) -> serde_json::Value {
+    let mut args: Vec<&str> = vec![old, new, "--output-format", "json"];
+    args.extend_from_slice(extra_args);
+    let output = run_diff_raw(&args);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout was not valid JSON ({e}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+fn find_change<'a>(
+    doc: &'a serde_json::Value,
+    column: &str,
+    kind: &str,
+) -> Option<&'a serde_json::Value> {
+    doc["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["column"] == column && c["kind"] == kind)
+}
+
+#[test]
+fn diff_fixture_pair_exercises_every_change_kind_and_classification() {
+    let old = fixture("diff_old.json");
+    let new = fixture("diff_new.json");
+    let doc = run_diff_json_fixtures(old.to_str().unwrap(), new.to_str().unwrap(), &[]);
+
+    let rename = find_change(&doc, "name -> full_name", "possible rename").unwrap();
+    assert_eq!(rename["compatibility"], "safe");
+    assert_eq!(rename["from"], "name");
+    assert_eq!(rename["to"], "full_name");
+
+    let removed = find_change(&doc, "legacy_score", "column removed").unwrap();
+    assert_eq!(removed["compatibility"], "breaking");
+
+    let widened = find_change(&doc, "signup_year", "type changed").unwrap();
+    assert_eq!(widened["compatibility"], "safe");
+    assert_eq!(widened["old_ideal_type"], "i64");
+    assert_eq!(widened["new_ideal_type"], "f64");
+
+    let narrowed = find_change(&doc, "status", "type changed").unwrap();
+    assert_eq!(narrowed["compatibility"], "breaking");
+    assert_eq!(narrowed["old_ideal_type"], "String");
+    assert_eq!(narrowed["new_ideal_type"], "i64");
+
+    let became_nullable = find_change(&doc, "phone", "missing % changed").unwrap();
+    assert_eq!(became_nullable["compatibility"], "safe");
+    assert_eq!(became_nullable["old_missing_pct"], 0.0);
+    assert_eq!(became_nullable["new_missing_pct"], 15.0);
+
+    let became_full = find_change(&doc, "verified", "missing % changed").unwrap();
+    assert_eq!(became_full["compatibility"], "breaking");
+    assert_eq!(became_full["old_missing_pct"], 20.0);
+    assert_eq!(became_full["new_missing_pct"], 0.0);
+
+    let safe_add = find_change(&doc, "notes", "column added").unwrap();
+    assert_eq!(safe_add["compatibility"], "safe");
+
+    let breaking_add = find_change(&doc, "account_id", "column added").unwrap();
+    assert_eq!(breaking_add["compatibility"], "breaking");
+
+    // Exactly these 8 changes - "id" is completely unchanged and must
+    // never show up as a spurious entry.
+    assert_eq!(doc["changes"].as_array().unwrap().len(), 8);
+    assert_eq!(doc["has_breaking_changes"], true);
+}
+
+#[test]
+fn diff_fixture_pair_resolution_sql_only_alters_the_safe_side() {
+    let dir = TempDir::new();
+    let sql_path = dir.path().join("resolution.sql");
+    let output = run_diff_raw(&[
+        fixture("diff_old.json").to_str().unwrap(),
+        fixture("diff_new.json").to_str().unwrap(),
+        "--resolution-sql",
+        sql_path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+
+    // Both dictionaries name their one table "customers", so there's a
+    // real, unambiguous table to write ALTER TABLE against.
+    assert!(sql.contains("ALTER TABLE \"customers\" ADD COLUMN \"notes\" TEXT;"));
+    assert!(!sql.contains("ADD COLUMN \"account_id\""));
+    assert!(sql.contains("-- ALTER TABLE \"customers\" RENAME COLUMN \"name\" TO \"full_name\";"));
+    // Every breaking change is named in the leading comment block, never
+    // turned into a live statement.
+    for breaking_col in ["legacy_score", "status", "verified", "account_id"] {
+        assert!(
+            sql.contains(breaking_col),
+            "expected {breaking_col} to be named in the breaking-changes comment:\n{sql}"
+        );
+    }
+    assert!(!sql.contains("DROP") && !sql.contains("CREATE TABLE"));
+}
+
+#[test]
+fn diff_multitable_fixture_pair_matches_tables_by_name() {
+    let doc = run_diff_json_fixtures(
+        fixture("diff_old_multitable.json").to_str().unwrap(),
+        fixture("diff_new_multitable.json").to_str().unwrap(),
+        &[],
+    );
+    let changes = doc["changes"].as_array().unwrap();
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["table"] == "orders" && c["kind"] == "table removed")
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["table"] == "payments" && c["kind"] == "table added")
+    );
+    let email_added = changes
+        .iter()
+        .find(|c| c["table"] == "users" && c["column"] == "email")
+        .unwrap();
+    assert_eq!(email_added["kind"], "column added");
+    assert_eq!(email_added["compatibility"], "safe");
+}
+
+#[test]
+fn diff_sparse_columns_defaults_missing_fields_and_ignores_non_string_samples() {
+    // "label" is byte-for-byte identical on both sides (once its own
+    // non-string sample values are filtered out) - it must produce zero
+    // diff entries, proving DiffColumn::from_json's defaults/filtering
+    // don't themselves manufacture a spurious difference.
+    let doc = run_diff_json_fixtures(
+        fixture("diff_sparse_columns.json").to_str().unwrap(),
+        fixture("diff_sparse_columns_new.json").to_str().unwrap(),
+        &[],
+    );
+    let changes = doc["changes"].as_array().unwrap();
+    assert!(changes.iter().all(|c| c["column"] != "label"));
+    assert!(changes.iter().all(|c| c["column"] != "id"));
+    let extra = changes.iter().find(|c| c["column"] == "extra").unwrap();
+    assert_eq!(extra["kind"], "column added");
+    assert_eq!(extra["compatibility"], "safe");
+}
+
+#[test]
+fn diff_self_comparison_reports_no_differences() {
+    let old = fixture("diff_old.json");
+    let output = run_diff_raw(&[old.to_str().unwrap(), old.to_str().unwrap()]);
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("No differences detected"));
+}
+
+#[test]
+fn diff_writes_the_report_to_an_explicit_output_path() {
+    let dir = TempDir::new();
+    let out_path = dir.path().join("report.md");
+    let output = run_diff_raw(&[
+        fixture("diff_old.json").to_str().unwrap(),
+        fixture("diff_new.json").to_str().unwrap(),
+        out_path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("change(s)"));
+    let written = std::fs::read_to_string(&out_path).unwrap();
+    assert!(written.contains("# Schema diff"));
+}
+
+#[test]
+fn diff_help_flag_prints_usage_and_exits_cleanly() {
+    let output = run_diff_raw(&["--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("USAGE"));
+    assert!(stdout.contains("--resolution-sql"));
+}
+
+#[test]
+fn diff_malformed_no_tables_json_is_a_clear_error() {
+    let output = run_diff_raw(&[
+        fixture("diff_malformed_no_tables.json").to_str().unwrap(),
+        fixture("diff_old.json").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"tables\""));
+}
+
+#[test]
+fn diff_malformed_table_not_array_json_is_a_clear_error() {
+    let output = run_diff_raw(&[
+        fixture("diff_malformed_table_not_array.json")
+            .to_str()
+            .unwrap(),
+        fixture("diff_old.json").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("isn't a JSON array of columns"));
+}
+
+#[test]
+fn diff_malformed_invalid_json_is_a_clear_error_not_a_panic() {
+    let output = run_diff_raw(&[
+        fixture("diff_malformed_invalid_json.json")
+            .to_str()
+            .unwrap(),
+        fixture("diff_old.json").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not valid JSON"));
+}
+
+#[test]
+fn diff_malformed_column_not_object_is_a_clear_error() {
+    let output = run_diff_raw(&[
+        fixture("diff_malformed_column_not_object.json")
+            .to_str()
+            .unwrap(),
+        fixture("diff_old.json").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expected each column entry to be a JSON object"));
+}
+
+#[test]
+fn diff_malformed_column_missing_name_is_a_clear_error() {
+    let output = run_diff_raw(&[
+        fixture("diff_malformed_column_missing_name.json")
+            .to_str()
+            .unwrap(),
+        fixture("diff_old.json").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing a string \"name\" field"));
+}

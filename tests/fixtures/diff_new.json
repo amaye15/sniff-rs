@@ -1,0 +1,88 @@
+{
+  "file": "customers_new.csv",
+  "format": "csv",
+  "tables": {
+    "customers": [
+      {
+        "name": "id",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["1", "2", "3"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "full_name",
+        "current_type": "String",
+        "ideal_type": "String",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["alice", "bob", "carol"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "signup_year",
+        "current_type": "f64",
+        "ideal_type": "f64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["2020.0", "2021.0", "2022.0"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "status",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["1", "0", "1"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "phone",
+        "current_type": "String",
+        "ideal_type": "String",
+        "description": "",
+        "missing_pct": 15.0,
+        "sample_values": ["555-0100", "555-0101"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "verified",
+        "current_type": "bool",
+        "ideal_type": "bool",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["true", "false", "true"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "notes",
+        "current_type": "String",
+        "ideal_type": "String",
+        "description": "",
+        "missing_pct": 33.3,
+        "sample_values": ["vip"],
+        "notes": "",
+        "row_count": 3
+      },
+      {
+        "name": "account_id",
+        "current_type": "i64",
+        "ideal_type": "i64",
+        "description": "",
+        "missing_pct": 0.0,
+        "sample_values": ["1001", "1002", "1003"],
+        "notes": "",
+        "row_count": 3
+      }
+    ]
+  }
+}

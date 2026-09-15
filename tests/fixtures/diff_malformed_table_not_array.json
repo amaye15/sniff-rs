@@ -1,0 +1,9 @@
+{
+  "file": "fake.json",
+  "tables": {
+    "t": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+}
