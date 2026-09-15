@@ -3013,6 +3013,80 @@ form, an unrecognized flag, a missing `--resolution-sql` value, an extra
 positional argument, `--help`, writing the report to an explicit output
 path instead of stdout, and comparing a dictionary against itself).
 
+**A memory-optimization pass, prompted by an explicit "focus on memory,
+performance, and streaming" request, found `load_dictionary_tables`
+(the very first thing `sniff-rs diff` does to each input) hadn't been
+profiled at all yet - the newest, least-audited code path in the whole
+project.** Measured, not assumed, the same discipline this project's own
+Performance/Streaming sections apply everywhere else: a real 36 MB,
+6,000-table/25-column synthetic dictionary pair (generated the same way
+every other large-file measurement in this project's history is) had
+`sniff-rs diff` peaking at maxRSS 340 MB / peak footprint 301 MB - a real
+multiplication of the combined ~72 MB input, caused by the exact "read
+the whole file into a `String`, parse into one whole `Value` tree, then
+`.clone()` every string field out of it into a second, `DiffColumn`-
+shaped copy" double-buffering pattern this project's own streaming-reads
+campaign already eliminated from every other reader.
+
+Fixed in two steps, each measured independently before moving to the
+next:
+
+1. **Stop cloning.** `DiffColumn::from_json_owned` consumes one column's
+   own parsed JSON object *by value*, moving each field's `String` out
+   of it via `Map`'s existing `IntoIterator` rather than
+   `.as_str()...to_string()`-cloning it, and `load_dictionary_tables`
+   itself drops the raw file text the instant parsing finishes (it's
+   never touched again). Alone, this took peak footprint from 301 MB to
+   258 MB - real, but modest, since the parsed `Value` tree itself (one
+   heap-allocated `String` per JSON string in the document) was still
+   fully resident for the whole file at once regardless.
+2. **Stop double-buffering the whole `tables` object, not just each
+   column.** `json_support::stream_object_of_arrays` - a new primitive,
+   the sibling of the existing `stream_top_level`/`stream_nested_array`
+   byte-window scanners this project's own streaming-reads campaign
+   already built - locates a top-level object's `target_key` value (here,
+   `"tables"`) via the identical "track string/bracket state, skip a
+   sibling key's value as an opaque byte span, never parse its meaning"
+   technique those two already use, then streams *that* object's own
+   key/array-value pairs one at a time: each table's array is parsed via
+   `from_str` on just its own byte span, handed to a callback, and
+   dropped before the next table is even read. `load_dictionary_tables`
+   now streams straight off the open `File` through this primitive
+   instead of ever building one `Value` tree for the whole `tables`
+   object - peak memory during the walk is one table's own array plus
+   whatever's already been converted into `DiffColumn`s, never the whole
+   file's parsed tree at once. Measured against the same synthetic pair:
+   maxRSS dropped to 159 MB (~53% off the original) and peak footprint to
+   158 MB (~47% off the original), with `diff` confirming byte-identical
+   `--output-format json` output against the pre-change binary throughout
+   both steps.
+
+`first_error` - a sidecar `Option<Error>` captured by the streaming
+callback - is what lets a *semantic* failure (a table's value isn't an
+array, a column fails to parse) surface with its own full, specific
+message and error chain intact, rather than being flattened through
+`ParseError`'s bare-string channel and re-wrapped in a misleading "is not
+valid JSON" (the document *is* syntactically valid; it's just the wrong
+shape) - only a genuine JSON-syntax error from the scanner itself gets
+that wrapping. `scan_string`/`ParseError::custom` - previously reachable
+only from the feature-gated GeoJSON/HAR readers - lost their `#[allow(
+dead_code)]` attributes once `stream_object_of_arrays` (part of the
+always-on `diff` subcommand) started using them unconditionally.
+
+Verified the same way as every other change in this document: the full
+existing `diff`-feature test suite (all malformed/edge-case fixtures,
+which exercise every one of `load_dictionary_tables`'s own error paths)
+passed unchanged with zero test modifications needed, six new direct
+unit tests on `stream_object_of_arrays` itself lock in its own
+correctness (entry order, skipping a sibling key whose own value
+contains tricky structural characters inside a string, a missing target
+key, a genuinely empty target object, a non-object top-level value, and
+callback-error propagation), and a real `--resolution-sql` run against
+`diff_old.json`/`diff_new.json` was re-verified byte-identical against
+the version already checked against a real, installed SQLite build
+before this pass began. Clean across default/`full`, matching each
+build's own established clippy baseline (full=6, default=2) exactly.
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:

@@ -1658,21 +1658,16 @@ mod json_support {
 
         /// Reads one JSON string literal at the current position (which
         /// must be `"`), with escapes decoded - used by `stream_nested_
-        /// array`'s own key-matching loop, which needs the string's real
-        /// value to compare against a known field name, unlike
-        /// `scan_value`'s own span-only tracking. Byte-safe for
-        /// multi-byte UTF-8 content: every unescaped byte is pushed
-        /// straight through (a continuation byte is always `>= 0x80`,
-        /// never one of the single-byte ASCII structural characters this
-        /// scan branches on), and a `\uXXXX` escape's resulting
-        /// codepoint is encoded to UTF-8 before being appended - the
-        /// same "decode once, byte-safe" discipline this project's other
-        /// hand-rolled string scanners already use.
-        // Only reachable via `stream_nested_array`, which every one of
-        // its own callers (geojson_support/har_support) gates behind
-        // its own optional feature - genuinely unused in the bare
-        // default build.
-        #[allow(dead_code)]
+        /// array`'s and `stream_object_of_arrays`'s own key-matching
+        /// loops, which need the string's real value to compare against
+        /// a known field name, unlike `scan_value`'s own span-only
+        /// tracking. Byte-safe for multi-byte UTF-8 content: every
+        /// unescaped byte is pushed straight through (a continuation
+        /// byte is always `>= 0x80`, never one of the single-byte ASCII
+        /// structural characters this scan branches on), and a `\uXXXX`
+        /// escape's resulting codepoint is encoded to UTF-8 before being
+        /// appended - the same "decode once, byte-safe" discipline this
+        /// project's other hand-rolled string scanners already use.
         fn scan_string(&mut self) -> std::result::Result<String, ParseError> {
             if self.bump()? != Some(b'"') {
                 return Err(self.err("expected '\"' to start a JSON string"));
@@ -1723,16 +1718,13 @@ mod json_support {
 
     impl ParseError {
         /// Lets a caller outside this module (a format reader built on
-        /// `stream_nested_array`, whose own record-building can fail for
-        /// reasons this parser knows nothing about - a `Feature` whose
-        /// `properties` isn't an object, say) signal its own error
-        /// through the same channel `on_value` already reports parse
-        /// errors through, rather than needing a second, parallel error
-        /// path.
-        // Only reachable from geojson_support/har_support, each behind
-        // its own optional feature - genuinely unused in the bare
-        // default build.
-        #[allow(dead_code)]
+        /// `stream_nested_array`/`stream_object_of_arrays`, whose own
+        /// record-building can fail for reasons this parser knows
+        /// nothing about - a `Feature` whose `properties` isn't an
+        /// object, say, or `sniff-rs diff`'s own "this table's value
+        /// isn't an array" check) signal its own error through the same
+        /// channel `on_value`/`on_entry` already reports parse errors
+        /// through, rather than needing a second, parallel error path.
         pub(crate) fn custom(message: impl Into<String>) -> Self {
             ParseError {
                 message: message.into(),
@@ -1848,6 +1840,99 @@ mod json_support {
         let mut win = ByteWindow::new(reader);
         let mut span: Vec<u8> = Vec::new();
         descend(&mut win, &mut span, path, &mut on_value)
+    }
+
+    /// Streams a top-level object's `target_key` value, which must
+    /// itself be an object whose own values are arrays - the exact
+    /// shape `sniff-rs diff`'s own dictionary documents have
+    /// (`{"tables": {name: [...], ...}}`). Every sibling key at the top
+    /// level (`"file"`/`"format"`/`"directory"`, or anything else) is
+    /// skipped via the same byte-span scan `scan_value` already uses to
+    /// walk past an unrelated field in `stream_nested_array` above, so
+    /// it's never parsed into a `Value` at all; once `target_key` is
+    /// found, each of *its own* keys' array values is parsed one at a
+    /// time via `from_str` and handed to `on_entry`, then dropped before
+    /// the next one is read - so peak memory during this walk is one
+    /// entry's own array span and parsed tree, never the whole
+    /// `target_key` object's tree at once. A real, measured concern this
+    /// exists to fix, not a hypothetical one - see `load_dictionary_
+    /// tables`'s own doc comment for the before/after numbers on a
+    /// large, multi-table dictionary.
+    ///
+    /// Returns `Ok(false)` (not an error) if the top-level value is a
+    /// well-formed JSON object but has no `target_key` at all - the same
+    /// "no fallback needed here, but don't conflate with a real parse
+    /// error" contract `stream_nested_array` already has. Once
+    /// `target_key` is found and fully streamed, this returns
+    /// immediately without validating whatever the rest of the document
+    /// contains - the identical narrower guarantee `stream_nested_array`
+    /// already accepts, for the same reason.
+    pub(crate) fn stream_object_of_arrays<R: std::io::Read>(
+        reader: R,
+        target_key: &str,
+        mut on_entry: impl FnMut(String, Value) -> std::result::Result<(), ParseError>,
+    ) -> std::result::Result<bool, ParseError> {
+        let mut win = ByteWindow::new(reader);
+        let mut span: Vec<u8> = Vec::new();
+
+        win.skip_ws()?;
+        if win.bump()? != Some(b'{') {
+            return Err(win.err("expected a top-level JSON object"));
+        }
+        win.skip_ws()?;
+        if win.peek()? == Some(b'}') {
+            win.pos += 1;
+            return Ok(false); // empty object - target_key not found
+        }
+        loop {
+            win.skip_ws()?;
+            let key = win.scan_string()?;
+            win.skip_ws()?;
+            if win.bump()? != Some(b':') {
+                return Err(win.err("expected ':' after an object key"));
+            }
+            win.skip_ws()?;
+            if key == target_key {
+                if win.bump()? != Some(b'{') {
+                    return Err(win.err(format!("expected \"{target_key}\" to be an object")));
+                }
+                win.skip_ws()?;
+                if win.peek()? == Some(b'}') {
+                    win.pos += 1; // empty object - zero entries, still found
+                } else {
+                    loop {
+                        win.skip_ws()?;
+                        let entry_key = win.scan_string()?;
+                        win.skip_ws()?;
+                        if win.bump()? != Some(b':') {
+                            return Err(win.err("expected ':' after an object key"));
+                        }
+                        win.skip_ws()?;
+                        win.scan_value(&mut span)?;
+                        let s = std::str::from_utf8(&span).map_err(|e| ParseError {
+                            message: format!("invalid UTF-8 in JSON: {e}"),
+                            line: 0,
+                            column: 0,
+                        })?;
+                        on_entry(entry_key, from_str(s)?)?;
+                        win.skip_ws()?;
+                        match win.bump()? {
+                            Some(b',') => continue,
+                            Some(b'}') => break,
+                            _ => return Err(win.err("expected ',' or '}' in a JSON object")),
+                        }
+                    }
+                }
+                return Ok(true);
+            }
+            win.scan_value(&mut span)?; // not the field we're looking for - skip it
+            win.skip_ws()?;
+            match win.bump()? {
+                Some(b',') => continue,
+                Some(b'}') => return Ok(false),
+                _ => return Err(win.err("expected ',' or '}' in a JSON object")),
+            }
+        }
     }
 
     /// Reads a JSON document straight off a byte stream, handing each
@@ -1971,6 +2056,92 @@ mod json_support {
             // Unbalanced / unterminated.
             assert!(stream_collect(b"[1, 2").is_err());
             assert!(stream_collect(b"{\"a\": [1, 2}").is_err());
+        }
+
+        fn stream_object_of_arrays_collect(
+            bytes: &[u8],
+            key: &str,
+        ) -> std::result::Result<Option<Vec<(String, Value)>>, ParseError> {
+            let mut out = Vec::new();
+            let found = stream_object_of_arrays(bytes, key, |name, v| {
+                out.push((name, v));
+                Ok(())
+            })?;
+            Ok(if found { Some(out) } else { None })
+        }
+
+        #[test]
+        fn stream_object_of_arrays_yields_every_entry_in_order() {
+            let got = stream_object_of_arrays_collect(
+                br#"{"file": "x.json", "tables": {"b": [1, 2], "a": [3]}, "format": "csv"}"#,
+                "tables",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(got.len(), 2);
+            assert_eq!(got[0].0, "b");
+            assert_eq!(
+                got[0].1,
+                Value::Array(vec![Value::from(1i64), Value::from(2i64)])
+            );
+            assert_eq!(got[1].0, "a");
+            assert_eq!(got[1].1, Value::Array(vec![Value::from(3i64)]));
+        }
+
+        #[test]
+        fn stream_object_of_arrays_skips_sibling_keys_with_tricky_structural_content() {
+            // A sibling field's own value contains brackets/braces/commas
+            // and an escaped quote *inside a string* - none of that may be
+            // mistaken for real structure while skipping past it to reach
+            // the real target key.
+            let got = stream_object_of_arrays_collect(
+                br#"{"noise": ["a]b,c{d", {"x\"y": [1,2,3]}], "tables": {"t": [42]}}"#,
+                "tables",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                got,
+                vec![("t".to_string(), Value::Array(vec![Value::from(42i64)]))]
+            );
+        }
+
+        #[test]
+        fn stream_object_of_arrays_returns_false_when_the_key_is_missing() {
+            assert_eq!(
+                stream_object_of_arrays_collect(br#"{"file": "x.json"}"#, "tables").unwrap(),
+                None
+            );
+            // A genuinely empty top-level object has no key to find either.
+            assert_eq!(
+                stream_object_of_arrays_collect(b"{}", "tables").unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn stream_object_of_arrays_handles_a_genuinely_empty_target_object() {
+            let got = stream_object_of_arrays_collect(br#"{"tables": {}}"#, "tables")
+                .unwrap()
+                .unwrap();
+            assert!(got.is_empty());
+        }
+
+        #[test]
+        fn stream_object_of_arrays_rejects_a_non_object_top_level_value() {
+            assert!(stream_object_of_arrays_collect(b"[1, 2, 3]", "tables").is_err());
+            assert!(stream_object_of_arrays_collect(b"42", "tables").is_err());
+        }
+
+        #[test]
+        fn stream_object_of_arrays_propagates_a_callback_error() {
+            let err = stream_object_of_arrays(
+                br#"{"tables": {"t": [1]}}"#.as_slice(),
+                "tables",
+                |_name, _v| Err(ParseError::custom("boom")),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("boom"));
         }
 
         #[test]
@@ -63264,39 +63435,61 @@ struct DiffColumn {
 }
 
 impl DiffColumn {
-    fn from_json(v: &JsonValue) -> Result<Self> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| anyhow!("expected each column entry to be a JSON object"))?;
-        let name = obj
-            .get("name")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| anyhow!("column entry is missing a string \"name\" field"))?
-            .to_string();
-        let current_type = obj
-            .get("current_type")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_string();
-        let ideal_type = obj
-            .get("ideal_type")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_string();
-        let missing_pct = obj
-            .get("missing_pct")
-            .and_then(JsonValue::as_f64)
-            .unwrap_or(0.0);
-        let sample_values = obj
-            .get("sample_values")
-            .and_then(JsonValue::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(JsonValue::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// Consumes one column's own JSON object *by value*, moving each
+    /// field's string data out of it rather than cloning - see
+    /// `load_dictionary_tables`'s own doc comment for why this matters:
+    /// a real, multi-table dictionary can be tens of megabytes, and a
+    /// `.clone()` of every string field would double the effective
+    /// in-memory cost of data that's already resident once, as the
+    /// parsed `Value` tree's own owned strings, for no reason - nothing
+    /// else ever needs that tree again once each column has been
+    /// converted. Every field not matched below (`description`/`notes`/
+    /// `row_count`, or anything a hand-edited document might add) is
+    /// simply dropped as the owned iteration passes it, exactly as the
+    /// old borrowing version already ignored it.
+    fn from_json_owned(v: JsonValue) -> Result<Self> {
+        let JsonValue::Object(obj) = v else {
+            bail!("expected each column entry to be a JSON object");
+        };
+        let mut name = None;
+        let mut current_type = String::new();
+        let mut ideal_type = String::new();
+        let mut missing_pct = 0.0;
+        let mut sample_values = Vec::new();
+        for (key, value) in obj {
+            match key.as_str() {
+                "name" => {
+                    if let JsonValue::String(s) = value {
+                        name = Some(s);
+                    }
+                }
+                "current_type" => {
+                    if let JsonValue::String(s) = value {
+                        current_type = s;
+                    }
+                }
+                "ideal_type" => {
+                    if let JsonValue::String(s) = value {
+                        ideal_type = s;
+                    }
+                }
+                "missing_pct" => missing_pct = value.as_f64().unwrap_or(0.0),
+                "sample_values" => {
+                    if let JsonValue::Array(items) = value {
+                        sample_values = items
+                            .into_iter()
+                            .filter_map(|item| match item {
+                                JsonValue::String(s) => Some(s),
+                                _ => None,
+                            })
+                            .collect();
+                    }
+                }
+                _ => {}
+            }
+        }
+        let name =
+            name.ok_or_else(|| anyhow!("column entry is missing a string \"name\" field"))?;
         Ok(DiffColumn {
             name,
             current_type,
@@ -63313,27 +63506,80 @@ impl DiffColumn {
 /// original order (not re-sorted) - `DiffChange::ColumnRenamed`'s own
 /// position-adjacency signal, below, needs each column's real position
 /// within its own file.
+///
+/// Streams straight off the file via `json_support::stream_object_of_
+/// arrays` rather than reading the whole document into one `String`
+/// and parsing it into one giant `Value` tree first - the same "stop
+/// double-buffering" discipline this project's own streaming-reads
+/// campaign already applied to every format reader, measured directly
+/// here too, not assumed: a real 36 MB, 6,000-table/25-column synthetic
+/// dictionary pair (generated the same way every other large-file
+/// measurement in this project's history is) had `sniff-rs diff`
+/// peaking at maxRSS 340 MB / peak footprint 301 MB for the pair of
+/// files under the original whole-document-then-clone design - a real
+/// multiplication of the combined ~72 MB input, for data a dictionary
+/// genuinely can reach (a `--combine` run over a directory with
+/// thousands of files, or a wide multi-hundred-column real-world
+/// schema). Streaming one table's own array at a time - converting it
+/// straight into `Vec<DiffColumn>` and dropping its own parsed `Value`
+/// tree before the next table is even read - bounds peak memory to one
+/// table's own size plus whatever's already been converted, never the
+/// whole file's parsed tree at once: measured directly against the same
+/// synthetic pair, maxRSS dropped to 159 MB (~53%) and peak footprint to
+/// 158 MB (~47%), with byte-identical `--output-format json` output
+/// confirmed via `diff` against the pre-change binary.
+///
+/// `first_error` is a sidecar rather than converting every failure
+/// through `json_support::ParseError` directly: a genuine JSON-syntax
+/// error from the scanner itself is wrapped with "is not valid JSON"
+/// context, but a semantic error this function's own callback raises
+/// (a table's value isn't an array, a column fails to parse) already
+/// carries its own complete, specific message and error chain - forcing
+/// it through a bare `ParseError` string and back would flatten that
+/// chain and prefix it with a misleading "is not valid JSON" (the
+/// document *is* valid JSON; it's just the wrong shape), so the real
+/// `Error` is captured here and returned directly instead.
 fn load_dictionary_tables(path: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
-    let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-    let doc =
-        json_support::from_str(&text).with_context(|| format!("{path:?} is not valid JSON"))?;
-    let tables_val = doc.get("tables").ok_or_else(|| {
-        anyhow!(
+    let file = fs::File::open(path).with_context(|| format!("failed to read {path:?}"))?;
+    let mut tables: BTreeMap<String, Vec<DiffColumn>> = BTreeMap::new();
+    let mut first_error: Option<Error> = None;
+
+    let stream_result = json_support::stream_object_of_arrays(file, "tables", |name, cols| {
+        let JsonValue::Array(items) = cols else {
+            first_error = Some(anyhow!(
+                "{path:?}: table {name:?}'s own value isn't a JSON array of columns"
+            ));
+            return Err(json_support::ParseError::custom("not an array of columns"));
+        };
+        let mut cols_out = Vec::with_capacity(items.len());
+        for item in items {
+            match DiffColumn::from_json_owned(item) {
+                Ok(c) => cols_out.push(c),
+                Err(e) => {
+                    first_error = Some(e);
+                    return Err(json_support::ParseError::custom("column parse error"));
+                }
+            }
+        }
+        tables.insert(name, cols_out);
+        Ok(())
+    });
+
+    let found = match stream_result {
+        Ok(found) => found,
+        Err(parse_err) => {
+            return match first_error {
+                Some(e) => Err(e),
+                None => Err(parse_err).with_context(|| format!("{path:?} is not valid JSON")),
+            };
+        }
+    };
+    if !found {
+        bail!(
             "{path:?} has no top-level \"tables\" object - `sniff-rs diff` compares two \
              --output-format json dictionaries (this tool's own rich JSON shape), not a raw \
              data file or a --output-format json-schema document"
-        )
-    })?;
-    let tables_obj = tables_val
-        .as_object()
-        .ok_or_else(|| anyhow!("{path:?}'s own \"tables\" field isn't a JSON object"))?;
-    let mut tables = BTreeMap::new();
-    for (name, cols) in tables_obj.iter() {
-        let arr = cols.as_array().ok_or_else(|| {
-            anyhow!("{path:?}: table {name:?}'s own value isn't a JSON array of columns")
-        })?;
-        let parsed: Result<Vec<DiffColumn>> = arr.iter().map(DiffColumn::from_json).collect();
-        tables.insert(name.clone(), parsed?);
+        );
     }
     Ok(tables)
 }
@@ -64457,12 +64703,13 @@ mod diff_tests {
     }
 
     #[test]
-    fn diff_column_from_json_defaults_missing_optional_fields_and_filters_non_string_samples() {
+    fn diff_column_from_json_owned_defaults_missing_optional_fields_and_filters_non_string_samples()
+    {
         let v = json_support::from_str(
             r#"{"name": "label", "ideal_type": "String", "sample_values": [1, true, null, "x", "y"]}"#,
         )
         .unwrap();
-        let col = DiffColumn::from_json(&v).unwrap();
+        let col = DiffColumn::from_json_owned(v).unwrap();
         assert_eq!(col.name, "label");
         assert_eq!(col.ideal_type, "String");
         assert_eq!(col.current_type, "");
@@ -64471,12 +64718,12 @@ mod diff_tests {
     }
 
     #[test]
-    fn diff_column_from_json_rejects_a_non_object_entry_or_a_missing_name() {
+    fn diff_column_from_json_owned_rejects_a_non_object_entry_or_a_missing_name() {
         let not_object = json_support::from_str(r#""just a string""#).unwrap();
-        assert!(DiffColumn::from_json(&not_object).is_err());
+        assert!(DiffColumn::from_json_owned(not_object).is_err());
 
         let missing_name = json_support::from_str(r#"{"ideal_type": "i64"}"#).unwrap();
-        assert!(DiffColumn::from_json(&missing_name).is_err());
+        assert!(DiffColumn::from_json_owned(missing_name).is_err());
     }
 
     #[test]
