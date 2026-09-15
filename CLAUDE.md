@@ -724,6 +724,30 @@ mode's own pre-existing output (`--output-format json/md/sql` without
 change binary, since this feature only touches the new `--load-into`
 branch of `run_directory`, not the normal per-file write path at all.
 
+**A later memory/performance/streaming audit pushed this feature's own
+verification past "a two-file directory" to real scale, and found the
+existing streaming design already holds - the only real cost is an
+inherent, already-disclosed architectural one, not a bug.** 1,500 real
+CSV files (5.9 MB total, 75,000 rows) each loaded into their own fresh
+SQLite database peaked at 10.9 MB maxRSS / 4.1 MB peak footprint - flat
+and small, confirming no per-file state leaks or accumulates across the
+loop. Wall-clock time was a different story: 8.69s total, versus 0.20s
+for the identical 1,500 files under plain `--output-format json` (no
+`--load-into` at all) - isolating the difference showed it's ~98%
+subprocess-spawn overhead (`sys` time and involuntary context switches
+both dominate the `--load-into` run's own profile), not this project's
+own code: spawning a real `sqlite3` process 1,500 times costs real,
+unavoidable OS-level process-creation time per file, the direct
+consequence of this feature's own deliberate "shell out to each engine's
+already-installed CLI, don't link a database driver of its own" design
+(see this section's own `--load-into` entry above for why that tradeoff
+was made). Fixing it would mean reversing that architectural choice
+(embedding a real SQLite/DuckDB/Postgres/MySQL driver crate, or batching
+many files into fewer subprocess invocations somehow) - a materially
+different feature, not a memory/streaming bug in this one, so it's
+disclosed here rather than "fixed" by quietly changing the design this
+project already settled on.
+
 **Deliberately not covered by an automated `cargo test`**: the full
 end-to-end happy path (an actual `--load-into sqlite:...` run spawning
 a real `sqlite3` process and succeeding) - matching this project's own
