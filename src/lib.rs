@@ -46149,6 +46149,57 @@ mod har_support {
         }
         Ok(profiler.finish())
     }
+
+    /// The HAR row-source for `render_sql_inline_flat` (Phase 22, the
+    /// eleventh format in the recursively-nested, JSON-bridge tier) - a
+    /// mechanical mirror of `columns_from_har`'s own decode loop just
+    /// above, folding each entry into `json_emit_row_for_sql` instead of
+    /// the profiling accumulator. HAR has only the one legal top-level
+    /// shape (`log.entries`, always an array of objects), so this always
+    /// runs in records mode - no dual-mode dispatch to consider, unlike
+    /// most of this tier's other formats. A fallible extraction can't use
+    /// `?` directly inside a closure whose own return type is a different
+    /// error type (`json_support::ParseError`, not this crate's `Error`),
+    /// so the first real error is captured here and re-raised once the
+    /// scan finishes, the same pattern JSON's own `stream_json_rows_
+    /// for_sql` already established for `stream_top_level`.
+    pub(crate) fn stream_har_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut seen = 0usize;
+        let mut first_err: Option<Error> = None;
+        let found = json_support::stream_nested_array(reader, &["log", "entries"], |v| match v {
+            JsonValue::Object(_) => {
+                if first_err.is_none()
+                    && let Err(e) = json_emit_row_for_sql(&v, columns, records_mode, sink)
+                {
+                    first_err = Some(e);
+                }
+                seen += 1;
+                Ok(())
+            }
+            other => Err(json_support::ParseError::custom(format!(
+                "log.entries[{seen}] is a {other:?}, not an object - not a well-formed HAR entry"
+            ))),
+        })
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        if !found {
+            bail!(
+                "{path:?} doesn't look like a HAR file - expected a top-level \
+                 `log.entries` array (HAR 1.2 §2.1)"
+            );
+        }
+        Ok(())
+    }
 } // mod har_support
 
 #[cfg(feature = "har")]
@@ -52864,6 +52915,7 @@ fn render_sql_inline_flat(
             | InputFormat::Bson
             | InputFormat::Plist
             | InputFormat::Json5
+            | InputFormat::Har
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -53106,6 +53158,7 @@ fn render_sql_inline_flat(
         InputFormat::Bson => render_sql_inline_flat_bson(read_path, profiles, &mut sink)?,
         InputFormat::Plist => render_sql_inline_flat_plist(read_path, profiles, &mut sink)?,
         InputFormat::Json5 => render_sql_inline_flat_json5(read_path, profiles, &mut sink)?,
+        InputFormat::Har => render_sql_inline_flat_har(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53670,6 +53723,31 @@ fn render_sql_inline_flat_json5(
     )
 }
 
+/// The HAR row-source wrapper for `render_sql_inline_flat` (Phase 22) -
+/// see `render_sql_inline_flat_avro`'s own doc comment; identical shape,
+/// just driven by `har_support::stream_har_rows_for_sql`'s own `log.
+/// entries` re-decode loop instead.
+#[cfg(feature = "har")]
+fn render_sql_inline_flat_har(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    har_support::stream_har_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "har"))]
+fn render_sql_inline_flat_har(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "HAR support isn't compiled in - rebuild with `cargo build --release --features har` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53815,12 +53893,13 @@ fn render_sql(
             | InputFormat::Bson
             | InputFormat::Plist
             | InputFormat::Json5
+            | InputFormat::Har
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5 are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -61094,10 +61173,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Bson
                 | InputFormat::Plist
                 | InputFormat::Json5
+                | InputFormat::Har
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5 are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har are supported so far",
             format.as_str()
         );
     }

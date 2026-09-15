@@ -322,9 +322,9 @@ Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
-Avro, XML, BSON, Property List (plist), and JSON5/JSONC, the first ten
-formats in the recursively-nested, JSON-bridge tier. Every other format
-transparently falls back to `staging` with a disclosed stderr
+Avro, XML, BSON, Property List (plist), JSON5/JSONC, and HAR, the first
+eleven formats in the recursively-nested, JSON-bridge tier. Every other
+format transparently falls back to `staging` with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
 asked for would be the wrong kind of quiet).
@@ -367,8 +367,8 @@ needs its own real design, not just repeating the same pattern:
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
-   MessagePack, CBOR, Avro, XML, BSON, plist, and JSON5/JSONC done as of
-   Phases 13-21.** Unlike the two tiers above, there was no existing
+   MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, and HAR done
+   as of Phases 13-22.** Unlike the two tiers above, there was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -422,7 +422,12 @@ needs its own real design, not just repeating the same pattern:
    top-level-array streaming scanner (`stream_top_level_array`, already
    built for profiling) needed no `--nrows`-invariant bookkeeping the way
    `columns_from_json5` itself needs, since `InlineRowSink::accept`'s own
-   cap is the only truncation logic this row-source ever needs. HAR,
+   cap is the only truncation logic this row-source ever needs. HAR
+   carried all three shared functions over unchanged too (the eighth
+   format in a row) - it has only the one legal top-level shape
+   (`log.entries`, always an array of objects), so it always runs in
+   records mode with no dual-mode dispatch to consider at all, the same
+   simplicity BSON's own single-shape format already demonstrated.
    GeoJSON, vCard, iCalendar, and MBOX remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
@@ -1815,19 +1820,60 @@ Phase 20's own three tests that used JSON5 as their "still genuinely
 unsupported format" example moved to HAR instead, gated behind
 `--features har` - the same one-hop-forward shuffle repeats itself again.
 
-Remaining in the recursively-nested, JSON-bridge tier: HAR, GeoJSON,
-vCard, iCalendar, and MBOX - each bridges to the same `json_support::
-Value` shape JSON itself uses (see the Architecture section), so `json_
-extract_value_for_sql`/`json_inline_blocking_column`/`json_bridge_
-columns_and_mode` are already reusable as-is once each format's own
-row-source re-decodes its file a second time into that same `Value`
-tree - Phases 14 through 21 are direct, working proof of this now, not
-just a plan (eight formats in a row needed zero changes to any of the
-three shared functions). vCard/iCalendar/MBOX's own repeated-property
-pooling (a different mechanism from JSON's array pooling, but the
-identical one-cell-per-row question) is the one sub-family that will
-need its own fresh look before assuming the same machinery applies
-unchanged.
+**Phase 22: HAR (HTTP Archive) - the eleventh format in the recursively-
+nested, JSON-bridge tier, and the eighth format in a row needing zero
+changes to `json_extract_value_for_sql`/`json_inline_blocking_column`/
+`json_bridge_columns_and_mode`.** HAR's own profiling reader (`columns_
+from_har`) already streams `log.entries` straight off a `BufReader` via
+`json_support::stream_nested_array` (a scanner built during this
+project's own streaming-reads campaign, well before this SQL campaign
+existed - HAR is a real spec-defined shape with only the one legal
+top-level structure, so it has no dual-mode dispatch to consider at all,
+the same simplicity BSON's own single-shape format already demonstrated).
+`har_support::stream_har_rows_for_sql` is a mechanical mirror of that
+same decode loop, folding each entry into `json_emit_row_for_sql`
+instead of the profiling accumulator - always records mode,
+unconditionally. `stream_nested_array`'s own callback needs a different
+error type (`json_support::ParseError`, not this crate's `Error`) the
+same way JSON's own `stream_top_level` does, so this row-source uses the
+identical "capture the first real error, re-raise once the scan finishes"
+pattern that phase already established.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.har --output-format sql --load-into sqlite:...` loaded
+its own real, three-levels-deep nested `request`/`response`/`timings`
+objects correctly, all flattening with no column of their own;
+`type_detection.har` confirmed every semantic type (UUID/email/IPv4/date)
+survives intact through the nested structure; `edge_har_missing_entries
+.har` confirmed the disclosed "doesn't look like a HAR file" error fires
+identically on both passes (Pass 2 never runs, since Pass 1 already
+fails first); a new hand-built fixture (`edge_har_sql_inline_array_of_
+objects.har`) confirmed the disclosed blocking error fires and names the
+offending field for a genuine array-of-objects column nested inside an
+entry; `--nrows` confirmed to bound the kept row count. Also verified as
+behavior-preserving for every already-shipped format: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-22 binary across
+the entire fixture corpus (HAR itself excluded, since this phase is
+exactly what changes its own output). Clean across default/`har`/`full`,
+matching each one's own established baseline exactly.
+
+Phase 21's own three tests that used HAR as their "still genuinely
+unsupported format" example moved to GeoJSON instead, gated behind
+`--features geojson` - the same one-hop-forward shuffle repeats itself
+again.
+
+Remaining in the recursively-nested, JSON-bridge tier: GeoJSON, vCard,
+iCalendar, and MBOX - each bridges to the same `json_support::Value`
+shape JSON itself uses (see the Architecture section), so `json_extract_
+value_for_sql`/`json_inline_blocking_column`/`json_bridge_columns_and_
+mode` are already reusable as-is once each format's own row-source
+re-decodes its file a second time into that same `Value` tree - Phases
+14 through 22 are direct, working proof of this now, not just a plan
+(nine formats in a row needed zero changes to any of the three shared
+functions). vCard/iCalendar/MBOX's own repeated-property pooling (a
+different mechanism from JSON's array pooling, but the identical
+one-cell-per-row question) is the one sub-family that will need its own
+fresh look before assuming the same machinery applies unchanged.
 
 ## Directory-input batch mode
 

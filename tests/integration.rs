@@ -550,25 +550,25 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 }
 
 #[test]
-#[cfg(feature = "har")]
+#[cfg(feature = "geojson")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist, and
-    // JSON5 are now inline-supported (Phases 13-21), so HAR is used
-    // here instead as a format that still genuinely isn't. Falls back
-    // to staging mode automatically (with a disclosed stderr note,
-    // checked separately below) rather than erroring or silently
-    // producing something different.
-    let sql = run_sql("sample.har", &[]);
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
+    // JSON5, and HAR are now inline-supported (Phases 13-22), so
+    // GeoJSON is used here instead as a format that still genuinely
+    // isn't. Falls back to staging mode automatically (with a disclosed
+    // stderr note, checked separately below) rather than erroring or
+    // silently producing something different.
+    let sql = run_sql("sample.geojson", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "har")]
+#[cfg(feature = "geojson")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.har").to_str().unwrap(),
+            fixture("sample.geojson").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -577,12 +577,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for har"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for geojson"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "har")]
+#[cfg(feature = "geojson")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -590,7 +590,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.har").to_str().unwrap(),
+            fixture("sample.geojson").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -601,7 +601,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for har"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for geojson"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -702,18 +702,18 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "har")]
+#[cfg(feature = "geojson")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist, and
-    // JSON5 are now inline-supported (Phases 13-21), so HAR stands in
-    // as a format that still genuinely isn't.
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
+    // JSON5, and HAR are now inline-supported (Phases 13-22), so
+    // GeoJSON stands in as a format that still genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.har").to_str().unwrap(),
+            fixture("sample.geojson").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -723,7 +723,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for har"));
+    assert!(stderr.contains("--load-into isn't available yet for geojson"));
 }
 
 #[test]
@@ -2275,6 +2275,84 @@ fn load_into_accepts_json5() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for json5"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "har")]
+fn sql_output_inline_mode_supports_har_nested_request_response() {
+    // Phase 22 of the "any format" rollout, and the eleventh format in
+    // the recursively-nested, JSON-bridge tier - sample.har's own real
+    // nested request/response/timings objects exercise this shape
+    // without needing a new hand-built fixture.
+    let sql = run_sql("sample.har", &[]);
+    assert!(!sql.contains("\"request\" "));
+    assert!(sql.contains("\"request.method\""));
+    assert!(sql.contains("\"response.status\""));
+    assert!(sql.contains("'GET'"));
+}
+
+#[test]
+#[cfg(feature = "har")]
+fn sql_output_inline_mode_har_missing_log_entries_gives_the_same_disclosed_error_both_passes() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_har_missing_entries.har").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("doesn't look like a HAR file"));
+}
+
+#[test]
+#[cfg(feature = "har")]
+fn sql_output_inline_mode_har_rejects_an_array_of_objects_column() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_har_sql_inline_array_of_objects.har")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for field \"cookies\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+#[cfg(feature = "har")]
+fn sql_output_inline_mode_har_respects_nrows() {
+    let sql = run_sql("sample.har", &["--nrows", "1"]);
+    assert!(sql.contains("'GET'"));
+    assert!(!sql.contains("'POST'"));
+}
+
+#[test]
+#[cfg(feature = "har")]
+fn load_into_accepts_har() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.har").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for har"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
