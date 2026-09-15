@@ -322,8 +322,9 @@ Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
-Avro, XML, BSON, Property List (plist), JSON5/JSONC, HAR, and GeoJSON,
-the first twelve formats in the recursively-nested, JSON-bridge tier.
+Avro, XML, BSON, Property List (plist), JSON5/JSONC, HAR, GeoJSON, and
+vCard, the first thirteen formats in the recursively-nested, JSON-bridge
+tier.
 Every other format transparently falls back to `staging` with a
 disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
@@ -368,8 +369,8 @@ needs its own real design, not just repeating the same pattern:
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
-   MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, HAR, and
-   GeoJSON done as of Phases 13-23.** Unlike the two tiers above, there
+   MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, HAR, GeoJSON,
+   and vCard done as of Phases 13-24.** Unlike the two tiers above, there
    was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
@@ -438,8 +439,14 @@ needs its own real design, not just repeating the same pattern:
    records-mode question to resolve), while the far more common
    `FeatureCollection`/bare-`Feature` shapes (whose own `feature_to_record`
    already renders `geometry` to WKT text during profiling) go through
-   the shared extractor completely normally. vCard, iCalendar, and MBOX
-   remain unstarted.
+   the shared extractor completely normally. vCard carried all three
+   shared functions over unchanged too (the ninth format in a row) -
+   despite pooling a repeated property through a completely different
+   mechanism (`vobject_support::insert_pooling`, not a JSON array
+   literal), that pooling already produces the identical
+   `JsonValue::Object`-with-array-values shape the shared functions
+   expect, so no changes were needed. iCalendar and MBOX remain
+   unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1933,17 +1940,74 @@ own roadmap already flagged as needing genuinely new design (vCard/
 iCalendar/MBOX's shared repeated-property pooling mechanism, a different
 shape from JSON's array pooling).
 
-Remaining in the recursively-nested, JSON-bridge tier: vCard, iCalendar,
-and MBOX - each shares `vobject_support`'s own repeated-property pooling
-(a genuinely different mechanism from JSON's array pooling, but the
-identical one-cell-per-row question every other format's own blocking
-check already resolves), so these three are the one sub-family in this
-entire tier that will need a real, fresh look before assuming `json_
-extract_value_for_sql`/`json_inline_blocking_column`/`json_bridge_
-columns_and_mode` apply unchanged - GeoJSON's own bare-`Geometry` special
-case is the closest precedent so far for "mostly reuse the shared
-machinery, but handle one real structural difference explicitly" rather
-than a pure mechanical port.
+**Phase 24: vCard - the thirteenth format in the recursively-nested,
+JSON-bridge tier, and confirmation that this tier's design generalizes
+even to a format using a genuinely different pooling mechanism than
+every prior format's own array-literal pooling.** vCard's own profiling
+reader (`columns_from_vcard`) already bridges through
+`vobject_support::insert_pooling` - the same repeated-property pooling
+this project's own INI reader already established for a repeated key -
+building one `JsonValue::Object` per `BEGIN:VCARD`/`END:VCARD` block,
+with a repeated property (multiple `EMAIL`/`TEL` lines) pooled into a
+`JsonValue::Array` of scalars. That's the exact same
+`JsonValue::Object`-with-`JsonValue::Array`-values shape JSON's own array
+pooling already produces, so despite arriving via a structurally
+different mechanism (repeated *keys* in a flat property list, not a
+JSON array literal), `json_extract_value_for_sql`/
+`json_inline_blocking_column`/`json_bridge_columns_and_mode` all carry
+over completely unchanged - the ninth format in a row to need zero
+changes to the shared functions. `vcard_support::stream_vcard_rows_for_sql`
+is a thin wrapper re-parsing each vCard block via the reader's own
+existing block-scanning logic and folding the result into
+`json_emit_row_for_sql`, always records mode (a vCard file has no
+top-level-scalar/top-level-array shape the way JSON/YAML/TOML/
+MessagePack/CBOR do - every block is a genuine object by construction,
+the same simplicity BSON/HAR's own single-shape formats already
+demonstrated). `--nrows` uses `sink.done` to stop reading further blocks
+once the limit is reached, matching vCard's own profiling reader's real-
+I/O-bounding convention (checked before each block is read) rather than
+dBase's decode-always convention.
+
+vCard is also the first format in this tier confirmed to be structurally
+incapable of producing the one-to-many "array of objects" shape the
+upfront blocking check exists to catch: every property vCard's own
+grammar defines pools to a scalar (a string value), never an object, so
+`json_inline_blocking_column`'s `Vec<struct>`/mixed-scalar-and-object
+check can never fire for a genuine vCard file - there is no meaningful
+"vCard rejects a blocking column" test to write here, unlike every other
+format in this tier so far, and this is a real, disclosed property of
+the format rather than a gap in test coverage.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.vcf --output-format sql --load-into sqlite:...` loaded
+its own two real contacts correctly; `edge_vcard_folding_and_escapes.vcf`
+(a real, already-committed fixture with a genuinely repeated `EMAIL`
+property, RFC-fold-continued `NOTE` text, and comma-escaping in `ADR`)
+confirmed the pooled property renders as real JSON-array text
+(`'["primary@example.com","secondary@example.com"]'`), matching every
+other format's own pooled-array convention in this tier exactly;
+`--nrows 1` confirmed to bound the kept row count via the real-I/O-
+bounding path. Also verified as behavior-preserving for every already-
+shipped format: `diff` confirmed byte-identical inline SQL output
+against the pre-Phase-24 binary across the entire fixture corpus (vCard
+itself excluded, since this phase is exactly what changes its own
+output). Clean across default/`vcard`/`full`, matching each one's own
+established baseline exactly.
+
+Phase 23's own three tests that used vCard as their "still genuinely
+unsupported format" example moved to iCalendar instead, gated behind
+`--features icalendar` - the same one-hop-forward shuffle repeats itself
+again, landing this time on the second of the three formats this tier's
+own roadmap flagged as needing genuinely new design - vCard's own
+zero-shared-function-changes result is a real, positive data point for
+iCalendar too, though iCalendar's own component-stack scoping (a
+`VALARM`/`VTIMEZONE` property must never leak into an enclosing
+`VEVENT`/`VTODO` record) is a real structural difference vCard didn't
+have to consider, so it still gets its own fresh verification rather
+than being assumed identical.
+
+Remaining in the recursively-nested, JSON-bridge tier: iCalendar and
+MBOX.
 
 ## Directory-input batch mode
 

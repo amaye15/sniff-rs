@@ -46907,6 +46907,74 @@ mod vcard_support {
         }
         Ok(profiler.finish())
     }
+
+    /// The vCard row-source for `render_sql_inline_flat` (Phase 24, the
+    /// thirteenth format in the recursively-nested, JSON-bridge tier,
+    /// and the first of this tier's own three formats needing a genuine
+    /// new decode - not a mechanical port of an existing profiling
+    /// scanner - since vCard's repeated-property pooling has no prior
+    /// analogue in this tier). A mechanical mirror of `columns_from_
+    /// vcard`'s own per-card accumulation loop just above: each `BEGIN:
+    /// VCARD`...`END:VCARD` block folds its properties into a plain
+    /// `json_support::Map` via the *exact* same `vobject_support::
+    /// insert_pooling` a repeated property already pools through for
+    /// profiling, so the resulting `JsonValue::Object` is byte-for-byte
+    /// the same shape `json_emit_row_for_sql`/`json_inline_blocking_
+    /// column` already know how to handle - a card is always in records
+    /// mode (there's no top-level-scalar/top-level-array shape for vCard
+    /// at all), so zero changes were needed to any of the three shared
+    /// JSON-bridge functions to support this format, the same "reuse
+    /// unchanged" pattern every prior format in this tier already
+    /// established, just reached here via a genuinely different pooling
+    /// mechanism instead of a JSON array literal. `sink.done` reproduces
+    /// `columns_from_vcard`'s own real-I/O-bounding early stop.
+    pub(crate) fn stream_vcard_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let lines = UnfoldingLines::new(reader);
+        let mut current: Option<json_support::Map> = None;
+
+        for line in lines {
+            if sink.done {
+                break;
+            }
+            let line = line?;
+            if line.eq_ignore_ascii_case("BEGIN:VCARD") {
+                if current.is_some() {
+                    bail!(
+                        "{path:?}: a new BEGIN:VCARD started before the previous one's END:VCARD"
+                    );
+                }
+                current = Some(json_support::Map::new());
+                continue;
+            }
+            if line.eq_ignore_ascii_case("END:VCARD") {
+                let map = current
+                    .take()
+                    .with_context(|| format!("{path:?}: END:VCARD with no matching BEGIN:VCARD"))?;
+                json_emit_row_for_sql(&JsonValue::from(map), columns, records_mode, sink)?;
+                continue;
+            }
+            let Some(map) = current.as_mut() else {
+                continue;
+            };
+            let prop = parse_property_line(&line)
+                .with_context(|| format!("{path:?}: malformed vCard property line"))?;
+            if prop.name == "VERSION" {
+                continue;
+            }
+            insert_pooling(map, prop.name, JsonValue::from(unescape_value(&prop.value)));
+        }
+        if current.is_some() && !sink.done {
+            bail!("{path:?}: unterminated VCARD block (missing END:VCARD)");
+        }
+        Ok(())
+    }
 } // mod vcard_support
 
 #[cfg(feature = "vcard")]
@@ -53004,6 +53072,7 @@ fn render_sql_inline_flat(
             | InputFormat::Json5
             | InputFormat::Har
             | InputFormat::GeoJson
+            | InputFormat::Vcard
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -53248,6 +53317,7 @@ fn render_sql_inline_flat(
         InputFormat::Json5 => render_sql_inline_flat_json5(read_path, profiles, &mut sink)?,
         InputFormat::Har => render_sql_inline_flat_har(read_path, profiles, &mut sink)?,
         InputFormat::GeoJson => render_sql_inline_flat_geojson(read_path, profiles, &mut sink)?,
+        InputFormat::Vcard => render_sql_inline_flat_vcard(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53862,6 +53932,31 @@ fn render_sql_inline_flat_geojson(
     )
 }
 
+/// The vCard row-source wrapper for `render_sql_inline_flat` (Phase 24) -
+/// see `render_sql_inline_flat_avro`'s own doc comment; identical shape,
+/// just driven by `vcard_support::stream_vcard_rows_for_sql`'s own
+/// per-card decode loop instead.
+#[cfg(feature = "vcard")]
+fn render_sql_inline_flat_vcard(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    vcard_support::stream_vcard_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "vcard"))]
+fn render_sql_inline_flat_vcard(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "vCard support isn't compiled in - rebuild with `cargo build --release --features vcard` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -54009,12 +54104,13 @@ fn render_sql(
             | InputFormat::Json5
             | InputFormat::Har
             | InputFormat::GeoJson
+            | InputFormat::Vcard
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -61290,10 +61386,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Json5
                 | InputFormat::Har
                 | InputFormat::GeoJson
+                | InputFormat::Vcard
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard are supported so far",
             format.as_str()
         );
     }
