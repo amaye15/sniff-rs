@@ -39915,6 +39915,83 @@ mod avro_support {
 
         Ok(profiler.finish())
     }
+
+    /// The Avro row-source for `render_sql_inline_flat` (Phase 17, the
+    /// sixth format in the recursively-nested, JSON-bridge tier) - a
+    /// mechanical mirror of `columns_from_avro`'s own decode loop just
+    /// above, folding each decoded record into `json_emit_row_for_sql`
+    /// instead of the profiling accumulator. Unlike MessagePack/CBOR's
+    /// own "decode every record regardless of `--nrows`" row-sources,
+    /// Avro's own profiling reader already bounds real I/O by breaking
+    /// out of the block loop early once enough records are found (real
+    /// decompression only happens per whole block, but no *further*
+    /// block is ever decompressed past the cutoff) - `sink.done` (set
+    /// once `InlineRowSink::accept` reaches its own cap) reproduces that
+    /// identical early-exit here, matching Stata's/SAS7BDAT's own
+    /// real-I/O-bounding convention rather than dBase's decode-always one.
+    pub(crate) fn stream_avro_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = BufReader::new(file);
+
+        expect_bytes(&mut r, b"Obj\x01")
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+        let metadata = read_metadata(&mut r)
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+
+        let schema_bytes = metadata
+            .get("avro.schema")
+            .with_context(|| format!("{path:?} has no avro.schema in its header"))?;
+        let schema_json: JsonValue = json_support::from_slice(schema_bytes)
+            .with_context(|| format!("failed parsing the Avro schema in {path:?}"))?;
+        let mut names: HashMap<String, Schema> = HashMap::new();
+        let schema = parse_schema(&schema_json, &mut names, None)
+            .with_context(|| format!("failed parsing the Avro schema in {path:?}"))?;
+
+        let codec = metadata
+            .get("avro.codec")
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_else(|| "null".to_string());
+
+        let sync_marker = read_exact_vec(&mut r, 16)
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+
+        'blocks: while let Some(count) = try_read_zigzag(&mut r)
+            .with_context(|| format!("failed reading a block from {path:?}"))?
+        {
+            if sink.done {
+                break 'blocks;
+            }
+            let count = usize::try_from(count).context("invalid Avro block object count")?;
+            let block_len = read_len(&mut r)?;
+            let block_data = read_exact_vec(&mut r, block_len)
+                .with_context(|| format!("failed reading a block from {path:?}"))?;
+            let marker = read_exact_vec(&mut r, 16)
+                .with_context(|| format!("failed reading a block from {path:?}"))?;
+            if marker != sync_marker {
+                bail!("{path:?}: a data block's sync marker doesn't match the header's");
+            }
+            let decompressed = decompress_codec(&codec, block_data)
+                .with_context(|| format!("failed decompressing a block from {path:?}"))?;
+            let mut cursor: &[u8] = &decompressed;
+            for _ in 0..count {
+                if sink.done {
+                    break 'blocks;
+                }
+                let value = decode_to_json(&mut cursor, &schema, &names)
+                    .with_context(|| format!("failed decoding a record from {path:?}"))?;
+                json_emit_row_for_sql(&value, columns, records_mode, sink)?;
+            }
+        }
+        Ok(())
+    }
 } // mod avro_support
 
 #[cfg(feature = "avro")]
@@ -52591,8 +52668,9 @@ fn render_sql_inline_flat(
             | InputFormat::Toml
             | InputFormat::MsgPack
             | InputFormat::Cbor
+            | InputFormat::Avro
     );
-    let json_filtered_profiles: Vec<ColumnProfile>;
+    let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
         if let Some(bad) = json_inline_blocking_column(profiles) {
             bail!(
@@ -52607,6 +52685,39 @@ fn render_sql_inline_flat(
             .filter(|p| json_column_is_emittable(p))
             .cloned()
             .collect();
+        // A descendant of an optional (non-array) nested-object ancestor
+        // has its own `missing_pct` computed relative to how often that
+        // ancestor itself was present, not the true top-level record
+        // count (`JsonPathAccumulator::finish`'s own `child_total` -
+        // see this project's own JSON-output docs on why a descendant's
+        // `row_count` can legitimately differ from its own top-level
+        // sibling's). A column whose narrow `missing_pct` reports 0% this
+        // way can still genuinely be `NULL` at the real record level
+        // whenever some ancestor along its own dot path was itself
+        // missing - found directly, not assumed, via a real Avro fixture
+        // whose optional `backup_address` object triggered exactly this:
+        // a genuine `NOT NULL` constraint violation once the generated
+        // SQL was actually loaded into SQLite. Force such a column's own
+        // effective `missing_pct` above zero whenever any ancestor
+        // prefix (by dot path, walked the whole way up - not just the
+        // immediate parent) is itself optional, so the `CREATE TABLE`
+        // below never declares a column `NOT NULL` that a real record
+        // could actually leave missing.
+        for p in json_filtered_profiles.iter_mut() {
+            if p.missing_pct > 0.0 {
+                continue;
+            }
+            let mut rest = p.name.as_str();
+            while let Some((parent, _)) = rest.rsplit_once('.') {
+                if let Some(ancestor) = profiles.iter().find(|a| a.name == parent)
+                    && ancestor.missing_pct > 0.0
+                {
+                    p.missing_pct = ancestor.missing_pct;
+                    break;
+                }
+                rest = parent;
+            }
+        }
         &json_filtered_profiles
     } else {
         profiles
@@ -52670,6 +52781,27 @@ fn render_sql_inline_flat(
         // line separating it from whatever the previous table's own
         // INSERT statements ended with.
         writeln!(sink)?;
+    }
+
+    // A genuinely empty schema - no columns were ever profiled at all,
+    // as opposed to a real, known column set with zero *rows* (which
+    // already produces a valid `CREATE TABLE` with no trailing `INSERT`
+    // - see Phase 9's own SQLite writeup for that already-handled case).
+    // `CREATE TABLE t ( )` is invalid SQL syntax on every real engine
+    // (confirmed directly against a real SQLite build - a bare,
+    // columnless table definition is rejected outright), so there is no
+    // honest `CREATE TABLE` to emit here at all. Found via real-world
+    // testing on a real, zero-field Avro file - not Avro-specific once
+    // checked: a genuinely zero-byte CSV hits the identical gap, and had
+    // ever since Phase 1, invisible until an actual database load
+    // finally surfaced it.
+    if profiles.is_empty() {
+        writeln!(
+            sink,
+            "-- {quoted_table}: no columns were profiled at all (a genuinely \
+             empty schema) - nothing to create a table for."
+        )?;
+        return Ok(());
     }
 
     writeln!(sink, "CREATE TABLE {quoted_table} (")?;
@@ -52774,6 +52906,7 @@ fn render_sql_inline_flat(
         InputFormat::Toml => render_sql_inline_flat_toml(read_path, profiles, &mut sink)?,
         InputFormat::MsgPack => render_sql_inline_flat_msgpack(read_path, profiles, &mut sink)?,
         InputFormat::Cbor => render_sql_inline_flat_cbor(read_path, profiles, &mut sink)?,
+        InputFormat::Avro => render_sql_inline_flat_avro(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53213,6 +53346,31 @@ fn render_sql_inline_flat_cbor(
     )
 }
 
+/// The Avro row-source wrapper for `render_sql_inline_flat` (Phase 17) -
+/// see `render_sql_inline_flat_msgpack`'s own doc comment; identical
+/// shape, just driven by `avro_support::stream_avro_rows_for_sql`'s own
+/// schema-aware block decode instead.
+#[cfg(feature = "avro")]
+fn render_sql_inline_flat_avro(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    avro_support::stream_avro_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "avro"))]
+fn render_sql_inline_flat_avro(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "Avro support isn't compiled in - rebuild with `cargo build --release --features avro` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53353,12 +53511,13 @@ fn render_sql(
             | InputFormat::Toml
             | InputFormat::MsgPack
             | InputFormat::Cbor
+            | InputFormat::Avro
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -60627,10 +60786,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Toml
                 | InputFormat::MsgPack
                 | InputFormat::Cbor
+                | InputFormat::Avro
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro are supported so far",
             format.as_str()
         );
     }

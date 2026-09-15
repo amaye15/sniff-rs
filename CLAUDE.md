@@ -321,8 +321,8 @@ fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
-`.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, and
-CBOR, the first five formats in the recursively-nested, JSON-bridge
+`.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
+and Avro, the first six formats in the recursively-nested, JSON-bridge
 tier. Every other format transparently falls back to `staging` with a
 disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
@@ -367,8 +367,8 @@ needs its own real design, not just repeating the same pattern:
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
-   MessagePack, and CBOR done as of Phases 13-16.** Unlike the two tiers
-   above, there was no existing
+   MessagePack, CBOR, and Avro done as of Phases 13-17.** Unlike the two
+   tiers above, there was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -393,9 +393,13 @@ needs its own real design, not just repeating the same pattern:
    unchanged too - both formats already decode straight to the same
    `Value` shape, so only each format's own concatenated-records-or-
    single-array re-decode loop needed writing (a mechanical mirror of
-   each format's own existing profiling decode loop). Avro, XML, BSON,
-   plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX remain
-   unstarted.
+   each format's own existing profiling decode loop). Avro carried all
+   three shared functions over unchanged too (the third format in a row
+   to need zero changes) - its own schema-aware block decode loop was
+   the only new code, and this phase's own real-SQLite testing surfaced
+   two genuine, disclosed-worthy bugs in the shared engine itself (see
+   Phase 17's own writeup below). XML, BSON, plist, JSON5, HAR, GeoJSON,
+   vCard, iCalendar, and MBOX remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1511,19 +1515,114 @@ unsupported format" example needed no change this phase - Avro remains
 genuinely unsupported (it's next), so this is the first phase in this
 tier where that shuffle didn't need to happen.
 
-Remaining in the recursively-nested, JSON-bridge tier: Avro, XML, BSON,
-plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX - each bridges to
-the same `json_support::Value` shape JSON itself uses (see the
-Architecture section), so `json_extract_value_for_sql`/`json_inline_
-blocking_column`/`json_bridge_columns_and_mode` are already reusable
-as-is once each format's own row-source re-decodes its file a second
-time into that same `Value` tree - Phases 14 through 16 are direct,
-working proof of this now, not just a plan (three formats in a row
-needed zero changes to any of the three shared functions). vCard/
-iCalendar/MBOX's own repeated-property pooling (a different mechanism
-from JSON's array pooling, but the identical one-cell-per-row question)
-is the one sub-family that will need its own fresh look before assuming
-the same machinery applies unchanged.
+**Phase 17: Avro - the sixth format in the recursively-nested, JSON-
+bridge tier, and the third format in a row needing zero changes to
+`json_extract_value_for_sql`/`json_inline_blocking_column`/`json_bridge_
+columns_and_mode`.** Avro's own decode already produces the shared
+`json_support::Value` shape in one pass (`decode_to_json`, schema-aware -
+see the Architecture section for why Avro's own bridge is single-pass
+rather than decode-then-convert the way MessagePack/CBOR's two-step
+bridge is), so `avro_support::stream_avro_rows_for_sql` is a mechanical
+mirror of `columns_from_avro`'s own block-decode loop, folding each
+decoded record into `json_emit_row_for_sql`. Unlike MessagePack/CBOR's
+own "decode every record regardless of `--nrows`" row-sources, Avro's
+own profiling reader already bounds real I/O by breaking out of the
+block loop early - `sink.done` (set once `InlineRowSink::accept` reaches
+its own cap) reproduces that identical early exit here, matching Stata's/
+SAS7BDAT's own real-I/O-bounding convention rather than dBase's
+decode-always one.
+
+**This phase's own real-SQLite testing found two genuine bugs - one in
+this tier's own shared engine, one in `render_sql_inline_flat` itself,
+present since Phase 1 - exactly the kind of finding this project's own
+"verify against real behavior, don't trust the design on paper"
+discipline exists to catch.**
+
+- **A column nested under an optional (non-array) record has its own
+  `missing_pct` computed relative to how often its *parent* was present,
+  not the true top-level record count** - `JsonPathAccumulator::finish`'s
+  own `child_total = self.object_count` (the parent's own presence
+  count, not the file's own total record count), a real, already-
+  disclosed property of this project's JSON-output docs ("a descendant
+  path's own `row_count` reflects its own nesting level's slot count
+  instead, which can legitimately differ"). What wasn't disclosed or
+  even considered before this phase: a descendant column whose *narrow*
+  missing_pct reports 0% this way can still genuinely be `NULL` at the
+  real record level whenever some ancestor along its own dot path was
+  itself missing - found directly via a real Avro fixture
+  (`edge_avro_named_type_refs.avro`) whose own optional `backup_address`
+  field (present in only 1 of 3 records) produced a `NOT NULL` column
+  declaration that failed with a genuine constraint violation the moment
+  the generated SQL was actually loaded into SQLite. Fixed by walking
+  each emitted column's own dot-path ancestor chain (the whole way up,
+  not just the immediate parent) against the *original*, unfiltered
+  profile list, and forcing the column's own effective `missing_pct`
+  above zero whenever any ancestor is itself optional - a small,
+  JSON-bridge-tier-specific fixup applied to the filtered profile copy,
+  not a change to the shared profiling engine itself.
+- **A genuinely zero-column schema (no columns profiled at all, as
+  opposed to a real, known column set with zero rows) produced
+  `CREATE TABLE t ( );` - invalid SQL syntax on every real engine,
+  confirmed directly against SQLite.** Found via `edge_zero_records.avro`
+  (a real, valid Avro file with zero declared fields), but checking
+  whether this was Avro-specific rather than assuming so found it
+  wasn't: a genuinely zero-byte CSV hits the identical gap, and has
+  since Phase 1 - invisible for six phases and 355+ committed fixtures
+  because none of them happen to be both genuinely schema-less *and*
+  actually piped into a real database, the exact combination this
+  phase's own Avro testing finally produced. Fixed with a small, format-
+  agnostic early return in `render_sql_inline_flat` itself: a table with
+  zero profiled columns now emits a disclosed comment naming the empty
+  schema and skips the `CREATE TABLE`/`INSERT` entirely, rather than
+  emitting syntax no engine accepts. Confirmed via `diff` against the
+  pre-fix binary that exactly nine committed fixtures across five
+  different formats (CSV, JSON, TOML, YAML, MessagePack, CBOR) share this
+  exact previously-broken shape, and every one of them now produces
+  valid, loadable SQL.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.avro`/`type_detection.avro --output-format sql
+--load-into sqlite:...` both loaded correctly (the former exercising a
+real nested `metadata` record and a real `tags` pooled array with no new
+fixture needed, since this real, already-committed fixture already has
+this exact shape - the first format in this tier not to need one for the
+basic case); `avro_logical_types.avro` confirmed `date`/`timestamp-millis`/
+`timestamp-micros`/`time-millis`/`decimal` logical types all resolve to
+real values, not opaque encoded bytes; `edge_avro_snappy_codec.avro`
+confirmed Snappy-compressed blocks decode correctly through the SQL row-
+source; `edge_avro_named_type_refs.avro` (a real, three-level-deep self-
+referential record) confirmed both the optional-nested-record fix above
+and correct handling of a genuinely always-null "column is empty" field;
+`edge_zero_records.avro` confirmed the zero-column fix directly; `--nrows`
+confirmed to bound the kept row count via the same real-I/O-bounding path
+as Stata/SAS7BDAT. Every other committed `.avro` fixture (`edge_avro_
+scalar_records.avro`, `edge_avro_enum.avro`, `edge_avro_edge_cases.avro`)
+also confirmed to load cleanly. Also verified as behavior-preserving for
+every already-shipped format apart from the two disclosed, intentional
+fixes above: `diff` confirmed byte-identical inline SQL output against
+the pre-Phase-17 binary across the entire fixture corpus, with exactly
+the nine zero-column fixtures (and no others) differing, each in the
+expected direction. Clean across default/`avro`/`full`, matching each
+one's own established baseline exactly.
+
+Phase 15's own three tests that used Avro as their "still genuinely
+unsupported format" example moved to XML instead, gated behind
+`--features xml` - the same one-hop-forward shuffle repeats itself again.
+
+Remaining in the recursively-nested, JSON-bridge tier: XML, BSON, plist,
+JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX - each bridges to the
+same `json_support::Value` shape JSON itself uses (see the Architecture
+section), so `json_extract_value_for_sql`/`json_inline_blocking_column`/
+`json_bridge_columns_and_mode` are already reusable as-is once each
+format's own row-source re-decodes its file a second time into that same
+`Value` tree - Phases 14 through 17 are direct, working proof of this now,
+not just a plan (four formats in a row needed zero changes to any of the
+three shared functions, and the two real bugs Phase 17 did find were both
+in code this project already shipped, not in anything specific to a new
+format's own bridge). vCard/iCalendar/MBOX's own repeated-property pooling
+(a different mechanism from JSON's array pooling, but the identical
+one-cell-per-row question) is the one sub-family that will need its own
+fresh look before assuming the same machinery applies unchanged.
 
 ## Directory-input batch mode
 

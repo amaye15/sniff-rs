@@ -535,24 +535,40 @@ fn sql_output_inline_mode_is_the_default_and_embeds_real_literal_data() {
 }
 
 #[test]
-#[cfg(feature = "avro")]
+fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_invalid_sql() {
+    // A real, cross-format bug found while verifying Phase 17 (Avro)
+    // against a real SQLite build: a genuinely zero-column schema (no
+    // columns profiled at all, distinct from a real known column set
+    // with zero rows - see the SQLite Phase 9 writeup for that already-
+    // handled case) used to emit `CREATE TABLE t ( );`, invalid SQL
+    // syntax on every real engine - present since Phase 1, since a
+    // zero-byte CSV hits the identical gap any inline-supported format
+    // with a genuinely empty schema does.
+    let sql = run_sql("malformed_empty.csv", &[]);
+    assert!(!sql.contains("CREATE TABLE"));
+    assert!(sql.contains("no columns were profiled at all"));
+}
+
+#[test]
+#[cfg(feature = "xml")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
-    // JSON, YAML, and TOML are now inline-supported (Phases 13-15), so
-    // Avro is used here instead as a format that still genuinely isn't.
-    // Falls back to staging mode automatically (with a disclosed stderr
-    // note, checked separately below) rather than erroring or silently
-    // producing something different.
-    let sql = run_sql("sample.avro", &[]);
+    // JSON, YAML, TOML, MessagePack, CBOR, and Avro are now inline-
+    // supported (Phases 13-17), so XML is used here instead as a format
+    // that still genuinely isn't. Falls back to staging mode
+    // automatically (with a disclosed stderr note, checked separately
+    // below) rather than erroring or silently producing something
+    // different.
+    let sql = run_sql("sample.xml", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "avro")]
+#[cfg(feature = "xml")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.avro").to_str().unwrap(),
+            fixture("sample.xml").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -561,12 +577,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for avro"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for xml"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "avro")]
+#[cfg(feature = "xml")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -574,7 +590,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.avro").to_str().unwrap(),
+            fixture("sample.xml").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -585,7 +601,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for avro"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for xml"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -686,17 +702,18 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "avro")]
+#[cfg(feature = "xml")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
-    // JSON, YAML, and TOML are now inline-supported (Phases 13-15), so
-    // Avro stands in as a format that still genuinely isn't.
+    // JSON, YAML, TOML, MessagePack, CBOR, and Avro are now inline-
+    // supported (Phases 13-17), so XML stands in as a format that still
+    // genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.avro").to_str().unwrap(),
+            fixture("sample.xml").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -706,7 +723,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for avro"));
+    assert!(stderr.contains("--load-into isn't available yet for xml"));
 }
 
 #[test]
@@ -1896,6 +1913,84 @@ fn load_into_accepts_cbor() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for cbor"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "avro")]
+fn sql_output_inline_mode_supports_avro_nested_record_and_array() {
+    // Phase 17 of the "any format" rollout, and the sixth format in the
+    // recursively-nested, JSON-bridge tier - sample.avro's own real
+    // "metadata" nested record and "tags" pooled array already exercise
+    // this shape without needing a new hand-built fixture, unlike every
+    // prior format in this tier.
+    let sql = run_sql("sample.avro", &[]);
+    assert!(!sql.contains("\"metadata\" "));
+    assert!(sql.contains("\"metadata.source\""));
+    assert!(sql.contains("\"metadata.risk_score\""));
+    assert!(sql.contains("'[\"vip\",\"verified\"]'"));
+    let values = sql
+        .split("INSERT INTO")
+        .nth(1)
+        .expect("no INSERT statement found");
+    assert!(values.contains("NULL"));
+}
+
+#[test]
+#[cfg(feature = "avro")]
+fn sql_output_inline_mode_avro_optional_nested_record_is_never_falsely_not_null() {
+    // A real bug found via genuine SQLite testing: a column nested under
+    // an optional (non-array) record has its own missing_pct computed
+    // relative to how often its *parent* was present, not the true
+    // top-level record count - a narrow 0% there doesn't mean the real
+    // column can never be NULL. edge_avro_named_type_refs.avro's own
+    // "backup_address" field (present in only 1 of 3 records) is exactly
+    // this shape; loading it used to fail with a genuine NOT NULL
+    // constraint violation once this reached a real database.
+    let sql = run_sql("edge_avro_named_type_refs.avro", &[]);
+    assert!(sql.contains("\"backup_address.city\" TEXT,"));
+    assert!(!sql.contains("\"backup_address.city\" TEXT NOT NULL"));
+}
+
+#[test]
+#[cfg(feature = "avro")]
+fn sql_output_inline_mode_avro_logical_types_resolve_correctly() {
+    let sql = run_sql("avro_logical_types.avro", &[]);
+    assert!(sql.contains("'2024-01-15T10:00:00.000'"));
+    assert!(sql.contains("'14:10:00.123'"));
+    assert!(sql.contains("123.45"));
+}
+
+#[test]
+#[cfg(feature = "avro")]
+fn sql_output_inline_mode_avro_zero_columns_skips_create_table_instead_of_emitting_invalid_sql() {
+    // A real, cross-format bug found via this phase's own real SQLite
+    // testing: a genuinely zero-column schema (no columns profiled at
+    // all, distinct from a real known column set with zero rows) used
+    // to emit `CREATE TABLE t ( );` - invalid SQL syntax on every real
+    // engine - for *any* inline-supported format, not just Avro (a
+    // zero-byte CSV hits the identical gap, present since Phase 1).
+    let sql = run_sql("edge_zero_records.avro", &[]);
+    assert!(!sql.contains("CREATE TABLE"));
+    assert!(sql.contains("no columns were profiled at all"));
+}
+
+#[test]
+#[cfg(feature = "avro")]
+fn load_into_accepts_avro() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.avro").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for avro"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
