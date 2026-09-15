@@ -322,9 +322,9 @@ Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
-Avro, XML, BSON, Property List (plist), JSON5/JSONC, HAR, GeoJSON, and
-vCard, the first thirteen formats in the recursively-nested, JSON-bridge
-tier.
+Avro, XML, BSON, Property List (plist), JSON5/JSONC, HAR, GeoJSON,
+vCard, and iCalendar, the first fourteen formats in the recursively-
+nested, JSON-bridge tier.
 Every other format transparently falls back to `staging` with a
 disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
@@ -370,7 +370,8 @@ needs its own real design, not just repeating the same pattern:
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
    MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, HAR, GeoJSON,
-   and vCard done as of Phases 13-24.** Unlike the two tiers above, there
+   vCard, and iCalendar done as of Phases 13-25.** Unlike the two tiers
+   above, there
    was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
@@ -445,8 +446,13 @@ needs its own real design, not just repeating the same pattern:
    mechanism (`vobject_support::insert_pooling`, not a JSON array
    literal), that pooling already produces the identical
    `JsonValue::Object`-with-array-values shape the shared functions
-   expect, so no changes were needed. iCalendar and MBOX remain
-   unstarted.
+   expect, so no changes were needed. iCalendar carried all three shared
+   functions over unchanged too (the tenth format in a row) - it shares
+   vCard's own `vobject_support` pooling mechanism directly, needing only
+   its own component-stack-scoped row-source (a property only folds into
+   the innermost open `VEVENT`/`VTODO`, never a nested `VALARM`/
+   `VTIMEZONE`) rather than any change to the shared extractor itself.
+   MBOX remains unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -2006,8 +2012,75 @@ iCalendar too, though iCalendar's own component-stack scoping (a
 have to consider, so it still gets its own fresh verification rather
 than being assumed identical.
 
-Remaining in the recursively-nested, JSON-bridge tier: iCalendar and
-MBOX.
+**Phase 25: iCalendar - the fourteenth format in the recursively-nested,
+JSON-bridge tier, and confirmation that vCard's own zero-shared-function-
+changes result generalizes to its sibling format too.** iCalendar's own
+profiling reader (`columns_from_ical`) already bridges through the same
+`vobject_support::insert_pooling` mechanism vCard's own reader uses -
+one record per `BEGIN:VEVENT`/`BEGIN:VTODO`...`END:` block, each
+property pooled into a plain `json_support::Map` exactly like a vCard
+block is - so `json_extract_value_for_sql`/`json_inline_blocking_column`/
+`json_bridge_columns_and_mode` all carry over completely unchanged, the
+tenth format in a row (counting vCard) to need zero changes to the
+shared functions. `ical_support::stream_ical_rows_for_sql` is a
+mechanical mirror of `columns_from_ical`'s own component-stack scanning
+loop, with the one real structural piece this format needed that vCard
+didn't: a property only ever folds into the innermost open component's
+`json_support::Map` if a `VEVENT`/`VTODO` is genuinely what's currently
+open (`stack.last_mut()` resolving to `Frame::Record`) - a nested
+`VALARM`/`VTIMEZONE`/any other component this reader doesn't turn into
+its own records pushes a `Frame::Other` onto the same stack instead, so
+its own properties are silently skipped by the row-source's identical
+`match stack.last_mut()` dispatch rather than ever leaking into an
+enclosing event/todo's row - the exact same isolation the profiling
+reader's own stack already provides, reused unchanged rather than
+re-derived. Always records mode (iCalendar has no top-level-scalar/
+top-level-array shape). `--nrows` uses `sink.done` for real-I/O-bounding,
+matching `columns_from_ical`'s own real-I/O-bounding behavior including
+its own disclosed exception (an enclosing `VCALENDAR`/still-open
+component is legitimately left on the stack once a `--nrows`-driven stop
+fires, so the "is anything left unterminated" check is skipped in
+exactly that case, on both passes).
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.ics --output-format sql --load-into sqlite:...` loaded
+its own two real events correctly, with its own genuinely nested
+`VALARM` (`TRIGGER`/`ACTION` properties) confirmed - by querying the
+resulting table's own schema directly - to produce no `TRIGGER`/`ACTION`
+columns at all, proving the component-stack scoping holds on the SQL
+row-source exactly as it already does for profiling;
+`edge_icalendar_vtodo_and_folding.ics` (a real, already-committed
+fixture with a `VTODO` component, RFC-fold-continued `DESCRIPTION` text,
+and its own nested `VALARM`) confirmed the identical isolation for the
+`VTODO` case; `edge_icalendar_multiple_vcalendar_blocks.ics` (two
+independent, concatenated `VCALENDAR`/`VEVENT` blocks in one file)
+confirmed both events are read correctly as two records, proving the
+stack-based scanner has no state that incorrectly persists across a
+`VCALENDAR` boundary; `--nrows 1` confirmed to bound the kept row count
+via the real-I/O-bounding path. Also verified as behavior-preserving for
+every already-shipped format: `diff` confirmed byte-identical inline SQL
+output against the pre-Phase-25 binary across the entire fixture corpus
+(iCalendar itself excluded, since this phase is exactly what changes its
+own output). Clean across default/`icalendar`/`full`, matching each
+one's own established baseline exactly.
+
+Phase 24's own three tests that used iCalendar as their "still genuinely
+unsupported format" example moved to MBOX instead, gated behind
+`--features mbox` - the same one-hop-forward shuffle repeats itself
+again, landing this time on the last format in this entire tier.
+
+Remaining in the recursively-nested, JSON-bridge tier: MBOX - the final
+format in this tier, and in the entire "extend --sql-mode inline to
+every format" campaign. MBOX shares `vobject_support`'s own sibling
+repeated-header pooling story (a repeated `Received:` header pools into
+an array the same way a repeated vCard/iCalendar property does, per this
+project's own Architecture section), so the vCard/iCalendar precedent
+suggests it will likely need zero shared-function changes too - but its
+own message-body-as-a-column question (MBOX has no vCard/iCalendar
+equivalent to a property list at all; the body is a separate, distinct
+piece of a message's own record) is a genuine structural difference
+neither prior format needed to resolve, so it still gets its own fresh
+design pass rather than being assumed identical.
 
 ## Directory-input batch mode
 

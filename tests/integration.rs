@@ -550,25 +550,25 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 }
 
 #[test]
-#[cfg(feature = "icalendar")]
+#[cfg(feature = "mbox")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
     // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
-    // JSON5, HAR, GeoJSON, and vCard are now inline-supported (Phases
-    // 13-24), so iCalendar is used here instead as a format that still
-    // genuinely isn't. Falls back to staging mode automatically (with a
-    // disclosed stderr note, checked separately below) rather than
-    // erroring or silently producing something different.
-    let sql = run_sql("sample.ics", &[]);
+    // JSON5, HAR, GeoJSON, vCard, and iCalendar are now inline-supported
+    // (Phases 13-25), so MBOX is used here instead as a format that
+    // still genuinely isn't. Falls back to staging mode automatically
+    // (with a disclosed stderr note, checked separately below) rather
+    // than erroring or silently producing something different.
+    let sql = run_sql("sample.mbox", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "icalendar")]
+#[cfg(feature = "mbox")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.ics").to_str().unwrap(),
+            fixture("sample.mbox").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -577,12 +577,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for icalendar"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for mbox"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "icalendar")]
+#[cfg(feature = "mbox")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -590,7 +590,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.ics").to_str().unwrap(),
+            fixture("sample.mbox").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -601,7 +601,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for icalendar"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for mbox"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -702,19 +702,19 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "icalendar")]
+#[cfg(feature = "mbox")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
     // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
-    // JSON5, HAR, GeoJSON, and vCard are now inline-supported (Phases
-    // 13-24), so iCalendar stands in as a format that still genuinely
+    // JSON5, HAR, GeoJSON, vCard, and iCalendar are now inline-supported
+    // (Phases 13-25), so MBOX stands in as a format that still genuinely
     // isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.ics").to_str().unwrap(),
+            fixture("sample.mbox").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -724,7 +724,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for icalendar"));
+    assert!(stderr.contains("--load-into isn't available yet for mbox"));
 }
 
 #[test]
@@ -2485,6 +2485,68 @@ fn load_into_accepts_vcard() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for vcard"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "icalendar")]
+fn sql_output_inline_mode_supports_icalendar_component_stack_scoping() {
+    // Phase 25 of the "any format" rollout, and the fourteenth format in
+    // the recursively-nested, JSON-bridge tier - the tenth format in a
+    // row (including vCard) to need zero changes to the three shared
+    // JSON-bridge functions, since iCalendar shares vCard's own
+    // vobject_support pooling mechanism. sample.ics's own real VALARM
+    // nested inside its first VEVENT exercises the one genuine
+    // structural difference from vCard: a property belonging to a
+    // component this reader doesn't turn into its own records must
+    // never leak into the enclosing VEVENT/VTODO row.
+    let sql = run_sql("sample.ics", &[]);
+    assert!(sql.contains("'Team standup'"));
+    assert!(sql.contains("'Conference room A'"));
+    assert!(!sql.contains("\"TRIGGER\""));
+    assert!(!sql.contains("\"ACTION\""));
+}
+
+#[test]
+#[cfg(feature = "icalendar")]
+fn sql_output_inline_mode_icalendar_unfolds_lines_and_reads_vtodo() {
+    let sql = run_sql("edge_icalendar_vtodo_and_folding.ics", &[]);
+    assert!(sql.contains("'This description spans two physical lines via folding.'"));
+    assert!(!sql.contains("\"TRIGGER\""));
+}
+
+#[test]
+#[cfg(feature = "icalendar")]
+fn sql_output_inline_mode_icalendar_reads_multiple_concatenated_vcalendar_blocks() {
+    let sql = run_sql("edge_icalendar_multiple_vcalendar_blocks.ics", &[]);
+    assert!(sql.contains("'First calendar''s event'"));
+    assert!(sql.contains("'Second calendar''s event'"));
+}
+
+#[test]
+#[cfg(feature = "icalendar")]
+fn sql_output_inline_mode_icalendar_respects_nrows() {
+    let sql = run_sql("sample.ics", &["--nrows", "1"]);
+    assert!(sql.contains("'Team standup'"));
+    assert!(!sql.contains("'Quarterly review'"));
+}
+
+#[test]
+#[cfg(feature = "icalendar")]
+fn load_into_accepts_icalendar() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.ics").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for icalendar"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 

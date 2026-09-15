@@ -47115,6 +47115,102 @@ mod ical_support {
         }
         Ok(profiler.finish())
     }
+
+    /// The iCalendar row-source for `render_sql_inline_flat` (Phase 25,
+    /// the fourteenth format in the recursively-nested, JSON-bridge
+    /// tier). A mechanical mirror of `columns_from_ical`'s own component-
+    /// stack scanning loop just above, with the identical structural
+    /// guarantee that scanner already provides: a property only ever
+    /// folds into the innermost `Frame::Record` if a `VEVENT`/`VTODO` is
+    /// genuinely what's open right now (`stack.last_mut()`) - a nested
+    /// `VALARM`/`VTIMEZONE`/any other component this reader doesn't turn
+    /// into its own records pushes a `Frame::Other` instead, so its own
+    /// properties are silently skipped rather than ever leaking into an
+    /// enclosing event/todo's row, exactly the same isolation the
+    /// profiling reader already relies on. Each completed `VEVENT`/
+    /// `VTODO`'s pooled `json_support::Map` (built via the identical
+    /// `vobject_support::insert_pooling` vCard's own row-source already
+    /// uses) is byte-for-byte the same `JsonValue::Object` shape
+    /// `json_emit_row_for_sql`/`json_inline_blocking_column` already
+    /// handle - always records mode, the same "zero shared-function
+    /// changes" result vCard's own Phase 24 already established, since
+    /// iCalendar shares the identical `vobject_support` pooling
+    /// mechanism. `sink.done` reproduces `columns_from_ical`'s own
+    /// real-I/O-bounding early stop, including its own "an enclosing
+    /// component is still legitimately open at that point" exception to
+    /// the unterminated-component check.
+    pub(crate) fn stream_ical_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let lines = UnfoldingLines::new(reader);
+        let mut stack: Vec<Frame> = Vec::new();
+
+        'lines: for line in lines {
+            if sink.done {
+                break;
+            }
+            let line = line?;
+            if let Some(name) = line
+                .strip_prefix("BEGIN:")
+                .or_else(|| line.strip_prefix("begin:"))
+            {
+                let name = name.to_ascii_uppercase();
+                if name == "VEVENT" || name == "VTODO" {
+                    stack.push(Frame::Record(json_support::Map::new()));
+                } else {
+                    stack.push(Frame::Other(name));
+                }
+                continue;
+            }
+            if let Some(name) = line
+                .strip_prefix("END:")
+                .or_else(|| line.strip_prefix("end:"))
+            {
+                let name = name.to_ascii_uppercase();
+                let frame = stack.pop().with_context(|| {
+                    format!("{path:?}: END:{name} with no matching BEGIN:{name}")
+                })?;
+                match frame {
+                    Frame::Record(map) => {
+                        if name != "VEVENT" && name != "VTODO" {
+                            bail!(
+                                "{path:?}: END:{name} doesn't match its own BEGIN (a VEVENT/VTODO)"
+                            );
+                        }
+                        json_emit_row_for_sql(&JsonValue::from(map), columns, records_mode, sink)?;
+                        if sink.done {
+                            break 'lines;
+                        }
+                    }
+                    Frame::Other(open_name) => {
+                        if open_name != name {
+                            bail!(
+                                "{path:?}: END:{name} doesn't match the currently open BEGIN:{open_name}"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            match stack.last_mut() {
+                Some(Frame::Record(map)) => {
+                    let prop = parse_property_line(&line)
+                        .with_context(|| format!("{path:?}: malformed iCalendar property line"))?;
+                    insert_pooling(map, prop.name, JsonValue::from(unescape_value(&prop.value)));
+                }
+                Some(Frame::Other(_)) | None => {}
+            }
+        }
+        if !sink.done && !stack.is_empty() {
+            bail!("{path:?}: unterminated component (missing an END: line)");
+        }
+        Ok(())
+    }
 } // mod ical_support
 
 #[cfg(feature = "icalendar")]
@@ -53073,6 +53169,7 @@ fn render_sql_inline_flat(
             | InputFormat::Har
             | InputFormat::GeoJson
             | InputFormat::Vcard
+            | InputFormat::Ical
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -53318,6 +53415,7 @@ fn render_sql_inline_flat(
         InputFormat::Har => render_sql_inline_flat_har(read_path, profiles, &mut sink)?,
         InputFormat::GeoJson => render_sql_inline_flat_geojson(read_path, profiles, &mut sink)?,
         InputFormat::Vcard => render_sql_inline_flat_vcard(read_path, profiles, &mut sink)?,
+        InputFormat::Ical => render_sql_inline_flat_icalendar(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53957,6 +54055,31 @@ fn render_sql_inline_flat_vcard(
     )
 }
 
+/// The iCalendar row-source wrapper for `render_sql_inline_flat` (Phase
+/// 25) - see `render_sql_inline_flat_vcard`'s own doc comment; identical
+/// shape, just driven by `ical_support::stream_ical_rows_for_sql`'s own
+/// component-stack-scoped decode loop instead.
+#[cfg(feature = "icalendar")]
+fn render_sql_inline_flat_icalendar(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    ical_support::stream_ical_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "icalendar"))]
+fn render_sql_inline_flat_icalendar(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "iCalendar support isn't compiled in - rebuild with `cargo build --release --features icalendar` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -54105,12 +54228,13 @@ fn render_sql(
             | InputFormat::Har
             | InputFormat::GeoJson
             | InputFormat::Vcard
+            | InputFormat::Ical
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -61387,10 +61511,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Har
                 | InputFormat::GeoJson
                 | InputFormat::Vcard
+                | InputFormat::Ical
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar are supported so far",
             format.as_str()
         );
     }
