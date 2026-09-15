@@ -4026,18 +4026,36 @@ struct ColumnInput {
 /// then shifts that marker's position by one. `q[2]` (the middle marker)
 /// is the running estimate of the `p`-th quantile at every point.
 ///
-/// Exact, not approximate, for the first five values pushed (before a
-/// sixth ever arrives, `value()` reports the real sorted-median of
-/// whatever's been buffered) - the approximation only ever kicks in once
-/// there's genuinely too much data to keep exactly.
+/// Exact, not approximate, through the fifth value pushed - `value()`
+/// reports the real, exact `p`-th percentile of whatever's been buffered
+/// so far for as long as `total_pushed <= 5`, regardless of `p` - the
+/// approximation only ever kicks in from the sixth push onward, once
+/// there's genuinely too much data to keep exactly. This needed its own
+/// real fix during development: the P² algorithm's own marker-seeding
+/// step sets the middle marker `q[2]` to the raw 3rd-ranked (of 5) sorted
+/// value, which is only actually the *target* quantile when `p = 0.5` -
+/// for any other `p`, `q[2]` only converges toward the real answer as
+/// *further* values arrive and trigger the algorithm's own update step
+/// (see `push`'s own comment). A column with exactly 5 numeric values has
+/// no sixth push to trigger that convergence, so without tracking
+/// `total_pushed` separately from "have the markers been seeded yet,"
+/// `value()` would have silently reported the *median* as every
+/// percentile's own answer for a 5-value column - caught by checking
+/// real output against an independently-computed reference before
+/// trusting it, the same discipline this project holds every heuristic
+/// to, not assumed correct from the algorithm compiling and running.
 #[derive(Clone)]
 struct P2Quantile {
     p: f64,
     // Buffered raw values until exactly five have been seen - bounded at
     // 5 elements for this accumulator's entire lifetime (never grows
-    // further, never shrinks), so this is not "buffer the column with
-    // extra steps," just enough real data to seed the five markers below.
+    // further, never shrinks, and never cleared even once the markers
+    // below are seeded - `value()` still needs it for as long as
+    // `total_pushed` stays at exactly 5), so this is not "buffer the
+    // column with extra steps," just enough real data to seed the five
+    // markers below and answer exactly until real convergence can start.
     initial: Vec<f64>,
+    total_pushed: usize,
     markers: Option<[f64; 5]>,
     positions: [f64; 5],
     desired: [f64; 5],
@@ -4049,6 +4067,7 @@ impl P2Quantile {
         P2Quantile {
             p,
             initial: Vec::with_capacity(5),
+            total_pushed: 0,
             markers: None,
             positions: [0.0; 5],
             desired: [0.0; 5],
@@ -4057,21 +4076,33 @@ impl P2Quantile {
     }
 
     fn push(&mut self, x: f64) {
-        if self.markers.is_none() {
+        self.total_pushed += 1;
+        if self.initial.len() < 5 {
             self.initial.push(x);
-            if self.initial.len() == 5 {
-                self.initial
-                    .sort_by(|a, b| a.partial_cmp(b).expect("finite f64"));
-                let q: [f64; 5] = self.initial[..].try_into().expect("exactly 5 elements");
-                self.markers = Some(q);
-                self.positions = [1.0, 2.0, 3.0, 4.0, 5.0];
-                let p = self.p;
-                self.desired = [1.0, 1.0 + 2.0 * p, 1.0 + 4.0 * p, 3.0 + 2.0 * p, 5.0];
-                self.increments = [0.0, p / 2.0, p, (1.0 + p) / 2.0, 1.0];
-            }
+        }
+        if self.total_pushed == 5 {
+            // Seed the five markers from the now-complete initial batch -
+            // this is initialization, not yet an "update" (the paper's
+            // own step B doesn't start until the sixth observation), so
+            // it returns immediately rather than falling through to the
+            // update logic below on this same call.
+            let mut sorted = self.initial.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite f64"));
+            let q: [f64; 5] = sorted[..].try_into().expect("exactly 5 elements");
+            self.markers = Some(q);
+            self.positions = [1.0, 2.0, 3.0, 4.0, 5.0];
+            let p = self.p;
+            self.desired = [1.0, 1.0 + 2.0 * p, 1.0 + 4.0 * p, 3.0 + 2.0 * p, 5.0];
+            self.increments = [0.0, p / 2.0, p, (1.0 + p) / 2.0, 1.0];
             return;
         }
-        let q = self.markers.as_mut().expect("already initialized above");
+        if self.total_pushed < 5 {
+            return;
+        }
+        let q = self
+            .markers
+            .as_mut()
+            .expect("seeded once total_pushed hit 5");
 
         // Locate the cell `x` falls into (widening q[0]/q[4] if it's a
         // new extreme), per the paper's own step B.1.
@@ -4095,7 +4126,10 @@ impl P2Quantile {
         // Adjust the three interior markers (step B.4) - `q` re-borrowed
         // since the extreme-marker branch above may have already written
         // through it.
-        let q = self.markers.as_mut().expect("already initialized above");
+        let q = self
+            .markers
+            .as_mut()
+            .expect("seeded once total_pushed hit 5");
         for i in 1..4 {
             let d = self.desired[i] - self.positions[i];
             let n = &self.positions;
@@ -4116,40 +4150,75 @@ impl P2Quantile {
         }
     }
 
+    /// At or below five observations, this is the real, exact `p`-th
+    /// percentile of whatever's been buffered so far - linear
+    /// interpolation between the two nearest sorted ranks
+    /// (`numpy.percentile`'s own default `"linear"` method: `index = p *
+    /// (n - 1)`, interpolating between its floor and ceiling), which is
+    /// also what makes the median case (`p = 0.5`) reduce to exactly the
+    /// textbook "average the two middle values for an even count, take
+    /// the middle one for an odd count" rule - one formula correctly
+    /// covers every target quantile, not just p50. Gated on
+    /// `total_pushed`, not on whether the markers have been seeded yet -
+    /// see this type's own doc comment for why that distinction is the
+    /// real fix, not a stylistic preference: the markers *are* seeded by
+    /// the time a 5th value arrives, but `q[2]` only equals the true
+    /// `p`-th percentile once real convergence has had a 6th value to
+    /// work with.
     fn value(&self) -> Option<f64> {
-        if let Some(q) = &self.markers {
-            return Some(q[2]);
-        }
-        if self.initial.is_empty() {
+        if self.total_pushed == 0 {
             return None;
+        }
+        if self.total_pushed > 5 {
+            return Some(self.markers.expect("seeded once total_pushed hit 5")[2]);
         }
         let mut sorted = self.initial.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite f64"));
         let n = sorted.len();
-        Some(if n % 2 == 1 {
-            sorted[n / 2]
-        } else {
-            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
-        })
+        if n == 1 {
+            return Some(sorted[0]);
+        }
+        let idx = self.p * (n - 1) as f64;
+        let lo = idx.floor() as usize;
+        let hi = idx.ceil() as usize;
+        let frac = idx - lo as f64;
+        Some(sorted[lo] * (1.0 - frac) + sorted[hi] * frac)
     }
 }
 
-/// Streaming min/max/mean/sample-stddev/(approximate) median for a
-/// numeric column - `count`-zero-based mean/variance via Welford's online
-/// algorithm and a P² estimator for the median (see `P2Quantile`'s own
-/// doc comment for why it's approximate), so this never buffers a single
-/// value: `push` takes one `O(1)`-cost step per raw string, matching
-/// every other incremental accumulator in this file (`IdealTypeAccumulator`,
-/// `NaiveTypeAccumulator`). Only ever populated on a column whose
-/// `ideal_type` resolved to `"i64"`/`"f64"` (checked after the fact, by
-/// the caller - this accumulator itself has no opinion on what a column's
-/// *type* is, it just quietly ignores any value that doesn't parse as a
-/// finite number, the same "count only what actually parses" contract
-/// `IdealTypeAccumulator`'s own i64/f64 checks already have). Real
-/// percentiles beyond the median (p90/p99/...) are still out of scope -
-/// `P2Quantile` only ever tracks one target quantile per instance, so a
-/// full percentile suite would mean several parallel estimators, a
-/// genuinely separate, larger feature left for its own future pass.
+/// The percentiles this project computes beyond the median itself
+/// (`NumericStats.median` already covers p50) - quartiles plus the
+/// standard latency/SLO-reporting trio, the same default set most
+/// general-purpose profiling tools surface (pandas' own `describe()`
+/// uses 25/50/75 by default; p90/p95/p99 are the conventional tail-
+/// percentile set for anything performance- or reliability-flavored).
+/// Each one is tracked by its own independent `P2Quantile` instance
+/// (`NumericStatsAccumulator.percentile_estimators`, in this exact
+/// order) - the algorithm only ever estimates a single target quantile
+/// per instance (see that type's own doc comment), so a full suite
+/// genuinely does mean several parallel estimators fed the same value
+/// stream, not a free extension of the median's own single estimator.
+const PERCENTILE_TARGETS: [(&str, f64); 5] = [
+    ("p25", 0.25),
+    ("p75", 0.75),
+    ("p90", 0.90),
+    ("p95", 0.95),
+    ("p99", 0.99),
+];
+
+/// Streaming min/max/mean/sample-stddev/(approximate) median and
+/// percentiles for a numeric column - `count`-zero-based mean/variance
+/// via Welford's online algorithm and one P² estimator per tracked
+/// quantile (see `P2Quantile`'s own doc comment for why each is
+/// approximate), so this never buffers a single value: `push` takes one
+/// `O(1)`-cost step per raw string, matching every other incremental
+/// accumulator in this file (`IdealTypeAccumulator`, `NaiveTypeAccumulator`).
+/// Only ever populated on a column whose `ideal_type` resolved to
+/// `"i64"`/`"f64"` (checked after the fact, by the caller - this
+/// accumulator itself has no opinion on what a column's *type* is, it
+/// just quietly ignores any value that doesn't parse as a finite number,
+/// the same "count only what actually parses" contract
+/// `IdealTypeAccumulator`'s own i64/f64 checks already have).
 #[derive(Clone, Debug, Default, PartialEq)]
 struct NumericStats {
     count: u64,
@@ -4165,6 +4234,11 @@ struct NumericStats {
     /// sorted middle value for a large column either - disclosed here
     /// rather than presented as if it were exact.
     median: f64,
+    /// Always exactly the five `(label, estimate)` pairs named by
+    /// `PERCENTILE_TARGETS`, in that fixed order - `p25`/`p75`/`p90`/
+    /// `p95`/`p99`. Same approximate-not-exact caveat as `median` above,
+    /// same "exact for five or fewer values" floor.
+    percentiles: Vec<(String, f64)>,
 }
 
 #[derive(Clone)]
@@ -4182,6 +4256,11 @@ struct NumericStatsAccumulator {
     // values in the same column).
     m2: f64,
     median_estimator: P2Quantile,
+    // Parallel to `PERCENTILE_TARGETS` - `percentile_estimators[i]`
+    // tracks `PERCENTILE_TARGETS[i]`'s own target quantile. Always
+    // exactly `PERCENTILE_TARGETS.len()` long, built once in `default()`
+    // and never resized afterward.
+    percentile_estimators: Vec<P2Quantile>,
 }
 
 impl Default for NumericStatsAccumulator {
@@ -4193,6 +4272,10 @@ impl Default for NumericStatsAccumulator {
             mean: 0.0,
             m2: 0.0,
             median_estimator: P2Quantile::new(0.5),
+            percentile_estimators: PERCENTILE_TARGETS
+                .iter()
+                .map(|&(_, p)| P2Quantile::new(p))
+                .collect(),
         }
     }
 }
@@ -4241,6 +4324,9 @@ impl NumericStatsAccumulator {
         let delta2 = v - self.mean;
         self.m2 += delta * delta2;
         self.median_estimator.push(v);
+        for est in &mut self.percentile_estimators {
+            est.push(v);
+        }
     }
 
     /// `None` iff nothing this accumulator saw ever parsed as a finite
@@ -4274,6 +4360,14 @@ impl NumericStatsAccumulator {
             // fallback rather than an `unwrap()` that could panic on a
             // logic error somewhere else in this file.
             median: self.median_estimator.value().unwrap_or(self.mean),
+            // Same "never actually `None` in practice, `self.mean` is
+            // just a defensive fallback" reasoning as `median` above -
+            // every percentile estimator sees the identical value stream.
+            percentiles: PERCENTILE_TARGETS
+                .iter()
+                .zip(self.percentile_estimators.iter())
+                .map(|(&(label, _), est)| (label.to_string(), est.value().unwrap_or(self.mean)))
+                .collect(),
         })
     }
 }
@@ -4281,13 +4375,18 @@ impl NumericStatsAccumulator {
 impl NumericStats {
     fn to_json(&self) -> json_support::Value {
         use json_support::{Map, Value};
-        let mut obj = Map::with_capacity(6);
+        let mut obj = Map::with_capacity(7);
         obj.insert("count".to_string(), Value::from(self.count));
         obj.insert("min".to_string(), Value::from(self.min));
         obj.insert("max".to_string(), Value::from(self.max));
         obj.insert("mean".to_string(), Value::from(self.mean));
         obj.insert("median".to_string(), Value::from(self.median));
         obj.insert("stddev".to_string(), Value::from(self.stddev));
+        let mut percentiles = Map::with_capacity(self.percentiles.len());
+        for (label, value) in &self.percentiles {
+            percentiles.insert(label.clone(), Value::from(*value));
+        }
+        obj.insert("percentiles".to_string(), Value::Object(percentiles));
         Value::Object(obj)
     }
 }
@@ -4593,6 +4692,38 @@ mod numeric_stats_tests {
     }
 
     #[test]
+    fn p2_quantile_is_exact_for_a_non_median_percentile_at_exactly_five_values() {
+        // A real, found-and-fixed bug: the P² algorithm's own marker-
+        // seeding step sets the middle marker to the raw 3rd-ranked (of
+        // 5) sorted value, which only equals the *target* quantile when
+        // p=0.5 - for any other p, that marker only converges toward the
+        // real answer once a 6th value arrives and triggers a real
+        // update. A column with exactly 5 values never gets that 6th
+        // push, so `value()` has to keep answering from the exact,
+        // interpolated buffer (not the seeded marker) through the 5th
+        // push specifically - every value here cross-checked directly
+        // against `numpy.percentile(..., method="linear")`.
+        let values = [0.0, 1.0, 3.0, 7.0, 12.0];
+        for &(p, expected) in &[
+            (0.25, 1.0),
+            (0.75, 7.0),
+            (0.90, 10.0),
+            (0.95, 11.0),
+            (0.99, 11.8),
+        ] {
+            let mut q = P2Quantile::new(p);
+            for &v in &values {
+                q.push(v);
+            }
+            let got = q.value().unwrap();
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "p={p}: expected {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
     fn p2_quantile_converges_close_to_the_true_median_of_a_large_uniform_dataset() {
         // 1..=1001 has a real, exact median of 501 - the P² estimate
         // should land close to it (a real, published property of the
@@ -4662,6 +4793,13 @@ mod numeric_stats_tests {
                 mean: 2.0,
                 median: 2.0,
                 stddev: std::f64::consts::FRAC_1_SQRT_2,
+                percentiles: vec![
+                    ("p25".to_string(), 1.5),
+                    ("p75".to_string(), 2.5),
+                    ("p90".to_string(), 2.5),
+                    ("p95".to_string(), 2.5),
+                    ("p99".to_string(), 2.5),
+                ],
             }),
         };
         let text = json_support::to_pretty_string(&p.to_json());
@@ -4671,6 +4809,9 @@ mod numeric_stats_tests {
         assert_eq!(via_real["numeric_stats"]["max"], 2.5);
         assert_eq!(via_real["numeric_stats"]["mean"], 2.0);
         assert_eq!(via_real["numeric_stats"]["median"], 2.0);
+        assert_eq!(via_real["numeric_stats"]["percentiles"]["p25"], 1.5);
+        assert_eq!(via_real["numeric_stats"]["percentiles"]["p75"], 2.5);
+        assert_eq!(via_real["numeric_stats"]["percentiles"]["p99"], 2.5);
 
         // A non-numeric column's `numeric_stats` renders as a real JSON
         // `null`, never an omitted key - a consumer can always find the

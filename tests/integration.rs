@@ -2882,6 +2882,25 @@ fn json_output_reports_numeric_stats_for_i64_and_f64_columns_only() {
     assert_eq!(balance_stats["min"], 89.2);
     assert_eq!(balance_stats["max"], 12000.0);
     assert!((balance_stats["mean"].as_f64().unwrap() - 3760.09).abs() < 1e-9);
+
+    // median and percentiles: sample.csv's columns all have <= 5 numeric
+    // values, so these must be *exact* (`numpy.percentile(..., method=
+    // "linear")` on the same values), not just plausible-looking -
+    // confirming the real bug this feature's own follow-up pass found
+    // and fixed (a 5-value column silently reporting the median as
+    // every percentile's own answer) stays fixed.
+    assert_eq!(age_stats["median"], 39.5);
+    assert_eq!(age_stats["percentiles"]["p25"], 32.75);
+    assert_eq!(age_stats["percentiles"]["p75"], 46.75);
+
+    let purchase = column(cols, "purchase_count");
+    let purchase_stats = &purchase["numeric_stats"];
+    assert_eq!(purchase_stats["median"], 3.0);
+    assert_eq!(purchase_stats["percentiles"]["p25"], 1.0);
+    assert_eq!(purchase_stats["percentiles"]["p75"], 7.0);
+    assert_eq!(purchase_stats["percentiles"]["p90"], 10.0);
+    assert_eq!(purchase_stats["percentiles"]["p95"], 11.0);
+    assert_eq!(purchase_stats["percentiles"]["p99"], 11.8);
 }
 
 #[test]

@@ -287,16 +287,19 @@ column *means*.
 
 `numeric_stats` is `null` for every column except one whose `ideal_type`
 resolved to exactly `"i64"` or `"f64"`, in which case it's a real
-`{"count", "min", "max", "mean", "median", "stddev"}` object — a genuine,
-incremental, streaming computation (never a second whole-column buffer),
-populated by every reader this tool has: `profile_column` and the
-`ColumnAccumulatorState`-based incremental readers (CSV/TSV, fixed-width,
-dBase, Stata, SAS7BDAT, SPSS, NumPy, ORC, the whole Excel family, SQLite,
-the log formats, and Parquet/Arrow IPC's own flat leaf columns) *and* the
-recursively-nested JSON-bridge tier (JSON, YAML, TOML, Avro, MessagePack,
-CBOR, XML, and friends, including a pooled array column's own flattened
-leaf values). `median` is a streaming *approximation* (the P² algorithm),
-not the literal sorted middle value — see "Numeric/statistical column
+`{"count", "min", "max", "mean", "median", "stddev", "percentiles"}`
+object (`percentiles` itself a nested `{"p25", "p75", "p90", "p95",
+"p99"}`) — a genuine, incremental, streaming computation (never a second
+whole-column buffer), populated by every reader this tool has:
+`profile_column` and the `ColumnAccumulatorState`-based incremental
+readers (CSV/TSV, fixed-width, dBase, Stata, SAS7BDAT, SPSS, NumPy, ORC,
+the whole Excel family, SQLite, the log formats, and Parquet/Arrow IPC's
+own flat leaf columns) *and* the recursively-nested JSON-bridge tier
+(JSON, YAML, TOML, Avro, MessagePack, CBOR, XML, and friends, including a
+pooled array column's own flattened leaf values). `median` and every
+`percentiles` entry are streaming *approximations* (the P² algorithm),
+exact only for a column with five or fewer numeric values, a converging
+approximation otherwise — see "Numeric/statistical column
 summaries" further down for the full design, including exactly why an
 approximation is the honest tradeoff here rather than an exact value.
 `--output-format json` only, the same reasoning `row_count` above already
@@ -3643,6 +3646,79 @@ scope (min/max/mean/stddev) plus a genuine, disclosed-approximate
 median - the only remaining, explicitly out-of-scope gap is a full
 percentile suite beyond the median itself, named above as its own
 future, separately-scoped feature rather than left unstated.
+
+**A second follow-up pass closed that last remaining gap too** (prompted
+by an explicit "don't stop work on this" instruction to keep improving
+this feature until nothing scoped-out was left). `NumericStats.percentiles`
+is now a real `{"p25", "p75", "p90", "p95", "p99"}` object - the standard
+quartile-plus-tail-percentile set most general-purpose profiling tools
+default to (pandas' own `describe()` uses 25/50/75; p90/p95/p99 are the
+conventional latency/SLO-reporting trio) - alongside the already-shipped
+`median` (p50). `PERCENTILE_TARGETS` names the five target quantiles once;
+`NumericStatsAccumulator` carries one independent `P2Quantile` instance
+per target (plus the pre-existing median estimator), fed the identical
+already-cleaned value on every `push` - the algorithm only ever tracks a
+single target quantile per instance, so a full suite genuinely does mean
+several parallel estimators over the same value stream, not a free
+extension of the median's own.
+
+**A real, found-and-fixed bug came out of actually checking the output
+against an independent reference before trusting it** - the same
+discipline this project holds every other heuristic to, applied here to
+its own newest code. A first, naive implementation reused
+`P2Quantile.value()`'s existing "markers seeded → return `q[2]`" branch
+unconditionally for every target quantile - but the P² algorithm's own
+marker-seeding step sets the middle marker to the raw 3rd-ranked (of 5)
+sorted value, which is only actually the *target* quantile when `p =
+0.5`; for any other `p`, that marker only converges toward the true
+answer once a *sixth* value arrives and triggers the algorithm's own
+update step. A column with exactly five numeric values - a real, common
+shape, not a contrived edge case - never gets that sixth push, so every
+non-median percentile silently reported the *median* as its own answer
+for any such column: confirmed directly by running `sample.csv` (whose
+own numeric columns all have five or fewer values) through the compiled
+binary and comparing against `numpy.percentile(..., method="linear")`
+on the same values, not assumed correct from the algorithm compiling and
+producing plausible-looking numbers.
+
+Fixed by tracking `total_pushed` as its own counter, independent of
+whether the markers have been seeded yet: `value()` now answers from the
+real, exact, linearly-interpolated percentile of the buffered raw values
+(the same `numpy.percentile`-style formula `index = p * (n - 1)`,
+interpolating between its floor and ceiling rank) for as long as
+`total_pushed <= 5`, and only switches to the P²-estimated marker once a
+sixth value has actually arrived to drive real convergence. This
+generalizes what used to be the median's own hardcoded "average the two
+middle values for an even count, take the middle one for an odd count"
+special case into one formula that's correct for every target quantile,
+not just p50 - re-verified that the existing five-or-fewer-values median
+test still passes unchanged with the generalized formula, not just the
+new percentile case.
+
+Verified four ways: a dedicated regression test pushing the exact
+`[0, 1, 3, 7, 12]` column from `sample.csv`'s own `purchase_count`
+through five different target quantiles (p25/p75/p90/p95/p99), each
+checked against `numpy.percentile(..., method="linear")` computed
+independently beforehand - the exact bug this pass found and fixed,
+locked in permanently rather than left as a one-off manual check; the
+existing five-or-fewer-values median test confirmed unaffected by the
+generalization; a new integration test extending the existing numeric-
+stats test with real `median`/`percentiles` assertions on `sample.csv`'s
+own `age`/`purchase_count` columns (all exact, all independently cross-
+checked); and manual re-verification against the same synthetic 2,000-row
+uniformly-random file used to verify the median (percentile estimates for
+p25/p75/p90/p95/p99 all land within a few units of their own
+independently-computed exact values via the same interpolation formula).
+Clean across default/`full`, matching each build's own established
+clippy baseline exactly.
+
+With both follow-up passes, numeric/statistical column summaries is now
+feature-complete relative to every gap its own original design ever
+named: every reader this project has, all four original numbers (min/
+max/mean/stddev), a real median, and a real five-percentile suite - with
+every approximate value's own honest caveat (converges, isn't exact
+past five values) disclosed directly on the types themselves, not just
+in this document.
 
 ## Architecture
 
