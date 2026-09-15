@@ -321,9 +321,10 @@ fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
-`.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, and TOML, the first three
-formats in the recursively-nested, JSON-bridge tier. Every other format
-transparently falls back to `staging` with a disclosed stderr
+`.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, and
+CBOR, the first five formats in the recursively-nested, JSON-bridge
+tier. Every other format transparently falls back to `staging` with a
+disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
 asked for would be the wrong kind of quiet).
@@ -365,8 +366,9 @@ needs its own real design, not just repeating the same pattern:
    genuinely different blank-row-reconstruction strategies for ODS's
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
-3. **The recursively-nested, JSON-bridge tier - JSON, YAML, and TOML done
-   as of Phases 13-15.** Unlike the two tiers above, there was no existing
+3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
+   MessagePack, and CBOR done as of Phases 13-16.** Unlike the two tiers
+   above, there was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -386,9 +388,14 @@ needs its own real design, not just repeating the same pattern:
    documents_stream`) needed writing. TOML carried both functions over
    unchanged too, needing only `toml_support::document_object` to
    re-parse its own single top-level document a second time - no loop at
-   all, since a TOML file always profiles as exactly one record. Avro,
-   MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
-   iCalendar, and MBOX remain unstarted.
+   all, since a TOML file always profiles as exactly one record.
+   MessagePack and CBOR carried all three shared functions over
+   unchanged too - both formats already decode straight to the same
+   `Value` shape, so only each format's own concatenated-records-or-
+   single-array re-decode loop needed writing (a mechanical mirror of
+   each format's own existing profiling decode loop). Avro, XML, BSON,
+   plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX remain
+   unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1452,19 +1459,71 @@ unsupported format" example moved to Avro instead, gated behind
 `--features avro` - the same one-hop-forward shuffle repeats itself
 again as each new format in this tier graduates out of "unsupported."
 
-Remaining in the recursively-nested, JSON-bridge tier: Avro, MessagePack,
-CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX -
-each bridges to the same `json_support::Value` shape JSON itself uses
-(see the Architecture section), so `json_extract_value_for_sql`/
-`json_inline_blocking_column`/`json_bridge_columns_and_mode` are already
-reusable as-is once each format's own row-source re-decodes its file a
-second time into that same `Value` tree - Phases 14 and 15 are direct,
-working proof of this now, not just a plan (two formats in a row needed
-zero changes to any of the three shared functions). vCard/iCalendar/
-MBOX's own repeated-property pooling (a different mechanism from JSON's
-array pooling, but the identical one-cell-per-row question) is the one
-sub-family that will need its own fresh look before assuming the same
-machinery applies unchanged.
+**Phase 16: MessagePack and CBOR, together - the fourth and fifth
+formats in the recursively-nested, JSON-bridge tier, shipped as one
+phase since both formats share the exact concatenated-records-or-
+single-array convention verbatim (see the Architecture section for why
+- it's the same reason their own profiling readers already share this
+shape).** A third format in a row needed zero changes to `json_extract_
+value_for_sql`/`json_inline_blocking_column`/`json_bridge_columns_
+and_mode` - both formats already decode to the shared `json_support::
+Value` shape via their own existing `value_to_json` conversion
+functions, so the only new code per format is `msgpack_support::
+stream_msgpack_rows_for_sql`/`cbor_support::stream_cbor_rows_for_sql`, a
+mechanical mirror of each format's own already-existing `columns_from_
+msgpack`/`columns_from_cbor` decode loop - same lookahead (peek whether
+a single top-level value is the *only* one in the file, and if so and
+it's an array, unwrap its elements as records), same "every value still
+decoded regardless of `--nrows`, only what's kept is capped" convention,
+just folding into `json_emit_row_for_sql` instead of the profiling
+accumulator. Both new functions live inside their own already-existing
+`_support` module (mirroring `columns_from_msgpack`/`columns_from_cbor`
+placement exactly) rather than the top-level SQL section, since they
+need direct access to each module's own private `read_value`/
+`value_to_json`/`MAX_DEPTH` - a `use super::*` import already makes the
+shared JSON-bridge functions visible there too, so no visibility changes
+were needed on either side.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.msgpack`/`sample.cbor --output-format sql --load-into
+sqlite:...` both loaded correctly, with a genuinely missing `age` value
+landing as a real `NULL`; `type_detection.msgpack` confirmed every
+semantic type (UUID/email/IPv4/date) survives intact;
+`edge_msgpack_scalar_array.msgpack` (a bare top-level array of floats)
+confirmed the single-`value`-column mode resolves correctly; two new
+hand-built fixtures (`edge_msgpack_sql_inline_flat.msgpack`/`edge_cbor_
+sql_inline_flat.cbor`, generated with Python's own `msgpack`/`cbor2`
+libraries, deliberately the wire-format equivalent of Phase 13-15's own
+JSON/YAML/TOML fixtures - a nested map, a pooled array including a
+genuinely empty one, and a `null` field) confirmed byte-identical
+behavior to every prior format in this tier; a hand-built array-of-maps
+fixture confirmed the disclosed blocking error fires and names the
+offending field (`"orders"`) exactly as it already does for JSON/YAML/
+TOML's own array-of-objects/array-of-tables cases; `--nrows` confirmed
+to bound the kept row count. Also verified as behavior-preserving for
+every already-shipped format: `diff` confirmed byte-identical inline SQL
+output against the pre-Phase-16 binary across the entire fixture corpus.
+Clean across default/`msgpack`/`cbor`/`full`, matching each one's own
+established baseline exactly.
+
+Phase 15's own three tests that used Avro as their "still genuinely
+unsupported format" example needed no change this phase - Avro remains
+genuinely unsupported (it's next), so this is the first phase in this
+tier where that shuffle didn't need to happen.
+
+Remaining in the recursively-nested, JSON-bridge tier: Avro, XML, BSON,
+plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX - each bridges to
+the same `json_support::Value` shape JSON itself uses (see the
+Architecture section), so `json_extract_value_for_sql`/`json_inline_
+blocking_column`/`json_bridge_columns_and_mode` are already reusable
+as-is once each format's own row-source re-decodes its file a second
+time into that same `Value` tree - Phases 14 through 16 are direct,
+working proof of this now, not just a plan (three formats in a row
+needed zero changes to any of the three shared functions). vCard/
+iCalendar/MBOX's own repeated-property pooling (a different mechanism
+from JSON's array pooling, but the identical one-cell-per-row question)
+is the one sub-family that will need its own fresh look before assuming
+the same machinery applies unchanged.
 
 ## Directory-input batch mode
 

@@ -1813,6 +1813,93 @@ fn load_into_accepts_toml() {
 }
 
 #[test]
+#[cfg(feature = "msgpack")]
+fn sql_output_inline_mode_supports_flat_msgpack_with_nested_map_and_array() {
+    // Phase 16 of the "any format" rollout, and the fourth format in the
+    // recursively-nested, JSON-bridge tier - MessagePack decodes to the
+    // shared json_support::Value shape the same way JSON/YAML/TOML
+    // already do, so json_extract_value_for_sql/json_inline_blocking_
+    // column carry over completely unchanged. A plain nested map
+    // flattens transparently with no column of its own, and a pooled
+    // array serializes as one JSON-array-text literal.
+    let sql = run_sql("edge_msgpack_sql_inline_flat.msgpack", &[]);
+    assert!(!sql.contains("\"meta\" "));
+    assert!(sql.contains("\"meta.score\""));
+    assert!(sql.contains("\"meta.active\""));
+    assert!(sql.contains("'[\"red\",\"blue\"]'"));
+    assert!(sql.contains("'[]'"));
+    let values = sql
+        .split("INSERT INTO")
+        .nth(1)
+        .expect("no INSERT statement found");
+    assert!(values.contains("NULL"));
+}
+
+#[test]
+#[cfg(feature = "msgpack")]
+fn sql_output_inline_mode_msgpack_single_value_column_top_level_array() {
+    let sql = run_sql("edge_msgpack_scalar_array.msgpack", &[]);
+    assert!(sql.contains("\"value\""));
+    assert!(sql.contains("(23.5)"));
+}
+
+#[test]
+#[cfg(feature = "msgpack")]
+fn load_into_accepts_msgpack() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_msgpack_sql_inline_flat.msgpack")
+                .to_str()
+                .unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for msgpack"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "cbor")]
+fn sql_output_inline_mode_supports_flat_cbor_with_nested_map_and_array() {
+    // The fifth format in the recursively-nested, JSON-bridge tier -
+    // CBOR shares MessagePack's own concatenated-records-or-single-array
+    // convention verbatim, and the same shared json_support::Value
+    // bridge, so this exercises the identical shape through a genuinely
+    // different binary wire format.
+    let sql = run_sql("edge_cbor_sql_inline_flat.cbor", &[]);
+    assert!(!sql.contains("\"meta\" "));
+    assert!(sql.contains("\"meta.score\""));
+    assert!(sql.contains("\"meta.active\""));
+    assert!(sql.contains("'[\"red\",\"blue\"]'"));
+    assert!(sql.contains("'[]'"));
+}
+
+#[test]
+#[cfg(feature = "cbor")]
+fn load_into_accepts_cbor() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_cbor_sql_inline_flat.cbor").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for cbor"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
 fn sql_output_default_extension_is_dictionary_sql() {
     // Copies the fixture into a scratch tempdir first (rather than
     // pointing the binary straight at the committed fixture with no

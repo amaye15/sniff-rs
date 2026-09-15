@@ -40338,6 +40338,67 @@ mod msgpack_support {
 
         Ok(profiler.finish())
     }
+
+    /// The MessagePack row-source for `render_sql_inline_flat` (Phase 16),
+    /// a mechanical mirror of `columns_from_msgpack`'s own decode loop
+    /// just above, folding each decoded value into `json_emit_row_for_sql`
+    /// instead of the profiling accumulator. Every value is still decoded
+    /// regardless of `--nrows` (matching `columns_from_msgpack`'s own
+    /// decode-all-then-truncate convention - `--nrows` only bounds what's
+    /// *kept*, via `InlineRowSink::accept`'s own cap), so a malformed
+    /// trailing record past the cutoff still errors exactly as before.
+    pub(crate) fn stream_msgpack_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        use std::fs::File;
+        use std::io::BufRead;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = BufReader::new(file);
+        let emit = |sink: &mut InlineRowSink<'_>, jv: &JsonValue| {
+            json_emit_row_for_sql(jv, columns, records_mode, sink)
+        };
+
+        if !reader
+            .fill_buf()
+            .with_context(|| format!("failed reading {path:?}"))?
+            .is_empty()
+        {
+            let first = read_value(&mut reader, MAX_DEPTH)
+                .with_context(|| format!("failed decoding a MessagePack value from {path:?}"))?;
+            let has_more = !reader
+                .fill_buf()
+                .with_context(|| format!("failed reading {path:?}"))?
+                .is_empty();
+            if !has_more {
+                match first {
+                    Value::Array(items) => {
+                        for item in &items {
+                            emit(sink, &value_to_json(item))?;
+                        }
+                    }
+                    other => emit(sink, &value_to_json(&other))?,
+                }
+            } else {
+                emit(sink, &value_to_json(&first))?;
+                while !reader
+                    .fill_buf()
+                    .with_context(|| format!("failed reading {path:?}"))?
+                    .is_empty()
+                {
+                    let v = read_value(&mut reader, MAX_DEPTH).with_context(|| {
+                        format!("failed decoding a MessagePack value from {path:?}")
+                    })?;
+                    emit(sink, &value_to_json(&v))?;
+                }
+            }
+        }
+        Ok(())
+    }
 } // mod msgpack_support
 
 #[cfg(feature = "msgpack")]
@@ -43459,6 +43520,69 @@ mod cbor_support {
         }
 
         Ok(profiler.finish())
+    }
+
+    /// The CBOR row-source for `render_sql_inline_flat` (Phase 16) - a
+    /// mechanical mirror of `columns_from_cbor`'s own decode loop just
+    /// above (identical shape to `msgpack_support::stream_msgpack_rows_
+    /// for_sql`'s own copy of this, since MessagePack/CBOR share the
+    /// concatenated-records-or-single-array convention verbatim), folding
+    /// each decoded value into `json_emit_row_for_sql` instead of the
+    /// profiling accumulator. Every value is still decoded regardless of
+    /// `--nrows` (matching `columns_from_cbor`'s own decode-all-then-
+    /// truncate convention - `--nrows` only bounds what's *kept*, via
+    /// `InlineRowSink::accept`'s own cap), so a malformed trailing record
+    /// past the cutoff still errors exactly as before.
+    pub(crate) fn stream_cbor_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        use std::fs::File;
+        use std::io::BufRead;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = BufReader::new(file);
+        let emit = |sink: &mut InlineRowSink<'_>, jv: &JsonValue| {
+            json_emit_row_for_sql(jv, columns, records_mode, sink)
+        };
+
+        if !reader
+            .fill_buf()
+            .with_context(|| format!("failed reading {path:?}"))?
+            .is_empty()
+        {
+            let first = read_value(&mut reader, MAX_DEPTH)
+                .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
+            let has_more = !reader
+                .fill_buf()
+                .with_context(|| format!("failed reading {path:?}"))?
+                .is_empty();
+            if !has_more {
+                match first {
+                    Value::Array(items) => {
+                        for item in &items {
+                            emit(sink, &value_to_json(item))?;
+                        }
+                    }
+                    other => emit(sink, &value_to_json(&other))?,
+                }
+            } else {
+                emit(sink, &value_to_json(&first))?;
+                while !reader
+                    .fill_buf()
+                    .with_context(|| format!("failed reading {path:?}"))?
+                    .is_empty()
+                {
+                    let v = read_value(&mut reader, MAX_DEPTH)
+                        .with_context(|| format!("failed decoding a CBOR value from {path:?}"))?;
+                    emit(sink, &value_to_json(&v))?;
+                }
+            }
+        }
+        Ok(())
     }
 } // mod cbor_support
 
@@ -52462,7 +52586,11 @@ fn render_sql_inline_flat(
     // than re-parsing the schema.
     let json_bridge_format = matches!(
         format,
-        InputFormat::Json | InputFormat::Yaml | InputFormat::Toml
+        InputFormat::Json
+            | InputFormat::Yaml
+            | InputFormat::Toml
+            | InputFormat::MsgPack
+            | InputFormat::Cbor
     );
     let json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -52644,6 +52772,8 @@ fn render_sql_inline_flat(
         InputFormat::Json => render_sql_inline_flat_json(read_path, profiles, &mut sink)?,
         InputFormat::Yaml => render_sql_inline_flat_yaml(read_path, profiles, &mut sink)?,
         InputFormat::Toml => render_sql_inline_flat_toml(read_path, profiles, &mut sink)?,
+        InputFormat::MsgPack => render_sql_inline_flat_msgpack(read_path, profiles, &mut sink)?,
+        InputFormat::Cbor => render_sql_inline_flat_cbor(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53031,6 +53161,58 @@ fn render_sql_inline_flat_toml(
     )
 }
 
+/// The MessagePack/CBOR row-source wrappers for `render_sql_inline_flat`
+/// (Phase 16, the fourth and fifth formats in the recursively-nested,
+/// JSON-bridge tier) - both formats decode to the same shared
+/// `json_support::Value` shape, so `json_bridge_columns_and_mode`/
+/// `json_emit_row_for_sql` carry over unchanged (the same "zero shared-
+/// function changes" pattern Phases 14-15 already established); the only
+/// new code is each format's own concatenated-records-or-single-array
+/// re-decode loop (`msgpack_support::stream_msgpack_rows_for_sql`/
+/// `cbor_support::stream_cbor_rows_for_sql`, both mechanical mirrors of
+/// their own already-existing profiling decode loop).
+#[cfg(feature = "msgpack")]
+fn render_sql_inline_flat_msgpack(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    msgpack_support::stream_msgpack_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "msgpack"))]
+fn render_sql_inline_flat_msgpack(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "MessagePack support isn't compiled in - rebuild with `cargo build --release --features msgpack` (or --features full)"
+    )
+}
+
+#[cfg(feature = "cbor")]
+fn render_sql_inline_flat_cbor(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    cbor_support::stream_cbor_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "cbor"))]
+fn render_sql_inline_flat_cbor(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "CBOR support isn't compiled in - rebuild with `cargo build --release --features cbor` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53169,12 +53351,14 @@ fn render_sql(
             | InputFormat::Json
             | InputFormat::Yaml
             | InputFormat::Toml
+            | InputFormat::MsgPack
+            | InputFormat::Cbor
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -60441,10 +60625,12 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Json
                 | InputFormat::Yaml
                 | InputFormat::Toml
+                | InputFormat::MsgPack
+                | InputFormat::Cbor
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor are supported so far",
             format.as_str()
         );
     }
