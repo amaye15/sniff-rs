@@ -690,8 +690,32 @@ fn load_into_rejects_a_malformed_target() {
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
+// Directory-mode --load-into's own end-to-end happy path (one fresh
+// database per recognized file, mirroring the source tree's own
+// subdirectories exactly the way --output-dir already does for every
+// other output format, with a prior run's own databases correctly
+// skipped rather than re-ingested on a later run) is deliberately NOT
+// covered by an automated test here, matching this project's own
+// standing precedent for --load-into: no automated test spawns a real
+// sqlite3/duckdb/psql/mysql process, since that CLI tool being on PATH
+// is an environment fact this test suite can't assume everywhere it
+// runs (unlike sqlite3, duckdb in particular is commonly absent).
+// Verified manually instead, against a real, installed sqlite3 build,
+// with no separate load step: a two-file directory (one nested under a
+// subdirectory) produced two correctly-named, correctly-mirrored
+// `.sqlite` databases, each queryable back for its own real data; a
+// second run over that same directory correctly skipped both
+// already-created databases (per looks_like_own_loaded_database, whose
+// own detection logic - the double-extension shape vs. a genuine
+// single-extension database someone already had - *is* covered by the
+// portable, subprocess-free unit tests next to its own definition) and
+// still correctly profiled a genuinely unrelated, real SQLite file
+// dropped in the same directory. What *is* covered here, since none of
+// it needs a working subprocess spawn to fail cleanly: every validation
+// error a bad combination of flags produces.
+
 #[test]
-fn load_into_is_rejected_in_directory_mode() {
+fn load_into_directory_mode_rejects_combining_with_output_dir() {
     let dir = TempDir::new();
     std::fs::copy(fixture("sample.csv"), dir.path().join("sample.csv")).unwrap();
     let output = Command::new(bin())
@@ -700,13 +724,68 @@ fn load_into_is_rejected_in_directory_mode() {
             "--output-format",
             "sql",
             "--load-into",
-            "sqlite:/tmp/whatever.db",
+            "sqlite:/tmp/whatever-load-into-target",
+            "--output-dir",
+            "/tmp/whatever-output-dir",
         ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into is single-file mode only"));
+    assert!(stderr.contains("already names the directory"));
+}
+
+#[test]
+fn load_into_directory_mode_rejects_postgres_and_mysql() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("sample.csv")).unwrap();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "postgres:mydb",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only supports sqlite/duckdb"));
+}
+
+#[test]
+fn load_into_directory_mode_rejects_staging_mode_and_wrong_output_format() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("sample.csv")).unwrap();
+
+    let staging = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--sql-mode",
+            "staging",
+            "--load-into",
+            "sqlite:/tmp/whatever-staging",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!staging.status.success());
+    assert!(String::from_utf8_lossy(&staging.stderr).contains("requires --sql-mode inline"));
+
+    let wrong_format = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-format",
+            "json",
+            "--load-into",
+            "sqlite:/tmp/whatever-wrong-format",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!wrong_format.status.success());
+    assert!(String::from_utf8_lossy(&wrong_format.stderr).contains("requires --output-format sql"));
 }
 
 #[test]

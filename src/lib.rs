@@ -61392,6 +61392,7 @@ fn resolved_sql_mode(args: &Args) -> Result<SqlMode> {
 /// footprint section for why this project treats adding a *write*-
 /// capable runtime dependency as a real, deliberate decision, not a
 /// default reach).
+#[derive(Clone, Copy)]
 enum LoadEngine {
     Sqlite,
     DuckDb,
@@ -61420,6 +61421,21 @@ impl LoadEngine {
             other => bail!(
                 "--load-into: unrecognized engine '{other}' (expected sqlite, duckdb, postgres, or mysql)"
             ),
+        }
+    }
+
+    /// The extension a directory-mode `--load-into` run gives each
+    /// per-file database it creates (see `run_directory`'s own
+    /// `--load-into` handling) - only ever called after that code has
+    /// already confirmed the engine is one of these two file-based ones,
+    /// so Postgres/MySql never reach here.
+    fn per_file_db_extension(&self) -> &'static str {
+        match self {
+            LoadEngine::Sqlite => "sqlite",
+            LoadEngine::DuckDb => "duckdb",
+            LoadEngine::Postgres | LoadEngine::MySql => {
+                unreachable!("directory-mode --load-into already rejects Postgres/MySql")
+            }
         }
     }
 }
@@ -61964,7 +61980,7 @@ fn batch_output_path(
 }
 
 /// Every default output filename this tool itself ever produces - in
-/// single-file mode too - ends in exactly one of these three suffixes.
+/// single-file mode too - ends in exactly one of these four suffixes.
 /// Found empirically, not reasoned out in advance: running this exact
 /// directory-batch feature a second time over a directory it had already
 /// written into showed it dutifully re-profiling its own prior JSON
@@ -61985,11 +62001,40 @@ const OWN_OUTPUT_SUFFIXES: [&str; 4] = [
     ".dictionary.sql",
 ];
 
+/// Whether `path` names a real database directory-mode's own
+/// `--load-into` already created on a prior run (`batch_output_file_name`'s
+/// identical `<full-original-filename>.<ext>` naming, just with `sqlite`/
+/// `duckdb` as the extension instead of a `.dictionary.*` one). Unlike
+/// `OWN_OUTPUT_SUFFIXES`'s own four suffixes - each unambiguous on its
+/// own, since no real user file would ever coincidentally be named
+/// `*.dictionary.sql` - a bare `.sqlite`/`.duckdb` extension is exactly
+/// what a real, unrelated SQLite/DuckDB database this tool is *supposed*
+/// to profile as fresh input already looks like (`warehouse.sqlite`),
+/// so this can't be a blanket suffix match: it only fires when the
+/// file's own *stem* (with `.sqlite`/`.duckdb` stripped) itself still
+/// carries a real extension - `sample.csv.sqlite`'s stem is `sample.csv`,
+/// unambiguously the double-extension shape only this feature's own
+/// per-file naming ever produces, while a genuine `warehouse.sqlite`'s
+/// stem (`warehouse`) has none and is correctly left alone.
+fn looks_like_own_loaded_database(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if ext != "sqlite" && ext != "duckdb" {
+        return false;
+    }
+    let Some(stem) = path.file_stem() else {
+        return false;
+    };
+    Path::new(stem).extension().is_some()
+}
+
 fn looks_like_own_output(path: &Path) -> bool {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     OWN_OUTPUT_SUFFIXES
         .iter()
         .any(|suffix| name.ends_with(suffix))
+        || looks_like_own_loaded_database(path)
 }
 
 /// The top-level index directory mode writes once per run, alongside
@@ -62222,20 +62267,67 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             "--widths only applies to --format fixed-width, which is never auto-detected and so is unreachable in directory mode"
         );
     }
-    if args.load_into.is_some() {
-        bail!(
-            "--load-into is single-file mode only - loading many files' worth of tables into one target sequentially is a different, unscoped feature; run it on a single file instead"
-        );
-    }
+    // Directory-mode `--load-into`: one database *per file*, not one
+    // shared target every file's tables get poured into sequentially -
+    // asked and settled directly with the user, since CLAUDE.md's own
+    // prior "different, unscoped feature" boundary here had left the
+    // shape genuinely undecided, not just unimplemented. `<target>` in
+    // `--load-into <engine>:<target>` is reinterpreted for this mode as
+    // the *directory* those per-file databases land in (created if
+    // missing), exactly the same role `--output-dir` already plays for
+    // every other output format - so the two are mutually exclusive
+    // rather than papering over which one would "win." Each recognized
+    // file gets its own fresh `<engine>` process spawned against
+    // `<original-filename>.<sqlite|duckdb>` under that directory
+    // (mirroring the source tree the same way `batch_output_path`
+    // already does for `.dictionary.*` files), with that file's own
+    // generated inline SQL streamed straight into it - the identical
+    // subprocess-piping mechanism single-file mode's own `--load-into`
+    // already uses, just looped once per file instead of once per run.
+    let load_target = if let Some(load_into) = &args.load_into {
+        if !matches!(output_format, OutputFormat::Sql) {
+            bail!("--load-into requires --output-format sql");
+        }
+        if matches!(resolved_sql_mode(args)?, SqlMode::Staging) {
+            bail!(
+                "--load-into requires --sql-mode inline (the default) - --sql-mode staging assumes a separate manual load step --load-into can't perform automatically, since it would create the tables with zero rows actually loaded"
+            );
+        }
+        if args.output_dir.is_some() {
+            bail!(
+                "--load-into's own <target> already names the directory each file's own database lands in - combining it with --output-dir would leave two different directories both claiming that role; drop --output-dir and fold its path into --load-into's <target> instead"
+            );
+        }
+        let target = LoadTarget::parse(load_into)?;
+        if matches!(target.engine, LoadEngine::Postgres | LoadEngine::MySql) {
+            bail!(
+                "--load-into in directory mode only supports sqlite/duckdb - postgres/mysql are server connection targets, not files, so \"one database per file\" would need this tool to issue its own CREATE DATABASE per file first (a real, unimplemented feature, not a file-path detail); run sniff-rs once per file against a postgres/mysql target instead"
+            );
+        }
+        fs::create_dir_all(&target.target).with_context(|| {
+            format!(
+                "failed to create --load-into's own target directory {:?}",
+                target.target
+            )
+        })?;
+        Some(target)
+    } else {
+        None
+    };
 
     let mut files = Vec::new();
     collect_files_sorted(dir, &mut files)?;
 
     // The index is written wherever the per-file outputs themselves land -
-    // co-located with the sources by default, or under --output-dir when
-    // given - so every link inside it is a short, correct relative path
-    // with no directory-walking needed to follow.
-    let index_dir = args.output_dir.as_deref().unwrap_or(dir);
+    // co-located with the sources by default, under --output-dir when
+    // given, or under --load-into's own target directory when that's
+    // what's routing every file's own output instead - so every link
+    // inside it is a short, correct relative path with no directory-
+    // walking needed to follow.
+    let index_dir: &Path = match &load_target {
+        Some(target) => Path::new(&target.target),
+        None => args.output_dir.as_deref().unwrap_or(dir),
+    };
 
     let mut processed = 0usize;
     let mut skipped = 0usize;
@@ -62283,6 +62375,60 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
+
+            if let Some(target) = &load_target {
+                // Every file gets its own fresh database, named the same
+                // way a `.dictionary.sql` file would be under
+                // `--output-dir` - `batch_output_path` already handles
+                // mirroring the source tree's own subdirectories under
+                // that directory, so this is a pure extension swap, not
+                // new naming logic.
+                let db_path = batch_output_path(
+                    dir,
+                    path,
+                    &logical_path,
+                    Some(Path::new(&target.target)),
+                    target.engine.per_file_db_extension(),
+                )?;
+                if let Some(parent) = db_path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create directory {parent:?}"))?;
+                }
+                let per_file_target = LoadTarget {
+                    engine: target.engine,
+                    target: db_path.to_string_lossy().into_owned(),
+                };
+                let mut child = spawn_load_target(&per_file_target)?;
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .expect("stdin was requested as piped at spawn time");
+                render_sql(
+                    &file_name,
+                    &format,
+                    &tables,
+                    &read_path,
+                    resolved_skip_rows,
+                    args,
+                    &mut stdin,
+                )?;
+                drop(stdin);
+                let status = child.wait().with_context(|| {
+                    format!(
+                        "failed waiting for {} to finish loading {path:?}",
+                        target.engine.command_name()
+                    )
+                })?;
+                if !status.success() {
+                    bail!(
+                        "{} exited with a non-zero status while loading {path:?} into {db_path:?} - see its own output above for the real error",
+                        target.engine.command_name()
+                    );
+                }
+                let table_count = tables.len();
+                let col_count: usize = tables.values().map(Vec::len).sum();
+                return Ok((table_count, col_count, db_path));
+            }
 
             let output_path = batch_output_path(
                 dir,
@@ -69003,6 +69149,44 @@ mod tests {
         let root = Path::new("/tmp/batch");
         let path = Path::new("/tmp/batch/top.csv");
         assert_eq!(relative_display_path(root, path), "top.csv");
+    }
+
+    #[test]
+    fn looks_like_own_loaded_database_recognizes_the_double_extension_shape() {
+        // The exact shape directory-mode --load-into's own per-file
+        // naming always produces (<original-filename>.sqlite/.duckdb) -
+        // the stem left over once the sqlite/duckdb extension is
+        // stripped still carries a real extension of its own.
+        assert!(looks_like_own_loaded_database(Path::new(
+            "sample.csv.sqlite"
+        )));
+        assert!(looks_like_own_loaded_database(Path::new(
+            "data.yaml.duckdb"
+        )));
+        assert!(looks_like_own_loaded_database(Path::new(
+            "sub/nested.json.sqlite"
+        )));
+    }
+
+    #[test]
+    fn looks_like_own_loaded_database_does_not_flag_a_genuine_single_extension_database() {
+        // A real, unrelated SQLite/DuckDB database someone already had -
+        // no double extension, so this must stay real, legitimate input
+        // for sniff-rs to keep profiling normally, not something to
+        // silently skip.
+        assert!(!looks_like_own_loaded_database(Path::new(
+            "warehouse.sqlite"
+        )));
+        assert!(!looks_like_own_loaded_database(Path::new(
+            "analytics.duckdb"
+        )));
+    }
+
+    #[test]
+    fn looks_like_own_loaded_database_ignores_every_other_extension() {
+        assert!(!looks_like_own_loaded_database(Path::new("sample.csv")));
+        assert!(!looks_like_own_loaded_database(Path::new("sample.csv.sql")));
+        assert!(!looks_like_own_loaded_database(Path::new("no_extension")));
     }
 
     fn index_entry(source: &str, output: &str, tables: usize, cols: usize) -> BatchIndexEntry {

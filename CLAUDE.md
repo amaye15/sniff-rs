@@ -651,12 +651,91 @@ before any real work starts: requires `--output-format sql` with the
 resolved mode being `inline` (never `staging`, whose whole design assumes
 a separate manual load step - piping its output would create the tables
 with zero rows actually loaded, a silent, misleading "success"), requires
-a format inline mode already supports (today: CSV/TSV), and can't combine
-with an explicit output path (including `-`) since the SQL has nowhere
-else to go once it's streaming into the subprocess. Single-file mode
-only - directory mode rejects it outright, the same way it already
-rejects `--format`/`--widths`, since loading many files' tables into one
-target sequentially is a different, unscoped feature.
+a format inline mode already supports (every format, as of Phase 28 - see
+above), and can't combine with an explicit output path (including `-`)
+since the SQL has nowhere else to go once it's streaming into the
+subprocess.
+
+**Directory mode: `--load-into` creates one fresh database per file, not
+one shared target every file's tables pour into.** This shape was a
+genuine, previously undecided fork - the original single-file design
+explicitly punted on directory-mode `--load-into` as "a different,
+unscoped feature" without settling *which* of two real shapes it should
+eventually take (one target several files share, versus one target per
+file), and asking the user directly settled it: `<target>` in
+`--load-into <engine>:<target>` is reinterpreted for directory mode as
+the *directory* those per-file databases land in (created via
+`fs::create_dir_all` if it doesn't already exist), the same role
+`--output-dir` already plays for every other output format - the two
+flags are mutually exclusive rather than leaving it ambiguous which
+directory wins if both were given. Each recognized file gets its own
+fresh `sqlite3`/`duckdb` process spawned against
+`<original-filename>.<sqlite|duckdb>` under that directory, mirroring
+the source tree's own subdirectories exactly the way `batch_output_path`
+already mirrors them for `.dictionary.*` files - a pure extension swap
+on that same existing naming function, not new naming logic. Postgres/
+MySQL are deliberately rejected in directory mode with a clear, disclosed
+error: they're server connection targets, not files, so "one database
+per file" would need this tool to issue its own `CREATE DATABASE` per
+file first - a real, unimplemented feature in its own right, not a
+file-path detail sqlite/duckdb's own "the target is just a path" model
+already gives for free. The remaining validation (requires
+`--output-format sql`, requires `--sql-mode inline`) is identical to
+single-file mode's own, just checked before the directory walk starts
+rather than before a single file's read.
+
+Directory mode's own pre-existing "don't re-profile my own prior output
+as if it were fresh input" protection (`looks_like_own_output`, see
+below) needed a real extension for this, not just reuse: a `.sqlite`/
+`.duckdb` file is exactly what a genuine, unrelated database this tool
+is *supposed* to profile as real input already looks like
+(`warehouse.sqlite`), so blanket-matching either extension the way the
+four `.dictionary.*` suffixes already are would silently stop profiling
+real user data. `looks_like_own_loaded_database` instead only fires on
+the specific double-extension shape this feature's own naming always
+produces - a file whose *stem*, once `.sqlite`/`.duckdb` is stripped,
+still carries a real extension of its own (`sample.csv.sqlite`'s stem is
+`sample.csv`) - leaving a genuine single-extension database
+(`warehouse.sqlite`) untouched and still profiled normally.
+
+Verified manually against a real, installed SQLite build with no
+separate load step (matching this whole campaign's own established
+verification discipline, not an automated `cargo test` - see below for
+why): a two-file directory, one nested under a subdirectory, produced
+two correctly-named, correctly-mirrored `.sqlite` databases, each
+queryable back for its own real, correct data; `--nrows` correctly
+bounded each file's own load independently; every validation error
+(combining with `--output-dir`, postgres/mysql, `--sql-mode staging`,
+a non-`sql` `--output-format`) fired with the right message before any
+file was even touched; a directory already containing a database from
+an earlier `--load-into` run had that database correctly skipped as
+this tool's own prior output on a second run, while a genuinely
+unrelated single-extension `.sqlite` file dropped in the same directory
+was still correctly recognized and loaded as real input. Directory
+mode's own pre-existing output (`--output-format json/md/sql` without
+`--load-into`) confirmed byte-identical via `diff` against the pre-
+change binary, since this feature only touches the new `--load-into`
+branch of `run_directory`, not the normal per-file write path at all.
+
+**Deliberately not covered by an automated `cargo test`**: the full
+end-to-end happy path (an actual `--load-into sqlite:...` run spawning
+a real `sqlite3` process and succeeding) - matching this project's own
+standing precedent for `--load-into` overall, spelled out directly in
+this section's own history: no automated test spawns a real `sqlite3`/
+`duckdb`/`psql`/`mysql` process, since that CLI tool being installed and
+on `PATH` is an environment fact this test suite can't assume holds on
+every machine it might run on (`duckdb` in particular is commonly
+absent even where `sqlite3` is nearly universal). Every `load_into_
+accepts_<format>` test already follows this by using a deliberately
+unparseable target (`--load-into bogus`) specifically to prove the
+format-acceptance check passes without ever reaching a real spawn - the
+new directory-mode validation tests follow the identical pattern (a
+combination-of-flags error, or postgres/mysql's own rejection, both
+fire before `LoadTarget::parse`/`spawn_load_target` are ever reached).
+What *is* covered by an automated, subprocess-free unit test is
+`looks_like_own_loaded_database`'s own detection logic directly (the
+double-extension-recognizes vs. single-extension-left-alone distinction
+above) - a pure function needing no process spawn at all to verify.
 
 Building `--load-into` surfaced a real, pre-existing architecture gap
 worth fixing at the same time: `render_sql_inline_csv` used to build the
@@ -2491,6 +2570,26 @@ and - the one genuinely easy-to-get-wrong interaction, checked in both
 output formats - that running the same directory twice in a row never
 leaves stale "skipped" entries for the index's own prior output in the
 second run's fresh copy.
+
+**`--load-into` works in directory mode too** (prompted directly by the
+user asking for it after `--sql-mode inline`/`--load-into` had just been
+extended to every single format - see the "SQL script output" section
+above for the full design, verification, and the "one database per file"
+shape settled directly with the user rather than assumed). In short:
+`<target>` in `--load-into <engine>:<target>` becomes the directory
+every recognized file's own fresh database lands in, mirroring the
+source tree's own subdirectory structure the same way `--output-dir`
+already does, mutually exclusive with `--output-dir` itself (both would
+otherwise claim the same "where do outputs go" role with no clear
+winner); sqlite/duckdb only, since postgres/mysql are server connection
+targets a per-file database would need this tool to `CREATE DATABASE`
+for first, a real, disclosed, unimplemented gap rather than a file-path
+detail. `looks_like_own_loaded_database` extends the existing "don't
+re-profile my own prior output" protection to this feature's own
+`<original-filename>.sqlite`/`.duckdb` naming, without the false-positive
+risk a blanket suffix match would have against a genuine, unrelated
+database file sitting in the same directory (see that function's own
+doc comment for the exact double-extension shape it looks for).
 
 ## Architecture
 
