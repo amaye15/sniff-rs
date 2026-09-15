@@ -45252,6 +45252,92 @@ mod plist_support {
         };
         Ok(profile_root_value(value, nrows, n_samples))
     }
+
+    /// The plist row-source for `render_sql_inline_flat` (Phase 20, the
+    /// ninth format in the recursively-nested, JSON-bridge tier) - a
+    /// mechanical mirror of `columns_from_plist`'s own three-shape
+    /// dispatch just above: a streamable top-level XML `<array>` feeds
+    /// each element straight into `json_emit_row_for_sql` via the same
+    /// `stream_xml_plist_array` scanner; everything else (a binary
+    /// plist, or an XML `<dict>`/bare scalar) reads the whole document
+    /// into one `Value` and then, unlike `profile_root_value`'s own
+    /// explicit "is this array all-objects" branch, treats *any*
+    /// top-level array uniformly - one call to `json_emit_row_for_sql`
+    /// per element regardless of whether every element happens to be an
+    /// object. This is safe because `records_mode` (already resolved
+    /// from the real, already-profiled column names via `json_bridge_
+    /// columns_and_mode`) tells `json_emit_row_for_sql` which
+    /// interpretation is correct without needing to re-derive it here -
+    /// the exact same "all objects -> records, otherwise -> one `value`
+    /// column" choice `profile_root_value` makes was already baked into
+    /// which columns exist by the time this function runs.
+    pub(crate) fn stream_plist_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        use std::io::{Read, Seek};
+
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut magic = [0u8; 8];
+        let n = file
+            .read(&mut magic)
+            .with_context(|| format!("failed to read {path:?}"))?;
+        file.rewind()
+            .with_context(|| format!("failed to seek {path:?}"))?;
+        let is_binary = magic[..n].starts_with(b"bplist0");
+
+        if !is_binary {
+            let mut prefix = vec![0u8; ROOT_PREFIX_LEN];
+            let mut filled = 0usize;
+            loop {
+                let r = file
+                    .read(&mut prefix[filled..])
+                    .with_context(|| format!("failed to read {path:?}"))?;
+                if r == 0 || filled + r == prefix.len() {
+                    filled += r;
+                    break;
+                }
+                filled += r;
+            }
+            prefix.truncate(filled);
+            let array_start = std::str::from_utf8(&prefix)
+                .ok()
+                .and_then(xp_find_root_array_start);
+            if let Some(start) = array_start {
+                file.seek(std::io::SeekFrom::Start(start as u64))
+                    .with_context(|| format!("failed to seek {path:?}"))?;
+                let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+                stream_xml_plist_array(reader, |v| {
+                    json_emit_row_for_sql(&v, columns, records_mode, sink)
+                })
+                .with_context(|| format!("failed to parse {path:?} as an XML plist"))?;
+                return Ok(());
+            }
+        }
+
+        let bytes = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = if is_binary {
+            parse_binary_plist(&bytes)
+                .with_context(|| format!("failed to parse {path:?} as a binary plist"))?
+        } else {
+            let text = std::str::from_utf8(&bytes)
+                .with_context(|| format!("{path:?} is not valid UTF-8"))?;
+            parse_xml_plist(text)
+                .with_context(|| format!("failed to parse {path:?} as an XML plist"))?
+        };
+        match value {
+            JsonValue::Array(items) => {
+                for item in items {
+                    json_emit_row_for_sql(&item, columns, records_mode, sink)?;
+                }
+            }
+            JsonValue::Null => {}
+            other => json_emit_row_for_sql(&other, columns, records_mode, sink)?,
+        }
+        Ok(())
+    }
 } // mod plist_support
 
 #[cfg(feature = "plist")]
@@ -52742,6 +52828,7 @@ fn render_sql_inline_flat(
             | InputFormat::Avro
             | InputFormat::Xml
             | InputFormat::Bson
+            | InputFormat::Plist
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -52982,6 +53069,7 @@ fn render_sql_inline_flat(
         InputFormat::Avro => render_sql_inline_flat_avro(read_path, profiles, &mut sink)?,
         InputFormat::Xml => render_sql_inline_flat_xml(read_path, profiles, &mut sink)?,
         InputFormat::Bson => render_sql_inline_flat_bson(read_path, profiles, &mut sink)?,
+        InputFormat::Plist => render_sql_inline_flat_plist(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53496,6 +53584,31 @@ fn render_sql_inline_flat_bson(
     )
 }
 
+/// The plist row-source wrapper for `render_sql_inline_flat` (Phase 20) -
+/// see `render_sql_inline_flat_yaml`'s own doc comment; identical shape,
+/// just driven by `plist_support::stream_plist_rows_for_sql`'s own
+/// three-shape dispatch instead.
+#[cfg(feature = "plist")]
+fn render_sql_inline_flat_plist(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    plist_support::stream_plist_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "plist"))]
+fn render_sql_inline_flat_plist(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "Property List (plist) support isn't compiled in - rebuild with `cargo build --release --features plist` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53639,12 +53752,13 @@ fn render_sql(
             | InputFormat::Avro
             | InputFormat::Xml
             | InputFormat::Bson
+            | InputFormat::Plist
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -60916,10 +61030,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Avro
                 | InputFormat::Xml
                 | InputFormat::Bson
+                | InputFormat::Plist
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist are supported so far",
             format.as_str()
         );
     }

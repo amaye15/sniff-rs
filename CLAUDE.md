@@ -322,9 +322,9 @@ Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
-Avro, XML, and BSON, the first eight formats in the recursively-nested,
-JSON-bridge tier. Every other format transparently falls back to
-`staging` with a disclosed stderr
+Avro, XML, BSON, and Property List (plist), the first nine formats in
+the recursively-nested, JSON-bridge tier. Every other format
+transparently falls back to `staging` with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
 asked for would be the wrong kind of quiet).
@@ -367,8 +367,8 @@ needs its own real design, not just repeating the same pattern:
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
-   MessagePack, CBOR, Avro, XML, and BSON done as of Phases 13-19.**
-   Unlike the two tiers above, there was no existing
+   MessagePack, CBOR, Avro, XML, BSON, and plist done as of Phases
+   13-20.** Unlike the two tiers above, there was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -410,8 +410,15 @@ needs its own real design, not just repeating the same pattern:
    "decode always, keep conditionally" convention, and it needs no
    records-mode/single-value fallback at all, since BSON has no top-
    level-scalar/top-level-array shape whatsoever (every top-level value
-   is a genuine object by construction). plist, JSON5, HAR, GeoJSON,
-   vCard, iCalendar, and MBOX remain unstarted.
+   is a genuine object by construction). plist carried all three shared
+   functions over unchanged too (the sixth format in a row) - its own
+   three-shape dispatch (a streamable top-level XML `<array>`, a binary
+   plist, or a bare XML `<dict>`/scalar) needed no explicit "is this
+   array all-objects" check the way `profile_root_value` itself makes,
+   since `records_mode` (already resolved from the real, already-
+   profiled columns) already tells the shared extractor which
+   interpretation applies. JSON5, HAR, GeoJSON, vCard, iCalendar, and
+   MBOX remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1710,15 +1717,60 @@ Phase 18's own three tests that used BSON as their "still genuinely
 unsupported format" example moved to plist instead, gated behind
 `--features plist` - the same one-hop-forward shuffle repeats itself again.
 
-Remaining in the recursively-nested, JSON-bridge tier: plist, JSON5,
-HAR, GeoJSON, vCard, iCalendar, and MBOX - each bridges to the same
+**Phase 20: Property List (plist) - the ninth format in the recursively-
+nested, JSON-bridge tier, and the sixth format in a row needing zero
+changes to `json_extract_value_for_sql`/`json_inline_blocking_column`/
+`json_bridge_columns_and_mode`.** plist's own profiling reader
+(`columns_from_plist`) has the most structurally varied dispatch of any
+format in this tier so far - a streamable top-level XML `<array>`
+(via the already-existing `stream_xml_plist_array` scanner, built during
+this project's own streaming-reads campaign), a binary plist (`bplist00`,
+whose own layout makes genuine streaming architecturally impossible - the
+whole file has to be resident to resolve any object reference), or a bare
+XML `<dict>`/scalar - all funneling into `profile_root_value`'s own
+explicit "is this array all-objects" check to decide records-mode versus
+a single `value` column. `plist_support::stream_plist_rows_for_sql`
+mirrors the same three-shape dispatch for re-parsing, but deliberately
+*doesn't* re-derive that "all-objects" check itself: since `records_mode`
+is already resolved from the real, already-profiled column names (via
+`json_bridge_columns_and_mode`), every element of a top-level array -
+streamed or not - can be handed to `json_emit_row_for_sql` uniformly,
+letting the already-correct column shape decide the interpretation
+instead of re-computing it a second time.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.plist --output-format sql --load-into sqlite:...`
+loaded its own real nested `meta` dict (flattened with no column of its
+own) and `tags` array correctly; `edge_plist_binary_type_detection.plist`
+confirmed the binary-plist path resolves every semantic type correctly;
+`edge_plist_array_spans_multiple_window_refills.plist` (a real, 2,000-
+element top-level XML array, deliberately large enough to force several
+genuine internal buffer refills) confirmed all 2,000 rows load correctly
+through the streaming path; a new hand-built fixture
+(`edge_plist_sql_inline_array_of_objects.plist`, generated with
+`plistlib`) confirmed the disclosed blocking error fires and names the
+offending field for a genuine array-of-dicts column; `--nrows` confirmed
+to bound the kept row count, including the `--nrows 0` edge case
+producing a real, empty `INSERT`-free table. Also verified as behavior-
+preserving for every already-shipped format: `diff` confirmed byte-
+identical inline SQL output against the pre-Phase-20 binary across the
+entire fixture corpus (plist itself excluded, since this phase is
+exactly what changes its own output). Clean across default/`plist`/
+`full`, matching each one's own established baseline exactly.
+
+Phase 19's own three tests that used plist as their "still genuinely
+unsupported format" example moved to JSON5 instead, gated behind
+`--features json5` - the same one-hop-forward shuffle repeats itself again.
+
+Remaining in the recursively-nested, JSON-bridge tier: JSON5, HAR,
+GeoJSON, vCard, iCalendar, and MBOX - each bridges to the same
 `json_support::Value` shape JSON itself uses (see the Architecture
 section), so `json_extract_value_for_sql`/`json_inline_blocking_column`/
 `json_bridge_columns_and_mode` are already reusable as-is once each
 format's own row-source re-decodes its file a second time into that same
-`Value` tree - Phases 14 through 19 are direct, working proof of this
-now, not just a plan (six formats in a row needed zero changes to any of
-the three shared functions). vCard/iCalendar/MBOX's own repeated-
+`Value` tree - Phases 14 through 20 are direct, working proof of this
+now, not just a plan (seven formats in a row needed zero changes to any
+of the three shared functions). vCard/iCalendar/MBOX's own repeated-
 property pooling (a different mechanism from JSON's array pooling, but
 the identical one-cell-per-row question) is the one sub-family that will
 need its own fresh look before assuming the same machinery applies
