@@ -321,8 +321,8 @@ fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
-`.xlsb`/`.ods`) - plus JSON/JSON Lines and YAML, the first two formats
-in the recursively-nested, JSON-bridge tier. Every other format
+`.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, and TOML, the first three
+formats in the recursively-nested, JSON-bridge tier. Every other format
 transparently falls back to `staging` with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
@@ -365,8 +365,8 @@ needs its own real design, not just repeating the same pattern:
    genuinely different blank-row-reconstruction strategies for ODS's
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
-3. **The recursively-nested, JSON-bridge tier - JSON and YAML done as of
-   Phases 13-14.** Unlike the two tiers above, there was no existing
+3. **The recursively-nested, JSON-bridge tier - JSON, YAML, and TOML done
+   as of Phases 13-15.** Unlike the two tiers above, there was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -383,9 +383,12 @@ needs its own real design, not just repeating the same pattern:
    shape (see the Architecture section), so `json_extract_value_for_sql`/
    `json_inline_blocking_column` carried over completely unchanged, only
    YAML's own document-stream re-parse (`yaml_support::parse_yaml_
-   documents_stream`) needed writing. TOML, Avro, MessagePack, CBOR, XML,
-   BSON, plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX remain
-   unstarted.
+   documents_stream`) needed writing. TOML carried both functions over
+   unchanged too, needing only `toml_support::document_object` to
+   re-parse its own single top-level document a second time - no loop at
+   all, since a TOML file always profiles as exactly one record. Avro,
+   MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
+   iCalendar, and MBOX remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1411,18 +1414,57 @@ phase's own writeup) moved to TOML instead, gated behind `--features
 toml` - the same one-hop-forward shuffle repeats itself as each new
 format in this tier graduates out of "unsupported."
 
-Remaining in the recursively-nested, JSON-bridge tier: TOML, Avro,
-MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
-iCalendar, and MBOX - each bridges to the same `json_support::Value`
-shape JSON itself uses (see the Architecture section), so
-`json_extract_value_for_sql`/`json_inline_blocking_column`/
-`json_bridge_columns_and_mode` are already reusable as-is once each
-format's own row-source re-decodes its file a second time into that same
-`Value` tree - Phase 14 is direct, working proof of this, not just a
-plan. vCard/iCalendar/MBOX's own repeated-property pooling (a different
-mechanism from JSON's array pooling, but the identical one-cell-per-row
-question) is the one sub-family that will need its own fresh look before
-assuming the same machinery applies unchanged.
+**Phase 15: TOML - the third format in the recursively-nested, JSON-
+bridge tier, and the simplest one yet - not because the flattener needed
+anything new (it didn't, the same way YAML needed nothing new in Phase
+14), but because a TOML file always profiles as exactly one record: the
+whole document, via `profile_json_records(&[record], ...)` (see
+`columns_from_toml`'s own doc comment).** `toml_support::document_object`
+(a small new function, factored directly out of `columns_from_toml`'s
+own existing parse-and-check logic - a pure extraction, not a behavior
+change) re-parses the file into that same top-level object a second
+time; `render_sql_inline_flat_toml` hands the result straight to
+`json_emit_row_for_sql` exactly once, with no loop at all - the only
+format in this tier so far that doesn't need one. Records mode is
+trivially correct here too: `profile_json_records` never produces a
+`"value"`-prefixed column the way `JsonRecordStreamProfiler`'s own
+single-value fallback can, so `json_bridge_columns_and_mode`'s own mode
+detection needs no TOML-specific reasoning either.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `edge_toml_sql_inline_flat.toml` (a hand-built fixture,
+deliberately the TOML-syntax equivalent of Phase 13/14's own JSON/YAML
+fixtures - a nested table, a pooled array, no array-of-tables) confirmed
+identical behavior to both prior formats: the nested table flattens with
+no column of its own, the array renders as JSON-array text; `sample.toml`
+- a real, already-committed fixture whose own `[[servers]]` array-of-
+tables is exactly the one-to-many shape this tier's upfront check exists
+to catch - confirmed the disclosed error fires and correctly names
+`"servers"`, not a generic message. Also verified as behavior-preserving
+for every already-shipped format (TOML itself excluded, since this phase
+is exactly what changes its own output): `diff` confirmed byte-identical
+inline SQL output against the pre-Phase-15 binary across the entire
+fixture corpus. Clean across default/`toml`/`full`, matching each one's
+own established baseline exactly.
+
+Phase 14's own three tests that used TOML as their "still genuinely
+unsupported format" example moved to Avro instead, gated behind
+`--features avro` - the same one-hop-forward shuffle repeats itself
+again as each new format in this tier graduates out of "unsupported."
+
+Remaining in the recursively-nested, JSON-bridge tier: Avro, MessagePack,
+CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX -
+each bridges to the same `json_support::Value` shape JSON itself uses
+(see the Architecture section), so `json_extract_value_for_sql`/
+`json_inline_blocking_column`/`json_bridge_columns_and_mode` are already
+reusable as-is once each format's own row-source re-decodes its file a
+second time into that same `Value` tree - Phases 14 and 15 are direct,
+working proof of this now, not just a plan (two formats in a row needed
+zero changes to any of the three shared functions). vCard/iCalendar/
+MBOX's own repeated-property pooling (a different mechanism from JSON's
+array pooling, but the identical one-cell-per-row question) is the one
+sub-family that will need its own fresh look before assuming the same
+machinery applies unchanged.
 
 ## Directory-input batch mode
 

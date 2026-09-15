@@ -41647,15 +41647,25 @@ mod toml_support {
     }
 
     pub(crate) fn columns_from_toml(path: &Path, n_samples: usize) -> Result<Vec<ColumnProfile>> {
+        let record = document_object(path)?;
+        Ok(profile_json_records(&[record], n_samples))
+    }
+
+    /// Re-parses `path` and returns its whole document as the single
+    /// top-level object every TOML file profiles as (`columns_from_toml`
+    /// itself, and `--sql-mode inline`'s own `stream_toml_row_for_sql`,
+    /// both just want the parsed `Map` - `columns_from_toml` to profile
+    /// it, the SQL row-source to extract literal values from it a second
+    /// time).
+    pub(crate) fn document_object(path: &Path) -> Result<json_support::Map> {
         let content =
             fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
         let value = parse_document(&content)
             .with_context(|| format!("failed to parse {path:?} as TOML"))?;
-        let record = match value {
-            JsonValue::Object(m) => m,
+        match value {
+            JsonValue::Object(m) => Ok(m),
             _ => bail!("expected a TOML document with top-level key-value pairs in {path:?}"),
-        };
-        Ok(profile_json_records(&[record], n_samples))
+        }
     }
 } // mod toml_support
 
@@ -52450,7 +52460,10 @@ fn render_sql_inline_flat(
     // SQLite's/INI's own upfront checks already established, just
     // reached here by scanning the already-profiled column list rather
     // than re-parsing the schema.
-    let json_bridge_format = matches!(format, InputFormat::Json | InputFormat::Yaml);
+    let json_bridge_format = matches!(
+        format,
+        InputFormat::Json | InputFormat::Yaml | InputFormat::Toml
+    );
     let json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
         if let Some(bad) = json_inline_blocking_column(profiles) {
@@ -52630,6 +52643,7 @@ fn render_sql_inline_flat(
         InputFormat::Xlsx => render_sql_inline_flat_xlsx(read_path, table_name, &mut sink)?,
         InputFormat::Json => render_sql_inline_flat_json(read_path, profiles, &mut sink)?,
         InputFormat::Yaml => render_sql_inline_flat_yaml(read_path, profiles, &mut sink)?,
+        InputFormat::Toml => render_sql_inline_flat_toml(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52983,6 +52997,40 @@ fn render_sql_inline_flat_yaml(
     )
 }
 
+/// The TOML row-source for `render_sql_inline_flat` (Phase 15, the third
+/// format in the recursively-nested, JSON-bridge tier) - the simplest of
+/// this tier so far, since a TOML file always profiles as exactly one
+/// record (the whole document, via `profile_json_records(&[record], ...)`,
+/// per `columns_from_toml`'s own doc comment): `toml_support::
+/// document_object` re-parses `read_path` into that same top-level
+/// object a second time, and the result is handed straight to
+/// `json_emit_row_for_sql` once, no loop needed at all. Always in
+/// records mode (`profile_json_records` never produces a `"value"`-
+/// prefixed column the way `JsonRecordStreamProfiler`'s own fallback
+/// path can), so `json_bridge_columns_and_mode`'s own mode detection is
+/// trivially correct here without any TOML-specific reasoning.
+#[cfg(feature = "toml")]
+fn render_sql_inline_flat_toml(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    let record = toml_support::document_object(read_path)?;
+    json_emit_row_for_sql(&JsonValue::Object(record), &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "toml"))]
+fn render_sql_inline_flat_toml(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "TOML support isn't compiled in - rebuild with `cargo build --release --features toml` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53120,12 +53168,13 @@ fn render_sql(
             | InputFormat::Xlsx
             | InputFormat::Json
             | InputFormat::Yaml
+            | InputFormat::Toml
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -60391,10 +60440,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Xlsx
                 | InputFormat::Json
                 | InputFormat::Yaml
+                | InputFormat::Toml
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml are supported so far",
             format.as_str()
         );
     }
