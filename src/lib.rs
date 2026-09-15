@@ -35641,8 +35641,11 @@ mod parquet_support {
     /// independently-scoped XML parsers). Real I/O is bounded the
     /// identical way - checked before reading each row group's own bytes
     /// from disk, not just before decoding the next row once a row group's
-    /// bytes are already resident.
-    #[cfg(feature = "delta")]
+    /// bytes are already resident. Shared by `delta_support` and
+    /// `iceberg_support` - both lakehouse-table-format readers ultimately
+    /// bottom out at "profile a live Parquet data file," just resolved to
+    /// via a genuinely different metadata chain each.
+    #[cfg(any(feature = "delta", feature = "iceberg"))]
     pub(crate) fn stream_parquet_rows(
         path: &Path,
         nrows: Option<usize>,
@@ -37206,6 +37209,588 @@ mod delta_support {
             fs::remove_dir_all(&dir).ok();
             let err = result.err().expect("expected an error").to_string();
             assert!(err.contains("no metaData action found"));
+        }
+    }
+}
+
+// --- Apache Iceberg table awareness (`--features iceberg`) ---
+//
+// An Iceberg table's own "what does this look like right now" chain is a
+// genuine multi-hop resolution, structurally different from Delta's
+// single flat JSON commit log even though the end goal is identical -
+// resolve a live schema and a live set of Parquet data files:
+//
+//   metadata/*.metadata.json (JSON, the *current* one - see
+//   `find_latest_metadata_file`) names the table's current schema
+//   directly (no replay needed - unlike Delta, each metadata.json is
+//   already a complete, self-contained snapshot of the table's own
+//   state, not a delta against a prior one) and a `current-snapshot-id`
+//   -> that snapshot's own entry in the same file's `snapshots` array
+//   names a `manifest-list` file (Avro) -> each entry in *that* file
+//   names a manifest file (Avro) -> each entry in *that* file names one
+//   live (or no-longer-live) data file.
+//
+// No new binary format needed here either: the metadata file is plain
+// JSON (this project's always-on core `json_support` parser), the
+// manifest-list/manifest files are plain Avro (`avro_support`'s own
+// generic per-record decode, already schema-self-describing the same
+// way every other Avro file this project reads already is), and the
+// data files are exactly the Parquet this project already reads. Once
+// the live file set is resolved, every live file's own rows are folded
+// into one shared set of per-column accumulators via the identical
+// `parquet_support::stream_parquet_rows`/`ColumnAccumulatorState` engine
+// `delta_support` already established - the only genuinely new work
+// here is the resolution chain itself, not a new way of reading rows.
+//
+// **A real simplification versus Delta, confirmed against a real table
+// rather than assumed**: Iceberg's own "hidden partitioning" computes a
+// partition value from a *source column that's still physically present
+// in the data file* (via a transform like `identity`/`bucket`/`day`),
+// unlike Delta's Hive-style external partitioning, which never repeats a
+// partition column's value inside the Parquet content at all. Verified
+// directly with a real `pyiceberg`-written, identity-partitioned table
+// (partitioned on `category`, laid out on disk as `data/category=a/...`/
+// `data/category=b/...` - visually identical to Delta's own directory
+// convention) - `category` is still a genuine column in each data file's
+// own Parquet schema, confirmed by reading the raw file with
+// `pyarrow.parquet.ParquetFile` directly (bypassing `pyarrow`'s own
+// higher-level dataset API, which would otherwise silently re-derive the
+// column from the directory path itself and mask this exact question).
+// This means `iceberg_support`, unlike `delta_support`, needs **no
+// partition-column special-casing at all** - every column's value always
+// comes from the row's own decoded Parquet content, looked up by name.
+//
+// **Disclosed scope, not silently assumed complete**, the same
+// "confident common case, disclosed gap" boundary `delta_support`'s own
+// header comment already draws:
+// - **Delete files and delete manifests aren't read.** A manifest-list
+//   entry's own `content` field (0 = data manifest, 1 = delete manifest,
+//   v2 only) and a manifest entry's own `data_file.content` field
+//   (0 = data, 1/2 = position/equality deletes) are both checked and
+//   skipped when non-zero, rather than resolved - so a table using
+//   Iceberg's row-level delete feature reports every row of every *data*
+//   file as present, uninfluenced by any delete that's since been
+//   recorded against it. Real, and disclosed, the same way `delta_
+//   support`'s own deletion-vector gap already is.
+// - **Only Parquet data files are read** - a live entry naming an ORC or
+//   Avro data file (both legal per the Iceberg spec, both formats this
+//   project can otherwise read on their own) is a clear, disclosed error
+//   naming the actual format, not a silent skip or a guess.
+// - **Schema resolution only ever uses the table's own *current* schema
+//   id** - real schema evolution (a column renamed, widened, or added
+//   partway through a table's history) means older data files can have
+//   been written against an *older* schema-id than the current one; this
+//   reader doesn't reconcile field-id-based schema evolution across
+//   snapshots the way a real Iceberg reader eventually needs to for a
+//   fully faithful read, it simply looks every live file's own Parquet
+//   column up by the *current* schema's own column names.
+// - **No catalog integration of any kind** - this only ever reads a
+//   table directly off the local filesystem by its own on-disk layout,
+//   the identical "no network, no catalog service, just read local files
+//   the same way a human pointed this tool at them" scope `delta_
+//   support` already has. A manifest naming a remote-storage path
+//   (`s3://`, `hdfs://`, ...) is a clear, disclosed error rather than an
+//   attempted, and inevitably failing, network read.
+#[cfg(feature = "iceberg")]
+mod iceberg_support {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// One field of an Iceberg table's own resolved *current* schema.
+    struct IcebergField {
+        name: String,
+        /// The Iceberg primitive type name verbatim (`"long"`, `"string"`,
+        /// `"double"`, `"timestamp"`, ...), or - for a nested struct/list/
+        /// map field - the same `"struct"`/`"list"`/`"map"` outer-shape
+        /// label `delta_support::spark_type_label` already uses for the
+        /// identical reason: real recursive flattening of a nested field
+        /// is out of scope for this first phase, the same disclosed
+        /// simplification `delta_support` already makes. Used as this
+        /// column's `current_type` - `ideal_type` is still independently
+        /// re-derived from the real Parquet values regardless.
+        iceberg_type: String,
+    }
+
+    /// Same shape and same reasoning as `delta_support::percent_decode` -
+    /// duplicated rather than shared, since `delta`/`iceberg` are
+    /// independently togglable Cargo features and neither should depend
+    /// on the other's own private module.
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Resolves one path/URI as it appears in a metadata/manifest-list/
+    /// manifest file into a real local filesystem path. Iceberg's own
+    /// spec permits either a bare absolute path or a URI (almost always
+    /// `file://` for a local table) here - never a bare relative one,
+    /// though a relative value is still resolved (relative to the
+    /// table's own root) rather than rejected, cheap defensive handling
+    /// for a hand-built or relocated table rather than a real spec
+    /// requirement. A remote-storage scheme (`s3://`, `hdfs://`, ...) is
+    /// a clear, disclosed error - this tool never accesses the network.
+    fn resolve_file_uri(raw: &str, table_dir: &Path) -> Result<PathBuf> {
+        if let Some(rest) = raw.strip_prefix("file://") {
+            let Some(local_path) = rest.strip_prefix('/') else {
+                bail!(
+                    "{raw:?}: a file:// URI naming a remote host isn't supported - this tool only ever reads local files"
+                );
+            };
+            return Ok(PathBuf::from(percent_decode(&format!("/{local_path}"))));
+        }
+        for scheme in [
+            "s3://", "s3a://", "hdfs://", "abfss://", "gs://", "wasbs://",
+        ] {
+            if raw.starts_with(scheme) {
+                bail!(
+                    "{raw:?}: reading a data/manifest file from remote storage isn't supported - this tool never accesses the network, only local files"
+                );
+            }
+        }
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
+        }
+        Ok(table_dir.join(percent_decode(raw)))
+    }
+
+    /// Picks the table's own *current* metadata file - the one with the
+    /// highest leading sequence number among every `*.metadata.json` file
+    /// in `metadata/`. Deliberately not a single fixed naming convention:
+    /// real Iceberg writers use at least two (confirmed directly against
+    /// a real `pyiceberg`-written table, not assumed from the spec, which
+    /// leaves this implementation-defined on purpose) - `v<N>.metadata
+    /// .json` (Spark/Hive-catalog-style, usually paired with a `version-
+    /// hint.text` sidecar this reader doesn't need since the max-sequence
+    /// scan already gives the same answer) and `<N>-<uuid>.metadata.json`
+    /// (`pyiceberg`'s own convention, no version hint at all). Both share
+    /// the one thing this function actually relies on: a leading run of
+    /// decimal digits (after an optional leading `v`) that increases
+    /// monotonically with every new metadata file a commit writes.
+    fn find_latest_metadata_file(table_dir: &Path) -> Result<PathBuf> {
+        let metadata_dir = table_dir.join("metadata");
+        let mut entries: Vec<PathBuf> = fs::read_dir(&metadata_dir)
+            .with_context(|| format!("failed to read {metadata_dir:?}"))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to read directory entries in {metadata_dir:?}"))?
+            .into_iter()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".metadata.json"))
+            })
+            .collect();
+        if entries.is_empty() {
+            bail!("no *.metadata.json file found in {metadata_dir:?}");
+        }
+        // Sorted first so a genuine tie in sequence number (or a filename
+        // this heuristic can't parse a number out of at all, sequence 0)
+        // resolves deterministically rather than depending on whatever
+        // order the filesystem happens to hand back.
+        entries.sort();
+
+        fn sequence_number(path: &Path) -> u64 {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let digits: String = name
+                .strip_prefix('v')
+                .unwrap_or(name)
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().unwrap_or(0)
+        }
+        Ok(entries
+            .into_iter()
+            .max_by_key(|p| sequence_number(p))
+            .expect("checked non-empty above"))
+    }
+
+    /// A schema JSON `"type"` value is either a bare string (every
+    /// primitive Iceberg type) or a nested JSON object for a struct/list/
+    /// map field - the identical shape (and identical scope decision -
+    /// see this module's own header comment) `delta_support::
+    /// spark_type_label` already handles for Delta's own Spark-schema
+    /// JSON, just with Iceberg's own `{"type": "list", ...}`/`{"type":
+    /// "map", ...}` shapes instead of Spark's `{"type": "array", ...}`.
+    fn iceberg_type_label(type_value: &JsonValue) -> String {
+        if let Some(s) = type_value.as_str() {
+            return s.to_string();
+        }
+        match type_value {
+            JsonValue::Object(m) => m
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("struct")
+                .to_string(),
+            _ => "unknown".to_string(),
+        }
+    }
+
+    /// Resolves the table's own *current* schema from an already-parsed
+    /// `metadata.json` document - `format-version` 2's own `"schemas"`
+    /// array (keyed by `"current-schema-id"`) if present, falling back to
+    /// `format-version` 1's single top-level `"schema"` object otherwise
+    /// (a v1 table has no `schema-id` concept at all, so there's nothing
+    /// to look up - the one schema present already is the current one).
+    fn parse_iceberg_schema(metadata: &JsonValue) -> Result<Vec<IcebergField>> {
+        let schema_obj =
+            if let Some(schemas) = metadata.get("schemas").and_then(JsonValue::as_array) {
+                let current_id = metadata
+                    .get("current-schema-id")
+                    .and_then(JsonValue::as_i64);
+                current_id
+                    .and_then(|id| {
+                        schemas
+                            .iter()
+                            .find(|s| s.get("schema-id").and_then(JsonValue::as_i64) == Some(id))
+                    })
+                    .or_else(|| schemas.first())
+                    .context("metadata.json's \"schemas\" array is empty")?
+            } else {
+                metadata.get("schema").with_context(|| {
+                    "metadata.json has neither a \"schemas\" array nor a top-level \"schema\""
+                        .to_string()
+                })?
+            };
+        let fields = schema_obj
+            .get("fields")
+            .and_then(JsonValue::as_array)
+            .context("the resolved schema has no \"fields\" array")?;
+        let mut out = Vec::with_capacity(fields.len());
+        for field in fields {
+            let name = field
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .context("a schema field is missing its own \"name\"")?
+                .to_string();
+            let iceberg_type = field
+                .get("type")
+                .map(iceberg_type_label)
+                .unwrap_or_else(|| "unknown".to_string());
+            out.push(IcebergField { name, iceberg_type });
+        }
+        Ok(out)
+    }
+
+    /// `Ok(None)` iff the table has no current snapshot at all - a real,
+    /// valid shape (a table that's been created but never written to),
+    /// not an error; `resolve_iceberg_table_profiles` treats it as zero
+    /// live files, matching every other reader's own "column is empty/
+    /// all null" convention for a genuinely empty table.
+    fn resolve_current_snapshot_manifest_list(
+        metadata: &JsonValue,
+        table_dir: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let Some(snapshot_id) = metadata
+            .get("current-snapshot-id")
+            .and_then(JsonValue::as_i64)
+        else {
+            return Ok(None);
+        };
+        let snapshots = metadata
+            .get("snapshots")
+            .and_then(JsonValue::as_array)
+            .with_context(|| {
+                format!(
+                    "metadata.json names current-snapshot-id {snapshot_id} but has no \"snapshots\" array"
+                )
+            })?;
+        let snapshot = snapshots
+            .iter()
+            .find(|s| s.get("snapshot-id").and_then(JsonValue::as_i64) == Some(snapshot_id))
+            .with_context(|| {
+                format!("no snapshot with id {snapshot_id} found in metadata.json's own \"snapshots\" array")
+            })?;
+        let manifest_list = snapshot
+            .get("manifest-list")
+            .and_then(JsonValue::as_str)
+            .with_context(|| format!("snapshot {snapshot_id} has no \"manifest-list\""))?;
+        Ok(Some(resolve_file_uri(manifest_list, table_dir)?))
+    }
+
+    /// Walks the two-level Avro chain (manifest-list -> each manifest it
+    /// names) down to the final, live set of Parquet data file paths -
+    /// see this module's own header comment for exactly which manifest-
+    /// list/manifest entries are skipped (delete manifests, delete
+    /// files, anything already marked `DELETED`) and why. A `BTreeSet`
+    /// both dedups (the same physical file could in principle be named
+    /// by more than one manifest across a table's own history, though a
+    /// well-formed current snapshot's manifest list never should) and
+    /// gives a stable, deterministic read order - the same reasoning
+    /// `delta_support`'s own `BTreeMap`-keyed live-file map already uses.
+    fn resolve_live_data_files(
+        manifest_list_path: &Path,
+        table_dir: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let mut manifest_paths: Vec<PathBuf> = Vec::new();
+        avro_support::stream_avro_rows(manifest_list_path, |row| {
+            // Absent in a v1-written manifest list (delete files didn't
+            // exist yet) - defaults to 0 (a data manifest), the only kind
+            // a v1 table could ever produce.
+            let content = row.get("content").and_then(JsonValue::as_i64).unwrap_or(0);
+            if content != 0 {
+                return Ok(()); // a delete-file manifest - out of scope
+            }
+            let manifest_path = row
+                .get("manifest_path")
+                .and_then(JsonValue::as_str)
+                .context("a manifest-list entry has no \"manifest_path\"")?;
+            manifest_paths.push(resolve_file_uri(manifest_path, table_dir)?);
+            Ok(())
+        })
+        .with_context(|| format!("failed to read manifest list {manifest_list_path:?}"))?;
+
+        let mut live_files: BTreeSet<PathBuf> = BTreeSet::new();
+        for manifest_path in &manifest_paths {
+            avro_support::stream_avro_rows(manifest_path, |row| {
+                let status = row.get("status").and_then(JsonValue::as_i64).unwrap_or(0);
+                if status == 2 {
+                    return Ok(()); // DELETED - no longer live
+                }
+                let data_file = row
+                    .get("data_file")
+                    .with_context(|| format!("a manifest entry in {manifest_path:?} has no \"data_file\""))?;
+                let content = data_file
+                    .get("content")
+                    .and_then(JsonValue::as_i64)
+                    .unwrap_or(0);
+                if content != 0 {
+                    return Ok(()); // a position/equality delete file, not real data
+                }
+                let file_format = data_file
+                    .get("file_format")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                if !file_format.eq_ignore_ascii_case("parquet") {
+                    bail!(
+                        "{manifest_path:?} names a live data file in {file_format} format - only Parquet data files are supported so far"
+                    );
+                }
+                let file_path = data_file
+                    .get("file_path")
+                    .and_then(JsonValue::as_str)
+                    .context("a data_file entry has no \"file_path\"")?;
+                live_files.insert(resolve_file_uri(file_path, table_dir)?);
+                Ok(())
+            })
+            .with_context(|| format!("failed to read manifest file {manifest_path:?}"))?;
+        }
+        Ok(live_files.into_iter().collect())
+    }
+
+    /// The real top-level entry point: resolves the table's current
+    /// schema and live file set, then folds every live file's own rows
+    /// into one shared `ColumnAccumulatorState` per schema column -
+    /// looked up purely by column name, with no partition-value special-
+    /// casing at all (see this module's own header comment for why that
+    /// genuinely isn't needed here, unlike `delta_support`'s identical-
+    /// looking function). `nrows` bounds the *table's* total row count
+    /// across every file combined, matching `delta_support::resolve_
+    /// delta_table_profiles`'s own identical convention.
+    pub(crate) fn resolve_iceberg_table_profiles(
+        table_dir: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let metadata_path = find_latest_metadata_file(table_dir)?;
+        let metadata_text = fs::read_to_string(&metadata_path)
+            .with_context(|| format!("failed to read {metadata_path:?}"))?;
+        let metadata: JsonValue = json_support::from_str(&metadata_text)
+            .with_context(|| format!("{metadata_path:?} isn't valid JSON"))?;
+
+        let schema = parse_iceberg_schema(&metadata).with_context(|| {
+            format!("failed to resolve the current schema from {metadata_path:?}")
+        })?;
+
+        let live_files = match resolve_current_snapshot_manifest_list(&metadata, table_dir)? {
+            Some(manifest_list_path) => resolve_live_data_files(&manifest_list_path, table_dir)?,
+            None => Vec::new(),
+        };
+
+        let mut states: Vec<ColumnAccumulatorState> = schema
+            .iter()
+            .map(|_| ColumnAccumulatorState::new())
+            .collect();
+        let field_index: HashMap<&str, usize, FxBuildHasher> = schema
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+
+        let mut total_rows = 0usize;
+        'files: for file_path in &live_files {
+            if nrows.is_some_and(|limit| total_rows >= limit) {
+                break;
+            }
+            if !file_path.is_file() {
+                bail!(
+                    "{file_path:?} is listed as a live data file in the Iceberg manifest, but doesn't exist on disk"
+                );
+            }
+            let remaining = nrows.map(|limit| limit - total_rows);
+            let mut file_rows = 0usize;
+            parquet_support::stream_parquet_rows(file_path, remaining, |row| {
+                let JsonValue::Object(map) = row else {
+                    bail!("{file_path:?}: expected each Parquet row to decode to an object");
+                };
+                for (key, value) in map.iter() {
+                    if value.is_null() {
+                        continue;
+                    }
+                    if let Some(&idx) = field_index.get(key.as_str()) {
+                        states[idx].push(
+                            parquet_support::json_scalar_into_raw_string(value.clone()),
+                            n_samples,
+                        );
+                    }
+                }
+                file_rows += 1;
+                Ok(())
+            })
+            .with_context(|| format!("failed to read {file_path:?}"))?;
+            total_rows += file_rows;
+            if nrows.is_some_and(|limit| total_rows >= limit) {
+                break 'files;
+            }
+        }
+
+        let mut out = Vec::with_capacity(schema.len());
+        for (field, col_state) in schema.into_iter().zip(states) {
+            out.push(col_state.into_profile_with_declared_type(
+                field.name,
+                total_rows,
+                field.iceberg_type,
+            ));
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn percent_decode_handles_valid_and_leaves_invalid_escapes_alone() {
+            assert_eq!(percent_decode("a%20b"), "a b");
+            assert_eq!(percent_decode("plain"), "plain");
+        }
+
+        #[test]
+        fn resolve_file_uri_handles_file_scheme_absolute_and_relative_and_rejects_remote() {
+            let table_dir = Path::new("/warehouse/ns/mytable");
+            assert_eq!(
+                resolve_file_uri("file:///abs/path/data.parquet", table_dir).unwrap(),
+                PathBuf::from("/abs/path/data.parquet")
+            );
+            assert_eq!(
+                resolve_file_uri("/already/absolute.parquet", table_dir).unwrap(),
+                PathBuf::from("/already/absolute.parquet")
+            );
+            assert_eq!(
+                resolve_file_uri("data/relative.parquet", table_dir).unwrap(),
+                PathBuf::from("/warehouse/ns/mytable/data/relative.parquet")
+            );
+            assert!(resolve_file_uri("s3://bucket/key.parquet", table_dir).is_err());
+            assert!(resolve_file_uri("file://remote-host/path", table_dir).is_err());
+        }
+
+        #[test]
+        fn find_latest_metadata_file_picks_the_highest_sequence_number_under_either_naming_convention()
+         {
+            let dir = std::env::temp_dir().join(format!(
+                "sniff-rs-iceberg-metadata-test-{}-{}",
+                std::process::id(),
+                line!()
+            ));
+            let metadata_dir = dir.join("metadata");
+            fs::create_dir_all(&metadata_dir).unwrap();
+            for name in [
+                "00000-aaaa.metadata.json",
+                "00001-bbbb.metadata.json",
+                "00002-cccc.metadata.json",
+            ] {
+                fs::write(metadata_dir.join(name), "{}").unwrap();
+            }
+            let latest = find_latest_metadata_file(&dir).unwrap();
+            fs::remove_dir_all(&dir).ok();
+            assert_eq!(
+                latest.file_name().unwrap().to_str().unwrap(),
+                "00002-cccc.metadata.json"
+            );
+        }
+
+        #[test]
+        fn find_latest_metadata_file_also_handles_the_v_n_naming_convention() {
+            let dir = std::env::temp_dir().join(format!(
+                "sniff-rs-iceberg-metadata-v-test-{}",
+                std::process::id()
+            ));
+            let metadata_dir = dir.join("metadata");
+            fs::create_dir_all(&metadata_dir).unwrap();
+            for name in ["v1.metadata.json", "v2.metadata.json", "v10.metadata.json"] {
+                fs::write(metadata_dir.join(name), "{}").unwrap();
+            }
+            let latest = find_latest_metadata_file(&dir).unwrap();
+            fs::remove_dir_all(&dir).ok();
+            // Proves this is a genuine numeric comparison, not a string
+            // one - "v10" would sort before "v2" lexicographically.
+            assert_eq!(
+                latest.file_name().unwrap().to_str().unwrap(),
+                "v10.metadata.json"
+            );
+        }
+
+        #[test]
+        fn parse_iceberg_schema_resolves_the_current_schema_by_id() {
+            let metadata = json_support::from_str(
+                r#"{
+                    "current-schema-id": 1,
+                    "schemas": [
+                        {"schema-id": 0, "fields": [{"id":1,"name":"old_col","type":"string"}]},
+                        {"schema-id": 1, "fields": [{"id":1,"name":"id","type":"long"},{"id":2,"name":"amount","type":"double"}]}
+                    ]
+                }"#,
+            )
+            .unwrap();
+            let fields = parse_iceberg_schema(&metadata).unwrap();
+            let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(names, vec!["id", "amount"]);
+            assert_eq!(fields[1].iceberg_type, "double");
+        }
+
+        #[test]
+        fn parse_iceberg_schema_falls_back_to_a_v1_style_top_level_schema() {
+            let metadata = json_support::from_str(
+                r#"{"schema": {"fields": [{"id":1,"name":"id","type":"long"}]}}"#,
+            )
+            .unwrap();
+            let fields = parse_iceberg_schema(&metadata).unwrap();
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].name, "id");
+        }
+
+        #[test]
+        fn resolve_current_snapshot_manifest_list_is_none_for_a_table_with_no_snapshot_yet() {
+            let metadata = json_support::from_str(r#"{"snapshots": []}"#).unwrap();
+            let result =
+                resolve_current_snapshot_manifest_list(&metadata, Path::new("/tmp")).unwrap();
+            assert!(result.is_none());
         }
     }
 }
@@ -41832,6 +42417,76 @@ mod avro_support {
                 let value = decode_to_json(&mut cursor, &schema, &names)
                     .with_context(|| format!("failed decoding a record from {path:?}"))?;
                 json_emit_row_for_sql(&value, columns, records_mode, sink)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A generic record-decode primitive for `iceberg_support`'s own use:
+    /// every record decoded straight to a `JsonValue` via a plain
+    /// callback, no `--nrows`/sample bookkeeping of any kind - Iceberg's
+    /// own manifest-list and manifest files (both plain Avro, decoded via
+    /// this same reader) are metadata, not the table's actual data, so
+    /// there's no reason to cap how many of their own records get read;
+    /// every one names a manifest or a live data file this project's own
+    /// orchestration logic genuinely needs to see. A mechanical mirror of
+    /// `columns_from_avro`'s own block-decode loop, duplicated rather than
+    /// refactored into a shared helper for the same "zero risk to an
+    /// already-shipped, already-verified path" reason `parquet_support::
+    /// stream_parquet_rows` is its own small addition rather than a
+    /// refactor of `stream_avro_rows_for_sql` just above.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn stream_avro_rows(
+        path: &Path,
+        mut on_row: impl FnMut(JsonValue) -> Result<()>,
+    ) -> Result<()> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = BufReader::new(file);
+
+        expect_bytes(&mut r, b"Obj\x01")
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+        let metadata = read_metadata(&mut r)
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+
+        let schema_bytes = metadata
+            .get("avro.schema")
+            .with_context(|| format!("{path:?} has no avro.schema in its header"))?;
+        let schema_json: JsonValue = json_support::from_slice(schema_bytes)
+            .with_context(|| format!("failed parsing the Avro schema in {path:?}"))?;
+        let mut names: HashMap<String, Schema> = HashMap::new();
+        let schema = parse_schema(&schema_json, &mut names, None)
+            .with_context(|| format!("failed parsing the Avro schema in {path:?}"))?;
+
+        let codec = metadata
+            .get("avro.codec")
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_else(|| "null".to_string());
+
+        let sync_marker = read_exact_vec(&mut r, 16)
+            .with_context(|| format!("failed reading the header of {path:?}"))?;
+
+        while let Some(count) = try_read_zigzag(&mut r)
+            .with_context(|| format!("failed reading a block from {path:?}"))?
+        {
+            let count = usize::try_from(count).context("invalid Avro block object count")?;
+            let block_len = read_len(&mut r)?;
+            let block_data = read_exact_vec(&mut r, block_len)
+                .with_context(|| format!("failed reading a block from {path:?}"))?;
+            let marker = read_exact_vec(&mut r, 16)
+                .with_context(|| format!("failed reading a block from {path:?}"))?;
+            if marker != sync_marker {
+                bail!("{path:?}: a data block's sync marker doesn't match the header's");
+            }
+            let decompressed = decompress_codec(&codec, block_data)
+                .with_context(|| format!("failed decompressing a block from {path:?}"))?;
+            let mut cursor: &[u8] = &decompressed;
+            for _ in 0..count {
+                let value = decode_to_json(&mut cursor, &schema, &names)
+                    .with_context(|| format!("failed decoding a record from {path:?}"))?;
+                on_row(value)?;
             }
         }
         Ok(())
@@ -53424,6 +54079,15 @@ enum InputFormat {
     /// handful of Parquet/Arrow IPC fields for the identical reason.
     #[allow(dead_code)]
     DeltaTable,
+    /// An Apache Iceberg table directory (a `metadata/` subdirectory with
+    /// real `*.metadata.json` files present) - `IcebergTable`'s own
+    /// sibling in every respect `DeltaTable` already documents above:
+    /// detected from directory structure alone, never an extension or
+    /// `--format`, never constructed by `detect_format`/`dispatch_reader`,
+    /// and only ever actually built by `run_iceberg_table` under
+    /// `#[cfg(feature = "iceberg")]`.
+    #[allow(dead_code)]
+    IcebergTable,
 }
 
 impl InputFormat {
@@ -53478,6 +54142,7 @@ impl InputFormat {
             InputFormat::Vcard => "vcard",
             InputFormat::Ical => "icalendar",
             InputFormat::DeltaTable => "delta",
+            InputFormat::IcebergTable => "iceberg",
         }
     }
 }
@@ -63558,6 +64223,9 @@ fn dispatch_reader(
             InputFormat::DeltaTable => unreachable!(
                 "a Delta table is a directory, resolved and profiled directly by run_delta_table - it never reaches detect_format/dispatch_reader at all"
             ),
+            InputFormat::IcebergTable => unreachable!(
+                "an Iceberg table is a directory, resolved and profiled directly by run_iceberg_table - it never reaches detect_format/dispatch_reader at all"
+            ),
         };
         std::iter::once((file_stem, profiles)).collect()
     };
@@ -63608,6 +64276,8 @@ pub fn run() -> Result<()> {
     if args.input_path.is_dir() {
         if is_delta_table_dir(&args.input_path) {
             run_delta_table(&args, &output_format)
+        } else if is_iceberg_table_dir(&args.input_path) {
+            run_iceberg_table(&args, &output_format)
         } else {
             run_directory(&args, &output_format)
         }
@@ -63704,6 +64374,114 @@ fn run_delta_table(args: &Args, output_format: &OutputFormat) -> Result<()> {
         std::iter::once((table_name.clone(), profiles)).collect();
 
     let rendered = render_output(&table_name, InputFormat::DeltaTable, &tables, output_format)?;
+    if args.output_path.as_deref() == Some(Path::new("-")) {
+        print!("{rendered}");
+        eprintln!("{table_count} table, {col_count} columns -> (stdout)");
+    } else {
+        let output_path = args
+            .output_path
+            .clone()
+            .unwrap_or_else(|| args.input_path.with_extension(default_ext(output_format)));
+        fs::write(&output_path, &rendered)
+            .with_context(|| format!("failed to write {output_path:?}"))?;
+        eprintln!(
+            "{table_count} table, {col_count} columns -> {}",
+            output_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether `path` names an Apache Iceberg table - auto-detected directly
+/// from the input path being a directory containing a `metadata/`
+/// subdirectory with at least one real `*.metadata.json` file in it,
+/// never from an extension or `--format` (like a Delta table, an Iceberg
+/// table has no file extension of its own). Deliberately a *weaker*
+/// structural check than Delta's own 20-digit-filename requirement -
+/// real Iceberg writers use at least two different metadata-file naming
+/// conventions (`v<N>.metadata.json` with a `version-hint.text`
+/// sidecar, and a `<sequence>-<uuid>.metadata.json` scheme with no
+/// version hint at all - confirmed directly against a real table
+/// written by `pyiceberg`, not assumed from the spec's own prose, which
+/// deliberately leaves this implementation-defined), so this only
+/// checks the one thing every convention actually agrees on: the file
+/// ends in `.metadata.json`. Always compiled regardless of `--features
+/// iceberg`, the same "give the actionable rebuild error even without
+/// the feature" reasoning `is_delta_table_dir` already documents.
+fn is_iceberg_table_dir(path: &Path) -> bool {
+    let metadata_dir = path.join("metadata");
+    let Ok(entries) = fs::read_dir(&metadata_dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(".metadata.json"))
+    })
+}
+
+#[cfg(not(feature = "iceberg"))]
+fn run_iceberg_table(_args: &Args, _output_format: &OutputFormat) -> Result<()> {
+    bail!(
+        "this looks like an Apache Iceberg table (a metadata/ directory with a *.metadata.json file was found) - support for it isn't compiled in - rebuild with --features iceberg"
+    )
+}
+
+#[cfg(feature = "iceberg")]
+fn run_iceberg_table(args: &Args, output_format: &OutputFormat) -> Result<()> {
+    if args.combine {
+        bail!(
+            "--combine doesn't apply to an Iceberg table - it's already exactly one logical table"
+        );
+    }
+    if args.output_dir.is_some() {
+        bail!(
+            "--output-dir doesn't apply to an Iceberg table - it's a single input, like a single file, not a directory of independent files"
+        );
+    }
+    if args.format.is_some() {
+        bail!(
+            "--format doesn't apply to an Iceberg table - its format is auto-detected from metadata/ and can't be overridden"
+        );
+    }
+    if args.widths.is_some() || args.delimiter.is_some() || args.skip_rows.is_some() {
+        bail!(
+            "--widths/--delimiter/--skip-rows don't apply to an Iceberg table - its data files are Parquet, not delimited text"
+        );
+    }
+    if matches!(output_format, OutputFormat::Sql) {
+        bail!(
+            "--output-format sql isn't available yet for an Iceberg table - use --output-format json/md/json-schema instead"
+        );
+    }
+    if args.load_into.is_some() {
+        bail!(
+            "--load-into requires --output-format sql, which isn't available yet for an Iceberg table"
+        );
+    }
+
+    let table_name = args
+        .input_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let profiles = iceberg_support::resolve_iceberg_table_profiles(
+        &args.input_path,
+        args.nrows,
+        args.samples,
+    )?;
+    let table_count = 1;
+    let col_count = profiles.len();
+    let tables: BTreeMap<String, Vec<ColumnProfile>> =
+        std::iter::once((table_name.clone(), profiles)).collect();
+
+    let rendered = render_output(
+        &table_name,
+        InputFormat::IcebergTable,
+        &tables,
+        output_format,
+    )?;
     if args.output_path.as_deref() == Some(Path::new("-")) {
         print!("{rendered}");
         eprintln!("{table_count} table, {col_count} columns -> (stdout)");

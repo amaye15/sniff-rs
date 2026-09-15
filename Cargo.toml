@@ -15,7 +15,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "delta"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "delta", "iceberg"]
 sqlite = []
 msgpack = []
 toml = []
@@ -80,6 +80,22 @@ icalendar = []
 # including the disclosed scope boundary (checkpoint files, column
 # mapping, and deletion vectors aren't read yet).
 delta = ["parquet"]
+# Apache Iceberg table awareness (iceberg_support): auto-detected directly
+# from the input path being a directory containing a `metadata/`
+# subdirectory with at least one real `*.metadata.json` file. No new
+# binary format either: Iceberg's own metadata chain is JSON (the current
+# metadata.json) plus Avro (the current snapshot's manifest-list, and
+# each manifest file it names) plus Parquet (the live data files those
+# manifests name) - three formats this project already hand-rolled, so
+# `iceberg` pulls in both `avro` and `parquet` rather than being its own
+# new decoder. Unlike Delta's single flat JSON commit log, resolving
+# Iceberg's current live-file set is a genuine multi-hop chain (metadata
+# JSON -> current snapshot -> manifest-list Avro -> manifest Avro files ->
+# live data files) - see src/lib.rs's iceberg_support module and
+# CLAUDE.md's own "Lakehouse table formats" section for the full design,
+# including the disclosed scope boundary (delete files/manifests, schema
+# evolution across snapshots, and non-Parquet data files aren't read yet).
+iceberg = ["avro", "parquet"]
 
 [dev-dependencies]
 # Unlike every other entry in this list, `serde`/`serde_json` used to be

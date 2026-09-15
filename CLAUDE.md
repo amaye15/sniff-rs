@@ -8,11 +8,11 @@ CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
 logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON,
 Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
 vCard, and iCalendar — any of them gzip- or zstd-compressed too — plus
-Delta Lake tables (a directory profiled as one logical table by resolving
-its own transaction log) — and writes Markdown, this tool's own rich
-JSON, json-schema.org-standard JSON, or a runnable SQL script that
-creates a properly-typed table per table and casts a raw staging copy
-into it.
+Delta Lake and Apache Iceberg tables (a directory profiled as one
+logical table by resolving its own transaction log / metadata chain) —
+and writes Markdown, this tool's own rich JSON, json-schema.org-standard
+JSON, or a runnable SQL script that creates a properly-typed table per
+table and casts a raw staging copy into it.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -84,6 +84,7 @@ every format. See "Testing" below.
 | iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
 | MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
 | Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
+| Apache Iceberg | *(directory)* | `--features iceberg` | also detected from directory structure (a `metadata/` subdirectory with a real `*.metadata.json` file); resolves the current metadata.json's own snapshot to a manifest-list (Avro) naming manifest files (Avro) naming live Parquet data files, then profiles them the same "one merged table" way - see "Lakehouse table formats" below |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -3723,7 +3724,7 @@ every approximate value's own honest caveat (converges, isn't exact
 past five values) disclosed directly on the types themselves, not just
 in this document.
 
-## Lakehouse table formats (`sniff-rs` on a Delta Lake table)
+## Lakehouse table formats (`sniff-rs` on a Delta Lake or Apache Iceberg table)
 
 `--features delta` teaches this tool to recognize a Delta Lake table -
 auto-detected directly from the *input path being a directory* that
@@ -3835,16 +3836,10 @@ Windows-1252 encodings):
   project already is - it folds through the same scalar-stringification
   fallback (`json_scalar_into_raw_string`) any other non-scalar `Value`
   already uses, a real, disclosed simplification for this first phase.
-- **Apache Iceberg is not yet supported at all** - a genuinely larger
-  future phase than Delta was, since resolving an Iceberg table's
-  current state means a real, multi-step chain (the current metadata
-  JSON file names the current snapshot; that snapshot points at a
-  manifest-list file, itself Avro; each manifest-list entry names a
-  manifest file, also Avro; each manifest entry names a live data file,
-  and can itself be Parquet, ORC, *or* Avro) rather than Delta's single
-  flat JSON commit log - real orchestration work on top of formats this
-  project already hand-rolled (Avro, Parquet, ORC), but meaningfully
-  more of it, and not started in this pass.
+- **Apache Iceberg is now supported too, as its own follow-up phase** -
+  see this section's own dedicated Iceberg write-up further down for
+  the full design (its own genuinely different, multi-hop metadata
+  chain) and disclosed scope boundary.
 
 **Verified against a real, independent implementation, not just self-
 consistency**: `deltalake` (the official delta-rs Python package, a
@@ -3875,6 +3870,152 @@ default/`parquet`/`delta`/`full`, matching each build's own established
 clippy baseline exactly (`delta` requiring `parquet` transitively, the
 same way `orc`'s own LZ4 codec reuse already does, per Cargo.toml's own
 `delta = ["parquet"]`).
+
+### Apache Iceberg (`--features iceberg`)
+
+Auto-detected the same way Delta is - directory *structure*, not an
+extension or `--format` - via `is_iceberg_table_dir`: a `metadata/`
+subdirectory containing at least one file ending in `.metadata.json`.
+Deliberately a weaker structural check than Delta's own 20-digit-
+filename requirement, because Iceberg's own metadata-file naming is
+genuinely implementation-defined and this project found two real,
+different conventions in active use - confirmed directly against a
+real table written by `pyiceberg` (Apache Iceberg's own Python
+implementation), not assumed from the spec's prose, which leaves this
+detail open on purpose: Spark/Hive-catalog writers use `v<N>.metadata
+.json` (usually paired with a `version-hint.text` sidecar naming the
+current version); `pyiceberg` uses `<N>-<uuid>.metadata.json` with no
+version hint at all. `find_latest_metadata_file` handles both with one
+rule - extract the leading run of decimal digits (after an optional
+leading `v`) from each candidate filename and take the one with the
+highest number - so this reader never needs `version-hint.text` even
+when a real table happens to have one.
+
+**A genuinely different, multi-hop resolution chain from Delta's single
+flat JSON commit log, but converging on the identical end goal**: the
+current `metadata.json` is already a complete, self-contained snapshot
+of the table's own state (no replay needed, unlike Delta) - it directly
+names the table's current schema (`format-version` 2's own `"schemas"`
+array, resolved by `"current-schema-id"`; `format-version` 1's single
+top-level `"schema"` object otherwise) and a `"current-snapshot-id"`.
+That snapshot's own entry in the same file's `"snapshots"` array names a
+**manifest-list** file (Avro) - each of *its* entries names a **manifest**
+file (also Avro) - each of *its* entries names one live (or no-longer-
+live) data file. No new binary format needed anywhere in this chain:
+the metadata file is plain JSON (this project's always-on core
+`json_support` parser), the manifest-list/manifest files are plain,
+self-describing Avro (`avro_support`'s own existing generic per-record
+decoder - a new, small `stream_avro_rows` primitive, mirroring `parquet_
+support::stream_parquet_rows`'s own "controlled duplication, zero risk
+to the already-shipped SQL row-source it sits next to" reasoning), and
+the data files are exactly the Parquet this project already reads. Once
+the live file set is resolved, every live file's own rows fold into the
+identical `ColumnAccumulatorState` engine `delta_support` already
+established - the genuinely new work in this feature is the resolution
+chain itself, not a new way of reading rows.
+
+**A real simplification versus Delta, confirmed against a real table
+rather than assumed**: Iceberg's own "hidden partitioning" computes a
+partition value from a *source column that's still physically present
+in the data file* (via a transform like `identity`/`bucket`/`day`),
+unlike Delta's Hive-style external partitioning, which never repeats a
+partition column's value inside the Parquet content at all. Verified
+directly with a real, identity-partitioned `pyiceberg` table
+(partitioned on a `category` column, laid out on disk as `data/
+category=a/...`/`data/category=b/...` - visually identical to Delta's
+own directory convention) - `category` is still a genuine column in
+each data file's own Parquet schema, confirmed by reading the raw file
+with `pyarrow.parquet.ParquetFile` directly (bypassing `pyarrow`'s own
+higher-level dataset API, which would otherwise silently re-derive the
+column from the directory path itself and mask this exact question).
+This means `iceberg_support`, unlike `delta_support`, needs **no
+partition-column special-casing at all** - every column's value always
+comes from the row's own decoded Parquet content, looked up by name.
+
+**Disclosed scope, not silently assumed complete**, the same
+"confident common case, disclosed gap" boundary `delta_support`'s own
+write-up above already draws:
+
+- **Delete files and delete manifests aren't read.** A manifest-list
+  entry's own `content` field (0 = data manifest, 1 = delete manifest,
+  v2 only) and a manifest entry's own `data_file.content` field
+  (0 = data, 1/2 = position/equality deletes) are both checked and
+  skipped when non-zero, rather than resolved - so a table using
+  Iceberg's row-level delete feature reports every row of every *data*
+  file as present, uninfluenced by any delete recorded against it. Real,
+  and disclosed, the same way `delta_support`'s own deletion-vector gap
+  already is.
+- **Only Parquet data files are read** - a live entry naming an ORC or
+  Avro data file (both legal per the Iceberg spec, both formats this
+  project can otherwise read on their own) is a clear, disclosed error
+  naming the actual format, not a silent skip or a guess.
+- **Schema resolution only ever uses the table's own *current* schema
+  id** - real schema evolution (a column renamed, widened, or added
+  partway through a table's history) means older data files can have
+  been written against an older schema-id than the current one; this
+  reader doesn't reconcile field-id-based schema evolution across
+  snapshots, it simply looks every live file's own Parquet column up by
+  the *current* schema's own column names.
+- **No catalog integration of any kind** - this only ever reads a table
+  directly off the local filesystem by its own on-disk layout, the
+  identical "no network, no catalog service" scope `delta_support`
+  already has. A manifest naming a remote-storage path (`s3://`,
+  `hdfs://`, ...) is a clear, disclosed error rather than an attempted,
+  and inevitably failing, network read.
+- **A nested struct/list/map schema field** folds through the same
+  scalar-stringification fallback any other non-scalar `Value` already
+  uses, not recursively flattened into dot-notation sub-columns - the
+  identical disclosed simplification `delta_support` already makes for
+  Delta's own nested columns.
+
+**A real, non-obvious fixture-portability problem was found and fixed
+while building this feature's own committed test fixture, not assumed
+away.** Unlike Delta's own `add.path` (already relative to the table
+root), a real Iceberg writer's metadata/manifest-list/manifest files all
+bake in *absolute* `file://` URIs at write time - genuinely non-portable
+the moment the fixture is committed to a repository someone else checks
+out to a different absolute path. Every absolute path was rewritten to a
+path relative to the table's own root directory before committing
+`tests/fixtures/edge_iceberg_table`: the metadata.json's own JSON text
+via a plain string replace (safe - it's just text), but the manifest-
+list/manifest Avro files needed a real re-encode via `fastavro` (reading
+each with its own real, self-describing schema and rewriting with that
+same schema) rather than a raw byte-level string replace, which would
+have corrupted Avro's own length-prefixed string encoding the moment the
+replacement path wasn't byte-identical in length to the original.
+`resolve_file_uri`'s own relative-path fallback (join with the table's
+root directory) - already needed for defensive handling of a
+theoretical relative manifest reference, not originally written with
+this in mind - turned out to be exactly what makes a relocated fixture
+like this resolve correctly with no special-casing at all.
+
+Verified against a real, independent implementation, not just self-
+consistency, the same discipline `delta_support`'s own verification
+already establishes: `pyiceberg` (Apache Iceberg's own Python
+implementation, a genuinely separate codebase from this project's own
+reader) was used to create the committed fixture, verify every expected
+test value against its own `table.scan().to_pandas()` read before
+hardcoding, and - manually, not committed, since it needs the real
+package - exercise a real multi-snapshot append (confirming the second
+snapshot's own manifest-list correctly references *both* the original
+manifest and the new one, and that this reader's own row count/min/max/
+mean match `pyiceberg`'s own post-append read exactly across 7 total
+rows spanning two manifests) and a real identity-partitioned, multi-file
+table (confirming the partition column resolves correctly with zero
+special-casing, and that row/column stats match `pyiceberg`'s own read
+exactly). Also verified: a table created but never written to (no
+`current-snapshot-id` at all) correctly profiles as zero rows per column
+rather than erroring; `--nrows` bounds the total row count across every
+live file combined; a directory whose only relationship to Iceberg is an
+incidentally-named `metadata` subfolder with no real `*.metadata.json`
+file in it falls through cleanly to ordinary directory-batch mode (a
+committed regression test, unconditional); every rejected-flag
+combination (`--output-format sql`, `--combine`) fires its own specific,
+actionable error; and the "not compiled in" error fires correctly on a
+build without `--features iceberg`. Clean across default/`parquet`/
+`avro`/`delta`/`iceberg`/`full`, matching each build's own established
+clippy baseline exactly (`iceberg` requiring both `avro` and `parquet`
+transitively, per Cargo.toml's own `iceberg = ["avro", "parquet"]`).
 
 ## Architecture
 

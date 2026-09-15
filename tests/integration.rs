@@ -11284,3 +11284,154 @@ fn a_delta_log_directory_with_no_real_commit_files_is_not_misdetected() {
     // nothing.
     assert!(output_dir.join("data.csv.dictionary.md").exists());
 }
+
+// --- Apache Iceberg table awareness (--features iceberg) ---
+//
+// tests/fixtures/edge_iceberg_table is a real, committed Iceberg table -
+// generated with the real `pyiceberg` (Apache Iceberg's own Python
+// implementation) package, the same "generate via a real tool, commit
+// the fixture" convention `edge_delta_table` already follows. Unlike
+// Delta's own `add.path` (already relative to the table root), a real
+// Iceberg writer's metadata/manifest-list/manifest files all bake in
+// *absolute* `file://` URIs at write time - genuinely non-portable once
+// committed to a repository that gets checked out somewhere else, found
+// directly while building this fixture, not assumed. Every absolute
+// path was rewritten to a path relative to the table's own root
+// directory before committing (the metadata.json's own JSON text via a
+// plain string replace; the manifest-list/manifest Avro files via
+// `fastavro` - reading each with its own real schema and rewriting with
+// the same schema, since a raw byte-level string replace would corrupt
+// Avro's own length-prefixed string encoding whenever the replacement
+// isn't byte-identical in length) - `resolve_file_uri`'s own relative-
+// path fallback (join with the table's root) is exactly what makes a
+// relocated fixture like this still resolve correctly. Every expected
+// value below was independently cross-checked against `pyiceberg`'s own
+// `table.scan().to_pandas()` read (on the *original*, not-yet-rewritten
+// table, before rewriting could have introduced any doubt about
+// intent) before being hardcoded here.
+
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_resolves_schema_and_reads_the_current_snapshot() {
+    let doc = run_json("edge_iceberg_table", &[]);
+    assert_eq!(doc["format"], "iceberg");
+    let cols = table(&doc, "edge_iceberg_table");
+
+    let id = column(cols, "id");
+    assert_eq!(id["current_type"], "long");
+    assert_eq!(id["ideal_type"], "i64");
+    assert_eq!(id["row_count"], 5);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["count"], 5);
+    assert_eq!(id_stats["min"], 1.0);
+    assert_eq!(id_stats["max"], 5.0);
+    assert_eq!(id_stats["mean"], 3.0);
+
+    let name = column(cols, "name");
+    assert_eq!(name["missing_pct"], 20.0);
+
+    let score = column(cols, "score");
+    assert_eq!(score["ideal_type"], "f64");
+    let score_stats = &score["numeric_stats"];
+    assert_eq!(score_stats["count"], 4);
+    assert_eq!(score_stats["min"], 10.5);
+    assert_eq!(score_stats["max"], 50.75);
+    assert!((score_stats["mean"].as_f64().unwrap() - 27.875).abs() < 1e-9);
+
+    // `category` isn't a partition column in this particular fixture,
+    // but its own correct resolution (straight off the row's own
+    // decoded Parquet content, exactly like every other column) is what
+    // this reader relies on for a genuinely partitioned table too - see
+    // this section's own header comment for why Iceberg needs no
+    // partition-value special-casing at all, unlike Delta.
+    let category = column(cols, "category");
+    assert_eq!(category["missing_pct"], 0.0);
+    let category_samples: Vec<&str> = category["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(category_samples, vec!["a", "b"]);
+}
+
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_nrows_bounds_the_total_row_count() {
+    let doc = run_json("edge_iceberg_table", &["--nrows", "3"]);
+    let cols = table(&doc, "edge_iceberg_table");
+    for name in ["id", "name", "score", "category"] {
+        assert_eq!(
+            column(cols, name)["row_count"],
+            3,
+            "column {name} should be bounded to 3 rows"
+        );
+    }
+}
+
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_rejects_output_format_sql_and_combine_with_actionable_errors() {
+    let path = fixture("edge_iceberg_table");
+
+    let sql_output = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!sql_output.status.success());
+    assert!(String::from_utf8_lossy(&sql_output.stderr).contains("--output-format sql"));
+
+    let combine_output = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+            "--combine",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!combine_output.status.success());
+    assert!(String::from_utf8_lossy(&combine_output.stderr).contains("--combine"));
+}
+
+#[cfg(not(feature = "iceberg"))]
+#[test]
+fn iceberg_table_without_the_feature_gives_an_actionable_error() {
+    let path = fixture("edge_iceberg_table");
+    let output = Command::new(bin())
+        .args([path.to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Iceberg") && stderr.contains("--features iceberg"));
+}
+
+/// A directory that merely happens to contain a `metadata` subdirectory
+/// with no real `*.metadata.json` file in it must still be treated as an
+/// ordinary directory to batch-profile, never misdetected as a genuine
+/// Iceberg table - `is_iceberg_table_dir`'s own structural filename check
+/// exists specifically to rule this out.
+#[test]
+fn a_metadata_directory_with_no_real_metadata_json_file_is_not_misdetected() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+    std::fs::write(dir.path().join("metadata/readme.txt"), "not metadata").unwrap();
+    std::fs::write(dir.path().join("data.csv"), "id\n1\n2\n").unwrap();
+    let output_dir = dir.path().join("out");
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output_dir.join("data.csv.dictionary.md").exists());
+}
