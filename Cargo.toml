@@ -15,7 +15,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "delta"]
 sqlite = []
 msgpack = []
 toml = []
@@ -65,6 +65,21 @@ vcard = []
 # Hand-rolled, no dep - a hand-rolled RFC 5545 iCalendar property-line
 # parser (ical_support), one record per VEVENT/VTODO component.
 icalendar = []
+# Delta Lake table awareness (delta_support): auto-detected directly from
+# the input path being a directory containing `_delta_log/` - resolves
+# the transaction log's own JSON commits to the table's current schema
+# and live set of Parquet data files, then profiles them as one logical
+# table by reusing the already-hand-rolled `parquet` reader's own row-
+# decode primitive. No new dependency and no new binary format of its
+# own - Delta's transaction log is plain JSON (this project's always-on
+# core parser already reads it) and its data files are exactly the
+# Parquet this project already reads; `delta` therefore always pulls in
+# `parquet` too, the same way `orc`'s own LZ4 codec reuse implies no new
+# feature of its own. See src/lib.rs's delta_support module and
+# CLAUDE.md's own "Lakehouse table formats" section for the full design,
+# including the disclosed scope boundary (checkpoint files, column
+# mapping, and deletion vectors aren't read yet).
+delta = ["parquet"]
 
 [dev-dependencies]
 # Unlike every other entry in this list, `serde`/`serde_json` used to be

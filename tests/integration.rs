@@ -11136,3 +11136,151 @@ fn diff_rejects_a_directory_input_with_an_actionable_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("is a directory") && stderr.contains("--combine"));
 }
+
+// --- Delta Lake table awareness (--features delta) ---
+//
+// tests/fixtures/edge_delta_table is a real, committed Delta table -
+// two Hive-style partitions (category=a/category=b), one genuinely
+// missing value each in `name`/`score` - generated with the real
+// `deltalake` (delta-rs) Python package, the same "generate via a real
+// tool, commit the fixture" convention every other format's own
+// `type_detection.<ext>`/`sample.<ext>` fixtures already follow. Every
+// expected value below was independently cross-checked against that
+// same `deltalake` package's own `DeltaTable(...).to_pandas()` read
+// (`id`: [1,2,3,4,5]; `name`: [alice,bob,carol,dave,None]; `score`:
+// [10.5,20.0,30.25,None,50.75]; `category`: [a,a,b,b,b]) before being
+// hardcoded here, not assumed correct from this reader's own output.
+
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_resolves_schema_and_merges_rows_across_partitions() {
+    let doc = run_json("edge_delta_table", &[]);
+    assert_eq!(doc["format"], "delta");
+    let cols = table(&doc, "edge_delta_table");
+
+    let id = column(cols, "id");
+    assert_eq!(id["current_type"], "long");
+    assert_eq!(id["ideal_type"], "i64");
+    assert_eq!(id["row_count"], 5);
+    assert_eq!(id["missing_pct"], 0.0);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["count"], 5);
+    assert_eq!(id_stats["min"], 1.0);
+    assert_eq!(id_stats["max"], 5.0);
+    assert_eq!(id_stats["mean"], 3.0);
+
+    // A genuinely missing (null) value in one partition - proves the
+    // reader isn't just reading one file and calling it done.
+    let name = column(cols, "name");
+    assert_eq!(name["missing_pct"], 20.0);
+
+    // `score` mixes a value from each of the two physical Parquet files
+    // with one genuinely missing value - min/max/mean must reflect all
+    // 4 real non-null values merged across both files, not just one.
+    let score = column(cols, "score");
+    assert_eq!(score["ideal_type"], "f64");
+    let score_stats = &score["numeric_stats"];
+    assert_eq!(score_stats["count"], 4);
+    assert_eq!(score_stats["min"], 10.5);
+    assert_eq!(score_stats["max"], 50.75);
+    assert!((score_stats["mean"].as_f64().unwrap() - 27.875).abs() < 1e-9);
+
+    // `category` is the partition column - its value never appears
+    // inside either Parquet file's own content at all, only in the
+    // transaction log's own `add.partitionValues` and the directory
+    // name itself, so a correct answer here proves partition-value
+    // resolution actually works, not just plain Parquet-content reading.
+    let category = column(cols, "category");
+    assert_eq!(category["missing_pct"], 0.0);
+    let category_samples: Vec<&str> = category["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(category_samples, vec!["a", "b"]);
+}
+
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_nrows_bounds_the_total_row_count_across_every_file() {
+    let doc = run_json("edge_delta_table", &["--nrows", "2"]);
+    let cols = table(&doc, "edge_delta_table");
+    for name in ["id", "name", "score", "category"] {
+        assert_eq!(
+            column(cols, name)["row_count"],
+            2,
+            "column {name} should be bounded to 2 rows"
+        );
+    }
+}
+
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_rejects_output_format_sql_and_combine_with_actionable_errors() {
+    let path = fixture("edge_delta_table");
+
+    let sql_output = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!sql_output.status.success());
+    assert!(String::from_utf8_lossy(&sql_output.stderr).contains("--output-format sql"));
+
+    let combine_output = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+            "--combine",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!combine_output.status.success());
+    assert!(String::from_utf8_lossy(&combine_output.stderr).contains("--combine"));
+}
+
+#[cfg(not(feature = "delta"))]
+#[test]
+fn delta_table_without_the_feature_gives_an_actionable_error() {
+    let path = fixture("edge_delta_table");
+    let output = Command::new(bin())
+        .args([path.to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Delta") && stderr.contains("--features delta"));
+}
+
+/// A directory that merely happens to contain a `_delta_log` subdirectory
+/// with no real commit files in it (no 20-digit-`.json` files) must still
+/// be treated as an ordinary directory to batch-profile, never
+/// misdetected as a genuine Delta table - `is_delta_table_dir`'s own
+/// structural filename check exists specifically to rule this out.
+#[test]
+fn a_delta_log_directory_with_no_real_commit_files_is_not_misdetected() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("_delta_log")).unwrap();
+    std::fs::write(dir.path().join("_delta_log/readme.txt"), "not a commit").unwrap();
+    std::fs::write(dir.path().join("data.csv"), "id\n1\n2\n").unwrap();
+    let output_dir = dir.path().join("out");
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Ordinary directory-batch mode ran (data.csv got profiled) rather
+    // than either failing as an incomplete Delta table or silently doing
+    // nothing.
+    assert!(output_dir.join("data.csv.dictionary.md").exists());
+}

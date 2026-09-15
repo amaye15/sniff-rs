@@ -7,10 +7,12 @@ Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
 logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON,
 Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
-vCard, and iCalendar — any of them gzip- or zstd-compressed too — and
-writes Markdown, this tool's own rich JSON, json-schema.org-standard
-JSON, or a runnable SQL script that creates a properly-typed table per
-table and casts a raw staging copy into it.
+vCard, and iCalendar — any of them gzip- or zstd-compressed too — plus
+Delta Lake tables (a directory profiled as one logical table by resolving
+its own transaction log) — and writes Markdown, this tool's own rich
+JSON, json-schema.org-standard JSON, or a runnable SQL script that
+creates a properly-typed table per table and casts a raw staging copy
+into it.
 
 The point of the tool is schema extraction that doesn't trust anyone's
 claims about the data — not the file extension, not the declared column
@@ -81,6 +83,7 @@ every format. See "Testing" below.
 | vCard | `.vcf` | `--features vcard` | one record per `BEGIN:VCARD`/`END:VCARD` block (RFC 6350); a repeated property (multiple `EMAIL`/`TEL` lines) pools into an array column, the same convention this tool's INI reader already uses for a repeated key |
 | iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
 | MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
+| Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -3719,6 +3722,159 @@ max/mean/stddev), a real median, and a real five-percentile suite - with
 every approximate value's own honest caveat (converges, isn't exact
 past five values) disclosed directly on the types themselves, not just
 in this document.
+
+## Lakehouse table formats (`sniff-rs` on a Delta Lake table)
+
+`--features delta` teaches this tool to recognize a Delta Lake table -
+auto-detected directly from the *input path being a directory* that
+contains a `_delta_log/` subdirectory with at least one real commit file
+(`is_delta_table_dir`, checked structurally: a 20-zero-padded-digit
+filename followed by `.json`, so a directory that merely happens to have
+an unrelated `_delta_log` subfolder is never misdetected) - never from an
+extension or `--format`, since a Delta table has no file extension of its
+own at all. This check itself is always compiled, regardless of whether
+`--features delta` is enabled, specifically so a build without the
+feature still recognizes a real Delta table and gives the same
+actionable "rebuild with --features delta" error every other optional
+format already gives, rather than silently falling through to ordinary
+directory-batch mode and profiling the log's own JSON commit files and
+the table's Parquet data files as a pile of unrelated documents.
+
+**No new binary format needed at all - this is pure orchestration on top
+of two readers this project already hand-rolled.** A Delta table's
+transaction log (`_delta_log/*.json`) is plain, newline-delimited JSON -
+this project's always-on core `json_support` parser already reads it -
+and its data files are exactly the Parquet this tool already reads.
+Resolving "what does this table actually look like right now" means
+replaying every commit in version order: the *latest* `metaData` action
+names the table's current schema (an embedded Spark-JSON schema string,
+`{"type":"struct","fields":[{"name":...,"type":...},...]}`, parsed with
+the same core JSON parser a second time) and which of its columns are
+partition columns; every `add` action names a data file that's part of
+the table as of that commit (plus that file's own fixed `partitionValues`
+- Delta's Hive-style partitioning convention means a partition column's
+value is never physically stored inside the Parquet file's own content,
+only in the log/directory name); every `remove` names one that no longer
+is. The live file set is exactly "every `add`ed path that hasn't since
+been `remove`d" - `resolve_delta_log` folds this down to one final
+`DeltaTableState` (a schema plus a live-files map) with a single pass
+over every commit file, in order.
+
+Once the live set is known, every live Parquet file's own rows are
+folded into **one shared set of per-column accumulators** - the same
+`ColumnAccumulatorState` engine every other flat reader (CSV, SQLite,
+the Excel family, ...) already trusts, driven here by a genuine multi-
+file row stream instead of one file's own sequential records, via a new,
+small `parquet_support::stream_parquet_rows` primitive (a plain-callback
+row-decode loop, added specifically for this feature rather than
+refactoring the already-shipped, already-verified SQL-generation row-
+source it sits next to - the same "controlled duplication, zero risk to
+an already-trusted path" tradeoff this project already accepts elsewhere,
+e.g. the two independently-scoped XML parsers). A partition column's own
+fixed value is resolved once per file (not once per row - it's the same
+value for every row in that file, the entire point of Hive-style
+partitioning) and fed into that column's own accumulator for every row;
+every other column's value comes from the row's own decoded Parquet
+content, looked up by name. A Delta table with 5+ numeric values in a
+column gets the identical min/max/mean/median/percentile suite the rest
+of this project's `numeric_stats` work already established - this
+feature needed zero new code for that, since it reuses the exact same
+accumulator.
+
+**`--nrows` bounds the whole table's row count across every live file
+combined**, not each file independently - stopping (and skipping any
+further live files entirely) the instant enough rows have been folded
+in. `--output-format md/json/json-schema` all work normally, rendering
+the merged result as one table named after the directory's own basename,
+the same "one file, one table" convention a single CSV file's own
+default naming already has. `--output-format sql` (and, transitively,
+`--load-into`) is a clear, disclosed error for now rather than a guess -
+none of the dozens of per-format SQL row-sources this project's own
+inline-SQL campaign already built know how to re-read a *multi-file
+Delta table* a second time, and building that properly is its own
+separately-scoped future phase, not squeezed into this one.
+`--combine`/`--output-dir`/`--format`/`--widths`/`--delimiter`/
+`--skip-rows` are all rejected too, each with its own specific reason
+(a Delta table is already exactly one logical table, has no delimiter or
+column widths to override, and its format can't be overridden since it's
+never guessed at from content in the first place).
+
+**Disclosed scope, not silently assumed complete** - the same "confident
+common case, disclosed gap" boundary this project draws everywhere else
+(LZO compression, old-style BIFF2-5 `.xls`, SAS7BDAT's non-Latin-1/
+Windows-1252 encodings):
+
+- **Checkpoint files aren't read.** Delta periodically flattens its own
+  growing log into a `.checkpoint.parquet` file so old JSON commits can
+  be safely deleted (log retention) on a long-lived production table.
+  This reader only replays `_delta_log/*.json` commit files directly, so
+  a table whose earliest commits have already been log-cleaned away
+  produces an incomplete or wrong live-file set rather than the real
+  one - real for a small or moderately-sized table (or any table still
+  within its log retention window), a genuine gap for an old, heavily-
+  churned one. Reading a checkpoint is itself just another Parquet file
+  this project's own reader could decode; the real remaining work is the
+  checkpoint's own wide, mostly-null-per-row schema (`txn`/`add`/`remove`/
+  `metaData`/`protocol` columns sharing one row space) - a real,
+  separately-scoped future phase, not attempted here.
+- **Column mapping mode** (`delta.columnMapping.mode = "name"`/`"id"`,
+  a newer Delta feature that lets a column be renamed without rewriting
+  every existing Parquet file) isn't handled - this reader assumes a
+  schema field's own logical name matches its data files' *physical*
+  column name directly, the default and still overwhelmingly common
+  case for a table that's never gone through this specific kind of
+  schema evolution.
+- **Deletion vectors** (a newer, separate soft-delete mechanism marking
+  individual *rows* as deleted via a small side file, rather than
+  removing a whole data file) aren't read - every row of every live
+  Parquet file is treated as present.
+- **A schema field whose own type is a nested struct/array/map** (legal
+  in Delta, since its data files are ordinary nested Parquet under the
+  hood) is read but not recursively flattened into dot-notation sub-
+  columns the way a native nested JSON/Parquet column elsewhere in this
+  project already is - it folds through the same scalar-stringification
+  fallback (`json_scalar_into_raw_string`) any other non-scalar `Value`
+  already uses, a real, disclosed simplification for this first phase.
+- **Apache Iceberg is not yet supported at all** - a genuinely larger
+  future phase than Delta was, since resolving an Iceberg table's
+  current state means a real, multi-step chain (the current metadata
+  JSON file names the current snapshot; that snapshot points at a
+  manifest-list file, itself Avro; each manifest-list entry names a
+  manifest file, also Avro; each manifest entry names a live data file,
+  and can itself be Parquet, ORC, *or* Avro) rather than Delta's single
+  flat JSON commit log - real orchestration work on top of formats this
+  project already hand-rolled (Avro, Parquet, ORC), but meaningfully
+  more of it, and not started in this pass.
+
+**Verified against a real, independent implementation, not just self-
+consistency**: `deltalake` (the official delta-rs Python package, a
+genuinely separate Rust/Python codebase from this project's own reader)
+was used to both generate the committed test fixture
+(`tests/fixtures/edge_delta_table` - two Hive-style partitions, a
+genuinely missing value in two different columns) and to independently
+read it back (`DeltaTable(...).to_pandas()`) for cross-checking every
+expected value before it was hardcoded into a test - not assumed correct
+from this reader's own output. A second, manually-exercised scenario (not
+committed, since it needs the `deltalake` package to construct) confirmed
+multi-commit `add`/`remove` folding against a real table: overwriting a
+table's data (a real `deltalake` `mode="overwrite"` write, which emits a
+`remove` for every old file and `add` for every new one in the *same*
+commit) correctly excluded the old, now-`remove`d files - still
+physically present on disk, exactly like a real un-VACUUMed table - from
+the profiled result, with every resulting value (row count, per-column
+min/max/mean) matching `deltalake`'s own read of the same post-overwrite
+table exactly. Also verified: a directory whose only relationship to
+Delta is an incidentally-named `_delta_log` subfolder with no real commit
+files in it falls through cleanly to ordinary directory-batch mode
+(a committed regression test, unconditional - `is_delta_table_dir`'s own
+structural check is always compiled); every rejected-flag combination
+(`--output-format sql`, `--combine`, `--load-into`) fires its own
+specific, actionable error; and the "not compiled in" error fires
+correctly on a build without `--features delta`. Clean across
+default/`parquet`/`delta`/`full`, matching each build's own established
+clippy baseline exactly (`delta` requiring `parquet` transitively, the
+same way `orc`'s own LZ4 codec reuse already does, per Cargo.toml's own
+`delta = ["parquet"]`).
 
 ## Architecture
 

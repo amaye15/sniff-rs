@@ -35622,6 +35622,51 @@ mod parquet_support {
         Ok(())
     }
 
+    /// A generic row-decode primitive - the same per-row `JsonValue::Object`
+    /// shape `decode_row_group_nested` already produces, streamed one at a
+    /// time via a plain callback rather than tied to `InlineRowSink` the
+    /// way `stream_parquet_rows_for_sql` is. Added for `delta_support`
+    /// (`--features delta`), which needs to fold a Parquet file's own rows
+    /// into row-level accumulators shared *across several data files* of
+    /// one logical Delta table - a genuinely different consumer shape than
+    /// either of this module's other two row-sources (`profile_parquet_file`
+    /// builds one file's own `ColumnProfile`s in isolation;
+    /// `stream_parquet_rows_for_sql` only ever writes into one shared SQL
+    /// sink). Deliberately not a refactor of `stream_parquet_rows_for_sql`
+    /// itself - that function is already shipped, verified SQL-generation
+    /// code, and duplicating its own small row-group loop here rather than
+    /// threading a new abstraction through it keeps this addition at zero
+    /// risk to that already-trusted path, the same "controlled duplication"
+    /// tradeoff this project already accepts elsewhere (e.g. the two
+    /// independently-scoped XML parsers). Real I/O is bounded the
+    /// identical way - checked before reading each row group's own bytes
+    /// from disk, not just before decoding the next row once a row group's
+    /// bytes are already resident.
+    #[cfg(feature = "delta")]
+    pub(crate) fn stream_parquet_rows(
+        path: &Path,
+        nrows: Option<usize>,
+        mut on_row: impl FnMut(JsonValue) -> Result<()>,
+    ) -> Result<()> {
+        let (mut file, meta) = open_and_read_footer(path)?;
+        let schema = build_schema(&meta.schema)?;
+        let mut emitted = 0usize;
+        for rg in &meta.row_groups {
+            if nrows.is_some_and(|limit| emitted >= limit) {
+                break;
+            }
+            let (rg_bytes, rg) = read_row_group_bytes(&mut file, rg)?;
+            for row in decode_row_group_nested(&rg_bytes, &schema, &rg)? {
+                if nrows.is_some_and(|limit| emitted >= limit) {
+                    break;
+                }
+                on_row(row)?;
+                emitted += 1;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -36647,6 +36692,521 @@ mod parquet_support {
         // reader can decode page data (the next phase) - correctly
         // parsing the footer doesn't yet prove the values it points to
         // are read correctly too.
+    }
+}
+
+// --- Delta Lake table awareness (`--features delta`) ---
+//
+// A Delta table is a directory: Parquet data files (possibly nested under
+// Hive-style partition subdirectories) plus a `_delta_log/` transaction
+// log of newline-delimited-JSON "commit" files, each one a sequence of
+// independent JSON action objects (`metaData`, `add`, `remove`,
+// `commitInfo`, `protocol`, `txn`, ...). Resolving "what does this table
+// actually look like right now" means replaying every commit in order:
+// the *latest* `metaData` action names the table's current schema (as an
+// embedded Spark-JSON schema string) and which of those columns are
+// partition columns; every `add` action names a data file that's part of
+// the table as of that commit, and every `remove` names one that no
+// longer is - the live file set is exactly "every `add`ed path that
+// hasn't since been `remove`d".
+//
+// No new binary format needed at all: the log itself is plain JSON (this
+// project's always-on core `json_support` parser already reads it), and
+// Delta's data files are exactly the Parquet this project already reads -
+// `delta_support` is pure orchestration on top of two already-hand-rolled
+// readers, reusing `parquet_support::stream_parquet_rows` (a small,
+// dedicated row-decode primitive added alongside this feature - see that
+// function's own doc comment for why it's a new, small addition rather
+// than a refactor of the already-shipped, already-verified SQL-generation
+// row-source it sits next to) to fold every live file's own rows into one
+// shared set of per-column accumulators, the same `ColumnAccumulatorState`
+// engine CSV/SQLite/Excel/every other flat reader already trusts - a
+// multi-file Delta table is profiled as the one logical table it actually
+// is, not as several independent per-file tables the way plain directory-
+// batch mode treats an ordinary directory of unrelated files.
+//
+// **Disclosed scope, not silently assumed complete**: only `_delta_log/
+// *.json` commit files are read - a `.checkpoint.parquet` file (Delta's
+// own periodic "flatten the log so far into one Parquet file" optimization,
+// needed once older JSON commits have been log-cleaned off a long-lived
+// production table) isn't resolved, so a table whose earliest commits are
+// no longer present as plain JSON produces an incomplete or wrong live-
+// file set rather than the real one - the same "confident common case,
+// disclosed gap" boundary this project draws for a genuinely unverifiable
+// or unimplemented case everywhere else (LZO compression, old-style
+// BIFF2-5 `.xls`). Column mapping mode (`delta.columnMapping.mode`, which
+// changes a data file's own *physical* column names away from the
+// schema's logical ones) and deletion vectors (a newer, separate soft-
+// delete mechanism storing removed *row* offsets outside the Parquet file
+// itself) aren't handled either - both real, but each its own separately-
+// scoped future phase, not silently assumed away. A schema field whose
+// own type is a nested struct/array/map (legal in Delta, since its
+// physical data files are ordinary nested Parquet) is read but not
+// recursively flattened into dot-notation sub-columns the way a native
+// nested JSON/Parquet column elsewhere in this project is - it's folded
+// through the same scalar-stringification fallback `json_scalar_into_
+// raw_string` already uses for any non-scalar `Value`, a real, disclosed
+// simplification for this first phase rather than a silent gap.
+#[cfg(feature = "delta")]
+mod delta_support {
+    use super::*;
+
+    /// One field of a Delta table's own resolved schema, in the table's
+    /// real declared column order (partition columns included, in their
+    /// own natural position - Delta's `metaData.schema` already lists
+    /// every column, partition or not, so there's no reordering to do).
+    struct DeltaField {
+        name: String,
+        /// The Spark/Delta type name verbatim (`"long"`, `"string"`,
+        /// `"double"`, `"timestamp"`, ...) - used as this column's
+        /// `current_type`, the same "declared type is a hint, not the
+        /// truth" role every other format's own declared-type field
+        /// already plays (dBase's field-type byte, SQLite's column
+        /// affinity, Parquet's physical type) - `ideal_type` is still
+        /// independently re-derived from the real values regardless.
+        spark_type: String,
+        is_partition: bool,
+    }
+
+    /// The result of replaying every commit in `_delta_log/` in order:
+    /// the table's current schema and its current live file set (each
+    /// entry's own `partitionValues`, keyed by column name - Delta always
+    /// represents a partition value as a string, `None` meaning a
+    /// genuinely null partition value, regardless of that column's own
+    /// logical type, since the value never round-trips through a typed
+    /// Parquet cell at all).
+    struct DeltaTableState {
+        schema: Vec<DeltaField>,
+        live_files: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    }
+
+    /// RFC 3986 percent-decoding for a Delta `add`/`remove` action's own
+    /// `path` field - the protocol's spec explicitly permits (and real
+    /// writers use) a URL-encoded relative path whenever it would
+    /// otherwise contain characters unsafe for a bare path segment (most
+    /// commonly `%3D` for `=` in a Hive-style partition directory name
+    /// like `date%3D2024-01-01`, or `%20` for a space). Invalid or
+    /// incomplete escapes are left byte-for-byte as-is rather than
+    /// guessed at - a real path segment containing a literal, un-escaped
+    /// `%` is rare but not impossible, and misreading it would be worse
+    /// than leaving it alone.
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A Spark/Delta schema JSON `"type"` value is either a bare string
+    /// (every primitive type - `"long"`, `"string"`, `"boolean"`, ...) or
+    /// a nested JSON object/array for a struct/array/map column. Only the
+    /// primitive shape carries a real, specific type name worth reporting
+    /// as `current_type`; a nested one is labeled by its own outer shape
+    /// instead (`"struct"`/`"array"`/`"map"`), matching this phase's own
+    /// disclosed "not recursively flattened yet" scope.
+    fn spark_type_label(type_value: &JsonValue) -> String {
+        if let Some(s) = type_value.as_str() {
+            return s.to_string();
+        }
+        match type_value {
+            JsonValue::Array(_) => "array".to_string(),
+            JsonValue::Object(m) => m
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("struct")
+                .to_string(),
+            _ => "unknown".to_string(),
+        }
+    }
+
+    /// Parses one `metaData` action's own `schemaString` field - a JSON
+    /// *string* whose own content is itself a JSON document (Spark's
+    /// standard `StructType` shape: `{"type":"struct","fields":[{"name":
+    /// ...,"type":...,"nullable":...,"metadata":{...}},...]}`) - into this
+    /// module's own flat `DeltaField` list, in the schema's own declared
+    /// order. `partition_columns` (the sibling `partitionColumns` action
+    /// field, a plain JSON array of column-name strings) marks which of
+    /// those fields are partition columns.
+    fn parse_delta_schema(
+        schema_string: &str,
+        partition_columns: &HashSet<String>,
+    ) -> Result<Vec<DeltaField>> {
+        let schema_doc = json_support::from_str(schema_string)
+            .context("metaData.schemaString isn't valid JSON")?;
+        let fields = schema_doc
+            .get("fields")
+            .and_then(JsonValue::as_array)
+            .context("metaData.schemaString has no top-level \"fields\" array")?;
+        let mut out = Vec::with_capacity(fields.len());
+        for field in fields {
+            let name = field
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .context("a schema field is missing its own \"name\"")?
+                .to_string();
+            let spark_type = field
+                .get("type")
+                .map(spark_type_label)
+                .unwrap_or_else(|| "unknown".to_string());
+            let is_partition = partition_columns.contains(&name);
+            out.push(DeltaField {
+                name,
+                spark_type,
+                is_partition,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Replays every `_delta_log/*.json` commit file present, in version
+    /// order, folding `metaData`/`add`/`remove` actions into one final
+    /// `DeltaTableState` - see this module's own header comment for the
+    /// checkpoint-file gap this doesn't yet close, and for why a plain
+    /// JSON commit log needs no new parser at all.
+    fn resolve_delta_log(table_dir: &Path) -> Result<DeltaTableState> {
+        let log_dir = table_dir.join("_delta_log");
+        let mut commit_files: Vec<PathBuf> = fs::read_dir(&log_dir)
+            .with_context(|| format!("failed to read {log_dir:?}"))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to read directory entries in {log_dir:?}"))?
+            .into_iter()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_delta_commit_filename)
+            })
+            .collect();
+        // Zero-padded, fixed-width version numbers - lexicographic order
+        // is numeric order.
+        commit_files.sort();
+
+        let mut schema: Option<Vec<DeltaField>> = None;
+        let mut live_files: BTreeMap<String, BTreeMap<String, Option<String>>> = BTreeMap::new();
+
+        for commit_path in &commit_files {
+            let content = fs::read_to_string(commit_path)
+                .with_context(|| format!("failed to read {commit_path:?}"))?;
+            for (line_no, line) in content.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let action = json_support::from_str(line).with_context(|| {
+                    format!(
+                        "{commit_path:?} line {}: not a valid JSON action",
+                        line_no + 1
+                    )
+                })?;
+                let JsonValue::Object(obj) = action else {
+                    bail!(
+                        "{commit_path:?} line {}: expected a JSON object naming one action",
+                        line_no + 1
+                    );
+                };
+                for (action_name, action_value) in obj.iter() {
+                    match action_name.as_str() {
+                        "metaData" => {
+                            let schema_string = action_value
+                                .get("schemaString")
+                                .and_then(JsonValue::as_str)
+                                .with_context(|| {
+                                    format!(
+                                        "{commit_path:?}: metaData action has no \"schemaString\""
+                                    )
+                                })?;
+                            let partition_columns: HashSet<String> = action_value
+                                .get("partitionColumns")
+                                .and_then(JsonValue::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(JsonValue::as_str)
+                                        .map(str::to_string)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            schema = Some(parse_delta_schema(schema_string, &partition_columns)?);
+                        }
+                        "add" => {
+                            let path = action_value
+                                .get("path")
+                                .and_then(JsonValue::as_str)
+                                .with_context(|| {
+                                    format!("{commit_path:?}: add action has no \"path\"")
+                                })?
+                                .to_string();
+                            let mut partition_values = BTreeMap::new();
+                            if let Some(pv) = action_value
+                                .get("partitionValues")
+                                .and_then(JsonValue::as_object)
+                            {
+                                for (k, v) in pv.iter() {
+                                    partition_values
+                                        .insert(k.clone(), v.as_str().map(str::to_string));
+                                }
+                            }
+                            live_files.insert(path, partition_values);
+                        }
+                        "remove" => {
+                            if let Some(path) = action_value.get("path").and_then(JsonValue::as_str)
+                            {
+                                live_files.remove(path);
+                            }
+                        }
+                        // protocol/commitInfo/txn/cdc, or any future action
+                        // this table's own writer added: safe to ignore -
+                        // none of them change the live schema or file set.
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let schema = schema.with_context(|| {
+            format!(
+                "no metaData action found anywhere in {log_dir:?} - can't resolve a schema for this Delta table"
+            )
+        })?;
+        Ok(DeltaTableState { schema, live_files })
+    }
+
+    /// The real top-level entry point: resolves the table's current
+    /// schema and live file set, then folds every live file's own rows
+    /// into one shared `ColumnAccumulatorState` per schema column -
+    /// exactly the same incremental engine every other flat reader in
+    /// this project already trusts, driven here by a genuine multi-file
+    /// row stream instead of one file's own sequential records. `nrows`
+    /// bounds the *table's* total row count across every file combined,
+    /// not each file independently - stopping (skipping any remaining
+    /// live files entirely) the moment enough rows have been folded in.
+    pub(crate) fn resolve_delta_table_profiles(
+        table_dir: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let state = resolve_delta_log(table_dir)?;
+
+        let mut states: Vec<ColumnAccumulatorState> = state
+            .schema
+            .iter()
+            .map(|_| ColumnAccumulatorState::new())
+            .collect();
+        let field_index: HashMap<&str, usize, FxBuildHasher> = state
+            .schema
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+
+        let mut total_rows = 0usize;
+        'files: for (rel_path, partition_values) in &state.live_files {
+            if nrows.is_some_and(|limit| total_rows >= limit) {
+                break;
+            }
+            let file_path = table_dir.join(percent_decode(rel_path));
+            if !file_path.is_file() {
+                bail!(
+                    "{file_path:?} is listed as a live data file in the Delta transaction log, but doesn't exist on disk - the table may have been VACUUMed inconsistently with its own log, or this reader mis-resolved its path"
+                );
+            }
+            // Every partition column's own value is fixed for every row
+            // of this one file (that's the entire point of Hive-style
+            // partitioning - the value lives in the log/path, never
+            // repeated inside the Parquet content itself), so it's
+            // resolved once per file, not once per row.
+            let partition_raw: Vec<(usize, Option<&str>)> = state
+                .schema
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.is_partition)
+                .map(|(i, f)| (i, partition_values.get(&f.name).and_then(|v| v.as_deref())))
+                .collect();
+            let remaining = nrows.map(|limit| limit - total_rows);
+            let mut file_rows = 0usize;
+            parquet_support::stream_parquet_rows(&file_path, remaining, |row| {
+                let JsonValue::Object(map) = row else {
+                    bail!("{file_path:?}: expected each Parquet row to decode to an object");
+                };
+                for (key, value) in map.iter() {
+                    if value.is_null() {
+                        continue;
+                    }
+                    if let Some(&idx) = field_index.get(key.as_str())
+                        && !state.schema[idx].is_partition
+                    {
+                        states[idx].push(
+                            parquet_support::json_scalar_into_raw_string(value.clone()),
+                            n_samples,
+                        );
+                    }
+                }
+                for &(idx, value) in &partition_raw {
+                    if let Some(v) = value {
+                        states[idx].push(v.to_string(), n_samples);
+                    }
+                }
+                file_rows += 1;
+                Ok(())
+            })
+            .with_context(|| format!("failed to read {file_path:?}"))?;
+            total_rows += file_rows;
+            if nrows.is_some_and(|limit| total_rows >= limit) {
+                break 'files;
+            }
+        }
+
+        let mut out = Vec::with_capacity(state.schema.len());
+        for (field, col_state) in state.schema.into_iter().zip(states) {
+            out.push(col_state.into_profile_with_declared_type(
+                field.name,
+                total_rows,
+                field.spark_type,
+            ));
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn percent_decode_handles_valid_and_leaves_invalid_escapes_alone() {
+            assert_eq!(percent_decode("date%3D2024-01-01"), "date=2024-01-01");
+            assert_eq!(percent_decode("a%20b"), "a b");
+            assert_eq!(percent_decode("no_escapes_here"), "no_escapes_here");
+            // A trailing, incomplete escape (not enough bytes left) and a
+            // non-hex escape are both left byte-for-byte as-is, never
+            // guessed at - see this function's own doc comment.
+            assert_eq!(percent_decode("truncated%3"), "truncated%3");
+            assert_eq!(percent_decode("bad%zzescape"), "bad%zzescape");
+        }
+
+        #[test]
+        fn is_delta_commit_filename_matches_only_the_real_20_digit_json_shape() {
+            assert!(is_delta_commit_filename("00000000000000000000.json"));
+            assert!(is_delta_commit_filename("00000000000000000042.json"));
+            // A checkpoint file, a CRC sidecar, and anything else that
+            // merely lives in `_delta_log/` must not be mistaken for a
+            // real commit.
+            assert!(!is_delta_commit_filename(
+                "00000000000000000010.checkpoint.parquet"
+            ));
+            assert!(!is_delta_commit_filename("00000000000000000000.crc"));
+            assert!(!is_delta_commit_filename("_last_checkpoint"));
+            assert!(!is_delta_commit_filename("0.json")); // wrong width
+        }
+
+        #[test]
+        fn spark_type_label_distinguishes_primitive_and_nested_types() {
+            assert_eq!(
+                spark_type_label(&JsonValue::String("long".to_string())),
+                "long"
+            );
+            let struct_type = json_support::from_str(
+                r#"{"type":"struct","fields":[{"name":"x","type":"long"}]}"#,
+            )
+            .unwrap();
+            assert_eq!(spark_type_label(&struct_type), "struct");
+            let array_type =
+                json_support::from_str(r#"{"type":"array","elementType":"long"}"#).unwrap();
+            assert_eq!(spark_type_label(&array_type), "array");
+        }
+
+        #[test]
+        fn parse_delta_schema_marks_partition_columns_and_orders_fields() {
+            let schema_string = r#"{"type":"struct","fields":[
+                {"name":"id","type":"long","nullable":true,"metadata":{}},
+                {"name":"region","type":"string","nullable":true,"metadata":{}},
+                {"name":"amount","type":"double","nullable":true,"metadata":{}}
+            ]}"#;
+            let partition_columns: HashSet<String> = ["region".to_string()].into_iter().collect();
+            let fields = parse_delta_schema(schema_string, &partition_columns).unwrap();
+            let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(names, vec!["id", "region", "amount"]);
+            assert!(!fields[0].is_partition);
+            assert!(fields[1].is_partition);
+            assert!(!fields[2].is_partition);
+            assert_eq!(fields[2].spark_type, "double");
+        }
+
+        /// `resolve_delta_log` never touches the actual Parquet data
+        /// files it names - only `_delta_log/*.json` - so this can (and
+        /// does) verify multi-commit add/remove folding with zero real
+        /// data files on disk at all, no `--features parquet`-backed
+        /// fixture generation needed for this part of the feature.
+        #[test]
+        fn resolve_delta_log_folds_add_and_remove_across_multiple_commits() {
+            let dir = std::env::temp_dir().join(format!(
+                "sniff-rs-delta-log-unit-test-{}-{}",
+                std::process::id(),
+                line!()
+            ));
+            let log_dir = dir.join("_delta_log");
+            fs::create_dir_all(&log_dir).unwrap();
+
+            let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"#;
+            fs::write(
+                log_dir.join("00000000000000000000.json"),
+                format!(
+                    "{{\"metaData\":{{\"schemaString\":\"{schema}\",\"partitionColumns\":[\"region\"]}}}}\n\
+                     {{\"add\":{{\"path\":\"region=us/part-0.parquet\",\"partitionValues\":{{\"region\":\"us\"}}}}}}\n\
+                     {{\"add\":{{\"path\":\"region=eu/part-0.parquet\",\"partitionValues\":{{\"region\":\"eu\"}}}}}}\n"
+                ),
+            )
+            .unwrap();
+            // A second commit removes the `eu` file and adds a
+            // replacement - the final live set must reflect only the
+            // *current* state, not every file ever added.
+            fs::write(
+                log_dir.join("00000000000000000001.json"),
+                "{\"remove\":{\"path\":\"region=eu/part-0.parquet\"}}\n\
+                 {\"add\":{\"path\":\"region=eu/part-1.parquet\",\"partitionValues\":{\"region\":\"eu\"}}}\n",
+            )
+            .unwrap();
+
+            let state = resolve_delta_log(&dir).unwrap();
+            fs::remove_dir_all(&dir).ok();
+
+            let names: Vec<&str> = state.schema.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(names, vec!["id", "region"]);
+            let live: Vec<&str> = state.live_files.keys().map(String::as_str).collect();
+            assert_eq!(
+                live,
+                vec!["region=eu/part-1.parquet", "region=us/part-0.parquet"]
+            );
+        }
+
+        #[test]
+        fn resolve_delta_log_errors_clearly_when_no_metadata_action_exists() {
+            let dir = std::env::temp_dir().join(format!(
+                "sniff-rs-delta-log-no-metadata-test-{}",
+                std::process::id()
+            ));
+            let log_dir = dir.join("_delta_log");
+            fs::create_dir_all(&log_dir).unwrap();
+            fs::write(
+                log_dir.join("00000000000000000000.json"),
+                "{\"commitInfo\":{\"operation\":\"WRITE\"}}\n",
+            )
+            .unwrap();
+            let result = resolve_delta_log(&dir);
+            fs::remove_dir_all(&dir).ok();
+            let err = result.err().expect("expected an error").to_string();
+            assert!(err.contains("no metaData action found"));
+        }
     }
 }
 
@@ -52847,6 +53407,23 @@ enum InputFormat {
     Mbox,
     Vcard,
     Ical,
+    /// A Delta Lake table directory (`_delta_log/` present) - detected
+    /// directly from the input path being such a directory, never from an
+    /// extension or `--format` (a Delta table has no file extension of its
+    /// own at all). Never constructed by `detect_format`/passed through
+    /// `dispatch_reader` - `run_delta_table` resolves and profiles it
+    /// directly, bypassing the single-file pipeline entirely, the same way
+    /// `sniff-rs diff`'s own subcommand bypasses the normal `Args` grammar.
+    /// Exists as an `InputFormat` variant purely so `render_markdown`/
+    /// `render_json`'s already-shared rendering code can report a real,
+    /// honest format label instead of a borrowed/misleading one. Only
+    /// ever actually constructed by `run_delta_table` under `#[cfg(feature
+    /// = "delta")]`, hence the dead-code allowance in every other build
+    /// (default, or any single other feature) - the same "genuinely used,
+    /// just not in every build" treatment this project already gives a
+    /// handful of Parquet/Arrow IPC fields for the identical reason.
+    #[allow(dead_code)]
+    DeltaTable,
 }
 
 impl InputFormat {
@@ -52900,6 +53477,7 @@ impl InputFormat {
             InputFormat::Mbox => "mbox",
             InputFormat::Vcard => "vcard",
             InputFormat::Ical => "icalendar",
+            InputFormat::DeltaTable => "delta",
         }
     }
 }
@@ -62977,6 +63555,9 @@ fn dispatch_reader(
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
+            InputFormat::DeltaTable => unreachable!(
+                "a Delta table is a directory, resolved and profiled directly by run_delta_table - it never reaches detect_format/dispatch_reader at all"
+            ),
         };
         std::iter::once((file_stem, profiles)).collect()
     };
@@ -63025,10 +63606,120 @@ pub fn run() -> Result<()> {
     let output_format = OutputFormat::parse(&args.output_format)?;
 
     if args.input_path.is_dir() {
-        run_directory(&args, &output_format)
+        if is_delta_table_dir(&args.input_path) {
+            run_delta_table(&args, &output_format)
+        } else {
+            run_directory(&args, &output_format)
+        }
     } else {
         run_single_file(&args, &output_format)
     }
+}
+
+/// A commit filename in a Delta transaction log's own `_delta_log/`
+/// directory - always exactly 20 zero-padded decimal digits (the commit's
+/// version number) followed by `.json`, e.g.
+/// `00000000000000000000.json`. Deliberately checked structurally, not
+/// just "is there any `.json` file in a `_delta_log` subdirectory" - a
+/// real Delta log directory can also hold `.crc` sidecar files and
+/// `.checkpoint.parquet` files, and this exact naming convention is what
+/// actually distinguishes a genuine commit file from either.
+fn is_delta_commit_filename(name: &str) -> bool {
+    name.strip_suffix(".json")
+        .is_some_and(|stem| stem.len() == 20 && stem.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `path` names a Delta Lake table - auto-detected directly from
+/// the input path being a directory containing a `_delta_log/`
+/// subdirectory with at least one real commit file in it, never from an
+/// extension or `--format` (a Delta table has no file extension of its
+/// own - it's a directory of Parquet data files plus a JSON transaction
+/// log). This check itself is cheap and always compiled (a couple of
+/// `fs::read_dir` calls, no parsing) regardless of whether `--features
+/// delta` is enabled, specifically so a build without that feature can
+/// still recognize a real Delta table and give the same actionable
+/// "rebuild with --features delta" error every other optional format
+/// gives, rather than silently falling through to ordinary directory-
+/// batch mode and profiling `_delta_log`'s own JSON commit files and
+/// Parquet data files as a pile of unrelated documents.
+fn is_delta_table_dir(path: &Path) -> bool {
+    let log_dir = path.join("_delta_log");
+    let Ok(entries) = fs::read_dir(&log_dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.file_name().to_str().is_some_and(is_delta_commit_filename))
+}
+
+#[cfg(not(feature = "delta"))]
+fn run_delta_table(_args: &Args, _output_format: &OutputFormat) -> Result<()> {
+    bail!(
+        "this looks like a Delta Lake table (a _delta_log/ directory with real commit files was found) - support for it isn't compiled in - rebuild with --features delta"
+    )
+}
+
+#[cfg(feature = "delta")]
+fn run_delta_table(args: &Args, output_format: &OutputFormat) -> Result<()> {
+    if args.combine {
+        bail!("--combine doesn't apply to a Delta table - it's already exactly one logical table");
+    }
+    if args.output_dir.is_some() {
+        bail!(
+            "--output-dir doesn't apply to a Delta table - it's a single input, like a single file, not a directory of independent files"
+        );
+    }
+    if args.format.is_some() {
+        bail!(
+            "--format doesn't apply to a Delta table - its format is auto-detected from _delta_log/ and can't be overridden"
+        );
+    }
+    if args.widths.is_some() || args.delimiter.is_some() || args.skip_rows.is_some() {
+        bail!(
+            "--widths/--delimiter/--skip-rows don't apply to a Delta table - its data files are Parquet, not delimited text"
+        );
+    }
+    if matches!(output_format, OutputFormat::Sql) {
+        bail!(
+            "--output-format sql isn't available yet for a Delta table - use --output-format json/md/json-schema instead"
+        );
+    }
+    if args.load_into.is_some() {
+        bail!(
+            "--load-into requires --output-format sql, which isn't available yet for a Delta table"
+        );
+    }
+
+    let table_name = args
+        .input_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let profiles =
+        delta_support::resolve_delta_table_profiles(&args.input_path, args.nrows, args.samples)?;
+    let table_count = 1;
+    let col_count = profiles.len();
+    let tables: BTreeMap<String, Vec<ColumnProfile>> =
+        std::iter::once((table_name.clone(), profiles)).collect();
+
+    let rendered = render_output(&table_name, InputFormat::DeltaTable, &tables, output_format)?;
+    if args.output_path.as_deref() == Some(Path::new("-")) {
+        print!("{rendered}");
+        eprintln!("{table_count} table, {col_count} columns -> (stdout)");
+    } else {
+        let output_path = args
+            .output_path
+            .clone()
+            .unwrap_or_else(|| args.input_path.with_extension(default_ext(output_format)));
+        fs::write(&output_path, &rendered)
+            .with_context(|| format!("failed to write {output_path:?}"))?;
+        eprintln!(
+            "{table_count} table, {col_count} columns -> {}",
+            output_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// `--output-format sql`'s own destination logic for single-file mode:
