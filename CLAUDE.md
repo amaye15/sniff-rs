@@ -71,7 +71,7 @@ every format. See "Testing" below.
 | dBase | `.dbf` | `--features dbase` | soft-deleted records skipped (dBase's own convention); `current_type` can reveal a Numeric field that's really an integer |
 | Stata | `.dta` | `--features stata` | every DTA release (102-119); Stata's own missing markers become missing values, not literal strings |
 | SAS7BDAT | `.sas7bdat` | `--features sas7bdat` | `current_type` from the file's own declared type; SAS stores nearly all numerics as doubles, so `ideal_type` often narrows further |
-| SPSS | `.sav`, `.zsav` | `--features spss` | a native SPSS date/time/datetime variable is stored as a plain numeric offset, so `current_type` stays `f64` while `ideal_type` narrows to a real date once it's rendered; `.zsav` (zlib-compressed) is a disclosed, not-yet-supported error - see below |
+| SPSS | `.sav`, `.zsav` | `--features spss` | a native SPSS date/time/datetime variable is stored as a plain numeric offset, so `current_type` stays `f64` while `ideal_type` narrows to a real date once it's rendered; `.zsav` (zlib-block-compressed) is fully supported - see below |
 | ORC | `.orc` | `--features orc` | one section per top-level column; a nested Struct/List/Map/Union column is a disclosed placeholder (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
 | BSON | `.bson` | `--features bson` | stream of concatenated top-level documents (MongoDB's own on-disk/dump convention); always object-at-top-level, so there's no scalar/array top-level fallback the way MessagePack/CBOR need |
 | Property List (plist) | `.plist` | `--features plist` | both the XML and binary (`bplist00`) variants; a top-level `<dict>`/binary-plist root dict = one row, a top-level `<array>`/binary-plist root array = array-of-records, same dual-mode convention as YAML/TOML |
@@ -1024,11 +1024,14 @@ future needs as a plain byte-slice callback), `read_cases` builds its own
 small, decomposition rather than reusing an existing callback outright.
 The new row-source matches `read_cases`'s own real-I/O-bounding `nrows`
 behavior (checked before each row is read) the same way Stata's and
-SAS7BDAT's own row-sources already do, and rejects a `.zsav` (zlib-
-compressed) file with the identical disclosed error the profiling reader
-already gives - defensively duplicated rather than actually reachable via
-the CLI, since Pass 1 always rejects a `.zsav` file before Pass 2 is ever
-called for it.
+SAS7BDAT's own row-sources already do. At the time this phase shipped,
+`.zsav` (zlib-compressed) files were rejected with the identical
+disclosed error the profiling reader gave, since both passes shared the
+same `CaseSource` construction logic - a later pass added real `.zsav`
+support to both passes at once (see the Architecture section's own SPSS
+entry for the full zlib-block implementation), so this row-source now
+reads a `.zsav` file's own case data exactly as it already did for a
+plain, uncompressed `.sav`.
 
 Verified against a real, installed SQLite build with **no separate load
 step**: `type_detection.sav --output-format sql --load-into sqlite:...`,
@@ -3421,8 +3424,79 @@ values, or a range, e.g. "900-999 means not administered") - both are
 treated as absent, the same "missing values never fake a type change"
 principle Stata's own `.`-through-`.z` missing markers already get.
 Variable/value labels aren't surfaced (same considered non-surfacing
-decision as Stata's/SAS7BDAT's). A `.zsav` file's own zlib compression
-layer isn't implemented yet - see Known limitations.
+decision as Stata's/SAS7BDAT's).
+
+**A `.zsav` file's own zlib-block compression layer is fully supported**,
+closed in a later pass prompted by a direct "what else can be improved"
+request rather than a specific `.zsav` file the user needed to read - a
+real, if smaller-scope, feature addition on top of this reader's own
+already-complete dictionary/case-data understanding, not a from-scratch
+format effort. Before implementing anything, the exact on-disk block
+layout was fetched and read directly from the `ambers` crate's own source
+(`compression/zlib.rs`, via `WebFetch` against its real GitHub
+repository) - the same "read the reference implementation's own source,
+don't reconstruct from memory" discipline every other hand-roll in this
+project already follows, applied here with extra care given how easy a
+misremembered binary-format detail is to get subtly, silently wrong
+rather than cleanly failing. That reading surfaced one detail worth
+double-checking against `flate2`'s own documentation before trusting it:
+`ambers` calls `Decompress::new(true)`, and `flate2`'s own `zlib_header`
+parameter meaning "yes, parse a real zlib header/trailer" when `true`
+(not "raw DEFLATE" - the opposite of what a first, LLM-summarized fetch
+of the source claimed) confirmed each `.zsav` block is a genuine zlib
+(RFC 1950) stream, not raw DEFLATE - a real distinction, since this
+project's own existing `inflate` function only ever decoded raw DEFLATE
+before this (built for gzip/zip, which wrap DEFLATE differently).
+
+The verified layout: a 24-byte ZHEADER (three `i64` fields - `zheader_
+offset`/`ztrailer_offset`/`ztrailer_length`) sits exactly where case data
+would otherwise begin, read sequentially right after `read_dictionary`'s
+own type-999 terminator; `ztrailer_offset` names an absolute file
+position (typically near, but not necessarily exactly at, EOF) holding a
+ZTRAILER - a redundant restatement of the file header's own `bias` (never
+consulted, since the already-parsed `bias: f64` the plain bytecode case
+already uses is the one this project trusts), a `block_size` (also never
+consulted - each block already states its own real size), an `n_blocks`
+count, and exactly `n_blocks` 24-byte block descriptors (`compressed_
+offset`/`uncompressed_size`/`compressed_size` - `uncompressed_offset` is
+parsed for structural fidelity but never consulted either, since blocks
+are always read in the file's own declared order). Each block's own zlib
+stream, once decompressed, still holds this format's own "bytecode"
+(RLE-style) compressed bytes - the identical stream a plain bytecode-
+compressed (non-zlib) `.sav` file already has - which is what lets the
+new `ZlibBlockReader` feed straight into the existing, completely
+unmodified `BytecodeDecompressor` rather than needing a second,
+zlib-specific case-data decoder of its own. `zlib_decompress` handles the
+zlib-specific framing on top of `inflate` (a 2-byte header with its own
+checksum, and a trailing 4-byte big-endian Adler-32 verified against the
+decompressed output via a small, hand-rolled `adler32` - the same
+"verified independently, no new dependency" treatment CRC32/FxHash/
+civil-calendar arithmetic already get elsewhere in this project).
+`ZlibBlockReader` is the one place in this project that implements the
+standard `std::io::Read` trait on a custom type (every other streaming
+abstraction here uses its own custom, `Result`-returning methods
+instead) - deliberately, so it can be dropped straight into `Bytecode
+Decompressor<R: Read>` unchanged rather than duplicating that type's own
+control-byte decode logic a second time; `CaseSource<R>`'s own generic
+bound widened from `Read` to `Read + Seek` to accommodate it (locating
+the ZTRAILER needs one real, one-time seek - the sole exception to this
+reader's own "never look backward" streaming discipline, confined
+entirely to that one setup step before any case data is actually read).
+
+Verified two ways: `spss_reader_matches_the_ambers_crate_output_exactly`
+(the existing oracle-comparison test, already cross-checking this
+project's hand-rolled reader against the real `ambers` crate for every
+other `.sav` fixture) now includes the real, already-committed
+`edge_spss_zlib_compressed.zsav` fixture too, matching column names/
+current_type/missing_pct/sample_values exactly against `ambers`'s own
+independent decode - not just "doesn't crash," genuine agreement with a
+second, real implementation on the actual decoded values. Separately,
+`--output-format sql --load-into sqlite:...` against that same real
+`.zsav` file was verified manually against a real, installed SQLite
+build (matching this project's own standing `--load-into` precedent):
+the resulting table's real rows matched the source file exactly. The two
+integration tests that used to assert `.zsav` gives a clean, actionable
+*error* were rewritten to assert its new, correct *success* instead.
 
 ORC (`columns_from_orc`, via `orc_support` - a hand-rolled reader from the
 start, see the Dependency footprint section) is architecturally different
@@ -4873,8 +4947,9 @@ resolved to a real date), its declared-missing-value exclusion (both
 discrete and range, on top of SYSMIS), its "very long string"
 reconstruction across a real segment boundary, its bytecode compression
 reading identically to an uncompressed equivalent, and its `.zsav`
-(zlib-compressed) files failing with a clean, actionable error rather
-than a guess, ORC's own current-vs-ideal-type gap on a native date column,
+(zlib-block-compressed) files reading correctly (verified byte-for-byte
+against the real `ambers` crate's own decode - see the Architecture
+section's own SPSS entry), ORC's own current-vs-ideal-type gap on a native date column,
 its RLEv2 short-repeat/direct/delta sub-encodings all reading correctly
 through the full pipeline (not just their own unit-level worked
 examples), its declared-missing-value exclusion via the PRESENT stream,
@@ -12722,8 +12797,9 @@ this project could just implement directly rather than depend on:
        corrupted by an earlier segment's own padding bytes.
 
   "Bytecode" compression (SPSS's own default RLE-style scheme, distinct
-  from `.zsav`'s separate zlib layer - see the Known limitations section
-  for that boundary) is a stateful decompressor whose 8-byte control
+  from `.zsav`'s own separate zlib-block layer - both fully supported,
+  see the Architecture section's own SPSS entry) is a stateful
+  decompressor whose 8-byte control
   blocks never align with a case (row) boundary, so its decode state has
   to persist across `next_slot` calls rather than resetting per row - the
   same shape this project's own gzip/zstd decoders already have for an
@@ -13444,16 +13520,6 @@ unmodified `main`).
   stack for one format was judged not worth it here; would reconsider if
   the crate trims that footprint, or if there's a concrete need for
   `.duckdb` files.
-- **No SPSS `.zsav` (zlib-compressed) support yet.** `spss_support`
-  (see the Dependency footprint section for the full hand-roll writeup)
-  reads a plain `.sav`'s two real compression schemes - none, and SPSS's
-  own "bytecode" RLE-style compression - but a `.zsav` file's own
-  zlib-wrapped-bytecode layer isn't implemented yet, and the reader bails
-  cleanly with an actionable error naming the gap rather than guessing at
-  the framing. Would reconsider given a concrete need for `.zsav` files;
-  the format's own dictionary/case-data layout is otherwise fully
-  understood at this point (verified against `ambers`'s own source), so
-  this is a scoping decision, not an unverifiable gap the way LZO is.
 - **Stata/SAS7BDAT/SPSS variable/value labels aren't surfaced.** A `.dta`,
   `.sas7bdat`, or `.sav` file can carry a human-authored description per
   variable (a "variable label") and, for Stata and SPSS, a named mapping

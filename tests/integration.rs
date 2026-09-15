@@ -6154,18 +6154,19 @@ fn spss_bytecode_compression_reads_identically_to_uncompressed() {
 
 #[cfg(feature = "spss")]
 #[test]
-fn spss_zsav_zlib_compression_gives_an_actionable_error_not_a_panic() {
-    let output = Command::new(bin())
-        .args([fixture("edge_spss_zlib_compressed.zsav").to_str().unwrap()])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("zsav"),
-        "expected a zsav-specific error message: {stderr}"
-    );
-    assert!(!stderr.contains("panicked at"));
+fn spss_zsav_zlib_compression_reads_correctly() {
+    // .zsav support was added after this project's own hand-rolled zlib
+    // block reader was verified byte-for-byte against the real `ambers`
+    // crate (see spss_reader_matches_the_ambers_crate_output_exactly) -
+    // this is the full-pipeline confirmation that the compiled binary
+    // itself reads a real zlib-compressed file cleanly, not just the
+    // in-process reader function.
+    let doc = run_json("edge_spss_zlib_compressed.zsav", &[]);
+    let cols = table(&doc, "edge_spss_zlib_compressed");
+    assert_eq!(cols.len(), 2);
+    let id = column(cols, "id");
+    assert_eq!(id["ideal_type"], "i64");
+    assert_eq!(id["sample_values"], serde_json::json!(["1", "2", "3"]));
 }
 
 #[cfg(feature = "spss")]
@@ -9370,24 +9371,12 @@ fn sas7bdat_reads_with_json_schema_output() {
 
 #[cfg(feature = "spss")]
 #[test]
-fn spss_zsav_gives_clean_error_and_sav_reads_schema() {
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_spss_zlib_compressed.zsav").to_str().unwrap(),
-            "-",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.to_lowercase().contains("zsav")
-            || stderr.to_lowercase().contains("zlib")
-            || stderr.contains("not supported")
-    );
+fn spss_zsav_reads_with_json_schema_output_alongside_a_plain_sav() {
+    let doc_zsav = run_with_format("edge_spss_zlib_compressed.zsav", "json-schema", &[]);
+    assert!(doc_zsav["tables"]["edge_spss_zlib_compressed"]["properties"].is_object());
 
-    let doc = run_with_format("edge_spss_edge_cases.sav", "json-schema", &[]);
-    assert!(doc["tables"]["edge_spss_edge_cases"]["properties"].is_object());
+    let doc_sav = run_with_format("edge_spss_edge_cases.sav", "json-schema", &[]);
+    assert!(doc_sav["tables"]["edge_spss_edge_cases"]["properties"].is_object());
 }
 
 #[cfg(feature = "stata")]

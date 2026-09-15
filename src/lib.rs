@@ -10584,7 +10584,7 @@ fn columns_from_sas7bdat(
 #[cfg(feature = "spss")]
 mod spss_support {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
 
     // -- SYSMIS: SPSS's own system-missing value, a specific bit pattern
     // that (per `ambers`'s own test coverage, confirmed rather than assumed
@@ -11292,16 +11292,214 @@ mod spss_support {
         }
     }
 
-    enum CaseSource<R: Read> {
-        Raw(R),
-        Bytecode(BytecodeDecompressor<R>),
+    // -- .zsav (zlib-block-compressed) case data --
+    //
+    // Verified directly against the `ambers` crate's own source
+    // (`compression/zlib.rs`, fetched and read rather than reconstructed
+    // from memory - the same "read the reference implementation's own
+    // source" discipline every other hand-roll in this project already
+    // follows) before trusting the layout below: a 24-byte ZHEADER
+    // record (three i64 fields) sits exactly where case data would
+    // otherwise begin (read sequentially, right after `read_dictionary`'s
+    // own type-999 terminator); its own `ztrailer_offset` names an
+    // absolute file position (near, but not necessarily exactly at, EOF)
+    // holding a ZTRAILER record - two more i64 fields (a redundant
+    // restatement of the file header's own `bias`, and an always-zero
+    // field, neither ever consulted here, since the file header's own
+    // already-parsed `bias: f64` is what `BytecodeDecompressor` needs and
+    // there's no reason to trust a second, differently-typed restatement
+    // of the same value over the one the non-zlib bytecode case already
+    // uses), a `block_size` (informational only - each block already
+    // states its own real size), an `n_blocks` count, and then exactly
+    // `n_blocks` 24-byte block descriptors (`uncompressed_offset` i64 -
+    // never consulted, since blocks are always read in the file's own
+    // declared order, not out of order; `compressed_offset` i64;
+    // `uncompressed_size`/`compressed_size` i32 each). Each block's own
+    // compressed bytes are a genuine, complete zlib (RFC 1950) stream -
+    // confirmed directly against `ambers`'s own `Decompress::new(true)`
+    // call (`flate2::Decompress::new`'s own `zlib_header` parameter:
+    // `true` means "yes, parse a real zlib header/trailer", not raw
+    // DEFLATE) - and, once decompressed, still hold this format's own
+    // "bytecode" (RLE-style) compressed bytes, the identical stream a
+    // plain bytecode-compressed (non-zlib) `.sav` file already has.
+    // That's what lets `ZlibBlockReader` feed straight into the
+    // existing, unmodified `BytecodeDecompressor` above rather than
+    // needing a second, SPSS-specific case-data decoder of its own.
+
+    fn read_i64(r: &mut impl Read) -> Result<i64> {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf).context("truncated SPSS file")?;
+        Ok(i64::from_le_bytes(buf))
     }
 
-    impl<R: Read> CaseSource<R> {
+    /// Adler-32 (RFC 1950 §9) - the trailing 4 bytes of every real zlib
+    /// stream. A small, well-known algorithm (two running sums modulo
+    /// 65521), hand-rolled the same "verified independently, no new
+    /// dependency" treatment CRC32/FxHash/civil-calendar arithmetic
+    /// already get elsewhere in this project.
+    fn adler32(data: &[u8]) -> u32 {
+        const MOD_ADLER: u32 = 65521;
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + u32::from(byte)) % MOD_ADLER;
+            b = (b + a) % MOD_ADLER;
+        }
+        (b << 16) | a
+    }
+
+    /// Decompresses one real zlib (RFC 1950) stream: a 2-byte header, a
+    /// raw DEFLATE body, and a 4-byte big-endian Adler-32 trailer
+    /// verified against the decompressed output. This project's own
+    /// `inflate` already decodes the DEFLATE body itself (built for
+    /// gzip/zip, which wrap DEFLATE differently); this is the thin,
+    /// zlib-specific framing SPSS's own `.zsav` blocks genuinely need on
+    /// top of it (see this section's own header comment for how that was
+    /// confirmed, not assumed).
+    fn zlib_decompress(compressed: &[u8]) -> Result<Vec<u8>> {
+        if compressed.len() < 6 {
+            bail!("SPSS .zsav zlib block is too short to hold a real zlib stream");
+        }
+        let cmf = compressed[0];
+        if cmf & 0x0f != 8 {
+            bail!("SPSS .zsav zlib block doesn't declare the DEFLATE compression method");
+        }
+        if (u16::from(cmf) << 8 | u16::from(compressed[1])) % 31 != 0 {
+            bail!("SPSS .zsav zlib block has an invalid header checksum");
+        }
+        let body = &compressed[2..compressed.len() - 4];
+        let out = inflate(body)?;
+        let expected = u32::from_be_bytes(compressed[compressed.len() - 4..].try_into().unwrap());
+        if adler32(&out) != expected {
+            bail!("SPSS .zsav zlib block failed its Adler-32 checksum - the file may be corrupt");
+        }
+        Ok(out)
+    }
+
+    struct ZTrailerEntry {
+        compressed_offset: u64,
+        uncompressed_size: usize,
+        compressed_size: usize,
+    }
+
+    /// Reads the ZHEADER (at the reader's current position, immediately
+    /// after the dictionary's own type-999 terminator - the exact spot
+    /// case data begins for a non-`.zsav` file too) and, from its own
+    /// `ztrailer_offset`, the ZTRAILER and its full block-descriptor
+    /// table. Requires `Seek` only for this one-time setup step - once
+    /// the block table is in hand, `ZlibBlockReader` drives its own
+    /// further seeks directly.
+    fn read_zlib_block_table(r: &mut (impl Read + Seek)) -> Result<Vec<ZTrailerEntry>> {
+        let _zheader_offset = read_i64(r)?;
+        let ztrailer_offset = read_i64(r)?;
+        let _ztrailer_length = read_i64(r)?;
+
+        let seek_pos = u64::try_from(ztrailer_offset)
+            .context("SPSS .zsav file has a negative ZTRAILER offset")?;
+        r.seek(SeekFrom::Start(seek_pos))
+            .context("failed to seek to the SPSS .zsav ZTRAILER")?;
+
+        let _bias = read_i64(r)?; // redundant with the file header's own bias; not consulted
+        let _zero = read_i64(r)?;
+        let _block_size = read_i32(r)?; // informational only
+        let n_blocks = read_i32(r)?;
+        if !(0..1_000_000).contains(&n_blocks) {
+            bail!("SPSS .zsav file declares an implausible zlib block count ({n_blocks})");
+        }
+        let mut entries = Vec::with_capacity(n_blocks as usize);
+        for _ in 0..n_blocks {
+            let _uncompressed_offset = read_i64(r)?;
+            let compressed_offset = read_i64(r)?;
+            let uncompressed_size = read_i32(r)?;
+            let compressed_size = read_i32(r)?;
+            if uncompressed_size < 0 || compressed_size < 0 {
+                bail!("SPSS .zsav zlib block table declares a negative block size");
+            }
+            entries.push(ZTrailerEntry {
+                compressed_offset: u64::try_from(compressed_offset)
+                    .context("SPSS .zsav zlib block table has a negative offset")?,
+                uncompressed_size: uncompressed_size as usize,
+                compressed_size: compressed_size as usize,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Produces the *bytecode-compressed* byte stream a `.zsav` file's
+    /// own sequence of zlib blocks decompresses to, one block at a
+    /// time - never holding more than one block's own decompressed bytes
+    /// in memory at once, the same streaming discipline this project
+    /// already holds itself to everywhere else. Implements the standard
+    /// `Read` trait (rather than this project's own usual custom-method
+    /// convention) specifically so it can be dropped straight into the
+    /// existing, generic `BytecodeDecompressor<R: Read>` unchanged.
+    struct ZlibBlockReader<R> {
+        reader: R,
+        entries: std::vec::IntoIter<ZTrailerEntry>,
+        current: Vec<u8>,
+        pos: usize,
+    }
+
+    impl<R: Read + Seek> ZlibBlockReader<R> {
+        fn new(reader: R, entries: Vec<ZTrailerEntry>) -> Self {
+            ZlibBlockReader {
+                reader,
+                entries: entries.into_iter(),
+                current: Vec::new(),
+                pos: 0,
+            }
+        }
+
+        fn fill(&mut self) -> Result<bool> {
+            while self.pos >= self.current.len() {
+                let Some(entry) = self.entries.next() else {
+                    return Ok(false);
+                };
+                self.reader
+                    .seek(SeekFrom::Start(entry.compressed_offset))
+                    .context("failed to seek to an SPSS .zsav zlib block")?;
+                let compressed = read_bytes(&mut self.reader, entry.compressed_size)?;
+                let decompressed = zlib_decompress(&compressed)?;
+                if decompressed.len() != entry.uncompressed_size {
+                    bail!(
+                        "SPSS .zsav zlib block decompressed to {} bytes, expected {}",
+                        decompressed.len(),
+                        entry.uncompressed_size
+                    );
+                }
+                self.current = decompressed;
+                self.pos = 0;
+            }
+            Ok(true)
+        }
+    }
+
+    impl<R: Read + Seek> Read for ZlibBlockReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self
+                .fill()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+            {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.current.len() - self.pos);
+            buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    enum CaseSource<R: Read + Seek> {
+        Raw(R),
+        Bytecode(BytecodeDecompressor<R>),
+        Zlib(BytecodeDecompressor<ZlibBlockReader<R>>),
+    }
+
+    impl<R: Read + Seek> CaseSource<R> {
         fn next_slot(&mut self) -> Result<Option<[u8; 8]>> {
             match self {
                 CaseSource::Raw(r) => read_slot(r),
                 CaseSource::Bytecode(d) => d.next_slot(),
+                CaseSource::Zlib(d) => d.next_slot(),
             }
         }
     }
@@ -11446,7 +11644,7 @@ mod spss_support {
     /// pending). Factored out of `read_cases`'s own loop so the SQL
     /// row-source can reuse the identical "how do I know a row boundary
     /// versus a genuine mid-row truncation" logic.
-    fn read_row_slots<R: Read>(
+    fn read_row_slots<R: Read + Seek>(
         source: &mut CaseSource<R>,
         slots_per_row: usize,
     ) -> Result<Option<Vec<[u8; 8]>>> {
@@ -11465,7 +11663,7 @@ mod spss_support {
         Ok(Some(row_slots))
     }
 
-    fn read_cases<R: Read>(
+    fn read_cases<R: Read + Seek>(
         mut source: CaseSource<R>,
         dict: &Dictionary,
         nrows: Option<usize>,
@@ -11505,9 +11703,10 @@ mod spss_support {
     /// reached, checked before each row) rather than dBase's "decode
     /// always" convention - the same per-format check every prior row-
     /// source in this tier has made. `.zsav` (zlib-compressed) files are
-    /// rejected the identical way profiling already rejects them. SPSS
-    /// has no header row and no `--skip-rows` concept, so
-    /// `sink.has_header` must already be `false`.
+    /// supported the identical way profiling already handles them - see
+    /// `CaseSource::Zlib`'s own setup in `columns_from_spss` below for
+    /// the shared design. SPSS has no header row and no `--skip-rows`
+    /// concept, so `sink.has_header` must already be `false`.
     pub(crate) fn stream_spss_rows_for_sql(
         path: &Path,
         sink: &mut InlineRowSink<'_>,
@@ -11516,18 +11715,18 @@ mod spss_support {
         let mut r = std::io::BufReader::new(file);
         let dict = read_dictionary(&mut r)?;
 
-        if dict.header.compression == Compression::Zlib {
-            bail!(
-                "SPSS .zsav (zlib-compressed) files aren't supported by this reader yet - \
-                 rebuild the file as an uncompressed or default-compressed .sav"
-            );
-        }
         let mut source = match dict.header.compression {
             Compression::None => CaseSource::Raw(r),
             Compression::Bytecode => {
                 CaseSource::Bytecode(BytecodeDecompressor::new(r, dict.header.bias))
             }
-            Compression::Zlib => unreachable!("handled above"),
+            Compression::Zlib => {
+                let entries = read_zlib_block_table(&mut r)?;
+                CaseSource::Zlib(BytecodeDecompressor::new(
+                    ZlibBlockReader::new(r, entries),
+                    dict.header.bias,
+                ))
+            }
         };
 
         let visible: Vec<&VariableRecord> = dict.variables.iter().filter(|v| !v.is_ghost).collect();
@@ -11558,12 +11757,6 @@ mod spss_support {
         let mut r = std::io::BufReader::new(file);
         let dict = read_dictionary(&mut r)?;
 
-        if dict.header.compression == Compression::Zlib {
-            bail!(
-                "SPSS .zsav (zlib-compressed) files aren't supported by this reader yet - \
-                 rebuild the file as an uncompressed or default-compressed .sav"
-            );
-        }
         // Streams case data straight off the same BufReader the header/
         // dictionary were already read from, instead of first reading
         // the entire remainder of the file into one Vec<u8> - safe
@@ -11573,12 +11766,24 @@ mod spss_support {
         // read_cases's own early-break check now stops pulling further
         // bytes from disk once the row limit is reached, rather than
         // that limit only ever trimming an already-fully-read buffer.
+        // `.zsav` needs one extra one-time setup step first
+        // (`read_zlib_block_table`, which does need to `Seek` - the one
+        // exception to "never look backward" in this function, confined
+        // entirely to locating the block table before any case data is
+        // actually read): the rest of `ZlibBlockReader`'s own reads are
+        // still genuinely forward-streaming, one block at a time.
         let source = match dict.header.compression {
             Compression::None => CaseSource::Raw(r),
             Compression::Bytecode => {
                 CaseSource::Bytecode(BytecodeDecompressor::new(r, dict.header.bias))
             }
-            Compression::Zlib => unreachable!("handled above"),
+            Compression::Zlib => {
+                let entries = read_zlib_block_table(&mut r)?;
+                CaseSource::Zlib(BytecodeDecompressor::new(
+                    ZlibBlockReader::new(r, entries),
+                    dict.header.bias,
+                ))
+            }
         };
 
         let (col_states, total) = read_cases(source, &dict, nrows, n_samples)?;
@@ -55358,15 +55563,17 @@ fn dynamic_tables<R: std::io::Read>(
 /// Decodes a raw DEFLATE stream (no gzip/zlib wrapper) to its full
 /// uncompressed bytes. `#[allow(dead_code)]`: genuinely called from
 /// production code under `--features parquet` (its own DEFLATE block
-/// codec) and `--features avro` (Avro's "deflate" block codec), both of
-/// which decompress one already-bounded block at a time and have no
-/// reason to route through the streaming `inflate_to` a whole `.gz`
-/// *file* needs - but neither feature is on in a bare default build,
-/// where `decompress_if_needed`'s own gzip-file case now calls
-/// `gzip_decompress_to` directly instead of this Vec<u8>-returning form,
-/// which is what makes this look unused there even though it isn't in
-/// every real build that actually needs it. Every one of this function's
-/// own dedicated unit tests calls it directly too.
+/// codec), `--features avro` (Avro's "deflate" block codec), and
+/// `--features spss` (the DEFLATE body inside one `.zsav` zlib block,
+/// via `spss_support::zlib_decompress`), all of which decompress one
+/// already-bounded block at a time and have no reason to route through
+/// the streaming `inflate_to` a whole `.gz` *file* needs - but none of
+/// those three features is on in a bare default build, where
+/// `decompress_if_needed`'s own gzip-file case now calls `gzip_
+/// decompress_to` directly instead of this Vec<u8>-returning form, which
+/// is what makes this look unused there even though it isn't in every
+/// real build that actually needs it. Every one of this function's own
+/// dedicated unit tests calls it directly too.
 #[allow(dead_code)]
 fn inflate<R: std::io::Read>(input: R) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -71483,6 +71690,7 @@ mod tests {
             "tests/fixtures/edge_spss_very_long_string.sav",
             "tests/fixtures/edge_spss_bytecode_compressed.sav",
             "tests/fixtures/edge_spss_uncompressed_equivalent.sav",
+            "tests/fixtures/edge_spss_zlib_compressed.zsav",
         ] {
             let path = Path::new(f);
             let mine = spss_support::columns_from_spss(path, None, 100)
