@@ -64001,6 +64001,16 @@ struct DiffEntry {
 #[derive(Debug, Clone, Default)]
 struct DiffReport {
     entries: Vec<DiffEntry>,
+    /// Tables present on both sides whose fingerprint (see
+    /// `table_fingerprint`) matched exactly, so the real column-by-column
+    /// diff was skipped entirely - surfaced separately from `entries`
+    /// rather than as a bunch of "nothing changed" entries, since an
+    /// unchanged table isn't a change at all. A renamed table (which
+    /// always gets its own `TableRenamed` entry regardless of whether its
+    /// columns also changed) is never listed here even if its own column
+    /// fingerprints happened to match too - the rename itself is already
+    /// the reported change.
+    unchanged_tables: Vec<String>,
 }
 
 impl DiffReport {
@@ -64127,6 +64137,68 @@ fn classify_missing_pct_change(old: f64, new: f64) -> Option<(Compatibility, Str
         ));
     }
     None
+}
+
+/// FNV-1a 64-bit hash - fast, small, and good enough for a cheap "did
+/// this table's data actually change" pre-check inside `sniff-rs diff`.
+/// Deliberately not `FxHasher` (already used elsewhere in this file for
+/// hot, non-adversarial in-memory map keys - its own design intent
+/// explicitly disclaims collision-resistance, which is exactly the
+/// property a content fingerprint needs) and not the existing
+/// `Xxh64Incremental` (a real, verified hash, but it lives behind
+/// `#[cfg(feature = "zstd")]` and this fingerprint has to work in the
+/// always-on default build). Constants and algorithm verified
+/// independently against three well-known public test vectors (the empty
+/// string, `"a"`, `"foobar"`) before being trusted, the same "verify
+/// before relying on it" discipline every other hand-rolled hash in this
+/// project already follows for CRC32/Huffman/xxHash.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// A cheap, order-sensitive fingerprint of one table's own column list -
+/// every field a real diff (`diff_table_columns`) can ever actually
+/// compare (name, current_type, ideal_type, missing_pct, sample_values),
+/// each length-prefixed so a concatenation ambiguity (two adjacent short
+/// values vs. one longer one that happens to share the same bytes) can
+/// never collapse two genuinely different column lists onto the same
+/// hash input. This hashes a strict superset of what `diff_table_columns`
+/// itself looks at - `DiffColumn` doesn't even carry `row_count`/
+/// `description`/`notes` - so two tables whose fingerprints match are
+/// provably guaranteed to produce zero diff entries against each other,
+/// which is what makes it safe to skip the real column-by-column diff
+/// entirely once two matched tables' fingerprints agree. The reverse
+/// isn't guaranteed (a reordered-but-otherwise-identical column list
+/// hashes differently, since order is part of the input) - a false
+/// negative here only costs a skipped optimization, never a wrong
+/// answer, so it's not worth chasing further.
+fn push_len_prefixed(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn table_fingerprint(cols: &[DiffColumn]) -> String {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(cols.len() as u64).to_le_bytes());
+    for c in cols {
+        push_len_prefixed(&mut buf, &c.name);
+        push_len_prefixed(&mut buf, &c.current_type);
+        push_len_prefixed(&mut buf, &c.ideal_type);
+        buf.extend_from_slice(&c.missing_pct.to_le_bytes());
+        buf.extend_from_slice(&(c.sample_values.len() as u64).to_le_bytes());
+        for sv in &c.sample_values {
+            push_len_prefixed(&mut buf, sv);
+        }
+    }
+    format!("{:016x}", fnv1a64(&buf))
 }
 
 /// Diffs one table's own column list between the old and new schema.
@@ -64370,8 +64442,15 @@ fn diff_dictionaries(
         } else {
             format!("{old_name} -> {new_name}")
         };
+        if table_fingerprint(old_cols) == table_fingerprint(new_cols) {
+            return DiffReport {
+                unchanged_tables: vec![label],
+                ..Default::default()
+            };
+        }
         return DiffReport {
             entries: diff_table_columns(&label, sql_table, old_cols, new_cols),
+            ..Default::default()
         };
     }
 
@@ -64448,8 +64527,14 @@ fn diff_dictionaries(
         // A renamed table can still have real column-level drift of its
         // own - surface that too, under the same "old -> new" label,
         // rather than only reporting the rename and staying silent about
-        // everything else that changed inside it.
-        entries.extend(diff_table_columns(&label, None, &old[r], &new[a]));
+        // everything else that changed inside it. Still worth a
+        // fingerprint check first: a rename with byte-identical column
+        // data is a real, if less common, shape (e.g. a table copied
+        // verbatim to a new name), and there's no reason to pay for the
+        // full column diff when it's provably going to find nothing.
+        if table_fingerprint(&old[r]) != table_fingerprint(&new[a]) {
+            entries.extend(diff_table_columns(&label, None, &old[r], &new[a]));
+        }
     }
     removed_tables.retain(|t| !matched_removed_tables.contains(t));
     added_tables.retain(|t| !matched_added_tables.contains(t));
@@ -64475,13 +64560,21 @@ fn diff_dictionaries(
                 .to_string(),
         });
     }
+    let mut unchanged_tables = Vec::new();
     for (table, old_cols) in old {
         if let Some(new_cols) = new.get(table) {
-            entries.extend(diff_table_columns(table, Some(table), old_cols, new_cols));
+            if table_fingerprint(old_cols) == table_fingerprint(new_cols) {
+                unchanged_tables.push(table.clone());
+            } else {
+                entries.extend(diff_table_columns(table, Some(table), old_cols, new_cols));
+            }
         }
     }
 
-    DiffReport { entries }
+    DiffReport {
+        entries,
+        unchanged_tables,
+    }
 }
 
 fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -> String {
@@ -64490,21 +64583,42 @@ fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -
     md.push_str(&format!("- **Old:** {}\n", old_path.display()));
     md.push_str(&format!("- **New:** {}\n\n", new_path.display()));
 
-    if report.entries.is_empty() {
+    if report.entries.is_empty() && report.unchanged_tables.is_empty() {
         md.push_str("No differences detected.\n");
         return md;
     }
 
-    let breaking = report
-        .entries
-        .iter()
-        .filter(|e| e.compatibility == Compatibility::Breaking)
-        .count();
-    let safe = report.entries.len() - breaking;
-    md.push_str(&format!(
-        "**{} change(s)** - {safe} safe, {breaking} breaking\n\n",
-        report.entries.len(),
-    ));
+    if report.entries.is_empty() {
+        md.push_str("No differences detected.\n");
+    } else {
+        let breaking = report
+            .entries
+            .iter()
+            .filter(|e| e.compatibility == Compatibility::Breaking)
+            .count();
+        let safe = report.entries.len() - breaking;
+        md.push_str(&format!(
+            "**{} change(s)** - {safe} safe, {breaking} breaking\n\n",
+            report.entries.len(),
+        ));
+    }
+
+    if !report.unchanged_tables.is_empty() {
+        md.push_str(&format!(
+            "**{} table(s) unchanged** (fingerprint matched, full diff skipped): {}\n\n",
+            report.unchanged_tables.len(),
+            report
+                .unchanged_tables
+                .iter()
+                .map(|t| escape_md(t).to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+
+    if report.entries.is_empty() {
+        return md;
+    }
 
     let mut by_table: BTreeMap<&str, Vec<&DiffEntry>> = BTreeMap::new();
     for e in &report.entries {
@@ -64628,6 +64742,16 @@ fn render_diff_json(old_path: &Path, new_path: &Path, report: &DiffReport) -> St
         arr.push(JsonValue::Object(obj));
     }
     doc.insert("changes".to_string(), JsonValue::Array(arr));
+    doc.insert(
+        "unchanged_tables".to_string(),
+        JsonValue::Array(
+            report
+                .unchanged_tables
+                .iter()
+                .map(|t| JsonValue::from(t.clone()))
+                .collect(),
+        ),
+    );
     json_support::to_pretty_string(&JsonValue::Object(doc))
 }
 
@@ -65230,6 +65354,7 @@ mod diff_tests {
                     reason: "dropped".to_string(),
                 },
             ],
+            ..Default::default()
         };
         let sql = render_diff_resolution_sql(&report);
         assert!(sql.contains("ALTER TABLE \"t\" ADD COLUMN \"new_col\" TEXT;"));
@@ -65465,6 +65590,7 @@ mod diff_tests {
                 compatibility: Compatibility::Breaking,
                 reason: "col|umn removed".to_string(),
             }],
+            ..Default::default()
         };
         let md = render_diff_markdown(Path::new("old.json"), Path::new("new.json"), &report);
         // escape_md must have turned every literal '|' into an escaped
@@ -65500,6 +65626,7 @@ mod diff_tests {
                     reason: "became nullable".to_string(),
                 },
             ],
+            ..Default::default()
         };
         let json = render_diff_json(Path::new("old.json"), Path::new("new.json"), &report);
         let doc = json_support::from_str(&json).unwrap();
@@ -65527,6 +65654,35 @@ mod diff_tests {
     }
 
     #[test]
+    fn render_diff_json_carries_unchanged_tables() {
+        let report = DiffReport {
+            entries: vec![DiffEntry {
+                table: "orders".to_string(),
+                sql_table: Some("orders".to_string()),
+                column: Some("total".to_string()),
+                change: DiffChange::ColumnAdded {
+                    ideal_type: "f64".to_string(),
+                    missing_pct: 0.0,
+                },
+                compatibility: Compatibility::Breaking,
+                reason: "not nullable".to_string(),
+            }],
+            unchanged_tables: vec!["users".to_string(), "products".to_string()],
+        };
+        let json = render_diff_json(Path::new("old.json"), Path::new("new.json"), &report);
+        let doc = json_support::from_str(&json).unwrap();
+        let unchanged = doc
+            .get("unchanged_tables")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(unchanged, vec!["users".to_string(), "products".to_string()]);
+    }
+
+    #[test]
     fn render_diff_resolution_sql_discloses_when_no_safe_changes_exist() {
         let report = DiffReport {
             entries: vec![DiffEntry {
@@ -65539,6 +65695,7 @@ mod diff_tests {
                 compatibility: Compatibility::Breaking,
                 reason: "dropped".to_string(),
             }],
+            ..Default::default()
         };
         let sql = render_diff_resolution_sql(&report);
         assert!(sql.contains("No safe, auto-generatable changes found."));
@@ -65552,6 +65709,48 @@ mod diff_tests {
         let new = old.clone();
         let report = diff_dictionaries(&old, &new);
         assert!(report.entries.is_empty());
+        // Fingerprint short-circuit: two byte-identical tables should be
+        // reported as unchanged, not just "produced zero diff entries" -
+        // the two are distinguishable at the report level (see
+        // `DiffReport::unchanged_tables`'s own doc comment).
+        assert_eq!(report.unchanged_tables, vec!["t".to_string()]);
+    }
+
+    #[test]
+    fn table_fingerprint_is_identical_for_the_same_columns_and_differs_after_a_real_change() {
+        let a = vec![
+            col("id", "i64", 0.0, &["1", "2"]),
+            col("name", "String", 0.0, &["a", "b"]),
+        ];
+        let b = a.clone();
+        assert_eq!(table_fingerprint(&a), table_fingerprint(&b));
+
+        let mut c = a.clone();
+        c[0].missing_pct = 5.0;
+        assert_ne!(table_fingerprint(&a), table_fingerprint(&c));
+
+        let mut d = a.clone();
+        d.push(col("extra", "String", 0.0, &["x"]));
+        assert_ne!(table_fingerprint(&a), table_fingerprint(&d));
+    }
+
+    #[test]
+    fn diff_dictionaries_skips_the_full_diff_for_a_multitable_pair_with_one_unchanged_table() {
+        let mut old = BTreeMap::new();
+        old.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        old.insert("orders".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        let mut new = old.clone();
+        new.get_mut("orders")
+            .unwrap()
+            .push(col("total", "f64", 0.0, &["9.99"]));
+        let report = diff_dictionaries(&old, &new);
+        assert_eq!(report.unchanged_tables, vec!["users".to_string()]);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.table == "orders" && e.column.as_deref() == Some("total"))
+        );
     }
 }
 

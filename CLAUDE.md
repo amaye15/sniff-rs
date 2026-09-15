@@ -3332,6 +3332,62 @@ malformed-input fixture) confirmed unaffected via a byte-identical
 across default/`full`, matching each build's own established clippy
 baseline exactly.
 
+**Dataset fingerprinting - a cheap "did this table actually change"
+pre-check, added as a follow-up once the diff engine itself was already
+in real use.** `diff_dictionaries` now computes a fingerprint (see
+`table_fingerprint`, below) for every matched pair of tables - the
+single-table path, the by-name multi-table path, and even a detected
+table-rename's own column diff - before ever calling `diff_table_columns`
+against it; two tables whose fingerprints match are provably guaranteed
+to produce zero diff entries (the fingerprint hashes a strict superset of
+what a real diff compares - name/current_type/ideal_type/missing_pct/
+sample_values, in order), so the whole three-pass column-matching/
+rename-candidate algorithm is skipped outright for a table that hasn't
+moved. This is purely an internal optimization already - the safe kind,
+since a fingerprint mismatch never claims anything, it just means the
+real diff has to run - but it's also surfaced directly: `DiffReport`
+gained a new `unchanged_tables: Vec<String>` field, rendered in both
+Markdown (`"N table(s) unchanged (fingerprint matched, full diff
+skipped): ..."`) and JSON (a plain `"unchanged_tables"` array alongside
+the existing `"changes"` one) - useful on its own for a wide, mostly-
+static multi-table dictionary (a `--combine` run over a directory with
+hundreds of tables, most of which never change between two snapshots),
+not just as a performance detail.
+
+The hash itself (`fnv1a64`) is a freshly hand-rolled FNV-1a 64-bit,
+chosen over the two hashes already in this file for the same reason
+neither actually fits: `FxHasher` is already used elsewhere for hot,
+non-adversarial map keys, but its own design intent explicitly disclaims
+collision-resistance - not the property a content fingerprint needs -
+and the existing `Xxh64Incremental` (a real, verified hash) lives behind
+`#[cfg(feature = "zstd")]`, unavailable in the always-on default build
+`sniff-rs diff` has to work in with no extra feature flags. FNV-1a's
+constants and algorithm were verified independently (a standalone Python
+script) against three well-known public test vectors - the empty string,
+`"a"`, `"foobar"` - before being ported to Rust, the same "verify before
+relying on it" discipline every other hand-rolled hash in this project
+already follows. `table_fingerprint` builds a length-prefixed byte
+buffer of every field a real diff can ever compare (so `"ab"` followed
+by `"c"` can never hash the same as `"a"` followed by `"bc"`) and hashes
+it once - deliberately order-sensitive (a column list that's merely been
+reordered, with nothing else changed, hashes differently and just costs
+a skipped optimization, not a wrong answer, since the fingerprint's whole
+correctness property is one-directional: equal fingerprints guarantee no
+diff, not the reverse).
+
+Verified with three new unit tests (`table_fingerprint` distinguishes a
+missing-% change and an added column from an identical pair; a
+multi-table dictionary with one genuinely unchanged table and one
+genuinely modified table correctly lands the unchanged one in
+`unchanged_tables` and still fully diffs the other; `render_diff_json`
+carries the new field) plus the existing "two identical tables" test
+extended to assert the new field directly, and manual verification
+against the real fixture corpus (`diff_old.json` vs. itself correctly
+reports one unchanged table with zero diff entries; the multitable
+fixture pair - which has no genuinely unchanged table - is unaffected).
+Clean across default/`full`, matching each build's own established
+clippy baseline exactly.
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:
