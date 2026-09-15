@@ -1,0 +1,4 @@
+{
+  id: 1,
+  orders: [{ amount: 10 }, { amount: 20 }],
+}

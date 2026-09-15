@@ -322,8 +322,8 @@ Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
-Avro, XML, BSON, and Property List (plist), the first nine formats in
-the recursively-nested, JSON-bridge tier. Every other format
+Avro, XML, BSON, Property List (plist), and JSON5/JSONC, the first ten
+formats in the recursively-nested, JSON-bridge tier. Every other format
 transparently falls back to `staging` with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
@@ -367,8 +367,8 @@ needs its own real design, not just repeating the same pattern:
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
-   MessagePack, CBOR, Avro, XML, BSON, and plist done as of Phases
-   13-20.** Unlike the two tiers above, there was no existing
+   MessagePack, CBOR, Avro, XML, BSON, plist, and JSON5/JSONC done as of
+   Phases 13-21.** Unlike the two tiers above, there was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -417,8 +417,13 @@ needs its own real design, not just repeating the same pattern:
    array all-objects" check the way `profile_root_value` itself makes,
    since `records_mode` (already resolved from the real, already-
    profiled columns) already tells the shared extractor which
-   interpretation applies. JSON5, HAR, GeoJSON, vCard, iCalendar, and
-   MBOX remain unstarted.
+   interpretation applies. JSON5/JSONC carried all three shared
+   functions over unchanged too (the seventh format in a row) - its own
+   top-level-array streaming scanner (`stream_top_level_array`, already
+   built for profiling) needed no `--nrows`-invariant bookkeeping the way
+   `columns_from_json5` itself needs, since `InlineRowSink::accept`'s own
+   cap is the only truncation logic this row-source ever needs. HAR,
+   GeoJSON, vCard, iCalendar, and MBOX remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1762,17 +1767,65 @@ Phase 19's own three tests that used plist as their "still genuinely
 unsupported format" example moved to JSON5 instead, gated behind
 `--features json5` - the same one-hop-forward shuffle repeats itself again.
 
-Remaining in the recursively-nested, JSON-bridge tier: JSON5, HAR,
-GeoJSON, vCard, iCalendar, and MBOX - each bridges to the same
-`json_support::Value` shape JSON itself uses (see the Architecture
-section), so `json_extract_value_for_sql`/`json_inline_blocking_column`/
-`json_bridge_columns_and_mode` are already reusable as-is once each
-format's own row-source re-decodes its file a second time into that same
-`Value` tree - Phases 14 through 20 are direct, working proof of this
-now, not just a plan (seven formats in a row needed zero changes to any
-of the three shared functions). vCard/iCalendar/MBOX's own repeated-
-property pooling (a different mechanism from JSON's array pooling, but
-the identical one-cell-per-row question) is the one sub-family that will
+**Phase 21: JSON5/JSONC - the tenth format in the recursively-nested,
+JSON-bridge tier, and the seventh format in a row needing zero changes
+to `json_extract_value_for_sql`/`json_inline_blocking_column`/`json_
+bridge_columns_and_mode`.** JSON5's own profiling reader (`columns_
+from_json5`) already has exactly the same dual-mode dispatch YAML/TOML/
+plist already established: a top-level array streams element by element
+via `stream_top_level_array` (its own separate byte-window scanner,
+built during the streaming-reads campaign specifically to recognize
+comments/single-quoted strings without corrupting its own depth-tracking
+scan - see the Dependency footprint section's own JSON5 entry for the
+adversarial "a comment containing a stray bracket" case this had to get
+right); anything else (a top-level object or bare scalar) falls back to
+a whole-file read as one record. `json5_support::stream_json5_rows_for_
+sql` mirrors this exactly, with one real simplification over `columns_
+from_json5`'s own profiling pass: that function has to stop *pushing*
+values at precisely `--nrows` to protect `JsonRecordStreamProfiler`'s own
+`pushed_count == total` invariant (desyncing it would silently force a
+truncated read into the wrong dual-mode branch), but the SQL row-source
+has no such invariant to protect at all - every element is simply
+offered to `json_emit_row_for_sql` unconditionally, with `InlineRowSink::
+accept`'s own cap doing all the real truncation work.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.json5 --output-format sql --load-into sqlite:...` loaded
+its own real nested `meta` object (flattened with no column of its own)
+and `tags` array correctly, through a document exercising every one of
+this reader's relaxations at once (line and block comments, unquoted
+keys, single-quoted strings, trailing commas); `sample.jsonc` confirmed
+the `.jsonc` extension routes to the identical reader and grammar;
+`edge_json5_comment_with_stray_brackets.json5` (a real, already-committed
+adversarial fixture - a top-level array whose own comments deliberately
+contain stray `]`/`{`/`"` characters) confirmed the structural byte-scan
+survives exactly the shape it was built to handle, with every row loading
+correctly; a new hand-built fixture (`edge_json5_sql_inline_array_of_
+objects.json5`) confirmed the disclosed blocking error fires and names
+the offending field for a genuine array-of-objects column; `--nrows`
+confirmed to bound the kept row count on the streamed-array path. Also
+verified as behavior-preserving for every already-shipped format: `diff`
+confirmed byte-identical inline SQL output against the pre-Phase-21
+binary across the entire fixture corpus (JSON5/JSONC themselves excluded,
+since this phase is exactly what changes their own output). Clean across
+default/`json5`/`full`, matching each one's own established baseline
+exactly.
+
+Phase 20's own three tests that used JSON5 as their "still genuinely
+unsupported format" example moved to HAR instead, gated behind
+`--features har` - the same one-hop-forward shuffle repeats itself again.
+
+Remaining in the recursively-nested, JSON-bridge tier: HAR, GeoJSON,
+vCard, iCalendar, and MBOX - each bridges to the same `json_support::
+Value` shape JSON itself uses (see the Architecture section), so `json_
+extract_value_for_sql`/`json_inline_blocking_column`/`json_bridge_
+columns_and_mode` are already reusable as-is once each format's own
+row-source re-decodes its file a second time into that same `Value`
+tree - Phases 14 through 21 are direct, working proof of this now, not
+just a plan (eight formats in a row needed zero changes to any of the
+three shared functions). vCard/iCalendar/MBOX's own repeated-property
+pooling (a different mechanism from JSON's array pooling, but the
+identical one-cell-per-row question) is the one sub-family that will
 need its own fresh look before assuming the same machinery applies
 unchanged.
 

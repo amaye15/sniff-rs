@@ -46042,6 +46042,40 @@ mod json5_support {
         profiler.push(&value);
         Ok(profiler.finish())
     }
+
+    /// The JSON5/JSONC row-source for `render_sql_inline_flat` (Phase 21,
+    /// the tenth format in the recursively-nested, JSON-bridge tier) - a
+    /// mechanical mirror of `columns_from_json5`'s own dual-mode dispatch
+    /// just above: a top-level array streams each element straight into
+    /// `json_emit_row_for_sql` via the same `stream_top_level_array`
+    /// scanner; anything else (a top-level object or bare scalar) falls
+    /// back to a whole-file read as a single record. Unlike `columns_
+    /// from_json5`'s own profiling pass (which has to stop *pushing*
+    /// exactly at `--nrows` to keep `JsonRecordStreamProfiler`'s own
+    /// `pushed_count == total` invariant intact), this row-source has no
+    /// such invariant to protect - every element is simply offered to
+    /// `json_emit_row_for_sql` unconditionally, and `InlineRowSink::
+    /// accept`'s own cap silently stops keeping rows past the limit.
+    pub(crate) fn stream_json5_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let is_array = stream_top_level_array(reader, |v| {
+            json_emit_row_for_sql(&v, columns, records_mode, sink)
+        })
+        .with_context(|| format!("failed to parse {path:?} as JSON5"))?;
+        if is_array {
+            return Ok(());
+        }
+
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = parse(&text).with_context(|| format!("failed to parse {path:?} as JSON5"))?;
+        json_emit_row_for_sql(&value, columns, records_mode, sink)
+    }
 } // mod json5_support
 
 #[cfg(feature = "json5")]
@@ -52829,6 +52863,7 @@ fn render_sql_inline_flat(
             | InputFormat::Xml
             | InputFormat::Bson
             | InputFormat::Plist
+            | InputFormat::Json5
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -53070,6 +53105,7 @@ fn render_sql_inline_flat(
         InputFormat::Xml => render_sql_inline_flat_xml(read_path, profiles, &mut sink)?,
         InputFormat::Bson => render_sql_inline_flat_bson(read_path, profiles, &mut sink)?,
         InputFormat::Plist => render_sql_inline_flat_plist(read_path, profiles, &mut sink)?,
+        InputFormat::Json5 => render_sql_inline_flat_json5(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53609,6 +53645,31 @@ fn render_sql_inline_flat_plist(
     )
 }
 
+/// The JSON5/JSONC row-source wrapper for `render_sql_inline_flat`
+/// (Phase 21) - see `render_sql_inline_flat_yaml`'s own doc comment;
+/// identical shape, just driven by `json5_support::stream_json5_rows_
+/// for_sql`'s own dual-mode dispatch instead.
+#[cfg(feature = "json5")]
+fn render_sql_inline_flat_json5(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    json5_support::stream_json5_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "json5"))]
+fn render_sql_inline_flat_json5(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "JSON5/JSONC support isn't compiled in - rebuild with `cargo build --release --features json5` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53753,12 +53814,13 @@ fn render_sql(
             | InputFormat::Xml
             | InputFormat::Bson
             | InputFormat::Plist
+            | InputFormat::Json5
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5 are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -61031,10 +61093,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Xml
                 | InputFormat::Bson
                 | InputFormat::Plist
+                | InputFormat::Json5
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5 are supported so far",
             format.as_str()
         );
     }

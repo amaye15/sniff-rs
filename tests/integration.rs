@@ -550,25 +550,25 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 }
 
 #[test]
-#[cfg(feature = "json5")]
+#[cfg(feature = "har")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, and plist
-    // are now inline-supported (Phases 13-20), so JSON5 is used here
-    // instead as a format that still genuinely isn't. Falls back to
-    // staging mode automatically (with a disclosed stderr note, checked
-    // separately below) rather than erroring or silently producing
-    // something different.
-    let sql = run_sql("sample.json5", &[]);
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist, and
+    // JSON5 are now inline-supported (Phases 13-21), so HAR is used
+    // here instead as a format that still genuinely isn't. Falls back
+    // to staging mode automatically (with a disclosed stderr note,
+    // checked separately below) rather than erroring or silently
+    // producing something different.
+    let sql = run_sql("sample.har", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "json5")]
+#[cfg(feature = "har")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.json5").to_str().unwrap(),
+            fixture("sample.har").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -577,12 +577,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for json5"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for har"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "json5")]
+#[cfg(feature = "har")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -590,7 +590,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.json5").to_str().unwrap(),
+            fixture("sample.har").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -601,7 +601,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for json5"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for har"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -702,18 +702,18 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "json5")]
+#[cfg(feature = "har")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, and plist
-    // are now inline-supported (Phases 13-20), so JSON5 stands in as a
-    // format that still genuinely isn't.
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist, and
+    // JSON5 are now inline-supported (Phases 13-21), so HAR stands in
+    // as a format that still genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.json5").to_str().unwrap(),
+            fixture("sample.har").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -723,7 +723,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for json5"));
+    assert!(stderr.contains("--load-into isn't available yet for har"));
 }
 
 #[test]
@@ -2205,6 +2205,76 @@ fn load_into_accepts_plist() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for plist"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "json5")]
+fn sql_output_inline_mode_supports_json5_nested_object_and_array() {
+    // Phase 21 of the "any format" rollout, and the tenth format in the
+    // recursively-nested, JSON-bridge tier - sample.json5's own real
+    // nested "meta" object and "tags" array (with comments, unquoted
+    // keys, single-quoted strings, and trailing commas throughout)
+    // exercise this shape without needing a new hand-built fixture.
+    let sql = run_sql("sample.json5", &[]);
+    assert!(!sql.contains("\"meta\" "));
+    assert!(sql.contains("\"meta.x\""));
+    assert!(sql.contains("'[\"a\",\"b\",\"c\"]'"));
+}
+
+#[test]
+#[cfg(feature = "json5")]
+fn sql_output_inline_mode_supports_jsonc() {
+    let sql = run_sql("sample.jsonc", &[]);
+    assert!(sql.contains("'sniff-rs'"));
+}
+
+#[test]
+#[cfg(feature = "json5")]
+fn sql_output_inline_mode_json5_streams_a_top_level_array_with_stray_bracket_comments() {
+    // A real, committed adversarial fixture: comments containing stray
+    // ]/{/" characters must not corrupt the structural scan.
+    let sql = run_sql("edge_json5_comment_with_stray_brackets.json5", &[]);
+    assert!(sql.contains("(1, 'Alice')"));
+    assert!(sql.contains("(2, 'Bob')"));
+}
+
+#[test]
+#[cfg(feature = "json5")]
+fn sql_output_inline_mode_json5_rejects_an_array_of_objects_column() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_json5_sql_inline_array_of_objects.json5")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for field \"orders\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+#[cfg(feature = "json5")]
+fn load_into_accepts_json5() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.json5").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for json5"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
