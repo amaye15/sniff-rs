@@ -389,6 +389,19 @@ fn nested_arrays_and_objects_are_recursively_typed_at_every_leaf() {
     );
     let mixed_x = column(cols, "mixed_list.x");
     assert_eq!(mixed_x["ideal_type"], "i64");
+
+    // numeric_stats: a scalar top-level i64 column, a nested-object i64
+    // column pooled across every record's own `events` array, and a
+    // three-levels-deep i64 leaf - all real, verified min/max/mean, and
+    // never present on a non-numeric column (`tags`, `Vec<UUID>`).
+    assert_eq!(column(cols, "id")["numeric_stats"]["mean"], 2.0);
+    let amount_stats = &amount["numeric_stats"];
+    assert_eq!(amount_stats["count"], 4);
+    assert_eq!(amount_stats["min"], 20.0);
+    assert_eq!(amount_stats["max"], 99.0);
+    assert_eq!(amount_stats["mean"], 61.0);
+    assert_eq!(score["numeric_stats"]["mean"], 2.5);
+    assert!(tags["numeric_stats"].is_null());
 }
 
 #[test]

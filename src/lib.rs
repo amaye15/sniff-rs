@@ -3996,22 +3996,160 @@ struct ColumnInput {
     skip_heuristics: bool,   // true for nested JSON (array/object) columns
 }
 
-/// Streaming min/max/mean/sample-stddev for a numeric column - `count`
-/// zero-based mean/variance via Welford's online algorithm, so this never
-/// buffers a single value: `push` takes one `O(1)`-cost step per raw
-/// string, matching every other incremental accumulator in this file
-/// (`IdealTypeAccumulator`, `NaiveTypeAccumulator`). Only ever populated
-/// on a column whose `ideal_type` resolved to `"i64"`/`"f64"` (checked
-/// after the fact, by the caller - this accumulator itself has no opinion
-/// on what a column's *type* is, it just quietly ignores any value that
-/// doesn't parse as a finite number, the same "count only what actually
-/// parses" contract `IdealTypeAccumulator`'s own i64/f64 checks already
-/// have). Deliberately scoped to exactly these four numbers for now -
-/// median/percentiles need either a second, bounded pass or a real
-/// streaming-approximation algorithm (P²/t-digest), neither of which is
-/// implemented here yet; see this feature's own CLAUDE.md writeup for why
-/// that's staged, disclosed future work rather than attempted in the same
-/// pass.
+/// The P² (piecewise-parabolic) streaming quantile estimator - Jain &
+/// Chlamtac, 1985 ("The P² Algorithm for Dynamic Calculation of Quantiles
+/// and Histograms Without Storing Observations"). Tracks a single target
+/// quantile (here, the median, `p = 0.5`) in genuinely `O(1)` memory - five
+/// running markers, never the column itself - which is exactly the
+/// missing piece that kept median/percentiles out of this project's first
+/// numeric-stats pass: an *exact* median needs either the whole column
+/// sorted in memory, or a second, bounded pass over the file, both of
+/// which conflict with this project's own "never buffer the whole column"
+/// streaming discipline. This is the honest trade-off instead - a real,
+/// converging *approximation*, not the exact value, and disclosed as
+/// exactly that on `NumericStats.median`'s own doc comment.
+///
+/// Implemented directly from the paper's own five-step algorithm (not a
+/// port of any particular open-source implementation): the first five
+/// observations are buffered, sorted, and used to seed five markers -
+/// their heights (`q`, the running quantile estimates at five percentile
+/// positions), integer positions (`n`), ideal fractional positions (`np`),
+/// and per-observation position increments (`dn`, derived from `p` once
+/// and never touched again). Every observation after the fifth locates
+/// which of the four cells it falls into, nudges every marker position
+/// past that cell by one, advances every marker's own ideal position by
+/// its fixed increment, and - only for the three interior markers, only
+/// when a marker's real position has drifted at least one whole step from
+/// its own ideal position - re-estimates that one marker's height via a
+/// parabolic interpolation (falling back to simple linear interpolation
+/// if the parabolic estimate would leave the marker's own sorted order),
+/// then shifts that marker's position by one. `q[2]` (the middle marker)
+/// is the running estimate of the `p`-th quantile at every point.
+///
+/// Exact, not approximate, for the first five values pushed (before a
+/// sixth ever arrives, `value()` reports the real sorted-median of
+/// whatever's been buffered) - the approximation only ever kicks in once
+/// there's genuinely too much data to keep exactly.
+#[derive(Clone)]
+struct P2Quantile {
+    p: f64,
+    // Buffered raw values until exactly five have been seen - bounded at
+    // 5 elements for this accumulator's entire lifetime (never grows
+    // further, never shrinks), so this is not "buffer the column with
+    // extra steps," just enough real data to seed the five markers below.
+    initial: Vec<f64>,
+    markers: Option<[f64; 5]>,
+    positions: [f64; 5],
+    desired: [f64; 5],
+    increments: [f64; 5],
+}
+
+impl P2Quantile {
+    fn new(p: f64) -> Self {
+        P2Quantile {
+            p,
+            initial: Vec::with_capacity(5),
+            markers: None,
+            positions: [0.0; 5],
+            desired: [0.0; 5],
+            increments: [0.0; 5],
+        }
+    }
+
+    fn push(&mut self, x: f64) {
+        if self.markers.is_none() {
+            self.initial.push(x);
+            if self.initial.len() == 5 {
+                self.initial
+                    .sort_by(|a, b| a.partial_cmp(b).expect("finite f64"));
+                let q: [f64; 5] = self.initial[..].try_into().expect("exactly 5 elements");
+                self.markers = Some(q);
+                self.positions = [1.0, 2.0, 3.0, 4.0, 5.0];
+                let p = self.p;
+                self.desired = [1.0, 1.0 + 2.0 * p, 1.0 + 4.0 * p, 3.0 + 2.0 * p, 5.0];
+                self.increments = [0.0, p / 2.0, p, (1.0 + p) / 2.0, 1.0];
+            }
+            return;
+        }
+        let q = self.markers.as_mut().expect("already initialized above");
+
+        // Locate the cell `x` falls into (widening q[0]/q[4] if it's a
+        // new extreme), per the paper's own step B.1.
+        let k = if x < q[0] {
+            q[0] = x;
+            0
+        } else if x >= q[4] {
+            q[4] = x;
+            3
+        } else {
+            (0..4).find(|&i| x < q[i + 1]).unwrap_or(3)
+        };
+
+        for n in self.positions.iter_mut().skip(k + 1) {
+            *n += 1.0;
+        }
+        for (np, dn) in self.desired.iter_mut().zip(self.increments.iter()) {
+            *np += dn;
+        }
+
+        // Adjust the three interior markers (step B.4) - `q` re-borrowed
+        // since the extreme-marker branch above may have already written
+        // through it.
+        let q = self.markers.as_mut().expect("already initialized above");
+        for i in 1..4 {
+            let d = self.desired[i] - self.positions[i];
+            let n = &self.positions;
+            if (d >= 1.0 && n[i + 1] - n[i] > 1.0) || (d <= -1.0 && n[i - 1] - n[i] < -1.0) {
+                let sign = if d >= 0.0 { 1.0 } else { -1.0 };
+                let parabolic = q[i]
+                    + sign / (n[i + 1] - n[i - 1])
+                        * ((n[i] - n[i - 1] + sign) * (q[i + 1] - q[i]) / (n[i + 1] - n[i])
+                            + (n[i + 1] - n[i] - sign) * (q[i] - q[i - 1]) / (n[i] - n[i - 1]));
+                q[i] = if q[i - 1] < parabolic && parabolic < q[i + 1] {
+                    parabolic
+                } else {
+                    let j = (i as f64 + sign) as usize;
+                    q[i] + sign * (q[j] - q[i]) / (n[j] - n[i])
+                };
+                self.positions[i] += sign;
+            }
+        }
+    }
+
+    fn value(&self) -> Option<f64> {
+        if let Some(q) = &self.markers {
+            return Some(q[2]);
+        }
+        if self.initial.is_empty() {
+            return None;
+        }
+        let mut sorted = self.initial.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite f64"));
+        let n = sorted.len();
+        Some(if n % 2 == 1 {
+            sorted[n / 2]
+        } else {
+            (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        })
+    }
+}
+
+/// Streaming min/max/mean/sample-stddev/(approximate) median for a
+/// numeric column - `count`-zero-based mean/variance via Welford's online
+/// algorithm and a P² estimator for the median (see `P2Quantile`'s own
+/// doc comment for why it's approximate), so this never buffers a single
+/// value: `push` takes one `O(1)`-cost step per raw string, matching
+/// every other incremental accumulator in this file (`IdealTypeAccumulator`,
+/// `NaiveTypeAccumulator`). Only ever populated on a column whose
+/// `ideal_type` resolved to `"i64"`/`"f64"` (checked after the fact, by
+/// the caller - this accumulator itself has no opinion on what a column's
+/// *type* is, it just quietly ignores any value that doesn't parse as a
+/// finite number, the same "count only what actually parses" contract
+/// `IdealTypeAccumulator`'s own i64/f64 checks already have). Real
+/// percentiles beyond the median (p90/p99/...) are still out of scope -
+/// `P2Quantile` only ever tracks one target quantile per instance, so a
+/// full percentile suite would mean several parallel estimators, a
+/// genuinely separate, larger feature left for its own future pass.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct NumericStats {
     count: u64,
@@ -4019,9 +4157,17 @@ struct NumericStats {
     max: f64,
     mean: f64,
     stddev: f64,
+    /// The P²-estimated median - exact for a column with 5 or fewer
+    /// numeric values, a converging approximation otherwise. Never
+    /// exactly wrong in a way that misleads (it's always genuinely
+    /// between two real observed values, by construction of the
+    /// algorithm's own marker-ordering invariant), but not the literal
+    /// sorted middle value for a large column either - disclosed here
+    /// rather than presented as if it were exact.
+    median: f64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct NumericStatsAccumulator {
     count: u64,
     min: f64,
@@ -4035,6 +4181,20 @@ struct NumericStatsAccumulator {
     // project's own numeric columns routinely mix small and very large
     // values in the same column).
     m2: f64,
+    median_estimator: P2Quantile,
+}
+
+impl Default for NumericStatsAccumulator {
+    fn default() -> Self {
+        NumericStatsAccumulator {
+            count: 0,
+            min: 0.0,
+            max: 0.0,
+            mean: 0.0,
+            m2: 0.0,
+            median_estimator: P2Quantile::new(0.5),
+        }
+    }
 }
 
 impl NumericStatsAccumulator {
@@ -4080,6 +4240,7 @@ impl NumericStatsAccumulator {
         self.mean += delta / self.count as f64;
         let delta2 = v - self.mean;
         self.m2 += delta * delta2;
+        self.median_estimator.push(v);
     }
 
     /// `None` iff nothing this accumulator saw ever parsed as a finite
@@ -4106,6 +4267,13 @@ impl NumericStatsAccumulator {
             max: self.max,
             mean: self.mean,
             stddev: variance.sqrt(),
+            // `self.count > 0` here (checked above) guarantees at least
+            // one value has reached `median_estimator.push` too - same
+            // values, same call sites - so this is never `None` in
+            // practice; `self.mean` is a defensive, never-actually-hit
+            // fallback rather than an `unwrap()` that could panic on a
+            // logic error somewhere else in this file.
+            median: self.median_estimator.value().unwrap_or(self.mean),
         })
     }
 }
@@ -4113,11 +4281,12 @@ impl NumericStatsAccumulator {
 impl NumericStats {
     fn to_json(&self) -> json_support::Value {
         use json_support::{Map, Value};
-        let mut obj = Map::with_capacity(5);
+        let mut obj = Map::with_capacity(6);
         obj.insert("count".to_string(), Value::from(self.count));
         obj.insert("min".to_string(), Value::from(self.min));
         obj.insert("max".to_string(), Value::from(self.max));
         obj.insert("mean".to_string(), Value::from(self.mean));
+        obj.insert("median".to_string(), Value::from(self.median));
         obj.insert("stddev".to_string(), Value::from(self.stddev));
         Value::Object(obj)
     }
@@ -4401,6 +4570,81 @@ mod numeric_stats_tests {
     }
 
     #[test]
+    fn p2_quantile_is_exact_for_five_or_fewer_values() {
+        // Below the fifth observation, `value()` reports the real, exact
+        // sorted median of whatever's been buffered so far - no
+        // approximation kicks in until there's genuinely too much data
+        // to keep exactly.
+        let mut q = P2Quantile::new(0.5);
+        assert_eq!(q.value(), None);
+        q.push(3.0);
+        assert_eq!(q.value(), Some(3.0));
+        q.push(1.0);
+        // [1, 3] -> even count, average of the two middle (only) values.
+        assert_eq!(q.value(), Some(2.0));
+        q.push(2.0);
+        // [1, 2, 3] -> exact middle.
+        assert_eq!(q.value(), Some(2.0));
+        q.push(100.0);
+        q.push(4.0);
+        // [1, 2, 3, 4, 100] -> exact middle is 3, unaffected by the
+        // outlier - proves this isn't secretly just an average.
+        assert_eq!(q.value(), Some(3.0));
+    }
+
+    #[test]
+    fn p2_quantile_converges_close_to_the_true_median_of_a_large_uniform_dataset() {
+        // 1..=1001 has a real, exact median of 501 - the P² estimate
+        // should land close to it (a real, published property of the
+        // algorithm: it converges quickly and never drifts far for a
+        // smoothly-distributed dataset), even though it never sorts or
+        // buffers the 1,001 values it sees.
+        let mut q = P2Quantile::new(0.5);
+        for i in 1..=1001 {
+            q.push(i as f64);
+        }
+        let estimate = q.value().unwrap();
+        assert!(
+            (estimate - 501.0).abs() < 15.0,
+            "expected the P2 median estimate to land near 501, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn p2_quantile_estimate_always_stays_within_the_observed_range() {
+        // A real, structural guarantee of the algorithm (the middle
+        // marker's own sorted-order invariant relative to its neighbors) -
+        // worth locking in directly, not just "the number looks plausible".
+        let mut q = P2Quantile::new(0.5);
+        for i in 0..500 {
+            // A skewed, non-uniform sequence (not just 0..n) to exercise
+            // the parabolic/linear fallback branches on genuinely uneven
+            // spacing, not just a smooth linear ramp.
+            let v = ((i * 37) % 251) as f64;
+            q.push(v);
+            let estimate = q.value().unwrap();
+            assert!(
+                (0.0..=250.0).contains(&estimate),
+                "estimate {estimate} left the observed [0, 250] range at i={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_stats_accumulator_reports_a_median_close_to_the_true_value() {
+        let mut acc = NumericStatsAccumulator::new();
+        for i in 1..=101 {
+            acc.push(&i.to_string());
+        }
+        let stats = acc.finish().unwrap();
+        // Exact median of 1..=101 is 51; a small approximation tolerance
+        // is expected and disclosed (see `NumericStats.median`'s own doc
+        // comment) - this is the property actually worth locking in,
+        // not exact equality with the true value.
+        assert!((stats.median - 51.0).abs() < 5.0);
+    }
+
+    #[test]
     fn numeric_stats_round_trips_through_to_json() {
         let p = ColumnProfile {
             name: "amount".to_string(),
@@ -4416,6 +4660,7 @@ mod numeric_stats_tests {
                 min: 1.5,
                 max: 2.5,
                 mean: 2.0,
+                median: 2.0,
                 stddev: std::f64::consts::FRAC_1_SQRT_2,
             }),
         };
@@ -4425,6 +4670,7 @@ mod numeric_stats_tests {
         assert_eq!(via_real["numeric_stats"]["min"], 1.5);
         assert_eq!(via_real["numeric_stats"]["max"], 2.5);
         assert_eq!(via_real["numeric_stats"]["mean"], 2.0);
+        assert_eq!(via_real["numeric_stats"]["median"], 2.0);
 
         // A non-numeric column's `numeric_stats` renders as a real JSON
         // `null`, never an omitted key - a consumer can always find the
@@ -14708,6 +14954,15 @@ struct JsonPathAccumulator {
     scalar_count: usize,
     object_count: usize,
     ideal_acc: IdealTypeAccumulator,
+    // Fed every scalar leaf this path ever absorbs, the identical value
+    // `ideal_acc` sees - including one pooled inside an array (`saw_array`
+    // wraps the resolved `ideal_type` as `Vec<T>`, but the *stats* are
+    // still computed over the same flattened leaf values that decided
+    // what `T` is, exactly the way `scalar_samples`/`ideal_acc` already
+    // do for a pooled array column). Only ever consulted in `finish` once
+    // the un-wrapped, pre-`Vec<>` ideal type is exactly `"i64"`/`"f64"` -
+    // see that method's own comment.
+    numeric_acc: NumericStatsAccumulator,
     scalar_samples: Vec<String>,
     object_samples: Vec<String>,
     /// Child accumulators in first-seen key order, mirroring
@@ -14727,6 +14982,7 @@ impl JsonPathAccumulator {
             scalar_count: 0,
             object_count: 0,
             ideal_acc: IdealTypeAccumulator::new(),
+            numeric_acc: NumericStatsAccumulator::new(),
             scalar_samples: Vec::new(),
             object_samples: Vec::new(),
             child_order: Vec::new(),
@@ -14810,6 +15066,7 @@ impl JsonPathAccumulator {
     fn absorb_scalar(&mut self, s: &str) {
         self.scalar_count += 1;
         self.ideal_acc.push(s);
+        self.numeric_acc.push(s);
         if self.scalar_samples.len() < self.n_samples && !self.scalar_samples.iter().any(|x| x == s)
         {
             self.scalar_samples.push(s.to_string());
@@ -14847,30 +15104,46 @@ impl JsonPathAccumulator {
             }
         };
         let pool_is_empty = self.scalar_count == 0 && self.object_count == 0;
+        // Computed unconditionally up front (cheap - it's already been
+        // accumulated incrementally, this just reads it out) and only
+        // ever kept below once the resolved *base* ideal type (before
+        // `wrap()` adds a `Vec<>` around it for a pooled array) is
+        // exactly `"i64"`/`"f64"` - never a semantic type that happens to
+        // be numeric-shaped underneath, and never a `mixed(...)` column,
+        // matching `ColumnAccumulatorState::finish_profile`'s own
+        // identical scope decision for the flat-reader engine.
+        let numeric_stats_candidate = self.numeric_acc.finish();
 
-        let (current_type, ideal_type, mut notes) = if pool_is_empty {
+        let (current_type, ideal_type, mut notes, numeric_stats) = if pool_is_empty {
             // saw_array must be true: something was pushed but every array was empty.
             (
                 wrap("empty"),
                 wrap("empty"),
                 "array is always empty - can't infer an element type".to_string(),
+                None,
             )
         } else if self.object_count > 0 && self.scalar_count == 0 {
             (
                 wrap("object"),
                 wrap("struct"),
                 format!("flattened into {name}.* below"),
+                None,
             )
         } else if self.scalar_count > 0 && self.object_count == 0 {
             let base_current = describe_kinds(&self.kind_counts);
             let (ideal, note) = self.ideal_acc.finish(&base_current);
-            (wrap(&base_current), wrap(&ideal), note)
+            let numeric_stats = if matches!(ideal.as_str(), "i64" | "f64") {
+                numeric_stats_candidate
+            } else {
+                None
+            };
+            (wrap(&base_current), wrap(&ideal), note, numeric_stats)
         } else {
             let base_current = describe_kinds(&self.kind_counts);
             let note = format!(
                 "mix of scalars and objects - object fields listed separately under {name}.*"
             );
-            (wrap(&base_current), wrap("String"), note)
+            (wrap(&base_current), wrap("String"), note, None)
         };
 
         if missing_pct > 0.0 {
@@ -14897,7 +15170,7 @@ impl JsonPathAccumulator {
             sample_values: samples,
             notes,
             row_count: total,
-            numeric_stats: None,
+            numeric_stats,
         }];
 
         if self.object_count > 0 {
@@ -67431,6 +67704,56 @@ mod tests {
             .find(|c| c.name == "events.amount")
             .expect("events.amount column missing");
         assert_eq!(amount.ideal_type, "i64");
+    }
+
+    #[test]
+    fn profile_json_path_populates_numeric_stats_for_a_scalar_numeric_field() {
+        let events = json!([
+            {"user_email": "alice@example.com", "amount": 50},
+            {"user_email": "bob@example.com", "amount": 75}
+        ]);
+        let profiles = profile_json_path("events".to_string(), 1, vec![&events], 3);
+
+        let amount = profiles
+            .iter()
+            .find(|c| c.name == "events.amount")
+            .expect("events.amount column missing");
+        let stats = amount
+            .numeric_stats
+            .as_ref()
+            .expect("numeric column should carry stats");
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.min, 50.0);
+        assert_eq!(stats.max, 75.0);
+        assert_eq!(stats.mean, 62.5);
+
+        // A non-numeric field alongside it must stay `None`.
+        let email = profiles
+            .iter()
+            .find(|c| c.name == "events.user_email")
+            .expect("events.user_email column missing");
+        assert!(email.numeric_stats.is_none());
+    }
+
+    #[test]
+    fn profile_json_path_populates_numeric_stats_across_a_pooled_array_of_numbers() {
+        // A `tags`-shaped array of plain numbers, pooled the same way a
+        // repeated scalar array already is for `ideal_type`/`sample_values`
+        // - stats must reflect every leaf value across every record's own
+        // array, not just the first.
+        let scores_a = json!([10, 20]);
+        let scores_b = json!([30]);
+        let profiles = profile_json_path("scores".to_string(), 2, vec![&scores_a, &scores_b], 3);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].ideal_type, "Vec<i64>");
+        let stats = profiles[0]
+            .numeric_stats
+            .as_ref()
+            .expect("pooled numeric array should carry stats");
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.min, 10.0);
+        assert_eq!(stats.max, 30.0);
+        assert_eq!(stats.mean, 20.0);
     }
 
     #[test]
