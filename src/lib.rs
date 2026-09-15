@@ -44235,6 +44235,37 @@ mod bson_support {
         }
         Ok(profiler.finish())
     }
+
+    /// The BSON row-source for `render_sql_inline_flat` (Phase 19, the
+    /// eighth format in the recursively-nested, JSON-bridge tier) - a
+    /// mechanical mirror of `columns_from_bson`'s own decode loop just
+    /// above, folding each decoded document into `json_emit_row_for_sql`
+    /// instead of the profiling accumulator. Every document is still
+    /// decoded regardless of `--nrows` (matching `columns_from_bson`'s
+    /// own decode-all-then-truncate convention - `--nrows` only bounds
+    /// what's *kept*, via `InlineRowSink::accept`'s own cap), the same
+    /// "decode always" shape dBase's own row-source already uses. BSON
+    /// has no top-level-scalar/top-level-array shape at all (every
+    /// top-level value is a genuine object by construction), so this
+    /// needs no records-mode/single-value fallback the way JSON/YAML/
+    /// TOML/MessagePack/CBOR's own row-sources do.
+    pub(crate) fn stream_bson_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        while let Some(bytes) =
+            read_one_document(&mut reader).with_context(|| format!("failed reading {path:?}"))?
+        {
+            let (map, _) = decode_document(&bytes, 0)
+                .with_context(|| format!("failed decoding a BSON document from {path:?}"))?;
+            json_emit_row_for_sql(&JsonValue::from(map), columns, records_mode, sink)?;
+        }
+        Ok(())
+    }
 } // mod bson_support
 
 #[cfg(feature = "bson")]
@@ -52710,6 +52741,7 @@ fn render_sql_inline_flat(
             | InputFormat::Cbor
             | InputFormat::Avro
             | InputFormat::Xml
+            | InputFormat::Bson
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -52949,6 +52981,7 @@ fn render_sql_inline_flat(
         InputFormat::Cbor => render_sql_inline_flat_cbor(read_path, profiles, &mut sink)?,
         InputFormat::Avro => render_sql_inline_flat_avro(read_path, profiles, &mut sink)?,
         InputFormat::Xml => render_sql_inline_flat_xml(read_path, profiles, &mut sink)?,
+        InputFormat::Bson => render_sql_inline_flat_bson(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53438,6 +53471,31 @@ fn render_sql_inline_flat_xml(
     )
 }
 
+/// The BSON row-source wrapper for `render_sql_inline_flat` (Phase 19) -
+/// see `render_sql_inline_flat_avro`'s own doc comment; identical shape,
+/// just driven by `bson_support::stream_bson_rows_for_sql`'s own
+/// concatenated-documents decode loop instead.
+#[cfg(feature = "bson")]
+fn render_sql_inline_flat_bson(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    bson_support::stream_bson_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "bson"))]
+fn render_sql_inline_flat_bson(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "BSON support isn't compiled in - rebuild with `cargo build --release --features bson` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53580,12 +53638,13 @@ fn render_sql(
             | InputFormat::Cbor
             | InputFormat::Avro
             | InputFormat::Xml
+            | InputFormat::Bson
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -60856,10 +60915,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Cbor
                 | InputFormat::Avro
                 | InputFormat::Xml
+                | InputFormat::Bson
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson are supported so far",
             format.as_str()
         );
     }

@@ -322,7 +322,7 @@ Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
-Avro, and XML, the first seven formats in the recursively-nested,
+Avro, XML, and BSON, the first eight formats in the recursively-nested,
 JSON-bridge tier. Every other format transparently falls back to
 `staging` with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
@@ -367,8 +367,8 @@ needs its own real design, not just repeating the same pattern:
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
-   MessagePack, CBOR, Avro, and XML done as of Phases 13-18.** Unlike the
-   two tiers above, there was no existing
+   MessagePack, CBOR, Avro, XML, and BSON done as of Phases 13-19.**
+   Unlike the two tiers above, there was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -404,8 +404,14 @@ needs its own real design, not just repeating the same pattern:
    during this project's own streaming-reads campaign) producing the
    shared `Value` shape directly, so the SQL row-source is a thin wrapper
    over that existing scanner plus the same whole-DOM single-record
-   fallback `columns_from_xml` itself already uses. BSON, plist, JSON5,
-   HAR, GeoJSON, vCard, iCalendar, and MBOX remain unstarted.
+   fallback `columns_from_xml` itself already uses. BSON carried all
+   three shared functions over unchanged too (the fifth format in a
+   row) - its own concatenated-documents decode loop matches dBase's own
+   "decode always, keep conditionally" convention, and it needs no
+   records-mode/single-value fallback at all, since BSON has no top-
+   level-scalar/top-level-array shape whatsoever (every top-level value
+   is a genuine object by construction). plist, JSON5, HAR, GeoJSON,
+   vCard, iCalendar, and MBOX remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1662,20 +1668,61 @@ Phase 17's own three tests that used XML as their "still genuinely
 unsupported format" example moved to BSON instead, gated behind
 `--features bson` - the same one-hop-forward shuffle repeats itself again.
 
-Remaining in the recursively-nested, JSON-bridge tier: BSON, plist,
-JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX - each bridges to the
-same `json_support::Value` shape JSON itself uses (see the Architecture
+**Phase 19: BSON - the eighth format in the recursively-nested, JSON-
+bridge tier, and the fifth format in a row needing zero changes to
+`json_extract_value_for_sql`/`json_inline_blocking_column`/`json_bridge_
+columns_and_mode`.** BSON's own decode loop (`columns_from_bson`) is the
+simplest of any format so far to port: a plain, concatenated stream of
+top-level documents, every one of them a genuine object by construction
+(BSON has no top-level-scalar or top-level-array shape at all, unlike
+JSON/YAML/TOML/MessagePack/CBOR's own dual-mode dispatch), so `bson_
+support::stream_bson_rows_for_sql` needs no records-mode/single-value
+fallback whatsoever - always records mode, unconditionally.
+`columns_from_bson`'s own real behavior (decode every document
+regardless of `--nrows`, only *counting* toward the profiler
+conditionally) matches dBase's own "decode always, keep conditionally"
+convention exactly, so the SQL row-source folds every decoded document
+into `json_emit_row_for_sql` unconditionally too, relying on `InlineRowSink
+::accept`'s own cap to bound what's kept.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.bson --output-format sql --load-into sqlite:...` loaded
+its own real nested `meta` document (flattened with no column of its
+own) and pooled `tags` array correctly, with a genuinely missing
+`meta.y` value landing as a real `NULL`; `edge_bson_rare_types.bson`
+confirmed BSON's own less-common element types (Regex, the internal
+Timestamp type rendered as a flattened `{t, i}` struct, MinKey/MaxKey,
+JS code) all render per this project's own already-documented
+conventions and load correctly; `type_detection.bson` confirmed every
+semantic type survives; a new hand-built fixture (`edge_bson_sql_inline_
+array_of_objects.bson`, generated with `pymongo`) confirmed the
+disclosed blocking error fires and names the offending field
+(`"orders"`) for a genuine array-of-documents column; `--nrows` confirmed
+to bound the kept row count via the decode-always/keep-conditionally
+path. Also verified as behavior-preserving for every already-shipped
+format: `diff` confirmed byte-identical inline SQL output against the
+pre-Phase-19 binary across the entire fixture corpus (BSON itself
+excluded, since this phase is exactly what changes its own output).
+Clean across default/`bson`/`full`, matching each one's own established
+baseline exactly.
+
+Phase 18's own three tests that used BSON as their "still genuinely
+unsupported format" example moved to plist instead, gated behind
+`--features plist` - the same one-hop-forward shuffle repeats itself again.
+
+Remaining in the recursively-nested, JSON-bridge tier: plist, JSON5,
+HAR, GeoJSON, vCard, iCalendar, and MBOX - each bridges to the same
+`json_support::Value` shape JSON itself uses (see the Architecture
 section), so `json_extract_value_for_sql`/`json_inline_blocking_column`/
 `json_bridge_columns_and_mode` are already reusable as-is once each
 format's own row-source re-decodes its file a second time into that same
-`Value` tree - Phases 14 through 18 are direct, working proof of this now,
-not just a plan (five formats in a row needed zero changes to any of the
-three shared functions, including one - XML - whose own bridge shape
-looked the most structurally different of any format in this tier so far).
-vCard/iCalendar/MBOX's own repeated-property pooling (a different
-mechanism from JSON's array pooling, but the identical one-cell-per-row
-question) is the one sub-family that will need its own fresh look before
-assuming the same machinery applies unchanged.
+`Value` tree - Phases 14 through 19 are direct, working proof of this
+now, not just a plan (six formats in a row needed zero changes to any of
+the three shared functions). vCard/iCalendar/MBOX's own repeated-
+property pooling (a different mechanism from JSON's array pooling, but
+the identical one-cell-per-row question) is the one sub-family that will
+need its own fresh look before assuming the same machinery applies
+unchanged.
 
 ## Directory-input batch mode
 

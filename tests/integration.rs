@@ -550,25 +550,25 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 }
 
 #[test]
-#[cfg(feature = "bson")]
+#[cfg(feature = "plist")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, and XML are now inline-
-    // supported (Phases 13-18), so BSON is used here instead as a
-    // format that still genuinely isn't. Falls back to staging mode
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, and BSON are now
+    // inline-supported (Phases 13-19), so plist is used here instead as
+    // a format that still genuinely isn't. Falls back to staging mode
     // automatically (with a disclosed stderr note, checked separately
     // below) rather than erroring or silently producing something
     // different.
-    let sql = run_sql("sample.bson", &[]);
+    let sql = run_sql("sample.plist", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "bson")]
+#[cfg(feature = "plist")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.bson").to_str().unwrap(),
+            fixture("sample.plist").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -577,12 +577,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for bson"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for plist"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "bson")]
+#[cfg(feature = "plist")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -590,7 +590,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.bson").to_str().unwrap(),
+            fixture("sample.plist").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -601,7 +601,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for bson"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for plist"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -702,18 +702,18 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "bson")]
+#[cfg(feature = "plist")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, and XML are now inline-
-    // supported (Phases 13-18), so BSON stands in as a format that
-    // still genuinely isn't.
+    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, and BSON are now
+    // inline-supported (Phases 13-19), so plist stands in as a format
+    // that still genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.bson").to_str().unwrap(),
+            fixture("sample.plist").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -723,7 +723,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for bson"));
+    assert!(stderr.contains("--load-into isn't available yet for plist"));
 }
 
 #[test]
@@ -2070,6 +2070,72 @@ fn load_into_accepts_xml() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for xml"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "bson")]
+fn sql_output_inline_mode_supports_bson_nested_document_and_array() {
+    // Phase 19 of the "any format" rollout, and the eighth format in
+    // the recursively-nested, JSON-bridge tier - sample.bson's own real
+    // nested "meta" document and "tags" pooled array exercise this
+    // shape without needing a new hand-built fixture.
+    let sql = run_sql("sample.bson", &[]);
+    assert!(!sql.contains("\"meta\" "));
+    assert!(sql.contains("\"meta.x\""));
+    assert!(sql.contains("'[\"a\",\"b\",\"c\"]'"));
+    let values = sql
+        .split("INSERT INTO")
+        .nth(1)
+        .expect("no INSERT statement found");
+    assert!(values.contains("NULL"));
+}
+
+#[test]
+#[cfg(feature = "bson")]
+fn sql_output_inline_mode_bson_rare_element_types_render_correctly() {
+    let sql = run_sql("edge_bson_rare_types.bson", &[]);
+    assert!(sql.contains("'/^foo/i'"));
+    assert!(sql.contains("'MinKey'"));
+    assert!(sql.contains("'MaxKey'"));
+}
+
+#[test]
+#[cfg(feature = "bson")]
+fn sql_output_inline_mode_bson_rejects_an_array_of_documents_column() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_bson_sql_inline_array_of_objects.bson")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for field \"orders\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+#[cfg(feature = "bson")]
+fn load_into_accepts_bson() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.bson").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for bson"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
