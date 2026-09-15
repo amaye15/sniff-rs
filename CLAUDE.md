@@ -2668,16 +2668,63 @@ disclosed inconsistency with the richer JSON shape's own `"directory"`
 key, accepted for the real simplicity of touching zero existing code
 there).
 
-**`--sql-mode staging` is a disclosed, not-yet-supported gap for
-`--combine` specifically** - `render_sql_staging`'s own per-table "Load"
-comment needs to name that table's own distinct source file, which its
-whole-script rendering has no way to do once several files' tables are
-merged into one script the way `--sql-mode inline`'s own literal
-`INSERT` statements already tolerate cleanly (each table's own row-source
-re-reads its own real source file directly, with no shared "the whole
-script has one source" assumption to begin with) - a real, disclosed
-scope boundary rather than a guess, matching this project's own
-"confident common case, disclosed gap" discipline everywhere else.
+**`--sql-mode staging` works under `--combine` too, added in a follow-up
+pass right after `--combine` itself shipped** (prompted directly by the
+user asking for staging support specifically, plus "make sure everything
+is streamed, lightweight as much as possible"). The real blocker this
+closed: `render_sql_staging`'s own per-table "Load" comment needs to name
+that table's own *distinct* source file - a whole-script rendering that
+assumes one shared `file_name`/`format` for every table (the shape it
+had when this was first written, well before `--combine` existed) can't
+do that once several files' tables are merged into one script the way
+`--sql-mode inline`'s own literal `INSERT` statements already tolerate
+cleanly (each table's own row-source re-reads its own real source file
+directly, with no shared "the whole script has one source" assumption at
+all). The fix was to stop assuming that in the first place:
+`write_staging_table_body` - a new function, one table's own complete
+staging-mode block (the `-- === name ===` comment, the raw staging
+table, its own "Load" hint, the real typed table, the `CAST`-based
+`INSERT ... SELECT`) - already took `file_name`/`format` as plain
+per-call parameters rather than closing over one shared value, so
+`--combine`'s own per-file loop just passes *that file's* own values on
+every call. Each table's own "Load" comment names its source file's
+*relative path*, not just its bare filename - `2024/sales.csv` and
+`2025/sales.csv` genuinely share a bare name, and the per-engine load
+commands the comment embeds (DuckDB's `read_csv_auto(...)`, SQLite's
+`.import`, ...) need to point at a real, distinguishable path a user
+could actually run, not an ambiguous one two different tables would
+otherwise both claim. `render_sql_staging_combined_header` is `--combine`'s
+own version of the shared preamble every staging script already carries
+(the portability/scope-boundary prose), naming the directory instead of
+one file and dropping the single `(format: {fmt})` a combined run can't
+give one honest answer for - pointing at each table's own "Load" comment
+for its real source file instead of implying the whole script has one.
+
+**This same pass also converted `render_sql_staging` itself to stream
+directly to a `sink: &mut dyn Write`, rather than building the whole
+multi-table document as one `String` first** - a real, if long-standing,
+inconsistency with `--sql-mode inline`'s own already-streaming
+`render_sql_inline_flat`, prompted by the same "make everything streamed"
+request. This was always a smaller memory concern than inline mode's own
+motivating one (a staging table's own text is proportional to *schema*
+size - column and table count - never *row* count, the actual cost this
+project's whole "Streaming reads" campaign exists to eliminate), but
+fixing the inconsistency was still the right call, and it's what made
+`write_staging_table_body`'s own per-table extraction possible in the
+first place - a function that writes one table's own block straight to a
+sink, reusable identically by both the single-file `render_sql_staging`
+(looping over its own `tables` map) and `--combine`'s own per-file loop
+(one file's own tables at a time, interleaved with every other file's).
+The old post-hoc `sql.truncate(sql.trim_end_matches('\n')...)` trailing-
+newline cleanup - impossible to replicate against a sink already written
+to, the identical problem `--sql-mode inline`'s own `separator_written`
+mechanism was already built to solve - is replaced the same way: the
+header now ends in exactly one trailing newline (not two), and every
+table's own block unconditionally writes its *leading* blank-line
+separator first, whether that's right after the shared header or right
+after the previous table's own `INSERT` statement - so the document
+always ends cleanly with no trailing blank line, with nothing to trim
+after the fact.
 
 `[OUTPUT_PATH]` (previously always rejected in directory mode) becomes
 meaningful again under `--combine` - there's exactly one output artifact
@@ -2699,24 +2746,41 @@ a multi-table SQLite file combined alongside a plain CSV correctly
 qualified all three resulting tables; `--combine --load-into sqlite:...`
 loaded both files' tables into one real, queryable shared database;
 `--nrows` correctly bounded each file's own row count within the
-combined output; every validation error (staging mode, combining
-`--load-into` with `--output-dir` or an output path) fired with the
-right message; `--combine --load-into postgres:mydb` correctly reached
-the real `psql`-spawn attempt (failing only because `psql` isn't
-installed here) rather than the plain per-file case's own postgres/
-mysql rejection, confirming the "one shared target" shape genuinely
-reuses single-file mode's own unrestricted engine support. `diff`
-confirmed both single-file mode and directory mode's own default (non-
-`--combine`) output completely byte-identical against the pre-change
-binary across the entire fixture corpus, in every output format -
-`render_markdown`/`render_json`'s own refactor is a pure extraction, not
-a behavior change. The naming/collision logic itself
-(`combine_qualifier_from_path`, `CombinedTableNamer`) has its own
-portable, subprocess-free unit tests, matching how `looks_like_own_
-loaded_database`'s own detection logic was tested for the same reason
-in the plain directory `--load-into` phase just before this one. Clean
-across default/`full`, matching each build's own established clippy
-baseline (full=6, default=2) exactly.
+combined output; every validation error (combining `--load-into` with
+`--output-dir` or an output path) fired with the right message;
+`--combine --load-into postgres:mydb` correctly reached the real
+`psql`-spawn attempt (failing only because `psql` isn't installed here)
+rather than the plain per-file case's own postgres/mysql rejection,
+confirming the "one shared target" shape genuinely reuses single-file
+mode's own unrestricted engine support. `diff` confirmed both single-file
+mode and directory mode's own default (non-`--combine`) output completely
+byte-identical against the pre-change binary across the entire fixture
+corpus, in every output format - `render_markdown`/`render_json`'s own
+refactor is a pure extraction, not a behavior change. The naming/
+collision logic itself (`combine_qualifier_from_path`, `CombinedTableNamer`)
+has its own portable, subprocess-free unit tests, matching how `looks_
+like_own_loaded_database`'s own detection logic was tested for the same
+reason in the plain directory `--load-into` phase just before this one.
+
+`--sql-mode staging`'s own combine support was verified the same way:
+two files sharing an identical bare filename (`2024/sales.csv`,
+`2025/sales.csv`) produced two correctly-distinguished "Load" comments,
+each naming its own real relative path, never the ambiguous shared
+basename; the generated staging script's own `.import`/`CREATE TABLE`/
+`INSERT ... SELECT CAST` sequence was piped into a real, installed
+SQLite build with no separate load step skipped, confirming a genuinely
+missing value (`age`) still correctly lands as `NULL` through the
+combined script's own cast expressions, exactly as single-file mode's
+own staging output already does. The streaming refactor (`render_sql_
+staging`/`write_staging_table_body` writing directly to a sink instead
+of building a whole-document `String`) was confirmed as pure, behavior-
+preserving extraction via `diff` against the pre-change binary across
+the entire fixture corpus in `--sql-mode staging`, alongside the
+already-established `--sql-mode inline` sweep - zero differences in
+either mode, including every already-degenerate edge fixture (a
+zero-column schema, a zero-row table) this project's corpus already
+carries. Clean across default/`full`, matching each build's own
+established clippy baseline (full=6, default=2) exactly.
 
 ## Architecture
 

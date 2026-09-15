@@ -3022,8 +3022,10 @@ OPTIONS:
         --output-format <FMT>   md (default), json, json-schema, or sql
         --sql-mode <MODE>       --output-format sql only: inline (default - no load
                                 step needed) or staging (raw-text staging table +
-                                per-engine load hint, for a file too large to embed;
-                                not yet supported with --combine)
+                                per-engine load hint, for a file too large to embed -
+                                each table's own hint names its own real source file
+                                even under --combine). staging can't be combined with
+                                --load-into (single-file mode or not).
         --load-into <TARGET>    --output-format sql --sql-mode inline only: pipe the
                                 generated SQL directly into <engine>:<target> (e.g.
                                 sqlite:mydb.db, postgres:mydb, mysql:mydb,
@@ -52971,20 +52973,130 @@ fn sql_load_hint(
     s
 }
 
+/// One table's own complete staging-mode block: the `-- === name ===`
+/// comment, the raw all-`TEXT` staging table, that table's own per-engine
+/// "Load" hint (naming *its own* `file_name`/`format` - the one piece
+/// `--combine`'s own merged-script rendering genuinely needs distinct per
+/// table, since two different tables in one combined script can come
+/// from two different source files), the real typed table, and the
+/// `CAST`-based `INSERT ... SELECT`. Writes directly to `sink` - nothing
+/// here is ever buffered as a whole-document `String` first, matching
+/// this project's own "stream, don't buffer what doesn't need to be"
+/// discipline (see the Streaming reads section) - each of the small
+/// per-column string joins below is bounded by that one table's own
+/// column count, the same bounded, proportional-to-schema-size cost
+/// every other renderer in this file already accepts, not the
+/// proportional-to-*row*-count cost that discipline actually exists to
+/// eliminate. Always writes its own leading blank-line separator first -
+/// whether this is the very first table right after the shared header
+/// (which itself ends in exactly one, not two, trailing newlines - see
+/// `render_sql_staging`'s own doc comment) or a later one right after
+/// the previous table's own `INSERT` statement - so nothing here ever
+/// needs a post-hoc trailing-newline trim the way the old whole-`String`
+/// version did.
+fn write_staging_table_body(
+    sink: &mut dyn std::io::Write,
+    table_name: &str,
+    profiles: &[ColumnProfile],
+    format: &InputFormat,
+    file_name: &str,
+    delim: char,
+) -> Result<()> {
+    writeln!(sink)?;
+    writeln!(
+        sink,
+        "-- === {} ===\n",
+        table_name.replace(['\n', '\r'], " ")
+    )?;
+
+    if profiles.is_empty() {
+        writeln!(sink, "-- (no columns - nothing to create)")?;
+        return Ok(());
+    }
+
+    let quoted_table = sql_quote_ident(table_name);
+    let staging_table = sql_quote_ident(&format!("{table_name}_staging"));
+
+    // Raw staging table - every column TEXT, so any bulk-text loader
+    // (see the Load comment below) can fill it with no type errors
+    // regardless of what the real values look like.
+    writeln!(sink, "CREATE TABLE {staging_table} (")?;
+    write!(
+        sink,
+        "{}",
+        profiles
+            .iter()
+            .map(|p| format!("    {} TEXT", sql_quote_ident(&p.name)))
+            .collect::<Vec<_>>()
+            .join(",\n")
+    )?;
+    writeln!(sink, "\n);\n")?;
+
+    write!(
+        sink,
+        "{}",
+        sql_load_hint(format, file_name, &staging_table, delim)
+    )?;
+    writeln!(sink)?;
+
+    // The real, typed table.
+    writeln!(sink, "CREATE TABLE {quoted_table} (")?;
+    write!(
+        sink,
+        "{}",
+        profiles
+            .iter()
+            .map(|p| {
+                let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
+                format!(
+                    "    {} {}{nullability}",
+                    sql_quote_ident(&p.name),
+                    sql_column_type(&p.ideal_type)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n")
+    )?;
+    writeln!(sink, "\n);\n")?;
+
+    // The portable part: cast every staged TEXT value into its real
+    // type in one INSERT ... SELECT, using nothing but standard
+    // CAST/CASE/NULLIF/TRIM - see sql_cast_expr's own doc comment.
+    let insert_cols = profiles
+        .iter()
+        .map(|p| sql_quote_ident(&p.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_cols = profiles
+        .iter()
+        .map(|p| sql_cast_expr(&sql_quote_ident(&p.name), &p.ideal_type))
+        .collect::<Vec<_>>()
+        .join(",\n    ");
+    writeln!(
+        sink,
+        "INSERT INTO {quoted_table} ({insert_cols})\nSELECT\n    {select_cols}\nFROM {staging_table};"
+    )?;
+    Ok(())
+}
+
 /// `--sql-mode staging`: a raw all-`TEXT` staging table per source table,
 /// a per-engine load-command comment block, and a `CAST`-based `INSERT
 /// ... SELECT`. This is the original, still-supported shape - unchanged
 /// since it first shipped, and untouched by the newer, now-default
 /// `--sql-mode inline` (`render_sql_inline_flat`) added alongside it -
 /// better suited to a file too large to comfortably embed as literal SQL
-/// (see `render_sql`, the dispatcher between the two modes).
+/// (see `render_sql`, the dispatcher between the two modes). Streams
+/// directly to `sink` rather than building the whole document as a
+/// `String` first (see `write_staging_table_body`'s own doc comment).
 fn render_sql_staging(
     file_name: &str,
     format: &InputFormat,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
-) -> String {
+    sink: &mut dyn std::io::Write,
+) -> Result<()> {
     let clean_file_name = file_name.replace(['\n', '\r'], " ");
-    let mut sql = format!(
+    write!(
+        sink,
         "-- Data dictionary for {clean_file_name} (format: {fmt})\n\
          -- Generated by sniff-rs --output-format sql --sql-mode staging\n\
          --\n\
@@ -53011,9 +53123,9 @@ fn render_sql_staging(
          --    TIMESTAMP/TIME) there silently truncates a real value to\n\
          --    just its leading digits (confirmed directly, not assumed:\n\
          --    CAST('2024-01-15T09:00:00' AS TIMESTAMP) becomes the\n\
-         --    integer 2024) rather than erroring or preserving it.\n\n",
+         --    integer 2024) rather than erroring or preserving it.\n",
         fmt = format.as_str(),
-    );
+    )?;
 
     let delim = if matches!(format, InputFormat::Tsv) {
         '\t'
@@ -53022,74 +53134,60 @@ fn render_sql_staging(
     };
 
     for (table_name, profiles) in tables {
-        sql.push_str(&format!(
-            "-- === {} ===\n\n",
-            table_name.replace(['\n', '\r'], " ")
-        ));
-
-        if profiles.is_empty() {
-            sql.push_str("-- (no columns - nothing to create)\n\n");
-            continue;
-        }
-
-        let quoted_table = sql_quote_ident(table_name);
-        let staging_table = sql_quote_ident(&format!("{table_name}_staging"));
-
-        // Raw staging table - every column TEXT, so any bulk-text loader
-        // (see the Load comment below) can fill it with no type errors
-        // regardless of what the real values look like.
-        sql.push_str(&format!("CREATE TABLE {staging_table} (\n"));
-        sql.push_str(
-            &profiles
-                .iter()
-                .map(|p| format!("    {} TEXT", sql_quote_ident(&p.name)))
-                .collect::<Vec<_>>()
-                .join(",\n"),
-        );
-        sql.push_str("\n);\n\n");
-
-        sql.push_str(&sql_load_hint(format, file_name, &staging_table, delim));
-        sql.push('\n');
-
-        // The real, typed table.
-        sql.push_str(&format!("CREATE TABLE {quoted_table} (\n"));
-        sql.push_str(
-            &profiles
-                .iter()
-                .map(|p| {
-                    let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
-                    format!(
-                        "    {} {}{nullability}",
-                        sql_quote_ident(&p.name),
-                        sql_column_type(&p.ideal_type)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",\n"),
-        );
-        sql.push_str("\n);\n\n");
-
-        // The portable part: cast every staged TEXT value into its real
-        // type in one INSERT ... SELECT, using nothing but standard
-        // CAST/CASE/NULLIF/TRIM - see sql_cast_expr's own doc comment.
-        let insert_cols = profiles
-            .iter()
-            .map(|p| sql_quote_ident(&p.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let select_cols = profiles
-            .iter()
-            .map(|p| sql_cast_expr(&sql_quote_ident(&p.name), &p.ideal_type))
-            .collect::<Vec<_>>()
-            .join(",\n    ");
-        sql.push_str(&format!(
-            "INSERT INTO {quoted_table} ({insert_cols})\nSELECT\n    {select_cols}\nFROM {staging_table};\n\n"
-        ));
+        write_staging_table_body(sink, table_name, profiles, format, file_name, delim)?;
     }
+    Ok(())
+}
 
-    sql.truncate(sql.trim_end_matches('\n').len());
-    sql.push('\n');
-    sql
+/// `--combine`'s own directory-mode staging-mode header (`run_directory_
+/// combined`) - the same shared preamble `render_sql_staging`'s own
+/// header already carries, minus the single `(format: {fmt})` a combined
+/// run genuinely can't give one honest answer for (it can span several
+/// different source formats at once), naming the directory instead of
+/// one file, and pointing at each *table's* own "Load" comment for that
+/// table's real source file rather than implying the whole script has
+/// just one. Ends in exactly one trailing newline, matching `render_sql_
+/// staging`'s own header - `write_staging_table_body` always writes its
+/// own leading blank-line separator first, so the two compose correctly
+/// regardless of which header preceded the first table.
+fn render_sql_staging_combined_header(
+    directory_name: &str,
+    sink: &mut dyn std::io::Write,
+) -> Result<()> {
+    let clean_directory_name = directory_name.replace(['\n', '\r'], " ");
+    write!(
+        sink,
+        "-- Data dictionary for {clean_directory_name} (combined - see each table's own\n\
+         -- \"Load\" comment for its real source file, since a combined script can\n\
+         -- span several different ones)\n\
+         -- Generated by sniff-rs --output-format sql --sql-mode staging --combine\n\
+         --\n\
+         -- Portable across SQLite/DuckDB/PostgreSQL/MySQL except the one\n\
+         -- place that genuinely can't be made so: loading each table's own\n\
+         -- source file's own bytes, which has no ANSI-standard syntax at all -\n\
+         -- see that table's own \"Load\" comment block below for the per-engine\n\
+         -- command. MySQL users also need `SET sql_mode='ANSI_QUOTES';`\n\
+         -- first (or a find/replace of \" for `) - every identifier below is\n\
+         -- double-quoted, the ANSI-standard form SQLite/DuckDB/PostgreSQL\n\
+         -- already accept with no setup at all.\n\
+         --\n\
+         -- Two disclosed scope boundaries, not silently guessed at:\n\
+         -- 1) The CAST expressions below assume already-clean numeric/\n\
+         --    date/time text (bare digits, no currency symbol, thousands\n\
+         --    separator, parenthesized negative, or trailing '%'). If a\n\
+         --    column's own `notes` in this tool's other output formats\n\
+         --    mention stripping any of those, add the equivalent REPLACE()\n\
+         --    calls here before the CAST.\n\
+         -- 2) Date/time columns are inserted from their original text with\n\
+         --    no explicit CAST at all, relying on the destination column's\n\
+         --    own declared type to coerce it - deliberately, because\n\
+         --    SQLite has no native temporal type, and CAST(text AS\n\
+         --    TIMESTAMP/TIME) there silently truncates a real value to\n\
+         --    just its leading digits (confirmed directly, not assumed:\n\
+         --    CAST('2024-01-15T09:00:00' AS TIMESTAMP) becomes the\n\
+         --    integer 2024) rather than erroring or preserving it.\n"
+    )?;
+    Ok(())
 }
 
 /// `--sql-mode inline` (the default): the whole dataset is embedded as
@@ -54681,15 +54779,12 @@ fn render_sql(
             "inline SQL mode isn't available yet for {} - using --sql-mode staging instead",
             format.as_str()
         );
-        sink.write_all(render_sql_staging(file_name, format, tables).as_bytes())?;
+        render_sql_staging(file_name, format, tables, sink)?;
         return Ok(());
     }
 
     match mode {
-        SqlMode::Staging => {
-            sink.write_all(render_sql_staging(file_name, format, tables).as_bytes())?;
-            Ok(())
-        }
+        SqlMode::Staging => render_sql_staging(file_name, format, tables, sink),
         SqlMode::Inline => {
             // Every flat-tier format produces exactly one implicit table
             // (see `dispatch_reader`'s own `std::iter::once((file_stem,
@@ -62773,15 +62868,17 @@ fn combine_default_output_path(
 /// Every table across the whole run gets a combined name via
 /// `CombinedTableNamer` (`<file-qualifier>__<real-table-name>`, always -
 /// see that type's own doc comment for why "always" was chosen over
-/// "only on an actual collision"). `--sql-mode staging` is a disclosed,
-/// not-yet-supported gap for `--combine` specifically: its own per-table
-/// "Load" comment needs to name that table's own distinct source file,
-/// which its whole-script rendering (`render_sql_staging`) has no way to
-/// do once several files' tables are merged into one script the way
-/// `--sql-mode inline`'s own literal `INSERT` statements already
-/// tolerate cleanly (each table's own row-source re-reads its own real
-/// source file directly, with no shared "the whole script has one
-/// source" assumption to begin with).
+/// "only on an actual collision"). `--sql-mode staging` works under
+/// `--combine` too: `write_staging_table_body` already takes that
+/// table's own `file_name`/`format` as plain parameters rather than
+/// assuming one shared value for the whole script, so its own per-table
+/// "Load" comment correctly names *that* table's real source file even
+/// when a combined script spans several different ones - the one piece
+/// that would have broken had this reused the old whole-`String` `render_
+/// sql_staging` unchanged. `--combine --load-into` still forces inline
+/// mode regardless (checked above) - not a staging-mode limitation, the
+/// same "would create the tables with zero rows actually loaded"
+/// reasoning single-file mode's own `--load-into` already applies.
 fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path) -> Result<()> {
     let directory_name = dir
         .file_name()
@@ -62816,13 +62913,11 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
         // since there's only ever one database being loaded into at all.
         Some(LoadTarget::parse(load_into)?)
     } else {
-        if matches!(output_format, OutputFormat::Sql)
-            && matches!(resolved_sql_mode(args)?, SqlMode::Staging)
-        {
-            bail!(
-                "--combine doesn't support --sql-mode staging yet - each table's own \"Load\" comment needs to name its own distinct source file, which staging mode's whole-script shape has no room for once several files' tables are merged into one script; use --sql-mode inline (the default) instead"
-            );
-        }
+        None
+    };
+    let sql_mode = if matches!(output_format, OutputFormat::Sql) {
+        Some(resolved_sql_mode(args)?)
+    } else {
         None
     };
 
@@ -62871,6 +62966,19 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
             };
             sql_sink = Some(sink);
         }
+        // The staging-mode header is written exactly once, up front,
+        // covering the whole combined run - `--combine --load-into`
+        // always forces inline mode (checked above), so `sql_sink` is
+        // guaranteed `Some` whenever staging mode is actually resolved
+        // here; there's no staging-mode child-process case to cover.
+        if matches!(sql_mode, Some(SqlMode::Staging)) {
+            render_sql_staging_combined_header(
+                &directory_name,
+                &mut **sql_sink
+                    .as_mut()
+                    .expect("staging mode never uses --load-into"),
+            )?;
+        }
     }
     let mut is_first_table = true;
 
@@ -62897,16 +63005,51 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
             }
         };
 
-        let qualifier = combine_qualifier_from_path(&relative_display_path(dir, path));
+        let relative_path = relative_display_path(dir, path);
+        let qualifier = combine_qualifier_from_path(&relative_path);
 
         (|| -> Result<()> {
             let (tables, resolved_skip_rows) =
                 dispatch_reader(&read_path, &logical_path, format, args)?;
 
-            if matches!(output_format, OutputFormat::Sql) {
+            if matches!(sql_mode, Some(SqlMode::Staging)) {
+                // Staging mode works for every format unconditionally
+                // (it's the original, format-agnostic shape - unlike
+                // inline mode, there's no per-format row-source that
+                // could be missing), and never uses --load-into (forced
+                // to inline above) - so `sql_sink` is always the
+                // destination here, never `sql_child`. The *relative*
+                // path (not just the bare filename) is what each
+                // table's own "Load" comment names, deliberately - two
+                // different files can easily share the same bare name
+                // (`2024/sales.csv`, `2025/sales.csv`), and the embedded
+                // per-engine load commands need to point at the real,
+                // distinguishable file a combined script's own reader
+                // would actually have to load from disk.
+                let delim = if matches!(format, InputFormat::Tsv) {
+                    '\t'
+                } else {
+                    ','
+                };
+                let sink_ref: &mut dyn std::io::Write =
+                    &mut **sql_sink.as_mut().expect("resolved above for staging mode");
+                for (table_name, profiles) in &tables {
+                    let qualified = namer.resolve(&qualifier, table_name);
+                    total_tables += 1;
+                    total_columns += profiles.len();
+                    write_staging_table_body(
+                        sink_ref,
+                        &qualified,
+                        profiles,
+                        &format,
+                        &relative_path,
+                        delim,
+                    )?;
+                }
+            } else if matches!(output_format, OutputFormat::Sql) {
                 if !inline_supported_format(&format) {
                     bail!(
-                        "--sql-mode inline isn't available yet for {} - --combine's own SQL rendering only supports the inline shape (--sql-mode staging isn't supported at all under --combine yet - see that gap's own disclosed reason above)",
+                        "--sql-mode inline isn't available yet for {} - --combine's own SQL rendering only supports the inline shape for this format",
                         format.as_str()
                     );
                 }
@@ -69911,7 +70054,9 @@ mod tests {
         let mut tables = BTreeMap::new();
         tables.insert("people".to_string(), profiles);
 
-        let sql = render_sql_staging("people.csv", &InputFormat::Csv, &tables);
+        let mut buf: Vec<u8> = Vec::new();
+        render_sql_staging("people.csv", &InputFormat::Csv, &tables, &mut buf).unwrap();
+        let sql = String::from_utf8(buf).unwrap();
 
         assert!(sql.contains("CREATE TABLE \"people_staging\""));
         assert!(sql.contains("CREATE TABLE \"people\""));
