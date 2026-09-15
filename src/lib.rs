@@ -47410,6 +47410,91 @@ mod mbox_support {
         }
         Ok(profiler.finish())
     }
+
+    /// The MBOX row-source for `render_sql_inline_flat` (Phase 26, the
+    /// fifteenth and FINAL format in the recursively-nested, JSON-bridge
+    /// tier). A mechanical mirror of `columns_from_mbox`'s own envelope-
+    /// boundary scanning loop just above: each completed message's
+    /// `MessageBuilder::finish` output - the identical `envelope_sender`/
+    /// `envelope_date`/one-field-per-header (a repeated header like
+    /// `Received:` pooled into a `JsonValue::Array` the exact same way
+    /// vCard/iCalendar's own `vobject_support::insert_pooling` pools a
+    /// repeated property, just via this reader's own independent
+    /// `Map::get_mut`-based pooling instead)/`body` map the profiling
+    /// reader already builds - is byte-for-byte the same `JsonValue::
+    /// Object` shape `json_emit_row_for_sql`/`json_inline_blocking_
+    /// column` already handle, `body` included: it's just one more plain
+    /// scalar string field in the map, with nothing that needs special-
+    /// casing relative to any other header. This is the eleventh format
+    /// in a row (counting vCard/iCalendar) to need zero changes to any
+    /// of the three shared JSON-bridge functions, and the final format
+    /// in this entire "extend --sql-mode inline to every format"
+    /// campaign - always records mode (MBOX has no top-level-scalar/
+    /// top-level-array shape). `sink.done` reproduces `columns_from_
+    /// mbox`'s own real-I/O-bounding early stop exactly, breaking out of
+    /// the line loop the instant enough messages have been kept rather
+    /// than continuing to scan (and discard) the rest of a real,
+    /// potentially gigabyte-sized mail export.
+    pub(crate) fn stream_mbox_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+
+        let mut current: Option<MessageBuilder> = None;
+        let mut prev_blank = true;
+        let mut any_message = false;
+
+        for line in reader.lines() {
+            if sink.done {
+                break;
+            }
+            let line = line.with_context(|| format!("I/O error while reading {path:?}"))?;
+            let line = line.strip_suffix('\r').unwrap_or(&line).to_string();
+            if prev_blank && line.starts_with("From ") {
+                if let Some(builder) = current.take() {
+                    json_emit_row_for_sql(
+                        &JsonValue::from(builder.finish()),
+                        columns,
+                        records_mode,
+                        sink,
+                    )?;
+                    if sink.done {
+                        any_message = true;
+                        break;
+                    }
+                }
+                any_message = true;
+                current = Some(MessageBuilder::new(&line));
+                prev_blank = false;
+                continue;
+            }
+            prev_blank = line.is_empty();
+            if let Some(builder) = current.as_mut() {
+                builder
+                    .add_line(&line)
+                    .with_context(|| format!("{path:?}: malformed message"))?;
+            }
+        }
+        if let Some(builder) = current.take() {
+            json_emit_row_for_sql(
+                &JsonValue::from(builder.finish()),
+                columns,
+                records_mode,
+                sink,
+            )?;
+        }
+
+        if !any_message {
+            bail!(
+                "{path:?} doesn't look like an mbox file - expected the first message to start with a 'From ' envelope line (RFC 4155)"
+            );
+        }
+        Ok(())
+    }
 } // mod mbox_support
 
 #[cfg(feature = "mbox")]
@@ -53170,6 +53255,7 @@ fn render_sql_inline_flat(
             | InputFormat::GeoJson
             | InputFormat::Vcard
             | InputFormat::Ical
+            | InputFormat::Mbox
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -53416,6 +53502,7 @@ fn render_sql_inline_flat(
         InputFormat::GeoJson => render_sql_inline_flat_geojson(read_path, profiles, &mut sink)?,
         InputFormat::Vcard => render_sql_inline_flat_vcard(read_path, profiles, &mut sink)?,
         InputFormat::Ical => render_sql_inline_flat_icalendar(read_path, profiles, &mut sink)?,
+        InputFormat::Mbox => render_sql_inline_flat_mbox(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -54080,6 +54167,32 @@ fn render_sql_inline_flat_icalendar(
     )
 }
 
+/// The MBOX row-source wrapper for `render_sql_inline_flat` (Phase 26,
+/// the FINAL format in this entire campaign) - see
+/// `render_sql_inline_flat_vcard`'s own doc comment; identical shape,
+/// just driven by `mbox_support::stream_mbox_rows_for_sql`'s own
+/// envelope-boundary decode loop instead.
+#[cfg(feature = "mbox")]
+fn render_sql_inline_flat_mbox(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    mbox_support::stream_mbox_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "mbox"))]
+fn render_sql_inline_flat_mbox(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "MBOX support isn't compiled in - rebuild with `cargo build --release --features mbox` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -54229,12 +54342,13 @@ fn render_sql(
             | InputFormat::GeoJson
             | InputFormat::Vcard
             | InputFormat::Ical
+            | InputFormat::Mbox
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -61512,10 +61626,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::GeoJson
                 | InputFormat::Vcard
                 | InputFormat::Ical
+                | InputFormat::Mbox
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox are supported so far",
             format.as_str()
         );
     }

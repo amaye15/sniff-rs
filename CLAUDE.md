@@ -323,8 +323,10 @@ SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
 Avro, XML, BSON, Property List (plist), JSON5/JSONC, HAR, GeoJSON,
-vCard, and iCalendar, the first fourteen formats in the recursively-
-nested, JSON-bridge tier.
+vCard, iCalendar, and MBOX - the entire recursively-nested, JSON-bridge
+tier, and with it every format in this campaign's own three-tier scope
+(Parquet and Arrow IPC/Feather are the two explicitly out-of-scope
+formats, disclosed below rather than silently omitted).
 Every other format transparently falls back to `staging` with a
 disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
@@ -370,8 +372,8 @@ needs its own real design, not just repeating the same pattern:
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
    MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, HAR, GeoJSON,
-   vCard, and iCalendar done as of Phases 13-25.** Unlike the two tiers
-   above, there
+   vCard, iCalendar, and MBOX done as of Phases 13-26 - the final tier
+   in this campaign.** Unlike the two tiers above, there
    was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
@@ -452,7 +454,14 @@ needs its own real design, not just repeating the same pattern:
    its own component-stack-scoped row-source (a property only folds into
    the innermost open `VEVENT`/`VTODO`, never a nested `VALARM`/
    `VTIMEZONE`) rather than any change to the shared extractor itself.
-   MBOX remains unstarted.
+   MBOX carried all three shared functions over unchanged too (the
+   eleventh format in a row, and the last one in this tier) - its own
+   independent, non-`vobject_support` repeated-header pooling still
+   produces the identical `JsonValue::Object`-with-array-values shape,
+   and the message body turned out to be nothing more than one more
+   plain scalar field in that same map, needing no special-casing at
+   all. With MBOX, this entire tier - and this entire campaign - is
+   done.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -2069,18 +2078,80 @@ unsupported format" example moved to MBOX instead, gated behind
 `--features mbox` - the same one-hop-forward shuffle repeats itself
 again, landing this time on the last format in this entire tier.
 
-Remaining in the recursively-nested, JSON-bridge tier: MBOX - the final
-format in this tier, and in the entire "extend --sql-mode inline to
-every format" campaign. MBOX shares `vobject_support`'s own sibling
-repeated-header pooling story (a repeated `Received:` header pools into
-an array the same way a repeated vCard/iCalendar property does, per this
-project's own Architecture section), so the vCard/iCalendar precedent
-suggests it will likely need zero shared-function changes too - but its
-own message-body-as-a-column question (MBOX has no vCard/iCalendar
-equivalent to a property list at all; the body is a separate, distinct
-piece of a message's own record) is a genuine structural difference
-neither prior format needed to resolve, so it still gets its own fresh
-design pass rather than being assumed identical.
+**Phase 26: MBOX - the fifteenth and FINAL format in the recursively-
+nested, JSON-bridge tier, completing this entire "extend --sql-mode
+inline to every format" campaign.** MBOX's own profiling reader
+(`columns_from_mbox`) doesn't bridge through `vobject_support` at all -
+it's an independent, hand-rolled RFC 822 parser (`MessageBuilder`) - but
+its own repeated-header pooling (a repeated `Received:` line pools into
+a `JsonValue::Array` via `Map::get_mut`, matching this project's INI
+reader's own repeated-key convention rather than reusing
+`vobject_support::insert_pooling` directly) still produces exactly the
+same `JsonValue::Object`-with-array-values shape every prior format's
+own pooling mechanism already does, so `json_extract_value_for_sql`/
+`json_inline_blocking_column`/`json_bridge_columns_and_mode` all carry
+over completely unchanged - the eleventh format in a row (counting
+vCard/iCalendar) to need zero changes to the shared functions. The one
+genuinely new design question this format raised - how the message body
+becomes a column, since MBOX has no vCard/iCalendar equivalent to "just
+another pooled property" - resolved to the simplest possible answer once
+`MessageBuilder::finish` was actually read: the body is already just one
+more plain scalar string field (`"body"`) in the same map every header
+lands in, with nothing structurally different about it at all -
+`json_emit_row_for_sql` needed no special-casing whatsoever.
+`mbox_support::stream_mbox_rows_for_sql` is a mechanical mirror of
+`columns_from_mbox`'s own envelope-boundary (`"From "` after a blank
+line, per RFC 4155) scanning loop, folding each completed
+`MessageBuilder::finish()` map into `json_emit_row_for_sql`. Always
+records mode (MBOX has no top-level-scalar/top-level-array shape).
+`sink.done` reproduces `columns_from_mbox`'s own real-I/O-bounding early
+stop exactly, including discarding a message that was only just started
+when the cutoff fires, matching the profiling reader's identical
+behavior at that boundary.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.mbox --output-format sql --load-into sqlite:...` loaded
+all three of its real messages correctly, `body` included as a plain
+text column; `edge_mbox_repeated_and_folded_headers.mbox` (a real,
+already-committed fixture with a genuinely repeated, RFC-fold-continued
+`Received:` header) confirmed the pooled header renders as real
+JSON-array text, matching every other format's own pooled-array
+convention in this tier exactly - checked directly against the loaded
+database, not just the generated text; `edge_mbox_crlf_line_endings.mbox`
+confirmed genuine CRLF line endings decode identically to the LF-only
+fixtures; `--nrows 2` confirmed to bound the kept message count via the
+real-I/O-bounding path, discarding the third message entirely rather
+than reading and decoding it first. Also verified as behavior-preserving
+for every already-shipped format: `diff` confirmed byte-identical inline
+SQL output against the pre-Phase-26 binary across the entire fixture
+corpus (MBOX itself excluded, since this phase is exactly what changes
+its own output). Clean across default/`mbox`/`full`, matching each
+one's own established baseline exactly.
+
+Phase 25's own three tests that used MBOX as their "still genuinely
+unsupported format" example moved to Parquet instead, gated behind
+`--features parquet` - the last hop of this particular shuffle, since
+every format in this campaign's own three-tier scope is now inline-
+supported. Parquet (and its Arrow IPC/Feather sibling) bridge their own
+nested Struct/List/Map columns through a genuinely different mechanism
+(Arrow's own JSON writer producing a `serde_json::Map` shape - see the
+Architecture section's own Parquet/Arrow IPC entry) than any of the
+three tiers this campaign covers, and were never named in any of the
+three tiers' own format inventories from the start - extending inline
+mode to them would be its own separately-scoped design effort (a fresh
+row-source built on top of Arrow's `RecordBatch` type rather than
+`json_support::Value`), not a natural fourth phase of this tier.
+
+**With Phase 26, the entire recursively-nested, JSON-bridge tier is
+done**: JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
+JSON5/JSONC, HAR, GeoJSON, vCard, iCalendar, and MBOX all support
+`--sql-mode inline` - **and with it, the entire "extend --sql-mode
+inline to every format" campaign is complete**: every format across all
+three tiers (the flat, fixed-column tier from Phase 1; the multi-table
+tier from Phase 9; and this recursively-nested tier from Phase 13) now
+supports inline mode, with Parquet and Arrow IPC/Feather remaining as
+the two explicitly out-of-scope formats this campaign's own three tiers
+never claimed to cover, disclosed rather than silently omitted.
 
 ## Directory-input batch mode
 

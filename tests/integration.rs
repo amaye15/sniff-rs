@@ -550,25 +550,30 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 }
 
 #[test]
-#[cfg(feature = "mbox")]
+#[cfg(feature = "parquet")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
-    // JSON5, HAR, GeoJSON, vCard, and iCalendar are now inline-supported
-    // (Phases 13-25), so MBOX is used here instead as a format that
-    // still genuinely isn't. Falls back to staging mode automatically
+    // Phase 26 (MBOX) completed the entire recursively-nested,
+    // JSON-bridge tier, so every format in this campaign's own three-
+    // tier scope now supports inline mode. Parquet (and its Arrow IPC/
+    // Feather sibling) bridge their own nested Struct/List/Map columns
+    // through a genuinely different mechanism (Arrow's own JSON writer,
+    // not `json_support::Value` - see the Architecture section) and were
+    // never part of any of the three tiers this campaign covers, so
+    // Parquet is used here instead as a format that still genuinely
+    // isn't inline-supported. Falls back to staging mode automatically
     // (with a disclosed stderr note, checked separately below) rather
     // than erroring or silently producing something different.
-    let sql = run_sql("sample.mbox", &[]);
+    let sql = run_sql("sample.parquet", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "mbox")]
+#[cfg(feature = "parquet")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.mbox").to_str().unwrap(),
+            fixture("sample.parquet").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -577,12 +582,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for mbox"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for parquet"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "mbox")]
+#[cfg(feature = "parquet")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -590,7 +595,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.mbox").to_str().unwrap(),
+            fixture("sample.parquet").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -601,7 +606,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for mbox"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for parquet"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -702,19 +707,21 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "mbox")]
+#[cfg(feature = "parquet")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
-    // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
-    // JSON5, HAR, GeoJSON, vCard, and iCalendar are now inline-supported
-    // (Phases 13-25), so MBOX stands in as a format that still genuinely
+    // Every format in this campaign's own three-tier scope (through
+    // MBOX, Phase 26) is now inline-supported - Parquet (and its Arrow
+    // IPC/Feather sibling) bridge nested columns through a genuinely
+    // different mechanism than any of the three tiers this campaign
+    // covers, so Parquet stands in as a format that still genuinely
     // isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.mbox").to_str().unwrap(),
+            fixture("sample.parquet").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -724,7 +731,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for mbox"));
+    assert!(stderr.contains("--load-into isn't available yet for parquet"));
 }
 
 #[test]
@@ -2547,6 +2554,58 @@ fn load_into_accepts_icalendar() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for icalendar"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "mbox")]
+fn sql_output_inline_mode_supports_mbox_repeated_header_pooling_and_body() {
+    // Phase 26 of the "any format" rollout, and the FINAL format in the
+    // recursively-nested, JSON-bridge tier - the eleventh format in a
+    // row (counting vCard/iCalendar) to need zero changes to the three
+    // shared JSON-bridge functions, since MessageBuilder::finish already
+    // pools a repeated header (Received:) into a JsonValue::Array the
+    // same way vCard/iCalendar's own vobject_support::insert_pooling
+    // does, and the message body is just one more plain scalar field in
+    // the same map.
+    let sql = run_sql("sample.mbox", &[]);
+    assert!(sql.contains("\"envelope_sender\""));
+    assert!(sql.contains("\"body\""));
+    assert!(sql.contains("'This is message one.'"));
+    assert!(sql.contains("'This is message three, the last one.'"));
+
+    let pooled = run_sql("edge_mbox_repeated_and_folded_headers.mbox", &[]);
+    assert!(pooled.contains("\"Received\""));
+    assert!(pooled.contains(
+        "'[\"from mx1.example.com by mx2.example.com; Mon, 15 Jan 2024 12:00:00 +0000\",\"from client.example.com by mx1.example.com; Mon, 15 Jan 2024 11:59:00 +0000\"]'"
+    ));
+}
+
+#[test]
+#[cfg(feature = "mbox")]
+fn sql_output_inline_mode_mbox_respects_nrows() {
+    let sql = run_sql("sample.mbox", &["--nrows", "2"]);
+    assert!(sql.contains("'This is message one.'"));
+    assert!(sql.contains("'This is message two.'"));
+    assert!(!sql.contains("'This is message three, the last one.'"));
+}
+
+#[test]
+#[cfg(feature = "mbox")]
+fn load_into_accepts_mbox() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.mbox").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for mbox"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
