@@ -3145,6 +3145,35 @@ identical output confirmed via `diff` against the pre-fix binary across
 every committed `diff_*.json` fixture pair. Clean across default/`full`,
 matching each build's own established clippy baseline exactly.
 
+**A final round in the same audit swept the remaining plausible
+candidate - `--combine --load-into` (streaming SQL for a whole
+directory's worth of tables straight into a real, spawned engine's own
+stdin) - and found it already clean, not a fix.** Verified manually
+against a real, installed SQLite build (matching this project's own
+standing rule that no *automated* test spawns a real database engine
+CLI): 1,000 real CSV files (3.9 MB total, 100 rows each) combined and
+loaded in one run peaked at 14.9 MB maxRSS / 4.5 MB peak footprint;
+pushed to 5,000 files (20 MB total, 250,000 rows) peaked at 19.2 MB
+maxRSS / 11.5 MB peak footprint - essentially flat as file count grew
+5x, confirming the streaming design CLAUDE.md's own `--combine` writeup
+already describes ("SQL output streams straight to its real destination
+as each file's own tables are read") holds up at real scale, not just on
+paper. Both runs independently verified correct, not just fast: querying
+a real table back out of each resulting database (`file_500__file_500`,
+`file_2500__file_2500`) confirmed the exact row count and real values
+from the source CSV, and `sqlite_master` confirmed every one of the
+1,000/5,000 source files landed as its own real, distinctly-qualified
+table.
+
+With `load_dictionary_tables`'s double-buffering fixed, the rename-
+candidate cartesian product fixed, and `--combine`/`--combine --load-
+into`/directory-mode index rendering/`CombinedTableNamer` all swept and
+confirmed clean at real scale, this pass's own memory/performance/
+streaming audit of `sniff-rs diff` and its surrounding `--combine`
+machinery is complete - every code path this feature touches has now
+been measured against a real or realistic large input at least once, not
+just left un-profiled the way it was at the start of this audit.
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:
