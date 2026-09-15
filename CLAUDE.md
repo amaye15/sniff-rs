@@ -3269,6 +3269,66 @@ same standing precedent `--load-into`'s own real-subprocess behavior
 already follows. Clean across default/`full`, matching each build's own
 established clippy baseline exactly.
 
+**Table-level rename detection, one level up from the existing column-
+level heuristic - the natural next extension once multi-table diffing
+was already exercised at real scale.** Before this, a whole table
+renamed across two snapshots (`orders` -> `purchases`, a real shape a
+`--combine` run's own file-driven table naming makes easy to hit) showed
+up as an unrelated "table removed" + "table added" pair with no signal
+connecting them, even when the two tables were otherwise identical.
+`diff_dictionaries`'s own multi-table branch now runs the same greedy,
+inverted-index-based candidate matching the column-level rename fix
+already established (see this document's own writeup of that
+optimization), just keyed on **column-name overlap** instead of sample-
+value overlap - two tables have no shared "sample values" of their own,
+but their column *names* are exactly the signal a genuine rename
+preserves. `table_column_name_overlap` mirrors `sample_value_overlap`'s
+own Jaccard-similarity shape one level up; `TABLE_RENAME_SIMILARITY_
+THRESHOLD` (`0.5`) is deliberately more lenient than the column-level
+`0.6`, since a real table rename can plausibly happen alongside a few
+ordinary column adds/removes at the same time, where a column rename's
+own single sample-value-overlap signal has no equivalent slack built in.
+
+A `DiffChange::TableRenamed { from, to, similarity }` entry is always
+`Safe` and always a suggestion - the identical "surfaced, never silently
+merged" rule this whole feature already applies to column renames, per
+this section's own header comment. Once two tables are matched as a
+rename, their **columns are still diffed against each other** under the
+new `"orders -> purchases"` label (reusing `diff_table_columns`
+unchanged) - a renamed table can genuinely have real column-level drift
+of its own, and reporting only the rename while staying silent about
+everything else that changed inside it would be a real, if quieter, gap.
+`sql_table` is `None` for both the rename entry and its own nested
+column-diff entries, matching the existing single-table cross-name
+precedent - there's no single "real" live table name to write a column-
+level `ALTER TABLE` against once the two sides disagree on what to call
+it. The rename suggestion itself needs no such ambiguity, though: unlike
+a column-level op, `ALTER TABLE "from" RENAME TO "to";` is fully
+specified by the rename itself, so `render_diff_resolution_sql` emits it
+as a commented-out suggestion (never a live statement) even though the
+entry's own `sql_table` is `None` - verified directly against a real,
+installed SQLite build: the commented line was correctly skipped as a
+comment, and a real `ADD COLUMN` change elsewhere in the same script
+still applied normally in the same run.
+
+Verified with two new unit tests (a genuine rename detected via full
+column-name overlap even when the table itself gains no other changes,
+and a weak-overlap pair - sharing only one column out of four each -
+correctly staying a plain remove/add rather than a forced-looking
+rename) plus the two existing multi-table tests (one committed-fixture-
+based, one built from hand-written `.ini` files) updated: the fixture
+pair's own `orders`/`payments` tables turned out to already share
+identical columns, so that test now asserts the *correct*, improved
+rename-detected behavior instead of the old drop+add pair it happened to
+exercise by coincidence; the `.ini`-built test's own `orders`/`payments`
+sections were given genuinely disjoint columns so it keeps testing plain
+add/remove, with the rename case now covered by its own dedicated test
+instead. Every other existing diff test (the single-table path, every
+malformed-input fixture) confirmed unaffected via a byte-identical
+`--output-format json` `diff` against the pre-change binary. Clean
+across default/`full`, matching each build's own established clippy
+baseline exactly.
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:

@@ -63717,6 +63717,16 @@ impl Compatibility {
 enum DiffChange {
     TableAdded,
     TableRemoved,
+    /// Always a *suggestion*, mirroring `ColumnRenamed`'s own rule one
+    /// level up: a removed table and an added table sharing a strong
+    /// column-name overlap are never silently merged into one "the
+    /// table was renamed" fact, only ever surfaced alongside their
+    /// similarity score for a human to confirm.
+    TableRenamed {
+        from: String,
+        to: String,
+        similarity: f64,
+    },
     ColumnAdded {
         ideal_type: String,
         missing_pct: f64,
@@ -63750,6 +63760,7 @@ fn diff_change_label(change: &DiffChange) -> &'static str {
     match change {
         DiffChange::TableAdded => "table added",
         DiffChange::TableRemoved => "table removed",
+        DiffChange::TableRenamed { .. } => "possible table rename",
         DiffChange::ColumnAdded { .. } => "column added",
         DiffChange::ColumnRemoved { .. } => "column removed",
         DiffChange::ColumnRenamed { .. } => "possible rename",
@@ -63799,6 +63810,14 @@ impl DiffReport {
 /// mirroring Confluent Avro's own "a new field must carry a default to
 /// be backward-compatible" rule and Delta Lake's additive-only merge.
 const RENAME_SIMILARITY_THRESHOLD: f64 = 0.6;
+/// The table-level analogue of `RENAME_SIMILARITY_THRESHOLD` - deliberately
+/// a bit more lenient than the column-level bar, since a genuinely
+/// renamed table can plausibly also gain/lose a handful of columns at
+/// the same time (the rename and an ordinary schema change happening
+/// together), where a column rename's own similarity is checked against
+/// a much narrower, single-value signal (sample-value overlap) that
+/// doesn't have an equivalent "some columns also changed" slack built in.
+const TABLE_RENAME_SIMILARITY_THRESHOLD: f64 = 0.5;
 /// A missing-% shift smaller than this (in percentage points, and not
 /// crossing the 0.0 boundary either direction) is real but not worth its
 /// own flagged entry - see `classify_missing_pct_change`.
@@ -63814,6 +63833,25 @@ fn sample_value_overlap(a: &[String], b: &[String]) -> Option<f64> {
     }
     let sa: HashSet<&str> = a.iter().map(String::as_str).collect();
     let sb: HashSet<&str> = b.iter().map(String::as_str).collect();
+    let intersection = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        return None;
+    }
+    Some(intersection as f64 / union as f64)
+}
+
+/// Jaccard similarity between two tables' own column-*name* sets - the
+/// table-level signal `diff_dictionaries` uses to suggest a table
+/// rename, mirroring `sample_value_overlap`'s exact shape one level up
+/// (a column's sample values there, a table's column names here). `None`
+/// if either table has no columns at all to compare.
+fn table_column_name_overlap(a: &[DiffColumn], b: &[DiffColumn]) -> Option<f64> {
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let sa: HashSet<&str> = a.iter().map(|c| c.name.as_str()).collect();
+    let sb: HashSet<&str> = b.iter().map(|c| c.name.as_str()).collect();
     let intersection = sa.intersection(&sb).count();
     let union = sa.union(&sb).count();
     if union == 0 {
@@ -64132,30 +64170,103 @@ fn diff_dictionaries(
 
     let mut entries = Vec::new();
 
-    for table in old.keys() {
-        if !new.contains_key(table) {
-            entries.push(DiffEntry {
-                table: table.clone(),
-                sql_table: None,
-                column: None,
-                change: DiffChange::TableRemoved,
-                compatibility: Compatibility::Breaking,
-                reason: "table is no longer present in the new schema".to_string(),
-            });
+    let mut removed_tables: Vec<&String> = old.keys().filter(|t| !new.contains_key(*t)).collect();
+    let mut added_tables: Vec<&String> = new.keys().filter(|t| !old.contains_key(*t)).collect();
+
+    // Table-rename candidate detection, one level up from
+    // `diff_table_columns`'s own column-rename logic and using the same
+    // greedy-by-descending-similarity matching: two tables are never the
+    // same table just because their names differ, but a removed table
+    // and an added table sharing a strong column-*name* overlap are a
+    // real, worth-surfacing signal - always a suggestion, never silently
+    // merged into a bare "table removed" + "table added" pair without
+    // saying so. Built via the same inverted-index technique the column-
+    // rename fix already established (a genuine complexity-class
+    // consideration here too - a directory with hundreds of tables added
+    // and removed at once is a real `--combine` shape, not hypothetical).
+    let mut added_by_colname: HashMap<&str, Vec<&String>, FxBuildHasher> = HashMap::default();
+    for &a in &added_tables {
+        for col in &new[a] {
+            added_by_colname
+                .entry(col.name.as_str())
+                .or_default()
+                .push(a);
         }
     }
-    for table in new.keys() {
-        if !old.contains_key(table) {
-            entries.push(DiffEntry {
-                table: table.clone(),
-                sql_table: None,
-                column: None,
-                change: DiffChange::TableAdded,
-                compatibility: Compatibility::Safe,
-                reason: "a new table doesn't affect an existing consumer reading the old schema"
-                    .to_string(),
-            });
+    let mut table_candidates: Vec<(f64, &String, &String)> = Vec::new();
+    for &r in &removed_tables {
+        let old_cols = &old[r];
+        let mut already_checked: HashSet<&String> = HashSet::new();
+        for col in old_cols {
+            let Some(candidate_tables) = added_by_colname.get(col.name.as_str()) else {
+                continue;
+            };
+            for &a in candidate_tables {
+                if !already_checked.insert(a) {
+                    continue;
+                }
+                if let Some(sim) = table_column_name_overlap(old_cols, &new[a])
+                    && sim >= TABLE_RENAME_SIMILARITY_THRESHOLD
+                {
+                    table_candidates.push((sim, r, a));
+                }
+            }
         }
+    }
+    table_candidates.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut matched_removed_tables: HashSet<&String> = HashSet::new();
+    let mut matched_added_tables: HashSet<&String> = HashSet::new();
+    for (sim, r, a) in table_candidates {
+        if matched_removed_tables.contains(r) || matched_added_tables.contains(a) {
+            continue;
+        }
+        matched_removed_tables.insert(r);
+        matched_added_tables.insert(a);
+        let label = format!("{r} -> {a}");
+        entries.push(DiffEntry {
+            table: label.clone(),
+            sql_table: None, // ambiguous which of the two names, if either, the live table is called
+            column: None,
+            change: DiffChange::TableRenamed {
+                from: r.clone(),
+                to: a.clone(),
+                similarity: sim,
+            },
+            compatibility: Compatibility::Safe,
+            reason: format!(
+                "possible table rename: {:.0}% column-name overlap - this is a suggestion, never applied automatically; review before treating it as a real rename",
+                sim * 100.0
+            ),
+        });
+        // A renamed table can still have real column-level drift of its
+        // own - surface that too, under the same "old -> new" label,
+        // rather than only reporting the rename and staying silent about
+        // everything else that changed inside it.
+        entries.extend(diff_table_columns(&label, None, &old[r], &new[a]));
+    }
+    removed_tables.retain(|t| !matched_removed_tables.contains(t));
+    added_tables.retain(|t| !matched_added_tables.contains(t));
+
+    for table in removed_tables {
+        entries.push(DiffEntry {
+            table: table.clone(),
+            sql_table: None,
+            column: None,
+            change: DiffChange::TableRemoved,
+            compatibility: Compatibility::Breaking,
+            reason: "table is no longer present in the new schema".to_string(),
+        });
+    }
+    for table in added_tables {
+        entries.push(DiffEntry {
+            table: table.clone(),
+            sql_table: None,
+            column: None,
+            change: DiffChange::TableAdded,
+            compatibility: Compatibility::Safe,
+            reason: "a new table doesn't affect an existing consumer reading the old schema"
+                .to_string(),
+        });
     }
     for (table, old_cols) in old {
         if let Some(new_cols) = new.get(table) {
@@ -64222,6 +64333,15 @@ fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -
 fn diff_change_extra_json(change: &DiffChange) -> Vec<(&'static str, JsonValue)> {
     match change {
         DiffChange::TableAdded | DiffChange::TableRemoved => Vec::new(),
+        DiffChange::TableRenamed {
+            from,
+            to,
+            similarity,
+        } => vec![
+            ("from", JsonValue::from(from.clone())),
+            ("to", JsonValue::from(to.clone())),
+            ("similarity", JsonValue::from(*similarity)),
+        ],
         DiffChange::ColumnAdded {
             ideal_type,
             missing_pct,
@@ -64340,14 +64460,37 @@ fn render_diff_resolution_sql(report: &DiffReport) -> String {
     let mut wrote_any = false;
     let mut ambiguous_table_noted = false;
     for e in &report.entries {
-        // A table-level change (a whole table added/removed) never gets
-        // a live statement here regardless of compatibility - creating
-        // or dropping a table is exactly the kind of destructive/
-        // structural action this feature never guesses at (see this
-        // section's own header comment); and an entry whose old/new
-        // table names disagree (`sql_table: None` - see `DiffEntry`'s
-        // own doc comment) has no honest table name to write real SQL
-        // against at all.
+        // A table rename needs no `sql_table` at all - unlike a column-
+        // level op, which needs to know which of two disagreeing names
+        // the *live* table is really called, a `RENAME TABLE from TO to`
+        // statement is fully specified by the rename itself. Handled
+        // before the `sql_table` check below, which only applies to
+        // column-level entries.
+        if let DiffChange::TableRenamed {
+            from,
+            to,
+            similarity,
+        } = &e.change
+        {
+            sql.push_str(&format!(
+                "-- Possible table rename (NOT applied - review first, {:.0}% column-name overlap):\n",
+                similarity * 100.0
+            ));
+            sql.push_str(&format!(
+                "-- ALTER TABLE {} RENAME TO {};\n",
+                sql_quote_ident(from),
+                sql_quote_ident(to),
+            ));
+            wrote_any = true;
+            continue;
+        }
+        // A table-level add/remove never gets a live statement here
+        // regardless of compatibility - creating or dropping a table is
+        // exactly the kind of destructive/structural action this
+        // feature never guesses at (see this section's own header
+        // comment); and an entry whose old/new table names disagree
+        // (`sql_table: None` - see `DiffEntry`'s own doc comment) has no
+        // honest table name to write real SQL against at all.
         let Some(sql_table) = e.sql_table.as_deref() else {
             let would_generate_sql = matches!(
                 (&e.change, e.compatibility),
@@ -64726,12 +64869,22 @@ mod diff_tests {
 
     #[test]
     fn diff_dictionaries_matches_multi_table_dictionaries_by_name() {
+        // "orders"/"payments" deliberately share no column names at all
+        // (unlike a genuine rename, which the dedicated test below covers)
+        // so this test stays a clean check of plain by-name matching for
+        // "users" plus genuine add/remove for two unrelated tables.
         let mut old = BTreeMap::new();
         old.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
-        old.insert("orders".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        old.insert(
+            "orders".to_string(),
+            vec![col("order_ref", "String", 0.0, &["A1"])],
+        );
         let mut new = BTreeMap::new();
         new.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
-        new.insert("payments".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        new.insert(
+            "payments".to_string(),
+            vec![col("payment_ref", "String", 0.0, &["P1"])],
+        );
         let report = diff_dictionaries(&old, &new);
         assert!(
             report
@@ -64744,6 +64897,103 @@ mod diff_tests {
                 .entries
                 .iter()
                 .any(|e| e.table == "payments" && matches!(e.change, DiffChange::TableAdded))
+        );
+    }
+
+    #[test]
+    fn diff_dictionaries_detects_a_table_rename_by_column_name_overlap() {
+        let mut old = BTreeMap::new();
+        old.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        old.insert(
+            "orders".to_string(),
+            vec![
+                col("id", "i64", 0.0, &["1"]),
+                col("amount", "f64", 0.0, &["9.99"]),
+            ],
+        );
+        let mut new = BTreeMap::new();
+        new.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        // "purchases" shares every column name with "orders" - a strong
+        // rename signal even though the table itself was also renamed.
+        new.insert(
+            "purchases".to_string(),
+            vec![
+                col("id", "i64", 0.0, &["1"]),
+                col("amount", "f64", 0.0, &["9.99"]),
+            ],
+        );
+        let report = diff_dictionaries(&old, &new);
+        let rename = report
+            .entries
+            .iter()
+            .find(|e| matches!(e.change, DiffChange::TableRenamed { .. }))
+            .expect("expected a table rename to be detected");
+        let DiffChange::TableRenamed { from, to, .. } = &rename.change else {
+            unreachable!()
+        };
+        assert_eq!(from, "orders");
+        assert_eq!(to, "purchases");
+        assert_eq!(rename.compatibility, Compatibility::Safe);
+        assert_eq!(rename.sql_table, None);
+        // The old/removed and new/added tables must not *also* show up
+        // as a plain add/remove once they've been matched as a rename.
+        assert!(
+            !report
+                .entries
+                .iter()
+                .any(|e| matches!(e.change, DiffChange::TableRemoved | DiffChange::TableAdded))
+        );
+    }
+
+    #[test]
+    fn diff_dictionaries_does_not_suggest_a_table_rename_with_weak_column_overlap() {
+        // A shared, unrelated "users" table on both sides keeps this
+        // fixture genuinely multi-table (the single-table special case
+        // above would otherwise trigger, since it always compares the
+        // one table directly regardless of name - not what this test
+        // means to exercise).
+        let mut old = BTreeMap::new();
+        old.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        old.insert(
+            "orders".to_string(),
+            vec![
+                col("id", "i64", 0.0, &["1"]),
+                col("amount", "f64", 0.0, &["9.99"]),
+                col("customer", "String", 0.0, &["alice"]),
+                col("shipped_at", "String", 0.0, &["2024-01-01"]),
+            ],
+        );
+        let mut new = BTreeMap::new();
+        new.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        // Only "id" overlaps out of four real columns on each side -
+        // well below TABLE_RENAME_SIMILARITY_THRESHOLD.
+        new.insert(
+            "logs".to_string(),
+            vec![
+                col("id", "i64", 0.0, &["1"]),
+                col("message", "String", 0.0, &["hello"]),
+                col("level", "String", 0.0, &["info"]),
+                col("host", "String", 0.0, &["server1"]),
+            ],
+        );
+        let report = diff_dictionaries(&old, &new);
+        assert!(
+            !report
+                .entries
+                .iter()
+                .any(|e| matches!(e.change, DiffChange::TableRenamed { .. }))
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.table == "orders" && matches!(e.change, DiffChange::TableRemoved))
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.table == "logs" && matches!(e.change, DiffChange::TableAdded))
         );
     }
 

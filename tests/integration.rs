@@ -10707,15 +10707,20 @@ fn diff_missing_positional_arguments_is_an_actionable_error_not_a_panic() {
 #[test]
 fn diff_multi_table_dictionaries_match_tables_by_name() {
     let dir = TempDir::new();
+    // "orders"/"payments" deliberately share no column names - a genuine
+    // table rename (same columns, different name) is covered by its own
+    // dedicated test/fixture below; this one stays a clean check of
+    // plain by-name matching plus genuine add/remove for two unrelated
+    // tables.
     let old = write_dictionary(
         dir.path(),
         "old.ini",
-        "[users]\nid=1\nname=alice\n\n[orders]\nid=1\namount=9.99\n",
+        "[users]\nid=1\nname=alice\n\n[orders]\norder_ref=A1\n",
     );
     let new = write_dictionary(
         dir.path(),
         "new.ini",
-        "[users]\nid=1\nname=alice\nemail=alice@example.com\n\n[payments]\nid=1\namount=9.99\n",
+        "[users]\nid=1\nname=alice\nemail=alice@example.com\n\n[payments]\npayment_ref=P1\n",
     );
 
     let output = run_diff_raw(&[old.to_str().unwrap(), new.to_str().unwrap()]);
@@ -10850,16 +10855,21 @@ fn diff_multitable_fixture_pair_matches_tables_by_name() {
         &[],
     );
     let changes = doc["changes"].as_array().unwrap();
-    assert!(
-        changes
-            .iter()
-            .any(|c| c["table"] == "orders" && c["kind"] == "table removed")
-    );
-    assert!(
-        changes
-            .iter()
-            .any(|c| c["table"] == "payments" && c["kind"] == "table added")
-    );
+    // "orders" -> "payments" share the exact same two columns (id,
+    // amount) in these fixtures - a real table rename, not a genuine
+    // drop+add, and table-rename detection now correctly reports it as
+    // one suggestion instead of two unrelated table-level entries.
+    let rename = changes
+        .iter()
+        .find(|c| c["kind"] == "possible table rename")
+        .expect("expected a table rename to be detected between orders and payments");
+    assert_eq!(rename["from"], "orders");
+    assert_eq!(rename["to"], "payments");
+    assert_eq!(rename["compatibility"], "safe");
+    assert!(!changes.iter().any(|c| matches!(
+        c["kind"].as_str(),
+        Some("table removed") | Some("table added")
+    )));
     let email_added = changes
         .iter()
         .find(|c| c["table"] == "users" && c["column"] == "email")
