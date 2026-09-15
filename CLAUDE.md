@@ -321,9 +321,9 @@ fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
-`.xlsb`/`.ods`) - plus JSON/JSON Lines, the first format in the
-recursively-nested, JSON-bridge tier. Every other format transparently
-falls back to `staging` with a disclosed stderr
+`.xlsb`/`.ods`) - plus JSON/JSON Lines and YAML, the first two formats
+in the recursively-nested, JSON-bridge tier. Every other format
+transparently falls back to `staging` with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
 asked for would be the wrong kind of quiet).
@@ -365,22 +365,27 @@ needs its own real design, not just repeating the same pattern:
    genuinely different blank-row-reconstruction strategies for ODS's
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
-3. **The recursively-nested, JSON-bridge tier - JSON done as of Phase 13,
-   the hardest tier's own first format.** Unlike the two tiers above,
-   there was no existing function that flattens a *single* record into a
-   flat row matching the dot-notation column set `JsonPathAccumulator`
-   already produces (that accumulator only ever absorbs values
-   incrementally across *all* records at once) - `json_extract_value_
-   for_sql` is the new one, walking a record's own dot path directly
-   rather than re-deriving anything from the accumulator. The pooled-
-   array design question this tier's own roadmap entry used to leave
-   open is settled too: a `Vec<T>` column (scalar leaves only - see
-   below) serializes as one JSON-array-shaped text literal per row
-   (`["a","b"]`, via this project's own `Value` `Display` impl) - the
-   same "keep it as text, no fabricated relational shape" choice
-   staging mode's own `Vec<T>`/`mixed(...)` columns already make.
-   YAML, TOML, Avro, MessagePack, CBOR, XML, BSON, plist, JSON5, HAR,
-   GeoJSON, vCard, iCalendar, and MBOX remain unstarted.
+3. **The recursively-nested, JSON-bridge tier - JSON and YAML done as of
+   Phases 13-14.** Unlike the two tiers above, there was no existing
+   function that flattens a *single* record into a flat row matching the
+   dot-notation column set `JsonPathAccumulator` already produces (that
+   accumulator only ever absorbs values incrementally across *all*
+   records at once) - `json_extract_value_for_sql` is the new one,
+   walking a record's own dot path directly rather than re-deriving
+   anything from the accumulator. The pooled-array design question this
+   tier's own roadmap entry used to leave open is settled too: a
+   `Vec<T>` column (scalar leaves only - see below) serializes as one
+   JSON-array-shaped text literal per row (`["a","b"]`, via this
+   project's own `Value` `Display` impl) - the same "keep it as text, no
+   fabricated relational shape" choice staging mode's own `Vec<T>`/
+   `mixed(...)` columns already make. YAML needed no new flattener at
+   all - it already decodes straight to the shared `json_support::Value`
+   shape (see the Architecture section), so `json_extract_value_for_sql`/
+   `json_inline_blocking_column` carried over completely unchanged, only
+   YAML's own document-stream re-parse (`yaml_support::parse_yaml_
+   documents_stream`) needed writing. TOML, Avro, MessagePack, CBOR, XML,
+   BSON, plist, JSON5, HAR, GeoJSON, vCard, iCalendar, and MBOX remain
+   unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1349,17 +1354,75 @@ inline mode doesn't yet handle, so these three necessarily became
 feature-gated rather than running unconditionally in the bare default
 build the way they used to.
 
-Remaining in the recursively-nested, JSON-bridge tier: YAML, TOML, Avro,
+**Phase 14: YAML - the second format in the recursively-nested,
+JSON-bridge tier, and confirmation that Phase 13's own flattener
+generalizes to a genuinely different format with zero changes.** YAML's
+own reader already bridges straight to the shared `json_support::Value`
+shape (`yaml_support::parse_yaml_documents_stream`, see the Architecture
+section) - once a document's own `Value` tree is in hand, it needs no
+format-specific handling at all, so `json_extract_value_for_sql`/
+`json_inline_blocking_column`/`json_column_is_emittable` all carry over
+completely unchanged. The only real work this phase did was extracting
+`json_bridge_columns_and_mode` (the "which columns are pooled arrays, is
+this file in records mode or single-`value`-column mode" resolution) out
+of `render_sql_inline_flat_json` into its own shared function, and
+writing `stream_yaml_rows_for_sql` - a mechanical mirror of
+`columns_from_yaml`'s own dual-mode dispatch (a lone non-null top-level
+sequence unwraps to its elements as records; a `---`-separated
+multi-document stream is one record per document; anything else is a
+single record), feeding each resolved document into the exact same
+`json_emit_row_for_sql` JSON itself uses. `render_sql_inline_flat`'s own
+upfront blocking-column check (previously JSON-only) is now gated on
+`matches!(format, InputFormat::Json | InputFormat::Yaml)`, and its error
+message dropped the word "JSON" (now `"can't emit real data for field
+\"X\""`, not `"...for JSON field \"X\""`) since the same check now
+serves two formats - the one intentional wording change in this phase's
+own output, confirmed via `diff` to be the *only* difference in every
+already-shipped JSON fixture's own generated SQL.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.yaml --output-format sql --load-into sqlite:...` loaded
+correctly, matching its own `--output-format json` values exactly;
+`edge_yaml_sql_inline_flat.yaml` (a hand-built fixture, deliberately the
+YAML-syntax equivalent of Phase 13's own JSON fixture - a nested mapping,
+a flow-sequence array including a genuinely empty `[]`, and a `null`
+field) confirmed identical behavior to JSON's own: the nested mapping
+flattens with no column of its own, the array renders as JSON-array text,
+and the null field lands as a genuine SQL `NULL`; `edge_yaml_explicit_doc
+.yaml` (a real `---`-separated two-document stream) confirmed one row per
+document and correct `--nrows` bounding; `edge_yaml_scalar_sequence.yaml`
+(a bare top-level sequence of scalars) confirmed the single-`value`-
+column mode resolves correctly; `edge_yaml_complex_mixed.yaml` (three
+levels of nested mapping, an explicit-tag scalar, and a mixed-type flow
+array) confirmed deep flattening (`nested.level1.level2.value`) and
+mixed-type array serialization both work; `edge_yaml_merge.yaml` (a real
+alias/merge-key file, already a disclosed, unsupported YAML shape -
+see the Dependency footprint section's own YAML entry) confirmed the
+identical parse error fires on both passes, not a new or different one.
+Also verified as behavior-preserving for every already-shipped format
+(JSON included, modulo the one intentional wording change above): `diff`
+confirmed byte-identical inline SQL output against the pre-Phase-14
+binary across the entire fixture corpus. Clean across default/`yaml`/
+`full`, matching each one's own established baseline exactly.
+
+Phase 13's own three tests that used JSON as their "still genuinely
+unsupported format" example (already updated once, to YAML, in that
+phase's own writeup) moved to TOML instead, gated behind `--features
+toml` - the same one-hop-forward shuffle repeats itself as each new
+format in this tier graduates out of "unsupported."
+
+Remaining in the recursively-nested, JSON-bridge tier: TOML, Avro,
 MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
 iCalendar, and MBOX - each bridges to the same `json_support::Value`
 shape JSON itself uses (see the Architecture section), so
-`json_extract_value_for_sql`/`json_inline_blocking_column` are already
-reusable as-is once each format's own row-source re-decodes its file a
-second time into that same `Value` tree; vCard/iCalendar/MBOX's own
-repeated-property pooling (a different mechanism from JSON's array
-pooling, but the identical one-cell-per-row question) is the one
-sub-family that will need its own fresh look before assuming the same
-machinery applies unchanged.
+`json_extract_value_for_sql`/`json_inline_blocking_column`/
+`json_bridge_columns_and_mode` are already reusable as-is once each
+format's own row-source re-decodes its file a second time into that same
+`Value` tree - Phase 14 is direct, working proof of this, not just a
+plan. vCard/iCalendar/MBOX's own repeated-property pooling (a different
+mechanism from JSON's array pooling, but the identical one-cell-per-row
+question) is the one sub-family that will need its own fresh look before
+assuming the same machinery applies unchanged.
 
 ## Directory-input batch mode
 

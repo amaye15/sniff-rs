@@ -14633,21 +14633,17 @@ fn stream_json_rows_for_sql(
     Ok(())
 }
 
-/// The JSON row-source wrapper for `render_sql_inline_flat` - resolves
-/// which columns are pooled-array columns and whether the file is in
-/// records mode (every column named directly off an object key) or
-/// single-`value`-column mode, then streams `read_path` a second time via
-/// `stream_json_rows_for_sql`. `render_sql_inline_flat` itself already
-/// ran `json_inline_blocking_column` (and filtered out every
-/// `json_column_is_emittable() == false` column) before ever
-/// constructing `InlineRowSink`, so every column reaching this function
-/// is guaranteed representable as one scalar or one JSON-array-text cell
-/// per record.
-fn render_sql_inline_flat_json(
-    read_path: &Path,
-    profiles: &[ColumnProfile],
-    sink: &mut InlineRowSink<'_>,
-) -> Result<()> {
+/// Shared by every JSON-bridge format's own `render_sql_inline_flat_*`
+/// wrapper (JSON itself, and every later nested format that bridges to
+/// the same `json_support::Value` shape - see the Architecture section):
+/// resolves which columns are pooled-array columns
+/// (`ideal_type.starts_with("Vec<")`) and whether the file is in records
+/// mode (every column named directly off an object key -
+/// `JsonRecordStreamProfiler::finish`'s own "all_objects" shortcut) or
+/// single-`value`-column mode (every column name is `"value"` or
+/// `"value.*"`) - purely from the already-profiled column names, with no
+/// need to re-derive either fact from a second pass over the file.
+fn json_bridge_columns_and_mode(profiles: &[ColumnProfile]) -> (Vec<(String, bool)>, bool) {
     let records_mode = !profiles
         .iter()
         .all(|p| p.name == "value" || p.name.starts_with("value."));
@@ -14655,6 +14651,24 @@ fn render_sql_inline_flat_json(
         .iter()
         .map(|p| (p.name.clone(), p.ideal_type.starts_with("Vec<")))
         .collect();
+    (columns, records_mode)
+}
+
+/// The JSON row-source wrapper for `render_sql_inline_flat` - resolves
+/// which columns are pooled-array columns and whether the file is in
+/// records mode via `json_bridge_columns_and_mode`, then streams
+/// `read_path` a second time via `stream_json_rows_for_sql`.
+/// `render_sql_inline_flat` itself already ran `json_inline_blocking_
+/// column` (and filtered out every `json_column_is_emittable() == false`
+/// column) before ever constructing `InlineRowSink`, so every column
+/// reaching this function is guaranteed representable as one scalar or
+/// one JSON-array-text cell per record.
+fn render_sql_inline_flat_json(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
     stream_json_rows_for_sql(read_path, &columns, records_mode, sink)
 }
 
@@ -52424,22 +52438,24 @@ fn render_sql_inline_flat(
     sink: &mut dyn std::io::Write,
     is_first_table: bool,
 ) -> Result<()> {
-    // JSON (the first format in the recursively-nested, JSON-bridge tier)
-    // is the one format in this tier so far, and needs a real, upfront
-    // shape check no other format in this tier-less flat tier ever
-    // needed: a pure nested-object "struct" column has no literal value
-    // of its own to embed (only its own flattened `.` children do - see
-    // `json_column_is_emittable`), and an array-of-objects or mixed
-    // scalar/object column has no *honest* single-cell literal at all
-    // (see `json_inline_blocking_column`'s own doc comment) - the exact
-    // same "no data to emit" boundary ORC's/SQLite's/INI's own upfront
-    // checks already established, just reached here by scanning the
-    // already-profiled column list rather than re-parsing the schema.
+    // Every format that bridges to the shared `json_support::Value` shape
+    // (see the Architecture section) - JSON itself, and now YAML - needs
+    // a real, upfront shape check no format in the two tiers before this
+    // one ever needed: a pure nested-object "struct" column has no
+    // literal value of its own to embed (only its own flattened `.`
+    // children do - see `json_column_is_emittable`), and an array-of-
+    // objects or mixed scalar/object column has no *honest* single-cell
+    // literal at all (see `json_inline_blocking_column`'s own doc
+    // comment) - the exact same "no data to emit" boundary ORC's/
+    // SQLite's/INI's own upfront checks already established, just
+    // reached here by scanning the already-profiled column list rather
+    // than re-parsing the schema.
+    let json_bridge_format = matches!(format, InputFormat::Json | InputFormat::Yaml);
     let json_filtered_profiles: Vec<ColumnProfile>;
-    let profiles: &[ColumnProfile] = if matches!(format, InputFormat::Json) {
+    let profiles: &[ColumnProfile] = if json_bridge_format {
         if let Some(bad) = json_inline_blocking_column(profiles) {
             bail!(
-                "--sql-mode inline can't emit real data for JSON field \"{bad}\" - it's an \
+                "--sql-mode inline can't emit real data for field \"{bad}\" - it's an \
                  array of objects, or a value that's sometimes a scalar and sometimes an \
                  object across different records, which has no single cell to embed as a \
                  literal; use --sql-mode staging instead"
@@ -52613,6 +52629,7 @@ fn render_sql_inline_flat(
         InputFormat::Ini => render_sql_inline_flat_ini(read_path, table_name, &mut sink)?,
         InputFormat::Xlsx => render_sql_inline_flat_xlsx(read_path, table_name, &mut sink)?,
         InputFormat::Json => render_sql_inline_flat_json(read_path, profiles, &mut sink)?,
+        InputFormat::Yaml => render_sql_inline_flat_yaml(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52883,6 +52900,89 @@ fn render_sql_inline_flat_ini(
     )
 }
 
+/// The YAML row-source for `render_sql_inline_flat` (Phase 14, the second
+/// format in the recursively-nested, JSON-bridge tier) - re-parses
+/// `read_path` a second time via `yaml_support::parse_yaml_documents_
+/// stream` (which already decodes straight to the shared
+/// `json_support::Value` shape - see the Architecture section), mirroring
+/// `columns_from_yaml`'s own dual-mode dispatch exactly: a lone non-null
+/// top-level sequence document unwraps to its elements as records, a
+/// `---`-separated multi-document stream is one record per document,
+/// anything else is a single record. Every resolved record is folded via
+/// `json_emit_row_for_sql` - the exact same JSON-bridge extractor JSON
+/// itself uses, since a YAML document's own `Value` tree needs no
+/// format-specific handling once it's already in hand.
+#[cfg(feature = "yaml")]
+fn stream_yaml_rows_for_sql(
+    read_path: &Path,
+    columns: &[(String, bool)],
+    records_mode: bool,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let file =
+        fs::File::open(read_path).with_context(|| format!("failed to open {read_path:?}"))?;
+    // The one non-null document seen so far, held back until we know
+    // whether a second follows (multi-doc) or it stands alone (and, if a
+    // sequence, unwraps to its elements) - the identical lookahead
+    // `columns_from_yaml`'s own Pass 1 already uses.
+    let mut pending: Option<JsonValue> = None;
+    let mut multi = false;
+    yaml_support::parse_yaml_documents_stream(file, |doc| {
+        if doc.is_null() {
+            return Ok(());
+        }
+        match pending.take() {
+            None if !multi => pending = Some(doc),
+            first => {
+                if let Some(first) = first {
+                    json_emit_row_for_sql(&first, columns, records_mode, sink)?;
+                }
+                multi = true;
+                json_emit_row_for_sql(&doc, columns, records_mode, sink)?;
+            }
+        }
+        Ok(())
+    })
+    .with_context(|| format!("failed to parse YAML in {read_path:?}"))?;
+
+    if !multi {
+        match pending {
+            None => {}
+            Some(JsonValue::Array(items)) => {
+                for item in &items {
+                    json_emit_row_for_sql(item, columns, records_mode, sink)?;
+                }
+            }
+            Some(other) => json_emit_row_for_sql(&other, columns, records_mode, sink)?,
+        }
+    }
+    Ok(())
+}
+
+/// The YAML row-source wrapper for `render_sql_inline_flat` - see
+/// `render_sql_inline_flat_json`'s own doc comment; identical shape,
+/// just driven by YAML's own document stream instead of JSON's.
+#[cfg(feature = "yaml")]
+fn render_sql_inline_flat_yaml(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    stream_yaml_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "yaml"))]
+fn render_sql_inline_flat_yaml(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "YAML support isn't compiled in - rebuild with `cargo build --release --features yaml` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53019,12 +53119,13 @@ fn render_sql(
             | InputFormat::Ini
             | InputFormat::Xlsx
             | InputFormat::Json
+            | InputFormat::Yaml
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -60289,10 +60390,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Ini
                 | InputFormat::Xlsx
                 | InputFormat::Json
+                | InputFormat::Yaml
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml are supported so far",
             format.as_str()
         );
     }

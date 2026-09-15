@@ -535,24 +535,24 @@ fn sql_output_inline_mode_is_the_default_and_embeds_real_literal_data() {
 }
 
 #[test]
-#[cfg(feature = "yaml")]
+#[cfg(feature = "toml")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
-    // JSON is now inline-supported (Phase 13), so YAML is used here
-    // instead as a format that still genuinely isn't. Falls back to
-    // staging mode automatically (with a disclosed stderr note, checked
-    // separately below) rather than erroring or silently producing
-    // something different.
-    let sql = run_sql("sample.yaml", &[]);
+    // JSON and YAML are now inline-supported (Phases 13-14), so TOML is
+    // used here instead as a format that still genuinely isn't. Falls
+    // back to staging mode automatically (with a disclosed stderr note,
+    // checked separately below) rather than erroring or silently
+    // producing something different.
+    let sql = run_sql("sample.toml", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "yaml")]
+#[cfg(feature = "toml")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.yaml").to_str().unwrap(),
+            fixture("sample.toml").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -561,12 +561,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for yaml"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for toml"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "yaml")]
+#[cfg(feature = "toml")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -574,7 +574,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.yaml").to_str().unwrap(),
+            fixture("sample.toml").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -585,7 +585,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for yaml"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for toml"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -607,7 +607,7 @@ fn sql_output_inline_mode_json_array_of_objects_needs_staging_instead() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for JSON field"));
+    assert!(stderr.contains("can't emit real data for field"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -686,17 +686,17 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "yaml")]
+#[cfg(feature = "toml")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
-    // JSON is now inline-supported (Phase 13), so YAML stands in as a
-    // format that still genuinely isn't.
+    // JSON and YAML are now inline-supported (Phases 13-14), so TOML
+    // stands in as a format that still genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.yaml").to_str().unwrap(),
+            fixture("sample.toml").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -706,7 +706,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for yaml"));
+    assert!(stderr.contains("--load-into isn't available yet for toml"));
 }
 
 #[test]
@@ -1684,7 +1684,7 @@ fn sql_output_inline_mode_json_rejects_an_array_of_objects_column() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for JSON field \"events\""));
+    assert!(stderr.contains("can't emit real data for field \"events\""));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -1703,6 +1703,56 @@ fn load_into_accepts_json() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for json"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "yaml")]
+fn sql_output_inline_mode_supports_flat_yaml_with_nested_mapping_and_sequence() {
+    // Phase 14 of the "any format" rollout, and the second format in the
+    // recursively-nested, JSON-bridge tier - reuses JSON's own
+    // json_extract_value_for_sql/json_inline_blocking_column unchanged,
+    // since a YAML document already decodes straight to the shared
+    // json_support::Value shape. A plain (non-array) nested mapping
+    // flattens transparently with no column of its own, and a pooled
+    // flow-sequence column serializes as one JSON-array-text literal.
+    let sql = run_sql("edge_yaml_sql_inline_flat.yaml", &[]);
+    assert!(!sql.contains("\"meta\" "));
+    assert!(sql.contains("\"meta.score\""));
+    assert!(sql.contains("\"meta.active\""));
+    assert!(sql.contains("'[\"red\",\"blue\"]'"));
+    assert!(sql.contains("'[]'"));
+    let values = sql
+        .split("INSERT INTO")
+        .nth(1)
+        .expect("no INSERT statement found");
+    assert!(values.contains("NULL"));
+}
+
+#[test]
+#[cfg(feature = "yaml")]
+fn sql_output_inline_mode_yaml_respects_multi_document_stream_and_nrows() {
+    let sql = run_sql("edge_yaml_explicit_doc.yaml", &["--nrows", "1"]);
+    assert!(sql.contains("'Alice'"));
+    assert!(!sql.contains("'Bob'"));
+}
+
+#[test]
+#[cfg(feature = "yaml")]
+fn load_into_accepts_yaml() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_yaml_sql_inline_flat.yaml").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for yaml"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
