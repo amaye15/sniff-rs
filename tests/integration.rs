@@ -7837,6 +7837,258 @@ fn batch_mode_index_caps_the_files_table_on_a_large_directory() {
 }
 
 // ---------------------------------------------------------------------------
+// --combine: one combined artifact for a whole directory, instead of the
+// default one-artifact-per-file behavior above. Settled directly with the
+// user (both the overall shape and the table-naming-collision policy -
+// always qualify by the source file's own path, never only on an actual
+// collision). None of these spawn a real sqlite3/duckdb process (matching
+// this project's own standing --load-into precedent - see the validation-
+// only tests further up this file for why); the naming/qualifier logic
+// itself has its own portable unit tests next to combine_qualifier_from_
+// path's/CombinedTableNamer's definitions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn combine_only_applies_to_directory_input() {
+    let output = run_dir(&[
+        fixture("sample.csv").to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--combine only applies when the input path is a directory"));
+}
+
+#[test]
+fn combine_merges_two_files_own_tables_into_one_json_document_with_qualified_names() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("2024")).unwrap();
+    std::fs::create_dir_all(dir.path().join("2025")).unwrap();
+    std::fs::copy(
+        fixture("sample.csv"),
+        dir.path().join("2024").join("sales.csv"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture("type_detection.csv"),
+        dir.path().join("2025").join("sales.csv"),
+    )
+    .unwrap();
+
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["directory"], dir_name);
+    // No top-level "format" field - a combined run can genuinely span
+    // several different source formats, so there's no one honest answer
+    // the way single-file mode's own JSON output always has.
+    assert!(doc.get("format").is_none());
+    let tables = doc["tables"].as_object().unwrap();
+    assert!(tables.contains_key("2024_sales__sales"));
+    assert!(tables.contains_key("2025_sales__sales"));
+    // The two "sales" tables' own columns must not have bled into each
+    // other - 2024's file is the plain 9-column sample.csv, 2025's is
+    // type_detection.csv's own distinctly-shaped column set.
+    let cols_2024 = tables["2024_sales__sales"].as_array().unwrap();
+    let cols_2025 = tables["2025_sales__sales"].as_array().unwrap();
+    assert_eq!(cols_2024.len(), 9);
+    assert_ne!(cols_2025.len(), cols_2024.len());
+    assert!(cols_2024.iter().any(|c| c["name"] == "user_id"));
+    assert!(cols_2025.iter().any(|c| c["name"] == "contact_email"));
+    assert!(!cols_2024.iter().any(|c| c["name"] == "contact_email"));
+}
+
+#[test]
+fn combine_produces_one_markdown_document_with_a_table_of_contents() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a.csv")).unwrap();
+    std::fs::copy(fixture("type_detection.csv"), dir.path().join("b.csv")).unwrap();
+
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "md",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let md = std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.md"))).unwrap();
+    assert!(md.starts_with(&format!("# Data Dictionary: {dir_name}")));
+    // No single "**Format:**" line - see the JSON test's own identical
+    // reasoning above.
+    assert!(!md.contains("**Format:**"));
+    assert!(md.contains("## Tables"));
+    assert!(md.contains("a__a") || md.contains("a\\_\\_a")); // escaped in the TOC link text
+    assert!(md.contains("b__b") || md.contains("b\\_\\_b"));
+}
+
+#[test]
+fn combine_writes_one_sql_script_with_a_shared_header_and_qualified_table_names() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a.csv")).unwrap();
+    std::fs::copy(fixture("type_detection.csv"), dir.path().join("b.csv")).unwrap();
+
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "sql",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let sql =
+        std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.sql"))).unwrap();
+    // The shared header comment is written exactly once for the whole
+    // combined run, not once per table - the same "is_first_table" split
+    // a real multi-table *file* (SQLite, Excel, ...) already gets.
+    assert_eq!(
+        sql.matches("Generated by sniff-rs --output-format sql")
+            .count(),
+        1
+    );
+    assert!(sql.contains("CREATE TABLE \"a__a\""));
+    assert!(sql.contains("CREATE TABLE \"b__b\""));
+    assert!(sql.contains("'U1001'")); // real value from a.csv
+    assert!(sql.contains("'alice@example.com'")); // real value from b.csv
+}
+
+#[test]
+fn combine_rejects_sql_mode_staging() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a.csv")).unwrap();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "sql",
+        "--sql-mode",
+        "staging",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--combine doesn't support --sql-mode staging yet"));
+}
+
+#[test]
+fn combine_load_into_rejects_combining_with_output_dir_or_an_output_path() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a.csv")).unwrap();
+
+    let with_output_dir = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "sql",
+        "--load-into",
+        "sqlite:/tmp/whatever-combine-target",
+        "--output-dir",
+        "/tmp/whatever-combine-output-dir",
+    ]);
+    assert!(!with_output_dir.status.success());
+    assert!(
+        String::from_utf8_lossy(&with_output_dir.stderr)
+            .contains("already the one shared database")
+    );
+
+    let with_output_path = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "out.sql",
+        "--combine",
+        "--output-format",
+        "sql",
+        "--load-into",
+        "sqlite:/tmp/whatever-combine-target",
+    ]);
+    assert!(!with_output_path.status.success());
+    assert!(
+        String::from_utf8_lossy(&with_output_path.stderr)
+            .contains("--load-into can't be combined with an output path")
+    );
+}
+
+#[test]
+fn combine_load_into_accepts_postgres_and_mysql_unlike_the_plain_per_file_case() {
+    // The plain (non-combined) directory --load-into rejects postgres/
+    // mysql outright, since "one database per file" would need this tool
+    // to issue its own CREATE DATABASE per file first. --combine's own
+    // "one shared target" shape has no such problem - it's structurally
+    // identical to single-file mode's own --load-into, which already
+    // supports every engine - so postgres/mysql must reach the same
+    // "must be in the form <engine>:<target>"/spawn-failure path a bogus
+    // target already does for single-file mode, never the directory-mode-
+    // specific "only supports sqlite/duckdb" rejection.
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a.csv")).unwrap();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "sql",
+        "--load-into",
+        "postgres:mydb",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("only supports sqlite/duckdb"));
+    assert!(stderr.contains("psql"));
+}
+
+#[test]
+fn combine_nrows_bounds_each_files_own_row_count() {
+    let dir = TempDir::new();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("a.csv")).unwrap();
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+        "--nrows",
+        "2",
+    ]);
+    assert!(output.status.success());
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["tables"]["a__a"][0]["row_count"], 2);
+}
+
+// ---------------------------------------------------------------------------
 // Additional edge-case fixtures added to broaden coverage beyond the
 // original committed corpus. Each fixture is small and permanent
 // (committed under tests/fixtures/edge_*) - the same "reviewable without

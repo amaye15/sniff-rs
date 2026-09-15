@@ -2591,6 +2591,133 @@ risk a blanket suffix match would have against a genuine, unrelated
 database file sitting in the same directory (see that function's own
 doc comment for the exact double-extension shape it looks for).
 
+**`--combine`: one combined artifact for the whole directory, instead of
+the default one-artifact-per-file behavior above.** Prompted directly by
+the user, right after directory-mode `--load-into` shipped, asking for
+an "aggregator" mode - Markdown/JSON/JSON-Schema/SQL output (and
+`--load-into`) all support it. Two real design forks here were settled
+directly with the user rather than assumed, since guessing wrong on
+either would have meant a real, backward-incompatible reshaping of
+already-generated combined output later:
+
+- **Table naming.** Two different source files can genuinely want the
+  same table name (`2024/sales.csv` and `2025/sales.csv` both default to
+  a table called `sales`; two multi-table files can each have a table
+  called `orders`). The user chose to *always* prefix every table's own
+  combined name with a qualifier derived from its source file's own
+  relative path (`combine_qualifier_from_path` - every non-alphanumeric
+  character becomes `_`, consecutive `_`s collapse, the file's own
+  extension is dropped), never only once an actual collision happens -
+  predictable, stable names that never depend on what else is in the
+  directory that run, over the alternative (shorter names in the common
+  case, but a table's own combined name could then silently change shape
+  depending on what else happened to be in the directory). `2024/
+  sales.csv`'s own `sales` table becomes `2024_sales__sales`;
+  `warehouse.sqlite`'s own `customers`/`orders` tables become `warehouse
+  __customers`/`warehouse__orders`. `CombinedTableNamer` layers a
+  numbered-suffix safety net on top (the same precedent `sql_unique_
+  column_names` already established for the analogous duplicate-column
+  problem), since two genuinely different paths can still sanitize to
+  the identical qualifier (`"a/b.csv"` and `"a_b.csv"` both become
+  `"a_b"`).
+- **`--combine` + `--load-into`: one shared database, not one per file.**
+  The plain (non-combined) directory `--load-into` just shipped creates
+  one database *per file* - genuinely the opposite shape from what
+  `--combine` needs. Asked directly, and confirmed: `--combine --load-into
+  <engine>:<target>` reuses `<target>` as one shared database every
+  file's own table(s) load into sequentially - structurally identical to
+  single-file mode's own `--load-into`, just looping over multiple
+  files' worth of tables into the same spawned process instead of one
+  file's. This is also why postgres/mysql - rejected outright by the
+  plain per-file directory `--load-into` (a per-file database would need
+  this tool to issue its own `CREATE DATABASE` per file first, real,
+  disclosed, unimplemented scope) - work perfectly fine here: there's
+  only ever one database being loaded into at all, so every engine
+  single-file mode already supports works unchanged.
+
+Implementation-wise, `run_directory_combined` is a fully separate
+function from `run_directory`'s own per-file loop, rather than a
+`combine` branch threaded through every one of that function's own
+existing per-format cases - the same "keep two genuinely different
+shapes in two genuinely separate functions" choice this project already
+makes elsewhere (e.g. the two independently-scoped XML parsers). SQL
+output (both plain and `--load-into`) streams straight to its real
+destination as each file's own tables are read - the only way a spawned
+engine's own stdin can work at all, and the same "don't buffer the whole
+output in memory" discipline every other inline-mode SQL row-source
+already follows - reusing `render_sql_inline_flat` completely unchanged
+per (file, table) pair (that function's own `file_name` parameter turned
+out, on inspection, to be used *only* inside its own `is_first_table`-
+gated header comment, so passing the directory's own name uniformly on
+every call - never one particular file's name - needed no change to that
+function at all). Markdown/JSON/JSON-Schema output, needing every table
+in hand at once to build a shared table-of-contents, merges every file's
+own tables into one `BTreeMap` (still keyed by the same qualified names)
+and calls one of three new/adapted renderers once at the end:
+`render_combined_markdown` (a thin wrapper reusing `render_markdown_
+tables`, extracted from `render_markdown`'s own body in a pure, byte-
+identical-output refactor, dropping only the single `**Format:**` line a
+combined run genuinely can't give one honest answer for) and
+`render_combined_json` (the identical rich `"tables"` shape `render_json`
+itself produces, via a similarly-shared `tables_to_json` helper, minus
+that same `"format"` field, with `"file"` renamed `"directory"`);
+`render_json_schema` is reused completely unchanged, since it was already
+format-agnostic before this feature existed - just given the directory's
+own name instead of one file's (its own JSON key stays `"file"`, a small,
+disclosed inconsistency with the richer JSON shape's own `"directory"`
+key, accepted for the real simplicity of touching zero existing code
+there).
+
+**`--sql-mode staging` is a disclosed, not-yet-supported gap for
+`--combine` specifically** - `render_sql_staging`'s own per-table "Load"
+comment needs to name that table's own distinct source file, which its
+whole-script rendering has no way to do once several files' tables are
+merged into one script the way `--sql-mode inline`'s own literal
+`INSERT` statements already tolerate cleanly (each table's own row-source
+re-reads its own real source file directly, with no shared "the whole
+script has one source" assumption to begin with) - a real, disclosed
+scope boundary rather than a guess, matching this project's own
+"confident common case, disclosed gap" discipline everywhere else.
+
+`[OUTPUT_PATH]` (previously always rejected in directory mode) becomes
+meaningful again under `--combine` - there's exactly one output artifact
+now, so it names that artifact directly (including `-` for stdout,
+matching every other single-output convention this tool already has).
+Left unset, the default name is `<directory-basename>.dictionary.<ext>`,
+written under `--output-dir` if given or the directory itself otherwise
+(protected the same way the existing top-level index already is - see
+`OWN_OUTPUT_SUFFIXES`).
+
+Verified manually against a real, installed SQLite build (matching this
+project's own standing `--load-into` precedent - no automated `cargo
+test` spawns a real engine process): a two-file directory with a genuine
+naming collision (`2024/sales.csv`/`2025/sales.csv`, both implicitly
+named `sales`) produced correctly-qualified, non-colliding tables in
+every one of Markdown/JSON/JSON-Schema/SQL output, each carrying that
+table's own real, correct data (not bled together from the other file);
+a multi-table SQLite file combined alongside a plain CSV correctly
+qualified all three resulting tables; `--combine --load-into sqlite:...`
+loaded both files' tables into one real, queryable shared database;
+`--nrows` correctly bounded each file's own row count within the
+combined output; every validation error (staging mode, combining
+`--load-into` with `--output-dir` or an output path) fired with the
+right message; `--combine --load-into postgres:mydb` correctly reached
+the real `psql`-spawn attempt (failing only because `psql` isn't
+installed here) rather than the plain per-file case's own postgres/
+mysql rejection, confirming the "one shared target" shape genuinely
+reuses single-file mode's own unrestricted engine support. `diff`
+confirmed both single-file mode and directory mode's own default (non-
+`--combine`) output completely byte-identical against the pre-change
+binary across the entire fixture corpus, in every output format -
+`render_markdown`/`render_json`'s own refactor is a pure extraction, not
+a behavior change. The naming/collision logic itself
+(`combine_qualifier_from_path`, `CombinedTableNamer`) has its own
+portable, subprocess-free unit tests, matching how `looks_like_own_
+loaded_database`'s own detection logic was tested for the same reason
+in the plain directory `--load-into` phase just before this one. Clean
+across default/`full`, matching each build's own established clippy
+baseline (full=6, default=2) exactly.
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:

@@ -2896,7 +2896,8 @@ struct Args {
     /// convention and are only reachable via --format)
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
-    /// Only valid when input_path is a single file - a directory input uses
+    /// Only valid when input_path is a single file, or a directory with
+    /// `combine` set (below) - a directory input without `combine` uses
     /// --output-dir instead (see that field's own doc comment for why this
     /// is a separate flag rather than reusing this positional argument).
     output_path: Option<PathBuf>,
@@ -2950,11 +2951,28 @@ struct Args {
     /// `postgres:mydb`, or a full connection URI) - pipes the generated
     /// SQL directly into that engine's own CLI (see `LoadTarget`/
     /// `spawn_load_target`) instead of writing a `.sql` file at all.
-    /// Single-file mode only, requires `--output-format sql` with the
-    /// resolved mode being `inline` (never `staging` - see
-    /// `run_single_file`'s own validation for why), and only for a
-    /// format inline mode already supports.
+    /// Requires `--output-format sql` with the resolved mode being
+    /// `inline` (never `staging` - see `run_single_file`'s own
+    /// validation for why), and only for a format inline mode already
+    /// supports. Works in directory mode too, in two different shapes:
+    /// without `combine` (below), `<target>` becomes the directory one
+    /// fresh database *per file* lands in (sqlite/duckdb only - see
+    /// `run_directory`'s own validation); with `combine`, `<target>`
+    /// is instead the *one* shared database every file's own table(s)
+    /// load into sequentially (any engine, matching single-file mode
+    /// exactly - see `run_directory_combined`).
     load_into: Option<String>,
+    /// Directory-input mode only: build exactly ONE combined output
+    /// (one Markdown/JSON/JSON-Schema document, one SQL script, or -
+    /// combined with `--load-into` - one shared database every file's
+    /// own table(s) load into sequentially) instead of the default one-
+    /// output-per-file behavior. Every table's own combined name is
+    /// always prefixed by a qualifier derived from its source file's own
+    /// relative path (see `combine_qualifier_from_path`), settled
+    /// directly with the user over the alternative of only qualifying on
+    /// an actual name collision - see `run_directory_combined`'s own doc
+    /// comment for the full design.
+    combine: bool,
 }
 
 const HELP_TEXT: &str = r#"sniff-rs - profile a data file and produce a data dictionary
@@ -2972,9 +2990,11 @@ USAGE:
 
     If INPUT_PATH is a directory, every file under it (recursively) that
     sniff-rs can identify on its own is profiled, one output per input
-    file. OUTPUT_PATH is not valid in this mode - use --output-dir. The
-    first file that fails aborts the whole run; a file whose format can't
-    be identified at all is skipped and noted, not treated as a failure.
+    file by default (see --combine below for one combined output
+    instead). OUTPUT_PATH is not valid in this mode unless --combine is
+    given - use --output-dir. The first file that fails aborts the whole
+    run; a file whose format can't be identified at all is skipped and
+    noted, not treated as a failure.
 
 ARGS:
     <INPUT_PATH>
@@ -2984,8 +3004,9 @@ ARGS:
             sniffed instead. A .gz or .zst extension is transparently
             decompressed first.
     [OUTPUT_PATH]
-            Single-file mode only. Output path (default:
-            <input>.dictionary.md or .json). Pass "-" to write to stdout.
+            Single-file mode, or directory mode with --combine. Output
+            path (default: <input>.dictionary.md or .json). Pass "-" to
+            write to stdout.
 
 OPTIONS:
         --samples <N>          Number of sample values to show per column [default: 3]
@@ -3001,16 +3022,29 @@ OPTIONS:
         --output-format <FMT>   md (default), json, json-schema, or sql
         --sql-mode <MODE>       --output-format sql only: inline (default - no load
                                 step needed) or staging (raw-text staging table +
-                                per-engine load hint, for a file too large to embed)
+                                per-engine load hint, for a file too large to embed;
+                                not yet supported with --combine)
         --load-into <TARGET>    --output-format sql --sql-mode inline only: pipe the
                                 generated SQL directly into <engine>:<target> (e.g.
                                 sqlite:mydb.db, postgres:mydb, mysql:mydb,
                                 duckdb:mydb.duckdb, or a full connection URI) via that
                                 engine's own installed CLI - no .sql file written at all.
-                                Single-file mode only.
-        --output-dir <DIR>      Directory-input mode only: where per-file outputs are
-                                written, mirroring the input's own subdirectory structure.
-                                Defaults to writing each output next to its own source file.
+                                In directory mode (without --combine), <target> is the
+                                directory each recognized file's own fresh database
+                                (sqlite/duckdb only) lands in - one database per file.
+                                With --combine, <target> is instead the one shared
+                                database every file's tables load into sequentially
+                                (any engine, same as single-file mode).
+        --output-dir <DIR>      Directory-input mode only (not with --combine): where
+                                per-file outputs are written, mirroring the input's own
+                                subdirectory structure. Defaults to writing each output
+                                next to its own source file.
+        --combine               Directory-input mode only: build exactly ONE combined
+                                output (one md/json/json-schema document, one SQL
+                                script, or - with --load-into - one shared database)
+                                instead of one output per file. Every table's own
+                                combined name is always <source-file-path>__<table>,
+                                to avoid collisions across different source files.
     -h, --help                  Print this help
     -V, --version                Print version
 "#;
@@ -3042,6 +3076,7 @@ impl Args {
         let mut sql_mode: Option<String> = None;
         let mut load_into: Option<String> = None;
         let mut output_dir: Option<PathBuf> = None;
+        let mut combine = false;
         let mut positionals: Vec<String> = Vec::new();
 
         let mut i = 0;
@@ -3118,6 +3153,7 @@ impl Args {
                     "sql-mode" => sql_mode = Some(value(&mut i)?),
                     "load-into" => load_into = Some(value(&mut i)?),
                     "output-dir" => output_dir = Some(PathBuf::from(value(&mut i)?)),
+                    "combine" => combine = true,
                     other => bail!("unrecognized flag --{other}"),
                 }
             } else if let Some(short) = arg.strip_prefix('-')
@@ -3154,6 +3190,7 @@ impl Args {
             output_format,
             sql_mode,
             load_into,
+            combine,
         })
     }
 }
@@ -52329,7 +52366,53 @@ fn render_markdown(
         md.push_str(&format!(" · **Rows:** {}", first_profile.row_count));
     }
     md.push_str("\n\n");
+    render_markdown_tables(&mut md, tables);
+    md.truncate(md.trim_end_matches('\n').len());
+    md.push('\n');
+    md
+}
 
+/// `--combine`'s own directory-mode Markdown rendering (`run_directory_
+/// combined`) - a title naming the whole directory rather than one file,
+/// and no single `format`/row-count summary line to show (a combined run
+/// can genuinely span several different formats), but otherwise the
+/// identical multi-table body `render_markdown` itself already renders
+/// for a real multi-table *file* (SQLite, Excel, ...) - `tables`'s own
+/// keys are already `--combine`'s own qualified `<file>__<table>` names
+/// by the time this is called, so nothing here needs to know which
+/// source file any one table actually came from.
+fn render_combined_markdown(
+    directory_name: &str,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> String {
+    let table_count = tables.len();
+    let col_count: usize = tables.values().map(Vec::len).sum();
+
+    let mut md = format!("# Data Dictionary: {directory_name}\n\n");
+    md.push_str(&format!(
+        "**Tables:** {table_count} · **Columns:** {col_count}"
+    ));
+    if table_count == 1
+        && let Some(first_profile) = tables.values().next().and_then(|p| p.first())
+    {
+        md.push_str(&format!(" · **Rows:** {}", first_profile.row_count));
+    }
+    md.push_str("\n\n");
+    render_markdown_tables(&mut md, tables);
+    md.truncate(md.trim_end_matches('\n').len());
+    md.push('\n');
+    md
+}
+
+/// The shared body both `render_markdown` and `render_combined_markdown`
+/// build on: a `## Tables` table-of-contents (only shown past one table,
+/// the same "SQLite/Excel/... vs. a plain single-table CSV" distinction
+/// `render_markdown` already drew before this was extracted) followed by
+/// one full column table per entry in `tables`, each under its own
+/// heading. A pure extraction, not a behavior change - every line below
+/// is unchanged from `render_markdown`'s own original body.
+fn render_markdown_tables(md: &mut String, tables: &BTreeMap<String, Vec<ColumnProfile>>) {
+    let table_count = tables.len();
     let show_headers = table_count > 1; // only multi-table sources (SQLite) get ## sections
 
     if show_headers {
@@ -52434,9 +52517,6 @@ fn render_markdown(
         }
         md.push('\n');
     }
-    md.truncate(md.trim_end_matches('\n').len());
-    md.push('\n');
-    md
 }
 
 fn render_json(
@@ -52459,6 +52539,40 @@ fn render_json(
         "format".to_string(),
         JsonValue::from(format.as_str().to_string()),
     );
+    doc.insert(
+        "tables".to_string(),
+        JsonValue::Object(tables_to_json(tables)),
+    );
+    Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+}
+
+/// `--combine`'s own directory-mode JSON rendering (`run_directory_
+/// combined`) - the identical rich `"tables"` shape `render_json` itself
+/// produces, minus a single `"format"` field a combined run genuinely
+/// can't give one honest answer for (it can span several different
+/// source formats at once), and `"file"` renamed `"directory"` since the
+/// value it holds is the directory that was walked, not one file.
+/// `tables`'s own keys are already `--combine`'s own qualified
+/// `<file>__<table>` names by the time this is called.
+fn render_combined_json(
+    directory_name: &str,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> Result<String> {
+    let mut doc = json_support::Map::with_capacity(2);
+    doc.insert(
+        "directory".to_string(),
+        JsonValue::from(directory_name.to_string()),
+    );
+    doc.insert(
+        "tables".to_string(),
+        JsonValue::Object(tables_to_json(tables)),
+    );
+    Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+}
+
+/// Shared by `render_json`/`render_combined_json`: one `ColumnProfile`
+/// array per table, keyed by table name.
+fn tables_to_json(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> json_support::Map {
     let mut tables_obj = json_support::Map::with_capacity(tables.len());
     for (table_name, profiles) in tables {
         // `push_unique`, not `insert` - `tables` is a `BTreeMap`, whose
@@ -52470,8 +52584,7 @@ fn render_json(
             JsonValue::Array(profiles.iter().map(ColumnProfile::to_json).collect()),
         );
     }
-    doc.insert("tables".to_string(), JsonValue::Object(tables_obj));
-    Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+    tables_obj
 }
 
 // --- JSON-Schema-standard output (--output-format json-schema) ---
@@ -54483,26 +54596,21 @@ fn render_sql_inline_flat_fixed_width(
 /// it to `sink` in one shot, while the inline branch hands `sink`
 /// straight to `render_sql_inline_flat`, which streams every row into it
 /// directly instead of ever materializing the whole script in memory.
-fn render_sql(
-    file_name: &str,
-    format: &InputFormat,
-    tables: &BTreeMap<String, Vec<ColumnProfile>>,
-    read_path: &Path,
-    resolved_skip_rows: usize,
-    args: &Args,
-    sink: &mut dyn std::io::Write,
-) -> Result<()> {
-    let explicit = args.sql_mode.is_some();
-    let mode = resolved_sql_mode(args)?;
-    // The flat, fixed-column, one-row-per-record tier and the entire
-    // multi-table tier (SQLite, `.npz`, INI, the Excel family) are both
-    // complete; JSON is the first format in the recursively-nested,
-    // JSON-bridge tier (Phase 13) - a genuinely nested JSON file with an
-    // array-of-objects/mixed scalar-object column still gets its own,
-    // more specific disclosed error from `render_sql_inline_flat_json`
-    // itself (see `json_inline_blocking_column`), the same way a
-    // compound ORC column already does for that format.
-    let inline_supported = matches!(
+/// Whether `--sql-mode inline` has a real row-source for `format` at all
+/// (see `render_sql_inline_flat`'s own per-format dispatch) - extracted
+/// out of `render_sql` itself so `run_directory_combined`'s own SQL/
+/// `--load-into` path can run the identical check before ever calling
+/// `render_sql_inline_flat` directly (that function's own dispatch
+/// assumes it's only ever reached for a format this already confirmed
+/// true for - calling it otherwise would silently fall through to the
+/// CSV/TSV catch-all instead of erroring). Every `InputFormat` variant
+/// this project's CLI can construct already matches here as of Phase 28
+/// (see CLAUDE.md's own "SQL script output" section) - kept as a real
+/// check anyway, not simplified to a bare `true`, as the correct,
+/// defensive behavior for any future format added without also wiring
+/// up its own inline-mode row-source in the same phase.
+fn inline_supported_format(format: &InputFormat) -> bool {
+    matches!(
         format,
         InputFormat::Csv
             | InputFormat::Tsv
@@ -54538,7 +54646,29 @@ fn render_sql(
             | InputFormat::Mbox
             | InputFormat::Parquet
             | InputFormat::ArrowIpc
-    );
+    )
+}
+
+fn render_sql(
+    file_name: &str,
+    format: &InputFormat,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    read_path: &Path,
+    resolved_skip_rows: usize,
+    args: &Args,
+    sink: &mut dyn std::io::Write,
+) -> Result<()> {
+    let explicit = args.sql_mode.is_some();
+    let mode = resolved_sql_mode(args)?;
+    // The flat, fixed-column, one-row-per-record tier and the entire
+    // multi-table tier (SQLite, `.npz`, INI, the Excel family) are both
+    // complete; JSON is the first format in the recursively-nested,
+    // JSON-bridge tier (Phase 13) - a genuinely nested JSON file with an
+    // array-of-objects/mixed scalar-object column still gets its own,
+    // more specific disclosed error from `render_sql_inline_flat_json`
+    // itself (see `json_inline_blocking_column`), the same way a
+    // compound ORC column already does for that format.
+    let inline_supported = inline_supported_format(format);
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
@@ -61766,6 +61896,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if args.output_dir.is_some() {
         bail!("--output-dir only applies when the input path is a directory");
     }
+    if args.combine {
+        bail!(
+            "--combine only applies when the input path is a directory - a single file already produces exactly one output"
+        );
+    }
 
     // --load-into's own validation, before any real work (decompression,
     // reading) even starts - every check here is answerable from args
@@ -62252,9 +62387,9 @@ fn render_directory_index_json(
 
 fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let dir = &args.input_path;
-    if args.output_path.is_some() {
+    if args.output_path.is_some() && !args.combine {
         bail!(
-            "{dir:?} is a directory - use --output-dir <PATH> instead of a positional output path"
+            "{dir:?} is a directory - use --output-dir <PATH> instead of a positional output path (or add --combine, which makes a positional output path meaningful again - see --combine's own help text)"
         );
     }
     if args.format.is_some() {
@@ -62266,6 +62401,9 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
         bail!(
             "--widths only applies to --format fixed-width, which is never auto-detected and so is unreachable in directory mode"
         );
+    }
+    if args.combine {
+        return run_directory_combined(args, output_format, dir);
     }
     // Directory-mode `--load-into`: one database *per file*, not one
     // shared target every file's tables get poured into sequentially -
@@ -62521,6 +62659,380 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
         "{processed} file(s) processed ({skipped} skipped), {total_tables} tables, {total_columns} columns total -> {}",
         index_path.display()
     );
+
+    Ok(())
+}
+
+/// Turns a file's own path (relative to the directory root a `--combine`
+/// run is walking) into an identifier-safe qualifier for that file's own
+/// combined table name(s) - every character that isn't ASCII alphanumeric
+/// (path separators included) becomes `_`, consecutive `_`s collapse to
+/// one, and the file's own extension is dropped (it adds nothing a human
+/// wouldn't already know from the qualifier's own surrounding context,
+/// just more noise in an already-long combined identifier). A `.` is
+/// only ever treated as the extension's own boundary if it's the *last*
+/// one in the whole relative path *and* nothing after the last `/`
+/// contains another `/` of its own - i.e. it has to actually be part of
+/// the final path component, not a `.` sitting inside some directory
+/// name earlier in the path.
+fn combine_qualifier_from_path(relative_path: &str) -> String {
+    let without_ext = match relative_path.rfind('.') {
+        Some(dot) if !relative_path[dot..].contains('/') => &relative_path[..dot],
+        _ => relative_path,
+    };
+    let mut out = String::with_capacity(without_ext.len());
+    let mut last_was_underscore = false;
+    for c in without_ext.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            out.push('_');
+            last_was_underscore = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `--combine`'s own table-naming scheme: every table's combined name is
+/// `<qualifier>__<real table name>`, *always* - not only once an actual
+/// collision happens - settled directly with the user, who preferred
+/// predictable, stable names (a table's own combined name never depends
+/// on what else happens to be in the directory that run) over shorter
+/// ones that could silently change shape run to run. The qualifier alone
+/// (`combine_qualifier_from_path`) already makes two different files'
+/// own tables unique in the overwhelming case, but two genuinely
+/// different relative paths can still sanitize to the identical
+/// qualifier (`"a/b.csv"` and `"a_b.csv"` both become `"a_b"`) - the
+/// numbered-suffix fallback here is the same safety net `sql_unique_
+/// column_names` already establishes for the analogous duplicate-column-
+/// name problem, just one level up (tables instead of columns).
+struct CombinedTableNamer {
+    seen: HashSet<String>,
+}
+
+impl CombinedTableNamer {
+    fn new() -> Self {
+        CombinedTableNamer {
+            seen: HashSet::new(),
+        }
+    }
+
+    fn resolve(&mut self, qualifier: &str, real_table_name: &str) -> String {
+        let base = format!("{qualifier}__{real_table_name}");
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while self.seen.contains(&name) {
+            name = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        self.seen.insert(name.clone());
+        name
+    }
+}
+
+/// The default path a `--combine` run's own single output lands at when
+/// no explicit `[OUTPUT_PATH]` was given - `--output-dir` if given, else
+/// the directory being walked itself (protected the same way the
+/// existing top-level index already is: this always ends in one of
+/// `OWN_OUTPUT_SUFFIXES`, so a later run of *this* directory never
+/// mistakes its own combined output for fresh source data).
+fn combine_default_output_path(
+    args: &Args,
+    dir: &Path,
+    directory_name: &str,
+    output_format: &OutputFormat,
+) -> PathBuf {
+    let base_dir = args.output_dir.as_deref().unwrap_or(dir);
+    base_dir.join(format!("{directory_name}.{}", default_ext(output_format)))
+}
+
+/// `--combine`'s own directory-mode entry point: instead of the default
+/// one-output-artifact-per-recognized-file behavior `run_directory`
+/// itself implements, build exactly ONE combined artifact spanning the
+/// whole directory - a single Markdown/JSON/JSON-Schema document, a
+/// single runnable SQL script, or - combined with `--load-into` - one
+/// shared database every file's own table(s) load into sequentially
+/// (the identical "one shared target" shape single-file mode's own
+/// `--load-into` already has, and the shape a plain, non-combined
+/// directory `--load-into` run deliberately does *not* use - see that
+/// feature's own doc comment above for why "one database per file" was
+/// chosen there instead). Two real shapes were possible for combined
+/// output at all (one shared artifact vs. this project's own already-
+/// shipped "one artifact per file" default) and this was settled
+/// directly with the user rather than assumed - `--combine` is that
+/// opt-in path, kept fully separate from `run_directory`'s own per-file
+/// loop rather than threading a `combine` branch through every one of
+/// that function's own existing per-format cases.
+///
+/// Every table across the whole run gets a combined name via
+/// `CombinedTableNamer` (`<file-qualifier>__<real-table-name>`, always -
+/// see that type's own doc comment for why "always" was chosen over
+/// "only on an actual collision"). `--sql-mode staging` is a disclosed,
+/// not-yet-supported gap for `--combine` specifically: its own per-table
+/// "Load" comment needs to name that table's own distinct source file,
+/// which its whole-script rendering (`render_sql_staging`) has no way to
+/// do once several files' tables are merged into one script the way
+/// `--sql-mode inline`'s own literal `INSERT` statements already
+/// tolerate cleanly (each table's own row-source re-reads its own real
+/// source file directly, with no shared "the whole script has one
+/// source" assumption to begin with).
+fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path) -> Result<()> {
+    let directory_name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string());
+
+    let load_target = if let Some(load_into) = &args.load_into {
+        if !matches!(output_format, OutputFormat::Sql) {
+            bail!("--load-into requires --output-format sql");
+        }
+        if matches!(resolved_sql_mode(args)?, SqlMode::Staging) {
+            bail!(
+                "--load-into requires --sql-mode inline (the default) - --sql-mode staging assumes a separate manual load step --load-into can't perform automatically, since it would create the tables with zero rows actually loaded"
+            );
+        }
+        if args.output_dir.is_some() {
+            bail!(
+                "--combine --load-into's own <target> is already the one shared database every file's own tables load into - combining it with --output-dir would leave two different things both claiming to say where the output goes; drop --output-dir"
+            );
+        }
+        if args.output_path.is_some() {
+            bail!(
+                "--load-into can't be combined with an output path - the generated SQL streams directly into the target engine's own stdin instead of a file"
+            );
+        }
+        // Unlike the plain, non-combined directory `--load-into` (one
+        // database per file, sqlite/duckdb only - see that feature's own
+        // doc comment), --combine's own "one shared target" shape is
+        // structurally identical to single-file mode's own --load-into,
+        // so every engine single-file mode already supports works here
+        // too - there's no per-file CREATE DATABASE problem to avoid,
+        // since there's only ever one database being loaded into at all.
+        Some(LoadTarget::parse(load_into)?)
+    } else {
+        if matches!(output_format, OutputFormat::Sql)
+            && matches!(resolved_sql_mode(args)?, SqlMode::Staging)
+        {
+            bail!(
+                "--combine doesn't support --sql-mode staging yet - each table's own \"Load\" comment needs to name its own distinct source file, which staging mode's whole-script shape has no room for once several files' tables are merged into one script; use --sql-mode inline (the default) instead"
+            );
+        }
+        None
+    };
+
+    let mut files = Vec::new();
+    collect_files_sorted(dir, &mut files)?;
+
+    let mut processed = 0usize;
+    let mut skipped = 0usize;
+    let mut total_tables = 0usize;
+    let mut total_columns = 0usize;
+    let mut unrecognized: Vec<String> = Vec::new();
+    let mut namer = CombinedTableNamer::new();
+    let mut combined_tables: BTreeMap<String, Vec<ColumnProfile>> = BTreeMap::new();
+
+    // SQL output streams straight to its real destination as each
+    // file's own tables are read, matching every other inline-mode SQL
+    // row-source's own "stream, don't buffer the whole thing in memory"
+    // discipline (and, for the --load-into case, the only way this can
+    // work at all - a spawned engine's own stdin isn't something to
+    // build up as a `String` first). Resolved once, up front, since a
+    // single sink/child serves the *entire* combined run, not one per
+    // file the way the non-combined per-file loop needs.
+    let mut sql_child: Option<std::process::Child> = None;
+    let mut sql_sink: Option<Box<dyn std::io::Write>> = None;
+    if matches!(output_format, OutputFormat::Sql) {
+        if let Some(target) = &load_target {
+            sql_child = Some(spawn_load_target(target)?);
+        } else {
+            let sink: Box<dyn std::io::Write> = match args.output_path.as_deref() {
+                Some(p) if p == Path::new("-") => Box::new(std::io::stdout()),
+                Some(p) => {
+                    Box::new(fs::File::create(p).with_context(|| format!("failed to write {p:?}"))?)
+                }
+                None => {
+                    let default_path =
+                        combine_default_output_path(args, dir, &directory_name, output_format);
+                    if let Some(parent) = default_path.parent() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("failed to create directory {parent:?}"))?;
+                    }
+                    Box::new(
+                        fs::File::create(&default_path)
+                            .with_context(|| format!("failed to write {default_path:?}"))?,
+                    )
+                }
+            };
+            sql_sink = Some(sink);
+        }
+    }
+    let mut is_first_table = true;
+
+    for path in &files {
+        if looks_like_own_output(path) {
+            skipped += 1;
+            eprintln!(
+                "{}: skipped (looks like this tool's own prior output)",
+                path.display()
+            );
+            continue;
+        }
+
+        let (read_path, logical_path, _decompressed_tmp) =
+            decompress_if_needed(path).with_context(|| format!("failed processing {path:?}"))?;
+
+        let format = match detect_format(&read_path, &logical_path, &None) {
+            Ok(format) => format,
+            Err(_) => {
+                skipped += 1;
+                unrecognized.push(relative_display_path(dir, path));
+                eprintln!("{}: skipped (unrecognized format)", path.display());
+                continue;
+            }
+        };
+
+        let qualifier = combine_qualifier_from_path(&relative_display_path(dir, path));
+
+        (|| -> Result<()> {
+            let (tables, resolved_skip_rows) =
+                dispatch_reader(&read_path, &logical_path, format, args)?;
+
+            if matches!(output_format, OutputFormat::Sql) {
+                if !inline_supported_format(&format) {
+                    bail!(
+                        "--sql-mode inline isn't available yet for {} - --combine's own SQL rendering only supports the inline shape (--sql-mode staging isn't supported at all under --combine yet - see that gap's own disclosed reason above)",
+                        format.as_str()
+                    );
+                }
+                for (table_name, profiles) in &tables {
+                    let qualified = namer.resolve(&qualifier, table_name);
+                    total_tables += 1;
+                    total_columns += profiles.len();
+                    let sink_ref: &mut dyn std::io::Write = if let Some(child) = sql_child.as_mut()
+                    {
+                        child
+                            .stdin
+                            .as_mut()
+                            .expect("stdin was requested as piped at spawn time")
+                    } else {
+                        &mut **sql_sink.as_mut().expect("resolved above for --output-format sql")
+                    };
+                    render_sql_inline_flat(
+                        &directory_name,
+                        &qualified,
+                        profiles,
+                        &format,
+                        &read_path,
+                        resolved_skip_rows,
+                        args,
+                        sink_ref,
+                        is_first_table,
+                    )?;
+                    is_first_table = false;
+                }
+            } else {
+                for (table_name, profiles) in tables {
+                    let qualified = namer.resolve(&qualifier, &table_name);
+                    total_tables += 1;
+                    total_columns += profiles.len();
+                    combined_tables.insert(qualified, profiles);
+                }
+            }
+            Ok(())
+        })()
+        .with_context(|| format!("failed processing {path:?}"))?;
+
+        processed += 1;
+        eprintln!("{}: profiled ({qualifier}__*)", path.display());
+    }
+
+    if processed == 0 {
+        bail!("no recognized files found in {dir:?} ({skipped} file(s) skipped as unrecognized)");
+    }
+
+    match output_format {
+        OutputFormat::Sql => {
+            if let Some(mut child) = sql_child {
+                let stdin = child
+                    .stdin
+                    .take()
+                    .expect("stdin was requested as piped at spawn time");
+                drop(stdin);
+                let target = load_target.expect("sql_child is only ever set from load_target");
+                let status = child.wait().with_context(|| {
+                    format!(
+                        "failed waiting for {} to finish",
+                        target.engine.command_name()
+                    )
+                })?;
+                if !status.success() {
+                    bail!(
+                        "{} exited with a non-zero status while loading the combined data - see its own output above for the real error",
+                        target.engine.command_name()
+                    );
+                }
+                eprintln!(
+                    "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> loaded into {} via {}",
+                    target.target,
+                    target.engine.command_name()
+                );
+            } else {
+                let destination = args.output_path.clone().unwrap_or_else(|| {
+                    combine_default_output_path(args, dir, &directory_name, output_format)
+                });
+                eprintln!(
+                    "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> {}",
+                    destination.display()
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Json | OutputFormat::JsonSchema => {
+            let content = match output_format {
+                OutputFormat::Markdown => {
+                    render_combined_markdown(&directory_name, &combined_tables)
+                }
+                OutputFormat::Json => render_combined_json(&directory_name, &combined_tables)?,
+                OutputFormat::JsonSchema => render_json_schema(&directory_name, &combined_tables)?,
+                OutputFormat::Sql => unreachable!("handled in the arm above"),
+            };
+            match args.output_path.as_deref() {
+                Some(p) if p == Path::new("-") => {
+                    use std::io::Write as _;
+                    std::io::stdout().write_all(content.as_bytes())?;
+                    eprintln!(
+                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> (stdout)"
+                    );
+                }
+                Some(p) => {
+                    fs::write(p, &content).with_context(|| format!("failed to write {p:?}"))?;
+                    eprintln!(
+                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> {}",
+                        p.display()
+                    );
+                }
+                None => {
+                    let default_path =
+                        combine_default_output_path(args, dir, &directory_name, output_format);
+                    if let Some(parent) = default_path.parent() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("failed to create directory {parent:?}"))?;
+                    }
+                    fs::write(&default_path, &content)
+                        .with_context(|| format!("failed to write {default_path:?}"))?;
+                    eprintln!(
+                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> {}",
+                        default_path.display()
+                    );
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -69187,6 +69699,51 @@ mod tests {
         assert!(!looks_like_own_loaded_database(Path::new("sample.csv")));
         assert!(!looks_like_own_loaded_database(Path::new("sample.csv.sql")));
         assert!(!looks_like_own_loaded_database(Path::new("no_extension")));
+    }
+
+    #[test]
+    fn combine_qualifier_from_path_sanitizes_separators_and_strips_the_extension() {
+        assert_eq!(combine_qualifier_from_path("2024/sales.csv"), "2024_sales");
+        assert_eq!(combine_qualifier_from_path("sales.csv"), "sales");
+        assert_eq!(
+            combine_qualifier_from_path("data files/my report (v2).xlsx"),
+            "data_files_my_report_v2"
+        );
+    }
+
+    #[test]
+    fn combine_qualifier_from_path_only_treats_a_dot_in_the_final_component_as_the_extension() {
+        // A '.' inside an earlier directory name must never be mistaken
+        // for the file's own extension boundary.
+        assert_eq!(combine_qualifier_from_path("a.b/sales.csv"), "a_b_sales");
+    }
+
+    #[test]
+    fn combine_qualifier_from_path_falls_back_when_sanitizing_leaves_nothing() {
+        assert_eq!(combine_qualifier_from_path("..."), "file");
+    }
+
+    #[test]
+    fn combined_table_namer_always_prefixes_with_the_qualifier_never_only_on_collision() {
+        // Settled directly with the user: a table's own combined name is
+        // always <qualifier>__<real name>, even when nothing else in the
+        // run would actually collide with a plain, unqualified name.
+        let mut namer = CombinedTableNamer::new();
+        assert_eq!(namer.resolve("sales", "sales"), "sales__sales");
+        assert_eq!(namer.resolve("2024_sales", "sales"), "2024_sales__sales");
+    }
+
+    #[test]
+    fn combined_table_namer_disambiguates_a_genuine_qualifier_collision() {
+        // Two different relative paths ("a/b.csv" and "a_b.csv") sanitize
+        // to the identical qualifier ("a_b") - the numbered-suffix safety
+        // net must still keep their own combined names apart.
+        let mut namer = CombinedTableNamer::new();
+        let first = namer.resolve(&combine_qualifier_from_path("a/b.csv"), "b");
+        let second = namer.resolve(&combine_qualifier_from_path("a_b.csv"), "b");
+        assert_ne!(first, second);
+        assert_eq!(first, "a_b__b");
+        assert_eq!(second, "a_b__b_2");
     }
 
     fn index_entry(source: &str, output: &str, tables: usize, cols: usize) -> BatchIndexEntry {
