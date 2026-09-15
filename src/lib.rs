@@ -3996,12 +3996,144 @@ struct ColumnInput {
     skip_heuristics: bool,   // true for nested JSON (array/object) columns
 }
 
+/// Streaming min/max/mean/sample-stddev for a numeric column - `count`
+/// zero-based mean/variance via Welford's online algorithm, so this never
+/// buffers a single value: `push` takes one `O(1)`-cost step per raw
+/// string, matching every other incremental accumulator in this file
+/// (`IdealTypeAccumulator`, `NaiveTypeAccumulator`). Only ever populated
+/// on a column whose `ideal_type` resolved to `"i64"`/`"f64"` (checked
+/// after the fact, by the caller - this accumulator itself has no opinion
+/// on what a column's *type* is, it just quietly ignores any value that
+/// doesn't parse as a finite number, the same "count only what actually
+/// parses" contract `IdealTypeAccumulator`'s own i64/f64 checks already
+/// have). Deliberately scoped to exactly these four numbers for now -
+/// median/percentiles need either a second, bounded pass or a real
+/// streaming-approximation algorithm (P²/t-digest), neither of which is
+/// implemented here yet; see this feature's own CLAUDE.md writeup for why
+/// that's staged, disclosed future work rather than attempted in the same
+/// pass.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NumericStats {
+    count: u64,
+    min: f64,
+    max: f64,
+    mean: f64,
+    stddev: f64,
+}
+
+#[derive(Clone, Default)]
+struct NumericStatsAccumulator {
+    count: u64,
+    min: f64,
+    max: f64,
+    mean: f64,
+    // Sum of squared differences from the running mean (Welford's
+    // algorithm's own `M2`) - `variance = m2 / (count - 1)` at the end,
+    // never accumulated as a running sum-of-squares directly, which is
+    // the textbook-known numerically-unstable way to compute variance
+    // incrementally (a real risk here, not a theoretical one: this
+    // project's own numeric columns routinely mix small and very large
+    // values in the same column).
+    m2: f64,
+}
+
+impl NumericStatsAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reuses `normalize_numeric_str` - the exact same cleanup
+    /// (currency symbols, thousands separators, parenthesized negatives,
+    /// a trailing `%`) that let a column resolve to a numeric type in the
+    /// first place - so a value this accumulator counts is always the
+    /// same value `IdealTypeAccumulator`'s own i64/f64 checks already
+    /// agreed was numeric. A non-finite parse (`"Infinity"`/`"NaN"`,
+    /// which `f64::from_str` accepts but this project's own numeric
+    /// heuristics already flag with a note - see the design-philosophy
+    /// section) is deliberately excluded from min/max/mean/stddev: one
+    /// infinite value would make every one of those four numbers
+    /// meaningless for the rest of the column, and "quietly skip it" is
+    /// this accumulator's whole missing-value convention (an unparseable
+    /// value is skipped the same way, no separate signal needed for
+    /// either case).
+    fn push(&mut self, raw: &str) {
+        let (cleaned, _is_pct) = normalize_numeric_str(raw);
+        let Ok(v) = cleaned.parse::<f64>() else {
+            return;
+        };
+        if !v.is_finite() {
+            return;
+        }
+        self.count += 1;
+        if self.count == 1 {
+            self.min = v;
+            self.max = v;
+        } else {
+            if v < self.min {
+                self.min = v;
+            }
+            if v > self.max {
+                self.max = v;
+            }
+        }
+        let delta = v - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = v - self.mean;
+        self.m2 += delta * delta2;
+    }
+
+    /// `None` iff nothing this accumulator saw ever parsed as a finite
+    /// number - a genuinely non-numeric or all-missing column, which
+    /// `ColumnProfile.numeric_stats` should stay `None` for rather than
+    /// reporting a fabricated all-zero summary. Sample standard deviation
+    /// (dividing by `count - 1`, not `count`) is reported, matching every
+    /// general-purpose statistics tool's own default (`pandas.Series.std`,
+    /// Excel's `STDEV`) - a single value has no defined sample variance,
+    /// so `stddev` is `0.0` in that case rather than a `NaN` from a `0/0`
+    /// division.
+    fn finish(&self) -> Option<NumericStats> {
+        if self.count == 0 {
+            return None;
+        }
+        let variance = if self.count > 1 {
+            self.m2 / (self.count - 1) as f64
+        } else {
+            0.0
+        };
+        Some(NumericStats {
+            count: self.count,
+            min: self.min,
+            max: self.max,
+            mean: self.mean,
+            stddev: variance.sqrt(),
+        })
+    }
+}
+
+impl NumericStats {
+    fn to_json(&self) -> json_support::Value {
+        use json_support::{Map, Value};
+        let mut obj = Map::with_capacity(5);
+        obj.insert("count".to_string(), Value::from(self.count));
+        obj.insert("min".to_string(), Value::from(self.min));
+        obj.insert("max".to_string(), Value::from(self.max));
+        obj.insert("mean".to_string(), Value::from(self.mean));
+        obj.insert("stddev".to_string(), Value::from(self.stddev));
+        Value::Object(obj)
+    }
+}
+
 // `Clone` is needed by `render_sql_inline_flat`'s own JSON-specific
 // column-filtering step (building an owned, struct-column-excluded
 // subset before the rest of that function's already-shared code runs) -
 // every field here is a plain owned scalar/String/Vec<String>, so this is
-// a cheap, safe derive, not a design change.
-#[derive(Clone)]
+// a cheap, safe derive, not a design change. `Default` is needed so every
+// existing `ColumnProfile { ... }` construction site can pick up the new
+// `numeric_stats` field via `..Default::default()` without having to
+// name it explicitly everywhere - see that field's own doc comment for
+// why it's additive rather than a stated part of this struct's core
+// shape.
+#[derive(Clone, Default)]
 struct ColumnProfile {
     name: String,
     current_type: String,
@@ -4025,6 +4157,22 @@ struct ColumnProfile {
     // slot count instead, which can legitimately differ (e.g. an array
     // that pools several elements per parent record).
     row_count: usize,
+    // `Some(...)` only for a column whose `ideal_type` is exactly `"i64"`
+    // or `"f64"` - min/max/mean/(sample) stddev, computed incrementally
+    // (see `NumericStatsAccumulator`), `None` for every other column
+    // (including a numeric-looking column that resolved to something
+    // more specific, like a semantic type, or a `mixed(...)` column).
+    // Deliberately not wired into every single reader yet - see this
+    // field's own CLAUDE.md writeup for exactly which engines populate it
+    // today (`profile_column` and the `ColumnAccumulatorState`-based
+    // incremental readers - CSV/TSV, fixed-width, dBase, Stata, SAS7BDAT,
+    // SPSS, NumPy, ORC, the whole Excel family, SQLite, the log formats,
+    // and Parquet/Arrow IPC's own flat leaf columns) versus which don't
+    // yet (the recursively-nested JSON-bridge tier - JSON, YAML, TOML,
+    // Avro, MessagePack, CBOR, XML, and friends - a separate, later phase,
+    // the same "one engine at a time" rollout this project's own inline-
+    // SQL and streaming-reads campaigns already established).
+    numeric_stats: Option<NumericStats>,
 }
 
 // This project used to have a hand-rolled `impl serde::Serialize for
@@ -4080,6 +4228,19 @@ impl ColumnProfile {
         // silently-reordered diff scattered through the middle of the
         // object.
         obj.insert("row_count".to_string(), Value::from(self.row_count));
+        // The newest field, added the same "always at the end" way
+        // `row_count` itself was - `null` for any column this session's
+        // numeric-stats work hasn't reached yet (a non-numeric column,
+        // or one read through an engine that doesn't populate it - see
+        // `numeric_stats`'s own doc comment on `ColumnProfile`), a real
+        // `{count, min, max, mean, stddev}` object otherwise.
+        obj.insert(
+            "numeric_stats".to_string(),
+            match &self.numeric_stats {
+                Some(stats) => stats.to_json(),
+                None => Value::Null,
+            },
+        );
         Value::Object(obj)
     }
 }
@@ -4099,6 +4260,7 @@ mod column_profile_to_json_tests {
             sample_values: vec!["02134".to_string(), "90210".to_string()],
             notes: "leading zeros".to_string(),
             row_count: 2,
+            numeric_stats: None,
         };
         let json_support::Value::Object(obj) = p.to_json() else {
             panic!("expected an Object");
@@ -4114,7 +4276,8 @@ mod column_profile_to_json_tests {
                 "missing_pct",
                 "sample_values",
                 "notes",
-                "row_count"
+                "row_count",
+                "numeric_stats"
             ]
         );
         assert_eq!(
@@ -4139,6 +4302,7 @@ mod column_profile_to_json_tests {
             sample_values: vec!["2024-01-15".to_string()],
             notes: "".to_string(),
             row_count: 5,
+            numeric_stats: None,
         };
         // `to_json()` rendered through the hand-rolled pretty-printer,
         // then parsed by a genuinely independent reference implementation
@@ -4151,6 +4315,126 @@ mod column_profile_to_json_tests {
         assert_eq!(via_real["sample_values"][0], "2024-01-15");
         assert_eq!(via_real["description"], "");
         assert_eq!(via_real["row_count"], 5);
+    }
+}
+
+#[cfg(test)]
+mod numeric_stats_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_stats_accumulator_computes_min_max_mean_and_stddev() {
+        let mut acc = NumericStatsAccumulator::new();
+        for v in ["2", "4", "4", "4", "5", "5", "7", "9"] {
+            acc.push(v);
+        }
+        let stats = acc.finish().unwrap();
+        assert_eq!(stats.count, 8);
+        assert_eq!(stats.min, 2.0);
+        assert_eq!(stats.max, 9.0);
+        assert_eq!(stats.mean, 5.0);
+        // Population standard deviation of this exact textbook example is
+        // 2.0; sample stddev (dividing by n-1, this accumulator's own
+        // documented convention - matching pandas/Excel's own default) is
+        // slightly higher.
+        assert!((stats.stddev - 2.13809).abs() < 1e-4);
+    }
+
+    #[test]
+    fn numeric_stats_accumulator_ignores_non_numeric_and_non_finite_values() {
+        let mut acc = NumericStatsAccumulator::new();
+        for v in ["10", "not a number", "Infinity", "-NaN", "20"] {
+            acc.push(v);
+        }
+        let stats = acc.finish().unwrap();
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.min, 10.0);
+        assert_eq!(stats.max, 20.0);
+    }
+
+    #[test]
+    fn numeric_stats_accumulator_is_none_for_an_empty_or_all_non_numeric_column() {
+        assert!(NumericStatsAccumulator::new().finish().is_none());
+        let mut acc = NumericStatsAccumulator::new();
+        acc.push("hello");
+        acc.push("world");
+        assert!(acc.finish().is_none());
+    }
+
+    #[test]
+    fn numeric_stats_accumulator_reports_zero_stddev_for_a_single_value() {
+        let mut acc = NumericStatsAccumulator::new();
+        acc.push("42");
+        let stats = acc.finish().unwrap();
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.mean, 42.0);
+        assert_eq!(stats.stddev, 0.0);
+    }
+
+    #[test]
+    fn profile_column_populates_numeric_stats_for_an_i64_column_and_not_for_a_string_column() {
+        let numeric = ColumnInput {
+            name: "age".to_string(),
+            current_type: "i64".to_string(),
+            raw_values: vec!["10".to_string(), "20".to_string(), "30".to_string()],
+            total: 3,
+            skip_heuristics: false,
+        };
+        let profile = profile_column(numeric, 3);
+        assert_eq!(profile.ideal_type, "i64");
+        let stats = profile.numeric_stats.expect("i64 column should have stats");
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.min, 10.0);
+        assert_eq!(stats.max, 30.0);
+        assert_eq!(stats.mean, 20.0);
+
+        let stringy = ColumnInput {
+            name: "name".to_string(),
+            current_type: "String".to_string(),
+            raw_values: vec!["alice".to_string(), "bob".to_string()],
+            total: 2,
+            skip_heuristics: false,
+        };
+        let profile = profile_column(stringy, 3);
+        assert_eq!(profile.ideal_type, "String");
+        assert!(profile.numeric_stats.is_none());
+    }
+
+    #[test]
+    fn numeric_stats_round_trips_through_to_json() {
+        let p = ColumnProfile {
+            name: "amount".to_string(),
+            current_type: "f64".to_string(),
+            ideal_type: "f64".to_string(),
+            description: String::new(),
+            missing_pct: 0.0,
+            sample_values: vec!["1.5".to_string()],
+            notes: String::new(),
+            row_count: 2,
+            numeric_stats: Some(NumericStats {
+                count: 2,
+                min: 1.5,
+                max: 2.5,
+                mean: 2.0,
+                stddev: std::f64::consts::FRAC_1_SQRT_2,
+            }),
+        };
+        let text = json_support::to_pretty_string(&p.to_json());
+        let via_real: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(via_real["numeric_stats"]["count"], 2);
+        assert_eq!(via_real["numeric_stats"]["min"], 1.5);
+        assert_eq!(via_real["numeric_stats"]["max"], 2.5);
+        assert_eq!(via_real["numeric_stats"]["mean"], 2.0);
+
+        // A non-numeric column's `numeric_stats` renders as a real JSON
+        // `null`, never an omitted key - a consumer can always find the
+        // key present, just sometimes null, matching every other
+        // optional-looking field this tool's JSON output already has.
+        let mut p2 = p.clone();
+        p2.numeric_stats = None;
+        let text2 = json_support::to_pretty_string(&p2.to_json());
+        let via_real2: serde_json::Value = serde_json::from_str(&text2).unwrap();
+        assert!(via_real2["numeric_stats"].is_null());
     }
 }
 
@@ -5965,6 +6249,7 @@ struct ColumnAccumulatorState {
     total_non_null: usize,
     ideal_acc: IdealTypeAccumulator,
     naive_acc: NaiveTypeAccumulator,
+    numeric_acc: NumericStatsAccumulator,
     samples: Vec<String>,
 }
 
@@ -5974,6 +6259,7 @@ impl ColumnAccumulatorState {
             total_non_null: 0,
             ideal_acc: IdealTypeAccumulator::new(),
             naive_acc: NaiveTypeAccumulator::new(),
+            numeric_acc: NumericStatsAccumulator::new(),
             samples: Vec::new(),
         }
     }
@@ -5993,6 +6279,13 @@ impl ColumnAccumulatorState {
         }
         self.ideal_acc.push(&field);
         self.naive_acc.push(&field);
+        // Always fed, regardless of what this column's own `ideal_type`
+        // ultimately resolves to - cheap (one more `f64` parse of an
+        // already-cleaned string) and harmless even for a genuinely
+        // non-numeric column, since `finish_profile` below only ever
+        // consults this accumulator's own result once `ideal_type` has
+        // already been decided to be `"i64"`/`"f64"`.
+        self.numeric_acc.push(&field);
         self.total_non_null += 1;
     }
 
@@ -6037,6 +6330,7 @@ impl ColumnAccumulatorState {
             total_non_null,
             ideal_acc,
             naive_acc: _,
+            numeric_acc,
             samples,
         } = self;
         let missing = total.saturating_sub(total_non_null);
@@ -6058,6 +6352,18 @@ impl ColumnAccumulatorState {
                 format!("{notes}; {extra}")
             };
         }
+        // Only ever attached to a column whose own `ideal_type` actually
+        // resolved to a plain numeric type - never a semantic type that
+        // happens to be numeric-shaped underneath (a credit card number,
+        // an IMEI, a ULID) and never a `mixed(...)` column, both of which
+        // would make min/max/mean/stddev a misleading summary of "the
+        // numbers in this column" rather than a real description of what
+        // the column actually is.
+        let numeric_stats = if matches!(ideal_type.as_str(), "i64" | "f64") {
+            numeric_acc.finish()
+        } else {
+            None
+        };
         ColumnProfile {
             name,
             current_type,
@@ -6067,6 +6373,7 @@ impl ColumnAccumulatorState {
             sample_values: samples,
             notes,
             row_count: total,
+            numeric_stats,
         }
     }
 }
@@ -13798,6 +14105,7 @@ mod orc_support {
                     sample_values: Vec::new(),
                     notes: note,
                     row_count: total,
+                    numeric_stats: None,
                 });
                 continue;
             }
@@ -14526,6 +14834,7 @@ impl JsonPathAccumulator {
                 sample_values: Vec::new(),
                 notes: "column is empty/all null".to_string(),
                 row_count: total,
+                numeric_stats: None,
             }];
         }
 
@@ -14588,6 +14897,7 @@ impl JsonPathAccumulator {
             sample_values: samples,
             notes,
             row_count: total,
+            numeric_stats: None,
         }];
 
         if self.object_count > 0 {
@@ -50441,6 +50751,7 @@ mod npy_support {
                     sample_values: Vec::new(),
                     notes: format!("array '{array_name}' could not be profiled: {e}"),
                     row_count: 0, // unreadable - no real row count is knowable
+                    numeric_stats: None,
                 }],
             };
             out.push((array_name, profiles));
@@ -52055,6 +52366,7 @@ mod sqlite_support {
                     sample_values: Vec::new(),
                     notes: format!("table '{}' could not be profiled: {e}", entry.name),
                     row_count: 0, // unreadable - no real row count is knowable
+                    numeric_stats: None,
                 }],
             };
             out.push((entry.name, profiles));
@@ -52581,6 +52893,22 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         }
     }
 
+    // Same "only for a genuine plain numeric ideal_type" scope
+    // `ColumnAccumulatorState::finish_profile` already applies - see that
+    // function's own comment. `non_null` is already fully resident here
+    // (unlike the CSV/fixed-width incremental engines this mirrors), so
+    // this is a second, bounded pass over data already in memory, not an
+    // extra file read.
+    let numeric_stats = if matches!(ideal_type.as_str(), "i64" | "f64") {
+        let mut acc = NumericStatsAccumulator::new();
+        for v in non_null {
+            acc.push(v);
+        }
+        acc.finish()
+    } else {
+        None
+    };
+
     ColumnProfile {
         name: col.name,
         current_type: col.current_type,
@@ -52590,6 +52918,7 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         sample_values: samples,
         notes,
         row_count: col.total,
+        numeric_stats,
     }
 }
 
@@ -72245,6 +72574,7 @@ mod tests {
             sample_values: vec![],
             notes: String::new(),
             row_count: 10,
+            numeric_stats: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = std::iter::once((
             "t".to_string(),
@@ -72319,6 +72649,7 @@ mod tests {
             sample_values: vec!["1".to_string()],
             notes: String::new(),
             row_count: 42,
+            numeric_stats: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> =
             std::iter::once(("t".to_string(), vec![profile])).collect();
@@ -72337,6 +72668,7 @@ mod tests {
             sample_values: vec![],
             notes: String::new(),
             row_count,
+            numeric_stats: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = [
             ("events".to_string(), vec![profile_with_rows(3)]),
@@ -72614,6 +72946,7 @@ mod tests {
                 sample_values: vec!["1".to_string()],
                 notes: String::new(),
                 row_count: 1,
+                numeric_stats: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -72624,6 +72957,7 @@ mod tests {
                 sample_values: vec!["a@example.com".to_string()],
                 notes: "matches email address format".to_string(),
                 row_count: 1,
+                numeric_stats: None,
             },
         ];
         let mut tables = BTreeMap::new();
@@ -72699,6 +73033,7 @@ mod tests {
                     sample_values: vec![],
                     notes: String::new(),
                     row_count: 1,
+                    numeric_stats: None,
                 })
                 .collect()
         };
@@ -72777,6 +73112,7 @@ mod tests {
                 sample_values: vec!["1".to_string()],
                 notes: String::new(),
                 row_count: 2,
+                numeric_stats: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -72787,6 +73123,7 @@ mod tests {
                 sample_values: vec!["a@example.com".to_string()],
                 notes: "matches email address format".to_string(),
                 row_count: 2,
+                numeric_stats: None,
             },
         ];
         let dir = std::env::temp_dir().join(format!(
@@ -72844,6 +73181,7 @@ mod tests {
             sample_values: vec!["1".to_string()],
             notes: String::new(),
             row_count: 1,
+            numeric_stats: None,
         }];
         let dir = std::env::temp_dir().join(format!(
             "sniff-rs-sql-inline-trailing-newline-test-{}",

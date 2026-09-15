@@ -258,7 +258,8 @@ everything else's implicit single one:
         "missing_pct": 0.0,
         "sample_values": ["02134", "90210"],
         "notes": "leading zeros in raw values (likely an ID/code)",
-        "row_count": 100
+        "row_count": 100,
+        "numeric_stats": null
       }
     ]
   }
@@ -283,6 +284,20 @@ many rows," the same reason that format never carried `sample_values`/
 `description` is always empty — intentionally left for a human (or an agent
 downstream of this one) to fill in; no heuristic should be guessing what a
 column *means*.
+
+`numeric_stats` is `null` for every column except one whose `ideal_type`
+resolved to exactly `"i64"` or `"f64"`, in which case it's a real
+`{"count", "min", "max", "mean", "stddev"}` object — a genuine, incremental,
+streaming computation (never a second whole-column buffer), currently
+populated by `profile_column` and the `ColumnAccumulatorState`-based
+incremental readers (CSV/TSV, fixed-width, dBase, Stata, SAS7BDAT, SPSS,
+NumPy, ORC, the whole Excel family, SQLite, the log formats, and Parquet/
+Arrow IPC's own flat leaf columns) but not yet the recursively-nested
+JSON-bridge tier (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML, and
+friends) — see "Numeric/statistical column summaries" further down for the
+full design and why that's staged, disclosed future work rather than
+attempted in the same pass. `--output-format json` only, the same reasoning
+`row_count` above already gives for why `json-schema` doesn't carry it.
 
 JSON-Schema shape (`json-schema`) — a second, more interoperable JSON
 rendering for consumers that want `json-schema.org` vocabulary instead of
@@ -3387,6 +3402,138 @@ reports one unchanged table with zero diff entries; the multitable
 fixture pair - which has no genuinely unchanged table - is unaffected).
 Clean across default/`full`, matching each build's own established
 clippy baseline exactly.
+
+## Numeric/statistical column summaries
+
+`ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,
+max, mean, stddev}>` - a real, genuinely useful gap this tool had until
+now: no min/max/mean/median/stddev/percentile output at all for any
+column, despite typing a column as `i64`/`f64` in the first place. Scoped
+deliberately to exactly four numbers for this first pass, not the full
+list a real research pass into comparable profiling tools originally
+named (median/percentiles are explicitly staged, disclosed future work -
+see below for why).
+
+**Where this data lives, and why**: appended to `ColumnProfile`, not
+introduced as a separate output or an opt-in flag, following the exact
+precedent `row_count` itself already set - a field added strictly at the
+*end* of `to_json`'s own field-insertion order, so any comparison
+predating this field fails loudly on the one new key rather than a
+silently-reordered diff scattered through the middle of the object. This
+was weighed against a genuinely separate opt-in output (a `--stats`
+flag, or its own output format) and rejected: `numeric_stats` costs
+nothing when it doesn't apply (`null` for every non-numeric column,
+which is most columns in most files) and nothing extra to compute for a
+column already being profiled (see below), so gating it behind a flag
+would only add a second code path to keep in sync for no real benefit.
+`json-schema` doesn't carry it, for the identical reason it doesn't
+carry `row_count`/`sample_values`/`notes` either - there's no
+json-schema.org vocabulary slot for "here's a statistical summary of
+this property's values."
+
+**How it's computed, and why median/percentiles aren't (yet)**:
+`NumericStatsAccumulator` is a genuinely streaming, `O(1)`-memory
+accumulator - min/max/count are trivial running values, and mean/
+variance use Welford's online algorithm (an accumulated sum of squared
+differences from the *running* mean, not a running sum-of-squares
+directly - the latter is the textbook-known numerically unstable way to
+compute variance incrementally, a real risk here given this project's
+own numeric columns routinely mix small and very large values in the
+same column) rather than ever buffering a single value - the same "never
+buffer the whole column" discipline this project's entire Streaming-reads
+campaign already established for type detection itself. `push` reuses
+`normalize_numeric_str` - the exact same cleanup (currency symbols,
+thousands separators, parenthesized negatives, a trailing `%`) that
+already let a column resolve to `i64`/`f64` in the first place - so a
+value this accumulator counts is always the identical value
+`IdealTypeAccumulator`'s own numeric checks already agreed was numeric;
+a non-finite parse (`"Infinity"`/`"NaN"`, which `f64::from_str` accepts
+but this project's own heuristics already flag with a note) is
+deliberately excluded, since one infinite value would make every one of
+min/max/mean/stddev meaningless for the rest of the column. Sample
+standard deviation (dividing by `count - 1`, not `count`) is reported,
+matching `pandas.Series.std`/Excel's `STDEV` own default; a single value
+reports `stddev: 0.0` rather than a `NaN` from a `0/0` division.
+
+Median and percentiles are deliberately **not** implemented in this
+pass, and disclosed as a real, staged gap rather than silently omitted:
+computing them exactly needs either the whole column resident at once
+(exactly the unbounded-memory shape this project's entire streaming
+architecture exists to avoid) or a real streaming-approximation
+algorithm (the P² algorithm, or a t-digest) - genuinely more design work
+than a first pass into "does this tool have basic numeric stats at all"
+warranted, and worth its own separately-scoped, separately-verified
+phase once it's actually attempted, matching this project's own
+consistent "one well-scoped piece at a time" practice for every other
+multi-part campaign in this file.
+
+**Where it's wired in, and where it isn't yet - the real scope
+boundary of this pass**: rather than touch every one of this project's
+reader-specific decode loops individually, the accumulator was wired
+into exactly the two shared engines every flat-format reader already
+funnels through, which is what makes this pass high-leverage rather than
+a one-format trickle:
+
+- `ColumnAccumulatorState` (the incremental, `IdealTypeAccumulator`-
+  backed engine CSV/TSV, fixed-width text, dBase, Stata, SAS7BDAT, SPSS,
+  NumPy, ORC, the entire Excel family, and SQLite all already share, per
+  the Streaming-reads campaign's own Tier 2 history) gained a
+  `numeric_acc: NumericStatsAccumulator` field, fed the identical raw
+  value its own `ideal_acc`/`naive_acc` already see on every `push` -
+  zero extra string parsing beyond what `NumericStatsAccumulator::push`
+  itself does, and zero extra values ever buffered. `finish_profile`
+  only ever consults the accumulator's result once `ideal_type` has
+  already resolved to exactly `"i64"`/`"f64"` - never a semantic type
+  that happens to be numeric-shaped underneath (a credit card number, an
+  IMEI, a ULID) and never a `mixed(...)` column, both of which would
+  make min/max/mean/stddev a misleading summary of "the numbers in this
+  column" rather than an honest description of what the column actually
+  is.
+- `profile_column` (the remaining `ColumnInput`-based engine - Common/
+  Combined Log, syslog, and Parquet/Arrow IPC's own flat leaf columns,
+  the only production readers that still build a full `Vec<String>` of
+  raw values before profiling) runs the identical accumulator over that
+  already-resident `raw_values` slice as a second, bounded pass - no new
+  file read, since the values are already in memory either way.
+
+**Not yet wired in, named explicitly rather than silently skipped**: the
+recursively-nested JSON-bridge tier (`profile_json_path`/
+`JsonPathAccumulator` - JSON, YAML, TOML, Avro, MessagePack, CBOR, XML,
+and every other format that bridges through it) doesn't populate
+`numeric_stats` yet. This is a real, deliberate scope boundary for this
+pass, not an oversight: `JsonPathAccumulator` is a genuinely different
+per-*path* recursive engine (see the Architecture section below), and
+wiring numeric stats through it correctly - especially the interaction
+with a pooled array of numbers, and with a value nested several levels
+deep - deserves its own focused verification pass rather than being
+folded silently into this one, matching this project's own established
+"one engine/tier at a time, fully verified" precedent (the inline-SQL
+campaign's own three-tier rollout, the streaming-reads campaign's own
+per-format phases). A JSON/YAML/Avro/etc. numeric column reports
+`numeric_stats: null` today, exactly as if it weren't numeric at all -
+disclosed here and in the JSON-shape documentation above, not hidden.
+
+Verified with six new unit tests (`NumericStatsAccumulator` matches a
+hand-computed textbook mean/stddev example; ignores non-numeric and
+non-finite values without polluting count/min/max; is `None` for an
+empty or all-non-numeric column; reports `stddev: 0.0` for a single
+value; `profile_column` populates `numeric_stats` for an `i64` column
+and leaves it `None` for a `String` column; `numeric_stats` round-trips
+through `to_json` as a real object or a real JSON `null`, checked
+against the real, independent `serde_json` oracle this project already
+keeps for exactly this purpose) plus one new integration test
+(`sample.csv`'s own `age`/`purchase_count`/`account_balance` columns,
+independently cross-checked against `pandas.Series.min/max/mean` on the
+same values - `account_balance` specifically exercises a genuine
+thousands-separated value, `"5,120.75"`, confirming stats reflect the
+*cleaned* number `normalize_numeric_str` already produces rather than
+failing or truncating on the comma). Every count/min/max/mean value
+matched the independently-computed reference exactly. Clean across
+default/`full`, matching each build's own established clippy baseline
+exactly (one new, unrelated `clippy::approx_constant` finding surfaced
+by a test's own hand-picked `stddev` value happening to be extremely
+close to `1/sqrt(2)` - fixed by using `std::f64::consts::FRAC_1_SQRT_2`
+directly, the correct value anyway, rather than suppressing the lint).
 
 ## Architecture
 

@@ -2836,6 +2836,42 @@ fn json_output_reports_an_independent_row_count_per_table() {
 }
 
 #[test]
+fn json_output_reports_numeric_stats_for_i64_and_f64_columns_only() {
+    let doc = run_json("sample.csv", &[]);
+    let cols = table(&doc, "sample");
+
+    // A non-numeric column always carries a real, present `numeric_stats`
+    // key - just `null` - never an omitted one.
+    let user_id = column(cols, "user_id");
+    assert_eq!(user_id["ideal_type"], "String");
+    assert!(user_id["numeric_stats"].is_null());
+
+    // `age` is i64 with one genuinely missing value (4 of 5 rows) -
+    // min/max/mean checked against real, independently-computed values
+    // (`pandas.Series.min/max/mean` on the same non-null values).
+    let age = column(cols, "age");
+    assert_eq!(age["ideal_type"], "i64");
+    let age_stats = &age["numeric_stats"];
+    assert_eq!(age_stats["count"], 4);
+    assert_eq!(age_stats["min"], 29.0);
+    assert_eq!(age_stats["max"], 52.0);
+    assert_eq!(age_stats["mean"], 40.0);
+
+    // `account_balance` is f64 and includes a thousands-separated value
+    // ("5,120.75") - stats must reflect the *cleaned* number
+    // (normalize_numeric_str's own output), not fail or truncate on the
+    // comma, and must agree with the real value independently recomputed
+    // by hand (1250.50, 340.00, 5120.75, 89.20, 12000.00).
+    let balance = column(cols, "account_balance");
+    assert_eq!(balance["ideal_type"], "f64");
+    let balance_stats = &balance["numeric_stats"];
+    assert_eq!(balance_stats["count"], 5);
+    assert_eq!(balance_stats["min"], 89.2);
+    assert_eq!(balance_stats["max"], 12000.0);
+    assert!((balance_stats["mean"].as_f64().unwrap() - 3760.09).abs() < 1e-9);
+}
+
+#[test]
 fn unrecognized_extension_gives_an_actionable_error_not_a_panic() {
     let output = Command::new(bin())
         .args(["/dev/null.mystery"])
