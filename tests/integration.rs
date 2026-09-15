@@ -10922,14 +10922,23 @@ fn diff_help_flag_prints_usage_and_exits_cleanly() {
 }
 
 #[test]
-fn diff_malformed_no_tables_json_is_a_clear_error() {
+fn diff_json_with_no_tables_key_is_treated_as_raw_data_to_profile() {
+    // `diff_malformed_no_tables.json` ({"foo": "bar", "not_a_dictionary":
+    // true}) is well-formed JSON with no "tables" key - not a broken
+    // dictionary, just an ordinary JSON data file. `diff` now profiles
+    // it fresh (the same "diff accepts a raw data file" capability
+    // proven directly below) instead of rejecting it.
     let output = run_diff_raw(&[
         fixture("diff_malformed_no_tables.json").to_str().unwrap(),
         fixture("diff_old.json").to_str().unwrap(),
     ]);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("\"tables\""));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("foo") && report.contains("column"));
 }
 
 #[test]
@@ -10982,4 +10991,81 @@ fn diff_malformed_column_missing_name_is_a_clear_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("missing a string \"name\" field"));
+}
+
+// --- `sniff-rs diff` accepting a raw data file directly, not just a
+// pre-generated --output-format json dictionary ---
+
+#[test]
+fn diff_accepts_two_raw_csv_files_directly_with_no_pregenerated_json() {
+    let dir = TempDir::new();
+    let old = dir.path().join("old.csv");
+    let new = dir.path().join("new.csv");
+    std::fs::write(
+        &old,
+        "id,name,email\n1,alice,alice@example.com\n2,bob,bob@example.com\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &new,
+        "id,full_name,email\n1,alice,alice@example.com\n2,bob,bob@example.com\n",
+    )
+    .unwrap();
+
+    let output = run_diff_raw(&[old.to_str().unwrap(), new.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        report.contains("name -> full_name") && report.contains("possible rename"),
+        "expected a real rename detected straight from two raw CSV files:\n{report}"
+    );
+}
+
+#[test]
+fn diff_accepts_a_mix_of_a_dictionary_and_a_raw_file() {
+    let dir = TempDir::new();
+    let old_csv = dir.path().join("old.csv");
+    let new_csv = dir.path().join("new.csv");
+    std::fs::write(&old_csv, "id,name\n1,alice\n2,bob\n").unwrap();
+    std::fs::write(&new_csv, "id,name,email\n1,alice,a@x.com\n2,bob,b@x.com\n").unwrap();
+    let old_json = write_dictionary(dir.path(), "old_pre.csv", "id,name\n1,alice\n2,bob\n");
+
+    let output = run_diff_raw(&[old_json.to_str().unwrap(), new_csv.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("email") && report.contains("column added"));
+    let _ = old_csv; // only used to make the fixture pair explicit; not a diff input here
+}
+
+// A compressed (.json.gz) dictionary input is deliberately not covered
+// by an automated test here - this project has no gzip *encoder*
+// anywhere (only the hand-rolled decoder `--features zstd`/gzip
+// support needs), and spawning a real `gzip` CLI to build one on the
+// fly would add an external-tool dependency this test suite doesn't
+// otherwise have (matching the same "don't assume a tool is on PATH"
+// discipline already applied to `--load-into`'s own real-database-CLI
+// tests). Verified manually instead: `sniff-rs diff old.json.gz new.csv`
+// against a real gzip-compressed dictionary correctly decompressed it
+// and diffed against the raw CSV - the exact case a real bug (this
+// function's own `read_path` vs. `path` mixup, caught before shipping)
+// would otherwise still be silently broken by.
+
+#[test]
+fn diff_rejects_a_directory_input_with_an_actionable_error() {
+    let dir = TempDir::new();
+    let output = run_diff_raw(&[
+        dir.path().to_str().unwrap(),
+        fixture("diff_old.json").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is a directory") && stderr.contains("--combine"));
 }

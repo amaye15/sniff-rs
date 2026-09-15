@@ -2829,15 +2829,16 @@ cost: a file or directory literally named `diff` now needs a `./diff`
 prefix to be profiled unambiguously - the same tradeoff every
 subcommand-based CLI (git, cargo, npm) already accepts.
 
-`<OLD>`/`<NEW>` are two already-generated `--output-format json`
-dictionaries (this tool's own rich JSON shape, or the `--combine`
-directory shape - both share the identical `"tables": {name: [...]}}`
-structure) - not raw data files. Diffing is a second, independent pass
-over already-profiled output, the same "read once, act on the result"
-separation this tool's own SQL-mode/combine features already keep
-between profiling and rendering. A `--output-format json-schema` document
-(no per-column array, just a `properties` object) is a clear, disclosed
-error naming the shape mismatch rather than a guess.
+`<OLD>`/`<NEW>` may each independently be an already-generated
+`--output-format json` dictionary (this tool's own rich JSON shape, or
+the `--combine` directory shape - both share the identical `"tables":
+{name: [...]}}` structure) **or a raw data file**, profiled fresh with
+default settings - see `load_diff_input`'s own writeup further down for
+the full design of this later addition. A `--output-format json-schema`
+document (no per-column array, just a `properties` object) is a clear,
+disclosed error naming the shape mismatch rather than a guess, since
+it's neither a real dictionary nor a format sniff-rs would ever profile
+as raw data on its own terms.
 
 **Scope was settled after researching how real schema-evolution/
 compatibility systems actually work** - Confluent Schema Registry's
@@ -3197,6 +3198,76 @@ streaming audit of `sniff-rs diff` and its surrounding `--combine`
 machinery is complete - every code path this feature touches has now
 been measured against a real or realistic large input at least once, not
 just left un-profiled the way it was at the start of this audit.
+
+**`sniff-rs diff` accepts a raw data file directly, not just an already-
+generated dictionary - the biggest real usability gap the feature
+shipped with, closed in a follow-up pass.** Before this, comparing two
+data files meant running `sniff-rs` twice by hand first just to get two
+`--output-format json` dictionaries to hand to `diff` - real, avoidable
+friction for the single most common real use case (comparing two
+snapshots of the same data). `load_diff_input` is the new per-side
+entry point `run_diff` calls for both `<OLD>` and `<NEW>` independently:
+
+- Decompresses (`.gz`/`.zst`) and detects the file's format exactly once,
+  reusing this project's own existing `decompress_if_needed`/
+  `detect_format` - the same pipeline `run_single_file` already runs for
+  a plain `sniff-rs <path>` invocation.
+- Only a file whose *detected format is JSON* is ever even considered as
+  a possible dictionary - every other format can never be one, since a
+  dictionary is always JSON by construction. For those, `try_load_
+  dictionary_tables` (the renamed, `Option`-returning core of the
+  original streaming loader) is tried first; a well-formed JSON document
+  with no `"tables"` key at all returns `Ok(None)` rather than an
+  error - it's ordinary JSON data, not a broken dictionary, so it falls
+  through to being profiled fresh exactly like any other format.
+- `profile_raw_file_as_diff_columns` profiles a real data file with the
+  same defaults a bare `sniff-rs <path>` (no extra flags) would use -
+  `--samples 3`, no `--nrows` limit, auto-detected format - by calling
+  `dispatch_reader` directly and converting its `ColumnProfile`s straight
+  into `DiffColumn`s, with **no JSON round-trip at all**: the whole point
+  of accepting a raw file is skipping the "write a dictionary, then read
+  it back" detour entirely. A caller needing `--nrows`/`--delimiter`/
+  `--format` control on one side can still pre-generate an explicit
+  `--output-format json` dictionary with those flags and hand that to
+  `diff` instead - this addition is strictly additive, no existing
+  workflow changed.
+
+**A real bug was caught before this shipped, not found in production**:
+the first draft called `try_load_dictionary_tables` with the *original*
+input path rather than the already-decompressed one `load_diff_input`
+had just resolved for format detection - meaning a genuine `.json.gz`
+dictionary would fail outright, since its own raw bytes on disk are
+still gzip-compressed binary, not JSON text. Caught by reading the two
+functions' own parameter lists side by side before trusting the wiring,
+the same "verify the plumbing, don't assume it's right because it
+compiles" discipline this project applies to every hand-rolled reader -
+fixed by threading the already-resolved `read_path` through explicitly,
+confirmed via a manual test against a real `.json.gz` dictionary
+(a compressed dictionary input has no automated test, deliberately - see
+below).
+
+Directory inputs are rejected with an actionable error naming the
+`--combine`-based workaround (profile each directory to its own JSON
+first, then diff those) rather than attempting `decompress_if_needed` on
+a directory and failing confusingly.
+
+Verified with new integration tests: two raw CSV files diffed directly
+with zero pre-generated JSON, a real dictionary mixed with a raw file on
+the other side, a directory input's own actionable error, and the
+existing "no tables key" malformed-dictionary test rewritten to assert
+its new, correct behavior (profiled as data, not rejected) rather than
+the old, now-superseded "always an error" expectation - every other
+existing malformed-dictionary test (invalid JSON, `"tables"` present but
+the wrong shape, a bad column entry) still fires the identical error
+unchanged, since those are all genuine `Err` cases this design never
+reinterprets as "just try profiling it instead." A compressed (`.json.gz`)
+dictionary input has no automated test - this project has no gzip
+*encoder* anywhere (only the hand-rolled decoder), and spawning a real
+`gzip` CLI to build one on the fly would add an external-tool dependency
+this test suite doesn't otherwise carry - verified manually instead, the
+same standing precedent `--load-into`'s own real-subprocess behavior
+already follows. Clean across default/`full`, matching each build's own
+established clippy baseline exactly.
 
 ## Architecture
 

@@ -3168,10 +3168,11 @@ USAGE:
     run; a file whose format can't be identified at all is skipped and
     noted, not treated as a failure.
 
-    `sniff-rs diff` compares two --output-format json dictionaries and
-    flags schema drift (added/removed/renamed columns, type changes,
-    missing-% shifts), classifying each change safe or breaking - a file
-    or directory literally named "diff" needs a "./diff" prefix to be
+    `sniff-rs diff` compares two --output-format json dictionaries, or
+    two raw data files (profiled fresh), or a mix of the two, and flags
+    schema drift (added/removed/renamed columns, type changes, missing-%
+    shifts), classifying each change safe or breaking - a file or
+    directory literally named "diff" needs a "./diff" prefix to be
     profiled instead of triggering this subcommand.
 
 ARGS:
@@ -63539,15 +63540,29 @@ impl DiffColumn {
 /// chain and prefix it with a misleading "is not valid JSON" (the
 /// document *is* valid JSON; it's just the wrong shape), so the real
 /// `Error` is captured here and returned directly instead.
-fn load_dictionary_tables(path: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
-    let file = fs::File::open(path).with_context(|| format!("failed to read {path:?}"))?;
+/// `Ok(None)` iff the top-level document is well-formed JSON but simply
+/// has no `"tables"` key at all - not this function's own error to
+/// raise, since `load_diff_input` (below) treats that case as "this is
+/// ordinary JSON data to profile fresh," not a broken dictionary. Every
+/// other failure (invalid JSON syntax, `"tables"` present but the wrong
+/// shape, a column that fails to parse) is a real `Err` - a genuinely
+/// malformed dictionary should never be silently reinterpreted as "just
+/// profile it as data instead," since that would likely fail anyway
+/// with a much less specific error, or silently succeed with output
+/// that has nothing to do with what the user actually meant to compare.
+fn try_load_dictionary_tables(
+    display_path: &Path,
+    read_path: &Path,
+) -> Result<Option<BTreeMap<String, Vec<DiffColumn>>>> {
+    let file =
+        fs::File::open(read_path).with_context(|| format!("failed to read {display_path:?}"))?;
     let mut tables: BTreeMap<String, Vec<DiffColumn>> = BTreeMap::new();
     let mut first_error: Option<Error> = None;
 
     let stream_result = json_support::stream_object_of_arrays(file, "tables", |name, cols| {
         let JsonValue::Array(items) = cols else {
             first_error = Some(anyhow!(
-                "{path:?}: table {name:?}'s own value isn't a JSON array of columns"
+                "{display_path:?}: table {name:?}'s own value isn't a JSON array of columns"
             ));
             return Err(json_support::ParseError::custom("not an array of columns"));
         };
@@ -63570,18 +63585,107 @@ fn load_dictionary_tables(path: &Path) -> Result<BTreeMap<String, Vec<DiffColumn
         Err(parse_err) => {
             return match first_error {
                 Some(e) => Err(e),
-                None => Err(parse_err).with_context(|| format!("{path:?} is not valid JSON")),
+                None => {
+                    Err(parse_err).with_context(|| format!("{display_path:?} is not valid JSON"))
+                }
             };
         }
     };
-    if !found {
+    Ok(if found { Some(tables) } else { None })
+}
+
+/// Profiles an already-decompressed, already-format-detected data file
+/// exactly the way a plain `sniff-rs <path>` invocation (no extra flags)
+/// would - default `--samples`/`--nrows` - then converts the result
+/// straight into `DiffColumn`s without ever round-tripping through
+/// `--output-format json` text at all. This is what lets `sniff-rs diff`
+/// accept a raw CSV/Parquet/SQLite/... file directly, not just an
+/// already-generated dictionary - a real, wanted convenience (comparing
+/// two data files shouldn't require running sniff-rs twice by hand
+/// first), scoped deliberately to the same defaults the bare CLI already
+/// uses: a caller who needs `--nrows`/`--delimiter`/`--format` control on
+/// one side can still pre-generate its own `--output-format json`
+/// dictionary explicitly and hand that to `diff` instead, exactly as
+/// before. Takes `read_path`/`logical_path`/`format` already resolved by
+/// the caller (`load_diff_input`) rather than re-running `decompress_if_
+/// needed`/`detect_format` itself - `load_diff_input` already needed
+/// both to decide whether this file could even be a dictionary in the
+/// first place, so redoing them here would both waste a second real
+/// decompression pass on a `.gz`/`.zst` input and risk disagreeing with
+/// that earlier decision.
+fn profile_raw_file_as_diff_columns(
+    display_path: &Path,
+    read_path: &Path,
+    logical_path: &Path,
+    format: InputFormat,
+) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
+    let synthetic_args = Args {
+        input_path: display_path.to_path_buf(),
+        output_path: None,
+        output_dir: None,
+        samples: 3,
+        nrows: None,
+        format: None,
+        delimiter: None,
+        skip_rows: None,
+        widths: None,
+        output_format: "json".to_string(),
+        sql_mode: None,
+        load_into: None,
+        combine: false,
+    };
+    let (tables, _resolved_skip_rows) =
+        dispatch_reader(read_path, logical_path, format, &synthetic_args)?;
+    Ok(tables
+        .into_iter()
+        .map(|(name, profiles)| {
+            let cols = profiles
+                .into_iter()
+                .map(|p| DiffColumn {
+                    name: p.name,
+                    current_type: p.current_type,
+                    ideal_type: p.ideal_type,
+                    missing_pct: p.missing_pct,
+                    sample_values: p.sample_values,
+                })
+                .collect();
+            (name, cols)
+        })
+        .collect())
+}
+
+/// `sniff-rs diff`'s own per-side input resolution: `<OLD>`/`<NEW>` may
+/// each independently be an already-generated `--output-format json`
+/// dictionary *or* a raw data file to profile fresh - mixing the two
+/// (an old, saved dictionary against today's live data file) works too.
+/// Only a file whose own detected format is JSON is ever even considered
+/// as a possible dictionary at all (every other format can never be one,
+/// by construction - a dictionary is always JSON); within that, a well-
+/// formed JSON document with no `"tables"` key is ordinary JSON data,
+/// profiled the same as any other format, not an error. A `.gz`/`.zst`-
+/// compressed dictionary or data file is decompressed exactly once,
+/// up front, and the same resolved `read_path` is reused by whichever
+/// branch actually needs it - trying to re-open the *original* (still
+/// compressed) path a second time inside `try_load_dictionary_tables`
+/// was a real bug caught before this shipped, not a hypothetical one:
+/// a `.json.gz` dictionary would otherwise fail to parse as JSON at all,
+/// since its own raw bytes are still gzip-compressed binary.
+fn load_diff_input(path: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
+    if path.is_dir() {
         bail!(
-            "{path:?} has no top-level \"tables\" object - `sniff-rs diff` compares two \
-             --output-format json dictionaries (this tool's own rich JSON shape), not a raw \
-             data file or a --output-format json-schema document"
+            "{path:?} is a directory - `sniff-rs diff` compares two files. To compare two \
+             --combine directory snapshots, run `sniff-rs <dir> --combine --output-format json \
+             <out.json>` on each one first, then diff the two resulting files"
         );
     }
-    Ok(tables)
+    let (read_path, logical_path, _decompressed_tmp) = decompress_if_needed(path)?;
+    let format = detect_format(&read_path, &logical_path, &None)?;
+    if matches!(format, InputFormat::Json)
+        && let Some(tables) = try_load_dictionary_tables(path, &read_path)?
+    {
+        return Ok(tables);
+    }
+    profile_raw_file_as_diff_columns(path, &read_path, &logical_path, format)
 }
 
 /// Whether a diff entry is safe to auto-generate a resolution statement
@@ -64306,14 +64410,19 @@ const DIFF_HELP_TEXT: &str = r#"sniff-rs diff - compare two data dictionaries an
 USAGE:
     sniff-rs diff <OLD> <NEW> [OUTPUT_PATH] [OPTIONS]
 
-    <OLD>/<NEW> are two --output-format json dictionaries (this tool's
-    own rich JSON shape, or the --combine directory shape) - not raw
-    data files. Run sniff-rs twice first (once per snapshot) if you only
-    have the original data.
+    <OLD>/<NEW> may each independently be an already-generated
+    --output-format json dictionary (this tool's own rich JSON shape, or
+    the --combine directory shape) OR a raw data file (csv, parquet,
+    sqlite, ... - anything sniff-rs already reads), profiled fresh with
+    default settings (--samples 3, no --nrows limit, auto-detected
+    format). Mixing the two - an old saved dictionary against today's
+    live data file - works too. A raw file needing --nrows/--delimiter/
+    --format control should be pre-profiled explicitly with those flags
+    first; hand the resulting --output-format json file to diff instead.
 
 ARGS:
-    <OLD>                   The earlier dictionary
-    <NEW>                   The later dictionary
+    <OLD>                   The earlier dictionary or data file
+    <NEW>                   The later dictionary or data file
     [OUTPUT_PATH]           Where the diff report is written (default:
                             stdout). Pass "-" to write to stdout explicitly.
 
@@ -64432,8 +64541,8 @@ fn run_diff(raw: &[String]) -> Result<()> {
     let args = DiffArgs::parse_from(raw)?;
     let output_format = DiffOutputFormat::parse(&args.output_format)?;
 
-    let old_tables = load_dictionary_tables(&args.old_path)?;
-    let new_tables = load_dictionary_tables(&args.new_path)?;
+    let old_tables = load_diff_input(&args.old_path)?;
+    let new_tables = load_diff_input(&args.new_path)?;
     let report = diff_dictionaries(&old_tables, &new_tables);
 
     let rendered = match output_format {
