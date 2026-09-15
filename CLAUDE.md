@@ -321,8 +321,9 @@ fixed-column, one-row-per-record tier - CSV, TSV, fixed-width text,
 Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
-`.xlsb`/`.ods`). Every other format transparently falls back to `staging`
-with a disclosed stderr
+`.xlsb`/`.ods`) - plus JSON/JSON Lines, the first format in the
+recursively-nested, JSON-bridge tier. Every other format transparently
+falls back to `staging` with a disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
 asked for would be the wrong kind of quiet).
@@ -364,16 +365,22 @@ needs its own real design, not just repeating the same pattern:
    genuinely different blank-row-reconstruction strategies for ODS's
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
-3. **The recursively-nested, JSON-bridge tier** (JSON, YAML, TOML, Avro,
-   MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
-   iCalendar, MBOX) - the hardest tier: there's no existing function that
-   flattens a *single* record into a flat row matching the dot-notation
-   column set `JsonPathAccumulator` already produces (that accumulator
-   only ever absorbs values incrementally across *all* records at once).
-   A pooled array column (`Vec<T>`) is also fundamentally one-to-many
-   relative to its parent record, not one more scalar cell, and needs a
-   settled text serialization for a single row's own cell before this
-   tier can start.
+3. **The recursively-nested, JSON-bridge tier - JSON done as of Phase 13,
+   the hardest tier's own first format.** Unlike the two tiers above,
+   there was no existing function that flattens a *single* record into a
+   flat row matching the dot-notation column set `JsonPathAccumulator`
+   already produces (that accumulator only ever absorbs values
+   incrementally across *all* records at once) - `json_extract_value_
+   for_sql` is the new one, walking a record's own dot path directly
+   rather than re-deriving anything from the accumulator. The pooled-
+   array design question this tier's own roadmap entry used to leave
+   open is settled too: a `Vec<T>` column (scalar leaves only - see
+   below) serializes as one JSON-array-shaped text literal per row
+   (`["a","b"]`, via this project's own `Value` `Display` impl) - the
+   same "keep it as text, no fabricated relational shape" choice
+   staging mode's own `Vec<T>`/`mixed(...)` columns already make.
+   YAML, TOML, Avro, MessagePack, CBOR, XML, BSON, plist, JSON5, HAR,
+   GeoJSON, vCard, iCalendar, and MBOX remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1214,14 +1221,145 @@ findings from a newer clippy version, confirmed identical on unmodified
 
 **With Phase 12, the entire multi-table tier is done**: SQLite, `.npz`,
 INI, and now the whole Excel family (`.xlsx`/`.xls`/`.xlsb`/`.ods`) all
-support `--sql-mode inline`. Only the recursively-nested, JSON-bridge
-tier (JSON, YAML, TOML, Avro, MessagePack, CBOR, XML, BSON, plist,
-JSON5, HAR, GeoJSON, vCard, iCalendar, MBOX) remains - the hardest tier,
-needing a brand-new single-record flattener (nothing today flattens one
-record into a flat row matching `JsonPathAccumulator`'s dot-notation
-columns) plus a decision on how a pooled `Vec<T>` column serializes into
-one row's cell (see this section's own tiered roadmap above for the
-full accounting of what each format in this tier still needs).
+support `--sql-mode inline`.
+
+**Phase 13: JSON/JSON Lines - the first format in the recursively-nested,
+JSON-bridge tier, and a genuinely different problem from either tier
+before it.** Every earlier format in this campaign already decoded one
+row's worth of values together before folding them into
+`ColumnAccumulatorState`; JSON's own profiling engine
+(`JsonPathAccumulator`, see the Architecture section) never does that -
+it absorbs values incrementally *across all records at once*, so there
+was no existing function anywhere in this codebase that could answer
+"what does *this one record's* own flat row actually look like." This
+phase's real work was building that answer, `json_extract_value_for_sql`,
+plus settling the one open design question this tier's own roadmap entry
+used to leave unresolved: how a pooled `Vec<T>` array column serializes
+into a single row's cell.
+
+Two structural shapes genuinely can't round-trip through one scalar cell
+per record, and both are detectable directly from the already-completed
+`profiles` list - no need to re-walk the JSON tree a third time just to
+find them:
+
+- **An array of objects** (`ideal_type == "Vec<struct>"` -
+  `JsonPathAccumulator::finish`'s own `wrap("struct")` branch) is
+  genuinely one-to-many relative to its parent record - a real value
+  *count* that varies per record, not a single cell with one honest
+  answer.
+- **A value that's sometimes a scalar and sometimes an object across
+  different records** (`finish`'s own "mix of scalars and objects"
+  branch, flagged by its distinctive note text) has no single SQL type
+  that represents both shapes honestly.
+
+`json_inline_blocking_column` scans the profiled column list once, up
+front, for either shape - the same "no data to emit" boundary SQLite's
+own `WITHOUT ROWID` check, ORC's own nested-column check, and INI's own
+repeated-key check already established, just reached here by reading
+already-computed `ColumnProfile` fields rather than a fresh check against
+the file. A file with either shape gets a clear, actionable error naming
+the offending field and pointing at `--sql-mode staging`, matching every
+other tier's own precedent (`nested_typed.jsonl`'s own real `events`
+array-of-objects field is exactly this case, confirmed directly). A
+plain, non-array nested object (`ideal_type == "struct"`) is *not*
+blocking - it's a pure flattening label with no scalar value of its own
+to embed (`json_column_is_emittable` excludes it from the emitted column
+list entirely, the same way it never gets a literal in the profiled
+output either), transparent to walk through on the way to its own
+dot-notation children.
+
+Once a file clears that check, `json_extract_value_for_sql` resolves one
+column's value for one record by walking its dot-separated path - safe
+to assume every intermediate segment is a plain object, never an array,
+since the upfront check has already ruled out every `Vec<struct>` column
+anywhere in the table. `None` means genuinely missing (an absent key or
+an explicit JSON `null` at any segment, including the whole record
+itself) - real, already-resolved missingness, so `InlineRowSink::
+values_pre_resolved` applies to JSON exactly the way it already does to
+every other native-null format in this campaign, with zero sentinel-
+guessing needed. A pooled-array column gathers every non-null leaf
+reachable at its own final segment - flattening any further nesting,
+matching `JsonPathAccumulator::absorb`'s own array walk - into one
+JSON-array-shaped text literal; a record whose own value there is a bare
+scalar rather than an array (`unwrap_arrays` already pools both shapes
+into the same column) is wrapped as a one-element array first, so every
+row of the column shares one consistent textual shape regardless of
+which shape that particular record happened to use.
+
+Records-mode (every top-level value a plain object, columns named
+directly off object keys - `JsonRecordStreamProfiler::finish`'s own
+"all_objects" shortcut) versus single-`value`-column mode (every column
+name is `"value"` or `"value.*"`, and the record itself *is* the wrapped
+value) only changes how the *first* path segment resolves; walking
+deeper is identical either way, and which mode applies is inferred
+directly from the already-profiled column names (every name sharing the
+`"value"`/`"value."` prefix means single-value mode) rather than
+re-deriving it from a second pass over the file.
+
+`stream_json_rows_for_sql` re-parses `read_path` a second time through
+the exact same three-way dispatch `columns_from_json` already uses (JSON
+Lines / a top-level array / a single document). The JSON-Lines branch
+gets the same real-I/O-bounding early stop every other line-oriented
+row-source in this campaign already has; the array/single-document
+branch, driven by `json_support::stream_top_level`, has no early-stop
+signal of its own (the same disclosed whole-scan exception `stream_json_
+document`'s own Pass 1 already has for this branch) - matching dBase's
+own "decode every record regardless of `--nrows`, keep only conditionally"
+convention instead, since `InlineRowSink::accept` already silently caps
+what's kept once the limit is reached. `ColumnProfile` gained a plain
+`#[derive(Clone)]` - a genuinely new need this phase introduced, since
+`render_sql_inline_flat` now builds an owned, struct-column-filtered copy
+of the profile list before the rest of its own already-shared code runs;
+every field on that type is a plain owned scalar/`String`/`Vec<String>`,
+so this is a cheap, safe derive, not a design change.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: a hand-built fixture (`edge_json_sql_inline_flat.jsonl`, three
+records mixing a plain scalar field, a genuinely null field, a pooled
+scalar array of varying length including a genuinely empty array, and a
+nested object) confirmed every real value survives intact, the nested
+object never gets a column of its own while its `.score`/`.active`
+children do, the pooled array renders as real JSON-array text
+(`'["red","blue"]'`, `'[]'`), and the null email lands as a genuine SQL
+`NULL` - checked directly against the loaded database, not just the
+generated text. `edge_top_level_scalar_array.json` (a bare top-level
+array of scalars, one already-existing fixture) confirmed the single-
+`value`-column mode resolves correctly, including its own `null` element
+landing as `NULL`. `nested_typed.jsonl` (a real, already-committed
+fixture with a genuine array-of-objects field) confirmed the disclosed
+error fires and names the actual offending column (`events`), not a
+generic message. `--nrows` confirmed to bound the kept row count on both
+the JSON-Lines and top-level-array paths. Also verified as
+behavior-preserving for every already-shipped format: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-13 binary across
+the entire 177-file fixture corpus - JSON/JSONL themselves are
+necessarily excluded from that comparison, since this phase is exactly
+what changes their own output (from a `--sql-mode staging` fallback to
+real inline `INSERT`s). Clean across the default build and `--features
+full` (JSON needs no feature flag - it's one of the two always-on
+default formats), matching each one's own established clippy/fmt
+baseline exactly.
+
+Three of this campaign's existing tests that used to rely on JSON being
+inline-unsupported (the staging-mode-fallback test, its disclosed-
+stderr-note sibling, and the explicit-inline-mode-errors test) now use a
+YAML fixture instead, gated behind `--features yaml` - JSON graduating
+out of "unsupported" removed the only always-on example of a format
+inline mode doesn't yet handle, so these three necessarily became
+feature-gated rather than running unconditionally in the bare default
+build the way they used to.
+
+Remaining in the recursively-nested, JSON-bridge tier: YAML, TOML, Avro,
+MessagePack, CBOR, XML, BSON, plist, JSON5, HAR, GeoJSON, vCard,
+iCalendar, and MBOX - each bridges to the same `json_support::Value`
+shape JSON itself uses (see the Architecture section), so
+`json_extract_value_for_sql`/`json_inline_blocking_column` are already
+reusable as-is once each format's own row-source re-decodes its file a
+second time into that same `Value` tree; vCard/iCalendar/MBOX's own
+repeated-property pooling (a different mechanism from JSON's array
+pooling, but the identical one-cell-per-row question) is the one
+sub-family that will need its own fresh look before assuming the same
+machinery applies unchanged.
 
 ## Directory-input batch mode
 

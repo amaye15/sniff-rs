@@ -3778,6 +3778,12 @@ struct ColumnInput {
     skip_heuristics: bool,   // true for nested JSON (array/object) columns
 }
 
+// `Clone` is needed by `render_sql_inline_flat`'s own JSON-specific
+// column-filtering step (building an owned, struct-column-excluded
+// subset before the rest of that function's already-shared code runs) -
+// every field here is a plain owned scalar/String/Vec<String>, so this is
+// a cheap, safe derive, not a design change.
+#[derive(Clone)]
 struct ColumnProfile {
     name: String,
     current_type: String,
@@ -14392,6 +14398,264 @@ fn columns_from_json(
     // `Vec<Value>`, `truncate` to `--nrows`, then the all-object-records
     // vs. single-`value`-column branch".
     stream_json_document(path, nrows, n_samples)
+}
+
+/// A JSON-shaped `--sql-mode inline` table's own upfront "is there any
+/// column here with no honest single-cell literal" check, run once
+/// before a single row is emitted - the same "no data to emit" boundary
+/// SQLite's own `WITHOUT ROWID` check, ORC's own nested-column check, and
+/// INI's own repeated-key check already established, just reached here by
+/// scanning the already-profiled column list rather than re-parsing the
+/// schema a second time.
+///
+/// Two structural shapes can't honestly round-trip through one scalar
+/// cell per record, and both are detectable directly from a
+/// `ColumnProfile`'s own already-computed fields, with no need to re-walk
+/// the JSON tree: an array of objects (`ideal_type == "Vec<struct>"` -
+/// `JsonPathAccumulator::finish`'s own `wrap("struct")` branch, meaning
+/// *this* column's own value is genuinely one-to-many relative to its
+/// parent record, not a single cell), and a value that's sometimes a
+/// scalar and sometimes an object across different records (`finish`'s
+/// own "mix of scalars and objects" branch, flagged by its distinctive
+/// note text). A plain, non-array nested object (`ideal_type == "struct"`)
+/// is *not* blocking - it's a pure flattening label with no column of its
+/// own to emit at all (see `json_column_is_emittable`), transparent to
+/// walk through on the way to its own dot-notation children.
+fn json_inline_blocking_column(profiles: &[ColumnProfile]) -> Option<&str> {
+    profiles
+        .iter()
+        .find(|p| {
+            p.ideal_type == "Vec<struct>"
+                || p.notes.contains("object fields listed separately under")
+        })
+        .map(|p| p.name.as_str())
+}
+
+/// A pure, non-array nested-object column (`metadata`, say) exists only
+/// to label where its own dot-notation children came from - it has no
+/// scalar/array leaf value of its own to embed as a literal, so it never
+/// gets its own SQL column at all (only its flattened `metadata.*`
+/// children do). Every other `ideal_type` this engine produces - a plain
+/// scalar, a pooled scalar array (`Vec<i64>`, ...), even the always-empty
+/// `"empty"`/`"Vec<empty>"` case - has a real value worth embedding.
+fn json_column_is_emittable(p: &ColumnProfile) -> bool {
+    p.ideal_type != "struct"
+}
+
+/// Resolves one JSON-shaped `--sql-mode inline` column's own value for a
+/// single record. `records_mode` (every top-level value a plain object,
+/// so columns are named directly off object keys with no prefix - see
+/// `JsonRecordStreamProfiler::finish`) vs. single-`value`-column mode
+/// (every column name is `"value"` or `"value.*"`, and `record` *is* the
+/// wrapped value itself, not an object holding it under a `"value"` key)
+/// changes only how the *first* path segment is resolved; walking deeper
+/// is identical either way.
+///
+/// Every intermediate segment is safe to assume is a plain object, never
+/// an array, since `json_inline_blocking_column` has already ruled out
+/// every `Vec<struct>` column in the whole table before this is ever
+/// called - an array-of-objects segment, if one existed anywhere in the
+/// path, would already have aborted the render before any row was
+/// emitted. `None` means genuinely missing (an absent key or an explicit
+/// JSON `null` at any segment, including the whole record itself) - the
+/// same real, already-resolved missingness `InlineRowSink::
+/// values_pre_resolved` exists for, so this never needs to guess from
+/// rendered text the way CSV/fixed-width's own sentinel check does.
+///
+/// A pooled-array column (`is_array_column`, i.e. `ideal_type` starts
+/// with `"Vec<"`) gathers every non-null leaf reachable at its own final
+/// segment - flattening any further nesting, matching
+/// `JsonPathAccumulator::absorb`'s own array walk - into one JSON-array-
+/// shaped text literal (`["a","b"]`, via this project's own `Value`
+/// `Display` impl) rather than one scalar cell; a record whose own value
+/// there is a bare scalar rather than an array (`unwrap_arrays` already
+/// pools both shapes into the same column) is wrapped as a one-element
+/// array so every row of the column shares one consistent textual shape.
+/// There's no native SQL array type to lean on instead - the same "keep
+/// it as text, no fabricated relational shape" choice this project's own
+/// staging-mode `Vec<T>`/`mixed(...)` columns already make.
+fn json_extract_value_for_sql(
+    record: &JsonValue,
+    column_name: &str,
+    is_array_column: bool,
+    records_mode: bool,
+) -> Option<String> {
+    let rest: &str = if records_mode {
+        column_name
+    } else {
+        column_name.strip_prefix("value.").unwrap_or("")
+    };
+
+    let mut current = record;
+    if !rest.is_empty() {
+        for seg in rest.split('.') {
+            match current {
+                JsonValue::Object(map) => match map.get(seg) {
+                    Some(v) if !v.is_null() => current = v,
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+    }
+    if current.is_null() {
+        return None;
+    }
+
+    if is_array_column {
+        fn collect_leaves(v: &JsonValue, out: &mut Vec<JsonValue>) {
+            match v {
+                JsonValue::Array(items) => {
+                    for item in items {
+                        if !item.is_null() {
+                            collect_leaves(item, out);
+                        }
+                    }
+                }
+                other => out.push(other.clone()),
+            }
+        }
+        let mut leaves = Vec::new();
+        collect_leaves(current, &mut leaves);
+        return Some(JsonValue::Array(leaves).to_string());
+    }
+
+    Some(match current {
+        JsonValue::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::String(s) => s.clone(),
+        // Defensive, not expected to be reached: `json_inline_blocking_
+        // column` already rules out a column whose value is ever an
+        // object for a non-pooled-array column, and the `is_array_column`
+        // branch above already handles every genuine array - but if a
+        // future JSON-bridge format's own accumulator shape ever slips
+        // past that check, fall back to real JSON text instead of a
+        // panic, matching this project's zero-panic-on-real-data
+        // discipline everywhere else.
+        other => other.to_string(),
+    })
+}
+
+/// Extracts and folds one already-parsed top-level JSON record into
+/// `sink`, resolving every column in `columns` via
+/// `json_extract_value_for_sql`. A literal top-level `null` record still
+/// produces a real, all-`NULL` row (every column resolves to `None` for
+/// it) - the same "the row exists, its cells are just missing" treatment
+/// every other format's own missing-value handling already gives, not a
+/// skipped row. A free function rather than a closure specifically so
+/// `sink.done` can still be read from its own caller's loop condition
+/// without fighting the borrow checker over a second, simultaneous
+/// mutable borrow of `sink`.
+fn json_emit_row_for_sql(
+    record: &JsonValue,
+    columns: &[(String, bool)],
+    records_mode: bool,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let row: Vec<Option<String>> = columns
+        .iter()
+        .map(|(name, is_array)| json_extract_value_for_sql(record, name, *is_array, records_mode))
+        .collect();
+    sink.accept(row)
+}
+
+/// The JSON row-source for `render_sql_inline_flat` (Phase 13, the first
+/// format in the recursively-nested, JSON-bridge tier) - re-parses
+/// `read_path` a second time through the exact same three-way dispatch
+/// `columns_from_json` already uses (JSON Lines / a top-level array / a
+/// single document), feeding each parsed top-level record into
+/// `json_emit_row_for_sql` instead of into `JsonPathAccumulator`. Takes
+/// no `nrows` of its own - `InlineRowSink::accept`'s own `emitted >=
+/// nrows` cap already bounds what's kept, the same split every other
+/// "decode always, keep conditionally" row-source in this tier uses (see
+/// dBase's own entry in CLAUDE.md for why).
+fn stream_json_rows_for_sql(
+    read_path: &Path,
+    columns: &[(String, bool)],
+    records_mode: bool,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let Some(first_line) = first_non_blank_line(read_path)? else {
+        return Ok(());
+    };
+    if !first_line.trim_start().starts_with('[') && json_support::from_str(&first_line).is_ok() {
+        use std::io::BufRead;
+        let file =
+            fs::File::open(read_path).with_context(|| format!("failed to open {read_path:?}"))?;
+        for line in std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file).lines() {
+            if sink.done {
+                break;
+            }
+            let line = line.with_context(|| format!("failed to read {read_path:?}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value = json_support::from_str(&line)
+                .with_context(|| format!("failed to parse a line of {read_path:?} as JSON"))?;
+            json_emit_row_for_sql(&value, columns, records_mode, sink)?;
+        }
+        return Ok(());
+    }
+
+    // `stream_top_level`'s own callback has no early-stop signal (an
+    // array's elements are always all scanned - the same disclosed
+    // whole-scan exception `stream_json_document`'s own Pass 1 already
+    // has for this exact branch), so `--nrows` here works the same way
+    // it already does for dBase's own row-source: every element is still
+    // decoded and offered to `sink.accept`, which silently stops
+    // accumulating past the limit on its own; this loop just can't stop
+    // pulling further *elements* early. A fallible extraction can't use
+    // `?` directly inside a closure whose own return type is a different
+    // error type (`ParseError`, not this crate's `Error`), so the first
+    // real error is captured here and re-raised once the scan finishes.
+    let mut first_err: Option<Error> = None;
+    let file =
+        fs::File::open(read_path).with_context(|| format!("failed to open {read_path:?}"))?;
+    let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+    json_support::stream_top_level(reader, |v| {
+        if first_err.is_none()
+            && let Err(e) = json_emit_row_for_sql(&v, columns, records_mode, sink)
+        {
+            first_err = Some(e);
+        }
+        Ok(())
+    })
+    .with_context(|| format!("failed to parse {read_path:?} as JSON"))?;
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The JSON row-source wrapper for `render_sql_inline_flat` - resolves
+/// which columns are pooled-array columns and whether the file is in
+/// records mode (every column named directly off an object key) or
+/// single-`value`-column mode, then streams `read_path` a second time via
+/// `stream_json_rows_for_sql`. `render_sql_inline_flat` itself already
+/// ran `json_inline_blocking_column` (and filtered out every
+/// `json_column_is_emittable() == false` column) before ever
+/// constructing `InlineRowSink`, so every column reaching this function
+/// is guaranteed representable as one scalar or one JSON-array-text cell
+/// per record.
+fn render_sql_inline_flat_json(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let records_mode = !profiles
+        .iter()
+        .all(|p| p.name == "value" || p.name.starts_with("value."));
+    let columns: Vec<(String, bool)> = profiles
+        .iter()
+        .map(|p| (p.name.clone(), p.ideal_type.starts_with("Vec<")))
+        .collect();
+    stream_json_rows_for_sql(read_path, &columns, records_mode, sink)
 }
 
 // --- Parquet + Arrow IPC/Feather readers (opt-in via --features parquet) ---
@@ -52160,6 +52424,37 @@ fn render_sql_inline_flat(
     sink: &mut dyn std::io::Write,
     is_first_table: bool,
 ) -> Result<()> {
+    // JSON (the first format in the recursively-nested, JSON-bridge tier)
+    // is the one format in this tier so far, and needs a real, upfront
+    // shape check no other format in this tier-less flat tier ever
+    // needed: a pure nested-object "struct" column has no literal value
+    // of its own to embed (only its own flattened `.` children do - see
+    // `json_column_is_emittable`), and an array-of-objects or mixed
+    // scalar/object column has no *honest* single-cell literal at all
+    // (see `json_inline_blocking_column`'s own doc comment) - the exact
+    // same "no data to emit" boundary ORC's/SQLite's/INI's own upfront
+    // checks already established, just reached here by scanning the
+    // already-profiled column list rather than re-parsing the schema.
+    let json_filtered_profiles: Vec<ColumnProfile>;
+    let profiles: &[ColumnProfile] = if matches!(format, InputFormat::Json) {
+        if let Some(bad) = json_inline_blocking_column(profiles) {
+            bail!(
+                "--sql-mode inline can't emit real data for JSON field \"{bad}\" - it's an \
+                 array of objects, or a value that's sometimes a scalar and sometimes an \
+                 object across different records, which has no single cell to embed as a \
+                 literal; use --sql-mode staging instead"
+            );
+        }
+        json_filtered_profiles = profiles
+            .iter()
+            .filter(|p| json_column_is_emittable(p))
+            .cloned()
+            .collect();
+        &json_filtered_profiles
+    } else {
+        profiles
+    };
+
     let clean_file_name = file_name.replace(['\n', '\r'], " ");
     let quoted_table = sql_quote_ident(table_name);
     // See sql_unique_column_names' own doc comment - a real CSV header
@@ -52317,6 +52612,7 @@ fn render_sql_inline_flat(
         }
         InputFormat::Ini => render_sql_inline_flat_ini(read_path, table_name, &mut sink)?,
         InputFormat::Xlsx => render_sql_inline_flat_xlsx(read_path, table_name, &mut sink)?,
+        InputFormat::Json => render_sql_inline_flat_json(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -52695,11 +52991,14 @@ fn render_sql(
 ) -> Result<()> {
     let explicit = args.sql_mode.is_some();
     let mode = resolved_sql_mode(args)?;
-    // The flat, fixed-column, one-row-per-record tier is complete as of
-    // NumPy; the multi-table tier (SQLite, `.npz`, INI, and now the Excel
-    // family) is complete as of Xlsx - only the entire nested/JSON-bridge
-    // tier remains as an explicit, not-yet-started future phase (see
-    // CLAUDE.md).
+    // The flat, fixed-column, one-row-per-record tier and the entire
+    // multi-table tier (SQLite, `.npz`, INI, the Excel family) are both
+    // complete; JSON is the first format in the recursively-nested,
+    // JSON-bridge tier (Phase 13) - a genuinely nested JSON file with an
+    // array-of-objects/mixed scalar-object column still gets its own,
+    // more specific disclosed error from `render_sql_inline_flat_json`
+    // itself (see `json_inline_blocking_column`), the same way a
+    // compound ORC column already does for that format.
     let inline_supported = matches!(
         format,
         InputFormat::Csv
@@ -52719,12 +53018,13 @@ fn render_sql(
             | InputFormat::Npz
             | InputFormat::Ini
             | InputFormat::Xlsx
+            | InputFormat::Json
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -59988,10 +60288,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Npz
                 | InputFormat::Ini
                 | InputFormat::Xlsx
+                | InputFormat::Json
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json are supported so far",
             format.as_str()
         );
     }

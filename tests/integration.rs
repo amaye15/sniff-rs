@@ -535,20 +535,24 @@ fn sql_output_inline_mode_is_the_default_and_embeds_real_literal_data() {
 }
 
 #[test]
+#[cfg(feature = "yaml")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
-    // No --sql-mode given, on a format inline mode doesn't support yet
-    // (only csv/tsv so far) - falls back to staging mode automatically
-    // (with a disclosed stderr note, checked separately below) rather
-    // than erroring or silently producing something different.
-    let sql = run_sql("nested_typed.jsonl", &[]);
+    // No --sql-mode given, on a format inline mode doesn't support yet -
+    // JSON is now inline-supported (Phase 13), so YAML is used here
+    // instead as a format that still genuinely isn't. Falls back to
+    // staging mode automatically (with a disclosed stderr note, checked
+    // separately below) rather than erroring or silently producing
+    // something different.
+    let sql = run_sql("sample.yaml", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
+#[cfg(feature = "yaml")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("nested_typed.jsonl").to_str().unwrap(),
+            fixture("sample.yaml").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -557,11 +561,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for json"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for yaml"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
+#[cfg(feature = "yaml")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -569,7 +574,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("nested_typed.jsonl").to_str().unwrap(),
+            fixture("sample.yaml").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -580,7 +585,29 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for json"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for yaml"));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+fn sql_output_inline_mode_json_array_of_objects_needs_staging_instead() {
+    // A genuinely nested JSON file (an array-of-objects field) is a
+    // different, more specific disclosed error than the generic
+    // "format not supported yet" fallback above - JSON itself IS
+    // inline-supported (Phase 13), but this particular file's own shape
+    // isn't representable as one scalar cell per record.
+    let output = Command::new(bin())
+        .args([
+            fixture("nested_typed.jsonl").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for JSON field"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -659,14 +686,17 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
+#[cfg(feature = "yaml")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
+    // JSON is now inline-supported (Phase 13), so YAML stands in as a
+    // format that still genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("nested_typed.jsonl").to_str().unwrap(),
+            fixture("sample.yaml").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -676,7 +706,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for json"));
+    assert!(stderr.contains("--load-into isn't available yet for yaml"));
 }
 
 #[test]
@@ -1597,6 +1627,82 @@ fn load_into_accepts_xlsx() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for xlsx"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+fn sql_output_inline_mode_supports_flat_json_with_nested_object_and_array() {
+    // Phase 13 of the "any format" rollout, and the first format in the
+    // recursively-nested, JSON-bridge tier: a plain (non-array) nested
+    // object flattens transparently with no column of its own
+    // ("meta" itself never appears, only "meta.score"/"meta.active"),
+    // and a pooled scalar array column serializes as one JSON-array-text
+    // literal per row.
+    let sql = run_sql("edge_json_sql_inline_flat.jsonl", &[]);
+    assert!(!sql.contains("\"meta\" "));
+    assert!(sql.contains("\"meta.score\""));
+    assert!(sql.contains("\"meta.active\""));
+    assert!(sql.contains("'[\"red\",\"blue\"]'"));
+    assert!(sql.contains("'[\"green\"]'"));
+    assert!(sql.contains("'[]'"));
+}
+
+#[test]
+fn sql_output_inline_mode_json_null_field_is_a_real_null_not_a_sentinel_guess() {
+    let sql = run_sql("edge_json_sql_inline_flat.jsonl", &[]);
+    let values = sql
+        .split("INSERT INTO")
+        .nth(1)
+        .expect("no INSERT statement found");
+    assert!(values.contains("NULL"));
+    assert!(values.contains("'alice@example.com'"));
+}
+
+#[test]
+fn sql_output_inline_mode_json_single_value_column_top_level_array() {
+    // A top-level array of bare scalars (not objects) has no field names,
+    // so the whole set profiles - and renders inline - as one "value"
+    // column, the same convention a headerless CSV/NumPy 1D array already
+    // uses elsewhere in this project.
+    let sql = run_sql("edge_top_level_scalar_array.json", &[]);
+    assert!(sql.contains("CREATE TABLE \"edge_top_level_scalar_array\""));
+    assert!(sql.contains("\"value\""));
+    assert!(sql.contains("'a4d1e6b0-1111-4a1a-9a1a-000000000001'"));
+    assert!(sql.contains("NULL"));
+}
+
+#[test]
+fn sql_output_inline_mode_json_rejects_an_array_of_objects_column() {
+    let output = Command::new(bin())
+        .args([
+            fixture("nested_typed.jsonl").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for JSON field \"events\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+fn load_into_accepts_json() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_json_sql_inline_flat.jsonl").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for json"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
