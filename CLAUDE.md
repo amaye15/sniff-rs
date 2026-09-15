@@ -18,6 +18,13 @@ type, not the format's own type inference. It re-derives what's actually
 there from the values themselves. See "Design philosophy" below; it's the
 reason most of the code is shaped the way it is.
 
+`sniff-rs diff <OLD> <NEW>` — this tool's one subcommand — compares two
+already-generated `--output-format json` dictionaries and flags schema
+drift (added/removed/renamed columns, type changes, missing-% shifts),
+classifying each change safe or breaking and, on request, generating a
+review-first SQL script for the safe ones. See "Schema diff / drift
+detection" below.
+
 ## Quick start
 
 ```bash
@@ -2781,6 +2788,185 @@ either mode, including every already-degenerate edge fixture (a
 zero-column schema, a zero-row table) this project's corpus already
 carries. Clean across default/`full`, matching each build's own
 established clippy baseline (full=6, default=2) exactly.
+
+## Schema diff / drift detection (`sniff-rs diff`)
+
+`sniff-rs diff <OLD> <NEW> [OUTPUT_PATH] [OPTIONS]` - this project's
+**first CLI subcommand ever**, rather than a new flag on the existing
+`<INPUT_PATH> [OUTPUT_PATH] [OPTIONS]` grammar. Detected as the literal
+first positional argument being `diff`, before `Args::parse` (which
+assumes the older grammar) ever runs. A real, if small, design fork - a
+new flag could theoretically have worked too - resolved by proceeding
+with the most natural shape rather than pausing to ask, unlike the three
+genuine forks this project's own `--combine`/directory-`--load-into` work
+*did* stop and ask the user about (no plausible alternative here produces
+a materially different, hard-to-undo result). The one real, disclosed
+cost: a file or directory literally named `diff` now needs a `./diff`
+prefix to be profiled unambiguously - the same tradeoff every
+subcommand-based CLI (git, cargo, npm) already accepts.
+
+`<OLD>`/`<NEW>` are two already-generated `--output-format json`
+dictionaries (this tool's own rich JSON shape, or the `--combine`
+directory shape - both share the identical `"tables": {name: [...]}}`
+structure) - not raw data files. Diffing is a second, independent pass
+over already-profiled output, the same "read once, act on the result"
+separation this tool's own SQL-mode/combine features already keep
+between profiling and rendering. A `--output-format json-schema` document
+(no per-column array, just a `properties` object) is a clear, disclosed
+error naming the shape mismatch rather than a guess.
+
+**Scope was settled after researching how real schema-evolution/
+compatibility systems actually work** - Confluent Schema Registry's
+BACKWARD/FORWARD/FULL/NONE compatibility modes, Delta Lake's additive-only
+`mergeSchema` (vs. its separate, explicit Column Mapping for a real
+rename/drop), Apache Iceberg's column-ID-based schema evolution, and
+Atlas's own rename-detection heuristic (same type + adjacent position,
+always surfaced for human confirmation, never auto-applied). The one
+consistent finding across every one of them: none fully automates schema-
+drift *resolution* - each splits a diff into a deterministic safe/additive
+bucket (auto-appliable) versus a destructive bucket (never auto-applied),
+and every one treats a column rename as fundamentally ambiguous
+(indistinguishable from a drop+add) rather than ever silently inferring
+it. This feature follows the identical shape: automatic *detection*
+(`diff_dictionaries`/`diff_table_columns`), automatic *compatibility
+classification* (`Compatibility`, `classify_type_change`/
+`classify_missing_pct_change`), *surfaced-but-never-silent* rename
+detection (`DiffChange::ColumnRenamed`, always emitted as a suggestion,
+never merged into a plain add+remove pair without saying so), and a
+*generated-but-never-applied* resolution artifact
+(`render_diff_resolution_sql`) - never a system that silently resolves
+anything against a live database or file, matching this project's own
+`--load-into` boundary (it only ever `CREATE`s fresh tables, never
+`ALTER`s or drops one). A fifth phase in the original research plan - CI/
+automation glue, a GitHub Action, an MCP wrapper - was explicitly dropped
+from scope by the user; `--fail-on-breaking`'s own exit code (`2`, distinct
+from a genuine error's `1`) is as far as this feature goes toward CI
+integration.
+
+**Table matching has a real, deliberately asymmetric rule.** A single-
+file dictionary's own "table" name is just the source file's own stem
+(see `run_single_file`'s default output naming) - almost never identical
+between two independently-named snapshots of the same data (`old.csv` vs.
+`new.csv`), so matching tables by name in that case would treat every
+single-table comparison as "the whole table was dropped and a different
+one added" instead of actually diffing its columns - confirmed directly
+by running this feature against its own first real fixture pair before
+trusting it, the same "verify against real behavior" discipline this
+project holds every other heuristic to. `diff_dictionaries` therefore
+always compares the two tables directly, regardless of name, whenever
+both dictionaries have exactly one table (the label shown is `name` when
+they match, `old_name -> new_name` when they don't); a multi-table
+dictionary (SQLite, Excel, INI, `--combine`'s own qualified names, ...)
+keeps real by-name matching, since a table name there is stable,
+meaningful data a user would genuinely want compared by identity, not
+silently paired off by position. `DiffEntry::sql_table` carries the
+distinction forward into resolution-SQL generation (see below): `Some`
+when there's an honest, unambiguous table name to write `ALTER TABLE`
+against, `None` when the two dictionaries disagree on what to call their
+one table - `render_diff_resolution_sql` never guesses a name in the
+latter case, disclosing the ambiguity in a comment instead.
+
+**Column matching, within one table, happens in three passes**
+(`diff_table_columns`): (1) a removed name and an added name are paired
+as a rename candidate wherever they share a type and a strong sample-
+value overlap (Jaccard similarity over `sample_values`, `>= 0.6`,
+`sample_value_overlap`) - matched off greedily by descending similarity
+so no name is claimed by more than one candidate, and a column's own
+normalized position (adjacent within ~a third of the table's width) is
+folded into the reported reason as a soft corroborating signal, never a
+hard requirement (real column reordering is common enough that gating on
+position would miss genuine renames); (2) whatever's left in either
+bucket after that is a genuine add or remove; (3) every name present
+under the same spelling in both schemas is checked for a type or
+missing-% change. A rename candidate is **always** a suggestion -
+`Compatibility::Safe`, but never silently merged into a plain add+remove
+pair without saying so, matching this whole feature's Atlas-derived
+design principle above.
+
+**Compatibility classification is deliberately binary** (`Compatibility::
+Safe`/`Breaking`), not Confluent's own four-way BACKWARD/FORWARD/FULL/
+NONE split - those four names describe which direction of producer/
+consumer compatibility a *wire-format* schema registry is checking, a
+distinction that doesn't map cleanly onto two already-generated data
+dictionaries with no separate "reader"/"writer" role. Simplified to the
+one question this feature actually needs an answer to: can a resolution
+script for this change ever be generated without guessing at destructive
+intent?
+
+- **Column added**: `Safe` iff the new column is nullable
+  (`missing_pct > 0.0`) - a `NOT NULL` column with no prior existence has
+  no honest default to backfill existing rows with, mirroring Confluent
+  Avro's own "a new field must carry a default to be backward-compatible"
+  rule and Delta Lake's additive-only merge. A non-nullable added column
+  is `Breaking`.
+- **Column removed**: always `Breaking` - any consumer reading it by name
+  will break, and there's no "maybe it was unused" signal available from
+  a data dictionary alone.
+- **Type changed** (`classify_type_change`): deliberately conservative,
+  matching this project's own "no partial credit" heuristic philosophy -
+  an unrecognized type change defaults to `Breaking` rather than guessed
+  as safe. A numeric widening (`i64 -> f64`) or "became a plain string"
+  (anything `-> String`) is the only kind of `Safe` type change; every
+  narrowing (`f64 -> i64`, `String -> i64`) and every unrelated-category
+  swap (`UUID -> Email`) is `Breaking`.
+- **Missing-% changed** (`classify_missing_pct_change`): the only two
+  transitions treated as a schema-level compatibility signal are the ones
+  that cross the `0.0` boundary - exactly what `sql_column_type`'s own
+  `NOT NULL iff missing_pct == 0.0` rule already keys on, so it's the one
+  place a missing-% change actually changes what a generated schema would
+  enforce. `0.0 -> >0.0` (became nullable) is `Safe`; `>0.0 -> 0.0`
+  (became fully populated, so a `NOT NULL` constraint could now be added)
+  is `Breaking`, since that can reject an existing pipeline that still
+  occasionally produces nulls. Anything else past a 10-percentage-point
+  threshold with neither side at exactly `0.0` is still surfaced, but as
+  a `Safe`, informational data-quality note, not a compatibility break.
+- **Table added**: `Safe` (a new table doesn't affect an existing
+  consumer reading the old schema). **Table removed**: `Breaking`.
+
+**`--fail-on-breaking`** exits with status `2` (distinct from a genuine
+error's `1`) once the report has already been written, if any entry
+classified `Breaking` exists - for CI use, checked after output so a
+pipeline can still capture the report even on a failing run.
+
+**`--resolution-sql <PATH>`** generates a review-first SQL script
+covering exactly the changes classified `Safe`: an `ALTER TABLE ... ADD
+COLUMN` per safely-added column (reusing the same `sql_quote_ident`/
+`sql_column_type` this tool's own `--output-format sql` already renders
+through), and a *commented-out* `ALTER TABLE ... RENAME COLUMN` suggestion
+per rename candidate - never a live statement, matching the "surfaced,
+never silently applied" rule above. Every `Breaking` change is named in a
+leading comment instead, explicitly excluded rather than guessed at; an
+entry whose `sql_table` is `None` (the two dictionaries disagree on their
+one table's name) gets a disclosed note instead of a guessed identifier.
+Nothing this script generates is ever run automatically - the same
+"generate, never auto-apply" boundary `--load-into` already draws by only
+ever `CREATE`ing fresh tables, never `ALTER`ing or dropping one. Verified
+directly against a real, installed SQLite build: a generated `ALTER
+TABLE ... ADD COLUMN` statement for a safely-added nullable column was
+piped straight into a real table and confirmed to apply cleanly.
+
+**`--output-format md` (default) or `json`** - the Markdown report groups
+entries by table with a `SAFE`/`BREAKING` tag per row; the JSON report
+(`{"old", "new", "has_breaking_changes", "changes": [...]}`) carries every
+change's own extra fields (`old_ideal_type`/`new_ideal_type` for a type
+change, `from`/`to`/`similarity` for a rename, `old_missing_pct`/
+`new_missing_pct` for a missing-% shift) for a machine consumer, not just
+the shared `table`/`column`/`kind`/`compatibility`/`reason` fields every
+entry carries regardless of kind.
+
+Verified with a dedicated `diff_tests` unit-test module (rename detection,
+type/missing-% classification at every real boundary, single- vs. multi-
+table matching, resolution-SQL generation) plus end-to-end integration
+tests covering the full CLI path - a real rename+remove+add scenario, an
+unchanged-schema no-op, `--output-format json`'s structured shape,
+`--fail-on-breaking`'s exit code in both directions, `--resolution-sql`'s
+real `ALTER TABLE` output (checked against a real SQLite build manually,
+and value-asserted in the automated suite), the ambiguous-table-name
+fallback, a rejected `json-schema` input, a missing positional argument,
+and multi-table by-name matching - the last one built from a pair of
+hand-written `.ini` files rather than spawning a real database engine CLI,
+matching this project's own standing rule that no automated `cargo test`
+depends on an external database tool being installed.
 
 ## Architecture
 

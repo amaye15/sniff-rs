@@ -2987,6 +2987,7 @@ blank Description field to fill in by hand.
 
 USAGE:
     sniff-rs <INPUT_PATH> [OUTPUT_PATH] [OPTIONS]
+    sniff-rs diff <OLD> <NEW> [OUTPUT_PATH] [OPTIONS]   (see `sniff-rs diff --help`)
 
     If INPUT_PATH is a directory, every file under it (recursively) that
     sniff-rs can identify on its own is profiled, one output per input
@@ -2995,6 +2996,12 @@ USAGE:
     given - use --output-dir. The first file that fails aborts the whole
     run; a file whose format can't be identified at all is skipped and
     noted, not treated as a failure.
+
+    `sniff-rs diff` compares two --output-format json dictionaries and
+    flags schema drift (added/removed/renamed columns, type changes,
+    missing-% shifts), classifying each change safe or breaking - a file
+    or directory literally named "diff" needs a "./diff" prefix to be
+    profiled instead of triggering this subcommand.
 
 ARGS:
     <INPUT_PATH>
@@ -61881,6 +61888,17 @@ fn render_output(
 }
 
 pub fn run() -> Result<()> {
+    // The one subcommand this CLI has: `sniff-rs diff <OLD> <NEW>
+    // [OUTPUT_PATH] [OPTIONS]`, detected before `Args::parse` (which
+    // assumes the older `<INPUT_PATH> [OUTPUT_PATH] [OPTIONS]` grammar)
+    // ever runs - see the "Schema diff" section's own header comment for
+    // why this is a genuine first, and the one disclosed cost (a file or
+    // directory literally named `diff` now needs a `./diff` prefix).
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("diff") {
+        return run_diff(&raw[1..]);
+    }
+
     let args = Args::parse()?;
     let output_format = OutputFormat::parse(&args.output_format)?;
 
@@ -63178,6 +63196,1214 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
     }
 
     Ok(())
+}
+
+// --- Schema diff / drift detection (`sniff-rs diff <old.json> <new.json>`) ---
+//
+// This project's first CLI subcommand ever, rather than a new flag on the
+// existing `<INPUT_PATH> [OUTPUT_PATH] [OPTIONS]` grammar - detected as
+// the literal first positional argument being "diff" (see `run`'s own
+// dispatch), before `Args::parse` ever runs. A real, if small, design
+// fork (a new flag could theoretically have worked too), resolved by
+// proceeding with the most natural shape rather than pausing to ask,
+// since - unlike the three genuine forks this project's own `--combine`/
+// directory-`--load-into` work *did* stop and ask the user about - no
+// plausible alternative here produces a materially different, hard-to-
+// undo result. The one real, disclosed cost: a file or directory
+// literally named `diff` now needs a `./diff` prefix to be profiled
+// unambiguously - the same tradeoff every subcommand-based CLI (git,
+// cargo, npm) already accepts.
+//
+// Scope was settled after researching how real schema-evolution/
+// compatibility systems actually work - Confluent Schema Registry's
+// BACKWARD/FORWARD/FULL compatibility modes, Delta Lake's additive-only
+// `mergeSchema` (vs. its separate, explicit Column Mapping for a real
+// rename/drop), Apache Iceberg's column-ID-based schema evolution, and
+// Atlas's own rename-detection heuristic (same type + adjacent position,
+// always surfaced for human confirmation, never auto-applied). The one
+// consistent finding across every one of them: none fully automates
+// schema-drift *resolution* - each splits a diff into a deterministic
+// safe/additive bucket (auto-appliable) versus a destructive bucket
+// (never auto-applied), and every one treats a column rename as
+// fundamentally ambiguous (indistinguishable from a drop+add) rather
+// than ever silently inferring it. This feature follows the identical
+// shape: automatic *detection* (this section), automatic *compatibility
+// classification* (`Compatibility`, `classify_type_change`/
+// `classify_missing_pct_change`, below), *surfaced-but-never-silent*
+// rename detection (`DiffChange::ColumnRenamed`, always emitted as a
+// suggestion, never merged into a plain add+remove pair without saying
+// so), and a *generated-but-never-applied* resolution artifact
+// (`render_diff_resolution_sql`) - never a system that silently resolves
+// anything against a live database or file, matching this project's own
+// `--load-into` boundary (it only ever `CREATE`s fresh tables, never
+// `ALTER`s or drops one).
+//
+// Deliberately consumes two already-generated `--output-format json`
+// dictionaries (this tool's own rich JSON shape, or the `--combine`
+// directory shape - both share the identical `"tables": {name: [...]}}`
+// structure), not two raw data files - diffing is a second, independent
+// pass over already-profiled output, the same "read once, act on the
+// result" separation this tool's own SQL-mode/combine features already
+// keep between profiling and rendering. Phase 5 of the original 5-phase
+// plan (CI/automation glue - a GitHub Action, an MCP wrapper) was
+// explicitly dropped from scope by the user; `--fail-on-breaking`'s own
+// exit code is as far as this feature goes toward CI integration.
+
+/// One column's worth of already-profiled information, read back out of
+/// a `--output-format json` document - a small, independent shape from
+/// `ColumnProfile` itself (a diff consumer has no use for `row_count`/
+/// `description`, and shouldn't have to construct a real `ColumnProfile`
+/// just to compare two schemas).
+#[derive(Debug, Clone)]
+struct DiffColumn {
+    name: String,
+    current_type: String,
+    ideal_type: String,
+    missing_pct: f64,
+    sample_values: Vec<String>,
+}
+
+impl DiffColumn {
+    fn from_json(v: &JsonValue) -> Result<Self> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow!("expected each column entry to be a JSON object"))?;
+        let name = obj
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| anyhow!("column entry is missing a string \"name\" field"))?
+            .to_string();
+        let current_type = obj
+            .get("current_type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let ideal_type = obj
+            .get("ideal_type")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string();
+        let missing_pct = obj
+            .get("missing_pct")
+            .and_then(JsonValue::as_f64)
+            .unwrap_or(0.0);
+        let sample_values = obj
+            .get("sample_values")
+            .and_then(JsonValue::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(DiffColumn {
+            name,
+            current_type,
+            ideal_type,
+            missing_pct,
+            sample_values,
+        })
+    }
+}
+
+/// Reads a `--output-format json` dictionary document (single-file or
+/// `--combine` directory shape - both carry a `"tables"` object) and
+/// returns its tables keyed by name, each column list kept in its own
+/// original order (not re-sorted) - `DiffChange::ColumnRenamed`'s own
+/// position-adjacency signal, below, needs each column's real position
+/// within its own file.
+fn load_dictionary_tables(path: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
+    let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+    let doc =
+        json_support::from_str(&text).with_context(|| format!("{path:?} is not valid JSON"))?;
+    let tables_val = doc.get("tables").ok_or_else(|| {
+        anyhow!(
+            "{path:?} has no top-level \"tables\" object - `sniff-rs diff` compares two \
+             --output-format json dictionaries (this tool's own rich JSON shape), not a raw \
+             data file or a --output-format json-schema document"
+        )
+    })?;
+    let tables_obj = tables_val
+        .as_object()
+        .ok_or_else(|| anyhow!("{path:?}'s own \"tables\" field isn't a JSON object"))?;
+    let mut tables = BTreeMap::new();
+    for (name, cols) in tables_obj.iter() {
+        let arr = cols.as_array().ok_or_else(|| {
+            anyhow!("{path:?}: table {name:?}'s own value isn't a JSON array of columns")
+        })?;
+        let parsed: Result<Vec<DiffColumn>> = arr.iter().map(DiffColumn::from_json).collect();
+        tables.insert(name.clone(), parsed?);
+    }
+    Ok(tables)
+}
+
+/// Whether a diff entry is safe to auto-generate a resolution statement
+/// for (`Safe`) or needs a human to decide what to do (`Breaking`) -
+/// deliberately binary, not Confluent's own four-way BACKWARD/FORWARD/
+/// FULL/NONE split: those four names describe which direction of
+/// producer/consumer compatibility a *wire-format* schema registry is
+/// checking, a distinction that doesn't map cleanly onto two already-
+/// generated data dictionaries with no separate "reader"/"writer" role -
+/// simplified here to the one question this feature actually needs an
+/// answer to: can a resolution script for this change ever be generated
+/// without guessing at destructive intent?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compatibility {
+    Safe,
+    Breaking,
+}
+
+impl Compatibility {
+    fn label(&self) -> &'static str {
+        match self {
+            Compatibility::Safe => "safe",
+            Compatibility::Breaking => "breaking",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DiffChange {
+    TableAdded,
+    TableRemoved,
+    ColumnAdded {
+        ideal_type: String,
+        missing_pct: f64,
+    },
+    ColumnRemoved {
+        ideal_type: String,
+    },
+    /// Always a *suggestion* - see this section's own header comment for
+    /// why a rename is never silently inferred or auto-applied, only
+    /// ever surfaced alongside its own similarity score for a human to
+    /// confirm.
+    ColumnRenamed {
+        from: String,
+        to: String,
+        similarity: f64,
+        ideal_type: String,
+    },
+    TypeChanged {
+        old_current: String,
+        new_current: String,
+        old_ideal: String,
+        new_ideal: String,
+    },
+    MissingPctChanged {
+        old: f64,
+        new: f64,
+    },
+}
+
+fn diff_change_label(change: &DiffChange) -> &'static str {
+    match change {
+        DiffChange::TableAdded => "table added",
+        DiffChange::TableRemoved => "table removed",
+        DiffChange::ColumnAdded { .. } => "column added",
+        DiffChange::ColumnRemoved { .. } => "column removed",
+        DiffChange::ColumnRenamed { .. } => "possible rename",
+        DiffChange::TypeChanged { .. } => "type changed",
+        DiffChange::MissingPctChanged { .. } => "missing % changed",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiffEntry {
+    /// The human-facing table label - `"name"` when the old/new table
+    /// share a name, `"old -> new"` when they don't (see
+    /// `diff_dictionaries`'s own single-table-name-mismatch handling).
+    table: String,
+    /// The *real* table name to use in generated SQL, only when there's
+    /// an unambiguous one - `Some(name)` when `old`/`new` share a table
+    /// name, `None` when they don't (there's no honest way to know what
+    /// a live database actually calls this table when the two
+    /// dictionaries disagree, e.g. `old.csv` vs. `new.csv`'s own file-
+    /// stem-derived table names) - `render_diff_resolution_sql` skips
+    /// generating a live statement for an entry with `None` here rather
+    /// than guessing at a table name.
+    sql_table: Option<String>,
+    /// `None` for a whole-table change (`TableAdded`/`TableRemoved`).
+    column: Option<String>,
+    change: DiffChange,
+    compatibility: Compatibility,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiffReport {
+    entries: Vec<DiffEntry>,
+}
+
+impl DiffReport {
+    fn has_breaking(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.compatibility == Compatibility::Breaking)
+    }
+}
+
+/// A column is classified as safely added only when it's nullable in the
+/// new schema (`missing_pct > 0.0`) - a NOT NULL column with no prior
+/// existence has no honest default to backfill existing rows with,
+/// mirroring Confluent Avro's own "a new field must carry a default to
+/// be backward-compatible" rule and Delta Lake's additive-only merge.
+const RENAME_SIMILARITY_THRESHOLD: f64 = 0.6;
+/// A missing-% shift smaller than this (in percentage points, and not
+/// crossing the 0.0 boundary either direction) is real but not worth its
+/// own flagged entry - see `classify_missing_pct_change`.
+const MISSING_PCT_NOTE_THRESHOLD: f64 = 10.0;
+
+/// Jaccard similarity between two columns' own sample-value sets -
+/// `None` if either side has no samples at all to compare (an empty-vs-
+/// anything comparison carries no real signal, so it's never treated as
+/// a match rather than guessed at).
+fn sample_value_overlap(a: &[String], b: &[String]) -> Option<f64> {
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let sa: HashSet<&str> = a.iter().map(String::as_str).collect();
+    let sb: HashSet<&str> = b.iter().map(String::as_str).collect();
+    let intersection = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        return None;
+    }
+    Some(intersection as f64 / union as f64)
+}
+
+/// Deliberately conservative, matching this project's own "no partial
+/// credit" heuristic philosophy (see the design-philosophy section of
+/// CLAUDE.md): an unrecognized type change defaults to `Breaking` rather
+/// than guessed as safe. Modeled on the same real-world systems this
+/// feature's own design research surveyed (Confluent Avro's schema-
+/// evolution promotion rules, Delta Lake's additive-only merge) - a
+/// numeric widening or "became a plain string" is safe; every narrowing,
+/// and every unrelated-category swap (e.g. `UUID` -> `Email`), is
+/// breaking.
+fn classify_type_change(old: &str, new: &str) -> (Compatibility, String) {
+    const SAFE_WIDENINGS: &[(&str, &str)] =
+        &[("i64", "f64"), ("NaiveDate", "NaiveDate / DateTime")];
+    if SAFE_WIDENINGS.contains(&(old, new)) || (new == "String" && old != "String") {
+        return (
+            Compatibility::Safe,
+            format!("{old} -> {new} is a recognized safe widening"),
+        );
+    }
+    (
+        Compatibility::Breaking,
+        format!(
+            "{old} -> {new} isn't a recognized safe widening - treated as breaking rather than guessed"
+        ),
+    )
+}
+
+/// The only two missing-% transitions this treats as a schema-level
+/// compatibility signal are the ones that cross the 0.0 boundary - that
+/// boundary is exactly what `sql_column_type`'s own `NOT NULL iff
+/// missing_pct == 0.0` rule already keys on, so it's the one place a
+/// missing-% change actually changes what a generated schema would
+/// enforce. Anything else past `MISSING_PCT_NOTE_THRESHOLD` is still
+/// surfaced, but as a `Safe`, informational data-quality note, not a
+/// compatibility break.
+fn classify_missing_pct_change(old: f64, new: f64) -> Option<(Compatibility, String)> {
+    if old == 0.0 && new > 0.0 {
+        return Some((
+            Compatibility::Safe,
+            format!(
+                "column became nullable ({old:.1}% -> {new:.1}% missing) - relaxing a constraint is safe for existing consumers"
+            ),
+        ));
+    }
+    if old > 0.0 && new == 0.0 {
+        return Some((
+            Compatibility::Breaking,
+            format!(
+                "column is now fully populated ({old:.1}% -> {new:.1}% missing) - a NOT NULL constraint could now be added, which can break inserts from a pipeline that still occasionally produces nulls"
+            ),
+        ));
+    }
+    if (new - old).abs() >= MISSING_PCT_NOTE_THRESHOLD {
+        return Some((
+            Compatibility::Safe,
+            format!(
+                "missing-value rate shifted {old:.1}% -> {new:.1}% - a data-quality signal worth reviewing, not a schema-level break"
+            ),
+        ));
+    }
+    None
+}
+
+/// Diffs one table's own column list between the old and new schema.
+/// Column matching happens in three passes: (1) greedily pair up a
+/// removed name with an added name as a rename candidate wherever they
+/// share a type and a strong sample-value overlap (see this section's
+/// own header comment for why this is always a *suggestion*, never a
+/// silent merge); (2) whatever's left in either bucket is a genuine
+/// add/remove; (3) every name present under the same spelling in both
+/// schemas is checked for a type or missing-% change.
+fn diff_table_columns(
+    table: &str,
+    sql_table: Option<&str>,
+    old_cols: &[DiffColumn],
+    new_cols: &[DiffColumn],
+) -> Vec<DiffEntry> {
+    let mut entries = Vec::new();
+
+    let old_by_name: BTreeMap<&str, (usize, &DiffColumn)> = old_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.as_str(), (i, c)))
+        .collect();
+    let new_by_name: BTreeMap<&str, (usize, &DiffColumn)> = new_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.as_str(), (i, c)))
+        .collect();
+
+    let mut removed: Vec<&str> = old_by_name
+        .keys()
+        .filter(|n| !new_by_name.contains_key(*n))
+        .copied()
+        .collect();
+    let mut added: Vec<&str> = new_by_name
+        .keys()
+        .filter(|n| !old_by_name.contains_key(*n))
+        .copied()
+        .collect();
+
+    // (removed name, added name) candidate pairs sharing a type and a
+    // real sample-value overlap, matched off greedily by descending
+    // similarity - the same "same type, adjacent position, high content
+    // overlap" heuristic Atlas/git already use for rename detection.
+    let mut candidates: Vec<(f64, &str, &str)> = Vec::new();
+    for &r in &removed {
+        let (_, rcol) = old_by_name[r];
+        for &a in &added {
+            let (_, acol) = new_by_name[a];
+            if rcol.ideal_type.is_empty() || rcol.ideal_type != acol.ideal_type {
+                continue;
+            }
+            if let Some(sim) = sample_value_overlap(&rcol.sample_values, &acol.sample_values)
+                && sim >= RENAME_SIMILARITY_THRESHOLD
+            {
+                candidates.push((sim, r, a));
+            }
+        }
+    }
+    candidates.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut matched_removed: HashSet<&str> = HashSet::new();
+    let mut matched_added: HashSet<&str> = HashSet::new();
+    for (sim, r, a) in candidates {
+        if matched_removed.contains(r) || matched_added.contains(a) {
+            continue;
+        }
+        matched_removed.insert(r);
+        matched_added.insert(a);
+        let (old_idx, _) = old_by_name[r];
+        let (new_idx, acol) = new_by_name[a];
+        let old_len = old_cols.len().max(1) as f64;
+        let new_len = new_cols.len().max(1) as f64;
+        let adjacent = (old_idx as f64 / old_len - new_idx as f64 / new_len).abs() <= 0.34;
+        entries.push(DiffEntry {
+            table: table.to_string(),
+            sql_table: sql_table.map(str::to_string),
+            column: Some(format!("{r} -> {a}")),
+            change: DiffChange::ColumnRenamed {
+                from: r.to_string(),
+                to: a.to_string(),
+                similarity: sim,
+                ideal_type: acol.ideal_type.clone(),
+            },
+            compatibility: Compatibility::Safe,
+            reason: format!(
+                "possible rename: same type ({}), {:.0}% sample-value overlap{} - this is a suggestion, never applied automatically; review before treating it as a real rename",
+                acol.ideal_type,
+                sim * 100.0,
+                if adjacent { ", adjacent position" } else { "" },
+            ),
+        });
+    }
+    removed.retain(|n| !matched_removed.contains(n));
+    added.retain(|n| !matched_added.contains(n));
+
+    for r in removed {
+        let (_, col) = old_by_name[r];
+        entries.push(DiffEntry {
+            table: table.to_string(),
+            sql_table: sql_table.map(str::to_string),
+            column: Some(r.to_string()),
+            change: DiffChange::ColumnRemoved {
+                ideal_type: col.ideal_type.clone(),
+            },
+            compatibility: Compatibility::Breaking,
+            reason: "column no longer exists - any consumer reading it by name will break"
+                .to_string(),
+        });
+    }
+    for a in added {
+        let (_, col) = new_by_name[a];
+        let nullable = col.missing_pct > 0.0;
+        entries.push(DiffEntry {
+            table: table.to_string(),
+            sql_table: sql_table.map(str::to_string),
+            column: Some(a.to_string()),
+            change: DiffChange::ColumnAdded {
+                ideal_type: col.ideal_type.clone(),
+                missing_pct: col.missing_pct,
+            },
+            compatibility: if nullable {
+                Compatibility::Safe
+            } else {
+                Compatibility::Breaking
+            },
+            reason: if nullable {
+                "new, nullable column - existing consumers reading the old schema are unaffected"
+                    .to_string()
+            } else {
+                "new column with no missing values in the new data - adding it as NOT NULL to an existing table needs a default/backfill first".to_string()
+            },
+        });
+    }
+
+    for (name, (_, old_col)) in &old_by_name {
+        let Some((_, new_col)) = new_by_name.get(name) else {
+            continue;
+        };
+        if old_col.ideal_type != new_col.ideal_type {
+            let (compatibility, reason) =
+                classify_type_change(&old_col.ideal_type, &new_col.ideal_type);
+            entries.push(DiffEntry {
+                table: table.to_string(),
+                sql_table: sql_table.map(str::to_string),
+                column: Some(name.to_string()),
+                change: DiffChange::TypeChanged {
+                    old_current: old_col.current_type.clone(),
+                    new_current: new_col.current_type.clone(),
+                    old_ideal: old_col.ideal_type.clone(),
+                    new_ideal: new_col.ideal_type.clone(),
+                },
+                compatibility,
+                reason,
+            });
+        } else if let Some((compatibility, reason)) =
+            classify_missing_pct_change(old_col.missing_pct, new_col.missing_pct)
+        {
+            entries.push(DiffEntry {
+                table: table.to_string(),
+                sql_table: sql_table.map(str::to_string),
+                column: Some(name.to_string()),
+                change: DiffChange::MissingPctChanged {
+                    old: old_col.missing_pct,
+                    new: new_col.missing_pct,
+                },
+                compatibility,
+                reason,
+            });
+        }
+    }
+
+    entries
+}
+
+fn diff_dictionaries(
+    old: &BTreeMap<String, Vec<DiffColumn>>,
+    new: &BTreeMap<String, Vec<DiffColumn>>,
+) -> DiffReport {
+    // A single-file dictionary's own "table" name is just the source
+    // file's own stem (see `run_single_file`'s default output naming) -
+    // almost never identical between two independently-named snapshots
+    // of the same data (`old.csv` vs. `new.csv`), so matching tables by
+    // name here would treat every single-table comparison as "the whole
+    // table was dropped and a different one added" instead of actually
+    // diffing its columns - confirmed directly by running this feature
+    // against its own first real fixture pair before trusting it, the
+    // same "verify against real behavior" discipline this project holds
+    // every other heuristic to. When both sides have exactly one table,
+    // that one table is always compared against the other regardless of
+    // its name; a multi-table dictionary (SQLite, Excel, `--combine`'s
+    // own qualified names, ...) keeps real by-name matching below, since
+    // a table name there is stable, meaningful data a user would
+    // genuinely want compared by identity, not silently paired off by
+    // position.
+    let old_entries: Vec<(&String, &Vec<DiffColumn>)> = old.iter().collect();
+    let new_entries: Vec<(&String, &Vec<DiffColumn>)> = new.iter().collect();
+    if let ([(old_name, old_cols)], [(new_name, new_cols)]) =
+        (old_entries.as_slice(), new_entries.as_slice())
+    {
+        let sql_table = if old_name == new_name {
+            Some(old_name.as_str())
+        } else {
+            None
+        };
+        let label = if old_name == new_name {
+            (*old_name).clone()
+        } else {
+            format!("{old_name} -> {new_name}")
+        };
+        return DiffReport {
+            entries: diff_table_columns(&label, sql_table, old_cols, new_cols),
+        };
+    }
+
+    let mut entries = Vec::new();
+
+    for table in old.keys() {
+        if !new.contains_key(table) {
+            entries.push(DiffEntry {
+                table: table.clone(),
+                sql_table: None,
+                column: None,
+                change: DiffChange::TableRemoved,
+                compatibility: Compatibility::Breaking,
+                reason: "table is no longer present in the new schema".to_string(),
+            });
+        }
+    }
+    for table in new.keys() {
+        if !old.contains_key(table) {
+            entries.push(DiffEntry {
+                table: table.clone(),
+                sql_table: None,
+                column: None,
+                change: DiffChange::TableAdded,
+                compatibility: Compatibility::Safe,
+                reason: "a new table doesn't affect an existing consumer reading the old schema"
+                    .to_string(),
+            });
+        }
+    }
+    for (table, old_cols) in old {
+        if let Some(new_cols) = new.get(table) {
+            entries.extend(diff_table_columns(table, Some(table), old_cols, new_cols));
+        }
+    }
+
+    DiffReport { entries }
+}
+
+fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -> String {
+    let mut md = String::new();
+    md.push_str("# Schema diff\n\n");
+    md.push_str(&format!("- **Old:** {}\n", old_path.display()));
+    md.push_str(&format!("- **New:** {}\n\n", new_path.display()));
+
+    if report.entries.is_empty() {
+        md.push_str("No differences detected.\n");
+        return md;
+    }
+
+    let breaking = report
+        .entries
+        .iter()
+        .filter(|e| e.compatibility == Compatibility::Breaking)
+        .count();
+    let safe = report.entries.len() - breaking;
+    md.push_str(&format!(
+        "**{} change(s)** - {safe} safe, {breaking} breaking\n\n",
+        report.entries.len(),
+    ));
+
+    let mut by_table: BTreeMap<&str, Vec<&DiffEntry>> = BTreeMap::new();
+    for e in &report.entries {
+        by_table.entry(e.table.as_str()).or_default().push(e);
+    }
+    for (table, table_entries) in by_table {
+        md.push_str(&format!("## {}\n\n", escape_md(table)));
+        md.push_str("| Compat | Column | Change | Detail |\n");
+        md.push_str("|---|---|---|---|\n");
+        for e in table_entries {
+            let tag = match e.compatibility {
+                Compatibility::Safe => "SAFE",
+                Compatibility::Breaking => "BREAKING",
+            };
+            let column = e.column.clone().unwrap_or_else(|| "*(table)*".to_string());
+            md.push_str(&format!(
+                "| {tag} | {} | {} | {} |\n",
+                escape_md(&column),
+                diff_change_label(&e.change),
+                escape_md(&e.reason),
+            ));
+        }
+        md.push('\n');
+    }
+    md
+}
+
+/// Every `DiffChange` variant's own extra fields, for the JSON rendering
+/// below - kept separate from the shared `table`/`column`/`kind`/
+/// `compatibility`/`reason` fields every entry already carries, so a
+/// machine consumer gets full fidelity without this tool guessing which
+/// subset of fields it actually needs.
+fn diff_change_extra_json(change: &DiffChange) -> Vec<(&'static str, JsonValue)> {
+    match change {
+        DiffChange::TableAdded | DiffChange::TableRemoved => Vec::new(),
+        DiffChange::ColumnAdded {
+            ideal_type,
+            missing_pct,
+        } => vec![
+            ("ideal_type", JsonValue::from(ideal_type.clone())),
+            ("missing_pct", JsonValue::from(*missing_pct)),
+        ],
+        DiffChange::ColumnRemoved { ideal_type } => {
+            vec![("ideal_type", JsonValue::from(ideal_type.clone()))]
+        }
+        DiffChange::ColumnRenamed {
+            from,
+            to,
+            similarity,
+            ideal_type,
+        } => vec![
+            ("from", JsonValue::from(from.clone())),
+            ("to", JsonValue::from(to.clone())),
+            ("similarity", JsonValue::from(*similarity)),
+            ("ideal_type", JsonValue::from(ideal_type.clone())),
+        ],
+        DiffChange::TypeChanged {
+            old_current,
+            new_current,
+            old_ideal,
+            new_ideal,
+        } => vec![
+            ("old_current_type", JsonValue::from(old_current.clone())),
+            ("new_current_type", JsonValue::from(new_current.clone())),
+            ("old_ideal_type", JsonValue::from(old_ideal.clone())),
+            ("new_ideal_type", JsonValue::from(new_ideal.clone())),
+        ],
+        DiffChange::MissingPctChanged { old, new } => vec![
+            ("old_missing_pct", JsonValue::from(*old)),
+            ("new_missing_pct", JsonValue::from(*new)),
+        ],
+    }
+}
+
+fn render_diff_json(old_path: &Path, new_path: &Path, report: &DiffReport) -> String {
+    let mut doc = json_support::Map::with_capacity(4);
+    doc.insert(
+        "old".to_string(),
+        JsonValue::from(old_path.display().to_string()),
+    );
+    doc.insert(
+        "new".to_string(),
+        JsonValue::from(new_path.display().to_string()),
+    );
+    doc.insert(
+        "has_breaking_changes".to_string(),
+        JsonValue::Bool(report.has_breaking()),
+    );
+    let mut arr = Vec::with_capacity(report.entries.len());
+    for e in &report.entries {
+        let mut obj = json_support::Map::with_capacity(9);
+        obj.insert("table".to_string(), JsonValue::from(e.table.clone()));
+        obj.insert(
+            "column".to_string(),
+            match &e.column {
+                Some(c) => JsonValue::from(c.clone()),
+                None => JsonValue::Null,
+            },
+        );
+        obj.insert(
+            "kind".to_string(),
+            JsonValue::from(diff_change_label(&e.change).to_string()),
+        );
+        obj.insert(
+            "compatibility".to_string(),
+            JsonValue::from(e.compatibility.label().to_string()),
+        );
+        obj.insert("reason".to_string(), JsonValue::from(e.reason.clone()));
+        for (key, value) in diff_change_extra_json(&e.change) {
+            obj.insert(key.to_string(), value);
+        }
+        arr.push(JsonValue::Object(obj));
+    }
+    doc.insert("changes".to_string(), JsonValue::Array(arr));
+    json_support::to_pretty_string(&JsonValue::Object(doc))
+}
+
+/// Generates a review-first SQL script covering exactly the changes this
+/// diff classified as `Safe` - an `ALTER TABLE ... ADD COLUMN` per safely
+/// added column, reusing the same `sql_quote_ident`/`sql_column_type`
+/// this tool's own `--output-format sql` already renders through. Every
+/// `Breaking` change is named in a leading comment instead, explicitly
+/// excluded rather than guessed at, and a rename candidate is emitted as
+/// a *commented-out* suggestion only - never a live statement - matching
+/// this whole feature's own "generate, never auto-apply" boundary (the
+/// same one `--load-into` already draws by only ever `CREATE`ing fresh
+/// tables, never `ALTER`ing or dropping one).
+fn render_diff_resolution_sql(report: &DiffReport) -> String {
+    let mut sql = String::new();
+    sql.push_str("-- Schema diff resolution script - generated by `sniff-rs diff`.\n");
+    sql.push_str("-- Review every statement before running it against a real database;\n");
+    sql.push_str("-- nothing here is applied automatically. Only changes classified as\n");
+    sql.push_str("-- \"safe\" produce a live statement below - a \"breaking\" change is\n");
+    sql.push_str("-- named in a comment instead, since this tool never guesses at how to\n");
+    sql.push_str("-- resolve a change that could destroy or reject existing data.\n");
+
+    let breaking: Vec<&DiffEntry> = report
+        .entries
+        .iter()
+        .filter(|e| e.compatibility == Compatibility::Breaking)
+        .collect();
+    if !breaking.is_empty() {
+        sql.push_str("--\n-- Breaking changes NOT included below (resolve manually):\n");
+        for e in &breaking {
+            let column = e.column.as_deref().unwrap_or("(table)");
+            sql.push_str(&format!("--   {}.{column}: {}\n", e.table, e.reason));
+        }
+    }
+    sql.push('\n');
+
+    let mut wrote_any = false;
+    let mut ambiguous_table_noted = false;
+    for e in &report.entries {
+        // A table-level change (a whole table added/removed) never gets
+        // a live statement here regardless of compatibility - creating
+        // or dropping a table is exactly the kind of destructive/
+        // structural action this feature never guesses at (see this
+        // section's own header comment); and an entry whose old/new
+        // table names disagree (`sql_table: None` - see `DiffEntry`'s
+        // own doc comment) has no honest table name to write real SQL
+        // against at all.
+        let Some(sql_table) = e.sql_table.as_deref() else {
+            let would_generate_sql = matches!(
+                (&e.change, e.compatibility),
+                (DiffChange::ColumnAdded { .. }, Compatibility::Safe)
+                    | (DiffChange::ColumnRenamed { .. }, _)
+            );
+            if would_generate_sql && !ambiguous_table_noted {
+                sql.push_str(
+                    "-- Note: the old and new dictionaries name their (single) table \
+                     differently, so no ALTER TABLE statements were generated below for \
+                     it - substitute your own real table name for any change listed above.\n\n",
+                );
+                ambiguous_table_noted = true;
+            }
+            continue;
+        };
+        match (&e.change, e.compatibility) {
+            (DiffChange::ColumnAdded { ideal_type, .. }, Compatibility::Safe) => {
+                let column = e.column.as_deref().unwrap_or_default();
+                sql.push_str(&format!(
+                    "ALTER TABLE {} ADD COLUMN {} {};\n",
+                    sql_quote_ident(sql_table),
+                    sql_quote_ident(column),
+                    sql_column_type(ideal_type),
+                ));
+                wrote_any = true;
+            }
+            (
+                DiffChange::ColumnRenamed {
+                    from,
+                    to,
+                    similarity,
+                    ..
+                },
+                _,
+            ) => {
+                sql.push_str(&format!(
+                    "-- Possible rename (NOT applied - review first, {:.0}% sample-value overlap):\n",
+                    similarity * 100.0
+                ));
+                sql.push_str(&format!(
+                    "-- ALTER TABLE {} RENAME COLUMN {} TO {};\n",
+                    sql_quote_ident(sql_table),
+                    sql_quote_ident(from),
+                    sql_quote_ident(to),
+                ));
+                wrote_any = true;
+            }
+            _ => {}
+        }
+    }
+    if !wrote_any {
+        sql.push_str("-- No safe, auto-generatable changes found.\n");
+    }
+    sql
+}
+
+const DIFF_HELP_TEXT: &str = r#"sniff-rs diff - compare two data dictionaries and flag schema drift
+
+USAGE:
+    sniff-rs diff <OLD> <NEW> [OUTPUT_PATH] [OPTIONS]
+
+    <OLD>/<NEW> are two --output-format json dictionaries (this tool's
+    own rich JSON shape, or the --combine directory shape) - not raw
+    data files. Run sniff-rs twice first (once per snapshot) if you only
+    have the original data.
+
+ARGS:
+    <OLD>                   The earlier dictionary
+    <NEW>                   The later dictionary
+    [OUTPUT_PATH]           Where the diff report is written (default:
+                            stdout). Pass "-" to write to stdout explicitly.
+
+OPTIONS:
+        --output-format <FMT>   md (default) or json
+        --fail-on-breaking      Exit with status 2 if any breaking change
+                                is found, after the report is written -
+                                for use in CI
+        --resolution-sql <PATH> Write a review-first SQL script covering
+                                every change classified as safe (an ALTER
+                                TABLE ADD COLUMN per safely-added column,
+                                a commented-out rename suggestion per
+                                rename candidate) - every breaking change
+                                is named in a leading comment instead,
+                                never guessed at. Nothing here is ever
+                                applied automatically.
+    -h, --help                  Print this help
+"#;
+
+/// `sniff-rs diff <OLD> <NEW> [OUTPUT_PATH] [OPTIONS]`'s own small,
+/// independent argument shape - deliberately not folded onto `Args`, the
+/// same "two genuinely different shapes deserve two genuinely separate
+/// structures" call this project already makes elsewhere (e.g. the two
+/// independently-scoped XML parsers, `run_directory` vs.
+/// `run_directory_combined`).
+struct DiffArgs {
+    old_path: PathBuf,
+    new_path: PathBuf,
+    output_path: Option<PathBuf>,
+    output_format: String,
+    fail_on_breaking: bool,
+    resolution_sql: Option<PathBuf>,
+}
+
+enum DiffOutputFormat {
+    Markdown,
+    Json,
+}
+
+impl DiffOutputFormat {
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "md" | "markdown" => Ok(DiffOutputFormat::Markdown),
+            "json" => Ok(DiffOutputFormat::Json),
+            other => {
+                bail!("unrecognized --output-format '{other}' for `diff` (expected md or json)")
+            }
+        }
+    }
+}
+
+impl DiffArgs {
+    fn parse_from(raw: &[String]) -> Result<Self> {
+        let mut output_format = "md".to_string();
+        let mut fail_on_breaking = false;
+        let mut resolution_sql: Option<PathBuf> = None;
+        let mut positionals: Vec<String> = Vec::new();
+
+        let mut i = 0;
+        while i < raw.len() {
+            let arg = raw[i].as_str();
+            if arg == "-h" || arg == "--help" {
+                print!("{DIFF_HELP_TEXT}");
+                std::process::exit(0);
+            }
+            if let Some(rest) = arg.strip_prefix("--") {
+                let (name, inline_value) = match rest.split_once('=') {
+                    Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                    None => (rest.to_string(), None),
+                };
+                let value = |i: &mut usize| -> Result<String> {
+                    if let Some(v) = inline_value.clone() {
+                        return Ok(v);
+                    }
+                    *i += 1;
+                    raw.get(*i)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("--{name} requires a value"))
+                };
+                match name.as_str() {
+                    "output-format" => output_format = value(&mut i)?,
+                    "fail-on-breaking" => fail_on_breaking = true,
+                    "resolution-sql" => resolution_sql = Some(PathBuf::from(value(&mut i)?)),
+                    other => bail!("unrecognized flag --{other}"),
+                }
+            } else {
+                positionals.push(arg.to_string());
+            }
+            i += 1;
+        }
+
+        let mut positionals = positionals.into_iter();
+        let old_path = positionals.next().map(PathBuf::from).ok_or_else(|| {
+            anyhow!("missing required argument: <OLD> (sniff-rs diff <OLD> <NEW> [OUTPUT_PATH])")
+        })?;
+        let new_path = positionals.next().map(PathBuf::from).ok_or_else(|| {
+            anyhow!("missing required argument: <NEW> (sniff-rs diff <OLD> <NEW> [OUTPUT_PATH])")
+        })?;
+        let output_path = positionals.next().map(PathBuf::from);
+        if let Some(extra) = positionals.next() {
+            bail!("unexpected extra argument: {extra}");
+        }
+
+        Ok(DiffArgs {
+            old_path,
+            new_path,
+            output_path,
+            output_format,
+            fail_on_breaking,
+            resolution_sql,
+        })
+    }
+}
+
+fn run_diff(raw: &[String]) -> Result<()> {
+    let args = DiffArgs::parse_from(raw)?;
+    let output_format = DiffOutputFormat::parse(&args.output_format)?;
+
+    let old_tables = load_dictionary_tables(&args.old_path)?;
+    let new_tables = load_dictionary_tables(&args.new_path)?;
+    let report = diff_dictionaries(&old_tables, &new_tables);
+
+    let rendered = match output_format {
+        DiffOutputFormat::Markdown => render_diff_markdown(&args.old_path, &args.new_path, &report),
+        DiffOutputFormat::Json => render_diff_json(&args.old_path, &args.new_path, &report),
+    };
+
+    match args.output_path.as_deref() {
+        Some(p) if p != Path::new("-") => {
+            fs::write(p, &rendered).with_context(|| format!("failed to write {p:?}"))?;
+            eprintln!("{} change(s) -> {}", report.entries.len(), p.display());
+        }
+        _ => {
+            print!("{rendered}");
+            if !rendered.ends_with('\n') {
+                println!();
+            }
+        }
+    }
+
+    if let Some(sql_path) = &args.resolution_sql {
+        let sql = render_diff_resolution_sql(&report);
+        fs::write(sql_path, &sql).with_context(|| format!("failed to write {sql_path:?}"))?;
+        eprintln!("resolution script -> {}", sql_path.display());
+    }
+
+    if args.fail_on_breaking && report.has_breaking() {
+        std::process::exit(2);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    fn col(name: &str, ideal_type: &str, missing_pct: f64, samples: &[&str]) -> DiffColumn {
+        DiffColumn {
+            name: name.to_string(),
+            current_type: ideal_type.to_string(),
+            ideal_type: ideal_type.to_string(),
+            missing_pct,
+            sample_values: samples.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn sample_value_overlap_is_none_when_either_side_has_no_samples() {
+        assert_eq!(sample_value_overlap(&[], &["a".to_string()]), None);
+        assert_eq!(sample_value_overlap(&["a".to_string()], &[]), None);
+    }
+
+    #[test]
+    fn sample_value_overlap_computes_jaccard_similarity() {
+        let a = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let b = vec!["b".to_string(), "c".to_string(), "d".to_string()];
+        // intersection {b, c} = 2, union {a, b, c, d} = 4
+        assert_eq!(sample_value_overlap(&a, &b), Some(0.5));
+    }
+
+    #[test]
+    fn classify_type_change_treats_numeric_widening_and_stringification_as_safe() {
+        assert_eq!(classify_type_change("i64", "f64").0, Compatibility::Safe);
+        assert_eq!(classify_type_change("i64", "String").0, Compatibility::Safe);
+        assert_eq!(
+            classify_type_change("UUID", "String").0,
+            Compatibility::Safe
+        );
+    }
+
+    #[test]
+    fn classify_type_change_treats_narrowing_and_unrelated_swaps_as_breaking() {
+        assert_eq!(
+            classify_type_change("f64", "i64").0,
+            Compatibility::Breaking
+        );
+        assert_eq!(
+            classify_type_change("String", "i64").0,
+            Compatibility::Breaking
+        );
+        assert_eq!(
+            classify_type_change("UUID", "Email").0,
+            Compatibility::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_missing_pct_change_flags_the_notnull_boundary_in_both_directions() {
+        // Became nullable: safe (relaxing a constraint).
+        assert_eq!(
+            classify_missing_pct_change(0.0, 5.0).unwrap().0,
+            Compatibility::Safe
+        );
+        // Became fully populated: breaking (a NOT NULL constraint could
+        // now be added, which can reject an old pipeline's own nulls).
+        assert_eq!(
+            classify_missing_pct_change(5.0, 0.0).unwrap().0,
+            Compatibility::Breaking
+        );
+        // A small shift with neither side at exactly 0 is not flagged.
+        assert_eq!(classify_missing_pct_change(5.0, 6.0), None);
+        // A large shift with neither side at exactly 0 is flagged, but safe.
+        assert_eq!(
+            classify_missing_pct_change(5.0, 50.0).unwrap().0,
+            Compatibility::Safe
+        );
+    }
+
+    #[test]
+    fn diff_table_columns_detects_a_rename_by_type_and_sample_overlap() {
+        let old = vec![col("name", "String", 0.0, &["alice", "bob"])];
+        let new = vec![col("full_name", "String", 0.0, &["alice", "bob"])];
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].change,
+            DiffChange::ColumnRenamed { .. }
+        ));
+        assert_eq!(entries[0].compatibility, Compatibility::Safe);
+    }
+
+    #[test]
+    fn diff_table_columns_does_not_suggest_a_rename_across_different_types() {
+        let old = vec![col("a", "i64", 0.0, &["1", "2"])];
+        let new = vec![col("b", "String", 0.0, &["1", "2"])];
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        // Different ideal_type -> genuinely a remove + an add, not a rename.
+        assert!(
+            entries
+                .iter()
+                .all(|e| !matches!(e.change, DiffChange::ColumnRenamed { .. }))
+        );
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn diff_table_columns_does_not_suggest_a_rename_with_no_sample_overlap() {
+        let old = vec![col("a", "String", 0.0, &["x", "y"])];
+        let new = vec![col("b", "String", 0.0, &["p", "q"])];
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        assert!(
+            entries
+                .iter()
+                .all(|e| !matches!(e.change, DiffChange::ColumnRenamed { .. }))
+        );
+    }
+
+    #[test]
+    fn diff_table_columns_classifies_a_notnull_added_column_as_breaking() {
+        let old = vec![col("id", "i64", 0.0, &["1"])];
+        let new = vec![
+            col("id", "i64", 0.0, &["1"]),
+            col("required_col", "String", 0.0, &["x"]),
+        ];
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        let added = entries
+            .iter()
+            .find(|e| e.column.as_deref() == Some("required_col"))
+            .unwrap();
+        assert_eq!(added.compatibility, Compatibility::Breaking);
+    }
+
+    #[test]
+    fn diff_dictionaries_matches_single_table_dictionaries_regardless_of_name() {
+        let mut old = BTreeMap::new();
+        old.insert("old_stem".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        let mut new = BTreeMap::new();
+        new.insert(
+            "new_stem".to_string(),
+            vec![
+                col("id", "i64", 0.0, &["1"]),
+                col("extra", "String", 10.0, &["x"]),
+            ],
+        );
+        let report = diff_dictionaries(&old, &new);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].table, "old_stem -> new_stem");
+        assert_eq!(report.entries[0].sql_table, None);
+    }
+
+    #[test]
+    fn diff_dictionaries_matches_multi_table_dictionaries_by_name() {
+        let mut old = BTreeMap::new();
+        old.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        old.insert("orders".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        let mut new = BTreeMap::new();
+        new.insert("users".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        new.insert("payments".to_string(), vec![col("id", "i64", 0.0, &["1"])]);
+        let report = diff_dictionaries(&old, &new);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.table == "orders" && matches!(e.change, DiffChange::TableRemoved))
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.table == "payments" && matches!(e.change, DiffChange::TableAdded))
+        );
+    }
+
+    #[test]
+    fn render_diff_resolution_sql_only_emits_live_sql_for_safe_changes_with_a_known_table() {
+        let report = DiffReport {
+            entries: vec![
+                DiffEntry {
+                    table: "t".to_string(),
+                    sql_table: Some("t".to_string()),
+                    column: Some("new_col".to_string()),
+                    change: DiffChange::ColumnAdded {
+                        ideal_type: "String".to_string(),
+                        missing_pct: 10.0,
+                    },
+                    compatibility: Compatibility::Safe,
+                    reason: "safe add".to_string(),
+                },
+                DiffEntry {
+                    table: "t".to_string(),
+                    sql_table: Some("t".to_string()),
+                    column: Some("gone".to_string()),
+                    change: DiffChange::ColumnRemoved {
+                        ideal_type: "String".to_string(),
+                    },
+                    compatibility: Compatibility::Breaking,
+                    reason: "dropped".to_string(),
+                },
+            ],
+        };
+        let sql = render_diff_resolution_sql(&report);
+        assert!(sql.contains("ALTER TABLE \"t\" ADD COLUMN \"new_col\" TEXT;"));
+        assert!(!sql.contains("DROP"));
+        assert!(
+            sql.contains("gone"),
+            "breaking change should still be named in a comment"
+        );
+    }
+
+    #[test]
+    fn diff_args_parse_from_requires_old_and_new() {
+        assert!(DiffArgs::parse_from(&[]).is_err());
+        assert!(DiffArgs::parse_from(&["only_old.json".to_string()]).is_err());
+        let args = DiffArgs::parse_from(&["old.json".to_string(), "new.json".to_string()]).unwrap();
+        assert_eq!(args.old_path, PathBuf::from("old.json"));
+        assert_eq!(args.new_path, PathBuf::from("new.json"));
+        assert_eq!(args.output_format, "md");
+        assert!(!args.fail_on_breaking);
+    }
 }
 
 // --- Unit tests for the heuristic engine ---

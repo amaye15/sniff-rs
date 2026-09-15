@@ -10440,3 +10440,294 @@ fn csv_category_50_vs_51_and_extra() {
     // With only 10 rows, both cat_50 and cat_51 have <50 unique but ratio >5%, so both are String (not category) - just check not panic.
     assert_eq!(cols.len(), 3);
 }
+
+// --- `sniff-rs diff <OLD> <NEW>` - schema diff / drift detection ---
+// This project's first CLI subcommand, so these tests follow a slightly
+// different shape from every test above: rather than pointing at one
+// committed fixture, each test builds its own small pair of dictionary
+// JSON files under a throwaway TempDir (via a real `sniff-rs <csv>
+// --output-format json` run first, matching how a real user would
+// actually produce the two inputs `diff` compares), then runs `sniff-rs
+// diff` against them and asserts on the report.
+
+fn run_diff_raw(args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .arg("diff")
+        .args(args)
+        .output()
+        .expect("failed to run binary")
+}
+
+/// Writes `content` to `dir/name`, profiles it to JSON under the same
+/// directory (`name.dictionary.json`), and returns that dictionary's
+/// path.
+fn write_dictionary(dir: &std::path::Path, name: &str, csv_content: &str) -> PathBuf {
+    let csv_path = dir.join(name);
+    std::fs::write(&csv_path, csv_content).unwrap();
+    let json_path = dir.join(format!("{name}.json"));
+    let output = Command::new(bin())
+        .args([
+            csv_path.to_str().unwrap(),
+            json_path.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "profiling {name} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_path
+}
+
+#[test]
+fn diff_detects_added_removed_and_a_renamed_column_in_a_single_table_dictionary() {
+    let dir = TempDir::new();
+    // "name" -> "full_name" is a real rename candidate (same type, 100%
+    // sample-value overlap); "legacy_col" is genuinely dropped;
+    // "new_col" is genuinely added, with no missing values (so it's
+    // classified breaking, since adding it as NOT NULL needs a
+    // backfill).
+    let old = write_dictionary(
+        dir.path(),
+        "old.csv",
+        "id,name,email,legacy_col\n1,alice,alice@example.com,x\n2,bob,bob@example.com,y\n3,carol,carol@example.com,z\n",
+    );
+    let new = write_dictionary(
+        dir.path(),
+        "new.csv",
+        "id,full_name,email,new_col\n1,alice,alice@example.com,10\n2,bob,bob@example.com,20\n3,carol,carol@example.com,30\n",
+    );
+
+    let output = run_diff_raw(&[old.to_str().unwrap(), new.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "diff should succeed (breaking changes alone don't fail the run without --fail-on-breaking): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        report.contains("name -> full_name") && report.contains("possible rename"),
+        "expected a rename candidate in the report:\n{report}"
+    );
+    assert!(
+        report.contains("legacy_col") && report.contains("column removed"),
+        "expected legacy_col to be reported removed:\n{report}"
+    );
+    assert!(
+        report.contains("new_col") && report.contains("column added"),
+        "expected new_col to be reported added:\n{report}"
+    );
+    assert!(
+        report.contains("BREAKING"),
+        "a dropped column and a non-nullable added column should both be breaking:\n{report}"
+    );
+}
+
+#[test]
+fn diff_reports_no_differences_for_an_unchanged_schema() {
+    let dir = TempDir::new();
+    let content = "id,name\n1,alice\n2,bob\n";
+    let old = write_dictionary(dir.path(), "a.csv", content);
+    let new = write_dictionary(dir.path(), "b.csv", content);
+
+    let output = run_diff_raw(&[old.to_str().unwrap(), new.to_str().unwrap()]);
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        report.contains("No differences detected"),
+        "identical schemas should report no differences:\n{report}"
+    );
+}
+
+#[test]
+fn diff_output_format_json_produces_structured_changes_with_a_breaking_flag() {
+    let dir = TempDir::new();
+    let old = write_dictionary(dir.path(), "old.csv", "id,name\n1,alice\n2,bob\n");
+    let new = write_dictionary(dir.path(), "new.csv", "id\n1\n2\n");
+
+    let output = run_diff_raw(&[
+        old.to_str().unwrap(),
+        new.to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["has_breaking_changes"], true);
+    let changes = doc["changes"].as_array().unwrap();
+    assert!(
+        changes.iter().any(|c| c["column"] == "name"
+            && c["kind"] == "column removed"
+            && c["compatibility"] == "breaking"),
+        "expected a breaking column-removed entry for 'name': {doc}"
+    );
+}
+
+#[test]
+fn diff_fail_on_breaking_exits_with_status_2_only_when_a_breaking_change_exists() {
+    let dir = TempDir::new();
+    let old = write_dictionary(dir.path(), "old.csv", "id,name\n1,alice\n2,bob\n");
+    let new_breaking = write_dictionary(dir.path(), "new_breaking.csv", "id\n1\n2\n");
+    let new_same = write_dictionary(dir.path(), "new_same.csv", "id,name\n1,alice\n2,bob\n");
+
+    let breaking_output = run_diff_raw(&[
+        old.to_str().unwrap(),
+        new_breaking.to_str().unwrap(),
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(breaking_output.status.code(), Some(2));
+
+    let clean_output = run_diff_raw(&[
+        old.to_str().unwrap(),
+        new_same.to_str().unwrap(),
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(clean_output.status.code(), Some(0));
+}
+
+#[test]
+fn diff_resolution_sql_emits_alter_table_for_a_safe_add_and_excludes_breaking_changes() {
+    let dir = TempDir::new();
+    // Same file name in two different subdirectories so both dictionaries'
+    // one-and-only table shares a real, unambiguous name ("data") -
+    // exercising the live ALTER TABLE path, not the "table names differ"
+    // disclosed fallback.
+    let old_dir = dir.path().join("a");
+    let new_dir = dir.path().join("b");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::create_dir_all(&new_dir).unwrap();
+    let old = write_dictionary(&old_dir, "data.csv", "id,name\n1,alice\n2,bob\n");
+    let new = write_dictionary(
+        &new_dir,
+        "data.csv",
+        "id,name,nickname\n1,alice,\n2,bob,bobby\n",
+    );
+
+    let sql_path = dir.path().join("resolution.sql");
+    let output = run_diff_raw(&[
+        old.to_str().unwrap(),
+        new.to_str().unwrap(),
+        "--resolution-sql",
+        sql_path.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(
+        sql.contains("ALTER TABLE \"data\" ADD COLUMN \"nickname\" TEXT;"),
+        "expected a real ALTER TABLE statement for the safely-added nullable column:\n{sql}"
+    );
+    assert!(
+        !sql.contains("DROP") && !sql.contains("RENAME COLUMN \"id\""),
+        "resolution SQL must never touch anything beyond a safe ADD COLUMN or a commented-out rename:\n{sql}"
+    );
+}
+
+#[test]
+fn diff_resolution_sql_never_emits_a_live_statement_when_table_names_disagree() {
+    let dir = TempDir::new();
+    let old = write_dictionary(dir.path(), "old.csv", "id,name\n1,alice\n2,bob\n");
+    let new = write_dictionary(
+        dir.path(),
+        "new.csv",
+        "id,name,nickname\n1,alice,\n2,bob,bobby\n",
+    );
+
+    let sql_path = dir.path().join("resolution.sql");
+    let output = run_diff_raw(&[
+        old.to_str().unwrap(),
+        new.to_str().unwrap(),
+        "--resolution-sql",
+        sql_path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(
+        !sql.contains("ALTER TABLE \""),
+        "an ambiguous table name (old.csv vs new.csv) must never be guessed at in generated SQL:\n{sql}"
+    );
+    assert!(
+        sql.contains("name their (single) table differently"),
+        "expected the disclosed ambiguous-table-name note:\n{sql}"
+    );
+}
+
+#[test]
+fn diff_rejects_a_json_schema_document_with_an_actionable_error() {
+    let dir = TempDir::new();
+    let csv_path = dir.path().join("data.csv");
+    std::fs::write(&csv_path, "id,name\n1,alice\n").unwrap();
+    let schema_path = dir.path().join("data.schema.json");
+    let profile = Command::new(bin())
+        .args([
+            csv_path.to_str().unwrap(),
+            schema_path.to_str().unwrap(),
+            "--output-format",
+            "json-schema",
+        ])
+        .output()
+        .unwrap();
+    assert!(profile.status.success());
+
+    let new = write_dictionary(dir.path(), "new.csv", "id,name\n1,alice\n");
+    let output = run_diff_raw(&[schema_path.to_str().unwrap(), new.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("isn't a JSON array of columns") || stderr.contains("tables"),
+        "expected an actionable error naming the shape mismatch: {stderr}"
+    );
+}
+
+#[test]
+fn diff_missing_positional_arguments_is_an_actionable_error_not_a_panic() {
+    let output = run_diff_raw(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("<OLD>"),
+        "expected an actionable error: {stderr}"
+    );
+}
+
+// Uses INI, not SQLite, to build the two multi-table dictionaries below -
+// deliberately: this project's own standing rule is that no automated
+// `cargo test` spawns a real external database engine CLI (see
+// CLAUDE.md's own "Deliberately not covered by an automated `cargo
+// test`" note under `--load-into`), and INI already gives one table per
+// section (see `columns_from_ini`) with nothing more than a plain text
+// file to write - no subprocess, no optional external tool, needed at all.
+#[cfg(feature = "ini")]
+#[test]
+fn diff_multi_table_dictionaries_match_tables_by_name() {
+    let dir = TempDir::new();
+    let old = write_dictionary(
+        dir.path(),
+        "old.ini",
+        "[users]\nid=1\nname=alice\n\n[orders]\nid=1\namount=9.99\n",
+    );
+    let new = write_dictionary(
+        dir.path(),
+        "new.ini",
+        "[users]\nid=1\nname=alice\nemail=alice@example.com\n\n[payments]\nid=1\namount=9.99\n",
+    );
+
+    let output = run_diff_raw(&[old.to_str().unwrap(), new.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("orders") && report.contains("table removed"));
+    assert!(report.contains("payments") && report.contains("table added"));
+    assert!(
+        report.contains("users") && report.contains("email") && report.contains("column added")
+    );
+}
