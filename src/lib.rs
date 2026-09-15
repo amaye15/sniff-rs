@@ -46535,6 +46535,93 @@ mod geojson_support {
             }
         }
     }
+
+    /// The GeoJSON row-source for `render_sql_inline_flat` (Phase 23,
+    /// the twelfth format in the recursively-nested, JSON-bridge tier) -
+    /// a mechanical mirror of `columns_from_geojson`'s own three-shape
+    /// dispatch just above, with one genuine wrinkle none of this tier's
+    /// prior formats had: a bare top-level `Geometry` document profiles
+    /// as a single column literally named `"geometry"`, not `"value"` -
+    /// so it can't be routed through `json_emit_row_for_sql`'s own
+    /// `"value"`/`"value.*"` convention the way every other format's
+    /// single-column fallback already is. That one case is handled by
+    /// calling `sink.accept` directly with the rendered WKT text (there's
+    /// exactly one column, so there's no path-walking or records-mode
+    /// question to resolve at all); the `FeatureCollection`/bare
+    /// `Feature` shapes both already produce genuine records (`feature_
+    /// to_record` already renders `geometry` to WKT text and folds in
+    /// `properties`/`id`, matching the profiling pass exactly), so those
+    /// two go through `json_emit_row_for_sql` normally.
+    pub(crate) fn stream_geojson_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut first_err: Option<Error> = None;
+        let found = json_support::stream_nested_array(reader, &["features"], |v| {
+            if first_err.is_none() {
+                match feature_to_record(v) {
+                    Ok(record) => {
+                        if let Err(e) = json_emit_row_for_sql(
+                            &JsonValue::from(record),
+                            columns,
+                            records_mode,
+                            sink,
+                        ) {
+                            first_err = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(json_support::ParseError::custom(format!("{e:?}")));
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        if found {
+            return Ok(());
+        }
+
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let value = json_support::from_str(&text)
+            .map_err(|e| anyhow!("{e}"))
+            .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        let JsonValue::Object(root) = value else {
+            bail!(
+                "{path:?} doesn't look like a GeoJSON document - expected a top-level JSON object (RFC 7946 §3)"
+            );
+        };
+        let ty = root
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .with_context(|| {
+                format!("{path:?} is missing its own top-level \"type\" field (RFC 7946 §3)")
+            })?;
+        match ty.as_str() {
+            "FeatureCollection" => bail!(
+                "{path:?}'s FeatureCollection is missing its own \"features\" array (RFC 7946 §3.3)"
+            ),
+            "Feature" => {
+                let record = feature_to_record(JsonValue::Object(root))
+                    .with_context(|| format!("{path:?} isn't a well-formed GeoJSON Feature"))?;
+                json_emit_row_for_sql(&JsonValue::from(record), columns, records_mode, sink)
+            }
+            _ => {
+                let wkt = geometry_to_wkt(&JsonValue::Object(root), 0)
+                    .with_context(|| format!("{path:?} isn't a well-formed GeoJSON document"))?;
+                sink.accept(vec![Some(wkt)])
+            }
+        }
+    }
 } // mod geojson_support
 
 #[cfg(feature = "geojson")]
@@ -52916,6 +53003,7 @@ fn render_sql_inline_flat(
             | InputFormat::Plist
             | InputFormat::Json5
             | InputFormat::Har
+            | InputFormat::GeoJson
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -53159,6 +53247,7 @@ fn render_sql_inline_flat(
         InputFormat::Plist => render_sql_inline_flat_plist(read_path, profiles, &mut sink)?,
         InputFormat::Json5 => render_sql_inline_flat_json5(read_path, profiles, &mut sink)?,
         InputFormat::Har => render_sql_inline_flat_har(read_path, profiles, &mut sink)?,
+        InputFormat::GeoJson => render_sql_inline_flat_geojson(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -53748,6 +53837,31 @@ fn render_sql_inline_flat_har(
     )
 }
 
+/// The GeoJSON row-source wrapper for `render_sql_inline_flat` (Phase
+/// 23) - see `render_sql_inline_flat_har`'s own doc comment; identical
+/// shape, just driven by `geojson_support::stream_geojson_rows_for_sql`'s
+/// own three-shape dispatch instead.
+#[cfg(feature = "geojson")]
+fn render_sql_inline_flat_geojson(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    geojson_support::stream_geojson_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "geojson"))]
+fn render_sql_inline_flat_geojson(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "GeoJSON support isn't compiled in - rebuild with `cargo build --release --features geojson` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -53894,12 +54008,13 @@ fn render_sql(
             | InputFormat::Plist
             | InputFormat::Json5
             | InputFormat::Har
+            | InputFormat::GeoJson
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -61174,10 +61289,11 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Plist
                 | InputFormat::Json5
                 | InputFormat::Har
+                | InputFormat::GeoJson
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson are supported so far",
             format.as_str()
         );
     }

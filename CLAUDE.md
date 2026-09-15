@@ -322,9 +322,10 @@ Common/Combined Log Format, syslog (RFC 3164/5424), dBase, Stata,
 SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
-Avro, XML, BSON, Property List (plist), JSON5/JSONC, and HAR, the first
-eleven formats in the recursively-nested, JSON-bridge tier. Every other
-format transparently falls back to `staging` with a disclosed stderr
+Avro, XML, BSON, Property List (plist), JSON5/JSONC, HAR, and GeoJSON,
+the first twelve formats in the recursively-nested, JSON-bridge tier.
+Every other format transparently falls back to `staging` with a
+disclosed stderr
 note (`--sql-mode inline` given *explicitly* on an unsupported format is
 a hard error instead, naming the gap - downgrading what was explicitly
 asked for would be the wrong kind of quiet).
@@ -367,8 +368,9 @@ needs its own real design, not just repeating the same pattern:
    real trailing-ambiguity problem versus BIFF's middle-gap-only
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
-   MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, and HAR done
-   as of Phases 13-22.** Unlike the two tiers above, there was no existing
+   MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, HAR, and
+   GeoJSON done as of Phases 13-23.** Unlike the two tiers above, there
+   was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
    accumulator only ever absorbs values incrementally across *all*
@@ -428,7 +430,16 @@ needs its own real design, not just repeating the same pattern:
    (`log.entries`, always an array of objects), so it always runs in
    records mode with no dual-mode dispatch to consider at all, the same
    simplicity BSON's own single-shape format already demonstrated.
-   GeoJSON, vCard, iCalendar, and MBOX remain unstarted.
+   GeoJSON needed one small, genuinely new piece: a bare top-level
+   `Geometry` document profiles as a single column literally named
+   `"geometry"`, not `"value"` the way every other format's own single-
+   column fallback is - so that one case bypasses `json_emit_row_for_sql`
+   entirely (there's exactly one column, so there's no path-walking or
+   records-mode question to resolve), while the far more common
+   `FeatureCollection`/bare-`Feature` shapes (whose own `feature_to_record`
+   already renders `geometry` to WKT text during profiling) go through
+   the shared extractor completely normally. vCard, iCalendar, and MBOX
+   remain unstarted.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -1862,18 +1873,77 @@ unsupported format" example moved to GeoJSON instead, gated behind
 `--features geojson` - the same one-hop-forward shuffle repeats itself
 again.
 
-Remaining in the recursively-nested, JSON-bridge tier: GeoJSON, vCard,
-iCalendar, and MBOX - each bridges to the same `json_support::Value`
-shape JSON itself uses (see the Architecture section), so `json_extract_
-value_for_sql`/`json_inline_blocking_column`/`json_bridge_columns_and_
-mode` are already reusable as-is once each format's own row-source
-re-decodes its file a second time into that same `Value` tree - Phases
-14 through 22 are direct, working proof of this now, not just a plan
-(nine formats in a row needed zero changes to any of the three shared
-functions). vCard/iCalendar/MBOX's own repeated-property pooling (a
-different mechanism from JSON's array pooling, but the identical
-one-cell-per-row question) is the one sub-family that will need its own
-fresh look before assuming the same machinery applies unchanged.
+**Phase 23: GeoJSON - the twelfth format in the recursively-nested,
+JSON-bridge tier, and the first format since JSON itself to need a
+genuine, if small, new piece of logic rather than a pure mechanical
+port.** GeoJSON's own profiling reader (`columns_from_geojson`) has the
+same three-shape dispatch HAR's own single-shape reader didn't need to
+worry about: a `FeatureCollection` streams `features` via `json_support::
+stream_nested_array` (each element passed through `feature_to_record`,
+which already renders `geometry` to WKT text and folds in `properties`/
+`id` - exactly the transformation the SQL row-source needs to replicate,
+not bypass); a bare top-level `Feature` (legal per RFC 7946 §3) is a
+single record, same shape; a bare top-level `Geometry` (also legal) has
+no properties at all, so it profiles as one column - but that column is
+literally named `"geometry"`, not `"value"` the way every other format's
+own single-column fallback already is (`profile_json_path("geometry".
+to_string(), 1, ...)`, not `"value"`). This is a genuine deviation from
+the convention `json_bridge_columns_and_mode`/`json_extract_value_for_
+sql` were built around, and the fix is to sidestep it rather than special-
+case the extractor itself: `geojson_support::stream_geojson_rows_for_sql`
+handles the bare-`Geometry` case by calling `sink.accept` directly with
+the rendered WKT text (there being exactly one column, there's no
+path-walking or records-mode question left to resolve at all), while the
+`FeatureCollection`/bare-`Feature` branches - which do produce genuine,
+`"value"`-free records via `feature_to_record` - go through `json_emit_
+row_for_sql` exactly like every other format in this tier. `stream_
+nested_array`'s own callback needs `json_support::ParseError` (not this
+crate's `Error`), so this row-source reuses the same "capture the first
+real error, re-raise once the scan finishes" pattern Phase 22's own HAR
+row-source already established for the identical reason.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.geojson --output-format sql --load-into sqlite:...`
+loaded its own real `FeatureCollection` (a Point and a LineString)
+correctly, with `geometry` rendering as real WKT text and `properties`/
+`id` flattening alongside it; `edge_geojson_bare_feature.geojson`
+confirmed the bare-`Feature` shape resolves identically;
+`edge_geojson_bare_geometry.geojson` confirmed the bare-`Geometry`
+special case produces a real, single-column `"geometry"` table that
+loads correctly - not `"value"`; `edge_geojson_geometry_types.geojson`
+confirmed every real WKT geometry keyword (Polygon/MultiPolygon/
+MultiPoint/MultiLineString/GeometryCollection) renders correctly and a
+genuinely null geometry lands as a real SQL `NULL`, not an empty string;
+a new hand-built fixture (`edge_geojson_sql_inline_array_of_objects.
+geojson`) confirmed the disclosed blocking error fires and names the
+offending field for a genuine array-of-objects property; `--nrows`
+confirmed to bound the kept row count on the `FeatureCollection` path.
+Also verified as behavior-preserving for every already-shipped format:
+`diff` confirmed byte-identical inline SQL output against the pre-
+Phase-23 binary across the entire fixture corpus (GeoJSON itself
+excluded, since this phase is exactly what changes its own output).
+Clean across default/`geojson`/`full`, matching each one's own
+established baseline exactly.
+
+Phase 22's own three tests that used GeoJSON as their "still genuinely
+unsupported format" example moved to vCard instead, gated behind
+`--features vcard` - the same one-hop-forward shuffle repeats itself
+again, landing this time on the first of the three formats this tier's
+own roadmap already flagged as needing genuinely new design (vCard/
+iCalendar/MBOX's shared repeated-property pooling mechanism, a different
+shape from JSON's array pooling).
+
+Remaining in the recursively-nested, JSON-bridge tier: vCard, iCalendar,
+and MBOX - each shares `vobject_support`'s own repeated-property pooling
+(a genuinely different mechanism from JSON's array pooling, but the
+identical one-cell-per-row question every other format's own blocking
+check already resolves), so these three are the one sub-family in this
+entire tier that will need a real, fresh look before assuming `json_
+extract_value_for_sql`/`json_inline_blocking_column`/`json_bridge_
+columns_and_mode` apply unchanged - GeoJSON's own bare-`Geometry` special
+case is the closest precedent so far for "mostly reuse the shared
+machinery, but handle one real structural difference explicitly" rather
+than a pure mechanical port.
 
 ## Directory-input batch mode
 

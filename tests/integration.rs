@@ -550,25 +550,25 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 }
 
 #[test]
-#[cfg(feature = "geojson")]
+#[cfg(feature = "vcard")]
 fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
     // No --sql-mode given, on a format inline mode doesn't support yet -
     // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
-    // JSON5, and HAR are now inline-supported (Phases 13-22), so
-    // GeoJSON is used here instead as a format that still genuinely
+    // JSON5, HAR, and GeoJSON are now inline-supported (Phases 13-23),
+    // so vCard is used here instead as a format that still genuinely
     // isn't. Falls back to staging mode automatically (with a disclosed
     // stderr note, checked separately below) rather than erroring or
     // silently producing something different.
-    let sql = run_sql("sample.geojson", &[]);
+    let sql = run_sql("sample.vcf", &[]);
     assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
 }
 
 #[test]
-#[cfg(feature = "geojson")]
+#[cfg(feature = "vcard")]
 fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
     let output = Command::new(bin())
         .args([
-            fixture("sample.geojson").to_str().unwrap(),
+            fixture("sample.vcf").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -577,12 +577,12 @@ fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for geojson"));
+    assert!(stderr.contains("inline SQL mode isn't available yet for vcard"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
 #[test]
-#[cfg(feature = "geojson")]
+#[cfg(feature = "vcard")]
 fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // Asking for --sql-mode inline explicitly on a format that can't do
     // it yet is a hard, actionable error - unlike the silent fallback
@@ -590,7 +590,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
     // wrong kind of quiet.
     let output = Command::new(bin())
         .args([
-            fixture("sample.geojson").to_str().unwrap(),
+            fixture("sample.vcf").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -601,7 +601,7 @@ fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for geojson"));
+    assert!(stderr.contains("--sql-mode inline isn't available yet for vcard"));
     assert!(stderr.contains("--sql-mode staging"));
 }
 
@@ -702,18 +702,18 @@ fn load_into_rejects_a_combined_output_path() {
 }
 
 #[test]
-#[cfg(feature = "geojson")]
+#[cfg(feature = "vcard")]
 fn load_into_rejects_an_unsupported_input_format() {
     // No output-path positional at all - the way --load-into is actually
     // meant to be used ("-" is itself an explicit output path, and is
     // correctly rejected in combination with --load-into by a separate
     // check, exercised by load_into_rejects_a_combined_output_path).
     // JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
-    // JSON5, and HAR are now inline-supported (Phases 13-22), so
-    // GeoJSON stands in as a format that still genuinely isn't.
+    // JSON5, HAR, and GeoJSON are now inline-supported (Phases 13-23),
+    // so vCard stands in as a format that still genuinely isn't.
     let output = Command::new(bin())
         .args([
-            fixture("sample.geojson").to_str().unwrap(),
+            fixture("sample.vcf").to_str().unwrap(),
             "--output-format",
             "sql",
             "--load-into",
@@ -723,7 +723,7 @@ fn load_into_rejects_an_unsupported_input_format() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for geojson"));
+    assert!(stderr.contains("--load-into isn't available yet for vcard"));
 }
 
 #[test]
@@ -2353,6 +2353,87 @@ fn load_into_accepts_har() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for har"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "geojson")]
+fn sql_output_inline_mode_supports_geojson_feature_collection() {
+    // Phase 23 of the "any format" rollout, and the twelfth format in
+    // the recursively-nested, JSON-bridge tier - sample.geojson's own
+    // real FeatureCollection exercises geometry-to-WKT rendering
+    // alongside flattened properties.
+    let sql = run_sql("sample.geojson", &[]);
+    assert!(sql.contains("\"geometry\""));
+    assert!(sql.contains("'POINT(-122.4783 37.8199)'"));
+    assert!(sql.contains("'LINESTRING(-122.4 37.8, -122.41 37.81)'"));
+}
+
+#[test]
+#[cfg(feature = "geojson")]
+fn sql_output_inline_mode_supports_geojson_bare_feature_and_bare_geometry() {
+    let feature_sql = run_sql("edge_geojson_bare_feature.geojson", &[]);
+    assert!(feature_sql.contains("'POINT(-74.0445 40.6892)'"));
+
+    // A bare top-level Geometry profiles as a single column literally
+    // named "geometry" (not "value") - a real deviation from every
+    // other format's own single-value-column convention in this tier,
+    // handled by bypassing the generic records-mode extractor entirely.
+    let geometry_sql = run_sql("edge_geojson_bare_geometry.geojson", &[]);
+    assert!(
+        geometry_sql.contains("CREATE TABLE \"edge_geojson_bare_geometry\" (\n    \"geometry\"")
+    );
+    assert!(geometry_sql.contains("'POINT(1.5 2.5)'"));
+}
+
+#[test]
+#[cfg(feature = "geojson")]
+fn sql_output_inline_mode_geojson_renders_every_geometry_type_and_a_null_geometry() {
+    let sql = run_sql("edge_geojson_geometry_types.geojson", &[]);
+    assert!(sql.contains("'POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'"));
+    assert!(sql.contains("'MULTIPOLYGON("));
+    assert!(sql.contains("'MULTIPOINT(0 0, 1 1)'"));
+    assert!(sql.contains("'MULTILINESTRING("));
+    assert!(sql.contains("'GEOMETRYCOLLECTION("));
+    assert!(sql.contains("('unlocated', NULL)"));
+}
+
+#[test]
+#[cfg(feature = "geojson")]
+fn sql_output_inline_mode_geojson_rejects_an_array_of_objects_column() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_geojson_sql_inline_array_of_objects.geojson")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for field \"tags\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+#[cfg(feature = "geojson")]
+fn load_into_accepts_geojson() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.geojson").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for geojson"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
