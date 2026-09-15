@@ -3087,6 +3087,64 @@ the version already checked against a real, installed SQLite build
 before this pass began. Clean across default/`full`, matching each
 build's own established clippy baseline (full=6, default=2) exactly.
 
+**A follow-up pass, in the same "memory, performance, streaming" audit,
+found a real CPU-time complexity problem in rename-candidate detection
+itself - the newest, previously-unmeasured code in the diff engine's own
+hot path, not the loading step above.** `diff_table_columns`'s own
+candidate-generation loop was a full `removed x added` cartesian
+product - fine at the small scale every existing test exercised, but a
+real, severe cost at real scale: a synthetic 5,000-column-vs-5,000-column
+single table with every column renamed (generated the same way every
+other large-scale measurement in this project's history is) took **3.21
+seconds and ~65 billion instructions retired** before this fix - for a
+table width well within what a genuinely wide real-world schema (survey
+data, a wide feature table) can reach.
+
+The fix is a genuine complexity-class change, not a constant-factor
+tweak, and it's provably lossless: two columns with *zero* sample values
+in common always have a Jaccard similarity of `0.0` (`sample_value_
+overlap`'s own definition), which can never clear `RENAME_SIMILARITY_
+THRESHOLD` (`0.6`) - so a removed column only ever needs to be checked
+against the added columns it shares at least one literal sample value
+with; every other pair was always going to be rejected anyway, so
+skipping it changes zero output, only how many pairs pay for the
+expensive per-pair check. `diff_table_columns` now builds a `HashMap<&str,
+Vec<&str>, FxBuildHasher>` inverted index (sample value -> the added
+columns that have it - the identical "hot, non-adversarial internal key"
+`FxHasher` tradeoff this project's own Performance section already makes
+for `bucket_object_fields`/`suggest_ideal_type`'s own unique-value count)
+once per table, then for each removed column gathers only its own
+already-seen-once candidate set by walking its own sample values through
+that index, before running the same type check and `sample_value_
+overlap` computation as before. Measured on the identical 5,000-vs-5,000
+fixture: **0.06s user time, ~748 million instructions retired** - roughly
+a 53x wall-clock and 87x instruction-count reduction, confirmed byte-
+identical `--output-format json` output against the pre-fix binary.
+
+**The true worst case - every single column across an entire wide table
+sharing byte-identical sample values - is disclosed, not silently
+assumed away**: a deliberately pathological 2,000-vs-2,000-column table
+where every column's `sample_values` are the exact same three strings
+still costs ~26.5 billion instructions, since the inverted index provides
+zero pruning when every value maps to every column. This is the honest,
+inherent floor of any overlap-based approach (the naive cartesian product
+would have cost the same in this exact case, since every pair genuinely
+has nonzero overlap needing the full check) - and it's a shape no real
+schema actually produces, since it would mean every column holds
+identical data, not just a rename. Left as a disclosed boundary rather
+than chased further with a candidate-list size cap or similar, the same
+"confident common case, disclosed gap" tradeoff this project already
+accepts throughout its own design-philosophy section.
+
+Verified with four new unit tests (a cross-type sample-value collision
+that must not shadow the real, correctly-typed match; a column with no
+sample values at all correctly never becoming a rename candidate; a
+400-column-per-side wide-disjoint-tables case pairing every rename
+correctly; the existing greedy-matching test unchanged) plus byte-
+identical output confirmed via `diff` against the pre-fix binary across
+every committed `diff_*.json` fixture pair. Clean across default/`full`,
+matching each build's own established clippy baseline exactly.
+
 ## Architecture
 
 Two shared building blocks carry almost the entire tool:

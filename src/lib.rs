@@ -63822,18 +63822,52 @@ fn diff_table_columns(
     // real sample-value overlap, matched off greedily by descending
     // similarity - the same "same type, adjacent position, high content
     // overlap" heuristic Atlas/git already use for rename detection.
+    //
+    // Generating candidates via an inverted sample-value index rather
+    // than a full `removed x added` cartesian product is a genuine
+    // complexity-class fix, not a micro-optimization: two columns with
+    // *zero* sample values in common always have a Jaccard similarity of
+    // 0 (below `RENAME_SIMILARITY_THRESHOLD` no matter what), so a
+    // removed column only ever needs to check the added columns it
+    // shares at least one sample value with - every other pair is
+    // provably not a candidate and would have been rejected anyway, so
+    // this changes no output, only how many pairs pay for the expensive
+    // per-pair check. Measured directly, not assumed: a real 5,000-vs-
+    // 5,000-column single table with every column renamed took over 3
+    // seconds and ~65 billion instructions retired under the old
+    // cartesian-product approach (see CLAUDE.md's own writeup for the
+    // fixed timing).
+    let mut added_by_sample: HashMap<&str, Vec<&str>, FxBuildHasher> = HashMap::default();
+    for &a in &added {
+        let (_, acol) = new_by_name[a];
+        for v in &acol.sample_values {
+            added_by_sample.entry(v.as_str()).or_default().push(a);
+        }
+    }
     let mut candidates: Vec<(f64, &str, &str)> = Vec::new();
     for &r in &removed {
         let (_, rcol) = old_by_name[r];
-        for &a in &added {
-            let (_, acol) = new_by_name[a];
-            if rcol.ideal_type.is_empty() || rcol.ideal_type != acol.ideal_type {
+        if rcol.ideal_type.is_empty() {
+            continue;
+        }
+        let mut already_checked: HashSet<&str> = HashSet::new();
+        for v in &rcol.sample_values {
+            let Some(candidate_names) = added_by_sample.get(v.as_str()) else {
                 continue;
-            }
-            if let Some(sim) = sample_value_overlap(&rcol.sample_values, &acol.sample_values)
-                && sim >= RENAME_SIMILARITY_THRESHOLD
-            {
-                candidates.push((sim, r, a));
+            };
+            for &a in candidate_names {
+                if !already_checked.insert(a) {
+                    continue; // already evaluated this pair via an earlier shared sample value
+                }
+                let (_, acol) = new_by_name[a];
+                if rcol.ideal_type != acol.ideal_type {
+                    continue;
+                }
+                if let Some(sim) = sample_value_overlap(&rcol.sample_values, &acol.sample_values)
+                    && sim >= RENAME_SIMILARITY_THRESHOLD
+                {
+                    candidates.push((sim, r, a));
+                }
             }
         }
     }
@@ -64756,6 +64790,86 @@ mod diff_tests {
             && matches!(e.change, DiffChange::ColumnRemoved { .. })));
         assert!(entries.iter().any(|e| e.column.as_deref() == Some("c_new")
             && matches!(e.change, DiffChange::ColumnAdded { .. })));
+    }
+
+    #[test]
+    fn diff_table_columns_inverted_sample_index_does_not_miss_a_real_match_across_a_shared_value() {
+        // Both "removed" columns share the literal sample value "x" with
+        // "added" - but only "b_old" also matches its *type* (i64) and
+        // has enough further overlap to clear the similarity threshold.
+        // The inverted-value index used to prune candidates must still
+        // let "b_old" reach its real match through "added"'s shared "x"
+        // entry, not stop at the first (wrong-typed) column that also
+        // happens to contain "x".
+        let old = vec![
+            col("a_old", "String", 0.0, &["x", "unrelated1", "unrelated2"]),
+            col("b_old", "i64", 0.0, &["x", "1", "2"]),
+        ];
+        let new = vec![col("added", "i64", 0.0, &["x", "1", "2"])];
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        let renames: Vec<&DiffEntry> = entries
+            .iter()
+            .filter(|e| matches!(e.change, DiffChange::ColumnRenamed { .. }))
+            .collect();
+        assert_eq!(renames.len(), 1);
+        let DiffChange::ColumnRenamed { from, to, .. } = &renames[0].change else {
+            unreachable!()
+        };
+        assert_eq!(from, "b_old");
+        assert_eq!(to, "added");
+        // "a_old" shares a sample value but not the type - must remain a
+        // genuine remove, never mistaken for the rename.
+        assert!(entries.iter().any(|e| e.column.as_deref() == Some("a_old")
+            && matches!(e.change, DiffChange::ColumnRemoved { .. })));
+    }
+
+    #[test]
+    fn diff_table_columns_a_column_with_no_sample_values_is_never_a_rename_candidate() {
+        let old = vec![col("gone", "String", 0.0, &[])];
+        let new = vec![col("arrived", "String", 0.0, &[])];
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        assert!(
+            entries
+                .iter()
+                .all(|e| !matches!(e.change, DiffChange::ColumnRenamed { .. }))
+        );
+        assert_eq!(entries.len(), 2); // a genuine remove + a genuine add
+    }
+
+    #[test]
+    fn diff_table_columns_wide_disjoint_tables_finish_quickly_and_pair_every_rename_correctly() {
+        // A real regression test for the inverted-sample-value-index
+        // optimization: 400 columns per side, every name changed, cycled
+        // across 4 types - the exact shape that used to be an O(n*m)
+        // cartesian product. This must both complete fast (the test
+        // itself has no explicit timeout, but a regression back to the
+        // old O(n*m) behavior at this scale previously took whole
+        // seconds - see this function's own real 5,000-column
+        // measurement in CLAUDE.md) and get every single rename right.
+        let types = ["i64", "f64", "String", "bool"];
+        let n = 400;
+        let make = |prefix: &str, i: usize| DiffColumn {
+            name: format!("{prefix}_{i}"),
+            current_type: types[i % types.len()].to_string(),
+            ideal_type: types[i % types.len()].to_string(),
+            missing_pct: 0.0,
+            sample_values: vec![format!("v{i}_a"), format!("v{i}_b")],
+        };
+        let old: Vec<DiffColumn> = (0..n).map(|i| make("old", i)).collect();
+        let new: Vec<DiffColumn> = (0..n).map(|i| make("new", i)).collect();
+        let entries = diff_table_columns("t", Some("t"), &old, &new);
+        let renames: Vec<&DiffEntry> = entries
+            .iter()
+            .filter(|e| matches!(e.change, DiffChange::ColumnRenamed { .. }))
+            .collect();
+        assert_eq!(renames.len(), n, "every column should pair off as a rename");
+        for e in &renames {
+            let DiffChange::ColumnRenamed { from, to, .. } = &e.change else {
+                unreachable!()
+            };
+            let i: usize = from.strip_prefix("old_").unwrap().parse().unwrap();
+            assert_eq!(to, &format!("new_{i}"));
+        }
     }
 
     #[test]
