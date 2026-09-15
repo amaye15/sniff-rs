@@ -34411,6 +34411,70 @@ mod parquet_support {
         Ok(out)
     }
 
+    /// The Parquet row-source for `render_sql_inline_flat` - the
+    /// sixteenth format to join the recursively-nested, JSON-bridge
+    /// tier, and the first added after that tier's own campaign was
+    /// originally declared complete (Phase 26, MBOX): Parquet's own
+    /// nested-column bridge (`decode_row_group_nested`, built for this
+    /// reader's own multi-session hand-roll campaign - see CLAUDE.md's
+    /// Dependency footprint section) already produces one
+    /// `JsonValue::Object` per row, covering *every* top-level field -
+    /// flat scalars and nested Struct/List/Map columns alike, in the
+    /// same row object - unlike `profile_parquet_file`'s own "flat vs.
+    /// nested" fast-path split, which only exists as a column-major
+    /// decode optimization for the *profiling* pass. This row-source
+    /// always uses the general per-row decoder regardless of whether
+    /// the schema happens to be fully flat, since a second full pass
+    /// over the file for SQL generation has no equivalent column-major
+    /// win to chase. Each row is byte-for-byte the same `JsonValue::
+    /// Object` shape `json_emit_row_for_sql`/`json_inline_blocking_
+    /// column` already handle - always records mode (a Parquet schema
+    /// root is always a named message/group, never a bare top-level
+    /// scalar/array the way JSON's own dual-mode dispatch needs to
+    /// consider), so zero changes were needed to any of the three
+    /// shared JSON-bridge functions - the same "reuse unchanged" result
+    /// this campaign has now shown holds for a fourth, structurally
+    /// distinct bridge mechanism (JSON's own array pooling, vCard/
+    /// iCalendar's repeated-property pooling, MBOX's independent header
+    /// pooling, and now Parquet's own Dremel-style record assembly).
+    /// A Map column's own `Vec<{"key","value"}>` reconstruction (this
+    /// reader's own deliberate choice per `ReaderNode`'s doc comment,
+    /// since a Map key isn't always a string) is exactly the
+    /// `Vec<struct>` shape `json_inline_blocking_column` already exists
+    /// to catch, so a file with a Map column correctly triggers the
+    /// same disclosed error every other array-of-objects column in this
+    /// tier already does - not a gap, the format's own real one-to-many
+    /// shape surfacing exactly where it should. `sink.done` bounds real
+    /// I/O by checking it before reading each row group's own bytes
+    /// from disk, matching `profile_parquet_file`'s own real-I/O-
+    /// bounding per-row-group early stop (see that function's own
+    /// Phase-11-of-the-Parquet-hand-roll writeup in CLAUDE.md for why
+    /// this granularity - one row group - is this reader's real
+    /// streaming floor).
+    pub(crate) fn stream_parquet_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let (mut file, meta) = open_and_read_footer(path)?;
+        let schema = build_schema(&meta.schema)?;
+
+        for rg in &meta.row_groups {
+            if sink.done {
+                break;
+            }
+            let (rg_bytes, rg) = read_row_group_bytes(&mut file, rg)?;
+            for row in decode_row_group_nested(&rg_bytes, &schema, &rg)? {
+                if sink.done {
+                    break;
+                }
+                json_emit_row_for_sql(&row, columns, records_mode, sink)?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -36450,11 +36514,11 @@ mod arrow_ipc_support {
 
     #[derive(Clone, Debug)]
     struct ArrowRecordBatchMeta {
-        // Row count of the batch - parsed always, but only read by the
-        // row-object path (`decode_record_batch`, test-only) now that
-        // `profile_arrow_ipc_file` is column-oriented; the column path
-        // gets its length from the decoded column vectors themselves.
-        #[allow(dead_code)]
+        // Row count of the batch - `profile_arrow_ipc_file`'s own
+        // column-oriented path gets its length from the decoded column
+        // vectors themselves instead, but the row-object paths
+        // (`decode_record_batch`, test-only, and `stream_arrow_ipc_rows_
+        // for_sql`'s own per-batch transpose) read this directly.
         length: i64,
         nodes: Vec<ArrowFieldNode>,
         buffers: Vec<ArrowBufferRegion>,
@@ -38320,6 +38384,79 @@ mod arrow_ipc_support {
             }
         }
         Ok(out)
+    }
+
+    /// The Arrow IPC row-source for `render_sql_inline_flat` - the
+    /// seventeenth format to join the recursively-nested, JSON-bridge
+    /// tier, and the second (with Parquet) added after that tier's own
+    /// campaign was originally declared complete (Phase 26, MBOX).
+    /// Unlike Parquet's own row-oriented `decode_row_group_nested`, this
+    /// reader is column-oriented end to end (see `profile_arrow_ipc_
+    /// file`'s own doc comment) - there is no existing per-row decoder
+    /// in the production path to reuse directly, so this function
+    /// transposes each `RecordBatch`'s own already-decoded columns
+    /// (`decode_record_batch_columns`) back into one `JsonValue::Object`
+    /// per row, the identical transpose `decode_record_batch` (this
+    /// module's own `#[cfg(test)]`-only sibling, kept for the Streaming-
+    /// format test coverage) already does - just driven by the
+    /// `Seek`-based streaming reads (`resolve_dictionaries_streaming`/
+    /// `read_block_bytes`) `profile_arrow_ipc_file`'s own production
+    /// path already uses, rather than a whole-file-resident buffer.
+    /// Once transposed, each row is byte-for-byte the same `JsonValue::
+    /// Object` shape `json_emit_row_for_sql`/`json_inline_blocking_
+    /// column` already handle - always records mode (an Arrow IPC
+    /// schema's own top-level fields are always named, never a bare
+    /// scalar/array the way JSON's own dual-mode dispatch needs to
+    /// consider) - so zero changes were needed to any of the three
+    /// shared JSON-bridge functions, the same result Parquet's own
+    /// row-source just established for this tier's fourth structurally
+    /// distinct bridge mechanism, now confirmed for a fifth. A `List`/
+    /// `Map` column's own array-of-values (or array-of-`{"key","value"}`
+    /// pairs) reconstruction is exactly the `Vec<T>`/`Vec<struct>` shape
+    /// this tier's shared machinery already knows how to pool or, for
+    /// the latter, correctly reject via the same disclosed blocking-
+    /// column error every other array-of-objects column in this tier
+    /// already triggers. `sink.done` bounds real I/O by checking it
+    /// before reading each record batch's own bytes from disk, matching
+    /// `read_arrow_ipc_file_columns_streaming`'s own real-I/O-bounding
+    /// per-batch early stop.
+    pub(crate) fn stream_arrow_ipc_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let (mut file, footer) = open_and_read_footer(path)?;
+        let dictionaries = resolve_dictionaries_streaming(&mut file, &footer)?;
+
+        for block in &footer.record_batches {
+            if sink.done {
+                break;
+            }
+            let block_bytes = read_block_bytes(&mut file, block)?;
+            let (header, body) =
+                read_message_at(&block_bytes, 0, block.meta_data_length, block.body_length)?;
+            let ArrowMessageHeader::RecordBatch(batch_meta) = header else {
+                bail!(
+                    "Arrow IPC footer's own recordBatches list points at a non-RecordBatch \
+                     message"
+                );
+            };
+            let cols =
+                decode_record_batch_columns(&footer.schema, &batch_meta, body, &dictionaries)?;
+            let row_count = usize::try_from(batch_meta.length).unwrap_or(0);
+            for i in 0..row_count {
+                if sink.done {
+                    break;
+                }
+                let mut obj = json_support::Map::with_capacity(cols.len());
+                for (name, col) in &cols {
+                    obj.push_unique(name.clone(), col.get(i).cloned().unwrap_or(JsonValue::Null));
+                }
+                json_emit_row_for_sql(&JsonValue::Object(obj), columns, records_mode, sink)?;
+            }
+        }
+        Ok(())
     }
 
     /// Reads a complete Arrow IPC *Streaming* format byte sequence into
@@ -53256,6 +53393,8 @@ fn render_sql_inline_flat(
             | InputFormat::Vcard
             | InputFormat::Ical
             | InputFormat::Mbox
+            | InputFormat::Parquet
+            | InputFormat::ArrowIpc
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -53503,6 +53642,8 @@ fn render_sql_inline_flat(
         InputFormat::Vcard => render_sql_inline_flat_vcard(read_path, profiles, &mut sink)?,
         InputFormat::Ical => render_sql_inline_flat_icalendar(read_path, profiles, &mut sink)?,
         InputFormat::Mbox => render_sql_inline_flat_mbox(read_path, profiles, &mut sink)?,
+        InputFormat::Parquet => render_sql_inline_flat_parquet(read_path, profiles, &mut sink)?,
+        InputFormat::ArrowIpc => render_sql_inline_flat_arrow_ipc(read_path, profiles, &mut sink)?,
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -54193,6 +54334,58 @@ fn render_sql_inline_flat_mbox(
     )
 }
 
+/// The Parquet row-source wrapper for `render_sql_inline_flat` - see
+/// `parquet_support::stream_parquet_rows_for_sql`'s own doc comment for
+/// the full design (this tier's fourth structurally distinct bridge
+/// mechanism, and the first added after the tier's own campaign was
+/// originally declared complete).
+#[cfg(feature = "parquet")]
+fn render_sql_inline_flat_parquet(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    parquet_support::stream_parquet_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "parquet"))]
+fn render_sql_inline_flat_parquet(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "Parquet support isn't compiled in - rebuild with `cargo build --release --features parquet` (or --features full)"
+    )
+}
+
+/// The Arrow IPC/Feather row-source wrapper for `render_sql_inline_flat`,
+/// per `arrow_ipc_support::stream_arrow_ipc_rows_for_sql`'s own doc
+/// comment for the full design. Gated on the same `parquet` feature
+/// Arrow IPC itself is (Arrow IPC shares Parquet's own Arrow-derived
+/// infrastructure and Cargo feature - see the Architecture section).
+#[cfg(feature = "parquet")]
+fn render_sql_inline_flat_arrow_ipc(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    arrow_ipc_support::stream_arrow_ipc_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "parquet"))]
+fn render_sql_inline_flat_arrow_ipc(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "Arrow IPC support isn't compiled in - rebuild with `cargo build --release --features parquet` (or --features full)"
+    )
+}
+
 /// The CSV/TSV row-source for `render_sql_inline_flat`: re-streams
 /// `read_path` via the exact same `stream_utf8_chunks`/`csv_feed_chunk`
 /// primitives the real profiling pass already uses, feeding each
@@ -54343,12 +54536,14 @@ fn render_sql(
             | InputFormat::Vcard
             | InputFormat::Ical
             | InputFormat::Mbox
+            | InputFormat::Parquet
+            | InputFormat::ArrowIpc
     );
 
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox/parquet/arrow are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -61627,10 +61822,12 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 | InputFormat::Vcard
                 | InputFormat::Ical
                 | InputFormat::Mbox
+                | InputFormat::Parquet
+                | InputFormat::ArrowIpc
         )
     {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox/parquet/arrow are supported so far",
             format.as_str()
         );
     }

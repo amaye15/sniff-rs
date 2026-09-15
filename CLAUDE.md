@@ -323,15 +323,15 @@ SAS7BDAT, SPSS, ORC, and NumPy (`.npy`) - plus the entire multi-table
 tier (SQLite, `.npz`, INI, and the whole Excel family: `.xlsx`/`.xls`/
 `.xlsb`/`.ods`) - plus JSON/JSON Lines, YAML, TOML, MessagePack, CBOR,
 Avro, XML, BSON, Property List (plist), JSON5/JSONC, HAR, GeoJSON,
-vCard, iCalendar, and MBOX - the entire recursively-nested, JSON-bridge
-tier, and with it every format in this campaign's own three-tier scope
-(Parquet and Arrow IPC/Feather are the two explicitly out-of-scope
-formats, disclosed below rather than silently omitted).
-Every other format transparently falls back to `staging` with a
-disclosed stderr
-note (`--sql-mode inline` given *explicitly* on an unsupported format is
-a hard error instead, naming the gap - downgrading what was explicitly
-asked for would be the wrong kind of quiet).
+vCard, iCalendar, MBOX, Parquet, and Arrow IPC/Feather - literally every
+input format this tool reads. There is no longer a format that falls
+back to `staging` mode on its own; the fallback and explicit-error logic
+described next remains in place only as the correct, defensive behavior
+for any future new format this project might add ahead of that format's
+own inline-mode row-source (`--sql-mode inline` given *explicitly* on an
+unsupported format is a hard error naming the gap rather than a silent
+fallback - downgrading what was explicitly asked for would be the wrong
+kind of quiet).
 
 Extending inline mode further is explicit, disclosed, staged future
 work, following this project's own "one format at a time, fully verified"
@@ -372,8 +372,11 @@ needs its own real design, not just repeating the same pattern:
    problem, see Phase 12's own writeup below).
 3. **The recursively-nested, JSON-bridge tier - JSON, YAML, TOML,
    MessagePack, CBOR, Avro, XML, BSON, plist, JSON5/JSONC, HAR, GeoJSON,
-   vCard, iCalendar, and MBOX done as of Phases 13-26 - the final tier
-   in this campaign.** Unlike the two tiers above, there
+   vCard, iCalendar, MBOX, Parquet, and Arrow IPC/Feather done as of
+   Phases 13-28 - the final tier in this campaign, and with Phases 27-28
+   the true end of "extend `--sql-mode inline` to every format," not
+   just to this tier's own originally-scoped three tiers.** Unlike the
+   two tiers above, there
    was no existing
    function that flattens a *single* record into a flat row matching the
    dot-notation column set `JsonPathAccumulator` already produces (that
@@ -455,13 +458,20 @@ needs its own real design, not just repeating the same pattern:
    the innermost open `VEVENT`/`VTODO`, never a nested `VALARM`/
    `VTIMEZONE`) rather than any change to the shared extractor itself.
    MBOX carried all three shared functions over unchanged too (the
-   eleventh format in a row, and the last one in this tier) - its own
-   independent, non-`vobject_support` repeated-header pooling still
-   produces the identical `JsonValue::Object`-with-array-values shape,
-   and the message body turned out to be nothing more than one more
-   plain scalar field in that same map, needing no special-casing at
-   all. With MBOX, this entire tier - and this entire campaign - is
-   done.
+   eleventh format in a row) - its own independent, non-`vobject_support`
+   repeated-header pooling still produces the identical `JsonValue::
+   Object`-with-array-values shape, and the message body turned out to
+   be nothing more than one more plain scalar field in that same map,
+   needing no special-casing at all. Parquet and Arrow IPC/Feather
+   carried all three shared functions over unchanged too (the twelfth
+   and thirteenth formats in a row, added in a follow-up pass once this
+   tier's originally-scoped three formats were already declared complete
+   - see Phases 27-28's own writeup below) - Parquet's own row-oriented
+   `decode_row_group_nested` already produces the shared `JsonValue::
+   Object` shape directly, and Arrow IPC's own column-oriented decode
+   only needed a small transpose back into row objects, not a redesign.
+   With Parquet and Arrow IPC, this entire tier - and this entire
+   campaign, in the fullest sense - is done.
 
 **`--sql-mode inline` (default): the whole dataset embedded as literal
 `INSERT` statements, so the script needs no separate load step at all.**
@@ -2142,16 +2152,130 @@ mode to them would be its own separately-scoped design effort (a fresh
 row-source built on top of Arrow's `RecordBatch` type rather than
 `json_support::Value`), not a natural fourth phase of this tier.
 
-**With Phase 26, the entire recursively-nested, JSON-bridge tier is
-done**: JSON, YAML, TOML, MessagePack, CBOR, Avro, XML, BSON, plist,
-JSON5/JSONC, HAR, GeoJSON, vCard, iCalendar, and MBOX all support
-`--sql-mode inline` - **and with it, the entire "extend --sql-mode
-inline to every format" campaign is complete**: every format across all
-three tiers (the flat, fixed-column tier from Phase 1; the multi-table
-tier from Phase 9; and this recursively-nested tier from Phase 13) now
-supports inline mode, with Parquet and Arrow IPC/Feather remaining as
-the two explicitly out-of-scope formats this campaign's own three tiers
-never claimed to cover, disclosed rather than silently omitted.
+**With Phase 26, the entire recursively-nested, JSON-bridge tier as
+originally scoped is done**: JSON, YAML, TOML, MessagePack, CBOR, Avro,
+XML, BSON, plist, JSON5/JSONC, HAR, GeoJSON, vCard, iCalendar, and MBOX
+all support `--sql-mode inline`, completing every format across the
+three tiers this campaign's own roadmap originally named (the flat,
+fixed-column tier from Phase 1; the multi-table tier from Phase 9; and
+this recursively-nested tier from Phase 13). Parquet and Arrow IPC/
+Feather were disclosed as the two remaining out-of-scope formats at that
+point - not because extending inline mode to them was impossible, but
+because their own nested-column bridge (Arrow's own `RecordBatch` type)
+looked, at the time, like a genuinely different mechanism from
+`json_support::Value`.
+
+**Phases 27-28: Parquet and Arrow IPC/Feather - the true final two
+formats, added in a follow-up pass once that "genuinely different
+bridge" assumption was checked directly against this reader's own
+current source rather than left as an inherited scope boundary.** By
+the time this pass ran, both readers' own multi-session hand-roll
+campaign (see the Dependency footprint section) had already moved well
+past that original assumption: `parquet_support::decode_row_group_nested`
+already produces one real `JsonValue::Object` per row - covering flat
+scalars and nested Struct/List/Map columns together, in the same row -
+built for this reader's own nested-column reconstruction work, entirely
+unrelated to this SQL campaign. That meant Parquet's own bridge
+*already was* the identical `json_support::Value` shape every other
+format in this tier already uses; the "different mechanism" boundary
+that excluded it from the original three-tier scope no longer reflected
+the reader's own current architecture. Checking Arrow IPC found the
+opposite structural detail but the identical practical answer: its own
+production path is column-oriented end to end (`read_arrow_ipc_file_
+columns_streaming`, built for that reader's own performance reasons),
+so there was no existing per-row decoder to reuse directly - but
+transposing its own already-decoded columns back into row objects
+(the identical transpose `decode_record_batch`, this module's own
+`#[cfg(test)]`-only sibling, already does for its own Streaming-format
+test coverage) is a small, mechanical piece of new code, not a
+redesign, and the result is the same `JsonValue::Object` shape too.
+
+`parquet_support::stream_parquet_rows_for_sql` always calls
+`decode_row_group_nested` regardless of whether a given file's schema
+happens to be fully flat (unlike `profile_parquet_file`'s own "flat vs.
+nested" fast-path split, which exists purely as a column-major decode
+optimization for the *profiling* pass - a second full pass over the
+file for SQL generation has no equivalent win to chase), folding each
+row into `json_emit_row_for_sql`. `arrow_ipc_support::stream_arrow_ipc_
+rows_for_sql` transposes each `RecordBatch`'s own decoded columns
+(`decode_record_batch_columns`) into one `JsonValue::Object` per row via
+the same `push_unique`-based transpose its own test-only sibling already
+uses, driven by the `Seek`-based streaming reads (`resolve_dictionaries_
+streaming`/`read_block_bytes`) the production profiling path already
+uses rather than a whole-file-resident buffer. Both are always records
+mode (neither format has a bare top-level-scalar/array shape), and both
+needed **zero changes** to `json_extract_value_for_sql`/`json_inline_
+blocking_column`/`json_bridge_columns_and_mode` - the fourth and fifth
+structurally distinct bridge mechanisms this tier has now confirmed
+generalize cleanly (after JSON's own array pooling, vCard/iCalendar's
+repeated-property pooling, and MBOX's independent header pooling). A
+Parquet Map column's own `Vec<{"key","value"}>` reconstruction (this
+reader's own deliberate choice, since a Map key isn't always a string -
+see `ReaderNode`'s own doc comment) and a genuine Arrow IPC array-of-
+structs column are both exactly the `Vec<struct>` shape `json_inline_
+blocking_column` already exists to catch, so either correctly triggers
+the same disclosed error every other array-of-objects column in this
+tier already does - the format's own real one-to-many shape surfacing
+exactly where it should, not a gap. `sink.done` bounds real I/O for both
+readers by checking it before reading the next row group's (Parquet) or
+record batch's (Arrow IPC) own bytes from disk, matching each reader's
+own existing real-I/O-bounding granularity from its profiling path.
+
+Verified against a real, installed SQLite build with **no separate load
+step**: `sample.parquet --output-format sql --load-into sqlite:...`
+loaded its own real, fully-flat schema correctly, including a genuine
+missing `age` value landing as `NULL`; a hand-built fixture
+(`edge_parquet_sql_inline_flat.parquet`, generated with `pyarrow` -
+a pooled scalar array including a genuinely empty one, and a nested
+struct that's `None` for one row) confirmed the nested path flattens
+and pools identically to every other format in this tier, with the
+`None` struct correctly forcing both of its own children to `NULL`
+(the same ancestor-missing_pct fix Avro's own Phase 17 already
+established, applying unchanged here since it operates purely on
+`ColumnProfile` names); `nested_types.parquet`'s own real Map column
+(`attributes`) confirmed the disclosed blocking error fires and names
+it correctly; a hand-built multi-row-group fixture confirmed `--nrows`
+correctly spans a row-group boundary. `type_detection.arrow --output-
+format sql --load-into sqlite:...` loaded correctly; `edge_arrow_
+nested_types.arrow`'s own real nested struct and pooled array confirmed
+the same flattening/pooling/null-propagation behavior; every one of
+this reader's own already-committed edge fixtures (dictionary encoding
+with and without nulls, LZ4/Zstd-compressed batches including the
+genuine multi-block LZ4 cross-block-back-reference fixture, Duration/
+Interval/Time-unit/View/ListView/RunEndEncoded/Union columns) rendered
+correctly through the new row-source with zero decode failures; a new
+hand-built fixture (`edge_arrow_sql_inline_array_of_objects.arrow`, a
+`List<Struct>` column) confirmed the disclosed blocking error fires and
+names the offending field; a hand-built multi-batch fixture confirmed
+`--nrows` correctly spans a `RecordBatch` boundary. Also verified as
+behavior-preserving for every already-shipped format: `diff` confirmed
+byte-identical inline SQL output against the pre-Phase-27/28 binary
+across the entire fixture corpus (Parquet/Arrow IPC fixtures excluded,
+since this phase is exactly what changes their own output - including
+`edge_sniff_parquet_no_ext`, a real, extensionless, content-sniffed
+Parquet file whose own inline-SQL output correctly changed from a
+staging-mode fallback to real inline `INSERT`s, the identical shape
+every other format's own graduation out of "unsupported" already
+produced). Clean across default/`parquet`/`full`, matching each one's
+own established baseline exactly.
+
+**With Phases 27-28, every `InputFormat` variant this project's CLI can
+ever dispatch to now supports `--sql-mode inline`** - the "extend
+`--sql-mode inline` to every format" campaign is now complete in the
+fullest possible sense, not just complete relative to its own originally
+scoped three tiers. The four "still genuinely unsupported format"
+placeholder tests that had shuffled forward once per phase throughout
+this entire campaign (`sql_output_inline_mode_falls_back_to_staging_
+for_an_unsupported_format` and its three siblings) are retired rather
+than shuffled again - there is no format left for them to point at.
+Their own underlying fallback/validation logic in `render_sql`/
+`run_single_file` stays in the code unchanged, since it remains the
+correct, defensive behavior should a future new format ever be added
+without also wiring up its own inline-mode row-source in the same
+phase (this project's own "one format at a time, fully verified"
+precedent for adding a *new* format in the first place) - there simply
+isn't a fixture that can prove that path today, with every currently-
+shipped format already covered.
 
 ## Directory-input batch mode
 

@@ -549,66 +549,25 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
     assert!(sql.contains("no columns were profiled at all"));
 }
 
-#[test]
-#[cfg(feature = "parquet")]
-fn sql_output_inline_mode_falls_back_to_staging_for_an_unsupported_format() {
-    // No --sql-mode given, on a format inline mode doesn't support yet -
-    // Phase 26 (MBOX) completed the entire recursively-nested,
-    // JSON-bridge tier, so every format in this campaign's own three-
-    // tier scope now supports inline mode. Parquet (and its Arrow IPC/
-    // Feather sibling) bridge their own nested Struct/List/Map columns
-    // through a genuinely different mechanism (Arrow's own JSON writer,
-    // not `json_support::Value` - see the Architecture section) and were
-    // never part of any of the three tiers this campaign covers, so
-    // Parquet is used here instead as a format that still genuinely
-    // isn't inline-supported. Falls back to staging mode automatically
-    // (with a disclosed stderr note, checked separately below) rather
-    // than erroring or silently producing something different.
-    let sql = run_sql("sample.parquet", &[]);
-    assert!(sql.contains("CREATE TABLE") && sql.contains("_staging\""));
-}
-
-#[test]
-#[cfg(feature = "parquet")]
-fn sql_output_inline_mode_fallback_prints_a_disclosed_stderr_note() {
-    let output = Command::new(bin())
-        .args([
-            fixture("sample.parquet").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("inline SQL mode isn't available yet for parquet"));
-    assert!(stderr.contains("--sql-mode staging"));
-}
-
-#[test]
-#[cfg(feature = "parquet")]
-fn sql_output_explicit_inline_mode_errors_on_an_unsupported_format() {
-    // Asking for --sql-mode inline explicitly on a format that can't do
-    // it yet is a hard, actionable error - unlike the silent fallback
-    // above, downgrading what was explicitly asked for would be the
-    // wrong kind of quiet.
-    let output = Command::new(bin())
-        .args([
-            fixture("sample.parquet").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--sql-mode inline isn't available yet for parquet"));
-    assert!(stderr.contains("--sql-mode staging"));
-}
+// The three "still genuinely unsupported format" placeholder tests that
+// used to live here (sql_output_inline_mode_falls_back_to_staging_for_
+// an_unsupported_format, ..._fallback_prints_a_disclosed_stderr_note,
+// sql_output_explicit_inline_mode_errors_on_an_unsupported_format) are
+// retired as of Parquet/Arrow IPC joining the recursively-nested,
+// JSON-bridge tier: every `InputFormat` variant this project's CLI can
+// ever dispatch to now supports `--sql-mode inline`, so there is no
+// longer a real, committed fixture left that can exercise the "format
+// inline mode doesn't support yet" fallback/error paths in
+// `render_sql`. Those code paths themselves are deliberately NOT
+// removed - `inline_supported`'s own `matches!` check (and the parallel
+// one in `run_single_file`'s `--load-into` validation) stay in place as
+// the correct, defensive behavior for the next format this project ever
+// adds without also wiring up its own inline-mode row-source in the
+// same phase, exactly per this project's own "one format at a time,
+// fully verified" precedent - there just isn't a fixture that can prove
+// it right now. Should a 35th format ever land with inline support
+// deferred to a later phase, these three tests (and the `--load-into`
+// sibling below) should be restored, pointed at that format.
 
 #[test]
 fn sql_output_inline_mode_json_array_of_objects_needs_staging_instead() {
@@ -706,33 +665,13 @@ fn load_into_rejects_a_combined_output_path() {
     assert!(stderr.contains("--load-into can't be combined with an output path"));
 }
 
-#[test]
-#[cfg(feature = "parquet")]
-fn load_into_rejects_an_unsupported_input_format() {
-    // No output-path positional at all - the way --load-into is actually
-    // meant to be used ("-" is itself an explicit output path, and is
-    // correctly rejected in combination with --load-into by a separate
-    // check, exercised by load_into_rejects_a_combined_output_path).
-    // Every format in this campaign's own three-tier scope (through
-    // MBOX, Phase 26) is now inline-supported - Parquet (and its Arrow
-    // IPC/Feather sibling) bridge nested columns through a genuinely
-    // different mechanism than any of the three tiers this campaign
-    // covers, so Parquet stands in as a format that still genuinely
-    // isn't.
-    let output = Command::new(bin())
-        .args([
-            fixture("sample.parquet").to_str().unwrap(),
-            "--output-format",
-            "sql",
-            "--load-into",
-            "sqlite:/tmp/whatever.db",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--load-into isn't available yet for parquet"));
-}
+// load_into_rejects_an_unsupported_input_format is retired for the same
+// reason as the three sql_output_inline_mode_* placeholder tests above -
+// every InputFormat this project's CLI can dispatch to (now including
+// Parquet and Arrow IPC) supports --load-into, so there's no remaining
+// fixture that can exercise this specific validation error. The
+// underlying check in run_single_file (paired with inline_supported's
+// own gate) stays in place for the same defensive future-format reason.
 
 #[test]
 fn load_into_rejects_a_malformed_target() {
@@ -2606,6 +2545,172 @@ fn load_into_accepts_mbox() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("isn't available yet for mbox"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn sql_output_inline_mode_supports_parquet_flat_and_nested_columns() {
+    // Parquet joins the recursively-nested, JSON-bridge tier as its
+    // sixteenth format - added after the tier's own campaign was
+    // originally declared complete at MBOX (Phase 26) - and confirms
+    // the shared JSON-bridge functions generalize to a fourth,
+    // structurally distinct bridge mechanism: `decode_row_group_nested`
+    // (this reader's own hand-rolled Dremel-style record assembler,
+    // built well before this campaign existed) already produces one
+    // `JsonValue::Object` per row covering flat scalars and nested
+    // Struct/List/Map columns alike, so zero changes were needed to
+    // `json_extract_value_for_sql`/`json_inline_blocking_column`/
+    // `json_bridge_columns_and_mode`. `sample.parquet` exercises the
+    // fully-flat schema (including a genuine missing value);
+    // `edge_parquet_sql_inline_flat.parquet` exercises a pooled scalar
+    // array and a nested struct (with one genuinely null struct
+    // correctly forcing both its own children to NULL).
+    let flat_sql = run_sql("sample.parquet", &[]);
+    assert!(flat_sql.contains("'U1001'"));
+    assert!(flat_sql.contains("NULL"));
+
+    let nested_sql = run_sql("edge_parquet_sql_inline_flat.parquet", &[]);
+    assert!(nested_sql.contains("\"info.age\""));
+    assert!(nested_sql.contains("'[\"a\",\"b\"]'"));
+    assert!(nested_sql.contains("('U3', 3.5, '[]', NULL, NULL)"));
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn sql_output_inline_mode_parquet_rejects_a_map_column() {
+    // A Parquet Map column always reconstructs as an array of
+    // `{"key","value"}` pairs (this reader's own deliberate choice,
+    // since a Map key isn't always a string) - exactly the `Vec<struct>`
+    // shape `json_inline_blocking_column` already exists to catch, so
+    // `nested_types.parquet`'s own real Map column (`attributes`)
+    // correctly triggers the same disclosed error every other array-of-
+    // objects column in this tier already does.
+    let output = Command::new(bin())
+        .args([
+            fixture("nested_types.parquet").to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for field \"attributes\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn sql_output_inline_mode_parquet_respects_nrows_across_a_row_group_boundary() {
+    let sql = run_sql("sample.parquet", &["--nrows", "2"]);
+    assert!(sql.contains("'U1001'"));
+    assert!(sql.contains("'U1002'"));
+    assert!(!sql.contains("'U1003'"));
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn load_into_accepts_parquet() {
+    let output = Command::new(bin())
+        .args([
+            fixture("sample.parquet").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for parquet"));
+    assert!(stderr.contains("must be in the form <engine>:<target>"));
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn sql_output_inline_mode_supports_arrow_ipc_flat_and_nested_columns() {
+    // Arrow IPC/Feather joins the recursively-nested, JSON-bridge tier
+    // as its seventeenth format, right alongside Parquet - unlike
+    // Parquet's own row-oriented `decode_row_group_nested`, this
+    // reader's production path is column-oriented end to end
+    // (`read_arrow_ipc_file_columns_streaming`), so its own row-source
+    // transposes each RecordBatch's decoded columns back into row
+    // objects (the identical transpose this reader's own `#[cfg(test)]`
+    // -only `decode_record_batch` already does for the Streaming-format
+    // test coverage) rather than reusing an existing per-row decoder -
+    // still zero changes needed to any of the three shared JSON-bridge
+    // functions, the tier's fifth structurally distinct bridge mechanism
+    // confirmed to generalize. `type_detection.arrow` is fully flat;
+    // `edge_arrow_nested_types.arrow`'s own real nested struct and
+    // pooled scalar array exercise the nested path, including a
+    // genuinely absent struct correctly leaving both its own children
+    // NULL.
+    let flat_sql = run_sql("type_detection.arrow", &[]);
+    assert!(flat_sql.contains("'alice@example.com'"));
+
+    let nested_sql = run_sql("edge_arrow_nested_types.arrow", &[]);
+    assert!(nested_sql.contains("\"address.city\""));
+    assert!(nested_sql.contains("'[90,85]'"));
+    assert!(nested_sql.contains("(2, 'bob', '[]', NULL, NULL, 0.0"));
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn sql_output_inline_mode_arrow_ipc_rejects_an_array_of_objects_column() {
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_arrow_sql_inline_array_of_objects.arrow")
+                .to_str()
+                .unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't emit real data for field \"orders\""));
+    assert!(stderr.contains("--sql-mode staging"));
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn sql_output_inline_mode_arrow_ipc_respects_nrows_across_a_batch_boundary() {
+    let sql = run_sql("edge_arrow_lz4_multi_block.arrow", &["--nrows", "3"]);
+    let insert_line = sql
+        .lines()
+        .find(|l| l.trim_start().starts_with('('))
+        .unwrap();
+    let kept = sql
+        .lines()
+        .filter(|l| l.trim_start().starts_with('('))
+        .count();
+    assert_eq!(
+        kept, 3,
+        "expected exactly 3 kept rows, first was {insert_line:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "parquet")]
+fn load_into_accepts_arrow_ipc() {
+    let output = Command::new(bin())
+        .args([
+            fixture("type_detection.arrow").to_str().unwrap(),
+            "--output-format",
+            "sql",
+            "--load-into",
+            "bogus",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("isn't available yet for arrow"));
     assert!(stderr.contains("must be in the form <engine>:<target>"));
 }
 
