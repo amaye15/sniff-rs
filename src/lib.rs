@@ -65876,6 +65876,33 @@ impl LoadEngine {
         }
     }
 
+    /// Extra flags making the spawned CLI's own credential handling never
+    /// block on an interactive prompt - real, if narrow, hardening
+    /// prompted by an "agent-friendly CLI" investigation: this project's
+    /// own stdin is already piped with the generated SQL (never a real
+    /// terminal, human-run or not), so a client that decides it needs a
+    /// password and tries to prompt for one either reads garbage off the
+    /// SQL stream or blocks forever with nothing to actually satisfy it -
+    /// a genuine hang risk for a non-interactive/agent-driven invocation,
+    /// not merely a human inconvenience. `psql` is the one real case:
+    /// unlike every other engine here, it prompts *automatically*
+    /// whenever the server demands password auth and none is available
+    /// via `PGPASSWORD`/`.pgpass`/a URI's own embedded credentials, with
+    /// no equivalent of `mysql`'s "only if you pass -p" gate - `-w`
+    /// (`--no-password`) is `psql`'s own documented way to disable that
+    /// prompt entirely, turning a missing credential into a clean,
+    /// immediate connection error instead. `sqlite3`/`duckdb` never
+    /// prompt for anything at all (a local file, no auth concept), and
+    /// `mysql` only ever prompts when explicitly told to via `-p` - a
+    /// flag this project never passes - so neither needs an equivalent
+    /// flag here.
+    fn non_interactive_args(&self) -> &'static [&'static str] {
+        match self {
+            LoadEngine::Postgres => &["-w"],
+            LoadEngine::Sqlite | LoadEngine::DuckDb | LoadEngine::MySql => &[],
+        }
+    }
+
     fn parse(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "sqlite" | "sqlite3" => Ok(LoadEngine::Sqlite),
@@ -65955,9 +65982,12 @@ impl LoadTarget {
 /// intermediate file. stdout/stderr are inherited so the tool's own
 /// prompts, row-count messages, and any real SQL errors show through
 /// directly and immediately, exactly as they would running it yourself.
+/// `non_interactive_args` (e.g. `psql`'s own `-w`) comes first, so it's
+/// never mistaken for part of the target's own positional argument.
 fn spawn_load_target(target: &LoadTarget) -> Result<std::process::Child> {
     let cmd_name = target.engine.command_name();
     std::process::Command::new(cmd_name)
+        .args(target.engine.non_interactive_args())
         .arg(&target.target)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
@@ -77111,5 +77141,22 @@ mod tests {
         assert!(LoadTarget::parse("bogus").is_err());
         assert!(LoadTarget::parse("sqlite:").is_err());
         assert!(LoadTarget::parse("oracle:mydb").is_err());
+    }
+
+    /// Only `psql` gets `-w` - it's the one engine here that prompts for
+    /// a password *automatically* whenever the server demands one and
+    /// none is available, with nothing equivalent to `mysql`'s "only if
+    /// you pass -p" gate. sniff-rs's own stdin is always piped with the
+    /// generated SQL (never a real terminal), so a `psql` process left
+    /// free to prompt either reads SQL bytes as a bogus password or
+    /// blocks forever - a real hang risk for any non-interactive/agent-
+    /// driven `--load-into postgres:...` invocation, not just human
+    /// inconvenience. See `non_interactive_args`'s own doc comment.
+    #[test]
+    fn only_postgres_gets_the_no_password_prompt_flag() {
+        assert_eq!(LoadEngine::Postgres.non_interactive_args(), &["-w"]);
+        assert!(LoadEngine::Sqlite.non_interactive_args().is_empty());
+        assert!(LoadEngine::DuckDb.non_interactive_args().is_empty());
+        assert!(LoadEngine::MySql.non_interactive_args().is_empty());
     }
 }

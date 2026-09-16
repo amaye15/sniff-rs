@@ -15056,12 +15056,42 @@ silently skipped**: `sniff-rs diff`'s own `--help` (`DIFF_HELP_TEXT`) was
 checked and found already accurate, needing no fix; a documented, per-
 format "what Cargo feature flag do I need" story already exists via
 `--list-formats` itself, so no separate installation-friction feature was
-added; and `--load-into`'s own subprocess-stdio-inheritance risk (a
-spawned `psql`/`mysql` prompting for a password could hang an agent-
-driven invocation indefinitely with no timeout) was investigated and
-named as a real, narrow gap, but left unfixed here since it's an opt-in
-flag with its own separately-scoped design (see that flag's own section
-above) rather than part of this pass's core "discoverability" focus.
+added.
+
+**A follow-up pass closed the one gap this section had left disclosed-but-
+unfixed**: `--load-into`'s own subprocess-stdio-inheritance hang risk. A
+spawned `psql`/`mysql` process inherits sniff-rs's own stdout/stderr, but
+its *stdin* is always the piped generated SQL, never a real terminal -
+human-run or agent-driven, there's no tty for a password prompt to
+actually read from. Checked per engine rather than assumed uniform:
+`sqlite3`/`duckdb` have no auth concept at all (a local file), and
+`mysql` only ever prompts if explicitly told to via `-p` (a flag this
+project never passes, so it was never actually at risk) - but `psql` is
+a real, different case, confirmed directly against its own documented
+behavior: it prompts *automatically* whenever the server demands
+password auth and none is available via `PGPASSWORD`/`.pgpass`/a URI's
+own embedded credentials, with no equivalent "only if asked" gate.
+Left alone, that prompt either reads bytes off the piped SQL stream as a
+bogus password or blocks indefinitely - a genuine hang, not just an
+inconvenience, for exactly the non-interactive/agent-driven invocation
+this whole section is about making safe. `LoadEngine::non_interactive_
+args` adds `psql`'s own documented `-w` (`--no-password`) flag, turning
+a missing credential into a clean, immediate connection error instead -
+`sqlite3`/`duckdb`/`mysql` get no extra flag, since none of them was
+ever actually at risk. This is a strict improvement for every caller,
+not merely an agent-only tradeoff: a human running `--load-into
+postgres:...` by hand couldn't have typed a password into the prompt
+either, since stdin was already claimed by the SQL pipe before `-w`
+existed - `-w` just makes that already-unusable prompt fail cleanly
+instead of hanging. Verified with a new unit test (`only_postgres_gets_
+the_no_password_prompt_flag`) confirming exactly one engine gets the
+flag; full test suite (1077 `--features full` / 515 default) passing,
+clippy/fmt clean on both builds matching established baselines exactly.
+No automated test spawns a real `psql` process to confirm the flag's own
+runtime effect, matching this project's own standing `--load-into`
+precedent (see that flag's own section above) - `psql` being installed
+and configured against a real password-requiring server is an
+environment fact this test suite can't assume holds anywhere it runs.
 
 ## Known limitations / roadmap
 
