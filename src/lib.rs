@@ -1532,6 +1532,20 @@ mod json_support {
         Ok(value)
     }
 
+    /// `scan_value`'s own shared multi-byte scan dispatcher - routes to
+    /// `simd_support::find_any`'s wide-lane scan when `--features simd`
+    /// is on (nightly-only, off by default), or the identical plain
+    /// scalar scan every stable build already uses, when it isn't.
+    #[cfg(feature = "simd")]
+    fn json_scan_find_any<const N: usize>(haystack: &[u8], needles: [u8; N]) -> Option<usize> {
+        super::simd_support::find_any(haystack, needles)
+    }
+
+    #[cfg(not(feature = "simd"))]
+    fn json_scan_find_any<const N: usize>(haystack: &[u8], needles: [u8; N]) -> Option<usize> {
+        haystack.iter().position(|&x| needles.contains(&x))
+    }
+
     /// A bounded byte-window over a `Read`, used by `stream_top_level`
     /// below to find each top-level value's exact byte span without ever
     /// holding the whole source resident. Keeps at most `CHUNK` unconsumed
@@ -1620,38 +1634,129 @@ mod json_support {
         /// once the scanner is outside any string, back at depth 0, has
         /// consumed at least one byte, and the next byte is EOF,
         /// whitespace, or one of `,` `]` `}`.
+        ///
+        /// Three genuinely different scan modes, each bulk-copying
+        /// however many "ordinary" bytes it can before reacting to the
+        /// next byte that actually matters - the same "batch the common
+        /// case" idea `parse_csv`'s own `InField` rewrite and the XML
+        /// byte-window scanners' own `copy_until_lt` already established,
+        /// carried over here to close this project's last remaining
+        /// byte-at-a-time hot loop of this shape:
+        ///
+        /// - **Inside a string**: only `"` (ends the string) and `\`
+        ///   (arms an escape) matter. A `\` always consumes exactly one
+        ///   more byte as an opaque, unconditionally-escaped pair,
+        ///   *regardless of that byte's own value* - this is what makes
+        ///   dropping the old per-iteration `escaped` flag sound rather
+        ///   than an approximation: `\\` followed by a real `"` is traced
+        ///   through explicitly in this function's own test module
+        ///   (`scan_value_handles_an_escaped_backslash_immediately_
+        ///   followed_by_a_real_closing_quote`) to confirm the escaped
+        ///   backslash is consumed as its own atomic pair and the
+        ///   following quote is still correctly recognized as real.
+        /// - **Outside a string, at depth > 0**: only `"`/`{`/`}`/`[`/`]`
+        ///   matter - the depth-0 exit condition (whitespace/`,`/`]`/`}`)
+        ///   can never fire while depth > 0, so every other byte is
+        ///   genuinely ordinary content safe to skip over in bulk.
+        /// - **Outside a string, at depth 0** (leading whitespace before
+        ///   the value starts, or scanning a bare top-level scalar like a
+        ///   plain number/bool/null): unchanged from the original byte-
+        ///   at-a-time scan - this state is inherently short-lived for
+        ///   the overwhelmingly common "value is an object/array" case
+        ///   (depth reaches 1 on the very first non-whitespace byte and
+        ///   never returns to 0 until the value's own last byte), so
+        ///   there's no real hot loop here worth the added complexity of
+        ///   bulk-copying it too.
         fn scan_value(&mut self, out: &mut Vec<u8>) -> std::result::Result<(), ParseError> {
             out.clear();
             let mut depth: i64 = 0;
             let mut in_string = false;
-            let mut escaped = false;
             loop {
-                match self.peek()? {
-                    None => {
-                        if in_string || depth != 0 || out.is_empty() {
-                            return Err(self.err("unexpected end of input inside a JSON value"));
-                        }
-                        return Ok(());
+                if in_string {
+                    self.fill()?;
+                    let rest = &self.buf[self.pos..];
+                    if rest.is_empty() {
+                        return Err(self.err("unexpected end of input inside a JSON value"));
                     }
-                    Some(b) => {
-                        if !in_string
-                            && depth == 0
-                            && !out.is_empty()
-                            && matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
-                        {
+                    match json_scan_find_any(rest, *b"\"\\") {
+                        Some(off) => {
+                            out.extend_from_slice(&rest[..off]);
+                            self.pos += off;
+                        }
+                        None => {
+                            let n = rest.len();
+                            out.extend_from_slice(rest);
+                            self.pos += n;
+                            continue;
+                        }
+                    }
+                    let b = self.buf[self.pos];
+                    self.pos += 1;
+                    out.push(b);
+                    if b == b'\\' {
+                        // The next byte is always part of this escape,
+                        // no matter what it is - never re-examined for
+                        // its own meaning, matching the old `escaped`
+                        // flag's own behavior exactly.
+                        match self.bump()? {
+                            Some(esc) => out.push(esc),
+                            None => {
+                                return Err(self.err("unexpected end of input inside a JSON value"));
+                            }
+                        }
+                    } else {
+                        in_string = false;
+                    }
+                } else if depth > 0 {
+                    self.fill()?;
+                    let rest = &self.buf[self.pos..];
+                    if rest.is_empty() {
+                        return Err(self.err("unexpected end of input inside a JSON value"));
+                    }
+                    match json_scan_find_any(rest, *b"\"{}[]") {
+                        Some(off) => {
+                            out.extend_from_slice(&rest[..off]);
+                            self.pos += off;
+                        }
+                        None => {
+                            let n = rest.len();
+                            out.extend_from_slice(rest);
+                            self.pos += n;
+                            continue;
+                        }
+                    }
+                    let b = self.buf[self.pos];
+                    self.pos += 1;
+                    out.push(b);
+                    match b {
+                        b'"' => in_string = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth < 0 {
+                                return Err(self.err("unbalanced ']' or '}' in JSON"));
+                            }
+                        }
+                        _ => unreachable!(
+                            "json_scan_find_any only ever returns an offset to one of the five bytes just matched on above"
+                        ),
+                    }
+                } else {
+                    match self.peek()? {
+                        None => {
+                            if out.is_empty() {
+                                return Err(self.err("unexpected end of input inside a JSON value"));
+                            }
                             return Ok(());
                         }
-                        self.pos += 1;
-                        out.push(b);
-                        if in_string {
-                            if escaped {
-                                escaped = false;
-                            } else if b == b'\\' {
-                                escaped = true;
-                            } else if b == b'"' {
-                                in_string = false;
+                        Some(b) => {
+                            if !out.is_empty()
+                                && matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
+                            {
+                                return Ok(());
                             }
-                        } else {
+                            self.pos += 1;
+                            out.push(b);
                             match b {
                                 b'"' => in_string = true,
                                 b'{' | b'[' => depth += 1,
@@ -2043,6 +2148,88 @@ mod json_support {
             assert_eq!(got[0], Value::from(1i64));
             assert_eq!(got[2], Value::String("x\"y".to_string()));
             assert_eq!(got[4], Value::String("café".to_string()));
+        }
+
+        /// `scan_value`'s own bulk-copy rewrite drops the old per-
+        /// iteration `escaped` flag entirely, relying instead on "a `\`
+        /// always consumes exactly one more byte as an opaque pair,
+        /// whatever that byte is" - this is the one case that actually
+        /// proves that's sound rather than an approximation: an escaped
+        /// backslash (`\\`) immediately followed by a *real* closing
+        /// quote. Traced by hand: byte 0 `\` arms an escape; byte 1 `\`
+        /// is consumed as that escape's own opaque pair (its own value
+        /// never inspected); byte 2 `"` is then read fresh, with no
+        /// escape armed, and correctly ends the string. A reader that
+        /// mishandled this would either see the string end one byte too
+        /// early (at the escaped backslash) or swallow the real closing
+        /// quote as still more escaped content.
+        #[test]
+        fn stream_top_level_handles_an_escaped_backslash_immediately_followed_by_a_real_closing_quote()
+         {
+            let got = stream_collect(br#"["a\\", "b"]"#).unwrap();
+            assert_eq!(got.len(), 2);
+            assert_eq!(got[0], Value::String("a\\".to_string()));
+            assert_eq!(got[1], Value::String("b".to_string()));
+        }
+
+        /// The same escaped-backslash-then-quote case, but repeated at
+        /// every padding length from 0 to 40 bytes before it - `simd_
+        /// support::find_any`'s own 32-byte lane width means this is the
+        /// one dimension a purely-scalar test can't exercise: the escape
+        /// pair needs to be checked landing at every possible position
+        /// relative to a real SIMD lane boundary, not just "somewhere in
+        /// a short string" the way the test above already covers on its
+        /// own. Found and fixed via exactly this kind of boundary-swept
+        /// fuzz before this feature ever shipped, not after.
+        #[test]
+        fn stream_top_level_handles_escaped_backslash_then_quote_at_every_lane_boundary_offset() {
+            for pad_len in 0..40 {
+                let pad = "x".repeat(pad_len);
+                let doc = format!(r#"["{pad}\\", "after"]"#);
+                let got = stream_collect(doc.as_bytes())
+                    .unwrap_or_else(|e| panic!("pad_len={pad_len}: {e}"));
+                assert_eq!(got.len(), 2, "pad_len={pad_len}");
+                assert_eq!(
+                    got[0],
+                    Value::String(format!("{pad}\\")),
+                    "pad_len={pad_len}"
+                );
+                assert_eq!(
+                    got[1],
+                    Value::String("after".to_string()),
+                    "pad_len={pad_len}"
+                );
+            }
+        }
+
+        /// A run of ordinary string content, or ordinary non-string
+        /// content at depth > 0, spanning exactly one/several full SIMD
+        /// lanes with the real terminating byte landing at every offset
+        /// within the following lane - the same "boundary-position-
+        /// independence" proof `csv_feed_chunk`'s own streaming rewrite
+        /// already required of itself, applied here to `scan_value`.
+        #[test]
+        fn stream_top_level_finds_string_and_structural_terminators_at_every_boundary_offset() {
+            for len in 0..70 {
+                let filler = "y".repeat(len);
+                // A string whose own closing quote lands at every offset.
+                let doc = format!(r#"["{filler}"]"#);
+                let got = stream_collect(doc.as_bytes())
+                    .unwrap_or_else(|e| panic!("string len={len}: {e}"));
+                assert_eq!(got, vec![Value::String(filler.clone())], "string len={len}");
+
+                // A nested array whose own closing bracket lands at every
+                // offset, with a run of repeated comma-separated numbers
+                // in between (depth > 0, not in a string - the second
+                // bulk-copy mode, which treats a comma as ordinary
+                // content since it's only a real terminator at depth 0).
+                let doc2 = format!("[[{}1]]", "5,".repeat(len));
+                let got2 = stream_collect(doc2.as_bytes())
+                    .unwrap_or_else(|e| panic!("array len={len}: {e}"));
+                let mut expected: Vec<Value> = vec![Value::from(5i64); len];
+                expected.push(Value::from(1i64));
+                assert_eq!(got2, vec![Value::Array(expected)], "array len={len}");
+            }
         }
 
         #[test]
@@ -6415,6 +6602,40 @@ mod simd_support {
             .map(|p| i + p)
     }
 
+    /// The general form of `find_byte`/`find_first_of3` for an arbitrary,
+    /// fixed number of candidate bytes, `OR`-ing one comparison mask per
+    /// candidate together - used by `json_support`'s own `scan_value`
+    /// bulk-copy rewrite, which needs a 2-candidate scan while inside a
+    /// JSON string (`"`/`\`) and a 5-candidate scan while outside one at
+    /// non-zero depth (`"`/`{`/`}`/`[`/`]`). `find_byte`/`find_first_of3`
+    /// are kept as their own separate, already-shipped, already-measured
+    /// functions rather than rewritten in terms of this one - they're
+    /// used by CSV/XML's own hot paths, already verified and documented
+    /// with specific real numbers, and there's no reason to risk
+    /// perturbing that for a generalization only this new caller needs.
+    pub(crate) fn find_any<const N: usize>(haystack: &[u8], needles: [u8; N]) -> Option<usize> {
+        if haystack.len() < LANES {
+            return haystack.iter().position(|&x| needles.contains(&x));
+        }
+        let needle_vs: [Simd<u8, LANES>; N] = needles.map(Simd::<u8, LANES>::splat);
+        let mut i = 0;
+        while i + LANES <= haystack.len() {
+            let chunk = Simd::<u8, LANES>::from_slice(&haystack[i..i + LANES]);
+            let mut mask = chunk.simd_eq(needle_vs[0]);
+            for nv in &needle_vs[1..] {
+                mask |= chunk.simd_eq(*nv);
+            }
+            if mask.any() {
+                return Some(i + mask.to_bitmask().trailing_zeros() as usize);
+            }
+            i += LANES;
+        }
+        haystack[i..]
+            .iter()
+            .position(|&x| needles.contains(&x))
+            .map(|p| i + p)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -6486,6 +6707,63 @@ mod simd_support {
             // The '\r' at index 4 is the first of the three candidate
             // bytes to appear, even though ',' and '\n' also occur later.
             assert_eq!(find_first_of3(haystack, b',', b'\r', b'\n'), Some(4));
+        }
+
+        fn scalar_find_any<const N: usize>(haystack: &[u8], needles: [u8; N]) -> Option<usize> {
+            haystack.iter().position(|&x| needles.contains(&x))
+        }
+
+        #[test]
+        fn find_any_matches_scalar_reference_for_2_and_5_candidates_across_every_boundary() {
+            for &needles in &[b"\"\\".as_slice(), b"\"{}[]".as_slice()] {
+                for len in [0, 1, LANES - 1, LANES, LANES + 1, LANES * 3, LANES * 3 + 5] {
+                    let mut haystack = vec![b'x'; len];
+                    if needles.len() == 2 {
+                        let n: [u8; 2] = needles.try_into().unwrap();
+                        assert_eq!(
+                            find_any(&haystack, n),
+                            scalar_find_any(&haystack, n),
+                            "len={len}, no match, N=2"
+                        );
+                    } else {
+                        let n: [u8; 5] = needles.try_into().unwrap();
+                        assert_eq!(
+                            find_any(&haystack, n),
+                            scalar_find_any(&haystack, n),
+                            "len={len}, no match, N=5"
+                        );
+                    }
+                    for pos in 0..len {
+                        for &needle in needles {
+                            haystack[pos] = needle;
+                            if needles.len() == 2 {
+                                let n: [u8; 2] = needles.try_into().unwrap();
+                                assert_eq!(
+                                    find_any(&haystack, n),
+                                    scalar_find_any(&haystack, n),
+                                    "len={len}, pos={pos}, needle={needle}, N=2"
+                                );
+                            } else {
+                                let n: [u8; 5] = needles.try_into().unwrap();
+                                assert_eq!(
+                                    find_any(&haystack, n),
+                                    scalar_find_any(&haystack, n),
+                                    "len={len}, pos={pos}, needle={needle}, N=5"
+                                );
+                            }
+                        }
+                        haystack[pos] = b'x';
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn find_any_picks_the_earliest_match_when_several_candidates_are_present() {
+            let haystack = b"aaaa]a{aaa\"a";
+            // ']' at index 4 is the first of the five candidates to
+            // appear, even though '{'/'"' also occur later.
+            assert_eq!(find_any(haystack, *b"\"{}[]"), Some(4));
         }
     }
 }

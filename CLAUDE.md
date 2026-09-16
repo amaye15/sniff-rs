@@ -8097,6 +8097,128 @@ CSV's own short-haystack guard to stay a clean win across every shape
 tested - there was no short-field-CSV-shaped worst case to guard against
 here.
 
+**A follow-up pass kept pushing past "check the rest of the codebase" and
+into the case already flagged as genuinely out of scope - JSON's own
+structural `ByteWindow::scan_value`** (backing `stream_top_level`/
+`stream_nested_array`/`stream_object_of_arrays` - the core, always-on
+JSON reader's own top-level-array path, GeoJSON/HAR's readers, and
+`sniff-rs diff`'s own streaming loader, all sharing this one function) -
+prompted by an explicit "don't let effort stop you, keep pushing" request
+after the earlier write-up called a full rewrite here "the entire reason
+dedicated `simd-json`-style crates exist as their own multi-thousand-line
+projects." That characterization was correct for a full stateful
+tokenizer, but turned out to overstate the difficulty of the *narrower*
+problem this function actually has: it already knows which of two modes
+it's in (inside a string, or outside one at nesting depth > 0) at every
+point, and each mode only cares about a small, *fixed* set of candidate
+bytes for as long as that mode holds - exactly the same "find the next
+occurrence of one of N fixed bytes" shape `find_byte`/`find_first_of3`
+already solve, just with the specific candidate set chosen per mode
+instead of fixed once for the whole function.
+
+**The real insight that made this tractable: the old per-iteration
+`escaped: bool` flag can be eliminated entirely, not just accelerated.**
+Tracing it by hand shows a `\` inside a string always consumes exactly
+one more byte as an opaque, unconditionally-escaped pair - *regardless of
+that byte's own value*, including another `\` or a real `"`. That means
+"scan forward for the next `"` or `\`; if it's `\`, consume it plus
+whatever the very next byte is (opaque, never re-examined) and keep
+scanning; if it's `"`, the string just ended" is an exact, not
+approximate, restatement of the original state machine - proven
+specifically for the trickiest case (an escaped backslash immediately
+followed by a real closing quote, `"a\\"` - byte 0 arms the escape, byte
+1 is consumed as that escape's own opaque pair with its own value never
+inspected, byte 2 is read fresh with no escape armed and correctly ends
+the string) both by hand and by a dedicated test
+(`stream_top_level_handles_an_escaped_backslash_immediately_followed_by_
+a_real_closing_quote`) before any bulk-copy code was written on top of
+it. The "outside a string, depth > 0" mode needs no equivalent
+insight - the existing depth-0 exit condition (whitespace/`,`/`]`/`}`)
+provably can never fire while depth > 0, so every byte that isn't
+`"`/`{`/`}`/`[`/`]` is unconditionally ordinary content, safe to skip in
+bulk. Only the genuinely rare, short-lived third mode (depth 0, not in a
+string - leading whitespace before a value starts, or scanning a bare
+top-level scalar) was left as the original, unchanged byte-at-a-time
+scan, since it has no long run of "doesn't matter" bytes worth batching
+in the first place for the overwhelmingly common object/array-shaped
+value.
+
+A new generic `simd_support::find_any<const N: usize>` (OR-ing one
+comparison mask per candidate together, generalizing `find_byte`/
+`find_first_of3` to an arbitrary fixed candidate count rather than
+rewriting either already-shipped, already-measured function in terms of
+it) backs both modes' own bulk-copy step - a 2-candidate scan (`"`/`\`)
+inside a string, a 5-candidate scan (`"`/`{`/`}`/`[`/`]`) outside one at
+depth > 0 - through the same `#[cfg(feature = "simd")]`/scalar-fallback
+dispatch pattern every earlier rollout in this section already
+established.
+
+**This is the single most safety-critical function this rewrite has
+touched in this entire section's history - "this project's single most
+heavily tested, adversarially-fuzzed... function," per the design
+philosophy section's own words - and it was verified accordingly, well
+past this section's own usual bar**: the complete existing test suite
+(492+ tests across default/full, including every existing `stream_top_
+level`/`stream_object_of_arrays` test already covering tricky structural
+content inside strings, unicode, and malformed/truncated input) passed
+unchanged on the first attempt; three new dedicated unit tests lock in
+the specific cases this rewrite's own correctness argument depends on -
+the escaped-backslash-then-real-quote case above, the identical case
+swept across every padding length from 0 to 40 bytes (specifically to
+catch a boundary bug that could only appear when the escape pair lands
+at a different position relative to a real 32-byte SIMD lane), and a
+string/array terminator swept across every length from 0 to 70 bytes for
+the identical reason. Beyond the committed suite: a Python-driven
+adversarial fuzz generated 3,160+ random nested JSON documents
+(including hand-targeted boundary cases - an escaped-backslash-then-quote
+sequence at every padding length 0-39) plus a *second*, independent fuzz
+across 50 random seeds (25,000 more records) and 20 seeds' worth of
+byte-truncated/malformed variants (1,140 total, deliberately cutting at
+every 7th byte offset up to 400 bytes - landing mid-escape-sequence and
+mid-multi-byte-UTF-8-character on purpose) - `diff` confirmed byte-
+identical output (including identical error messages and exit codes for
+every malformed case) between the pre-rewrite and post-rewrite binaries
+across all of it, with zero exceptions. Byte-identical output was also
+confirmed via `diff` across the entire committed `.json`/`.jsonl`/
+`.json5`/`.jsonc`/`.har`/`.geojson`/`.yaml`/`.toml`/`.avro`/`.msgpack`/
+`.cbor` fixture corpus and a real `sniff-rs diff` run (exercising `stream_
+object_of_arrays`, the third real caller of this function). Clippy/fmt
+clean on both toolchains at their own established baselines with zero
+new findings (nightly's own full-vs-full+simd clippy output diffed line
+for line, the same check every earlier rollout in this section already
+used).
+
+**The honest result split into two genuinely separate wins, one far
+bigger than the other and not gated behind `--features simd` at all.**
+The bulk-copy restructuring itself - available on *every* build, stable
+included, no nightly needed - is the dominant one: measured on a real
+152 MB top-level JSON array (500,000 records, five short-to-medium
+fields plus one ~150-character free-text description field each, a
+controlled alternating-binary comparison, 4 rounds), it cut user time
+from **1.32s to 0.98s - a consistent ~26% reduction**, the second-
+largest single win in this project's entire streaming/performance
+history after Parquet's own column-extraction complexity fix. This
+alone - with zero SIMD involved - is what most of this rewrite's real
+value turned out to be, the same lesson XML's own bulk-copy rewrite
+already taught this project once before applying here a second time.
+
+SIMD's own *additional* contribution on top of that already-bulk-copied
+scalar baseline is real but far more narrowly scoped, and honestly
+reported rather than folded into the headline number: on that same
+152 MB mixed-field file, SIMD measured statistically indistinguishable
+from the scalar bulk-copy version (0.99s vs 0.98s, within noise) -
+compact JSON's own structural density means the "outside a string"
+5-candidate scan almost never has more than a byte or two of genuinely
+ordinary content to skip before hitting the next quote, so the SIMD
+lane rarely gets to run even once, the same shape CSV's own short-field
+regression already came from. Isolated on a file built specifically to
+stress the case SIMD *can* help (150,000 records, one ~300-character
+string field each): a clean, consistent **~7% additional** reduction on
+top of the bulk-copy win (0.162s to 0.15s, 5 rounds, SIMD faster or
+equal in every round) - real, but only worth reaching for on JSON
+dominated by long string values, mirroring CSV's own already-disclosed
+recommendation rather than contradicting it.
+
 ## Streaming reads / memory footprint
 
 A deliberate, ongoing effort - prompted directly by the user, who wants
