@@ -51,6 +51,35 @@ impl Error {
             source: Some(Box::new(source)),
         }
     }
+
+    /// A single-line JSON rendering of this error and its full context
+    /// chain - `{"error": "...", "caused_by": ["...", ...]}` - used
+    /// instead of the default human-readable `Debug` chain (see `run`'s
+    /// own top-level dispatch) whenever the invocation that failed
+    /// requested `--output-format json`/`json-schema`. `caused_by` is the
+    /// same chain `Debug`'s own "Caused by:" section already walks, just
+    /// as a real JSON array instead of numbered prose lines - an agent
+    /// can check `caused_by.is_empty()` instead of parsing free-form text
+    /// to know whether there's a deeper root cause. Deliberately does
+    /// *not* try to classify the error into a stable machine-readable
+    /// "kind"/error-code field: this project's ~150 error call sites were
+    /// never authored with that taxonomy in mind, and inventing one after
+    /// the fact risks a code that's wrong or misleading more often than
+    /// it helps - the message text itself, unabbreviated, is the honest
+    /// contract this can make today.
+    fn to_json_line(&self) -> String {
+        let mut caused_by = Vec::new();
+        let mut cur = self.source.as_deref();
+        while let Some(e) = cur {
+            caused_by.push(JsonValue::from(e.message.clone()));
+            cur = e.source.as_deref();
+        }
+        json!({
+            "error": self.message.clone(),
+            "caused_by": JsonValue::Array(caused_by),
+        })
+        .to_string()
+    }
 }
 
 // Bridges any lower-level error (io::Error, serde_json::Error,
@@ -3344,6 +3373,15 @@ struct Args {
     /// an actual name collision - see `run_directory_combined`'s own doc
     /// comment for the full design.
     combine: bool,
+    /// `--list-formats`: print every format this tool knows about (name,
+    /// auto-detected extensions, required Cargo feature, and whether
+    /// *this build* actually has it compiled in) instead of profiling
+    /// anything - `--output-format json` for a machine-readable version.
+    /// Bypasses the usual required-`input_path` validation entirely (see
+    /// `parse_from`'s own positional-handling below) - `sniff-rs
+    /// --list-formats` alone is a complete, valid invocation. See
+    /// `print_format_catalog`/`FORMAT_CATALOG` for the full design.
+    list_formats: bool,
 }
 
 const HELP_TEXT: &str = r#"sniff-rs - profile a data file and produce a data dictionary
@@ -3352,9 +3390,15 @@ Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
 INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
-(.dta), or SAS7BDAT: one row per column, with a current type, a
-heuristic "ideal" type suggestion, missing %, sample values, and a
-blank Description field to fill in by hand.
+(.dta), SAS7BDAT, SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
+HAR, GeoJSON, vCard, iCalendar, MBOX, or a Delta Lake/Apache Iceberg
+table directory: one row per column, with a current type, a heuristic
+"ideal" type suggestion, missing %, sample values, and a blank
+Description field to fill in by hand. Each optional format needs its
+own `--features` flag at build time - run `sniff-rs --list-formats`
+(add `--output-format json` for a machine-readable version) for the
+authoritative, per-build list of every format, its extensions, and
+whether this particular binary actually has it compiled in.
 
 USAGE:
     sniff-rs <INPUT_PATH> [OUTPUT_PATH] [OPTIONS]
@@ -3390,10 +3434,16 @@ ARGS:
 OPTIONS:
         --samples <N>          Number of sample values to show per column [default: 3]
         --nrows <N>             Only read the first N rows/records
-        --format <FORMAT>       Override format detection (csv, tsv, json, parquet, arrow,
-                                avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml,
-                                fixed-width, npy, npz, common-log, combined-log, syslog,
-                                syslog5424, dbase, stata, sas7bdat) - single-file mode only
+        --format <FORMAT>       Override format detection: csv, tsv, json, parquet,
+                                arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor,
+                                ini, xml, fixed-width, npy, npz, common-log,
+                                combined-log, syslog, syslog5424, dbase, stata,
+                                sas7bdat, spss, orc, bson, plist, json5, har, geojson,
+                                mbox, vcard, or icalendar - single-file mode only. Run
+                                --list-formats to see exactly which of these (plus
+                                delta/iceberg, detected from directory structure
+                                instead) this particular build actually has compiled
+                                in.
         --delimiter <CHAR>      Override the field delimiter for csv/tsv (single character)
         --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
         --widths <N,N,...>      Column widths for --format fixed-width, comma-separated -
@@ -3426,6 +3476,13 @@ OPTIONS:
                                 instead of one output per file. Every table's own
                                 combined name is always <source-file-path>__<table>,
                                 to avoid collisions across different source files.
+        --list-formats           Print every format this tool knows about (name,
+                                auto-detected extensions, required --features flag, and
+                                whether this build actually has it compiled in) instead
+                                of profiling anything - no INPUT_PATH needed. Add
+                                --output-format json for a machine-readable version -
+                                the single most reliable way for a script or an AI
+                                agent to learn this tool's real, current capabilities.
     -h, --help                  Print this help
     -V, --version                Print version
 "#;
@@ -3441,11 +3498,6 @@ OPTIONS:
 /// still exits the process directly, matching what a user actually expects
 /// from either flag.
 impl Args {
-    fn parse() -> Result<Self> {
-        let raw: Vec<String> = std::env::args().skip(1).collect();
-        Self::parse_from(&raw)
-    }
-
     fn parse_from(raw: &[String]) -> Result<Self> {
         let mut samples: usize = 3;
         let mut nrows: Option<usize> = None;
@@ -3458,6 +3510,7 @@ impl Args {
         let mut load_into: Option<String> = None;
         let mut output_dir: Option<PathBuf> = None;
         let mut combine = false;
+        let mut list_formats = false;
         let mut positionals: Vec<String> = Vec::new();
 
         let mut i = 0;
@@ -3535,6 +3588,7 @@ impl Args {
                     "load-into" => load_into = Some(value(&mut i)?),
                     "output-dir" => output_dir = Some(PathBuf::from(value(&mut i)?)),
                     "combine" => combine = true,
+                    "list-formats" => list_formats = true,
                     other => bail!("unrecognized flag --{other}"),
                 }
             } else if let Some(short) = arg.strip_prefix('-')
@@ -3549,10 +3603,20 @@ impl Args {
         }
 
         let mut positionals = positionals.into_iter();
-        let input_path = positionals
-            .next()
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("missing required argument: input_path"))?;
+        // `--list-formats` never profiles anything, so it needs neither
+        // `input_path` nor any positional at all - `sniff-rs
+        // --list-formats` alone is a complete, valid invocation. A real
+        // `input_path` is still required for every other invocation,
+        // unchanged; `input_path` itself is simply never read when
+        // `list_formats` is set (see `run`'s own dispatch).
+        let input_path = if list_formats {
+            positionals.next().map(PathBuf::from).unwrap_or_default()
+        } else {
+            positionals
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("missing required argument: input_path"))?
+        };
         let output_path = positionals.next().map(PathBuf::from);
         if let Some(extra) = positionals.next() {
             bail!("unexpected extra argument: {extra}");
@@ -3572,6 +3636,7 @@ impl Args {
             sql_mode,
             load_into,
             combine,
+            list_formats,
         })
     }
 }
@@ -55359,6 +55424,594 @@ impl InputFormat {
     }
 }
 
+// --- The format catalog: one source of truth for --list-formats, the
+// --format/extension-detection error messages, and (via a #[cfg(test)]
+// guard below) HELP_TEXT itself ---
+//
+// Prompted directly by an "investigate and plan how to make this CLI as
+// agent-friendly as possible" request: the biggest concrete finding was
+// that HELP_TEXT's own hand-written prose had drifted out of sync with
+// this tool's real format support (missing SPSS/ORC/BSON/plist/JSON5/
+// HAR/GeoJSON/vCard/iCalendar/MBOX/Delta/Iceberg from its own opening
+// paragraph and --format option line), while the *separate* hand-written
+// list backing the `--format bogus` error message had been kept current
+// - two independently-maintained lists of the same information, already
+// caught disagreeing once and certain to disagree again. `FORMAT_CATALOG`
+// is the fix: every format this tool can ever dispatch to gets exactly
+// one entry here, and every other place that needs to enumerate formats
+// (the two error messages below, `--list-formats`) reads from it instead
+// of carrying its own copy.
+
+/// One row of `FORMAT_CATALOG` - see that constant's own doc comment.
+struct FormatInfo {
+    /// The canonical name: identical to `InputFormat::as_str()`'s own
+    /// spelling, and (for anything that isn't `directory`) the exact
+    /// `--format` value that selects it.
+    name: &'static str,
+    /// File extensions this format auto-detects from with no `--format`
+    /// needed - empty for a format reachable only via `--format` (fixed-
+    /// width text, the four log formats) or only via directory structure
+    /// (`directory: true`).
+    extensions: &'static [&'static str],
+    /// The Cargo feature this format needs, or `None` if it's always
+    /// compiled in (csv/tsv/json/jsonl, fixed-width).
+    feature: Option<&'static str>,
+    /// Whether *this build* actually has that feature compiled in - always
+    /// `true` when `feature` is `None`. `cfg!(feature = "...")` evaluates
+    /// to a plain `bool` literal at compile time, so this is real,
+    /// per-build information, not a static claim about every build.
+    compiled_in: bool,
+    /// Delta/Iceberg only: detected from directory *structure* (a
+    /// `_delta_log/`/`metadata/` subdirectory), never from an extension or
+    /// `--format` at all - see `is_delta_table_dir`/`is_iceberg_table_dir`.
+    directory: bool,
+}
+
+/// Every format this tool can ever dispatch to, one entry each - see this
+/// section's own header comment for why this exists. Kept honest against
+/// the real `--format` parser two ways: `format_catalog_names_match_the_
+/// format_override_parser` (a `#[cfg(test)]` below) round-trips every
+/// non-directory entry's `name` through `detect_format`'s own `--format`
+/// override branch and checks the resulting `InputFormat::as_str()`
+/// matches, and `help_text_mentions_every_catalog_format` checks every
+/// entry's `name` appears somewhere in `HELP_TEXT`.
+const FORMAT_CATALOG: &[FormatInfo] = &[
+    FormatInfo {
+        name: "csv",
+        extensions: &["csv"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "tsv",
+        extensions: &["tsv"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "json",
+        extensions: &["json", "jsonl", "ndjson"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "parquet",
+        extensions: &["parquet", "pqt"],
+        feature: Some("parquet"),
+        compiled_in: cfg!(feature = "parquet"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "arrow",
+        extensions: &["arrow", "feather"],
+        // Arrow IPC/Feather shares the `parquet` feature flag - both are
+        // Arrow-ecosystem formats with their own hand-rolled reader gated
+        // by the same flag, per Cargo.toml's own comment on `parquet`.
+        feature: Some("parquet"),
+        compiled_in: cfg!(feature = "parquet"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "avro",
+        extensions: &["avro"],
+        feature: Some("avro"),
+        compiled_in: cfg!(feature = "avro"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "xlsx",
+        extensions: &["xlsx", "xls", "xlsb", "ods"],
+        feature: Some("xlsx"),
+        compiled_in: cfg!(feature = "xlsx"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "sqlite",
+        extensions: &["db", "sqlite", "sqlite3"],
+        feature: Some("sqlite"),
+        compiled_in: cfg!(feature = "sqlite"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "msgpack",
+        extensions: &["msgpack", "mp"],
+        feature: Some("msgpack"),
+        compiled_in: cfg!(feature = "msgpack"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "toml",
+        extensions: &["toml"],
+        feature: Some("toml"),
+        compiled_in: cfg!(feature = "toml"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "yaml",
+        extensions: &["yaml", "yml"],
+        feature: Some("yaml"),
+        compiled_in: cfg!(feature = "yaml"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "cbor",
+        extensions: &["cbor"],
+        feature: Some("cbor"),
+        compiled_in: cfg!(feature = "cbor"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "ini",
+        extensions: &["ini"],
+        feature: Some("ini"),
+        compiled_in: cfg!(feature = "ini"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "xml",
+        extensions: &["xml"],
+        feature: Some("xml"),
+        compiled_in: cfg!(feature = "xml"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "fixed-width",
+        // No delimiter or magic number distinguishes fixed-width text
+        // from generic text at all - `--format fixed-width` (plus
+        // `--widths`) is always required, the same reason the four log
+        // formats below have no extensions either.
+        extensions: &[],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "npy",
+        extensions: &["npy"],
+        feature: Some("npy"),
+        compiled_in: cfg!(feature = "npy"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "npz",
+        extensions: &["npz"],
+        feature: Some("npy"),
+        compiled_in: cfg!(feature = "npy"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "common-log",
+        extensions: &[],
+        feature: Some("weblog"),
+        compiled_in: cfg!(feature = "weblog"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "combined-log",
+        extensions: &[],
+        feature: Some("weblog"),
+        compiled_in: cfg!(feature = "weblog"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "syslog",
+        extensions: &[],
+        feature: Some("syslog"),
+        compiled_in: cfg!(feature = "syslog"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "syslog5424",
+        extensions: &[],
+        feature: Some("syslog"),
+        compiled_in: cfg!(feature = "syslog"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "dbase",
+        extensions: &["dbf"],
+        feature: Some("dbase"),
+        compiled_in: cfg!(feature = "dbase"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "stata",
+        extensions: &["dta"],
+        feature: Some("stata"),
+        compiled_in: cfg!(feature = "stata"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "sas7bdat",
+        extensions: &["sas7bdat"],
+        feature: Some("sas7bdat"),
+        compiled_in: cfg!(feature = "sas7bdat"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "spss",
+        extensions: &["sav", "zsav"],
+        feature: Some("spss"),
+        compiled_in: cfg!(feature = "spss"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "orc",
+        extensions: &["orc"],
+        feature: Some("orc"),
+        compiled_in: cfg!(feature = "orc"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "bson",
+        extensions: &["bson"],
+        feature: Some("bson"),
+        compiled_in: cfg!(feature = "bson"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "plist",
+        extensions: &["plist"],
+        feature: Some("plist"),
+        compiled_in: cfg!(feature = "plist"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "json5",
+        extensions: &["json5", "jsonc"],
+        feature: Some("json5"),
+        compiled_in: cfg!(feature = "json5"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "har",
+        extensions: &["har"],
+        feature: Some("har"),
+        compiled_in: cfg!(feature = "har"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "geojson",
+        extensions: &["geojson"],
+        feature: Some("geojson"),
+        compiled_in: cfg!(feature = "geojson"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "mbox",
+        extensions: &["mbox"],
+        feature: Some("mbox"),
+        compiled_in: cfg!(feature = "mbox"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "vcard",
+        extensions: &["vcf"],
+        feature: Some("vcard"),
+        compiled_in: cfg!(feature = "vcard"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "icalendar",
+        extensions: &["ics"],
+        feature: Some("icalendar"),
+        compiled_in: cfg!(feature = "icalendar"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "delta",
+        // Never `--format`-selectable or extension-detected at all - a
+        // Delta table has no file extension of its own, and is instead
+        // recognized purely from a `_delta_log/` subdirectory being
+        // present. See `is_delta_table_dir`.
+        extensions: &[],
+        feature: Some("delta"),
+        compiled_in: cfg!(feature = "delta"),
+        directory: true,
+    },
+    FormatInfo {
+        name: "iceberg",
+        // Same story as delta above, via `is_iceberg_table_dir`.
+        extensions: &[],
+        feature: Some("iceberg"),
+        compiled_in: cfg!(feature = "iceberg"),
+        directory: true,
+    },
+];
+
+/// Joins `items` the same "a, b, or c" way this tool's own hand-written
+/// format-list error messages already did by hand, before they were
+/// generated from `FORMAT_CATALOG` - kept as a small, independent helper
+/// so a 0/1/2-item list (never actually reached today, since this tool
+/// always has 3+ formats, but a real, honest edge case worth not getting
+/// wrong) still reads like real English rather than a dangling comma.
+fn join_with_oxford_or(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [a, b] => format!("{a} or {b}"),
+        _ => {
+            let (last, rest) = items
+                .split_last()
+                .expect("non-empty per the match arms above");
+            format!("{}, or {last}", rest.join(", "))
+        }
+    }
+}
+
+/// Every `--format` value this build's error messages should mention, in
+/// `FORMAT_CATALOG`'s own order, joined as real English - directory-only
+/// formats (Delta/Iceberg) are never `--format`-selectable, so they're
+/// excluded here even though they're still listed by `--list-formats`.
+fn format_names_joined() -> String {
+    let names: Vec<&str> = FORMAT_CATALOG
+        .iter()
+        .filter(|f| !f.directory)
+        .map(|f| f.name)
+        .collect();
+    join_with_oxford_or(&names)
+}
+
+/// The same name list as `format_names_joined`, but `|`-joined - matching
+/// the `--format a|b|c` copy-pasteable shape the extension-detection
+/// error message below already used.
+fn format_names_piped() -> String {
+    FORMAT_CATALOG
+        .iter()
+        .filter(|f| !f.directory)
+        .map(|f| f.name)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// One `FORMAT_CATALOG` entry, rendered as a JSON object - the shape
+/// `--list-formats --output-format json` emits one of per format. See
+/// `print_format_catalog`.
+fn format_catalog_entry_json(f: &FormatInfo) -> JsonValue {
+    let extensions: Vec<JsonValue> = f.extensions.iter().map(|e| JsonValue::from(*e)).collect();
+    let feature = match f.feature {
+        Some(name) => JsonValue::from(name),
+        None => JsonValue::Null,
+    };
+    let auto_detected_from = if f.directory {
+        "directory-structure"
+    } else if f.extensions.is_empty() {
+        "format-flag-only"
+    } else {
+        "extension-or-content"
+    };
+    json!({
+        "name": f.name,
+        "extensions": JsonValue::Array(extensions),
+        "feature": feature,
+        "compiled_in": f.compiled_in,
+        "auto_detected_from": auto_detected_from,
+    })
+}
+
+/// `--list-formats`: a machine-readable (`--output-format json`) or
+/// human-readable (otherwise) listing of every format this tool knows
+/// about - whether *this particular build* actually has it compiled in,
+/// which extensions auto-detect it, and which Cargo feature would need to
+/// be enabled to read it. Built directly from `FORMAT_CATALOG`, the same
+/// single source of truth the `--format`/extension-detection error
+/// messages above are generated from.
+///
+/// The point of this flag: an AI agent (or any other non-interactive
+/// caller) can learn this tool's real, current capabilities with one
+/// deterministic call - `sniff-rs --list-formats --output-format json`
+/// piped straight to `jq` - instead of parsing `--help` prose or
+/// deliberately triggering a `--format bogus` error just to read its
+/// accepted-values list. Prompted directly by an "investigate and plan
+/// how to make this CLI as agent-friendly as possible" request - this was
+/// judged the single highest-leverage addition, since every other
+/// capability-discovery path (prose, an error message) is either
+/// incomplete or not meant to be relied on programmatically.
+fn print_format_catalog(output_format: &str) -> Result<()> {
+    if output_format.eq_ignore_ascii_case("json")
+        || output_format.eq_ignore_ascii_case("json-schema")
+    {
+        let formats: Vec<JsonValue> = FORMAT_CATALOG
+            .iter()
+            .map(format_catalog_entry_json)
+            .collect();
+        let doc = json!({
+            "sniff_rs_version": env!("CARGO_PKG_VERSION"),
+            "formats": JsonValue::Array(formats),
+        });
+        println!("{doc}");
+    } else {
+        // Each column spec is followed by a *literal* space in the
+        // template itself, not just padding baked into the width - a
+        // name at or past its column's own width (e.g. "combined-log" is
+        // exactly 12 characters) would otherwise run straight into the
+        // next column with no separator at all, since `{:<N}` only pads
+        // up to width N and never guarantees anything past it.
+        println!(
+            "{:<12} {:<9} {:<13} DETECTED FROM",
+            "FORMAT", "COMPILED", "FEATURE"
+        );
+        for f in FORMAT_CATALOG {
+            let compiled = if f.compiled_in { "yes" } else { "no" };
+            let feature = f.feature.unwrap_or("-");
+            let detected = if f.directory {
+                "directory structure".to_string()
+            } else if f.extensions.is_empty() {
+                "--format only".to_string()
+            } else {
+                f.extensions
+                    .iter()
+                    .map(|e| format!(".{e}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "{:<12} {:<9} {:<13} {}",
+                f.name, compiled, feature, detected
+            );
+        }
+        eprintln!("(pass --output-format json for a machine-readable version)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod format_catalog_tests {
+    use super::*;
+
+    /// The direct guard against the exact drift this whole catalog exists
+    /// to prevent: every non-directory `FORMAT_CATALOG` entry's `name`
+    /// must round-trip through `detect_format`'s own `--format` override
+    /// branch (the real, authoritative parser - never touched by this
+    /// change) back to an `InputFormat` whose own `as_str()` is identical.
+    /// A dummy path is safe here - the override branch returns before
+    /// either path argument is ever touched.
+    #[test]
+    fn format_catalog_names_match_the_format_override_parser() {
+        for f in FORMAT_CATALOG.iter().filter(|f| !f.directory) {
+            let got = detect_format(Path::new("x"), Path::new("x"), &Some(f.name.to_string()))
+                .unwrap_or_else(|e| panic!("--format {} should be recognized: {e}", f.name));
+            assert_eq!(
+                got.as_str(),
+                f.name,
+                "FORMAT_CATALOG entry {:?} round-trips to a different InputFormat::as_str()",
+                f.name
+            );
+        }
+    }
+
+    /// Guards the exact bug this catalog was built to fix: `HELP_TEXT` is
+    /// a hand-maintained literal (see its own doc comment on why it isn't
+    /// generated from `FORMAT_CATALOG` directly), so nothing stops it
+    /// drifting again the moment a new format is added - except this
+    /// test, which fails loudly the instant `FORMAT_CATALOG` gains a name
+    /// `HELP_TEXT` doesn't mention anywhere.
+    #[test]
+    fn help_text_mentions_every_catalog_format() {
+        for f in FORMAT_CATALOG {
+            assert!(
+                HELP_TEXT.contains(f.name),
+                "HELP_TEXT doesn't mention format {:?} - update it (its --format \
+                 option line is the obvious place) when adding a new format",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn join_with_oxford_or_handles_every_list_length() {
+        assert_eq!(join_with_oxford_or(&[]), "");
+        assert_eq!(join_with_oxford_or(&["a"]), "a");
+        assert_eq!(join_with_oxford_or(&["a", "b"]), "a or b");
+        assert_eq!(join_with_oxford_or(&["a", "b", "c"]), "a, b, or c");
+    }
+
+    #[test]
+    fn format_names_joined_and_piped_exclude_directory_only_formats() {
+        let joined = format_names_joined();
+        let piped = format_names_piped();
+        assert!(joined.contains("csv"));
+        assert!(joined.contains(", or icalendar"));
+        assert!(!joined.contains("delta"));
+        assert!(!joined.contains("iceberg"));
+        assert!(piped.contains("csv|tsv"));
+        assert!(!piped.contains("delta"));
+    }
+
+    #[test]
+    fn format_catalog_entry_json_reports_compiled_in_honestly() {
+        // csv is always compiled in; a real optional format's own
+        // `compiled_in` must track its actual Cargo feature for *this*
+        // build, not just claim `true` unconditionally.
+        let csv = FORMAT_CATALOG.iter().find(|f| f.name == "csv").unwrap();
+        assert_eq!(format_catalog_entry_json(csv)["compiled_in"], true);
+        let parquet = FORMAT_CATALOG.iter().find(|f| f.name == "parquet").unwrap();
+        assert_eq!(
+            format_catalog_entry_json(parquet)["compiled_in"],
+            cfg!(feature = "parquet")
+        );
+    }
+
+    #[test]
+    fn error_to_json_line_carries_the_full_context_chain() {
+        let inner = Error::msg("root cause");
+        let outer = Error::wrap("top-level message", inner);
+        let line = outer.to_json_line();
+        let parsed = json_support::from_str(&line).expect("must be valid JSON");
+        assert_eq!(parsed["error"], "top-level message");
+        assert_eq!(parsed["caused_by"][0], "root cause");
+    }
+
+    #[test]
+    fn error_to_json_line_has_an_empty_caused_by_with_no_source() {
+        let e = Error::msg("just this");
+        let parsed = json_support::from_str(&e.to_json_line()).unwrap();
+        assert_eq!(parsed["error"], "just this");
+        assert!(parsed["caused_by"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_formats_flag_bypasses_the_required_input_path() {
+        let args = Args::parse_from(&["--list-formats".to_string()]).unwrap();
+        assert!(args.list_formats);
+    }
+
+    #[test]
+    fn list_formats_flag_combines_with_output_format() {
+        let args = Args::parse_from(&[
+            "--list-formats".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+        ])
+        .unwrap();
+        assert!(args.list_formats);
+        assert_eq!(args.output_format, "json");
+    }
+
+    #[test]
+    fn wants_json_error_output_recognizes_both_flag_forms() {
+        assert!(wants_json_error_output(&[
+            "--output-format".to_string(),
+            "json".to_string()
+        ]));
+        assert!(wants_json_error_output(&[
+            "--output-format=json".to_string()
+        ]));
+        assert!(wants_json_error_output(&[
+            "--output-format".to_string(),
+            "json-schema".to_string()
+        ]));
+        assert!(!wants_json_error_output(&[
+            "--output-format".to_string(),
+            "md".to_string()
+        ]));
+        assert!(!wants_json_error_output(&["input.csv".to_string()]));
+    }
+}
+
 // --- Content-based format sniffing (the fallback detect_format reaches for
 // when the extension is missing or unrecognized) ---
 
@@ -55650,7 +56303,8 @@ fn detect_format(
             "icalendar" | "ical" | "ics" => Ok(InputFormat::Ical),
             other => {
                 bail!(
-                    "unrecognized --format '{other}' (expected csv, tsv, json, parquet, arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor, ini, xml, fixed-width, npy, npz, common-log, combined-log, syslog, syslog5424, dbase, stata, sas7bdat, spss, orc, bson, plist, json5, har, geojson, mbox, vcard, or icalendar)"
+                    "unrecognized --format '{other}' (expected {}) - run `sniff-rs --list-formats` for the full, per-build list",
+                    format_names_joined()
                 )
             }
         };
@@ -55701,7 +56355,8 @@ fn detect_format(
                 return Ok(format);
             }
             bail!(
-                "can't infer format from extension '.{other}' - pass --format csv|tsv|json|parquet|arrow|avro|xlsx|sqlite|msgpack|toml|yaml|cbor|ini|xml|fixed-width|npy|npz|common-log|combined-log|syslog|syslog5424|dbase|stata|sas7bdat|spss|orc|bson|plist|json5|har|geojson|mbox|vcard|icalendar explicitly"
+                "can't infer format from extension '.{other}' - pass --format {} explicitly (run `sniff-rs --list-formats` for the full, per-build list)",
+                format_names_piped()
             )
         }
     }
@@ -65470,6 +66125,26 @@ fn render_output(
     })
 }
 
+/// Whether `raw` requests JSON-shaped output anywhere (`--output-format
+/// json`/`json-schema`, either `--flag value` or `--flag=value` form) -
+/// checked directly against the raw argv rather than a parsed `Args`,
+/// since this has to decide how to *render an error* even when parsing
+/// the rest of the arguments is exactly what failed. Used by `run` to
+/// decide whether a top-level failure should come out as this tool's
+/// usual human-readable `Error: ...`/`Caused by:` chain (unchanged
+/// default, so every existing stderr-content assertion keeps working
+/// unmodified) or as one structured, `jq`-able JSON line - see `Error::
+/// to_json_line` - so an agent piping `--output-format json` doesn't have
+/// to fall back to scraping prose just for the one invocation that fails.
+fn wants_json_error_output(raw: &[String]) -> bool {
+    let is_json = |v: &str| v.eq_ignore_ascii_case("json") || v.eq_ignore_ascii_case("json-schema");
+    raw.iter()
+        .any(|a| a.strip_prefix("--output-format=").is_some_and(is_json))
+        || raw
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && is_json(&w[1]))
+}
+
 pub fn run() -> Result<()> {
     // The one subcommand this CLI has: `sniff-rs diff <OLD> <NEW>
     // [OUTPUT_PATH] [OPTIONS]`, detected before `Args::parse` (which
@@ -65478,11 +66153,36 @@ pub fn run() -> Result<()> {
     // why this is a genuine first, and the one disclosed cost (a file or
     // directory literally named `diff` now needs a `./diff` prefix).
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.first().map(String::as_str) == Some("diff") {
-        return run_diff(&raw[1..]);
+    let json_errors = wants_json_error_output(&raw);
+    let result = if raw.first().map(String::as_str) == Some("diff") {
+        run_diff(&raw[1..])
+    } else {
+        run_main(&raw)
+    };
+    match result {
+        Ok(()) => Ok(()),
+        // Only ever changes *how* a failure is reported, never whether
+        // one happens - the exit code stays 1 either way (matching
+        // `main`'s own default `Result<(), Error>` `Termination` impl),
+        // and every other invocation (the overwhelming majority, which
+        // never requested JSON output) gets byte-identical behavior to
+        // before this existed: `Err(e)` still flows straight back to
+        // `main`, which still prints it via `Error`'s own `Debug` chain.
+        Err(e) if json_errors => {
+            eprintln!("{}", e.to_json_line());
+            std::process::exit(1);
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_main(raw: &[String]) -> Result<()> {
+    let args = Args::parse_from(raw)?;
+
+    if args.list_formats {
+        return print_format_catalog(&args.output_format);
     }
 
-    let args = Args::parse()?;
     let output_format = OutputFormat::parse(&args.output_format)?;
 
     if args.input_path.is_dir() {
@@ -67264,6 +67964,7 @@ fn profile_raw_file_as_diff_columns(
         sql_mode: None,
         load_into: None,
         combine: false,
+        list_formats: false,
     };
     let (tables, _resolved_skip_rows) =
         dispatch_reader(read_path, logical_path, format, &synthetic_args)?;

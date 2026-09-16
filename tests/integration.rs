@@ -11826,3 +11826,177 @@ fn a_metadata_directory_with_no_real_metadata_json_file_is_not_misdetected() {
     );
     assert!(output_dir.join("data.csv.dictionary.md").exists());
 }
+
+// --- Agent-friendly CLI surface: --list-formats and structured JSON
+// errors, added directly in response to an "investigate and plan how to
+// make this CLI as agent-friendly as possible" request. See
+// FORMAT_CATALOG's own doc comment in src/lib.rs for the full design and
+// why it exists (HELP_TEXT's own format list had drifted out of sync
+// with this tool's real support - these two features are what an agent
+// can rely on instead of parsing --help prose). ---
+
+/// `--list-formats` alone (no INPUT_PATH at all) is a complete, valid
+/// invocation - it never touches `input_path`, per `Args::parse_from`'s
+/// own bypass.
+#[test]
+fn list_formats_succeeds_with_no_other_arguments() {
+    let output = Command::new(bin())
+        .args(["--list-formats"])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FORMAT"));
+    assert!(stdout.contains("csv"));
+    // A format at or past its own column's width (e.g. "combined-log" is
+    // exactly 12 characters) must never run straight into the next
+    // column with no separator - see the fix in `print_format_catalog`.
+    assert!(!stdout.contains("combined-logyes"));
+}
+
+/// The machine-readable half: `--output-format json` must produce a
+/// single parseable JSON document naming every format this build knows
+/// about, with real per-build `compiled_in` information (never a static
+/// claim), not just a list of names.
+#[test]
+fn list_formats_json_reports_real_per_build_capability() {
+    let output = Command::new(bin())
+        .args(["--list-formats", "--output-format", "json"])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout was not valid JSON ({e}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert!(doc["sniff_rs_version"].is_string());
+    let formats = doc["formats"].as_array().expect("formats must be an array");
+    let csv = formats
+        .iter()
+        .find(|f| f["name"] == "csv")
+        .expect("csv must be listed");
+    assert_eq!(csv["compiled_in"], true);
+    assert_eq!(csv["feature"], serde_json::Value::Null);
+    assert!(
+        csv["extensions"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("csv"))
+    );
+
+    let parquet = formats
+        .iter()
+        .find(|f| f["name"] == "parquet")
+        .expect("parquet must be listed");
+    // Whether parquet is actually compiled in must track this build's
+    // real feature flags, not a hardcoded claim - this binary is built
+    // with whatever features `cargo test` (this file's own harness) used.
+    assert_eq!(parquet["compiled_in"], cfg!(feature = "parquet"));
+
+    let delta = formats
+        .iter()
+        .find(|f| f["name"] == "delta")
+        .expect("delta must be listed even though it's never --format-selectable");
+    assert_eq!(delta["auto_detected_from"], "directory-structure");
+}
+
+/// `--help` must actually mention the new flag - the same "don't let
+/// this drift again" discipline as the format-list fix itself.
+#[test]
+fn help_text_mentions_list_formats() {
+    let output = Command::new(bin())
+        .args(["--help"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--list-formats"));
+}
+
+/// A failing invocation that requested `--output-format json` gets a
+/// structured, parseable JSON error on stderr instead of the default
+/// human-readable `Error: ...`/`Caused by:` chain - the whole point being
+/// that an agent piping JSON everywhere else doesn't have to fall back to
+/// scraping prose for the one invocation that fails.
+#[test]
+fn a_failing_invocation_with_json_output_format_gets_a_structured_json_error() {
+    let output = Command::new(bin())
+        .args([
+            "/this/path/does/not/exist.csv",
+            "-",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let doc: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("stderr was not valid JSON ({e}): {stderr}"));
+    assert!(
+        doc["error"]
+            .as_str()
+            .unwrap()
+            .contains("does/not/exist.csv")
+    );
+    assert!(
+        doc["caused_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c.as_str().unwrap().contains("No such file"))
+    );
+}
+
+/// The identical failure *without* `--output-format json` must keep
+/// producing exactly the old human-readable shape - this feature only
+/// ever changes behavior for an invocation that actually asked for JSON,
+/// never the default.
+#[test]
+fn a_failing_invocation_without_json_output_format_keeps_the_human_readable_error() {
+    let output = Command::new(bin())
+        .args(["/this/path/does/not/exist.csv", "-"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("Error:"));
+    assert!(stderr.contains("Caused by:"));
+    assert!(serde_json::from_str::<serde_json::Value>(stderr.trim()).is_err());
+}
+
+/// `--format bogus --output-format json` exercises the *other* error
+/// site this pass touched (the format-override parser's own bail!, now
+/// generated from `FORMAT_CATALOG`) through the same JSON-error path.
+#[test]
+fn unrecognized_format_with_json_output_format_gets_a_structured_json_error() {
+    let path = fixture("sample.csv");
+    let output = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--format",
+            "bogus",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let doc: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("stderr was not valid JSON ({e}): {stderr}"));
+    assert!(doc["error"].as_str().unwrap().contains("bogus"));
+    assert!(doc["error"].as_str().unwrap().contains("--list-formats"));
+}

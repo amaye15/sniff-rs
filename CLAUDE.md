@@ -14947,6 +14947,122 @@ baselines exactly (the same pre-existing `chunks_exact`/question-mark
 clippy findings from a newer clippy version, confirmed identical on
 unmodified `main`).
 
+## Agent-friendly CLI surface
+
+Prompted directly by a "make this CLI as agent-friendly as possible - not
+an MCP, just easy to set up and useful for an AI agent invoking it
+directly" request. Investigated first, rather than guessing at what "agent-
+friendly" should mean: checked `--help`'s own accuracy against this
+tool's real format support, `--version`/no-args/missing-file behavior,
+error-message structure, and whether there was any machine-readable way
+to learn this tool's own capabilities short of parsing prose. Two real,
+concrete gaps came out of that - both fixed here, everything else
+(`--version`, exit codes, stdout/stderr separation) was already solid.
+
+**`HELP_TEXT` had drifted out of sync with this tool's real format
+support** - its own opening paragraph and `--format` option line never
+mentioned SPSS, ORC, BSON, plist, JSON5/JSONC, HAR, GeoJSON, vCard,
+iCalendar, MBOX, Delta, or Iceberg, even though every one of them is
+fully supported - a real, if quiet, trust problem: an agent reading
+`--help` to decide "can this tool read X" would get a wrong answer for a
+dozen formats. Root cause: `HELP_TEXT`'s format list and the separate
+`--format bogus` error message's own list were two independently hand-
+maintained strings, already caught disagreeing once (this document's own
+earlier finding) and certain to disagree again the next time a format was
+added without remembering to touch both.
+
+**`FORMAT_CATALOG`** (`src/lib.rs`, right after `impl InputFormat`) is the
+fix: one `&[FormatInfo]` entry per format (name, auto-detected
+extensions, required Cargo feature, whether *this build* actually has
+that feature compiled in via `cfg!(feature = "...")`, and whether it's
+directory-detected like Delta/Iceberg rather than `--format`-selectable
+at all) - the single source both `--format`'s own error message
+(`format_names_joined`/`format_names_piped`) and the new `--list-formats`
+flag are built from. `HELP_TEXT` itself stays a hand-maintained literal
+(generating prose from a data table read worse than writing it once), but
+two `#[cfg(test)]` guards make future drift a build failure instead of a
+silent gap: `format_catalog_names_match_the_format_override_parser` round
+-trips every catalog entry through `detect_format`'s own real `--format`
+parser (the authoritative logic, untouched by this change) and checks
+the resulting `InputFormat::as_str()` matches; `help_text_mentions_every_
+catalog_format` fails the instant `FORMAT_CATALOG` gains a name `HELP_
+TEXT` doesn't mention anywhere.
+
+**`--list-formats`** (with `--output-format json` for a machine-readable
+version) is the actual new capability, and was judged the single
+highest-leverage addition of this whole investigation: one deterministic
+call - `sniff-rs --list-formats --output-format json | jq .` - tells an
+agent (or any other non-interactive caller) exactly which formats this
+particular binary can read right now, what extensions auto-detect each
+one, and which `--features` flag would be needed for one that isn't
+compiled in - instead of parsing `--help` prose or deliberately
+triggering a `--format bogus` error just to read its accepted-values
+list. Deliberately bypasses `Args::parse_from`'s own usual required-
+`input_path` validation (`sniff-rs --list-formats` alone, no other
+arguments, is a complete, valid invocation) rather than demanding a
+throwaway path just to reach a flag that never touches any file.
+
+**Structured JSON errors on request.** The default error shape (`Error`'s
+own `Debug` impl - `Error: <message>` plus a `Caused by:` chain) is
+unchanged for every invocation that doesn't ask for JSON output, matching
+every existing stderr-content assertion in this project's own test suite
+byte-for-byte. But an invocation that *did* request `--output-format
+json`/`json-schema` and then fails now gets a single-line, `jq`-able JSON
+object on stderr instead - `{"error": "...", "caused_by": ["...", ...]}`
+(`Error::to_json_line`) - so an agent piping JSON everywhere else doesn't
+have to fall back to scraping free-form prose for the one invocation that
+fails. `wants_json_error_output` scans the raw argv directly (not a
+parsed `Args`) for `--output-format json`/`json-schema` in either
+`--flag value` or `--flag=value` form, specifically so this still works
+even when the failure *is* the argument parsing itself. Deliberately does
+*not* invent a stable machine-readable error "code"/"kind" taxonomy: this
+project's ~150 existing error call sites were never authored with that
+classification in mind, and a guessed-at code risks being wrong or
+misleading more often than the plain message text already is - the
+message itself, unabridged, is the honest contract this can make today.
+The exit code is unchanged either way (1, matching `main`'s own default
+`Result<(), Error>` `Termination` behavior) - this only ever changes how
+a failure is *reported*, never whether one happens.
+
+Verified against real invocations, not just unit tests: `--list-formats`
+(both plain and `--output-format json`) run against a real `--features
+full` release binary, confirming `compiled_in` genuinely tracks each
+feature flag rather than claiming `true` unconditionally; a real
+column-alignment bug this pass's own manual check caught before it
+shipped - `"combined-log"` is exactly 12 characters, so a naive `{:<12}`
+column width produced `"combined-logyes"` with zero separator once a name
+reached (not just exceeded) its own column's width, fixed by making the
+inter-column spacing a literal character in the format string rather
+than relying on padding to provide it - confirmed fixed by re-running the
+same real binary; a real failing invocation (`--output-format json` on a
+nonexistent file) producing valid, parseable JSON on stderr with exit
+code 1, and the identical failure *without* `--output-format json`
+confirmed to still produce the unchanged human-readable chain. Also
+confirmed the three existing Delta/Iceberg integration tests that already
+assert specific substrings (`"deletion vector"`, `"part-dv.parquet"`,
+`"equality-delete"`) inside a `--output-format json` failure's own stderr
+still pass unmodified - the substring text survives verbatim inside the
+new JSON wrapper's `"error"` field, so nothing needed updating there.
+
+Full test suite (1076 `--features full` / 514 default-build tests, six
+new integration tests plus a dedicated `format_catalog_tests` unit-test
+module) passing unchanged, clippy/fmt clean on both builds matching each
+one's own already-established baseline exactly (the same pre-existing
+`chunks_exact`/question-mark clippy findings, confirmed identical on
+unmodified `main` via `git stash`).
+
+**Deliberately out of scope for this pass, disclosed rather than
+silently skipped**: `sniff-rs diff`'s own `--help` (`DIFF_HELP_TEXT`) was
+checked and found already accurate, needing no fix; a documented, per-
+format "what Cargo feature flag do I need" story already exists via
+`--list-formats` itself, so no separate installation-friction feature was
+added; and `--load-into`'s own subprocess-stdio-inheritance risk (a
+spawned `psql`/`mysql` prompting for a password could hang an agent-
+driven invocation indefinitely with no timeout) was investigated and
+named as a real, narrow gap, but left unfixed here since it's an opt-in
+flag with its own separately-scoped design (see that flag's own section
+above) rather than part of this pass's core "discoverability" focus.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike
