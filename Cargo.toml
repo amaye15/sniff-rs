@@ -76,9 +76,10 @@ icalendar = []
 # Parquet this project already reads; `delta` therefore always pulls in
 # `parquet` too, the same way `orc`'s own LZ4 codec reuse implies no new
 # feature of its own. See src/lib.rs's delta_support module and
-# CLAUDE.md's own "Lakehouse table formats" section for the full design,
-# including the disclosed scope boundary (checkpoint files, column
-# mapping, and deletion vectors aren't read yet).
+# CLAUDE.md's own "Lakehouse table formats" section for the full design -
+# checkpoint files, delta.columnMapping.mode, and deletion vectors are
+# all read now (a later pass closed all three); no catalog integration
+# remains a deliberate, permanent boundary, not a gap.
 delta = ["parquet"]
 # Apache Iceberg table awareness (iceberg_support): auto-detected directly
 # from the input path being a directory containing a `metadata/`
@@ -96,6 +97,20 @@ delta = ["parquet"]
 # including the disclosed scope boundary (delete files/manifests, schema
 # evolution across snapshots, and non-Parquet data files aren't read yet).
 iceberg = ["avro", "parquet"]
+# Portable SIMD (`std::simd`, RFC 2977) acceleration for this project's
+# own hottest, most heavily hand-optimized byte-scanning loop (the CSV
+# reader's own field/quoted-field scan) - genuinely optional and off by
+# default, since `std::simd` is still unstable (nightly-only, no
+# committed stabilization timeline as of this writing) and this project
+# otherwise builds and runs entirely on stable Rust. No new dependency:
+# `simd_support` in src/lib.rs is pure `core::simd`, the standard
+# library's own SIMD API, not a third-party crate. Requires `cargo
+# +nightly build --release --features simd` explicitly - never implied
+# by `full`, and never required for anything else in this project. See
+# src/lib.rs's `simd_support` module and CLAUDE.md's own "Performance"
+# section for the full design, the real, measured verdict on whether it
+# actually helps, and why.
+simd = []
 
 [dev-dependencies]
 # Unlike every other entry in this list, `serde`/`serde_json` used to be
