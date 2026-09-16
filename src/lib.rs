@@ -6800,12 +6800,24 @@ mod simd_support {
 /// tends to run longer between tag boundaries than a typical CSV field
 /// does, which is exactly why this scan doesn't need CSV's own
 /// short-haystack guard to stay a clean, unconditional win here.
-#[cfg(all(feature = "simd", any(feature = "xml", feature = "xlsx")))]
+/// Widened to also cover `plist_support::XmlValueWindow::scan_value`
+/// (the streaming plist `<array>` reader) once that turned out to need
+/// the identical single-byte scan for its own `<`/`>` tag boundaries -
+/// still just a trivial dispatch into the always-independently-available
+/// `simd_support` module, so adding a third caller here doesn't create
+/// any real dependency between `xml`/`xlsx`/`plist` themselves.
+#[cfg(all(
+    feature = "simd",
+    any(feature = "xml", feature = "xlsx", feature = "plist")
+))]
 fn byte_window_find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     simd_support::find_byte(haystack, needle)
 }
 
-#[cfg(all(not(feature = "simd"), any(feature = "xml", feature = "xlsx")))]
+#[cfg(all(
+    not(feature = "simd"),
+    any(feature = "xml", feature = "xlsx", feature = "plist")
+))]
 fn byte_window_find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
@@ -48187,6 +48199,15 @@ mod plist_support {
         /// themselves tolerate a raw `<`/`>` in text content either, so
         /// this scanner's scope matches the already-established grammar
         /// exactly, not a looser or stricter one.
+        ///
+        /// Bulk-copies "ordinary" bytes the same way `json_support`'s
+        /// own `scan_value` rewrite does, but genuinely simpler here:
+        /// with no string state to track at all, text content between
+        /// tags is bulk-copied until the next `<` and a tag's own
+        /// markup is bulk-copied until its closing `>`, both via the
+        /// same single-byte `byte_window_find_byte` this project's XML/
+        /// `.xlsx` byte-window scanners already use for their own
+        /// identical `<`-scanning need.
         fn scan_value(&mut self, out: &mut Vec<u8>) -> Result<()> {
             out.clear();
             self.skip_ws()?;
@@ -48195,38 +48216,63 @@ mod plist_support {
             }
             let mut depth: i64 = 0;
             loop {
-                match self.peek()? {
-                    None => bail!("unexpected end of input inside a plist value"),
-                    Some(b'<') => {
-                        let tag_start = out.len();
-                        out.push(self.bump()?.unwrap());
-                        loop {
-                            match self.bump()? {
-                                None => bail!("unterminated tag inside a plist value"),
-                                Some(b'>') => {
-                                    out.push(b'>');
-                                    break;
-                                }
-                                Some(b) => out.push(b),
-                            }
+                self.fill(1)?;
+                let rest = &self.buf[self.pos..];
+                if rest.is_empty() {
+                    bail!("unexpected end of input inside a plist value");
+                }
+                if rest[0] == b'<' {
+                    let tag_start = out.len();
+                    out.push(b'<');
+                    self.pos += 1;
+                    loop {
+                        self.fill(1)?;
+                        let rest2 = &self.buf[self.pos..];
+                        if rest2.is_empty() {
+                            bail!("unterminated tag inside a plist value");
                         }
-                        let tag = &out[tag_start..];
-                        let is_close = tag.get(1) == Some(&b'/');
-                        let is_self_closing = tag.len() >= 2 && tag[tag.len() - 2] == b'/';
-                        if is_close {
-                            depth -= 1;
-                            if depth == 0 {
-                                return Ok(());
+                        match byte_window_find_byte(rest2, b'>') {
+                            Some(off) => {
+                                out.extend_from_slice(&rest2[..off]);
+                                self.pos += off;
+                                out.push(b'>');
+                                self.pos += 1;
+                                break;
                             }
-                        } else if is_self_closing {
-                            if depth == 0 {
-                                return Ok(());
+                            None => {
+                                let n = rest2.len();
+                                out.extend_from_slice(rest2);
+                                self.pos += n;
                             }
-                        } else {
-                            depth += 1;
                         }
                     }
-                    Some(_) => out.push(self.bump()?.unwrap()),
+                    let tag = &out[tag_start..];
+                    let is_close = tag.get(1) == Some(&b'/');
+                    let is_self_closing = tag.len() >= 2 && tag[tag.len() - 2] == b'/';
+                    if is_close {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(());
+                        }
+                    } else if is_self_closing {
+                        if depth == 0 {
+                            return Ok(());
+                        }
+                    } else {
+                        depth += 1;
+                    }
+                } else {
+                    match byte_window_find_byte(rest, b'<') {
+                        Some(off) => {
+                            out.extend_from_slice(&rest[..off]);
+                            self.pos += off;
+                        }
+                        None => {
+                            let n = rest.len();
+                            out.extend_from_slice(rest);
+                            self.pos += n;
+                        }
+                    }
                 }
             }
         }
@@ -48736,6 +48782,73 @@ mod plist_support {
             other => json_emit_row_for_sql(&other, columns, records_mode, sink)?,
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod scan_value_tests {
+        use super::*;
+
+        fn stream_collect(bytes: &[u8]) -> Result<Vec<JsonValue>> {
+            let mut out = Vec::new();
+            stream_xml_plist_array(bytes, |v| {
+                out.push(v);
+                Ok(())
+            })?;
+            Ok(out)
+        }
+
+        /// A text-content run (bulk-copied until the next `<`) and a
+        /// tag's own markup (bulk-copied until its closing `>`) both
+        /// swept across every length from 0 to 70 bytes - the same
+        /// "boundary-position-independence" proof every other bulk-copy
+        /// rewrite in this project already requires of itself, since
+        /// `simd_support::find_byte`'s own 32-byte lane means the real
+        /// terminator needs to be checked landing at every offset
+        /// relative to it, not just "somewhere in a short value."
+        #[test]
+        fn stream_xml_plist_array_finds_tag_and_text_terminators_at_every_boundary_offset() {
+            for len in 0..70 {
+                let filler = "y".repeat(len);
+                let doc = format!("<array><string>{filler}</string></array>");
+                let got = stream_collect(doc.as_bytes())
+                    .unwrap_or_else(|e| panic!("text len={len}: {e}"));
+                assert_eq!(
+                    got,
+                    vec![JsonValue::String(filler.clone())],
+                    "text len={len}"
+                );
+
+                // A tag whose own attribute content (bulk-copied while
+                // scanning for the closing '>') spans the same range of
+                // lengths - <data> is the plist element whose own tag
+                // this reader's real callers never pad like this, but
+                // scan_value doesn't distinguish tag *kinds*, only where
+                // one ends, so a deliberately overlong (if semantically
+                // meaningless to the real parser) attribute on <string>
+                // still exercises the identical code path.
+                let padding_attr = "a".repeat(len);
+                let doc2 = format!("<array><string data-{padding_attr}=\"1\">v</string></array>");
+                let got2 = stream_collect(doc2.as_bytes())
+                    .unwrap_or_else(|e| panic!("tag len={len}: {e}"));
+                assert_eq!(
+                    got2,
+                    vec![JsonValue::String("v".to_string())],
+                    "tag len={len}"
+                );
+            }
+        }
+
+        #[test]
+        fn stream_xml_plist_array_handles_nested_dicts_and_a_genuinely_empty_array() {
+            let got = stream_collect(b"<array></array>").unwrap();
+            assert!(got.is_empty());
+
+            let got2 = stream_collect(
+                b"<array><dict><key>a</key><integer>1</integer></dict><true/></array>",
+            )
+            .unwrap();
+            assert_eq!(got2.len(), 2);
+        }
     }
 } // mod plist_support
 

@@ -8290,6 +8290,73 @@ for genuinely long-string-heavy JSON5, and is a small net loss for
 everything else, including the ordinary mixed-field shape most real
 files actually have.
 
+**A third instance of the identical shape was found and fixed in
+`plist_support::XmlValueWindow::scan_value`** (backing `stream_xml_
+plist_array`, the streaming path for a genuine top-level XML plist
+`<array>`) - genuinely *simpler* than either JSON scanner, not harder:
+this format's own grammar guarantees a literal, un-escaped `<`/`>` byte
+can never appear inside a tag's own markup or a leaf element's text
+content (both require the `&lt;`/`&gt;` entities instead - confirmed
+directly against this module's own `xp_parse_value`/`xp_read_text_and_
+close`, which never themselves tolerate a raw `<`/`>` in text content
+either), so there's no string-state tracking needed at all - just two
+independent single-byte bulk-copy scans (text content bulk-copied until
+the next `<`, a tag's own markup bulk-copied until its closing `>`),
+reusing the exact same `byte_window_find_byte` this project's XML/
+`.xlsx` byte-window scanners already use for their own identical `<`-
+scanning need (widened to also cover `plist`, still just a trivial
+dispatch into the always-independently-available `simd_support` module,
+so this doesn't create any real dependency between `xml`/`xlsx`/`plist`
+themselves).
+
+Verified with the same rigor as both JSON rewrites: the complete
+existing plist test suite (including `plist_xml_streams_a_top_level_
+array_across_window_refills`, this project's own existing test for a
+2,000-element array forcing several real internal buffer refills)
+passed unchanged; two new dedicated unit tests (a text-content run and a
+tag's own markup both swept across every length from 0 to 70 bytes; a
+genuinely empty array and a real nested-dict-plus-boolean case). Beyond
+the committed suite: an independent Python fuzz (via `plistlib`, the
+same real, independent library this project's own plist fixtures are
+already generated and cross-checked against) generated 1,500 random
+nested plist documents wrapped in one top-level array, plus 280 hand-
+targeted boundary cases (padding lengths 0-69, including a real XML
+entity escape adjacent to the padding) checked both combined and
+individually isolated, plus 462 truncated/malformed variants (cutting
+every 13 bytes up to 3,000, across both fuzz files) - `diff` confirmed
+byte-identical output, errors included, between the pre- and post-
+rewrite binaries across all of it. Byte-identical output also confirmed
+across the entire committed `.plist` fixture corpus. Clippy/fmt clean on
+both toolchains, and on every affected feature combination (`plist`
+alone, `plist,simd` alone, `full`, `full,simd`) with zero new findings.
+
+**The honest result matches the same pattern for a third time in a
+row**: the bulk-copy restructuring alone (stable, no SIMD) was again the
+dominant win - a real 144 MB, 300,000-record plist array (the same
+five-short-fields-plus-one-description-field shape used for every
+earlier measurement in this series) went from 1.20s to 0.835s user
+time, a consistent **~30% reduction** (4 rounds) - the largest of the
+three bulk-copy wins measured in this series, plausibly because a plist
+value's own tag markup (`<key>`, `<string>`, `</string>`, ...) gave the
+old byte-at-a-time scanner even more individual-byte overhead to pay for
+per record than JSON's bare `"`/`,`/`:` punctuation did. SIMD's own
+additional contribution on that same mixed-field file was a small,
+consistent **regression** again - 0.835s to 0.87s, ~4% slower - for the
+identical reason JSON5's own depth > 0 scan regressed: compact,
+machine-generated plist XML has short tag names, so the bulk-copy runs
+between `<`/`>` are often too short to amortize the SIMD lane's own
+setup cost. Isolated on the long-string-dominated shape (150,000
+records, one ~300-character field each), SIMD gave a real but smaller
+**~3% reduction** on top of the bulk-copy win (0.188s to 0.182s, 5
+rounds) - smaller than either JSON scanner's own equivalent result,
+since a plist string value's own surrounding `<string>...</string>` tag
+overhead dilutes the share of total time SIMD's own text-content scan
+can actually influence. The recommendation carries over unchanged a
+third time: `--features simd` earns its keep only on long-string-heavy
+content, and is a small net loss everywhere else - now demonstrated
+across three independently-hand-rolled scanners (core JSON, JSON5,
+plist) rather than resting on just one.
+
 ## Streaming reads / memory footprint
 
 A deliberate, ongoing effort - prompted directly by the user, who wants
