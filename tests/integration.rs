@@ -12000,3 +12000,134 @@ fn unrecognized_format_with_json_output_format_gets_a_structured_json_error() {
     assert!(doc["error"].as_str().unwrap().contains("bogus"));
     assert!(doc["error"].as_str().unwrap().contains("--list-formats"));
 }
+
+// --- Reading INPUT_PATH from stdin ("-") - added in the same
+// agent-friendly-CLI pass as --list-formats/structured JSON errors, so
+// an agent that already has data in memory doesn't have to write it to a
+// real file itself just to hand it to this tool. See
+// `resolve_stdin_input`'s own doc comment in src/lib.rs for the full
+// design. ---
+
+use std::io::Write as _;
+use std::process::Stdio;
+
+/// Runs the binary with `stdin_content` piped to its stdin, and the given
+/// args - a small local helper, distinct from the rest of this file's own
+/// `Command::new(bin()).args(...)` calls, since this is the only place
+/// that needs to actually write to a child's stdin rather than leave it
+/// inherited/empty.
+fn run_with_stdin(stdin_content: &[u8], args: &[&str]) -> std::process::Output {
+    let mut child = Command::new(bin())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+    child
+        .stdin
+        .take()
+        .expect("stdin was requested as piped")
+        .write_all(stdin_content)
+        .expect("failed to write to child stdin");
+    child.wait_with_output().expect("failed to wait on child")
+}
+
+/// The exact bug this feature shipped with, and was caught before it did:
+/// the default single-table name must be a real, meaningful "stdin", not
+/// `resolve_stdin_input`'s own randomly-named scratch temp file leaking
+/// into user-visible output.
+#[test]
+fn stdin_input_names_its_table_stdin_not_the_internal_temp_file() {
+    let content = std::fs::read(fixture("sample.csv")).unwrap();
+    let output = run_with_stdin(
+        &content,
+        &["-", "-", "--format", "csv", "--output-format", "json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout was not valid JSON ({e}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(doc["file"], "-");
+    let tables = doc["tables"].as_object().expect("tables must be an object");
+    assert!(tables.contains_key("stdin"), "tables were: {tables:?}");
+    assert!(!tables.keys().any(|k| k.starts_with("sniff-rs-")));
+}
+
+/// A format with a fixed, unambiguous leading byte (JSON's own `{`/`[`)
+/// still auto-detects correctly with no `--format` at all when read from
+/// stdin - the same content-sniffing fallback an extensionless real file
+/// already gets, since a piped `-` has no extension either.
+#[test]
+fn stdin_input_content_sniffs_json_with_no_format_flag() {
+    let output = run_with_stdin(
+        br#"[{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]"#,
+        &["-", "-", "--output-format", "json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["format"], "json");
+    assert_eq!(doc["tables"]["stdin"][0]["name"], "a");
+}
+
+/// A format with no fixed leading byte (CSV) still needs `--format`
+/// explicitly when piped through stdin, exactly as it already would for
+/// any other extensionless input - not a stdin-specific limitation, just
+/// the same rule applied consistently.
+#[test]
+fn stdin_input_without_format_still_needs_it_for_a_non_sniffable_format() {
+    let content = std::fs::read(fixture("sample.csv")).unwrap();
+    let output = run_with_stdin(&content, &["-", "-"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("can't infer format from extension"));
+}
+
+/// `sniff-rs -` alone (no OUTPUT_PATH) is a clear, actionable error - not
+/// a guessed default-output filename derived from a scratch temp path -
+/// since there's no real input filename to derive one from at all.
+#[test]
+fn stdin_input_without_an_output_path_is_an_actionable_error() {
+    let content = std::fs::read(fixture("sample.csv")).unwrap();
+    let output = run_with_stdin(&content, &["-", "--format", "csv"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires an explicit OUTPUT_PATH"));
+}
+
+/// `--output-format sql`'s own inline mode does a genuine *second* pass
+/// over the same input to emit literal `INSERT` rows once column types
+/// are known (see CLAUDE.md's own "SQL script output" section) - for
+/// stdin input, that second pass has to re-read the same temporary file
+/// the first pass already consumed, not stdin itself a second time
+/// (which would already be exhausted). This proves that actually works,
+/// not just that the header/schema comes out right.
+#[test]
+fn stdin_input_survives_sql_inline_modes_second_pass_reread() {
+    let content = std::fs::read(fixture("sample.csv")).unwrap();
+    let output = run_with_stdin(
+        &content,
+        &["-", "-", "--format", "csv", "--output-format", "sql"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sql = String::from_utf8_lossy(&output.stdout);
+    assert!(sql.contains("CREATE TABLE \"stdin\""));
+    // A real value from the fixture's own first data row, not just the
+    // schema - proves the second pass actually re-read real content.
+    assert!(sql.contains("U1001"));
+}

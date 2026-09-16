@@ -3293,7 +3293,11 @@ struct Args {
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
     /// .msgpack/.mp, .toml, .yaml/.yml, .cbor, .ini, .xml, .npy, .npz,
     /// .dbf, .dta, .sas7bdat; fixed-width text and the log formats have no extension
-    /// convention and are only reachable via --format)
+    /// convention and are only reachable via --format), or literally "-"
+    /// to read from stdin instead - see `resolve_stdin_input`'s own doc
+    /// comment for the full design (buffered into a real temp file, so
+    /// every reader works unchanged; needs --format or sniffable content
+    /// since there's no extension; always needs an explicit output_path).
     input_path: PathBuf,
     /// Output path (default: <input>.dictionary.md or .json). Pass "-" to write to stdout.
     /// Only valid when input_path is a single file, or a directory with
@@ -3425,7 +3429,13 @@ ARGS:
             above). A file's format is inferred from its extension; if
             there isn't one, or it's not recognized, its own bytes are
             sniffed instead. A .gz or .zst extension is transparently
-            decompressed first.
+            decompressed first. Pass "-" to read from stdin instead of a
+            real file (buffered into a real temp file first, so every
+            reader works unchanged) - since there's no extension to infer
+            from, this needs either --format or content that sniffs
+            unambiguously (JSON, XML, SQLite, Parquet, a zip-based
+            format, ...), and always needs an explicit OUTPUT_PATH (there
+            is no filename to derive a default from).
     [OUTPUT_PATH]
             Single-file mode, or directory mode with --combine. Output
             path (default: <input>.dictionary.md or .json). Pass "-" to
@@ -65757,6 +65767,65 @@ impl Drop for TempFile {
     }
 }
 
+/// If `input_path` is literally `-` (the same sentinel this tool's own
+/// `OUTPUT_PATH` already uses for stdout), materializes the *entire*
+/// contents of stdin into a real, seekable temporary file and returns its
+/// path instead of the literal `-` - added directly in response to an
+/// "agent-friendly CLI" investigation, since an agent that already has
+/// data in memory (fetched, generated, piped from another tool) would
+/// otherwise have to write it to a real file itself just to hand it to
+/// this tool, the exact "easy to use non-interactively" friction this
+/// whole effort exists to remove. Every reader in this project needs
+/// genuine random file access (Parquet's own tail-anchored footer,
+/// SQLite's page-by-page b-tree walk, the zip-based formats' central
+/// directory, `--sql-mode inline`'s own real second pass over the same
+/// file), which a pipe can never give directly - buffering once into a
+/// real file up front is what lets every existing reader work completely
+/// unchanged, with zero per-format stdin-specific code, rather than
+/// needing its own streaming special case. Any other input path passes
+/// through unchanged, with no guard and no stdin read at all - the
+/// overwhelmingly common (real file) case pays nothing.
+///
+/// A real, disclosed scope boundary: unlike a real file path, a literal
+/// `-` carries no extension for `compression_from_extension` to key off,
+/// so a gzip/zstd-compressed stream piped this way is *not* auto-
+/// decompressed - the same `gunzip -c foo.csv.gz | sniff-rs -` shell-
+/// pipeline workaround this tool already needs for any other
+/// extensionless compressed input. `sniff-rs diff`'s own two-input
+/// grammar doesn't get this treatment either (its own separate
+/// `load_diff_input`) - out of scope for now, disclosed rather than
+/// silently unsupported.
+fn resolve_stdin_input(input_path: &Path) -> Result<(PathBuf, Option<TempFile>)> {
+    if input_path != Path::new("-") {
+        return Ok((input_path.to_path_buf(), None));
+    }
+    let mut tmp = TempFile::new()?;
+    std::io::copy(&mut std::io::stdin(), tmp.as_file_mut())
+        .context("failed to read stdin into a temporary file")?;
+    Ok((tmp.path().to_path_buf(), Some(tmp)))
+}
+
+#[cfg(test)]
+mod stdin_input_tests {
+    use super::*;
+
+    // Deliberately doesn't cover the actual `-` branch here - reading
+    // real process stdin inside an in-process unit test is unreliable
+    // (whatever `cargo test` itself was given as stdin, shared across
+    // however many tests run in parallel) and unnecessary, since the
+    // real end-to-end behavior is already covered by subprocess-based
+    // integration tests in tests/integration.rs, which can control a
+    // child process's own stdin precisely. This test locks in the other
+    // half: every real path must be a pure passthrough, touching neither
+    // stdin nor the filesystem at all.
+    #[test]
+    fn a_real_path_passes_through_unchanged_with_no_temp_file() {
+        let (path, tmp) = resolve_stdin_input(Path::new("data.csv")).unwrap();
+        assert_eq!(path, PathBuf::from("data.csv"));
+        assert!(tmp.is_none());
+    }
+}
+
 /// If `path` ends in `.gz`/`.gzip` or `.zst`/`.zstd`, decompresses it into a
 /// real temporary file and returns (the path to actually read bytes from,
 /// the compression-stripped logical path used for format detection and
@@ -66570,11 +66639,42 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         None
     };
 
+    // INPUT_PATH "-" means "read from stdin" - but only when there's
+    // somewhere real for the output to go: a default output *name* is
+    // normally derived from the input path itself (see below), which
+    // "-" has none of. `--load-into` is the one exception, since it
+    // already forbids an output path of its own (the SQL streams
+    // straight into the target engine, never a named file) - so the
+    // "needs somewhere to go" concern that check exists for genuinely
+    // doesn't apply when a load target is already present.
+    if args.input_path == Path::new("-") && args.output_path.is_none() && load_target.is_none() {
+        bail!(
+            "reading INPUT_PATH from stdin (-) requires an explicit OUTPUT_PATH (pass \"-\" again to write to stdout instead) - there's no real filename to derive a default output name from"
+        );
+    }
+    let (stdin_input_path, _stdin_tmp) = resolve_stdin_input(&args.input_path)?;
+
     // data.csv.gz reads exactly like data.csv from here on: read_path points
     // at the real (decompressed) bytes every reader below opens, logical_path
     // is the compression-stripped name used for format detection and default
     // output naming, and _decompressed_tmp just needs to outlive the reads.
-    let (read_path, logical_path, _decompressed_tmp) = decompress_if_needed(&args.input_path)?;
+    let (read_path, mut logical_path, _decompressed_tmp) = decompress_if_needed(&stdin_input_path)?;
+    if args.input_path == Path::new("-") {
+        // `logical_path` would otherwise be `resolve_stdin_input`'s own
+        // randomly-named scratch file (e.g. `sniff-rs-1234-...-0.tmp`) -
+        // harmless for the one thing it's actually used for downstream
+        // of here (extension-based format detection, which already
+        // falls through to content-sniffing/`--format` for an
+        // unrecognized `.tmp` extension exactly as it would for no
+        // extension at all), but it *is* also `dispatch_reader`'s own
+        // source for `file_stem` - the default single-table name that
+        // ends up as a real, user-visible key in this run's own JSON/
+        // Markdown/SQL output. Overriding it here keeps that internal
+        // implementation detail from ever leaking into what's actually
+        // produced - "stdin" reads as a real, meaningful table name the
+        // random scratch filename never would.
+        logical_path = PathBuf::from("stdin");
+    }
 
     let format = detect_format(&read_path, &logical_path, &args.format)?;
     let file_name = args
