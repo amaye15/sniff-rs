@@ -49178,6 +49178,21 @@ mod json5_support {
     /// comments are recognized and copied through verbatim (not
     /// stripped; the per-element re-parse via `parse` already knows how
     /// to skip them) without ever being depth- or string-tracked.
+    /// `scan_value`'s own shared multi-byte scan dispatcher - see `json_
+    /// support`'s own identically-named/shaped helper for the full
+    /// rationale. Kept as its own separate copy (not shared with `json_
+    /// support`'s) since `json5`/the core JSON reader are independently
+    /// togglable features that must never depend on each other.
+    #[cfg(feature = "simd")]
+    fn json5_scan_find_any<const N: usize>(haystack: &[u8], needles: [u8; N]) -> Option<usize> {
+        super::simd_support::find_any(haystack, needles)
+    }
+
+    #[cfg(not(feature = "simd"))]
+    fn json5_scan_find_any<const N: usize>(haystack: &[u8], needles: [u8; N]) -> Option<usize> {
+        haystack.iter().position(|&x| needles.contains(&x))
+    }
+
     struct ByteWindow<R> {
         reader: R,
         buf: Vec<u8>,
@@ -49274,64 +49289,149 @@ mod json5_support {
         /// struct's own doc comment for why that's needed here and not
         /// there). The caller hands `out` to `parse` for the real,
         /// validating parse.
+        ///
+        /// Bulk-copies "ordinary" bytes the same way `json_support`'s own
+        /// rewrite does, generalized for this format's own two extra
+        /// wrinkles: a string can be closed by *either* `"` or `'`
+        /// (whichever opened it, tracked in `in_string: Option<u8>`
+        /// rather than a fixed byte), so the in-string bulk-copy's own
+        /// candidate set is `[q, b'\\']` with `q` resolved per string
+        /// rather than a compile-time constant; and outside a string, a
+        /// `/` can start a `//`/`/*` comment *at any point*, not just at
+        /// a value boundary, so the depth > 0 bulk-copy's own candidate
+        /// set adds `/` as a seventh candidate alongside the five
+        /// structural bytes and both quote characters. Finding a `/` via
+        /// the bulk copy doesn't yet mean a comment - `self.peek_at(1)`
+        /// resolves that exactly the way the original byte-at-a-time
+        /// code already did, with a lone, non-comment `/` (a genuine
+        /// JSON5 syntax error, caught later by the real parser) falling
+        /// through to be pushed as ordinary content and the scan
+        /// continuing, matching the old code's own implicit `_ => {}`
+        /// handling of that byte exactly.
         fn scan_value(&mut self, out: &mut Vec<u8>) -> Result<()> {
             out.clear();
             let mut depth: i64 = 0;
             let mut in_string: Option<u8> = None;
-            let mut escaped = false;
             loop {
-                if in_string.is_none() {
-                    if self.peek()? == Some(b'/') && self.peek_at(1)? == Some(b'/') {
-                        out.push(self.bump()?.unwrap());
-                        out.push(self.bump()?.unwrap());
-                        while !matches!(self.peek()?, None | Some(b'\n')) {
-                            out.push(self.bump()?.unwrap());
-                        }
-                        continue;
+                if let Some(q) = in_string {
+                    self.fill(1)?;
+                    let rest = &self.buf[self.pos..];
+                    if rest.is_empty() {
+                        bail!("unexpected end of input inside a JSON5 value");
                     }
-                    if self.peek()? == Some(b'/') && self.peek_at(1)? == Some(b'*') {
+                    match json5_scan_find_any(rest, [q, b'\\']) {
+                        Some(off) => {
+                            out.extend_from_slice(&rest[..off]);
+                            self.pos += off;
+                        }
+                        None => {
+                            let n = rest.len();
+                            out.extend_from_slice(rest);
+                            self.pos += n;
+                            continue;
+                        }
+                    }
+                    let b = self.buf[self.pos];
+                    self.pos += 1;
+                    out.push(b);
+                    if b == b'\\' {
+                        match self.bump()? {
+                            Some(esc) => out.push(esc),
+                            None => bail!("unexpected end of input inside a JSON5 value"),
+                        }
+                    } else {
+                        // b == q, since json5_scan_find_any only ever
+                        // returned an offset to one of the two bytes just
+                        // matched on above.
+                        in_string = None;
+                    }
+                } else if self.peek()? == Some(b'/') && self.peek_at(1)? == Some(b'/') {
+                    out.push(self.bump()?.unwrap());
+                    out.push(self.bump()?.unwrap());
+                    while !matches!(self.peek()?, None | Some(b'\n')) {
                         out.push(self.bump()?.unwrap());
-                        out.push(self.bump()?.unwrap());
-                        loop {
-                            match self.peek()? {
-                                None => bail!("unterminated /* comment"),
-                                Some(b'*') if self.peek_at(1)? == Some(b'/') => {
-                                    out.push(self.bump()?.unwrap());
-                                    out.push(self.bump()?.unwrap());
-                                    break;
-                                }
-                                _ => out.push(self.bump()?.unwrap()),
+                    }
+                } else if self.peek()? == Some(b'/') && self.peek_at(1)? == Some(b'*') {
+                    out.push(self.bump()?.unwrap());
+                    out.push(self.bump()?.unwrap());
+                    loop {
+                        match self.peek()? {
+                            None => bail!("unterminated /* comment"),
+                            Some(b'*') if self.peek_at(1)? == Some(b'/') => {
+                                out.push(self.bump()?.unwrap());
+                                out.push(self.bump()?.unwrap());
+                                break;
                             }
+                            _ => out.push(self.bump()?.unwrap()),
                         }
-                        continue;
                     }
-                }
-                match self.peek()? {
-                    None => {
-                        if in_string.is_some() || depth != 0 || out.is_empty() {
-                            bail!("unexpected end of input inside a JSON5 value");
+                } else if depth > 0 {
+                    self.fill(1)?;
+                    let rest = &self.buf[self.pos..];
+                    if rest.is_empty() {
+                        bail!("unexpected end of input inside a JSON5 value");
+                    }
+                    match json5_scan_find_any(rest, *b"\"'{}[]/") {
+                        Some(off) => {
+                            out.extend_from_slice(&rest[..off]);
+                            self.pos += off;
                         }
-                        return Ok(());
+                        None => {
+                            let n = rest.len();
+                            out.extend_from_slice(rest);
+                            self.pos += n;
+                            continue;
+                        }
                     }
-                    Some(b) => {
-                        if in_string.is_none()
-                            && depth == 0
-                            && !out.is_empty()
-                            && matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
-                        {
-                            return Ok(());
+                    let b = self.buf[self.pos];
+                    if b == b'/' {
+                        // Found via the bulk copy, but a lone '/' isn't
+                        // itself special - only a real `//`/`/*` opener
+                        // is, checked (and, if so, handled) on the next
+                        // iteration by the two comment branches above,
+                        // which only ever look at `self.pos` directly
+                        // rather than assuming anything was consumed yet.
+                        // A '/' that isn't a comment opener falls through
+                        // to plain content exactly like every other
+                        // consumed byte below.
+                        if self.peek_at(1)? == Some(b'/') || self.peek_at(1)? == Some(b'*') {
+                            continue;
                         }
                         self.pos += 1;
                         out.push(b);
-                        if let Some(q) = in_string {
-                            if escaped {
-                                escaped = false;
-                            } else if b == b'\\' {
-                                escaped = true;
-                            } else if b == q {
-                                in_string = None;
+                        continue;
+                    }
+                    self.pos += 1;
+                    out.push(b);
+                    match b {
+                        b'"' | b'\'' => in_string = Some(b),
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth < 0 {
+                                bail!("unbalanced ']' or '}}' in JSON5");
                             }
-                        } else {
+                        }
+                        _ => unreachable!(
+                            "json5_scan_find_any only ever returns an offset to one of the seven bytes just matched on above"
+                        ),
+                    }
+                } else {
+                    match self.peek()? {
+                        None => {
+                            if out.is_empty() {
+                                bail!("unexpected end of input inside a JSON5 value");
+                            }
+                            return Ok(());
+                        }
+                        Some(b) => {
+                            if !out.is_empty()
+                                && matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
+                            {
+                                return Ok(());
+                            }
+                            self.pos += 1;
+                            out.push(b);
                             match b {
                                 b'"' | b'\'' => in_string = Some(b),
                                 b'{' | b'[' => depth += 1,
@@ -49474,6 +49574,105 @@ mod json5_support {
         let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
         let value = parse(&text).with_context(|| format!("failed to parse {path:?} as JSON5"))?;
         json_emit_row_for_sql(&value, columns, records_mode, sink)
+    }
+
+    #[cfg(test)]
+    mod scan_value_tests {
+        use super::*;
+
+        fn stream_collect(bytes: &[u8]) -> Result<Vec<JsonValue>> {
+            let mut out = Vec::new();
+            stream_top_level_array(bytes, |v| {
+                out.push(v);
+                Ok(())
+            })?;
+            Ok(out)
+        }
+
+        #[test]
+        fn stream_top_level_array_handles_both_quote_styles_and_comments_and_tricky_content() {
+            let got = stream_collect(
+                r#"[
+                    1,
+                    {'k': "a]b,c{d"}, // a comment with ] } { chars
+                    'x\'y',
+                    "p\"q",
+                    [true, null],
+                    /* a block comment with ] } { chars */ "café",
+                ]"#
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(got.len(), 6);
+            assert_eq!(got[0], JsonValue::from(1i64));
+            assert_eq!(got[2], JsonValue::String("x'y".to_string()));
+            assert_eq!(got[3], JsonValue::String("p\"q".to_string()));
+            assert_eq!(got[5], JsonValue::String("café".to_string()));
+        }
+
+        /// The same "an escaped backslash immediately followed by a real
+        /// closing quote" case `json_support`'s own equivalent test
+        /// already locks in, proven separately here for *both* of this
+        /// format's own quote styles (single and double) at every
+        /// padding length from 0 to 40 bytes - the dimension a purely
+        /// hand-written test can't otherwise exercise, since `simd_
+        /// support::find_any`'s own 32-byte lane means the escape pair
+        /// needs to be checked landing at every position relative to a
+        /// real lane boundary, not just "somewhere in a short string."
+        #[test]
+        fn stream_top_level_array_handles_escaped_backslash_then_quote_at_every_boundary_offset_both_quote_styles()
+         {
+            for pad_len in 0..40 {
+                let pad = "x".repeat(pad_len);
+                for quote in ['"', '\''] {
+                    // A string opened and closed with `quote`, containing
+                    // the padding followed by an escaped backslash, then
+                    // a second, plain double-quoted string afterward.
+                    let doc = format!("[{quote}{pad}\\\\{quote}, \"after\"]");
+                    let got = stream_collect(doc.as_bytes())
+                        .unwrap_or_else(|e| panic!("pad_len={pad_len} quote={quote}: {e}"));
+                    assert_eq!(got.len(), 2, "pad_len={pad_len} quote={quote}");
+                    assert_eq!(
+                        got[0],
+                        JsonValue::String(format!("{pad}\\")),
+                        "pad_len={pad_len} quote={quote}"
+                    );
+                    assert_eq!(got[1], JsonValue::String("after".to_string()));
+                }
+            }
+        }
+
+        /// A `/` landing at every offset relative to a SIMD lane boundary
+        /// while scanning ordinary (non-string, depth > 0) content - both
+        /// as a genuine `//`/`/*` comment opener and as a plain,
+        /// non-comment `/` that must fall through to ordinary content
+        /// rather than being mistaken for one.
+        #[test]
+        fn stream_top_level_array_finds_a_slash_at_every_boundary_offset_both_as_comment_and_plain_content()
+         {
+            for len in 0..70 {
+                let filler = "1,".repeat(len);
+                // A real line comment after a run of ordinary content.
+                let doc = format!("[[{filler}2 // trailing comment\n]]");
+                let got = stream_collect(doc.as_bytes())
+                    .unwrap_or_else(|e| panic!("comment len={len}: {e}"));
+                let mut expected: Vec<JsonValue> = vec![JsonValue::from(1i64); len];
+                expected.push(JsonValue::from(2i64));
+                assert_eq!(got, vec![JsonValue::Array(expected)], "comment len={len}");
+
+                // A plain (non-comment) '/' inside a string at the same
+                // relative offsets - must never be mistaken for a
+                // comment opener just because it's a '/'.
+                let doc2 = format!(r#"["{}/x"]"#, "y".repeat(len));
+                let got2 = stream_collect(doc2.as_bytes())
+                    .unwrap_or_else(|e| panic!("plain slash len={len}: {e}"));
+                assert_eq!(
+                    got2,
+                    vec![JsonValue::String(format!("{}/x", "y".repeat(len)))],
+                    "plain slash len={len}"
+                );
+            }
+        }
     }
 } // mod json5_support
 

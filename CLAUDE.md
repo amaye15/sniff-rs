@@ -8219,6 +8219,77 @@ equal in every round) - real, but only worth reaching for on JSON
 dominated by long string values, mirroring CSV's own already-disclosed
 recommendation rather than contradicting it.
 
+**A further follow-up pass applied the identical rewrite to `json5_
+support`'s own independent `ByteWindow::scan_value`** (backing `stream_
+top_level_array`, the streaming path for a genuine top-level JSON5
+array) - a real, if smaller-audience, second instance of the exact same
+shape, deliberately kept as its own separate copy rather than shared
+with `json_support`'s version, since `json5`/the core JSON reader are
+independently togglable features that must never depend on each other
+(the same "controlled duplication across independently-gated feature
+modules" precedent this project already established for `xml`/`xlsx`'s
+own `copy_until_lt`/`copy_until`).
+
+**Two genuine wrinkles this format's own grammar adds, both handled
+without weakening the core technique**: a string can be closed by
+*either* `"` or `'` (tracked as `in_string: Option<u8>`, so the in-string
+bulk-copy's own 2-candidate set is `[q, b'\\']` with `q` resolved per
+string rather than a compile-time constant); and outside a string, a `/`
+can open a `//`/`/*` comment *at any point*, not just at a value
+boundary, so the depth > 0 bulk-copy's own candidate set grows to seven
+bytes (the five structural bytes, both quote characters, and `/`). A `/`
+found via that seven-candidate scan doesn't yet mean a comment - the
+existing `peek_at(1)` check (unchanged) still resolves that exactly the
+way the original byte-at-a-time code already did, with a lone, non-
+comment `/` (a genuine JSON5 syntax error the real parser catches later)
+falling through to ordinary content precisely like every other
+plain byte.
+
+Verified with the same rigor as the core JSON rewrite, adapted for this
+format's own extra surface: the complete existing JSON5 test suite
+(including `json5_comment_containing_stray_brackets_and_quotes_does_not_
+corrupt_the_scan`, this project's own existing adversarial fixture for
+exactly the "structural-looking characters inside a comment" case)
+passed unchanged; three new dedicated unit tests (both quote styles plus
+comments in one document; the escaped-backslash-then-real-quote case
+swept across every SIMD-lane boundary offset for *both* quote styles;
+and a `/` swept across every boundary offset both as a genuine comment
+opener and as ordinary content inside a string, proving neither is ever
+mistaken for the other). Beyond the committed suite: an independent
+Python fuzz generated 2,000 random nested JSON5 documents (comments,
+both quote styles, trailing commas, mixed content) wrapped in one
+top-level array, plus 200 hand-targeted boundary cases (the escaped-
+backslash-then-quote and comment-adjacency cases swept across padding
+lengths 0-39, for both quote styles) checked both combined and
+individually isolated, plus 546 truncated/malformed variants (cutting
+every 11 bytes up to 3,000, across both fuzz files) - `diff` confirmed
+byte-identical output, errors included, between the pre- and post-
+rewrite binaries across all of it. Byte-identical output also confirmed
+across the entire committed `.json5`/`.jsonc` fixture corpus. Clippy/fmt
+clean on both toolchains with zero new findings.
+
+**The honest result closely tracks core JSON's own, with one real
+difference worth disclosing rather than glossing over**: the bulk-copy
+restructuring alone (stable, no SIMD) showed the identical dominant win
+- a real 100 MB, 400,000-record JSON5 array (the same five-short-fields-
+plus-one-description-field shape used for core JSON's own measurement)
+went from 1.02s to 0.74s user time, a consistent **~27% reduction**
+(4 rounds). SIMD's own additional contribution on that same mixed-field
+file, though, was a small but consistently measured **regression** here
+- 0.74s to 0.78s, ~5% *slower* - unlike core JSON's roughly-neutral
+result on an equivalent file, because this format's own depth > 0 scan
+carries two more candidate bytes (7 vs. 5) to set up and OR together per
+SIMD lane, a real fixed cost that has nothing to amortize against when
+the "outside a string" runs are just as short as core JSON's own already
+were. Isolated on the identical long-string-dominated shape (150,000
+records, one ~300-character field each), SIMD still gave the same real,
+consistent **~7% reduction** on top of the bulk-copy win (0.162s to
+0.15s, 5 rounds) - so the honest recommendation for this format is
+narrower than core JSON's own: `--features simd` is worth it here only
+for genuinely long-string-heavy JSON5, and is a small net loss for
+everything else, including the ordinary mixed-field shape most real
+files actually have.
+
 ## Streaming reads / memory footprint
 
 A deliberate, ongoing effort - prompted directly by the user, who wants
