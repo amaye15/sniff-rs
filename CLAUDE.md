@@ -7825,6 +7825,75 @@ table, repeated rows/cells, a 1,200-byte text field, comments/PIs
 between rows, entity-escaped text) - zero mismatches in either. Clippy/
 fmt clean across default/`xml`/`xlsx`/`full`, established baselines.
 
+A twentieth pass targeted `delta_support`/`iceberg_support` specifically
+- the two newest readers in this project, added well after every format
+above had already been through this section's own repeated profiling
+history, and never audited against it themselves. Reading both readers'
+own per-row hot loops directly (rather than profiling first, since both
+are small, recently-written modules easy to read end to end) found the
+identical mistake in both: `stream_parquet_rows`'s own callback hands
+each row in as a fully owned `JsonValue` (`row: JsonValue`, not a
+reference), so destructuring it into `let JsonValue::Object(map) = row`
+already gives an owned `map` with nothing left anywhere that reads it
+again afterward - but both readers then walked it via a *borrowing*
+`map.iter()` and called `.clone()` on every single scalar value before
+handing it to `json_scalar_into_raw_string` (which itself already takes
+its argument by value). This is the exact "nothing left to preserve, so
+don't clone" mistake this project's own Parquet reader
+(`profile_parquet_file`'s `FieldAccum::Flat`) already avoided years
+earlier in its own, structurally identical shape - `delta_support`/
+`iceberg_support` were written independently, later, and simply never
+carried that lesson over. Fixed by switching both to `map.into_iter()`,
+moving each value out directly instead of cloning it - a real cost for
+every non-null cell of every row of every Delta/Iceberg table this
+reader ever profiles, not just an occasional path.
+
+A second, smaller finding in the same pass: `iceberg_support`'s own
+`PositionDeletesByFile` (the per-data-file set of row positions a
+position-delete file named as deleted, checked once per row of every
+live file in `resolve_iceberg_table_profiles`'s own hot loop) was a
+`BTreeSet<i64>`, giving every row's own deletion check O(log n) cost
+against however many positions that file has deleted, for a lookup key
+this project's own established `FxHasher` precedent already covers (a
+hot, non-adversarial per-row key with no need for sorted iteration over
+the set's own contents anywhere in this reader). Switched to
+`HashSet<i64, FxBuildHasher>`, the same "hot lookup, no ordering need"
+tradeoff `bucket_object_fields`/`suggest_ideal_type`'s own unique-value
+tracking already made in an earlier pass, for real O(1) amortized
+lookups instead.
+
+Measured on two real, `deltalake`/`pyiceberg`-generated files, the
+identical "controlled alternating-binary comparison" methodology every
+earlier pass in this section already uses: a real 1,000,000-row, 30 MB
+Delta table (id/name/email/amount/a longer free-text description column
+- five columns, so every row pays the clone cost five times over) showed
+a consistent, if modest, **~3-5%** user-time reduction across three
+rounds (1.82s/1.87s/1.85s before, 1.78s/1.79s/1.84s after, new faster or
+equal in every round); a real 500,000-row Iceberg table with a real,
+hand-assembled 100,000-row (20%) position-delete file - specifically
+sized to stress both fixes at once, the clone removal on every one of
+the 400,000 surviving rows and the `HashSet` lookup against a genuinely
+large deleted-position set - showed a cleaner **~5%** reduction (0.39s/
+0.37s/0.38s before, 0.36s/0.36s/0.36s after, new strictly faster or equal
+in every round). Peak memory was checked and found genuinely unchanged
+(`/usr/bin/time -l`, ~969 MB maxRSS / ~931 MB peak footprint on the Delta
+file, both before and after) - reported honestly rather than claimed as
+a win it isn't: the cloned string was always short-lived, freed
+immediately after each `push` call, so removing the clone saves real
+allocator/CPU work but was never going to move peak RSS, the same
+"don't cherry-pick the flattering metric" discipline this section's own
+history already holds itself to.
+
+Verified the same way as every pass before it: the full test suite (592
+tests) unchanged and passing, clippy/fmt clean across default/`delta`/
+`iceberg`/`parquet`/`full`, matching each build's own established
+baseline exactly with zero new findings, and `diff` confirmed byte-
+identical output against the pre-fix binary on both real measurement
+files (the Delta table and the Iceberg table with its position-delete
+file) as well as the entire committed Delta/Iceberg fixture corpus -
+this pass changed nothing about what either reader produces, only how
+much work it costs to produce it.
+
 ## Streaming reads / memory footprint
 
 A deliberate, ongoing effort - prompted directly by the user, who wants

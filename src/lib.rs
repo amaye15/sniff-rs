@@ -37297,7 +37297,14 @@ mod delta_support {
                 let JsonValue::Object(map) = row else {
                     bail!("{file_path:?}: expected each Parquet row to decode to an object");
                 };
-                for (key, value) in map.iter() {
+                // `map` is a fully owned row - nothing else reads it again
+                // after this loop - so each value is moved out via
+                // `into_iter` instead of cloned out of a borrowed `.iter()`,
+                // the same "nothing left to preserve, so don't clone"
+                // principle this project's own Parquet reader already
+                // applies to the identical shape (see `FieldAccum::Flat`
+                // in `profile_parquet_file`).
+                for (key, value) in map.into_iter() {
                     if value.is_null() {
                         continue;
                     }
@@ -37305,7 +37312,7 @@ mod delta_support {
                         && !state.schema[idx].is_partition
                     {
                         states[idx].push(
-                            parquet_support::json_scalar_into_raw_string(value.clone()),
+                            parquet_support::json_scalar_into_raw_string(value),
                             n_samples,
                         );
                     }
@@ -37780,8 +37787,16 @@ mod iceberg_support {
     }
 
     /// Every data file position a real position-delete file named as
-    /// deleted, keyed by that data file's own resolved path.
-    type PositionDeletesByFile = BTreeMap<PathBuf, BTreeSet<i64>>;
+    /// deleted, keyed by that data file's own resolved path. The inner
+    /// set is checked once per row of every live file (`contains`, in
+    /// `resolve_iceberg_table_profiles`'s own per-row loop) but only ever
+    /// built once per delete file - `FxHasher` gives that hot per-row
+    /// lookup real O(1) amortized cost instead of a `BTreeSet`'s O(log n),
+    /// the same "hot, non-adversarial lookup key" tradeoff this project's
+    /// other per-row hash tables already make; row positions are never
+    /// iterated in order, so there's no ordering property lost by
+    /// dropping the `BTreeSet`.
+    type PositionDeletesByFile = BTreeMap<PathBuf, HashSet<i64, FxBuildHasher>>;
 
     /// Walks the two-level Avro chain (manifest-list -> each manifest it
     /// names) down to the final, live set of Parquet data file paths,
@@ -37890,7 +37905,7 @@ mod iceberg_support {
         // a specific data file are deleted - tractable to read with the
         // exact same Parquet primitive every live data file already
         // goes through.
-        let mut position_deletes: BTreeMap<PathBuf, BTreeSet<i64>> = BTreeMap::new();
+        let mut position_deletes: PositionDeletesByFile = BTreeMap::new();
         for delete_path in &position_delete_files {
             if !delete_path.is_file() {
                 bail!(
@@ -37989,13 +38004,18 @@ mod iceberg_support {
                 let JsonValue::Object(map) = row else {
                     bail!("{file_path:?}: expected each Parquet row to decode to an object");
                 };
-                for (key, value) in map.iter() {
+                // `map` is a fully owned row - nothing else reads it again
+                // after this loop - so each value is moved out via
+                // `into_iter` instead of cloned out of a borrowed
+                // `.iter()`, the same fix `delta_support`'s own identical
+                // shape already got (see its own doc comment on this).
+                for (key, value) in map.into_iter() {
                     if value.is_null() {
                         continue;
                     }
                     if let Some(&idx) = field_index.get(key.as_str()) {
                         states[idx].push(
-                            parquet_support::json_scalar_into_raw_string(value.clone()),
+                            parquet_support::json_scalar_into_raw_string(value),
                             n_samples,
                         );
                     }
