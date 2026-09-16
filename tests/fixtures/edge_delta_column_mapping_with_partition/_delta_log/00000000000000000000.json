@@ -1,0 +1,3 @@
+{"metaData":{"id":"x","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.physicalName\":\"col-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\"}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.physicalName\":\"col-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\"}}]}","partitionColumns":["region"],"configuration":{"delta.columnMapping.mode":"name"}}}
+{"add":{"path":"region=us/part-0.parquet","partitionValues":{"region":"us"},"size":100,"modificationTime":1,"dataChange":true}}
+{"add":{"path":"region=eu/part-0.parquet","partitionValues":{"region":"eu"},"size":100,"modificationTime":1,"dataChange":true}}

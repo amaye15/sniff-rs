@@ -11356,6 +11356,140 @@ fn delta_table_rejects_a_live_file_carrying_a_deletion_vector() {
     assert!(stderr.contains("deletion vector"));
 }
 
+/// tests/fixtures/edge_delta_deletion_vector_among_multiple_files has two
+/// live files, only one of which carries a `deletionVector` - proving the
+/// refusal correctly names the *actual* offending file
+/// (`part-dv.parquet`), not just the first live file it happens to walk,
+/// and that a clean sibling file existing alongside it changes nothing.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_names_the_correct_file_among_several_when_only_one_carries_a_deletion_vector() {
+    let path = fixture("edge_delta_deletion_vector_among_multiple_files");
+    let output = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("part-dv.parquet"));
+    assert!(!stderr.contains("part-clean.parquet"));
+}
+
+// tests/fixtures/edge_delta_checkpoint_with_remove_tombstones is a real,
+// committed Delta table exercising a real production shape: an
+// `overwrite` write (via `deltalake`) that emits `remove` tombstones for
+// the two files it replaced in the *same* commit that added the
+// replacement file, followed by a real checkpoint created right after -
+// `deltalake`'s own checkpoint writer genuinely retains those remove
+// tombstones as rows in the checkpoint Parquet file (confirmed directly
+// by inspecting the real checkpoint's own decoded rows, not assumed),
+// rather than only ever emitting `add` rows for what's still live. This
+// proves `apply_checkpoint_row`/`apply_action` correctly fold a
+// checkpoint's own `remove` rows the same way a JSON commit's `remove`
+// action already does - a checkpoint replay that only understood `add`
+// rows would incorrectly resurrect both overwritten-away files' data
+// (ids 1-5) alongside the real, current 2-row table (ids 10, 20).
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_checkpoint_correctly_excludes_files_named_in_remove_tombstones() {
+    let doc = run_json("edge_delta_checkpoint_with_remove_tombstones", &[]);
+    let cols = table(&doc, "edge_delta_checkpoint_with_remove_tombstones");
+
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"], 2);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["min"], 10.0);
+    assert_eq!(id_stats["max"], 20.0);
+
+    let name = column(cols, "name");
+    let samples: Vec<&str> = name["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    // Neither overwritten-away file's own data may leak through.
+    assert!(
+        !samples
+            .iter()
+            .any(|s| ["a", "b", "c", "d", "e"].contains(s))
+    );
+    assert!(samples.contains(&"x") || samples.contains(&"y"));
+}
+
+/// tests/fixtures/edge_delta_checkpoint_stale_last_checkpoint has a real
+/// checkpoint at version 2, with its own `_last_checkpoint` sidecar
+/// deliberately corrupted to name a nonexistent version (99) instead -
+/// `find_checkpoint`'s own fallback (a plain directory scan for whatever
+/// checkpoint is actually present, once the sidecar's own claim can't be
+/// verified) must still resolve the real, valid checkpoint rather than
+/// either erroring or silently reading zero rows.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_falls_back_to_a_directory_scan_when_last_checkpoint_names_a_missing_version() {
+    let doc = run_json("edge_delta_checkpoint_stale_last_checkpoint", &[]);
+    let cols = table(&doc, "edge_delta_checkpoint_stale_last_checkpoint");
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"], 3);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["min"], 0.0);
+    assert_eq!(id_stats["max"], 2.0);
+}
+
+/// tests/fixtures/edge_delta_multipart_checkpoint is a real 4-row
+/// `deltalake`-appended table whose single-part checkpoint was split by
+/// hand (via `pyarrow`, since no tool in this environment can force
+/// `deltalake` itself to write a genuine multi-part checkpoint at this
+/// scale) into two real `<version>.checkpoint.<part>.<total>.parquet`
+/// files, with `_last_checkpoint` updated to declare `"parts": 2` and
+/// every commit older than the checkpoint deleted - the table can only
+/// be read correctly by reading *both* parts.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_reads_every_part_of_a_multi_part_checkpoint() {
+    let doc = run_json("edge_delta_multipart_checkpoint", &[]);
+    let cols = table(&doc, "edge_delta_multipart_checkpoint");
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"], 4);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["min"], 0.0);
+    assert_eq!(id_stats["max"], 3.0);
+    assert_eq!(id_stats["mean"], 1.5);
+}
+
+/// tests/fixtures/edge_delta_column_mapping_with_partition combines
+/// `delta.columnMapping.mode = "name"` with a real Hive-style partition
+/// column in the *same* table - proving the two features compose
+/// correctly: `id` must be resolved via its physical `col-<uuid>`
+/// Parquet column name (column mapping), while `region` must be
+/// resolved via `add.partitionValues` (Hive-style partitioning, which
+/// never repeats a partition value inside the Parquet content at all,
+/// column-mapped or not).
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_resolves_column_mapping_and_partitioning_together() {
+    let doc = run_json("edge_delta_column_mapping_with_partition", &[]);
+    let cols = table(&doc, "edge_delta_column_mapping_with_partition");
+
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"], 3);
+    assert_eq!(id["missing_pct"], 0.0);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["min"], 1.0);
+    assert_eq!(id_stats["max"], 3.0);
+
+    let region = column(cols, "region");
+    assert_eq!(region["missing_pct"], 0.0);
+    let mut samples: Vec<&str> = region["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    samples.sort_unstable();
+    assert_eq!(samples, vec!["eu", "us"]);
+}
+
 /// A directory that merely happens to contain a `_delta_log` subdirectory
 /// with no real commit files in it (no 20-digit-`.json` files) must still
 /// be treated as an ordinary directory to batch-profile, never
@@ -11564,6 +11698,92 @@ fn iceberg_table_rejects_an_equality_delete_file_with_an_actionable_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("equality-delete"));
+}
+
+// tests/fixtures/edge_iceberg_position_delete_multi_file is a real,
+// two-append `pyiceberg` table (two independent data files, 3 rows
+// each) with two hand-assembled position-delete files attached: one
+// deleting one row from *each* data file in a single delete file, and a
+// second, separate delete file redundantly re-deleting the exact same
+// row already deleted by the first (the same real position, in the same
+// data file) - proving deletes spanning multiple data files resolve
+// correctly together, and that a genuinely redundant delete recorded
+// twice across two different delete files doesn't double-count or error,
+// it just has no further effect the second time.
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_applies_position_deletes_spanning_multiple_data_files_and_dedups_redundant_ones() {
+    let doc = run_json("edge_iceberg_position_delete_multi_file", &[]);
+    let cols = table(&doc, "edge_iceberg_position_delete_multi_file");
+
+    // Data file 1 was [4,5,6]; data file 2 was [1,2,3]. Position 1 (0-
+    // indexed) is deleted in each - id 5 from file 1 (twice, redundantly,
+    // across the two delete files) and id 2 from file 2 - leaving
+    // exactly [4,6,1,3].
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"], 4);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["count"], 4);
+    assert_eq!(id_stats["min"], 1.0);
+    assert_eq!(id_stats["max"], 6.0);
+    assert_eq!(id_stats["mean"], 3.5);
+
+    let name = column(cols, "name");
+    let samples: Vec<&str> = name["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    // The two deleted rows' own values ("e" for id 5, "b" for id 2) must
+    // never appear.
+    assert!(!samples.contains(&"e"));
+    assert!(!samples.contains(&"b"));
+}
+
+/// tests/fixtures/edge_iceberg_v1_table is a real Iceberg format-version
+/// 1 table (`pyiceberg`, `properties={"format-version": "1"}`) - a
+/// genuinely different manifest schema from every other committed
+/// Iceberg fixture (a v1 manifest's own `data_file` struct has no
+/// `content` field at all, confirmed directly by inspecting the real
+/// file's own Avro schema, not assumed), proving `resolve_live_data_
+/// files`'s `.unwrap_or(0)` default for a missing `content` field is
+/// genuinely exercised, not just theoretically safe, and that schema
+/// resolution correctly falls back to a v1 metadata.json's own top-level
+/// `"schema"` object (v1 has no `"schemas"`/`"current-schema-id"`
+/// concept at all). `pyiceberg` 0.12's own write path in this
+/// environment doesn't actually persist a v1 table's snapshot pointer on
+/// commit (confirmed directly - a fresh reload of the table it just
+/// wrote to shows zero snapshots despite `to_pandas()` succeeding within
+/// the same process/script that wrote it), so this fixture's own
+/// metadata.json has that one missing pointer restored by hand (the
+/// snapshot id and manifest-list path are both taken directly from the
+/// real files `pyiceberg` itself already wrote alongside it) - verified
+/// correct by loading the patched metadata.json through `pyiceberg`'s
+/// own independent `StaticTable.from_metadata(...)` before trusting it,
+/// not just by this reader's own output.
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_reads_a_real_format_version_1_table() {
+    let doc = run_json("edge_iceberg_v1_table", &[]);
+    let cols = table(&doc, "edge_iceberg_v1_table");
+
+    let id = column(cols, "id");
+    assert_eq!(id["ideal_type"], "i64");
+    assert_eq!(id["row_count"], 3);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["min"], 1.0);
+    assert_eq!(id_stats["max"], 3.0);
+
+    let name = column(cols, "name");
+    let mut samples: Vec<&str> = name["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    samples.sort_unstable();
+    assert_eq!(samples, vec!["a", "b", "c"]);
 }
 
 #[cfg(not(feature = "iceberg"))]

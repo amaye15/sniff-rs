@@ -3915,6 +3915,59 @@ byte-identical output against the pre-change binary on `edge_delta_table`
 (the no-checkpoint case), proving this was a pure addition, not a
 behavior change for every table that doesn't need any of these three.
 
+**A follow-up pass added six more real, committed edge-case fixtures**,
+prompted directly by a "make sure this works 100%" request rather than
+any specific gap found in the closure above - each targets one real
+production shape or boundary condition the original verification hadn't
+exercised yet, not just a restatement of the happy path:
+
+- **`edge_delta_checkpoint_with_remove_tombstones`** - a real `deltalake`
+  `overwrite` write (which emits `remove` tombstones for the replaced
+  files in the *same* commit as the replacement's own `add`) followed by
+  a real checkpoint. Inspecting the checkpoint's own decoded rows
+  directly (not assumed) confirmed `deltalake`'s own checkpoint writer
+  genuinely retains those `remove` rows as real rows in the checkpoint
+  Parquet file, rather than only ever emitting `add` rows for what's
+  still live - proving `apply_checkpoint_row` correctly folds a
+  checkpoint's own `remove` rows the same way a JSON commit's `remove`
+  action already does, not just its `add` rows.
+- **`edge_delta_checkpoint_stale_last_checkpoint`** - a real checkpoint
+  with its own `_last_checkpoint` sidecar hand-corrupted to name a
+  nonexistent version (99), proving `find_checkpoint`'s own directory-
+  scan fallback genuinely fires and resolves the real checkpoint rather
+  than either erroring or silently reading zero rows.
+- **`edge_delta_multipart_checkpoint`** - a real 4-row `deltalake` table
+  whose single-part checkpoint was split by hand (via `pyarrow`, since no
+  tool available in this environment can force `deltalake` itself to
+  write a genuine multi-part checkpoint at test scale) into two real
+  `<version>.checkpoint.<part>.<total>.parquet` files, with
+  `_last_checkpoint` updated to declare `"parts": 2` - proving every part
+  is actually read, not just the first.
+- **`edge_delta_column_mapping_with_partition`** - column mapping and
+  Hive-style partitioning in the *same* table, proving the two features
+  compose correctly rather than one silently overriding the other's own
+  lookup path.
+- **`edge_delta_deletion_vector_among_multiple_files`** - two live files,
+  only one carrying a `deletionVector`, proving the refusal names the
+  *actual* offending file rather than just the first live file the reader
+  happens to walk.
+- **Iceberg's `edge_iceberg_position_delete_multi_file`** and
+  **`edge_iceberg_v1_table`** - see the Iceberg section's own write-up
+  further down.
+
+Every one of the five Delta fixtures above is a committed integration
+test (`delta_table_checkpoint_correctly_excludes_files_named_in_remove_
+tombstones`, `delta_table_falls_back_to_a_directory_scan_when_last_
+checkpoint_names_a_missing_version`, `delta_table_reads_every_part_of_a_
+multi_part_checkpoint`, `delta_table_resolves_column_mapping_and_
+partitioning_together`, `delta_table_names_the_correct_file_among_
+several_when_only_one_carries_a_deletion_vector`), each independently
+verified against real values before being hardcoded. `src/lib.rs` itself
+was untouched by this pass - every one of these is new test coverage
+locking in behavior the prior pass's own implementation already had,
+confirmed by every test passing on the first run against the unmodified
+reader.
+
 **Verified against a real, independent implementation, not just self-
 consistency**: `deltalake` (the official delta-rs Python package, a
 genuinely separate Rust/Python codebase from this project's own reader)
@@ -4170,6 +4223,55 @@ across default/`parquet`/`avro`/`delta`/`iceberg`/`full`, matching each
 build's own established clippy baseline exactly, with zero new findings
 (`iceberg` requiring both `avro` and `parquet` transitively, per
 Cargo.toml's own `iceberg = ["avro", "parquet"]`).
+
+**A follow-up pass added two more real, committed edge-case fixtures**,
+the same "make sure this works 100%" request that also prompted Delta's
+own five new fixtures above - `src/lib.rs` was untouched by this pass,
+every one of these is new test coverage on the existing reader, not a
+new fix:
+
+- **`edge_iceberg_position_delete_multi_file`** - a real, two-append
+  `pyiceberg` table (two independent data files, 3 rows each) with two
+  hand-assembled position-delete files: one deleting one row from *each*
+  data file together, and a second, separate delete file redundantly
+  re-deleting the exact same row the first one already deleted - proving
+  a delete spanning multiple data files resolves correctly, and that a
+  genuinely redundant delete recorded twice across two different delete
+  files doesn't double-count, error, or otherwise misbehave; it simply
+  has no further effect the second time.
+- **`edge_iceberg_v1_table`** - a real Iceberg format-version 1 table
+  (`pyiceberg`, `properties={"format-version": "1"}`), whose manifest
+  schema is genuinely different from every other committed Iceberg
+  fixture: a v1 manifest's own `data_file` struct has no `content` field
+  at all (confirmed directly by inspecting the real file's own Avro
+  schema, not assumed), so this is the first fixture to actually exercise
+  `resolve_live_data_files`'s `.unwrap_or(0)` default for a genuinely
+  missing field rather than just a v2 field that happens to be `0`. It
+  also exercises `parse_iceberg_schema`'s v1 fallback (a v1 metadata.json
+  has no `"schemas"`/`"current-schema-id"` at all, only a single
+  top-level `"schema"` object) against a real file rather than only the
+  hand-built unit test that already covered this shape.
+
+  **A real `pyiceberg` 0.12 write-path limitation was found while
+  building this fixture, not assumed away**: `properties={"format-
+  version": "1"}` at `create_table` time does make `table.format_version`
+  correctly report `1`, and a subsequent `table.append(...)` does write a
+  real manifest/manifest-list/data-file - but the commit never actually
+  updates the table's own `metadata.json` with the new snapshot at all
+  (confirmed directly: a *fresh* catalog/table reload in a separate
+  process shows `snapshots: []` and `current-snapshot-id: None`, even
+  though `table.scan().to_pandas()` returns real rows within the *same*
+  script that just wrote them - an artifact of `pyiceberg`'s own
+  in-process object state never having been correctly persisted, not a
+  gap in this project's own reader). Since the manifest/manifest-list/
+  data files `pyiceberg` itself already wrote are otherwise completely
+  real, the fixture's own metadata.json has just the one missing
+  snapshot pointer restored by hand (the snapshot id and manifest-list
+  path both taken directly from the real files sitting right next to
+  it, not invented) - verified correct by loading the patched metadata.
+  json through `pyiceberg`'s own independent `StaticTable.from_
+  metadata(...)` and confirming it reads the same 3 real rows, before
+  ever trusting this project's own reader's output against it.
 
 ## Architecture
 

@@ -1,0 +1,3 @@
+{"metaData":{"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}"}}
+{"add":{"path":"part-clean.parquet","partitionValues":{}}}
+{"add":{"path":"part-dv.parquet","partitionValues":{},"deletionVector":{"storageType":"u","pathOrInlineDv":"abc","offset":1,"sizeInBytes":10,"cardinality":1}}}
