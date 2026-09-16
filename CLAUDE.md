@@ -47,10 +47,12 @@ Every build above works on plain stable Rust - this project deliberately
 never depends on unstable/nightly-only APIs for anything a normal build
 needs. The one disclosed exception is entirely opt-in:
 `cargo +nightly build --release --features simd` accelerates the CSV
-reader's own byte-scanning loop with `std::simd` (portable SIMD, still
-unstable), genuinely worth it only for CSV files with long text fields -
-see the Performance section's own write-up for the real, measured,
-mixed verdict (a small, real *regression* for short-field CSVs) before
+reader's own byte-scanning loop, plus the XML/`.xlsx`/`.ods` byte-window
+scanners' own identically-shaped scan, with `std::simd` (portable SIMD,
+still unstable) - a real, consistent win for XML/spreadsheet files
+(never a measured regression), but genuinely worth it for CSV only when
+its fields run long (short-field CSVs measure *slower*) - see the
+Performance section's own write-up for the full, honest numbers before
 reaching for it.
 
 ## Supported formats
@@ -8022,6 +8024,78 @@ lane and the scalar tail (`0, 1, LANES-1, LANES, LANES+1, LANES*3,
 LANES*3+5`) and across every position the target byte could land at
 within that length, plus a dedicated "picks the earliest of several
 candidates" test for `find_first_of3`.
+
+**A follow-up pass extended the same `--features simd` infrastructure to
+the other genuinely matching hot loop in this project - the XML/`.xlsx`/
+`.ods` byte-window scanners' own `copy_until_lt`/`copy_until`** -
+prompted directly by the user asking why SIMD was only wired into CSV
+and whether the rest of the codebase had anything similar worth doing.
+The honest answer required actually checking every candidate rather than
+assuming "more SIMD is always better," and it split cleanly into two
+real categories:
+
+- **A genuine match, found and wired up**: `xml_support::XmlWindow`'s
+  and `xlsx_support::XmlByteWindow`'s own `copy_until_lt`/`copy_until`
+  (see the Streaming reads section's own history for why these exist -
+  the bulk-copy rewrite that already made them this project's own
+  second-largest streaming win after Parquet's column-extraction fix)
+  already reduce to the *exact* shape `simd_support::find_byte` already
+  solves for CSV: "find the next occurrence of one fixed byte in a
+  buffer, with no other state to track." A new shared `byte_window_
+  find_byte` dispatcher (gated `#[cfg(all(feature = "simd", any(feature
+  = "xml", feature = "xlsx")))]`, with the identical plain scan in the
+  `not(feature = "simd")` arm) replaces both modules' own `rest.iter()
+  .position(|&b| b == ...)` calls - shared as one function rather than
+  duplicated per module, unlike `copy_until_lt`/`copy_until` themselves,
+  since it dispatches into a third, independently-gated module (`simd_
+  support`, gated only by `simd`) rather than creating a real dependency
+  between the `xml` and `xlsx` features themselves.
+- **Not a match, checked and left alone**: JSON's own structural
+  `ByteWindow::scan_value` (backing `stream_top_level`/`stream_nested_
+  array`, and JSON5's own independent, identically-shaped scanner) looks
+  superficially similar - it also walks a buffered byte stream - but it
+  fundamentally isn't the same problem: it has to inspect *every single
+  byte*, including bytes inside a string, to track quote/escape/`{}`/`[]`
+  -depth state, since whether a given `"` or `,` is a real structural
+  boundary depends on that running state, not just on the byte's own
+  value. There's no long "doesn't matter what's in here" run to bulk-
+  skip past the way `<` or a CSV delimiter's absence lets `copy_until_lt`
+  /`InField` skip dozens of bytes in one compare. Genuinely SIMD-
+  accelerating a stateful tokenizer like this is a real, separate
+  undertaking (it's the entire reason dedicated `simd-json`-style crates
+  exist as their own multi-thousand-line projects, not a 15-line
+  `find_byte` reuse) - correctly out of scope here, not merely
+  unattempted. The same reasoning rules out every binary-format decoder
+  in this project too (gzip/zstd's own Huffman/FSE bit-level decode,
+  Parquet/Arrow IPC/Avro/ORC's own Thrift/FlatBuffers/RLE structured
+  decode): none of them are "find byte X in a buffer" problems at all,
+  so `simd_support`'s one primitive has nothing to offer any of them.
+
+Verified the same way as CSV's own rollout: byte-identical output
+confirmed via `diff` between the `simd` and non-`simd` binaries across
+every `.xml`/`.xlsx`/`.xls`/`.xlsb`/`.ods` fixture in the entire
+committed corpus, full test suite green on every affected toolchain/
+feature combination (stable default, stable `xml`, stable `xlsx`, stable
+`full`, nightly `simd` alone, nightly `simd,xml`, nightly `simd,xlsx`,
+nightly `full,simd`), and clippy/fmt clean with zero new findings on
+both toolchains (nightly's own full-vs-full+simd clippy output diffed
+line for line, the same check CSV's own rollout already used).
+
+**Unlike CSV's own genuinely mixed verdict, every real file tried here
+showed a real, consistent improvement, never a regression** - a
+controlled alternating-binary comparison (5 rounds each): a real 110 MB
+standalone `.xml` file (400,000 records, several short-to-medium child
+elements each) ran **~5-6% faster**; the same shape reshaped to one long
+(~500-byte) text run per record ran **~12% faster** - the case this scan
+benefits from most, a longer uninterrupted run between `<` bytes; a real
+`.xlsx` file with a long text column ran a smaller but still consistent
+**~3.5% faster**, diluted by the zip-decompression and shared-string/
+cell-type work surrounding this one scan in that format. XML/spreadsheet
+text content simply tends to run longer between tag boundaries than a
+typical CSV field does, which is exactly why this scan needed none of
+CSV's own short-haystack guard to stay a clean win across every shape
+tested - there was no short-field-CSV-shaped worst case to guard against
+here.
 
 ## Streaming reads / memory footprint
 
