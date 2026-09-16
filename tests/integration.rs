@@ -11254,6 +11254,108 @@ fn delta_table_without_the_feature_gives_an_actionable_error() {
     assert!(stderr.contains("Delta") && stderr.contains("--features delta"));
 }
 
+// tests/fixtures/edge_delta_table_with_checkpoint is a real, committed
+// Delta table exercising the checkpoint-replay gap this reader used to
+// have: 6 real `deltalake`-appended commits (versions 0-5), a real
+// checkpoint created at version 4 (`DeltaTable.create_checkpoint()`),
+// and every commit *older* than the checkpoint (versions 0-3) deleted
+// from the fixture entirely - the same shape a real, long-lived,
+// log-cleaned production table has. Only the checkpoint's own Parquet
+// rows plus the one remaining newer commit (version 5) are on disk at
+// all, so this table can only be read correctly by actually replaying
+// the checkpoint - a reader that only understood plain JSON commits (as
+// this one used to) fails outright with "no metaData action found",
+// confirmed directly against the pre-checkpoint-support binary before
+// this fixture was committed. Expected values (`id`: [0,1,2,3,4,5],
+// `name`: [row0..row5]) were cross-checked against `deltalake`'s own
+// `DeltaTable(...).to_pandas()` read of the same table before this
+// fixture's own commits were pruned.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_with_checkpoint_replays_checkpoint_plus_newer_commits() {
+    let doc = run_json("edge_delta_table_with_checkpoint", &[]);
+    let cols = table(&doc, "edge_delta_table_with_checkpoint");
+
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"], 6);
+    assert_eq!(id["missing_pct"], 0.0);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["count"], 6);
+    assert_eq!(id_stats["min"], 0.0);
+    assert_eq!(id_stats["max"], 5.0);
+    assert_eq!(id_stats["mean"], 2.5);
+
+    let name = column(cols, "name");
+    assert_eq!(name["row_count"], 6);
+    assert_eq!(name["missing_pct"], 0.0);
+}
+
+/// A Delta table using `delta.columnMapping.mode = "name"` stores every
+/// data file's own Parquet columns under a generated `col-<uuid>`
+/// physical name, with the real logical name (and the mapping between
+/// the two) carried only in the schema's own `metadata."delta.
+/// columnMapping.physicalName"`. `tests/fixtures/edge_delta_table_column_mapping`
+/// is a hand-built table exercising exactly this: a real Parquet file
+/// whose own two columns are physically named
+/// `col-11111111-...`/`col-22222222-...`, resolved back to their real
+/// logical names (`id`/`label`) purely from the schema's own metadata -
+/// a reader that ignored column mapping (looking data files up by
+/// logical name directly) would find no matching column at all and
+/// profile every row as 100% missing.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_resolves_column_mapped_physical_names() {
+    let doc = run_json("edge_delta_table_column_mapping", &[]);
+    let cols = table(&doc, "edge_delta_table_column_mapping");
+
+    let id = column(cols, "id");
+    assert_eq!(id["ideal_type"], "i64");
+    assert_eq!(id["missing_pct"], 0.0);
+    assert_eq!(id["row_count"], 3);
+
+    let label = column(cols, "label");
+    assert_eq!(label["ideal_type"], "String");
+    assert_eq!(label["missing_pct"], 0.0);
+    let samples: Vec<&str> = label["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(samples, vec!["a", "b", "c"]);
+}
+
+/// A live `add` entry carrying a `deletionVector` field marks individual
+/// *rows* within its own data file as logically deleted via a separate
+/// bitmap this reader doesn't decode - refusing the whole table outright
+/// (rather than silently counting every one of that file's rows as still
+/// present) is the correct, disclosed behavior; see the Delta Lake
+/// section of CLAUDE.md.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_rejects_a_live_file_carrying_a_deletion_vector() {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.path().join("_delta_log")).unwrap();
+    let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}"#;
+    std::fs::write(
+        dir.path().join("_delta_log/00000000000000000000.json"),
+        format!(
+            "{{\"metaData\":{{\"schemaString\":\"{schema}\"}}}}\n\
+             {{\"add\":{{\"path\":\"part-0.parquet\",\"partitionValues\":{{}},\
+             \"deletionVector\":{{\"storageType\":\"u\",\"pathOrInlineDv\":\"abc\",\
+             \"offset\":1,\"sizeInBytes\":10,\"cardinality\":1}}}}}}\n"
+        ),
+    )
+    .unwrap();
+    let output = Command::new(bin())
+        .args([dir.path().to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("deletion vector"));
+}
+
 /// A directory that merely happens to contain a `_delta_log` subdirectory
 /// with no real commit files in it (no 20-digit-`.json` files) must still
 /// be treated as an ordinary directory to batch-profile, never
@@ -11393,6 +11495,75 @@ fn iceberg_table_rejects_output_format_sql_and_combine_with_actionable_errors() 
         .expect("failed to run binary");
     assert!(!combine_output.status.success());
     assert!(String::from_utf8_lossy(&combine_output.stderr).contains("--combine"));
+}
+
+// tests/fixtures/edge_iceberg_position_delete is a real, committed
+// Iceberg table exercising position-delete support - a 5-row table (a
+// real `pyiceberg`-appended data file) plus one real position-delete
+// file (`{"file_path", "pos"}` Parquet columns, `pos: 2` naming the
+// third row - `id: 3`) and its own delete manifest, both hand-assembled
+// via `fastavro` re-encoding the *real* manifest/manifest-list schema
+// `pyiceberg` itself already wrote for the data file (not a guessed
+// schema) - needed because `pyiceberg` 0.12's own write path can't yet
+// produce a real position-delete file itself (confirmed directly: its
+// own `table.delete()` warns "Merge on read is not yet supported,
+// falling back to copy-on-write" even with `write.delete.mode` set to
+// `merge-on-read`). The delete file's own row order and the resulting
+// live-row set were independently verified via `pyarrow.parquet.
+// read_table(...).to_pandas()` on the real data file (rows in on-disk
+// order: id 1,2,3,4,5 at positions 0-4) and via `pyiceberg`'s own
+// `table.scan().plan_files()` correctly recognizing the hand-built
+// delete manifest as structurally valid and associating it with the
+// right data file, before this fixture's paths were rewritten from
+// their original absolute `/tmp/...` form to the portable relative form
+// committed here (the same fix `edge_iceberg_table`'s own fixture
+// already needed - see this file's own header comment above).
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_excludes_rows_named_by_a_position_delete_file() {
+    let doc = run_json("edge_iceberg_position_delete", &[]);
+    let cols = table(&doc, "edge_iceberg_position_delete");
+
+    let id = column(cols, "id");
+    assert_eq!(id["row_count"], 4);
+    let id_stats = &id["numeric_stats"];
+    assert_eq!(id_stats["count"], 4);
+    assert_eq!(id_stats["min"], 1.0);
+    assert_eq!(id_stats["max"], 5.0);
+    assert_eq!(id_stats["mean"], 3.0);
+
+    let name = column(cols, "name");
+    assert_eq!(name["row_count"], 4);
+    let samples: Vec<&str> = name["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    // The deleted row's own value ("c", for id 3) must never appear.
+    assert!(!samples.contains(&"c"));
+}
+
+/// tests/fixtures/edge_iceberg_equality_delete is a real, committed
+/// Iceberg table (a plain 3-row `pyiceberg`-appended data file) with one
+/// hand-assembled equality-delete manifest entry attached (`data_file.
+/// content == 2`, built the same "re-encode the real manifest schema via
+/// fastavro" way as the position-delete fixture above) - this reader
+/// refuses to profile a table with an equality delete at all, rather
+/// than silently including rows a real predicate evaluation would have
+/// excluded, so this proves the refusal fires and names the real
+/// offending file rather than a generic message.
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_rejects_an_equality_delete_file_with_an_actionable_error() {
+    let path = fixture("edge_iceberg_equality_delete");
+    let output = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("equality-delete"));
 }
 
 #[cfg(not(feature = "iceberg"))]

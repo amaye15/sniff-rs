@@ -3805,41 +3805,115 @@ common case, disclosed gap" boundary this project draws everywhere else
 (LZO compression, old-style BIFF2-5 `.xls`, SAS7BDAT's non-Latin-1/
 Windows-1252 encodings):
 
-- **Checkpoint files aren't read.** Delta periodically flattens its own
-  growing log into a `.checkpoint.parquet` file so old JSON commits can
-  be safely deleted (log retention) on a long-lived production table.
-  This reader only replays `_delta_log/*.json` commit files directly, so
-  a table whose earliest commits have already been log-cleaned away
-  produces an incomplete or wrong live-file set rather than the real
-  one - real for a small or moderately-sized table (or any table still
-  within its log retention window), a genuine gap for an old, heavily-
-  churned one. Reading a checkpoint is itself just another Parquet file
-  this project's own reader could decode; the real remaining work is the
-  checkpoint's own wide, mostly-null-per-row schema (`txn`/`add`/`remove`/
-  `metaData`/`protocol` columns sharing one row space) - a real,
-  separately-scoped future phase, not attempted here.
-- **Column mapping mode** (`delta.columnMapping.mode = "name"`/`"id"`,
-  a newer Delta feature that lets a column be renamed without rewriting
-  every existing Parquet file) isn't handled - this reader assumes a
-  schema field's own logical name matches its data files' *physical*
-  column name directly, the default and still overwhelmingly common
-  case for a table that's never gone through this specific kind of
-  schema evolution.
-- **Deletion vectors** (a newer, separate soft-delete mechanism marking
-  individual *rows* as deleted via a small side file, rather than
-  removing a whole data file) aren't read - every row of every live
-  Parquet file is treated as present.
 - **A schema field whose own type is a nested struct/array/map** (legal
   in Delta, since its data files are ordinary nested Parquet under the
   hood) is read but not recursively flattened into dot-notation sub-
   columns the way a native nested JSON/Parquet column elsewhere in this
   project already is - it folds through the same scalar-stringification
   fallback (`json_scalar_into_raw_string`) any other non-scalar `Value`
-  already uses, a real, disclosed simplification for this first phase.
+  already uses, a real, disclosed simplification kept from this feature's
+  first phase.
 - **Apache Iceberg is now supported too, as its own follow-up phase** -
   see this section's own dedicated Iceberg write-up further down for
   the full design (its own genuinely different, multi-hop metadata
   chain) and disclosed scope boundary.
+
+**A follow-up pass closed the three gaps originally disclosed here**
+(checkpoint files, column mapping, deletion vectors), prompted by a
+direct "handle any sort of gaps, this should be 100% rock solid" request
+rather than a specific table that needed one of them:
+
+- **Checkpoint files are now read.** `resolve_delta_log` looks for a
+  usable checkpoint before replaying any JSON commit at all -
+  `_last_checkpoint` (the sidecar JSON a real writer maintains,
+  `{"version": N, "parts": P}`) first, falling back to a plain directory
+  scan for the highest-versioned checkpoint file(s) actually present if
+  that sidecar is missing, unreadable, or names files that don't exist.
+  Single-part (`<20-digit version>.checkpoint.parquet`) is resolved
+  robustly (verified present before being trusted); multi-part
+  (`<version>.checkpoint.<part>.<total>.parquet`) is best-effort -
+  whatever parts of that version are actually found, in part order, even
+  if the set turns out incomplete. A checkpoint's own rows are read via
+  the same `parquet_support::stream_parquet_rows` primitive every live
+  data file already goes through - a checkpoint file is, after all,
+  just another Parquet file - with exactly one of its own `add`/`remove`/
+  `metaData`/`protocol`/`txn`/`domainMetadata`/`sidecar` nested-struct
+  columns non-null per row (confirmed directly against a real
+  `deltalake`-generated checkpoint file's own schema, not assumed from
+  the spec's prose). A new shared `apply_action` function is the single
+  place both a JSON commit line's own action (a native JSON object) and
+  a checkpoint row's own action (the same actions, just physically
+  encoded as sibling Parquet struct columns instead) fold through, so
+  the two encodings can never drift into two independently-maintained
+  interpretations of what an action means. After a checkpoint's own rows
+  are replayed, only `_delta_log/*.json` commits strictly *newer* than
+  that checkpoint's version are replayed on top - exactly matching the
+  real production shape where older commits have since been log-cleaned
+  away and only the checkpoint plus a handful of recent commits remain
+  on disk.
+
+  **A genuine structural subtlety was found and handled, not assumed
+  away**: `add.partitionValues`/`metaData.configuration` (Parquet
+  `map<string,string>` fields) decode as a native JSON *object* from a
+  JSON commit line, but as a JSON *array* of `{"key":..., "value":...}`
+  objects when the identical logical field is read out of a checkpoint
+  Parquet row instead - this project's own hand-rolled Parquet reader
+  reconstructs a Map column this way (see `ReaderNode`'s own doc
+  comment), confirmed directly against a real checkpoint file's own
+  decoded shape via `pyarrow`, not assumed. A new `normalize_string_map`
+  helper handles both shapes in the one place that needs to, so nothing
+  downstream of it ever has to know which shape it actually got.
+
+- **`delta.columnMapping.mode` is now resolved.** Each schema field's own
+  `metadata."delta.columnMapping.physicalName"` (always a plain, native
+  JSON object regardless of source - `schemaString` is always literal
+  embedded JSON text, whether it came from a JSON commit or a checkpoint
+  Parquet row's own string column, so this one field never has the dual-
+  shape problem above) is resolved once, at schema-parse time, into a new
+  `DeltaField::physical_name` - the name actually looked up in a live
+  data file's own decoded Parquet row - while `DeltaField::name` (the
+  logical name) is still what's reported in the output. A table that's
+  never gone through column mapping has `physical_name == name`
+  automatically (the field simply isn't present), so this closes the gap
+  with zero behavior change for the overwhelmingly common case.
+
+- **Deletion vectors are now detected and refused loudly, not silently
+  ignored.** Real bitmap decoding (the actual roaring-bitmap-like format
+  a deletion vector's own side file/inline blob uses) was judged out of
+  reasonable scope for this pass - but silently treating every row of a
+  file with one attached as still present was the real, disclosed
+  correctness risk this gap always carried, so closing it doesn't require
+  decoding the bitmap at all: an `add` action's own `deletionVector`
+  field being present (non-null) is enough to know rows have been
+  deleted from that file. `DeltaFileEntry::has_deletion_vector` tracks
+  this per live file; `resolve_delta_table_profiles` refuses to profile
+  the table at all if any live file has one, with a clear, actionable
+  error naming the file - turning a silent-wrongness risk (deleted rows
+  counted as present) into a safe, loud refusal instead, the same
+  "confident common case, disclosed gap" trade this project already
+  makes for LZO compression or old-style BIFF2-5 `.xls`.
+
+Verified against real, `deltalake`-generated tables throughout, not just
+reasoned about: a real 6-commit table with a real checkpoint created at
+version 4 (`DeltaTable.create_checkpoint()`), with every commit *older*
+than the checkpoint then deleted from disk (simulating real log
+retention) - the reader still resolves all 6 rows correctly, matching
+`deltalake`'s own read exactly, while the pre-checkpoint-support binary
+fails outright on the identical table with "no metaData action found",
+confirming the checkpoint path is genuinely exercised, not just present
+and unused. `tests/fixtures/edge_delta_table_with_checkpoint` commits
+this exact scenario as a permanent fixture. Column mapping was verified
+against a hand-built table (real Parquet columns physically named
+`col-<uuid>-...`, resolved back to their real logical names purely from
+schema metadata - `tests/fixtures/edge_delta_table_column_mapping`), and
+deletion-vector rejection against a hand-built `add` action carrying a
+real `deletionVector` struct, both locked in as committed integration
+tests. Clean across default/`parquet`/`delta`/`full`, matching each
+build's own established clippy baseline exactly, with zero new findings -
+confirmed identical to unmodified `main` via `git stash`. `diff` confirmed
+byte-identical output against the pre-change binary on `edge_delta_table`
+(the no-checkpoint case), proving this was a pure addition, not a
+behavior change for every table that doesn't need any of these three.
 
 **Verified against a real, independent implementation, not just self-
 consistency**: `deltalake` (the official delta-rs Python package, a
@@ -3936,15 +4010,17 @@ comes from the row's own decoded Parquet content, looked up by name.
 "confident common case, disclosed gap" boundary `delta_support`'s own
 write-up above already draws:
 
-- **Delete files and delete manifests aren't read.** A manifest-list
-  entry's own `content` field (0 = data manifest, 1 = delete manifest,
-  v2 only) and a manifest entry's own `data_file.content` field
-  (0 = data, 1/2 = position/equality deletes) are both checked and
-  skipped when non-zero, rather than resolved - so a table using
-  Iceberg's row-level delete feature reports every row of every *data*
-  file as present, uninfluenced by any delete recorded against it. Real,
-  and disclosed, the same way `delta_support`'s own deletion-vector gap
-  already is.
+- **Equality-delete files are detected and refused loudly, not silently
+  ignored.** A manifest entry's own `data_file.content == 2` names an
+  equality-delete file - deleted rows specified via column-value
+  predicates rather than row positions, which would need every row of
+  every live data file evaluated against every such predicate to resolve
+  correctly. Full predicate evaluation was judged out of reasonable scope
+  for this reader; rather than silently include rows that should have
+  been deleted, `resolve_live_data_files` refuses to profile the table
+  at all the instant one is found, naming the actual offending file -
+  the same "confident common case, disclosed gap" trade `delta_support`'s
+  own deletion-vector handling already makes.
 - **Only Parquet data files are read** - a live entry naming an ORC or
   Avro data file (both legal per the Iceberg spec, both formats this
   project can otherwise read on their own) is a clear, disclosed error
@@ -3989,6 +4065,74 @@ theoretical relative manifest reference, not originally written with
 this in mind - turned out to be exactly what makes a relocated fixture
 like this resolve correctly with no special-casing at all.
 
+**A follow-up pass closed the position-delete half of this section's own
+originally-disclosed "delete files and delete manifests aren't read" gap**
+(the other half, equality deletes, stays a permanent, disclosed refusal -
+see above), prompted by the same "handle any sort of gaps" request that
+closed Delta's own checkpoint/column-mapping/deletion-vector gaps.
+Position-delete files turned out to be exactly as tractable as that
+section's own original scope note already predicted: a position-delete
+file is itself an ordinary Parquet file with `file_path`/`pos` columns
+naming which row offsets within a specific data file are deleted, so it
+reads through the identical `parquet_support::stream_parquet_rows`
+primitive every live data file already goes through - no new binary
+format needed at all. `resolve_live_data_files` no longer skips a
+manifest based on the manifest-*list* entry's own `content` field at all
+(that field only distinguishes a v2 delete manifest from a data manifest
+at the list level, but the real distinction - is *this specific entry*
+live data, a position delete, or an equality delete - lives one level
+deeper, on each manifest *entry's* own `data_file.content` field,
+confirmed directly against a real `pyiceberg`-written table carrying
+both a data manifest and a delete manifest in the same manifest list) -
+every manifest is read regardless, and each entry is dispatched by its
+own `content` value instead. A `content == 1` entry's own file is read
+into a `PathBuf -> BTreeSet<i64>` map of deleted row positions per data
+file; `resolve_iceberg_table_profiles` tracks each row's own 0-based
+ordinal position as it streams a data file and simply never accumulates
+one whose position is in that file's own deleted set - the row is
+excluded exactly as if it had never existed in the table at all, neither
+counted toward that column's own row total nor included in any sample.
+
+**A real, non-obvious tooling gap was found while building this
+feature's own test fixture, not assumed away**: `pyiceberg` 0.12 (the
+version available in this environment) can *read* a table with position
+deletes correctly at the manifest-planning level, but its own write path
+can't actually *produce* a real position-delete file yet - confirmed
+directly, not assumed: `table.delete()` prints "Merge on read is not yet
+supported, falling back to copy-on-write" even with `write.delete.mode`
+explicitly set to `merge-on-read`, and simply rewrites the whole data
+file instead. With no real tool available to generate a position-delete
+fixture directly, `tests/fixtures/edge_iceberg_position_delete` was
+instead hand-assembled by re-encoding `pyiceberg`'s own *real* manifest/
+manifest-list schema (read via `fastavro`, not guessed) with one added
+entry naming a real, hand-written position-delete Parquet file - the
+same "verify against a real schema/implementation, don't invent one"
+discipline this project's every other hand-rolled reader already holds
+itself to, just applied here to fixture construction instead of decode
+logic. The result was cross-checked against `pyiceberg`'s own
+`table.scan().plan_files()`, which correctly recognized the hand-built
+delete manifest as structurally valid Iceberg and associated it with the
+right data file (proving the fixture's own structure is genuinely spec-
+correct, independent of this project's own reader) - though `pyiceberg`
+0.12 doesn't yet *apply* a position delete when materializing rows
+either (`to_pandas()`/`to_arrow()` both still returned every row), so the
+actual excluded-row values were instead verified directly against the
+real data file's own on-disk row order via `pyarrow.parquet.read_table`.
+
+**One real mistake was made and caught before it shipped**, worth
+recording since it's exactly the kind of thing this project's own
+verification discipline exists to catch: an early draft of the fixture-
+portability rewrite accidentally ran `python3 -m json.tool a.json
+b.json` (that command's second positional argument is an *output* file,
+not a second input) against two of `edge_iceberg_table`'s own already-
+committed metadata.json files, silently overwriting one real snapshot's
+worth of committed fixture data with a pretty-printed copy of the other.
+Caught immediately by re-running the existing test suite (rather than
+trusting the new work in isolation) and noticing `edge_iceberg_table`
+itself had gone from 5 real profiled rows to 0 - `git status`/`git diff`
+confirmed the exact accidental overwrite, and `git checkout --` restored
+the file before anything was committed.
+
 Verified against a real, independent implementation, not just self-
 consistency, the same discipline `delta_support`'s own verification
 already establishes: `pyiceberg` (Apache Iceberg's own Python
@@ -4012,10 +4156,20 @@ file in it falls through cleanly to ordinary directory-batch mode (a
 committed regression test, unconditional); every rejected-flag
 combination (`--output-format sql`, `--combine`) fires its own specific,
 actionable error; and the "not compiled in" error fires correctly on a
-build without `--features iceberg`. Clean across default/`parquet`/
-`avro`/`delta`/`iceberg`/`full`, matching each build's own established
-clippy baseline exactly (`iceberg` requiring both `avro` and `parquet`
-transitively, per Cargo.toml's own `iceberg = ["avro", "parquet"]`).
+build without `--features iceberg`. The position-delete/equality-delete
+closure above is verified the same way, with its own two committed
+fixtures: `tests/fixtures/edge_iceberg_position_delete` confirms a real
+deleted row (`id: 3`) is excluded from both the row count and every
+sample, with the remaining 4 rows' own min/max/mean matching a direct
+hand-check against the source data exactly; `tests/fixtures/
+edge_iceberg_equality_delete` confirms the refusal fires and names the
+real offending file rather than a generic message. `diff` confirmed
+byte-identical output against the pre-change binary on `edge_iceberg_
+table` (the no-deletes case), proving this was a pure addition. Clean
+across default/`parquet`/`avro`/`delta`/`iceberg`/`full`, matching each
+build's own established clippy baseline exactly, with zero new findings
+(`iceberg` requiring both `avro` and `parquet` transitively, per
+Cargo.toml's own `iceberg = ["avro", "parquet"]`).
 
 ## Architecture
 

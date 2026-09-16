@@ -36759,7 +36759,20 @@ mod delta_support {
     /// own natural position - Delta's `metaData.schema` already lists
     /// every column, partition or not, so there's no reordering to do).
     struct DeltaField {
+        /// The logical column name - what's reported as this column's
+        /// own name in the output, regardless of column mapping mode.
         name: String,
+        /// The name to actually look for in a live data file's own
+        /// decoded Parquet row. Identical to `name` unless the table has
+        /// `delta.columnMapping.mode` set to `"name"` or `"id"` (a real,
+        /// if less common, Delta feature that lets a column be renamed
+        /// without physically rewriting every existing data file) - in
+        /// that case every data file's own physical column name is a
+        /// generated `col-<uuid>` string, carried on each schema field's
+        /// own `metadata."delta.columnMapping.physicalName"`, resolved
+        /// once here so the rest of this reader never needs to know
+        /// column mapping is even in play.
+        physical_name: String,
         /// The Spark/Delta type name verbatim (`"long"`, `"string"`,
         /// `"double"`, `"timestamp"`, ...) - used as this column's
         /// `current_type`, the same "declared type is a hint, not the
@@ -36771,16 +36784,43 @@ mod delta_support {
         is_partition: bool,
     }
 
-    /// The result of replaying every commit in `_delta_log/` in order:
-    /// the table's current schema and its current live file set (each
-    /// entry's own `partitionValues`, keyed by column name - Delta always
-    /// represents a partition value as a string, `None` meaning a
-    /// genuinely null partition value, regardless of that column's own
-    /// logical type, since the value never round-trips through a typed
-    /// Parquet cell at all).
+    /// One live data file's own per-file metadata, resolved from whichever
+    /// `add` action last (re-)introduced it - a file's `partitionValues`
+    /// (keyed by *logical* column name; Delta always represents a
+    /// partition value as a string, `None` meaning a genuinely null
+    /// partition value, regardless of that column's own logical type,
+    /// since the value never round-trips through a typed Parquet cell at
+    /// all) and whether it carries a deletion vector (a real Delta
+    /// feature marking individual *rows* within the file as logically
+    /// deleted via a separate small bitmap file/inline blob - see
+    /// `resolve_delta_table_profiles`'s own doc comment for why a file
+    /// with one attached is refused outright rather than silently read
+    /// as if every one of its rows were still present).
+    struct DeltaFileEntry {
+        partition_values: BTreeMap<String, Option<String>>,
+        has_deletion_vector: bool,
+    }
+
+    /// The result of replaying every commit in `_delta_log/` in order -
+    /// a checkpoint's own rows first (if one was found and used), then
+    /// every JSON commit strictly newer than it: the table's current
+    /// schema and its current live file set.
     struct DeltaTableState {
         schema: Vec<DeltaField>,
-        live_files: BTreeMap<String, BTreeMap<String, Option<String>>>,
+        live_files: BTreeMap<String, DeltaFileEntry>,
+    }
+
+    /// Accumulates schema/live-file state one action at a time -
+    /// `apply_action` is the single place both a JSON commit line and a
+    /// checkpoint Parquet row ultimately fold their own actions through,
+    /// so the two genuinely different physical encodings of "the same
+    /// five action kinds" (see `apply_action`'s own doc comment) can
+    /// never drift into two independently-maintained interpretations of
+    /// what an `add`/`remove`/`metaData` action actually means.
+    #[derive(Default)]
+    struct DeltaLogAccumulator {
+        schema: Option<Vec<DeltaField>>,
+        live_files: BTreeMap<String, DeltaFileEntry>,
     }
 
     /// RFC 3986 percent-decoding for a Delta `add`/`remove` action's own
@@ -36842,7 +36882,13 @@ mod delta_support {
     /// module's own flat `DeltaField` list, in the schema's own declared
     /// order. `partition_columns` (the sibling `partitionColumns` action
     /// field, a plain JSON array of column-name strings) marks which of
-    /// those fields are partition columns.
+    /// those fields are partition columns. `schemaString` is always
+    /// literal embedded JSON text - whether it came from a JSON commit
+    /// line or a checkpoint Parquet row's own string column - so a
+    /// field's own `metadata."delta.columnMapping.physicalName"` is
+    /// always a plain, native JSON object here, never the Parquet-Map-
+    /// as-array-of-kv-structs shape `apply_action`'s own `partitionValues`
+    /// handling has to account for.
     fn parse_delta_schema(
         schema_string: &str,
         partition_columns: &HashSet<String>,
@@ -36860,6 +36906,12 @@ mod delta_support {
                 .and_then(JsonValue::as_str)
                 .context("a schema field is missing its own \"name\"")?
                 .to_string();
+            let physical_name = field
+                .get("metadata")
+                .and_then(|m| m.get("delta.columnMapping.physicalName"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| name.clone());
             let spark_type = field
                 .get("type")
                 .map(spark_type_label)
@@ -36867,6 +36919,7 @@ mod delta_support {
             let is_partition = partition_columns.contains(&name);
             out.push(DeltaField {
                 name,
+                physical_name,
                 spark_type,
                 is_partition,
             });
@@ -36874,33 +36927,262 @@ mod delta_support {
         Ok(out)
     }
 
-    /// Replays every `_delta_log/*.json` commit file present, in version
-    /// order, folding `metaData`/`add`/`remove` actions into one final
-    /// `DeltaTableState` - see this module's own header comment for the
-    /// checkpoint-file gap this doesn't yet close, and for why a plain
-    /// JSON commit log needs no new parser at all.
+    /// Delta's own `map<string,string>` action fields (`add.
+    /// partitionValues`, `metaData.configuration`) decode as a native
+    /// JSON *object* when read from a JSON commit line, but as a JSON
+    /// *array* of `{"key":..., "value":...}` objects when the same
+    /// logical field is read out of a checkpoint Parquet row instead -
+    /// this project's own hand-rolled Parquet reader reconstructs a Map
+    /// column this way (see `ReaderNode`'s own doc comment), confirmed
+    /// directly against a real `deltalake`-generated checkpoint file
+    /// before being relied on here. Any code reading one of these fields
+    /// from *either* source needs to handle both shapes - this is the
+    /// one place that does, so nothing downstream has to know which
+    /// shape it actually got.
+    fn normalize_string_map(v: &JsonValue) -> BTreeMap<String, Option<String>> {
+        let mut out = BTreeMap::new();
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj.iter() {
+                out.insert(k.clone(), val.as_str().map(str::to_string));
+            }
+        } else if let Some(arr) = v.as_array() {
+            for entry in arr {
+                if let Some(key) = entry.get("key").and_then(JsonValue::as_str) {
+                    let value = entry
+                        .get("value")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string);
+                    out.insert(key.to_string(), value);
+                }
+            }
+        }
+        out
+    }
+
+    /// Applies one Delta log action to an in-progress `DeltaLogAccumulator`.
+    /// Only `metaData`/`add`/`remove` ever change the live schema or file
+    /// set; `protocol`/`commitInfo`/`txn`/`cdc`/`domainMetadata`/`sidecar`,
+    /// or any future action a writer added, are safe to ignore. This is
+    /// the single place both a JSON commit line's own action (`{"add":
+    /// {...}}`, one native JSON object per line) and a checkpoint Parquet
+    /// row's own action (one row per action, `add`/`remove`/`metaData`/...
+    /// as sibling nested-struct columns, at most one non-null per row -
+    /// see `apply_checkpoint_row`) ultimately fold through, so the two
+    /// genuinely different physical encodings of the same action kinds
+    /// can never drift into two independently-maintained interpretations
+    /// of what an action actually means.
+    fn apply_action(
+        acc: &mut DeltaLogAccumulator,
+        action_name: &str,
+        action_value: &JsonValue,
+    ) -> Result<()> {
+        match action_name {
+            "metaData" => {
+                let schema_string = action_value
+                    .get("schemaString")
+                    .and_then(JsonValue::as_str)
+                    .context("metaData action has no \"schemaString\"")?;
+                let partition_columns: HashSet<String> = action_value
+                    .get("partitionColumns")
+                    .and_then(JsonValue::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(JsonValue::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                acc.schema = Some(parse_delta_schema(schema_string, &partition_columns)?);
+            }
+            "add" => {
+                let path = action_value
+                    .get("path")
+                    .and_then(JsonValue::as_str)
+                    .context("add action has no \"path\"")?
+                    .to_string();
+                let partition_values = action_value
+                    .get("partitionValues")
+                    .map(normalize_string_map)
+                    .unwrap_or_default();
+                let has_deletion_vector = action_value
+                    .get("deletionVector")
+                    .is_some_and(|v| !v.is_null());
+                acc.live_files.insert(
+                    path,
+                    DeltaFileEntry {
+                        partition_values,
+                        has_deletion_vector,
+                    },
+                );
+            }
+            "remove" => {
+                if let Some(path) = action_value.get("path").and_then(JsonValue::as_str) {
+                    acc.live_files.remove(path);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// One decoded row of a Delta checkpoint Parquet file - exactly one
+    /// of its own `add`/`remove`/`metaData`/`protocol`/`txn`/
+    /// `domainMetadata`/`sidecar` nested-struct columns is non-null per
+    /// row (confirmed directly against a real `deltalake`-generated
+    /// checkpoint's own schema) - applied through the identical
+    /// `apply_action` a JSON commit line's own action already goes
+    /// through.
+    fn apply_checkpoint_row(acc: &mut DeltaLogAccumulator, row: JsonValue) -> Result<()> {
+        let JsonValue::Object(map) = row else {
+            bail!("expected each Delta checkpoint row to decode to an object");
+        };
+        for (action_name, action_value) in map.iter() {
+            if !action_value.is_null() {
+                apply_action(acc, action_name, action_value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One checkpoint filename's own resolved version (and, for a
+    /// multi-part checkpoint, its `(part, total_parts)`) - `None` for
+    /// anything that isn't a real checkpoint file at all (a commit file,
+    /// a `.crc` sidecar, `_last_checkpoint` itself). Single-part:
+    /// `<20-digit version>.checkpoint.parquet`; multi-part: `<20-digit
+    /// version>.checkpoint.<part>.<total>.parquet` - both real, documented
+    /// Delta filename conventions.
+    fn parse_checkpoint_filename(name: &str) -> Option<(i64, Option<(u32, u32)>)> {
+        let segments: Vec<&str> = name.split('.').collect();
+        match segments.as_slice() {
+            [version, "checkpoint", "parquet"] => version.parse().ok().map(|v| (v, None)),
+            [version, "checkpoint", part, total, "parquet"] => {
+                let version = version.parse().ok()?;
+                let part = part.parse().ok()?;
+                let total = total.parse().ok()?;
+                Some((version, Some((part, total))))
+            }
+            _ => None,
+        }
+    }
+
+    /// Finds the latest usable Delta checkpoint, if any - `_last_checkpoint`
+    /// first (the sidecar JSON a real writer maintains specifically to
+    /// avoid a directory scan: `{"version": N, "parts": P}`, `parts`
+    /// omitted or `1` for a single-part checkpoint), falling back to a
+    /// directory scan (the highest version any real checkpoint file on
+    /// disk actually names) if that sidecar is missing, unreadable, or
+    /// names files that don't actually exist. Single-part is resolved
+    /// robustly (verified present before being trusted); multi-part is
+    /// best-effort (whatever parts of that version are actually found on
+    /// disk, in part order, even if the set turns out to be incomplete -
+    /// still strictly more replay coverage than ignoring the checkpoint
+    /// entirely).
+    fn find_checkpoint(log_dir: &Path) -> Result<Option<(i64, Vec<PathBuf>)>> {
+        if let Ok(content) = fs::read_to_string(log_dir.join("_last_checkpoint"))
+            && let Ok(doc) = json_support::from_str(&content)
+            && let Some(version) = doc.get("version").and_then(JsonValue::as_i64)
+        {
+            let parts = doc
+                .get("parts")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(1)
+                .max(1);
+            let version_str = format!("{version:020}");
+            let files: Vec<PathBuf> = if parts == 1 {
+                vec![log_dir.join(format!("{version_str}.checkpoint.parquet"))]
+            } else {
+                (1..=parts)
+                    .map(|p| {
+                        log_dir.join(format!(
+                            "{version_str}.checkpoint.{p:010}.{parts:010}.parquet"
+                        ))
+                    })
+                    .collect()
+            };
+            if files.iter().all(|f| f.is_file()) {
+                return Ok(Some((version, files)));
+            }
+        }
+
+        // No usable `_last_checkpoint` sidecar - fall back to a plain
+        // directory scan for whatever real checkpoint file(s) are
+        // actually present, taking the highest version found.
+        let mut by_version: BTreeMap<i64, Vec<(u32, PathBuf)>> = BTreeMap::new();
+        for entry in fs::read_dir(log_dir).with_context(|| format!("failed to read {log_dir:?}"))? {
+            let path = entry
+                .with_context(|| format!("failed to read a directory entry in {log_dir:?}"))?
+                .path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some((version, part_info)) = parse_checkpoint_filename(name) {
+                let part = part_info.map(|(p, _)| p).unwrap_or(1);
+                by_version.entry(version).or_default().push((part, path));
+            }
+        }
+        let Some((&version, files)) = by_version.iter().next_back() else {
+            return Ok(None);
+        };
+        let mut files = files.clone();
+        files.sort_by_key(|(p, _)| *p);
+        Ok(Some((version, files.into_iter().map(|(_, p)| p).collect())))
+    }
+
+    /// Resolves the table's current schema and live file set: a real
+    /// checkpoint's own rows first (if one is found and usable - see
+    /// `find_checkpoint`), then every `_delta_log/*.json` commit strictly
+    /// newer than that checkpoint's own version, in order (or every
+    /// commit in the log, from the very start, if no checkpoint was
+    /// found at all) - folding `metaData`/`add`/`remove` actions into one
+    /// final `DeltaTableState` via the shared `apply_action`.
     fn resolve_delta_log(table_dir: &Path) -> Result<DeltaTableState> {
         let log_dir = table_dir.join("_delta_log");
-        let mut commit_files: Vec<PathBuf> = fs::read_dir(&log_dir)
+        let mut acc = DeltaLogAccumulator::default();
+
+        let checkpoint_version = match find_checkpoint(&log_dir)? {
+            Some((version, files)) => {
+                for file in &files {
+                    if !file.is_file() {
+                        // Best-effort multi-part: a genuinely missing
+                        // part just means this checkpoint's own replay is
+                        // incomplete for whatever it would have carried -
+                        // the JSON commits replayed below (every commit
+                        // strictly newer than this checkpoint's version)
+                        // are still applied on top regardless.
+                        continue;
+                    }
+                    parquet_support::stream_parquet_rows(file, None, |row| {
+                        apply_checkpoint_row(&mut acc, row)
+                    })
+                    .with_context(|| format!("failed to read Delta checkpoint file {file:?}"))?;
+                }
+                Some(version)
+            }
+            None => None,
+        };
+
+        let mut commit_files: Vec<(i64, PathBuf)> = fs::read_dir(&log_dir)
             .with_context(|| format!("failed to read {log_dir:?}"))?
             .collect::<std::io::Result<Vec<_>>>()
             .with_context(|| format!("failed to read directory entries in {log_dir:?}"))?
             .into_iter()
             .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(is_delta_commit_filename)
+            .filter_map(|p| {
+                let name = p.file_name()?.to_str()?;
+                if !is_delta_commit_filename(name) {
+                    return None;
+                }
+                let version: i64 = name[..20].parse().ok()?;
+                Some((version, p))
             })
+            .filter(|(version, _)| checkpoint_version.is_none_or(|cv| *version > cv))
             .collect();
         // Zero-padded, fixed-width version numbers - lexicographic order
-        // is numeric order.
-        commit_files.sort();
+        // is numeric order - but sorting on the already-parsed version
+        // directly is clearer than relying on that again here.
+        commit_files.sort_by_key(|(version, _)| *version);
 
-        let mut schema: Option<Vec<DeltaField>> = None;
-        let mut live_files: BTreeMap<String, BTreeMap<String, Option<String>>> = BTreeMap::new();
-
-        for commit_path in &commit_files {
+        for (_, commit_path) in &commit_files {
             let content = fs::read_to_string(commit_path)
                 .with_context(|| format!("failed to read {commit_path:?}"))?;
             for (line_no, line) in content.lines().enumerate() {
@@ -36920,69 +37202,22 @@ mod delta_support {
                     );
                 };
                 for (action_name, action_value) in obj.iter() {
-                    match action_name.as_str() {
-                        "metaData" => {
-                            let schema_string = action_value
-                                .get("schemaString")
-                                .and_then(JsonValue::as_str)
-                                .with_context(|| {
-                                    format!(
-                                        "{commit_path:?}: metaData action has no \"schemaString\""
-                                    )
-                                })?;
-                            let partition_columns: HashSet<String> = action_value
-                                .get("partitionColumns")
-                                .and_then(JsonValue::as_array)
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(JsonValue::as_str)
-                                        .map(str::to_string)
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            schema = Some(parse_delta_schema(schema_string, &partition_columns)?);
-                        }
-                        "add" => {
-                            let path = action_value
-                                .get("path")
-                                .and_then(JsonValue::as_str)
-                                .with_context(|| {
-                                    format!("{commit_path:?}: add action has no \"path\"")
-                                })?
-                                .to_string();
-                            let mut partition_values = BTreeMap::new();
-                            if let Some(pv) = action_value
-                                .get("partitionValues")
-                                .and_then(JsonValue::as_object)
-                            {
-                                for (k, v) in pv.iter() {
-                                    partition_values
-                                        .insert(k.clone(), v.as_str().map(str::to_string));
-                                }
-                            }
-                            live_files.insert(path, partition_values);
-                        }
-                        "remove" => {
-                            if let Some(path) = action_value.get("path").and_then(JsonValue::as_str)
-                            {
-                                live_files.remove(path);
-                            }
-                        }
-                        // protocol/commitInfo/txn/cdc, or any future action
-                        // this table's own writer added: safe to ignore -
-                        // none of them change the live schema or file set.
-                        _ => {}
-                    }
+                    apply_action(&mut acc, action_name, action_value).with_context(|| {
+                        format!("{commit_path:?}: while applying a \"{action_name}\" action")
+                    })?;
                 }
             }
         }
 
-        let schema = schema.with_context(|| {
+        let schema = acc.schema.with_context(|| {
             format!(
                 "no metaData action found anywhere in {log_dir:?} - can't resolve a schema for this Delta table"
             )
         })?;
-        Ok(DeltaTableState { schema, live_files })
+        Ok(DeltaTableState {
+            schema,
+            live_files: acc.live_files,
+        })
     }
 
     /// The real top-level entry point: resolves the table's current
@@ -37001,20 +37236,32 @@ mod delta_support {
     ) -> Result<Vec<ColumnProfile>> {
         let state = resolve_delta_log(table_dir)?;
 
+        for (rel_path, entry) in &state.live_files {
+            if entry.has_deletion_vector {
+                bail!(
+                    "{rel_path:?} in this Delta table carries a deletion vector (a row-level soft-delete marker naming individual rows within the file as logically deleted, via a separate bitmap this reader doesn't decode) - refusing to profile this table rather than silently counting its deleted rows as still present; see the Delta Lake section of CLAUDE.md for this disclosed gap"
+                );
+            }
+        }
+
         let mut states: Vec<ColumnAccumulatorState> = state
             .schema
             .iter()
             .map(|_| ColumnAccumulatorState::new())
             .collect();
+        // Looked up by *physical* name - the name actually present in a
+        // live data file's own decoded Parquet row, which only differs
+        // from a field's logical `name` when `delta.columnMapping.mode`
+        // is in play (see `DeltaField::physical_name`'s own doc comment).
         let field_index: HashMap<&str, usize, FxBuildHasher> = state
             .schema
             .iter()
             .enumerate()
-            .map(|(i, f)| (f.name.as_str(), i))
+            .map(|(i, f)| (f.physical_name.as_str(), i))
             .collect();
 
         let mut total_rows = 0usize;
-        'files: for (rel_path, partition_values) in &state.live_files {
+        'files: for (rel_path, entry) in &state.live_files {
             if nrows.is_some_and(|limit| total_rows >= limit) {
                 break;
             }
@@ -37034,7 +37281,15 @@ mod delta_support {
                 .iter()
                 .enumerate()
                 .filter(|(_, f)| f.is_partition)
-                .map(|(i, f)| (i, partition_values.get(&f.name).and_then(|v| v.as_deref())))
+                .map(|(i, f)| {
+                    (
+                        i,
+                        entry
+                            .partition_values
+                            .get(&f.name)
+                            .and_then(|v| v.as_deref()),
+                    )
+                })
                 .collect();
             let remaining = nrows.map(|limit| limit - total_rows);
             let mut file_rows = 0usize;
@@ -37524,29 +37779,40 @@ mod iceberg_support {
         Ok(Some(resolve_file_uri(manifest_list, table_dir)?))
     }
 
+    /// Every data file position a real position-delete file named as
+    /// deleted, keyed by that data file's own resolved path.
+    type PositionDeletesByFile = BTreeMap<PathBuf, BTreeSet<i64>>;
+
     /// Walks the two-level Avro chain (manifest-list -> each manifest it
-    /// names) down to the final, live set of Parquet data file paths -
-    /// see this module's own header comment for exactly which manifest-
-    /// list/manifest entries are skipped (delete manifests, delete
-    /// files, anything already marked `DELETED`) and why. A `BTreeSet`
-    /// both dedups (the same physical file could in principle be named
-    /// by more than one manifest across a table's own history, though a
+    /// names) down to the final, live set of Parquet data file paths,
+    /// plus every position-delete file's own `{file_path, pos}` pairs
+    /// resolved into a per-data-file set of deleted row positions -
+    /// `resolve_iceberg_table_profiles` excludes exactly those row
+    /// positions from the corresponding data file's own row stream,
+    /// rather than counting a deleted row as still present. A manifest-
+    /// list entry's own `content` field (v2 only; absent, and therefore
+    /// defaulted to 0, on a v1-written list, the only kind a v1 table
+    /// could ever produce) doesn't need checking at all any more - every
+    /// manifest it names is read regardless, since the real distinction
+    /// (is *this entry* a live data file, a position delete, or an
+    /// equality delete) lives one level deeper, on each manifest entry's
+    /// own `data_file.content` field, confirmed directly against a real
+    /// `pyiceberg`-written table carrying both a data manifest and a
+    /// delete manifest in the same manifest list. An equality-delete
+    /// entry (`content == 2`) is a clear, disclosed error rather than a
+    /// guess - see this module's own header comment for why full
+    /// predicate evaluation is out of scope. A `BTreeSet`/`BTreeMap` both
+    /// dedup (the same physical file could in principle be named by more
+    /// than one manifest across a table's own history, though a
     /// well-formed current snapshot's manifest list never should) and
-    /// gives a stable, deterministic read order - the same reasoning
+    /// give a stable, deterministic read order - the same reasoning
     /// `delta_support`'s own `BTreeMap`-keyed live-file map already uses.
     fn resolve_live_data_files(
         manifest_list_path: &Path,
         table_dir: &Path,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<(Vec<PathBuf>, PositionDeletesByFile)> {
         let mut manifest_paths: Vec<PathBuf> = Vec::new();
         avro_support::stream_avro_rows(manifest_list_path, |row| {
-            // Absent in a v1-written manifest list (delete files didn't
-            // exist yet) - defaults to 0 (a data manifest), the only kind
-            // a v1 table could ever produce.
-            let content = row.get("content").and_then(JsonValue::as_i64).unwrap_or(0);
-            if content != 0 {
-                return Ok(()); // a delete-file manifest - out of scope
-            }
             let manifest_path = row
                 .get("manifest_path")
                 .and_then(JsonValue::as_str)
@@ -37557,41 +37823,101 @@ mod iceberg_support {
         .with_context(|| format!("failed to read manifest list {manifest_list_path:?}"))?;
 
         let mut live_files: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut position_delete_files: Vec<PathBuf> = Vec::new();
         for manifest_path in &manifest_paths {
             avro_support::stream_avro_rows(manifest_path, |row| {
                 let status = row.get("status").and_then(JsonValue::as_i64).unwrap_or(0);
                 if status == 2 {
                     return Ok(()); // DELETED - no longer live
                 }
-                let data_file = row
-                    .get("data_file")
-                    .with_context(|| format!("a manifest entry in {manifest_path:?} has no \"data_file\""))?;
+                let data_file = row.get("data_file").with_context(|| {
+                    format!("a manifest entry in {manifest_path:?} has no \"data_file\"")
+                })?;
+                // Absent on a v1-written entry (row-level deletes didn't
+                // exist yet) - defaults to 0, a plain live data file.
                 let content = data_file
                     .get("content")
                     .and_then(JsonValue::as_i64)
                     .unwrap_or(0);
-                if content != 0 {
-                    return Ok(()); // a position/equality delete file, not real data
-                }
-                let file_format = data_file
-                    .get("file_format")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("");
-                if !file_format.eq_ignore_ascii_case("parquet") {
-                    bail!(
-                        "{manifest_path:?} names a live data file in {file_format} format - only Parquet data files are supported so far"
-                    );
-                }
                 let file_path = data_file
                     .get("file_path")
                     .and_then(JsonValue::as_str)
                     .context("a data_file entry has no \"file_path\"")?;
-                live_files.insert(resolve_file_uri(file_path, table_dir)?);
+                let resolved_path = resolve_file_uri(file_path, table_dir)?;
+                match content {
+                    0 => {
+                        let file_format = data_file
+                            .get("file_format")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        if !file_format.eq_ignore_ascii_case("parquet") {
+                            bail!(
+                                "{manifest_path:?} names a live data file in {file_format} format - only Parquet data files are supported so far"
+                            );
+                        }
+                        live_files.insert(resolved_path);
+                    }
+                    1 => {
+                        let file_format = data_file
+                            .get("file_format")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        if !file_format.eq_ignore_ascii_case("parquet") {
+                            bail!(
+                                "{manifest_path:?} names a position-delete file in {file_format} format - only Parquet position-delete files are supported so far"
+                            );
+                        }
+                        position_delete_files.push(resolved_path);
+                    }
+                    2 => {
+                        bail!(
+                            "{resolved_path:?} is an Iceberg equality-delete file - this reader doesn't evaluate equality-delete predicates against every row, so this table's live rows can't be resolved correctly; refusing to profile it rather than silently including rows that should have been deleted"
+                        );
+                    }
+                    // An unrecognized future content value - safe to
+                    // ignore, the same "unknown fields/values are
+                    // forward-compatible" contract this project's other
+                    // self-describing formats already rely on.
+                    _ => {}
+                }
                 Ok(())
             })
             .with_context(|| format!("failed to read manifest file {manifest_path:?}"))?;
         }
-        Ok(live_files.into_iter().collect())
+
+        // Position-delete files are themselves ordinary Parquet files
+        // with `file_path`/`pos` columns naming which row offsets within
+        // a specific data file are deleted - tractable to read with the
+        // exact same Parquet primitive every live data file already
+        // goes through.
+        let mut position_deletes: BTreeMap<PathBuf, BTreeSet<i64>> = BTreeMap::new();
+        for delete_path in &position_delete_files {
+            if !delete_path.is_file() {
+                bail!(
+                    "{delete_path:?} is listed as a position-delete file in an Iceberg manifest, but doesn't exist on disk"
+                );
+            }
+            parquet_support::stream_parquet_rows(delete_path, None, |row| {
+                let target = row
+                    .get("file_path")
+                    .and_then(JsonValue::as_str)
+                    .with_context(|| {
+                        format!("{delete_path:?}: a position-delete row has no \"file_path\"")
+                    })?;
+                let pos = row
+                    .get("pos")
+                    .and_then(JsonValue::as_i64)
+                    .with_context(|| {
+                        format!("{delete_path:?}: a position-delete row has no \"pos\"")
+                    })?;
+                let target_path = resolve_file_uri(target, table_dir)?;
+                position_deletes.entry(target_path).or_default().insert(pos);
+                Ok(())
+            })
+            .with_context(|| format!("failed to read position-delete file {delete_path:?}"))?;
+        }
+
+        Ok((live_files.into_iter().collect(), position_deletes))
     }
 
     /// The real top-level entry point: resolves the table's current
@@ -37618,10 +37944,13 @@ mod iceberg_support {
             format!("failed to resolve the current schema from {metadata_path:?}")
         })?;
 
-        let live_files = match resolve_current_snapshot_manifest_list(&metadata, table_dir)? {
-            Some(manifest_list_path) => resolve_live_data_files(&manifest_list_path, table_dir)?,
-            None => Vec::new(),
-        };
+        let (live_files, position_deletes) =
+            match resolve_current_snapshot_manifest_list(&metadata, table_dir)? {
+                Some(manifest_list_path) => {
+                    resolve_live_data_files(&manifest_list_path, table_dir)?
+                }
+                None => (Vec::new(), BTreeMap::new()),
+            };
 
         let mut states: Vec<ColumnAccumulatorState> = schema
             .iter()
@@ -37645,7 +37974,18 @@ mod iceberg_support {
             }
             let remaining = nrows.map(|limit| limit - total_rows);
             let mut file_rows = 0usize;
+            let deleted_positions = position_deletes.get(file_path);
+            let mut row_pos: i64 = 0;
             parquet_support::stream_parquet_rows(file_path, remaining, |row| {
+                let this_pos = row_pos;
+                row_pos += 1;
+                if deleted_positions.is_some_and(|set| set.contains(&this_pos)) {
+                    // A row a position-delete file named as deleted -
+                    // excluded entirely, the same as if it never existed
+                    // in this table at all (never accumulated, never
+                    // counted toward this file's own row total).
+                    return Ok(());
+                }
                 let JsonValue::Object(map) = row else {
                     bail!("{file_path:?}: expected each Parquet row to decode to an object");
                 };
