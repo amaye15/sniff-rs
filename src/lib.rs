@@ -2,11 +2,12 @@
 // with no committed stabilization timeline as of this writing (confirmed
 // directly against the current nightly compiler and the RFC's own tracking
 // issue before relying on it, the same "verify, don't assume" discipline
-// this project holds every other design decision to). This attribute is
-// itself only active when `--features simd` is explicitly requested
-// (`cfg_attr`, not a bare `feature(...)`), so a plain `cargo build` on
-// stable Rust - the overwhelming common case, and every build this project
-// otherwise supports - never sees it at all. See `simd_support`'s own doc
+// this project holds every other design decision to). `simd` is a DEFAULT
+// feature: every normal build requires `cargo +nightly` - a plain `cargo
+// build` on stable fails with E0554. This is deliberate per project
+// decision (SIMD acceleration in the default build, nightly toolchain
+// required everywhere). `--no-default-features` gives a stable-compatible
+// build without SIMD. See `simd_support`'s own doc
 // comment and CLAUDE.md's "Performance" section for the full design and
 // the real, measured verdict on whether it's actually worth using.
 #![cfg_attr(feature = "simd", feature(portable_simd))]
@@ -1562,9 +1563,9 @@ mod json_support {
     }
 
     /// `scan_value`'s own shared multi-byte scan dispatcher - routes to
-    /// `simd_support::find_any`'s wide-lane scan when `--features simd`
-    /// is on (nightly-only, off by default), or the identical plain
-    /// scalar scan every stable build already uses, when it isn't.
+    /// `simd_support::find_any`'s wide-lane scan by default (nightly),
+    /// or the identical plain scalar scan `--no-default-features`
+    /// (stable, no-SIMD) builds use, when `simd` is off.
     #[cfg(feature = "simd")]
     fn json_scan_find_any<const N: usize>(haystack: &[u8], needles: [u8; N]) -> Option<usize> {
         super::simd_support::find_any(haystack, needles)
@@ -6583,15 +6584,11 @@ impl NaiveTypeAccumulator {
 // intrinsics for. It's still unstable: nightly-only, gated behind
 // `#![feature(portable_simd)]`, with no committed stabilization timeline
 // as of this writing (checked directly against the RFC's own tracking
-// issue, not assumed) - a real, ongoing maintenance cost this project
-// doesn't take on for the default build. `--features simd` is therefore
-// genuinely optional and off by default: nothing in this module is ever
-// compiled, and no nightly toolchain is ever needed, unless a caller
-// explicitly opts in with `cargo +nightly build --release --features
-// simd` - the same "confident common case (a plain stable build), a
-// disclosed opt-in for anything heavier" boundary every other optional
-// capability in this project already draws (a heavy dependency behind its
-// own feature flag, a real subprocess required only for `--load-into`).
+// issue, not assumed). `simd` is a DEFAULT feature: every normal build
+// requires `cargo +nightly` - this is deliberate per project decision,
+// so this module is compiled for every default build and no nightly
+// toolchain is ever optional. `--no-default-features` is the
+// stable-compatible escape hatch without SIMD.
 #[cfg(feature = "simd")]
 mod simd_support {
     use std::simd::cmp::SimdPartialEq;
@@ -7067,12 +7064,12 @@ fn csv_feed_chunk(
         match *state {
             CsvState::InField => {
                 let start = pos;
-                // `--features simd` (nightly-only, off by default - see
+                // `simd` (default-on, nightly-only - see
                 // `simd_support`'s own doc comment) scans all three
                 // candidate bytes at once via one wide SIMD compare
                 // instead of one scalar comparison per byte; the plain
-                // scalar loop below is exactly what every stable build
-                // of this project still runs.
+                // scalar loop below is what `--no-default-features`
+                // (stable, no-SIMD) builds run.
                 #[cfg(feature = "simd")]
                 {
                     pos = start

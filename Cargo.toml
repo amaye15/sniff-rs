@@ -2,9 +2,41 @@
 name = "sniff-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Profile a data file and produce a data dictionary - observed types, missing %, samples, and why, across 30+ formats"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/amaye15/sniff-rs"
+documentation = "https://github.com/amaye15/sniff-rs#readme"
+keywords = ["cli", "data", "profiling", "schema", "dictionary"]
+categories = ["command-line-utilities"]
+# No `rust-version`: the default build requires a nightly toolchain
+# (`std::simd`, still unstable) - a minimum stable version would be a lie.
+# `--no-default-features` builds on stable instead.
+# Exclude the big non-shipped assets: crates.io caps packages at 10MB and
+# this repo tracks ~13MB (fixtures, benches, design notes). The shipped
+# crate is source + small tests only.
+exclude = ["CLAUDE.md", "BENCHMARKS.md", "tests/", "benches/"]
+
+[package.metadata.binstall]
+# Lets `cargo binstall` fetch the GitHub release tarballs below instead of
+# building from source. Archives hold a top-level `sniff-rs-<target>/` dir
+# (binary + README + licenses); see .github/workflows/release.yml, which
+# owns that layout - the two must stay in sync.
+pkg-url = "{ repo }/releases/download/v{ version }/sniff-rs-{ target }.{ archive-format }"
+bin-dir = "sniff-rs-{ target }/{ bin }{ binary-ext }"
 
 [features]
-default = []
+# NOTE: the default build is EVERYTHING (`full`, including nightly-only
+# `simd`). A plain `cargo build` therefore requires `cargo +nightly`
+# (`std::simd`, RFC 2977, still unstable - stable fails with E0554).
+# This is deliberate per project decision: full capability out of the box,
+# nightly toolchain required everywhere (dev, CI, releases). Every format
+# reader is hand-rolled pure-`std` (zero runtime dependencies - there is no
+# `[dependencies]` section at all, only `[dev-dependencies]` oracles that
+# cross-verify each hand-roll and never ship); feature flags now gate only
+# this project's own code, never a third-party crate. Use
+# `--no-default-features` for a minimal stable-compatible build
+# (CSV/TSV/JSON/JSONL + fixed-width + gzip, no SIMD).
+default = ["full"]
 # parquet also covers Arrow IPC/Feather (.arrow/.feather) - both are Arrow-ecosystem
 # formats, and both now have their own hand-rolled reader (parquet_support/
 # arrow_ipc_support in src/lib.rs) rather than reading through the arrow/parquet
@@ -15,7 +47,7 @@ default = []
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "delta", "iceberg"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "delta", "iceberg", "simd"]
 sqlite = []
 msgpack = []
 toml = []
@@ -98,18 +130,17 @@ delta = ["parquet"]
 # evolution across snapshots, and non-Parquet data files aren't read yet).
 iceberg = ["avro", "parquet"]
 # Portable SIMD (`std::simd`, RFC 2977) acceleration for this project's
-# own hottest, most heavily hand-optimized byte-scanning loop (the CSV
-# reader's own field/quoted-field scan) - genuinely optional and off by
-# default, since `std::simd` is still unstable (nightly-only, no
-# committed stabilization timeline as of this writing) and this project
-# otherwise builds and runs entirely on stable Rust. No new dependency:
-# `simd_support` in src/lib.rs is pure `core::simd`, the standard
-# library's own SIMD API, not a third-party crate. Requires `cargo
-# +nightly build --release --features simd` explicitly - never implied
-# by `full`, and never required for anything else in this project. See
-# src/lib.rs's `simd_support` module and CLAUDE.md's own "Performance"
-# section for the full design, the real, measured verdict on whether it
-# actually helps, and why.
+# own hottest, most heavily hand-optimized byte-scanning loops (CSV plus
+# the XML/`.xlsx`/`.ods`/JSON/JSON5/plist byte-window scanners). DEFAULT-ON
+# and nightly-only (`std::simd` is still unstable, no committed
+# stabilization timeline as of this writing): every default build requires
+# `cargo +nightly`. No new dependency: `simd_support` in src/lib.rs is pure
+# `core::simd`, the standard library's own SIMD API, not a third-party
+# crate. Also listed in `full` so `--no-default-features --features full`
+# still gets SIMD. `--no-default-features` is the stable-compatible
+# escape hatch without SIMD. See src/lib.rs's `simd_support` module and
+# CLAUDE.md's own "Performance" section for the full design, the real,
+# measured verdict on whether it actually helps, and why.
 simd = []
 
 [dev-dependencies]
