@@ -5490,10 +5490,6 @@ fn deeply_nested_xml_fails_cleanly_instead_of_a_stack_overflow() {
     // clean error) before xml_nesting_too_deep's pre-parse scan was added.
     // This locks in the fix.
     let output = Command::new(bin())
-        // Same 1MB-Windows-stack reasoning as the MessagePack depth test
-        // above: give the child the Unix-default 8MB so the guard under
-        // test - not the platform stack size - decides the outcome.
-        .env("RUST_MIN_STACK", "8388608")
         .args([fixture("malformed_deeply_nested.xml").to_str().unwrap()])
         .output()
         .expect("failed to run binary");
@@ -6630,12 +6626,6 @@ fn msgpack_ascii_garbage_text_decodes_as_a_stream_of_small_integers() {
 #[test]
 fn deeply_nested_msgpack_fails_cleanly_instead_of_a_stack_overflow() {
     let output = Command::new(bin())
-        // Windows gives the main thread 1MB of stack (vs 8MB on Unix),
-        // and a debug build's frames are large enough that 256 nesting
-        // levels overflow it before the depth guard fires. An 8MB floor
-        // for the child - matching the Unix default - tests the guard
-        // itself on every OS instead of each platform's stack size.
-        .env("RUST_MIN_STACK", "8388608")
         .args([fixture("malformed_deeply_nested.msgpack").to_str().unwrap()])
         .output()
         .expect("failed to run binary");
@@ -11969,12 +11959,18 @@ fn a_failing_invocation_with_json_output_format_gets_a_structured_json_error() {
             .contains("does/not/exist.csv")
     );
     assert!(doc["caused_by"].as_array().unwrap().iter().any(|c| {
-        // The OS message for a missing file is platform-specific:
-        // "No such file or directory" on Unix, "The system cannot
-        // find the file specified" on Windows (both are raw os
-        // error 2). Accept either rather than pinning one OS.
+        // The OS message for a missing path is platform-specific (and
+        // even case-specific on Windows: ERROR_FILE_NOT_FOUND says
+        // "file", ERROR_PATH_NOT_FOUND says "path" - a path with several
+        // missing components reports the latter). The stable contract is
+        // the raw os error code, which Rust always appends untranslated:
+        // 2 (ENOENT / NOT_FOUND) or 3 (Windows PATH_NOT_FOUND). Prose
+        // kept as a fallback.
         let s = c.as_str().unwrap();
-        s.contains("No such file") || s.contains("cannot find the file")
+        s.contains("No such file")
+            || s.contains("cannot find the")
+            || s.contains("os error 2")
+            || s.contains("os error 3")
     }));
 }
 

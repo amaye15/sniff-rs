@@ -41,7 +41,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        include:
+          - os: ubuntu-latest
+            cargo-flags: ""
+          - os: macos-14
+            cargo-flags: ""
+          # Windows debug binaries get a 1MB main-thread stack (vs 8MB on
+          # Unix) - too small for the depth-guard paths the
+          # deeply_nested_* tests exercise (proven: the debug binary
+          # overflows a 1MB stack locally too, while the release binary
+          # handles the same fixtures cleanly). So Windows tests the
+          # release profile instead - which is also the shipped
+          # configuration, making this the more meaningful gate for
+          # distribution purposes, not just a workaround.
+          - os: windows-latest
+            cargo-flags: "--release"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -55,8 +69,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install numpy pandas pyreadstat
-      - run: cargo build
-      - run: cargo test
+      - run: cargo build ${{ matrix.cargo-flags }}
+      - run: cargo test ${{ matrix.cargo-flags }}
 
   minimal-stable:
     runs-on: ubuntu-latest
