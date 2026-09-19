@@ -3408,6 +3408,10 @@ whether this particular binary actually has it compiled in.
 USAGE:
     sniff-rs <INPUT_PATH> [OUTPUT_PATH] [OPTIONS]
     sniff-rs diff <OLD> <NEW> [OUTPUT_PATH] [OPTIONS]   (see `sniff-rs diff --help`)
+    sniff-rs explain <INPUT> <COLUMN> [OUTPUT_PATH]     (see `sniff-rs explain --help`)
+    sniff-rs path <INPUT> <FROM_TABLE> <TO_TABLE> [OUTPUT_PATH]
+                                                    (see `sniff-rs path --help`)
+    sniff-rs rank <INPUT> [OUTPUT_PATH]             (see `sniff-rs rank --help`)
 
     If INPUT_PATH is a directory, every file under it (recursively) that
     sniff-rs can identify on its own is profiled, one output per input
@@ -3423,6 +3427,15 @@ USAGE:
     shifts), classifying each change safe or breaking - a file or
     directory literally named "diff" needs a "./diff" prefix to be
     profiled instead of triggering this subcommand.
+
+    `sniff-rs explain`, `sniff-rs path`, and `sniff-rs rank` query the
+    relationship graph across a multi-table input (a multi-table file or
+    a --combine dictionary): everything known about one column, the
+    shortest join chain between two tables, and god tables plus
+    communities. Each takes a dictionary or a raw data file, like `diff`
+    does - and like `diff`, a file or directory literally named
+    "explain", "path", or "rank" needs a "./" prefix to be profiled
+    instead of triggering its subcommand.
 
 ARGS:
     <INPUT_PATH>
@@ -57341,6 +57354,331 @@ fn detect_relationships(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Vec<Re
     out
 }
 
+// --- Table graph: adjacency, paths, communities ---
+//
+// The query layer over `detect_relationships`' edge list, backing the
+// `explain`/`path`/`rank` subcommands. Nodes are tables; an undirected
+// adjacency maps each table to its neighbors alongside the relationship
+// indices connecting them. Everything here is deterministic by
+// construction - `BTreeMap` iteration is sorted, BFS expands neighbors in
+// that order, and components are numbered by (size desc, first member) -
+// so the same graph always prints the same answer, the same stability
+// guarantee `detect_relationships`' own sorted output already makes.
+// Isolated tables (no incident edges) are still first-class nodes: they
+// form single-member communities and rank with degree zero rather than
+// vanishing from the output.
+
+/// Adjacency over one profiled input: every table ever seen (isolated or
+/// not) maps to its neighbors, each carrying the indices into
+/// `relationships` behind that hop. Built once per subcommand invocation
+/// and shared by `explain` (incident edges), `path` (BFS), and `rank`
+/// (degrees + components).
+struct TableGraph {
+    tables: Vec<String>,
+    adj: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
+    relationships: Vec<Relationship>,
+}
+
+/// Build the graph for one already-profiled `tables` map. Relationship
+/// indices are assigned in `detect_relationships`' own sorted order, so
+/// the first index behind any table pair is always its lexicographically
+/// smallest column pair - the deterministic hop `shortest_path` reports.
+fn build_table_graph(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> TableGraph {
+    let relationships = detect_relationships(tables);
+    let mut adj: BTreeMap<String, BTreeMap<String, Vec<usize>>> = BTreeMap::new();
+    for name in tables.keys() {
+        adj.insert(name.clone(), BTreeMap::new());
+    }
+    for (idx, rel) in relationships.iter().enumerate() {
+        adj.get_mut(&rel.from_table)
+            .expect("relationship endpoint is always a profiled table")
+            .entry(rel.to_table.clone())
+            .or_default()
+            .push(idx);
+        adj.get_mut(&rel.to_table)
+            .expect("relationship endpoint is always a profiled table")
+            .entry(rel.from_table.clone())
+            .or_default()
+            .push(idx);
+    }
+    TableGraph {
+        tables: tables.keys().cloned().collect(),
+        adj,
+        relationships,
+    }
+}
+
+/// Incident relationship indices for one table, sorted (they already are:
+/// assigned in sorted edge order, and each neighbor list only appends).
+fn incident_edges(graph: &TableGraph, table: &str) -> Vec<usize> {
+    match graph.adj.get(table) {
+        Some(neighbors) => neighbors.values().flatten().copied().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Shortest join path between two tables as relationship indices, via BFS
+/// over sorted neighbors - fewest hops wins, ties broken deterministically
+/// by table name order. Within one hop, `extracted` edges are tried before
+/// `inferred` ones, so parallel edges resolve to the strongest link rather
+/// than the alphabetically first column: a 1-hop `path` between two tables
+/// sharing both a measured foreign key and a guessed email-domain link
+/// reports the foreign key. Length still dominates confidence - a 1-hop
+/// inferred chain always beats a 2-hop extracted one, since fewer joins is
+/// the primary objective and confidence only breaks ties. `None` means
+/// disconnected (including an isolated table, which has no hops to
+/// anything). A `from == to` query never reaches here: `run_path` rejects
+/// it as a usage error first.
+fn shortest_path(graph: &TableGraph, from: &str, to: &str) -> Option<Vec<usize>> {
+    let confidence_rank = |idx: &usize| match graph.relationships[*idx].confidence {
+        Confidence::Extracted => 0,
+        Confidence::Inferred => 1,
+    };
+    if !graph.adj.contains_key(from) || !graph.adj.contains_key(to) {
+        return None;
+    }
+    let mut prev: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    let mut queue = std::collections::VecDeque::from([from.to_string()]);
+    let mut seen = std::collections::HashSet::from([from.to_string()]);
+    while let Some(current) = queue.pop_front() {
+        if current == to {
+            break;
+        }
+        let neighbors = graph
+            .adj
+            .get(&current)
+            .expect("visited table is in the graph");
+        for (next, edge_indices) in neighbors {
+            if seen.insert(next.clone()) {
+                let mut ordered = edge_indices.clone();
+                ordered.sort_by_key(|idx| (confidence_rank(idx), *idx));
+                let hop = *ordered
+                    .first()
+                    .expect("a table pair is only adjacent through a real edge");
+                prev.insert(next.clone(), (current.clone(), hop));
+                queue.push_back(next.clone());
+            }
+        }
+    }
+    if from != to && !prev.contains_key(to) {
+        return None;
+    }
+    let mut hops = Vec::new();
+    let mut cursor = to.to_string();
+    while cursor != from {
+        let (parent, hop) = prev
+            .get(&cursor)
+            .expect("BFS parent chain is complete")
+            .clone();
+        hops.push(hop);
+        cursor = parent;
+    }
+    hops.reverse();
+    Some(hops)
+}
+
+/// Connected components over table adjacency: each component's members
+/// sorted, components ordered by (size descending, smallest member) so
+/// community 0 is always the largest cluster. Isolated tables form
+/// single-member components rather than being dropped.
+fn connected_components(graph: &TableGraph) -> Vec<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut components = Vec::new();
+    for start in &graph.tables {
+        if !seen.insert(start.clone()) {
+            continue;
+        }
+        let mut members = vec![start.clone()];
+        let mut queue = std::collections::VecDeque::from([start.clone()]);
+        while let Some(current) = queue.pop_front() {
+            let neighbors = graph
+                .adj
+                .get(&current)
+                .expect("visited table is in the graph");
+            for next in neighbors.keys() {
+                if seen.insert(next.clone()) {
+                    members.push(next.clone());
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+        members.sort();
+        components.push(members);
+    }
+    components.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    components
+}
+
+/// Community id of one table: its index in `connected_components`' output.
+/// Computed on demand (components are small - tables, not rows), so no
+/// caching layer is needed.
+fn community_of(graph: &TableGraph, table: &str) -> usize {
+    connected_components(graph)
+        .iter()
+        .position(|members| members.iter().any(|m| m == table))
+        .expect("every profiled table belongs to exactly one component")
+}
+
+/// Parse one dictionary column object into a `ColumnProfile`, mirroring
+/// `DiffColumn::from_json_owned`'s own tolerance (a missing `name` is the
+/// only hard error; anything absent defaults) but additionally keeping
+/// `notes` - the "why" `explain` exists to surface, which the diff path
+/// deliberately drops. Unknown keys (including a newer `"relationships"`
+/// top-level array, which lives beside - never inside - a table's column
+/// list anyway) are ignored.
+fn graph_column_from_json_owned(v: JsonValue) -> Result<ColumnProfile> {
+    let JsonValue::Object(obj) = v else {
+        bail!("expected each column entry to be a JSON object");
+    };
+    let mut profile = ColumnProfile::default();
+    for (key, value) in obj {
+        match key.as_str() {
+            "name" => {
+                if let JsonValue::String(s) = value {
+                    profile.name = s;
+                }
+            }
+            "current_type" => {
+                if let JsonValue::String(s) = value {
+                    profile.current_type = s;
+                }
+            }
+            "ideal_type" => {
+                if let JsonValue::String(s) = value {
+                    profile.ideal_type = s;
+                }
+            }
+            "description" => {
+                if let JsonValue::String(s) = value {
+                    profile.description = s;
+                }
+            }
+            "missing_pct" => profile.missing_pct = value.as_f64().unwrap_or(0.0),
+            "sample_values" => {
+                if let JsonValue::Array(items) = value {
+                    profile.sample_values = items
+                        .into_iter()
+                        .filter_map(|item| match item {
+                            JsonValue::String(s) => Some(s),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+            "notes" => {
+                if let JsonValue::String(s) = value {
+                    profile.notes = s;
+                }
+            }
+            _ => {}
+        }
+    }
+    if profile.name.is_empty() {
+        bail!("column entry is missing a string \"name\" field");
+    }
+    Ok(profile)
+}
+
+/// Streaming `"tables"` loader for the graph subcommands - a deliberate
+/// sibling of diff's own `try_load_dictionary_tables` (same
+/// `stream_object_of_arrays` technique, same error contract: a table whose
+/// value isn't an array or a column that fails to parse surfaces its own
+/// specific message, never a bare "not valid JSON"), not a refactor of it:
+/// that function feeds the memory-audited diff path, and this one keeps
+/// `notes`/`description` it drops, so sharing would couple two hot paths
+/// with different needs for no reason - the same controlled-duplication
+/// call this project already makes for its independently-scoped XML
+/// parsers.
+fn try_load_graph_tables(
+    display_path: &Path,
+    read_path: &Path,
+) -> Result<Option<BTreeMap<String, Vec<ColumnProfile>>>> {
+    let file =
+        fs::File::open(read_path).with_context(|| format!("failed to read {display_path:?}"))?;
+    let mut tables: BTreeMap<String, Vec<ColumnProfile>> = BTreeMap::new();
+    let mut first_error: Option<Error> = None;
+
+    let stream_result = json_support::stream_object_of_arrays(file, "tables", |name, cols| {
+        let JsonValue::Array(items) = cols else {
+            first_error = Some(anyhow!(
+                "{display_path:?}: table {name:?}'s own value isn't a JSON array of columns"
+            ));
+            return Err(json_support::ParseError::custom("not an array of columns"));
+        };
+        let mut cols_out = Vec::with_capacity(items.len());
+        for item in items {
+            match graph_column_from_json_owned(item) {
+                Ok(c) => cols_out.push(c),
+                Err(e) => {
+                    first_error = Some(e);
+                    return Err(json_support::ParseError::custom("column parse error"));
+                }
+            }
+        }
+        tables.insert(name, cols_out);
+        Ok(())
+    });
+
+    let found = match stream_result {
+        Ok(found) => found,
+        Err(parse_err) => {
+            return match first_error {
+                Some(e) => Err(e),
+                None => {
+                    Err(parse_err).with_context(|| format!("{display_path:?} is not valid JSON"))
+                }
+            };
+        }
+    };
+    Ok(if found { Some(tables) } else { None })
+}
+
+/// Graph-subcommand input resolution, mirroring `load_diff_input`'s own
+/// contract one level up: the input may independently be an
+/// already-generated `--output-format json` dictionary (rich or
+/// `--combine` shape - both share the same `"tables"` structure) or a raw
+/// data file profiled fresh with the same defaults a bare
+/// `sniff-rs <path>` uses. Only JSON-detected files are ever considered
+/// as dictionaries; anything else goes straight to `dispatch_reader`,
+/// whose own `ColumnProfile`s are used directly with no conversion step
+/// at all. Directories are rejected with the `--combine` workaround, the
+/// same boundary diff already draws.
+fn load_graph_input(path: &Path) -> Result<BTreeMap<String, Vec<ColumnProfile>>> {
+    if path.is_dir() {
+        bail!(
+            "{path:?} is a directory - the graph subcommands read one file. To query a whole \
+             directory, run `sniff-rs <dir> --combine --output-format json <out.json>` first, \
+             then query the resulting file"
+        );
+    }
+    let (read_path, logical_path, _decompressed_tmp) = decompress_if_needed(path)?;
+    let format = detect_format(&read_path, &logical_path, &None)?;
+    if matches!(format, InputFormat::Json)
+        && let Some(tables) = try_load_graph_tables(path, &read_path)?
+    {
+        return Ok(tables);
+    }
+    let synthetic_args = Args {
+        input_path: path.to_path_buf(),
+        output_path: None,
+        output_dir: None,
+        samples: 3,
+        nrows: None,
+        format: None,
+        delimiter: None,
+        skip_rows: None,
+        widths: None,
+        output_format: "json".to_string(),
+        sql_mode: None,
+        load_into: None,
+        combine: false,
+        list_formats: false,
+    };
+    let (tables, _resolved_skip_rows) =
+        dispatch_reader(&read_path, &logical_path, format, &synthetic_args)?;
+    Ok(tables.into_iter().collect())
+}
+
 // --- JSON-Schema-standard output (--output-format json-schema) ---
 // A third, more interoperable JSON shape alongside this tool's own rich one
 // above: json-schema.org's {"type": ..., "properties": {...}} vocabulary,
@@ -66760,6 +67098,12 @@ pub fn run() -> Result<()> {
     let json_errors = wants_json_error_output(&raw);
     let result = if raw.first().map(String::as_str) == Some("diff") {
         run_diff(&raw[1..])
+    } else if raw.first().map(String::as_str) == Some("explain") {
+        run_explain(&raw[1..])
+    } else if raw.first().map(String::as_str) == Some("path") {
+        run_path(&raw[1..])
+    } else if raw.first().map(String::as_str) == Some("rank") {
+        run_rank(&raw[1..])
     } else {
         run_main(&raw)
     };
@@ -69808,6 +70152,707 @@ fn run_diff(raw: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+// --- Graph subcommands: explain / path / rank ---
+//
+// Query layer over the relationship graph (`TableGraph`), the second half
+// of "graphify for data": profiling extracts typed columns (nodes),
+// `detect_relationships` links them (edges), and these three subcommands
+// answer questions against the result without re-reading any file -
+// `explain` (everything known about one column), `path` (the shortest join
+// chain between two tables), `rank` (god tables and communities). Like
+// `diff`, each takes an already-generated `--output-format json`
+// dictionary or a raw data file (via the same `load_graph_input`
+// resolution), renders `md` (default) or `json`, and writes stdout unless
+// given an explicit output path. Flat subcommands, not `graph explain`
+// nesting, matching `diff`'s own precedent: one positional slot, no
+// further grammar to learn.
+
+const EXPLAIN_HELP_TEXT: &str = r#"sniff-rs explain - show everything known about one column
+
+USAGE:
+    sniff-rs explain <INPUT> <COLUMN> [OUTPUT_PATH] [OPTIONS]
+
+    <INPUT> may be an already-generated --output-format json dictionary
+    (this tool's own rich JSON shape, or the --combine directory shape)
+    OR a raw data file (csv, parquet, sqlite, ... - anything sniff-rs
+    already reads), profiled fresh with default settings. Directories are
+    rejected - query a --combine dictionary instead (see below).
+
+    <COLUMN> is `table.column` (required when several tables share the
+    name), or a bare column name when it is unique across every table -
+    otherwise the error lists each qualified candidate. Dotted column
+    names from flattened nesting (`metadata.risk_score`) work: the table
+    is everything before the first dot, the column everything after it.
+
+ARGS:
+    <INPUT>                 Dictionary or raw data file to query
+    <COLUMN>                table.column, or a unique bare column name
+    [OUTPUT_PATH]           Where the report is written (default:
+                            stdout). Pass "-" to write to stdout explicitly.
+
+OPTIONS:
+        --output-format <FMT>   md (default) or json
+    -h, --help                  Print this help
+"#;
+
+const PATH_HELP_TEXT: &str = r#"sniff-rs path - trace the shortest join chain between two tables
+
+USAGE:
+    sniff-rs path <INPUT> <FROM_TABLE> <TO_TABLE> [OUTPUT_PATH] [OPTIONS]
+
+    Breadth-first search over the relationship graph: the fewest hops
+    wins, ties broken deterministically by table name, so the same graph
+    always prints the same chain. Each hop names its endpoint columns,
+    confidence, and why the link exists. Needs a multi-table graph (a
+    multi-table file or a --combine dictionary) - a single-table input
+    has no inter-table paths by construction, and disjoint table groups
+    are reported as "no join path found" (exit 1), never guessed across.
+
+    <INPUT> follows the same dictionary-or-raw-file rule as
+    `sniff-rs explain` (see `sniff-rs explain --help`); directories are
+    rejected - query a --combine dictionary instead.
+
+ARGS:
+    <INPUT>                 Dictionary or raw data file to query
+    <FROM_TABLE>            Table to start from (exact name)
+    <TO_TABLE>              Table to reach (exact name)
+    [OUTPUT_PATH]           Where the report is written (default:
+                            stdout). Pass "-" to write to stdout explicitly.
+
+OPTIONS:
+        --output-format <FMT>   md (default) or json
+    -h, --help                  Print this help
+"#;
+
+const RANK_HELP_TEXT: &str = r#"sniff-rs rank - god tables and communities
+
+USAGE:
+    sniff-rs rank <INPUT> [OUTPUT_PATH] [OPTIONS]
+
+    Ranks every table by connectivity (incident relationship count - the
+    data equivalent of Graphify's god nodes: fact tables surface above
+    dimensions with no configuration) and groups tables into communities
+    (connected components: tables linked by any chain of joins, largest
+    first). Isolated tables rank with degree zero in single-member
+    communities rather than vanishing.
+
+    <INPUT> follows the same dictionary-or-raw-file rule as
+    `sniff-rs explain` (see `sniff-rs explain --help`); directories are
+    rejected - query a --combine dictionary instead.
+
+ARGS:
+    <INPUT>                 Dictionary or raw data file to query
+    [OUTPUT_PATH]           Where the report is written (default:
+                            stdout). Pass "-" to write to stdout explicitly.
+
+OPTIONS:
+        --output-format <FMT>   md (default) or json
+    -h, --help                  Print this help
+"#;
+
+/// `md` (default) or `json`, the same two report shapes `diff` already
+/// renders through. Parsed separately (not shared with `DiffOutputFormat`)
+/// so neither subcommand family can drift the other's accepted values by
+/// accident - the day one of them grows a third format, the other's
+/// contract stays exactly as documented.
+enum GraphFormat {
+    Md,
+    Json,
+}
+
+impl GraphFormat {
+    fn parse(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "md" | "markdown" => Ok(GraphFormat::Md),
+            "json" => Ok(GraphFormat::Json),
+            other => {
+                bail!("unrecognized --output-format '{other}' (expected md or json)")
+            }
+        }
+    }
+}
+
+/// Shared CLI shape for the three graph subcommands: one input, a
+/// subcommand-specific tail of positionals, an optional output path, and
+/// `--output-format`. Flag parsing mirrors `DiffArgs::parse_from` exactly
+/// (`--flag value` and `--flag=value` forms, `--help` printing the
+/// subcommand's own text and exiting 0, anything else a hard error).
+struct GraphArgs {
+    input: PathBuf,
+    rest: Vec<String>,
+    output: Option<PathBuf>,
+    format: GraphFormat,
+}
+
+fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
+    let mut output_format = "md".to_string();
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = raw[i].as_str();
+        if arg == "-h" || arg == "--help" {
+            print!("{help_text}");
+            std::process::exit(0);
+        }
+        if let Some(rest) = arg.strip_prefix("--") {
+            let (name, inline_value) = match rest.split_once('=') {
+                Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                None => (rest.to_string(), None),
+            };
+            let value = |i: &mut usize| -> Result<String> {
+                if let Some(v) = inline_value.clone() {
+                    return Ok(v);
+                }
+                *i += 1;
+                raw.get(*i)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("--{name} requires a value"))
+            };
+            match name.as_str() {
+                "output-format" => output_format = value(&mut i)?,
+                other => bail!("unrecognized flag --{other}"),
+            }
+        } else {
+            positionals.push(arg.to_string());
+        }
+        i += 1;
+    }
+    let mut positionals = positionals.into_iter();
+    let input = positionals
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("missing required argument: <INPUT> (see --help for usage)"))?;
+    Ok(GraphArgs {
+        input,
+        rest: positionals.collect(),
+        output: None,
+        format: GraphFormat::parse(&output_format)?,
+    })
+}
+
+/// Split a subcommand's trailing positionals into its required args plus
+/// an optional output path: exactly `need` positionals means no output
+/// path, `need + 1` means the last one is it, anything else is a usage
+/// error naming the expected shape.
+fn split_graph_rest(
+    rest: &[String],
+    need: usize,
+    usage: &str,
+) -> Result<(Vec<String>, Option<PathBuf>)> {
+    if rest.len() != need && rest.len() != need + 1 {
+        bail!("expected {usage}");
+    }
+    let output = if rest.len() == need + 1 {
+        Some(PathBuf::from(&rest[need]))
+    } else {
+        None
+    };
+    Ok((rest[..need].to_vec(), output))
+}
+
+/// Write one rendered graph report: stdout by default (or explicit "-",
+/// staying pipe-friendly), otherwise the named file with a stderr status
+/// line - the identical convention `run_diff` already keeps.
+fn emit_graph_output(rendered: &str, output: &Option<PathBuf>, status: &str) -> Result<()> {
+    match output.as_deref() {
+        Some(p) if p != Path::new("-") => {
+            fs::write(p, rendered).with_context(|| format!("failed to write {p:?}"))?;
+            eprintln!("{status} -> {}", p.display());
+        }
+        _ => {
+            print!("{rendered}");
+            if !rendered.ends_with('\n') {
+                println!();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a column spec against profiled tables: `table.column`
+/// (splitting on the first dot, so flattened `metadata.risk_score`
+/// columns work), or a bare name when it is unique across every table.
+/// Every failure lists what actually exists rather than just saying no.
+fn resolve_graph_column(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    spec: &str,
+) -> Result<(String, usize)> {
+    if let Some((table, column)) = spec.split_once('.') {
+        let cols = tables.get(table).ok_or_else(|| {
+            let mut names: Vec<&String> = tables.keys().collect();
+            names.sort();
+            anyhow!(
+                "unknown table {table:?} - available tables: {}",
+                names
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        let idx = cols.iter().position(|c| c.name == column).ok_or_else(|| {
+            anyhow!(
+                "table {table:?} has no column {column:?} - available columns: {}",
+                cols.iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        return Ok((table.to_string(), idx));
+    }
+    let mut hits = Vec::new();
+    for (table, cols) in tables {
+        for (idx, col) in cols.iter().enumerate() {
+            if col.name == spec {
+                hits.push((table.clone(), idx));
+            }
+        }
+    }
+    match hits.len() {
+        0 => bail!("no column named {spec:?} in any table"),
+        1 => Ok(hits.into_iter().next().expect("exactly one hit")),
+        _ => {
+            let mut qualified: Vec<String> =
+                hits.iter().map(|(t, _)| format!("{t}.{spec}")).collect();
+            qualified.sort();
+            bail!(
+                "column {spec:?} exists in several tables - qualify it: {}",
+                qualified.join(", ")
+            )
+        }
+    }
+}
+
+fn escape_graph_md(text: &str) -> String {
+    text.replace('|', "\\|")
+}
+
+fn render_explain_md(
+    input: &Path,
+    table: &str,
+    profile: &ColumnProfile,
+    graph: &TableGraph,
+    edge_indices: &[usize],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {}.{}\n\n", table, profile.name));
+    out.push_str(&format!("- Current type: {}\n", profile.current_type));
+    out.push_str(&format!("- Ideal type: {}\n", profile.ideal_type));
+    out.push_str(&format!("- Missing: {:.1}%\n", profile.missing_pct));
+    if profile.sample_values.is_empty() {
+        out.push_str("- Samples: (none)\n");
+    } else {
+        out.push_str(&format!(
+            "- Samples: {}\n",
+            profile
+                .sample_values
+                .iter()
+                .map(|v| format!("`{v}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "- Notes: {}\n",
+        if profile.notes.is_empty() {
+            "(none)"
+        } else {
+            &profile.notes
+        }
+    ));
+    let neighbors: Vec<&String> = {
+        let mut seen: Vec<&String> = Vec::new();
+        for idx in edge_indices {
+            let rel = &graph.relationships[*idx];
+            let other = if rel.from_table == table {
+                &rel.to_table
+            } else {
+                &rel.from_table
+            };
+            if !seen.contains(&other) {
+                seen.push(other);
+            }
+        }
+        seen
+    };
+    out.push_str(&format!(
+        "- Degree: {} (neighbor{}) · Community: {}\n",
+        edge_indices.len(),
+        if neighbors.len() == 1 { "" } else { "s" },
+        community_of(graph, table)
+    ));
+    if !neighbors.is_empty() {
+        out.push_str(&format!(
+            "- Neighbors: {}\n",
+            neighbors
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out.push('\n');
+    if edge_indices.is_empty() {
+        out.push_str(&format!(
+            "No relationships link this column to any other table in {}.\n",
+            input.display()
+        ));
+    } else {
+        out.push_str("## Relationships\n\n");
+        out.push_str("| Table | Column | Confidence | Why |\n");
+        out.push_str("|---|---|---|---|\n");
+        for idx in edge_indices {
+            let rel = &graph.relationships[*idx];
+            let (other_table, other_column) = if rel.from_table == table {
+                (&rel.to_table, &rel.to_column)
+            } else {
+                (&rel.from_table, &rel.from_column)
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                escape_graph_md(other_table),
+                escape_graph_md(other_column),
+                rel.confidence.as_str(),
+                escape_graph_md(&rel.reason),
+            ));
+        }
+    }
+    out
+}
+
+fn render_explain_json(
+    input: &Path,
+    table: &str,
+    profile: &ColumnProfile,
+    graph: &TableGraph,
+    edge_indices: &[usize],
+) -> Result<String> {
+    let mut doc = json_support::Map::with_capacity(11);
+    doc.insert(
+        "input".to_string(),
+        JsonValue::from(input.display().to_string()),
+    );
+    doc.insert("table".to_string(), JsonValue::from(table.to_string()));
+    doc.insert("column".to_string(), JsonValue::from(profile.name.clone()));
+    doc.insert(
+        "current_type".to_string(),
+        JsonValue::from(profile.current_type.clone()),
+    );
+    doc.insert(
+        "ideal_type".to_string(),
+        JsonValue::from(profile.ideal_type.clone()),
+    );
+    doc.insert(
+        "missing_pct".to_string(),
+        JsonValue::from(profile.missing_pct),
+    );
+    doc.insert(
+        "sample_values".to_string(),
+        JsonValue::Array(
+            profile
+                .sample_values
+                .iter()
+                .cloned()
+                .map(JsonValue::from)
+                .collect(),
+        ),
+    );
+    doc.insert("notes".to_string(), JsonValue::from(profile.notes.clone()));
+    let neighbors: Vec<JsonValue> = {
+        let mut seen: Vec<String> = Vec::new();
+        for idx in edge_indices {
+            let rel = &graph.relationships[*idx];
+            let other = if rel.from_table == table {
+                rel.to_table.clone()
+            } else {
+                rel.from_table.clone()
+            };
+            if !seen.contains(&other) {
+                seen.push(other);
+            }
+        }
+        seen.into_iter().map(JsonValue::from).collect()
+    };
+    doc.insert(
+        "degree".to_string(),
+        JsonValue::from(edge_indices.len() as i64),
+    );
+    doc.insert("neighbors".to_string(), JsonValue::Array(neighbors));
+    doc.insert(
+        "community".to_string(),
+        JsonValue::from(community_of(graph, table) as i64),
+    );
+    doc.insert(
+        "relationships".to_string(),
+        JsonValue::Array(
+            edge_indices
+                .iter()
+                .map(|idx| graph.relationships[*idx].to_json())
+                .collect(),
+        ),
+    );
+    Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+}
+
+fn run_explain(raw: &[String]) -> Result<()> {
+    let mut args = parse_graph_args(raw, EXPLAIN_HELP_TEXT)?;
+    let (positionals, output) = split_graph_rest(&args.rest, 1, "<INPUT> <COLUMN> [OUTPUT_PATH]")?;
+    args.output = output;
+    let column_spec = positionals[0].clone();
+    let tables = load_graph_input(&args.input)?;
+    let graph = build_table_graph(&tables);
+    let (table, idx) = resolve_graph_column(&tables, &column_spec)?;
+    let profile = &tables.get(&table).expect("resolved table exists")[idx];
+    let mut edge_indices = incident_edges(&graph, &table)
+        .into_iter()
+        .filter(|i| {
+            let rel = &graph.relationships[*i];
+            (rel.from_table == table && rel.from_column == profile.name)
+                || (rel.to_table == table && rel.to_column == profile.name)
+        })
+        .collect::<Vec<_>>();
+    edge_indices.sort();
+    let rendered = match args.format {
+        GraphFormat::Md => render_explain_md(&args.input, &table, profile, &graph, &edge_indices),
+        GraphFormat::Json => {
+            render_explain_json(&args.input, &table, profile, &graph, &edge_indices)?
+        }
+    };
+    emit_graph_output(
+        &rendered,
+        &args.output,
+        &format!("{table}.{} explained", profile.name),
+    )
+}
+
+fn render_path_md(
+    input: &Path,
+    from: &str,
+    to: &str,
+    graph: &TableGraph,
+    hops: &[usize],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Join path: {from} → {to}\n\n"));
+    out.push_str(&format!(
+        "{} hop{} in {}:\n\n",
+        hops.len(),
+        if hops.len() == 1 { "" } else { "s" },
+        input.display()
+    ));
+    for (n, idx) in hops.iter().enumerate() {
+        let rel = &graph.relationships[*idx];
+        out.push_str(&format!(
+            "{}. {}.{} → {}.{} ({}) — {}\n",
+            n + 1,
+            rel.from_table,
+            rel.from_column,
+            rel.to_table,
+            rel.to_column,
+            rel.confidence.as_str(),
+            rel.reason,
+        ));
+    }
+    out
+}
+
+fn render_path_json(
+    input: &Path,
+    from: &str,
+    to: &str,
+    graph: &TableGraph,
+    hops: &[usize],
+) -> Result<String> {
+    let mut doc = json_support::Map::with_capacity(4);
+    doc.insert(
+        "input".to_string(),
+        JsonValue::from(input.display().to_string()),
+    );
+    doc.insert("from".to_string(), JsonValue::from(from.to_string()));
+    doc.insert("to".to_string(), JsonValue::from(to.to_string()));
+    doc.insert(
+        "hops".to_string(),
+        JsonValue::Array(
+            hops.iter()
+                .map(|idx| graph.relationships[*idx].to_json())
+                .collect(),
+        ),
+    );
+    Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+}
+
+fn run_path(raw: &[String]) -> Result<()> {
+    let mut args = parse_graph_args(raw, PATH_HELP_TEXT)?;
+    let (positionals, output) = split_graph_rest(
+        &args.rest,
+        2,
+        "<INPUT> <FROM_TABLE> <TO_TABLE> [OUTPUT_PATH]",
+    )?;
+    args.output = output;
+    let (from, to) = (positionals[0].clone(), positionals[1].clone());
+    if from == to {
+        bail!("{from:?} and {to:?} are the same table - a join path needs two different tables");
+    }
+    let tables = load_graph_input(&args.input)?;
+    for name in [&from, &to] {
+        if !tables.contains_key(name) {
+            let mut available: Vec<&String> = tables.keys().collect();
+            available.sort();
+            bail!(
+                "unknown table {name:?} - available tables: {}",
+                available
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    let graph = build_table_graph(&tables);
+    let hops = shortest_path(&graph, &from, &to).ok_or_else(|| {
+        anyhow!(
+            "no join path found between {from:?} and {to:?} ({} tables, {} relationships) - \
+             they sit in disconnected table groups",
+            graph.tables.len(),
+            graph.relationships.len()
+        )
+    })?;
+    let rendered = match args.format {
+        GraphFormat::Md => render_path_md(&args.input, &from, &to, &graph, &hops),
+        GraphFormat::Json => render_path_json(&args.input, &from, &to, &graph, &hops)?,
+    };
+    emit_graph_output(&rendered, &args.output, &format!("join path {from} → {to}"))
+}
+
+fn render_rank_md(graph: &TableGraph, components: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    out.push_str("# Tables by connectivity\n\n");
+    out.push_str("| Table | Degree | Neighbors | Community |\n");
+    out.push_str("|---|---|---|---|\n");
+    let mut rows: Vec<(&String, usize, usize, usize)> = graph
+        .tables
+        .iter()
+        .map(|t| {
+            let degree: usize = graph
+                .adj
+                .get(t)
+                .map(|m| m.values().map(Vec::len).sum())
+                .unwrap_or(0);
+            let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
+            (t, degree, neighbors, community_of(graph, t))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    for (table, degree, neighbors, community) in rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            escape_graph_md(table),
+            degree,
+            neighbors,
+            community
+        ));
+    }
+    out.push_str("\n## Communities\n\n");
+    for (id, members) in components.iter().enumerate() {
+        out.push_str(&format!(
+            "- Community {id} ({} table{}): {}\n",
+            members.len(),
+            if members.len() == 1 { "" } else { "s" },
+            members
+                .iter()
+                .map(|m| escape_graph_md(m))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+
+fn render_rank_json(
+    graph: &TableGraph,
+    components: &[Vec<String>],
+    input: &Path,
+) -> Result<String> {
+    let mut doc = json_support::Map::with_capacity(3);
+    doc.insert(
+        "input".to_string(),
+        JsonValue::from(input.display().to_string()),
+    );
+    let mut rows: Vec<(&String, usize, usize, usize)> = graph
+        .tables
+        .iter()
+        .map(|t| {
+            let degree: usize = graph
+                .adj
+                .get(t)
+                .map(|m| m.values().map(Vec::len).sum())
+                .unwrap_or(0);
+            let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
+            (t, degree, neighbors, community_of(graph, t))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    doc.insert(
+        "tables".to_string(),
+        JsonValue::Array(
+            rows.iter()
+                .map(|(table, degree, neighbors, community)| {
+                    let mut obj = json_support::Map::with_capacity(4);
+                    obj.insert("table".to_string(), JsonValue::from(table.to_string()));
+                    obj.insert("degree".to_string(), JsonValue::from(*degree as i64));
+                    obj.insert("neighbors".to_string(), JsonValue::from(*neighbors as i64));
+                    obj.insert("community".to_string(), JsonValue::from(*community as i64));
+                    JsonValue::Object(obj)
+                })
+                .collect(),
+        ),
+    );
+    doc.insert(
+        "communities".to_string(),
+        JsonValue::Array(
+            components
+                .iter()
+                .enumerate()
+                .map(|(id, members)| {
+                    let mut obj = json_support::Map::with_capacity(3);
+                    obj.insert("id".to_string(), JsonValue::from(id as i64));
+                    obj.insert("size".to_string(), JsonValue::from(members.len() as i64));
+                    obj.insert(
+                        "members".to_string(),
+                        JsonValue::Array(members.iter().cloned().map(JsonValue::from).collect()),
+                    );
+                    JsonValue::Object(obj)
+                })
+                .collect(),
+        ),
+    );
+    Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+}
+
+fn run_rank(raw: &[String]) -> Result<()> {
+    let mut args = parse_graph_args(raw, RANK_HELP_TEXT)?;
+    let (positionals, output) = split_graph_rest(&args.rest, 0, "<INPUT> [OUTPUT_PATH]")?;
+    debug_assert!(positionals.is_empty());
+    args.output = output;
+    let tables = load_graph_input(&args.input)?;
+    let graph = build_table_graph(&tables);
+    let components = connected_components(&graph);
+    let rendered = match args.format {
+        GraphFormat::Md => render_rank_md(&graph, &components),
+        GraphFormat::Json => render_rank_json(&graph, &components, &args.input)?,
+    };
+    emit_graph_output(
+        &rendered,
+        &args.output,
+        &format!(
+            "{} tables, {} communities",
+            graph.tables.len(),
+            components.len()
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -77763,6 +78808,231 @@ mod tests {
         assert!(LoadEngine::Sqlite.non_interactive_args().is_empty());
         assert!(LoadEngine::DuckDb.non_interactive_args().is_empty());
         assert!(LoadEngine::MySql.non_interactive_args().is_empty());
+    }
+
+    // `TableGraph` unit tests (see also the `relationships_*` tests above
+    // for the edge-detection tiers this graph is built from). Graphs are
+    // assembled through the real `build_table_graph`, never hand-wired
+    // adjacency, so these prove the whole pipeline from profiles to hops.
+    fn graph_tables(entries: &[(&str, Vec<ColumnProfile>)]) -> TableGraph {
+        build_table_graph(&rel_tables(entries))
+    }
+
+    fn hop_tables<'a>(graph: &'a TableGraph, hops: &[usize]) -> Vec<(&'a str, &'a str)> {
+        hops.iter()
+            .map(|i| {
+                let rel = &graph.relationships[*i];
+                (rel.from_table.as_str(), rel.to_table.as_str())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn graph_bfs_finds_a_two_hop_path_through_a_link_table() {
+        let graph = graph_tables(&[
+            ("authors", vec![rel_col("author_id", "i64", &["1", "2"])]),
+            (
+                "books",
+                vec![
+                    rel_col("author_id", "i64", &["1"]),
+                    rel_col("publisher_id", "i64", &["9"]),
+                ],
+            ),
+            ("publishers", vec![rel_col("publisher_id", "i64", &["9"])]),
+        ]);
+        let hops = shortest_path(&graph, "authors", "publishers").expect("chain should connect");
+        assert_eq!(hops.len(), 2);
+        assert_eq!(
+            hop_tables(&graph, &hops),
+            vec![("authors", "books"), ("books", "publishers")]
+        );
+    }
+
+    #[test]
+    fn graph_bfs_prefers_fewer_hops_over_stronger_links() {
+        // A direct inferred edge still beats a two-hop extracted chain:
+        // fewer joins is the primary objective, confidence only breaks
+        // ties between equal-length routes.
+        let graph = graph_tables(&[
+            (
+                "authors",
+                vec![
+                    rel_col("author_id", "i64", &["1", "2"]),
+                    rel_col("contact_email", "Email", &["a@x.example"]),
+                ],
+            ),
+            (
+                "books",
+                vec![
+                    rel_col("author_id", "i64", &["1"]),
+                    rel_col("publisher_id", "i64", &["9"]),
+                ],
+            ),
+            (
+                "publishers",
+                vec![
+                    rel_col("publisher_id", "i64", &["9"]),
+                    rel_col("contact", "Email", &["b@y.example"]),
+                ],
+            ),
+        ]);
+        let hops =
+            shortest_path(&graph, "authors", "publishers").expect("direct inferred edge exists");
+        assert_eq!(hops.len(), 1);
+        assert_eq!(
+            graph.relationships[hops[0]].confidence,
+            Confidence::Inferred
+        );
+    }
+
+    #[test]
+    fn graph_bfs_prefers_extracted_among_parallel_edges() {
+        // Two tables sharing both a measured `id` link and a guessed
+        // UUID-domain link: the reported hop must be the measured one,
+        // not the alphabetically-first column.
+        let graph = graph_tables(&[
+            (
+                "a",
+                vec![
+                    rel_col("id", "i64", &["1"]),
+                    rel_col("u1", "UUID", &["aaa"]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    rel_col("id", "i64", &["1"]),
+                    rel_col("u2", "UUID", &["bbb"]),
+                ],
+            ),
+        ]);
+        let hops = shortest_path(&graph, "a", "b").expect("a-b should connect");
+        assert_eq!(hops.len(), 1);
+        let rel = &graph.relationships[hops[0]];
+        assert_eq!(rel.confidence, Confidence::Extracted);
+        assert_eq!(
+            (rel.from_column.as_str(), rel.to_column.as_str()),
+            ("id", "id")
+        );
+    }
+
+    #[test]
+    fn graph_disconnected_or_unknown_tables_yield_no_path() {
+        let graph = graph_tables(&[
+            ("a", vec![rel_col("id", "i64", &["1"])]),
+            ("b", vec![rel_col("id", "i64", &["1"])]),
+            ("solo", vec![rel_col("note", "String", &["x"])]),
+        ]);
+        assert!(shortest_path(&graph, "a", "solo").is_none());
+        assert!(shortest_path(&graph, "nope", "a").is_none());
+        assert!(shortest_path(&graph, "a", "nope").is_none());
+        // Same table is a zero-hop path at the primitive level (the CLI
+        // itself rejects it as a usage error before ever calling this).
+        assert_eq!(shortest_path(&graph, "a", "a"), Some(vec![]));
+    }
+
+    #[test]
+    fn graph_components_group_linked_tables_and_isolate_the_rest() {
+        let graph = graph_tables(&[
+            ("a", vec![rel_col("id", "i64", &["1"])]),
+            ("b", vec![rel_col("id", "i64", &["1"])]),
+            ("c", vec![rel_col("key", "String", &["k"])]),
+            ("d", vec![rel_col("key", "String", &["k"])]),
+            ("solo", vec![rel_col("note", "String", &["x"])]),
+        ]);
+        let components = connected_components(&graph);
+        assert_eq!(components.len(), 3);
+        assert_eq!(components[0], vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(components[1], vec!["c".to_string(), "d".to_string()]);
+        assert_eq!(components[2], vec!["solo".to_string()]);
+        assert_eq!(community_of(&graph, "a"), 0);
+        assert_eq!(community_of(&graph, "d"), 1);
+        assert_eq!(community_of(&graph, "solo"), 2);
+    }
+
+    #[test]
+    fn graph_link_table_has_the_highest_degree() {
+        let graph = graph_tables(&[
+            ("authors", vec![rel_col("author_id", "i64", &["1", "2"])]),
+            (
+                "books",
+                vec![
+                    rel_col("author_id", "i64", &["1"]),
+                    rel_col("publisher_id", "i64", &["9"]),
+                ],
+            ),
+            ("publishers", vec![rel_col("publisher_id", "i64", &["9"])]),
+        ]);
+        let degree = |t: &str| incident_edges(&graph, t).len();
+        assert_eq!(degree("books"), 2);
+        assert_eq!(degree("authors"), 1);
+        assert_eq!(degree("publishers"), 1);
+        assert!(incident_edges(&graph, "missing").is_empty());
+    }
+
+    #[test]
+    fn graph_resolve_column_accepts_qualified_dotted_and_unique_bare_names() {
+        let tables = rel_tables(&[
+            (
+                "users",
+                vec![
+                    rel_col("id", "i64", &["1"]),
+                    rel_col("meta.score", "f64", &["2.5"]),
+                ],
+            ),
+            ("orders", vec![rel_col("user_id", "i64", &["1"])]),
+        ]);
+        assert_eq!(
+            resolve_graph_column(&tables, "users.id").unwrap(),
+            ("users".to_string(), 0)
+        );
+        // Flattened dotted names work: the table is everything before the
+        // first dot, the column everything after it.
+        assert_eq!(
+            resolve_graph_column(&tables, "users.meta.score").unwrap(),
+            ("users".to_string(), 1)
+        );
+        // Bare names work exactly when unique across every table.
+        assert_eq!(
+            resolve_graph_column(&tables, "user_id").unwrap(),
+            ("orders".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn graph_resolve_column_rejects_unknown_and_ambiguous_names_actionably() {
+        let tables = rel_tables(&[
+            ("users", vec![rel_col("id", "i64", &["1"])]),
+            ("orders", vec![rel_col("id", "i64", &["1"])]),
+        ]);
+        let err = resolve_graph_column(&tables, "missing.id").unwrap_err();
+        assert!(err.to_string().contains("unknown table"));
+        let err = resolve_graph_column(&tables, "users.missing").unwrap_err();
+        assert!(err.to_string().contains("no column"));
+        let err = resolve_graph_column(&tables, "id").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("several tables"), "got: {msg}");
+        assert!(
+            msg.contains("users.id") && msg.contains("orders.id"),
+            "got: {msg}"
+        );
+        let err = resolve_graph_column(&tables, "nope").unwrap_err();
+        assert!(err.to_string().contains("no column named"), "got: {err}");
+    }
+
+    #[test]
+    fn graph_column_from_json_keeps_notes_and_tolerates_sparse_objects() {
+        let v = json_support::from_str(
+            r#"{"name": "zip_code", "ideal_type": "String", "notes": "leading zeros", "unknown_future_key": 1}"#,
+        )
+        .unwrap();
+        let col = graph_column_from_json_owned(v).unwrap();
+        assert_eq!(col.name, "zip_code");
+        assert_eq!(col.ideal_type, "String");
+        assert_eq!(col.notes, "leading zeros");
+        assert!(col.sample_values.is_empty());
+        let v = json_support::from_str(r#"{"ideal_type": "i64"}"#).unwrap();
+        assert!(graph_column_from_json_owned(v).is_err());
     }
 
     // `detect_relationships` - cross-table join candidates. A column is

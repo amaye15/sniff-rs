@@ -12266,3 +12266,262 @@ fn relationships_single_table_reports_an_empty_array() {
     let doc = run_json("sample.csv", &[]);
     assert_eq!(doc["relationships"], serde_json::Value::Array(vec![]));
 }
+
+// ---------------------------------------------------------------------------
+// Graph subcommands (explain / path / rank): query layer over the
+// relationship graph above. `edge_graph_chain.ini` is a three-table chain
+// (customers -> orders -> products) plus one isolated table (audit), so
+// multi-hop paths, god-table ranking, communities, and the no-route error
+// each have a permanent, reviewable shape - the same committed-fixture
+// discipline every other feature in this file already follows.
+// ---------------------------------------------------------------------------
+
+fn run_graph(args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .output()
+        .expect("failed to run binary")
+}
+
+#[test]
+fn graph_explain_reports_profile_and_incident_edges() {
+    let output = run_graph(&[
+        "explain",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "orders.customer_id",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# orders.customer_id"));
+    assert!(stdout.contains("customers"));
+    assert!(stdout.contains("extracted"));
+    assert!(stdout.contains("Community: 0"));
+}
+
+#[test]
+fn graph_explain_json_shape_and_ambiguous_bare_name() {
+    let output = run_graph(&[
+        "explain",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "orders.customer_id",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    assert_eq!(doc["table"], "orders");
+    assert_eq!(doc["column"], "customer_id");
+    assert_eq!(doc["degree"], 1);
+    assert_eq!(doc["neighbors"], serde_json::json!(["customers"]));
+    assert_eq!(doc["community"], 0);
+    assert_eq!(doc["relationships"].as_array().unwrap().len(), 1);
+
+    // `customer_id` exists in two tables - the bare name must fail
+    // actionably, naming both qualified candidates.
+    let output = run_graph(&[
+        "explain",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "customer_id",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("several tables"), "got: {stderr}");
+    assert!(stderr.contains("customers.customer_id"), "got: {stderr}");
+    assert!(stderr.contains("orders.customer_id"), "got: {stderr}");
+}
+
+#[test]
+fn graph_explain_rejects_unknown_table_and_column_actionably() {
+    let output = run_graph(&[
+        "explain",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "missing.id",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown table"));
+    let output = run_graph(&[
+        "explain",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "orders.missing",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no column"));
+}
+
+#[test]
+fn graph_explain_isolated_column_reports_no_relationships() {
+    let output = run_graph(&[
+        "explain",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "audit.note",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No relationships"));
+}
+
+#[test]
+fn graph_path_reports_a_two_hop_chain_in_order() {
+    let output = run_graph(&[
+        "path",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "customers",
+        "products",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("2 hops"), "got: {stdout}");
+    let first = stdout.find("customers.customer_id").expect("first hop");
+    let second = stdout.find("orders.product_id").expect("second hop");
+    assert!(first < second, "hops out of order: {stdout}");
+
+    let output = run_graph(&[
+        "path",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "customers",
+        "products",
+        "--output-format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    let hops = doc["hops"].as_array().unwrap();
+    assert_eq!(hops.len(), 2);
+    assert_eq!(hops[0]["from_table"], "customers");
+    assert_eq!(hops[0]["to_table"], "orders");
+    assert_eq!(hops[1]["from_table"], "orders");
+    assert_eq!(hops[1]["to_table"], "products");
+}
+
+#[test]
+fn graph_path_disconnected_and_same_table_are_errors() {
+    let output = run_graph(&[
+        "path",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "customers",
+        "audit",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no join path found"),
+        "got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_graph(&[
+        "path",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "orders",
+        "orders",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("same table"));
+}
+
+#[test]
+fn graph_path_reads_an_already_generated_dictionary() {
+    // Every other graph test profiles the raw file; this one proves the
+    // dictionary-input half of `load_graph_input` on the same chain.
+    let dir = TempDir::new();
+    let dict = dir.path().join("chain.dictionary.json");
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_graph_chain.ini").to_str().unwrap(),
+            dict.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_graph(&["path", dict.to_str().unwrap(), "customers", "products"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("2 hops"));
+}
+
+#[test]
+fn graph_rank_lists_the_link_table_first_with_communities() {
+    let output = run_graph(&["rank", fixture("edge_graph_chain.ini").to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let orders = stdout.find("| orders | 2 |").expect("orders row");
+    let customers = stdout.find("| customers | 1 |").expect("customers row");
+    assert!(orders < customers, "god table must rank first: {stdout}");
+    assert!(stdout.contains("Community 0 (3 tables)"), "got: {stdout}");
+    assert!(
+        stdout.contains("Community 1 (1 table): audit"),
+        "got: {stdout}"
+    );
+
+    let output = run_graph(&[
+        "rank",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    let tables = doc["tables"].as_array().unwrap();
+    assert_eq!(tables[0]["table"], "orders");
+    assert_eq!(tables[0]["degree"], 2);
+    let communities = doc["communities"].as_array().unwrap();
+    assert_eq!(communities.len(), 2);
+    assert_eq!(communities[0]["members"].as_array().unwrap().len(), 3);
+    assert_eq!(communities[1]["members"], serde_json::json!(["audit"]));
+}
+
+#[test]
+fn graph_rank_single_table_reports_zero_degree() {
+    let output = run_graph(&["rank", fixture("sample.csv").to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("| sample | 0 | 0 | 0 |"), "got: {stdout}");
+}
+
+#[test]
+fn graph_subcommands_reject_bad_flags_and_explain_helps() {
+    let output = run_graph(&[
+        "explain",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "orders.customer_id",
+        "--bogus",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized flag"));
+    let output = run_graph(&["explain", "--help"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("USAGE"));
+}
