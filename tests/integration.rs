@@ -12039,12 +12039,22 @@ fn run_with_stdin(stdin_content: &[u8], args: &[&str]) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn binary");
-    child
+    // A child that rejects its args (e.g. `-` with no OUTPUT_PATH) can
+    // exit before this write lands, closing the pipe - that early exit
+    // is itself a legitimate outcome the caller asserts on below, so a
+    // broken pipe here is ignored rather than panicking. Any other I/O
+    // error still fails loudly. Whether the race fires is purely
+    // scheduling-dependent, which is why this only flakes under load.
+    match child
         .stdin
         .take()
         .expect("stdin was requested as piped")
         .write_all(stdin_content)
-        .expect("failed to write to child stdin");
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("failed to write to child stdin: {e}"),
+    }
     child.wait_with_output().expect("failed to wait on child")
 }
 
