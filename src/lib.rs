@@ -57253,6 +57253,14 @@ fn join_candidate(
     }
     let n1 = canon_name(&c1.name);
     let n2 = canon_name(&c2.name);
+    // Unnamed columns (a blank CSV header, a pandas index column written
+    // without a name) can neither be addressed by `explain`/`path` nor
+    // honestly matched: every blank in every table canonicalizes to the
+    // same empty string, so without this guard they would all "exactly
+    // match" each other into spurious extracted edges.
+    if n1.is_empty() || n2.is_empty() {
+        return None;
+    }
     let exact = n1 == n2;
     let id_side_1 = n1 == "id" && fk_stem_matches(t1, &n2);
     let id_side_2 = n2 == "id" && fk_stem_matches(t2, &n1);
@@ -57663,6 +57671,12 @@ fn graph_column_from_json_owned(v: JsonValue) -> Result<ColumnProfile> {
                 }
             }
             "missing_pct" => profile.missing_pct = value.as_f64().unwrap_or(0.0),
+            // `row_count` is deliberately absent from diff's own loader
+            // (which never needs table sizes), but the graph layer does:
+            // `rank` reports rows per table, and `table_rows` reads the
+            // first column's count by convention. A missing field stays 0
+            // (the `Default`), matching a genuinely zero-row table.
+            "row_count" => profile.row_count = value.as_f64().map(|n| n as usize).unwrap_or(0),
             "sample_values" => {
                 if let JsonValue::Array(items) = value {
                     profile.sample_values = items
@@ -57682,9 +57696,11 @@ fn graph_column_from_json_owned(v: JsonValue) -> Result<ColumnProfile> {
             _ => {}
         }
     }
-    if profile.name.is_empty() {
-        bail!("column entry is missing a string \"name\" field");
-    }
+    // A missing or empty name is not an error here: the loader below
+    // skips nameless columns (they cannot be addressed or matched), so
+    // carrying an empty name through is harmless, while bailing would
+    // refuse an otherwise perfectly good dictionary over one degenerate
+    // column.
     Ok(profile)
 }
 
@@ -57717,6 +57733,14 @@ fn try_load_graph_tables(
         let mut cols_out = Vec::with_capacity(items.len());
         for item in items {
             match graph_column_from_json_owned(item) {
+                // Nameless columns are skipped, not fatal: a blank header
+                // (or pandas index column) cannot be addressed by
+                // `explain`/`path` and must never match anything (see
+                // `join_candidate`'s own empty-name guard), so dropping it
+                // here loses nothing any subcommand could use. This
+                // deliberately differs from diff's own loader, which keeps
+                // the hard error - changing that contract is out of scope.
+                Ok(c) if c.name.is_empty() => {}
                 Ok(c) => cols_out.push(c),
                 Err(e) => {
                     first_error = Some(e);
@@ -79691,6 +79715,18 @@ mod tests {
     }
 
     #[test]
+    fn relationships_blank_column_names_never_link() {
+        // Two tables whose blank header columns share samples: without
+        // the empty-name guard every blank would "exactly match" every
+        // other blank into a spurious extracted edge.
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("", "i64", &["0", "1"])]),
+            ("b", vec![rel_col("", "i64", &["0", "1"])]),
+        ]);
+        assert!(detect_relationships(&tables).is_empty());
+    }
+
+    #[test]
     fn graph_disconnected_or_unknown_tables_yield_no_path() {
         let graph = graph_tables(&[
             ("a", vec![rel_col("id", "i64", &["1"])]),
@@ -79826,8 +79862,12 @@ mod tests {
         assert_eq!(col.ideal_type, "String");
         assert_eq!(col.notes, "leading zeros");
         assert!(col.sample_values.is_empty());
+        assert_eq!(col.row_count, 0);
         let v = json_support::from_str(r#"{"ideal_type": "i64"}"#).unwrap();
-        assert!(graph_column_from_json_owned(v).is_err());
+        // No name: parses fine with an empty one - the loader, not the
+        // parser, decides nameless columns are skipped, never fatal.
+        let col = graph_column_from_json_owned(v).unwrap();
+        assert!(col.name.is_empty());
     }
 
     fn graph_raw_args(flags: &[&str]) -> Vec<String> {

@@ -12769,6 +12769,49 @@ fn diff_reports_relationship_drift_for_a_broken_join() {
 }
 
 #[test]
+fn graph_blank_headers_neither_link_nor_break_queries() {
+    // A leading-comma header (pandas index column written nameless) in
+    // two files: the blank columns must not link to each other, and the
+    // dictionary built from them must still load for querying.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("l.csv"), ",name\n0,Alice\n1,Bob\n").unwrap();
+    std::fs::write(dir.path().join("r.csv"), ",city\n0,Paris\n1,Lyon\n").unwrap();
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let dict = out.path().join(format!("{dir_name}.dictionary.json"));
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dict).unwrap()).unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    assert!(
+        rels.iter()
+            .all(|e| !e["from_column"].as_str().unwrap().is_empty()
+                && !e["to_column"].as_str().unwrap().is_empty()),
+        "no edge may touch a blank column: {rels:?}"
+    );
+    // And the dictionary itself loads for querying (the loader skips the
+    // blank columns instead of refusing the whole file).
+    let output = run_graph(&["rank", dict.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn graph_subcommands_reject_bad_flags_and_explain_helps() {
     let output = run_graph(&[
         "explain",
