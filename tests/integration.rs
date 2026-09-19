@@ -19,6 +19,26 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// A Python interpreter for the handful of tests that generate a fixture
+/// on the fly (numpy/pyreadstat/zstd/gzip via `-c`). Tries `python3`
+/// first, falling back to `python`: Windows never provides the `python3`
+/// alias (python.org installer, Store, and setup-python all ship
+/// `python.exe`), so hardcoding `python3` breaks every one of those tests
+/// there. One probe process per call is negligible next to the fixture
+/// generation itself.
+fn python() -> Command {
+    let probe = Command::new("python3")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if probe {
+        Command::new("python3")
+    } else {
+        Command::new("python")
+    }
+}
+
 /// Runs the binary against a fixture with the given --output-format, writing
 /// to stdout ("-"), and returns the parsed document.
 fn run_with_format(
@@ -9486,10 +9506,7 @@ fn csv_with_bom_and_gzip_both_handled() {
         src.to_str().unwrap(),
         gz_path.to_str().unwrap()
     );
-    let out = Command::new("python3")
-        .args(["-c", &py_code])
-        .output()
-        .unwrap();
+    let out = python().args(["-c", &py_code]).output().unwrap();
     assert!(
         out.status.success(),
         "failed to gzip bom file: {}",
@@ -9781,10 +9798,7 @@ fn zstd_decompresses_trailing_comma_fixture_transparently() {
         src.to_str().unwrap(),
         zst_path.to_str().unwrap()
     );
-    let out = Command::new("python3")
-        .args(["-c", &py_code])
-        .output()
-        .unwrap();
+    let out = python().args(["-c", &py_code]).output().unwrap();
     if out.status.success() {
         let output = Command::new(bin())
             .args([zst_path.to_str().unwrap(), "-", "--output-format", "json"])
@@ -9861,10 +9875,7 @@ fn npy_nrows_stops_reading_before_a_truncated_tail() {
         "import numpy as np; a = np.arange(1000*4, dtype='<f8').reshape(1000, 4); np.save(r'{}', a)",
         path.to_str().unwrap()
     );
-    let out = Command::new("python3")
-        .args(["-c", &py_code])
-        .output()
-        .unwrap();
+    let out = python().args(["-c", &py_code]).output().unwrap();
     assert!(
         out.status.success(),
         "failed to generate npy fixture: {}",
@@ -9911,10 +9922,7 @@ fn spss_nrows_stops_reading_before_a_truncated_tail() {
          pyreadstat.write_sav(df, r'{}')\n",
         path.to_str().unwrap()
     );
-    let out = Command::new("python3")
-        .args(["-c", &py_code])
-        .output()
-        .unwrap();
+    let out = python().args(["-c", &py_code]).output().unwrap();
     assert!(
         out.status.success(),
         "failed to generate sav fixture: {}",

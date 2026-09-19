@@ -13,7 +13,10 @@ permissions:
   contents: write
 
 env:
-  TOOLCHAIN: nightly-2026-09-15
+  # Named NIGHTLY (not TOOLCHAIN) - see ci.yml: a workflow-level
+  # `TOOLCHAIN` collides with dtolnay/rust-toolchain's own lowercase
+  # `$toolchain` on case-insensitive Windows env.
+  NIGHTLY: nightly-2026-09-15
 
 jobs:
   build:
@@ -44,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.TOOLCHAIN }}
+          toolchain: ${{ env.NIGHTLY }}
           targets: ${{ matrix.target }}
       # Default features = full build (every format + SIMD).
       - run: cargo build --release --target ${{ matrix.target }}
