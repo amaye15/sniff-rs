@@ -60,7 +60,11 @@ jobs:
           printf 'id,name\n1,alice\n2,bob\n' > smoke.csv
           "$bin" smoke.csv smoke.md
           test -s smoke.md
-          "$bin" --list-formats | grep -q parquet
+          # Capture before grepping: piping straight into `grep -q` lets
+          # grep close the pipe early (SIGPIPE panic, exit 101) in a
+          # timing-dependent way. A file makes the check deterministic.
+          "$bin" --list-formats > formats.txt
+          grep -q parquet formats.txt
       - name: Package
         shell: bash
         run: |
