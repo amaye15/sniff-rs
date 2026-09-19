@@ -1,0 +1,9 @@
+# Byte-exact checkouts on every OS. This repo's test corpus is ~360
+# fixtures compared byte-for-byte (BOM handling, CRLF/bare-CR/bare-LF
+# equivalence, malformed inputs, golden decode outputs) - any line-ending
+# conversion on checkout silently corrupts them. Observed directly:
+# GitHub's Windows runners default to core.autocrlf=true, which rewrote
+# edge_brotli_english.expected's LF endings to CRLF and failed a
+# byte-exact decode test that passes everywhere else. Side benefit:
+# install.sh keeps its LF endings on Windows checkouts too.
+* -text
