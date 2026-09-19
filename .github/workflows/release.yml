@@ -1,0 +1,102 @@
+# Release: tag `v*` -> per-OS full-build binaries -> GitHub release.
+# Asset names are a contract: install.sh, the Homebrew formula, and
+# [package.metadata.binstall] in Cargo.toml all construct URLs from them.
+# Archives contain a top-level `sniff-rs-<target>/` dir holding the binary
+# plus README and both LICENSE files.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  TOOLCHAIN: nightly-2026-09-15
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 macOS is cross-compiled from the arm64 runner (same SDK,
+          # no extra linker needed) since GitHub has no Intel Mac runners.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      # Default features = full build (every format + SIMD).
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Smoke test
+        shell: bash
+        run: |
+          exe=""; case "${{ matrix.target }}" in *-windows-*) exe=".exe";; esac
+          bin="target/${{ matrix.target }}/release/sniff-rs$exe"
+          "$bin" --version
+          printf 'id,name\n1,alice\n2,bob\n' > smoke.csv
+          "$bin" smoke.csv smoke.md
+          test -s smoke.md
+          "$bin" --list-formats | grep -q parquet
+      - name: Package
+        shell: bash
+        run: |
+          exe=""; case "${{ matrix.target }}" in *-windows-*) exe=".exe";; esac
+          stage="sniff-rs-${{ matrix.target }}"
+          mkdir "$stage"
+          cp "target/${{ matrix.target }}/release/sniff-rs$exe" "$stage/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            tar -acf "$stage.zip" "$stage"
+          else
+            tar -czf "$stage.tar.gz" "$stage"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}.${{ matrix.archive }}
+          # upload-artifact names the file `<name>`; the assemble job
+          # renames `<target>.<archive>/sniff-rs-<target>/...` back to a
+          # flat `sniff-rs-<target>.<archive>`. The leading `sniff-rs-`
+          # glob below matches only the archives, never SHA256SUMS.
+          path: sniff-rs-${{ matrix.target }}.${{ matrix.archive }}
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and release
+        run: |
+          cd dist
+          sha256sum sniff-rs-*.tar.gz sniff-rs-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sniff-rs-*.tar.gz
+            dist/sniff-rs-*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

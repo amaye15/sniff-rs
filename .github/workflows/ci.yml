@@ -1,0 +1,57 @@
+# CI runs on the pinned nightly toolchain below - the default build
+# requires nightly (`std::simd`), so a floating toolchain would let a new
+# compiler's lints break CI without any code change. The `minimal` job
+# keeps the stable-compatible `--no-default-features` escape hatch honest.
+#
+# The `test` matrix runs the FULL suite (unit + integration, via the real
+# binary) on all three supported OSes. Windows/macOS failures here are the
+# release gate: the release workflow only smoke-tests, so anything
+# platform-specific must surface here first.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  TOOLCHAIN: nightly-2026-09-15
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      # Three grandfathered lints (baseline as of nightly-2026-09-15,
+      # confirmed pre-existing on unmodified main - not new findings):
+      # chunks_exact_to_as_chunks x5, len_zero, question_mark. Everything
+      # else is still denied, so new lints fail CI.
+      - run: cargo clippy --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks -A clippy::len_zero -A clippy::question_mark
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+      - run: cargo build
+      - run: cargo test
+
+  minimal-stable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - run: cargo build --no-default-features
+      - run: cargo test --no-default-features
