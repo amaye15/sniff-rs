@@ -12196,6 +12196,10 @@ fn relationships_ini_reports_fk_exact_and_inferred_edges() {
     let fk = find_edge(rels, "users", "id");
     assert_eq!(fk["confidence"], "extracted");
     assert!(find_edge(rels, "orders", "user_id").as_object() == fk.as_object());
+    assert_eq!(fk["reference"]["referencing_table"], "orders");
+    assert_eq!(fk["reference"]["referencing_column"], "user_id");
+    assert_eq!(fk["reference"]["referenced_table"], "users");
+    assert_eq!(fk["reference"]["referenced_column"], "id");
     let exact = find_edge(rels, "users", "region");
     assert_eq!(exact["confidence"], "extracted");
     let inferred = find_edge(rels, "users", "email");
@@ -12299,7 +12303,7 @@ fn graph_explain_reports_profile_and_incident_edges() {
     assert!(stdout.contains("# orders.customer_id"));
     assert!(stdout.contains("customers"));
     assert!(stdout.contains("extracted"));
-    assert!(stdout.contains("Community: 0"));
+    assert!(stdout.contains("Community: 0 (orders-centered)"));
 }
 
 #[test]
@@ -12323,6 +12327,7 @@ fn graph_explain_json_shape_and_ambiguous_bare_name() {
     assert_eq!(doc["degree"], 1);
     assert_eq!(doc["neighbors"], serde_json::json!(["customers"]));
     assert_eq!(doc["community"], 0);
+    assert_eq!(doc["community_label"], "orders-centered");
     assert_eq!(doc["relationships"].as_array().unwrap().len(), 1);
 
     // `customer_id` exists in two tables - the bare name must fail
@@ -12408,6 +12413,53 @@ fn graph_path_reports_a_two_hop_chain_in_order() {
     assert_eq!(hops[0]["to_table"], "orders");
     assert_eq!(hops[1]["from_table"], "orders");
     assert_eq!(hops[1]["to_table"], "products");
+    assert_eq!(
+        hops[0]["alternatives"],
+        serde_json::Value::Array(vec![]),
+        "single-edge hops have no alternatives"
+    );
+}
+
+#[test]
+fn graph_path_lists_parallel_links_as_alternatives() {
+    // users <-> orders share three links in edge_relationships.ini; the
+    // hop reports the strongest and names the other two.
+    let output = run_graph(&[
+        "path",
+        fixture("edge_relationships.ini").to_str().unwrap(),
+        "users",
+        "orders",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    let hops = doc["hops"].as_array().unwrap();
+    assert_eq!(hops.len(), 1);
+    assert_eq!(hops[0]["confidence"], "extracted");
+    let alternatives = hops[0]["alternatives"].as_array().unwrap();
+    assert_eq!(alternatives.len(), 2);
+    let cols: Vec<&str> = alternatives
+        .iter()
+        .map(|e| e["from_column"].as_str().unwrap())
+        .collect();
+    // The hop itself is region->region (first extracted edge); the two
+    // unchosen parallel links are named here, in edge order.
+    assert_eq!(cols, vec!["contact", "user_id"]);
+
+    let output = run_graph(&[
+        "path",
+        fixture("edge_relationships.ini").to_str().unwrap(),
+        "users",
+        "orders",
+    ]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("also via:"));
 }
 
 #[test]
@@ -12472,10 +12524,17 @@ fn graph_rank_lists_the_link_table_first_with_communities() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let orders = stdout.find("| orders | 2 |").expect("orders row");
-    let customers = stdout.find("| customers | 1 |").expect("customers row");
+    let orders = stdout
+        .find("| orders | 1 | 2 | 2 | 0 |")
+        .expect("orders row");
+    let customers = stdout
+        .find("| customers | 1 | 1 | 1 | 0 |")
+        .expect("customers row");
     assert!(orders < customers, "god table must rank first: {stdout}");
-    assert!(stdout.contains("Community 0 (3 tables)"), "got: {stdout}");
+    assert!(
+        stdout.contains("Community 0 (orders-centered, 3 tables)"),
+        "got: {stdout}"
+    );
     assert!(
         stdout.contains("Community 1 (1 table): audit"),
         "got: {stdout}"
@@ -12493,10 +12552,13 @@ fn graph_rank_lists_the_link_table_first_with_communities() {
     let tables = doc["tables"].as_array().unwrap();
     assert_eq!(tables[0]["table"], "orders");
     assert_eq!(tables[0]["degree"], 2);
+    assert_eq!(tables[0]["rows"], 1);
     let communities = doc["communities"].as_array().unwrap();
     assert_eq!(communities.len(), 2);
     assert_eq!(communities[0]["members"].as_array().unwrap().len(), 3);
+    assert_eq!(communities[0]["label"], "orders-centered");
     assert_eq!(communities[1]["members"], serde_json::json!(["audit"]));
+    assert_eq!(communities[1]["label"], "audit");
 }
 
 #[test]
@@ -12508,7 +12570,202 @@ fn graph_rank_single_table_reports_zero_degree() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("| sample | 0 | 0 | 0 |"), "got: {stdout}");
+    assert!(
+        stdout.contains("| sample | 5 | 0 | 0 | 0 |"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn graph_samples_deepens_overlap_evidence_on_raw_files() {
+    // `label` vs `labels` is a weak name signal either way; the tier is
+    // decided by overlap, which only deeper samples can see. agents.label
+    // holds v1..v10, jobs.labels holds w1,w2,w3,v7,v8: the first three
+    // samples are disjoint, the full columns share v7 and v8.
+    let dir = TempDir::new();
+    let db = dir.path().join("overlap.sqlite");
+    let setup = format!(
+        "import sqlite3; con = sqlite3.connect(r'{}'); \
+         con.execute('CREATE TABLE agents (label TEXT)'); \
+         con.executemany('INSERT INTO agents VALUES (?)', [(f'v{{i}}',) for i in range(1, 11)]); \
+         con.execute('CREATE TABLE jobs (labels TEXT)'); \
+         con.executemany('INSERT INTO jobs VALUES (?)', [(f'w{{i}}',) for i in range(1, 4)] + [('v7',), ('v8',)]); \
+         con.commit(); con.close()",
+        db.to_str().unwrap()
+    );
+    let out = python()
+        .args(["-c", &setup])
+        .output()
+        .expect("failed to run python");
+    assert!(
+        out.status.success(),
+        "failed to build sqlite fixture: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let output = run_graph(&[
+        "explain",
+        db.to_str().unwrap(),
+        "label",
+        "--output-format",
+        "json",
+        "--samples",
+        "3",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    assert_eq!(doc["relationships"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["relationships"][0]["confidence"], "inferred");
+
+    let output = run_graph(&[
+        "explain",
+        db.to_str().unwrap(),
+        "label",
+        "--output-format",
+        "json",
+        "--samples",
+        "50",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    let rels = doc["relationships"].as_array().unwrap();
+    assert_eq!(rels.len(), 1);
+    assert_eq!(rels[0]["confidence"], "extracted");
+    assert!(
+        rels[0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("v7"))
+    );
+}
+
+#[test]
+fn graph_samples_with_a_dictionary_is_disclosed_not_silent() {
+    let dir = TempDir::new();
+    let dict = dir.path().join("chain.dictionary.json");
+    let output = Command::new(bin())
+        .args([
+            fixture("edge_graph_chain.ini").to_str().unwrap(),
+            dict.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let output = run_graph(&[
+        "explain",
+        dict.to_str().unwrap(),
+        "orders.customer_id",
+        "--samples",
+        "50",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already carries its own samples"),
+        "got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn diff_reports_relationship_drift_for_a_broken_join() {
+    // users.id <-> orders.user_id links in old (both integers); the new
+    // side stores user_id as text, which cannot join an integer. The
+    // column entry already says "type changed" - the drift section adds
+    // the consequence: a join queries may rely on is gone.
+    let dir = TempDir::new();
+    std::fs::write(
+        dir.path().join("old.ini"),
+        "[users]\nid = 1\n\n[orders]\norder_id = 10\nuser_id = 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("new.ini"),
+        "[users]\nid = 1\n\n[orders]\norder_id = 10\nuser_id = C-001\n",
+    )
+    .unwrap();
+    let old = dir.path().join("old.ini");
+    let new = dir.path().join("new.ini");
+
+    let output = Command::new(bin())
+        .args(["diff", old.to_str().unwrap(), new.to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("## Relationship drift"), "got: {stdout}");
+    assert!(stdout.contains("removed"), "got: {stdout}");
+
+    let output = Command::new(bin())
+        .args([
+            "diff",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    assert!(doc["has_breaking_changes"].as_bool().unwrap());
+    let drift = doc["relationship_drift"].as_array().unwrap();
+    assert_eq!(drift.len(), 1);
+    assert_eq!(drift[0]["kind"], "removed");
+    assert_eq!(drift[0]["compatibility"], "breaking");
+
+    // A removed join counts as breaking for CI use...
+    let output = Command::new(bin())
+        .args([
+            "diff",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+            "--fail-on-breaking",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert_eq!(output.status.code(), Some(2));
+
+    // ...and is named (never auto-resolved) in the resolution script.
+    let sql_path = dir.path().join("resolution.sql");
+    let output = Command::new(bin())
+        .args([
+            "diff",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+            "--resolution-sql",
+            sql_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sql = std::fs::read_to_string(&sql_path).unwrap();
+    assert!(sql.contains("(relationship removed)"), "got: {sql}");
 }
 
 #[test]

@@ -56938,20 +56938,35 @@ impl Confidence {
 /// One undirected join-candidate edge between two columns in different
 /// tables. `from_*` is always the lexicographically smaller
 /// (table, column) pair, so the same logical edge serializes identically
-/// regardless of which table was profiled first.
+/// regardless of which table was profiled first. `reference` is `Some`
+/// exactly for foreign-key-pattern edges, where the data itself declares
+/// an orientation (the `<stem>_id` side references the bare-`id` side,
+/// many-to-one); every other edge is genuinely undirected and carries
+/// `None`, rather than a guessed direction.
 struct Relationship {
     from_table: String,
     from_column: String,
     to_table: String,
     to_column: String,
     confidence: Confidence,
+    reference: Option<Reference>,
     evidence: Vec<String>,
     reason: String,
 }
 
+/// The orientation of a foreign-key-pattern edge: `referencing_*` names
+/// the `<stem>_id` column (the many side), `referenced_*` the bare `id`
+/// column it points at (the one side).
+struct Reference {
+    referencing_table: String,
+    referencing_column: String,
+    referenced_table: String,
+    referenced_column: String,
+}
+
 impl Relationship {
     fn to_json(&self) -> JsonValue {
-        let mut obj = json_support::Map::with_capacity(7);
+        let mut obj = json_support::Map::with_capacity(8);
         obj.insert(
             "from_table".to_string(),
             JsonValue::from(self.from_table.clone()),
@@ -56975,6 +56990,34 @@ impl Relationship {
         obj.insert(
             "confidence".to_string(),
             JsonValue::from(self.confidence.as_str().to_string()),
+        );
+        obj.insert(
+            "reference".to_string(),
+            match &self.reference {
+                Some(r) => {
+                    let mut inner = json_support::Map::with_capacity(4);
+                    inner.insert(
+                        "referencing_table".to_string(),
+                        JsonValue::from(r.referencing_table.clone()),
+                    );
+                    inner.insert(
+                        "referencing_column".to_string(),
+                        JsonValue::from(r.referencing_column.clone()),
+                    );
+                    inner.insert(
+                        "referenced_table".to_string(),
+                        JsonValue::from(r.referenced_table.clone()),
+                    );
+                    inner.insert(
+                        "referenced_column".to_string(),
+                        JsonValue::from(r.referenced_column.clone()),
+                    );
+                    JsonValue::Object(inner)
+                }
+                // Never a guessed direction: only the foreign-key pattern
+                // declares an orientation (see `join_candidate`).
+                None => JsonValue::Null,
+            },
         );
         obj.insert(
             "evidence".to_string(),
@@ -57236,17 +57279,24 @@ fn join_candidate(
         Confidence::Inferred
     };
     let mut evidence = Vec::new();
+    // Resolved once for both the evidence text below and the edge's own
+    // `reference` orientation: the `<stem>_id` side references the bare-
+    // `id` side, many-to-one.
+    let fk_sides = if fk {
+        Some(if id_side_1 {
+            (t1, &c1.name, t2, &c2.name)
+        } else {
+            (t2, &c2.name, t1, &c1.name)
+        })
+    } else {
+        None
+    };
     if exact {
         evidence.push(format!(
             "column names match (\"{}\" vs \"{}\")",
             c1.name, c2.name
         ));
-    } else if fk {
-        let (id_tab, id_col, fk_tab, fk_col) = if id_side_1 {
-            (t1, &c1.name, t2, &c2.name)
-        } else {
-            (t2, &c2.name, t1, &c1.name)
-        };
+    } else if let Some((id_tab, id_col, fk_tab, fk_col)) = fk_sides {
         evidence.push(format!(
             "foreign-key naming pattern (\"{id_col}\" in \"{id_tab}\", \"{fk_col}\" in \"{fk_tab}\")"
         ));
@@ -57321,6 +57371,12 @@ fn join_candidate(
         to_table,
         to_column,
         confidence,
+        reference: fk_sides.map(|(id_tab, id_col, fk_tab, fk_col)| Reference {
+            referencing_table: fk_tab.to_string(),
+            referencing_column: fk_col.clone(),
+            referenced_table: id_tab.to_string(),
+            referenced_column: id_col.clone(),
+        }),
         evidence,
         reason,
     })
@@ -57418,7 +57474,6 @@ fn incident_edges(graph: &TableGraph, table: &str) -> Vec<usize> {
 }
 
 /// Shortest join path between two tables as relationship indices, via BFS
-/// over sorted neighbors - fewest hops wins, ties broken deterministically
 /// by table name order. Within one hop, `extracted` edges are tried before
 /// `inferred` ones, so parallel edges resolve to the strongest link rather
 /// than the alphabetically first column: a 1-hop `path` between two tables
@@ -57477,6 +57532,22 @@ fn shortest_path(graph: &TableGraph, from: &str, to: &str) -> Option<Vec<usize>>
     Some(hops)
 }
 
+/// Parallel edges behind one hop that `shortest_path` did NOT choose:
+/// every other relationship between the same table pair, in edge order.
+/// Surfacing them keeps the report honest about ambiguity - the chosen hop
+/// is the strongest link, but a 1-hop answer between tables sharing three
+/// links should not pretend the other two do not exist. One entry per real
+/// edge, the same bounded-by-construction discipline as overlap evidence.
+fn hop_alternatives(graph: &TableGraph, hop: usize) -> Vec<usize> {
+    let rel = &graph.relationships[hop];
+    graph
+        .adj
+        .get(&rel.from_table)
+        .and_then(|neighbors| neighbors.get(&rel.to_table))
+        .map(|indices| indices.iter().copied().filter(|i| *i != hop).collect())
+        .unwrap_or_default()
+}
+
 /// Connected components over table adjacency: each component's members
 /// sorted, components ordered by (size descending, smallest member) so
 /// community 0 is always the largest cluster. Isolated tables form
@@ -57517,6 +57588,44 @@ fn community_of(graph: &TableGraph, table: &str) -> usize {
         .iter()
         .position(|members| members.iter().any(|m| m == table))
         .expect("every profiled table belongs to exactly one component")
+}
+
+/// Human label for one table's community: its highest-degree member
+/// ("orders-centered"), or the member itself for a singleton. Degree ties
+/// keep the alphabetically first member (members arrive sorted, and only
+/// a strictly greater degree replaces the leader).
+fn community_label(graph: &TableGraph, table: &str) -> String {
+    let components = connected_components(graph);
+    let members = components
+        .iter()
+        .find(|members| members.iter().any(|m| m == table))
+        .expect("every profiled table belongs to exactly one component");
+    if members.len() == 1 {
+        return table.to_string();
+    }
+    let mut best = &members[0];
+    let mut best_degree = 0;
+    for member in members {
+        let degree = incident_edges(graph, member).len();
+        if degree > best_degree {
+            best_degree = degree;
+            best = member;
+        }
+    }
+    format!("{best}-centered")
+}
+
+/// Row count of one table: its first column's `row_count`, the documented
+/// convention this codebase already uses (flat readers store the same
+/// total on every column; nested readers store the table's real record
+/// count only on the first). `None` for a genuinely zero-column table,
+/// which has no column to read the count off - rendered as JSON null, not
+/// a fabricated zero.
+fn table_rows(tables: &BTreeMap<String, Vec<ColumnProfile>>, table: &str) -> Option<usize> {
+    tables
+        .get(table)
+        .and_then(|cols| cols.first())
+        .map(|c| c.row_count)
 }
 
 /// Parse one dictionary column object into a `ColumnProfile`, mirroring
@@ -57637,13 +57746,19 @@ fn try_load_graph_tables(
 /// contract one level up: the input may independently be an
 /// already-generated `--output-format json` dictionary (rich or
 /// `--combine` shape - both share the same `"tables"` structure) or a raw
-/// data file profiled fresh with the same defaults a bare
-/// `sniff-rs <path>` uses. Only JSON-detected files are ever considered
-/// as dictionaries; anything else goes straight to `dispatch_reader`,
-/// whose own `ColumnProfile`s are used directly with no conversion step
-/// at all. Directories are rejected with the `--combine` workaround, the
-/// same boundary diff already draws.
-fn load_graph_input(path: &Path) -> Result<BTreeMap<String, Vec<ColumnProfile>>> {
+/// data file profiled fresh. `samples` is the `--samples` value for that
+/// fresh profiling (default 3 when the flag was absent); a dictionary
+/// already carries whatever samples it was built with, so an explicit
+/// `--samples` alongside one is disclosed on stderr rather than silently
+/// ignored. Only JSON-detected files are ever considered as dictionaries;
+/// anything else goes straight to `dispatch_reader`, whose own
+/// `ColumnProfile`s are used directly with no conversion step at all.
+/// Directories are rejected with the `--combine` workaround, the same
+/// boundary diff already draws.
+fn load_graph_input(
+    path: &Path,
+    samples: Option<usize>,
+) -> Result<BTreeMap<String, Vec<ColumnProfile>>> {
     if path.is_dir() {
         bail!(
             "{path:?} is a directory - the graph subcommands read one file. To query a whole \
@@ -57656,13 +57771,19 @@ fn load_graph_input(path: &Path) -> Result<BTreeMap<String, Vec<ColumnProfile>>>
     if matches!(format, InputFormat::Json)
         && let Some(tables) = try_load_graph_tables(path, &read_path)?
     {
+        if let Some(n) = samples {
+            eprintln!(
+                "note: --samples {n} applies to raw-file profiling only - {} already carries its own samples",
+                path.display()
+            );
+        }
         return Ok(tables);
     }
     let synthetic_args = Args {
         input_path: path.to_path_buf(),
         output_path: None,
         output_dir: None,
-        samples: 3,
+        samples: samples.unwrap_or(3),
         nrows: None,
         format: None,
         delimiter: None,
@@ -69105,6 +69226,11 @@ struct DiffEntry {
 #[derive(Debug, Clone, Default)]
 struct DiffReport {
     entries: Vec<DiffEntry>,
+    /// Join-candidate drift between the two snapshots (see
+    /// `relationship_drift`): edges added, removed, or re-confidenced
+    /// among stable endpoints. Empty for single-table comparisons, which
+    /// have no cross-table pairs on either side by construction.
+    relationship_drift: Vec<RelDrift>,
     /// Tables present on both sides whose fingerprint (see
     /// `table_fingerprint`) matched exactly, so the real column-by-column
     /// diff was skipped entirely - surfaced separately from `entries`
@@ -69122,6 +69248,10 @@ impl DiffReport {
         self.entries
             .iter()
             .any(|e| e.compatibility == Compatibility::Breaking)
+            || self
+                .relationship_drift
+                .iter()
+                .any(|d| d.compatibility() == Compatibility::Breaking)
     }
 }
 
@@ -69552,8 +69682,13 @@ fn diff_dictionaries(
                 ..Default::default()
             };
         }
+        let entries = diff_table_columns(&label, sql_table, old_cols, new_cols);
         return DiffReport {
-            entries: diff_table_columns(&label, sql_table, old_cols, new_cols),
+            entries,
+            // Single-table inputs have no cross-table pairs on either
+            // side, so there is nothing relationship_drift could ever
+            // report here - skip the computation outright.
+            relationship_drift: Vec::new(),
             ..Default::default()
         };
     }
@@ -69676,9 +69811,308 @@ fn diff_dictionaries(
     }
 
     DiffReport {
+        relationship_drift: relationship_drift(old, new, &entries),
         entries,
         unchanged_tables,
     }
+}
+
+/// How one join-candidate edge moved between two snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelDriftKind {
+    /// Linked in new, not in old: a new join the new schema enables.
+    Added,
+    /// Linked in old, not in new: a join queries may already rely on.
+    Removed,
+    /// Still linked, but `inferred` now where it was `extracted`.
+    Weakened,
+    /// Still linked, but `extracted` now where it was `inferred`.
+    Strengthened,
+}
+
+impl RelDriftKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RelDriftKind::Added => "added",
+            RelDriftKind::Removed => "removed",
+            RelDriftKind::Weakened => "weakened",
+            RelDriftKind::Strengthened => "strengthened",
+        }
+    }
+
+    fn compatibility(self) -> Compatibility {
+        match self {
+            // A join that vanished - or got measurably less certain - can
+            // break a query built on the old schema, the same way a
+            // removed column can. A new or strengthened join only adds
+            // information, mirroring added-column safety.
+            RelDriftKind::Removed | RelDriftKind::Weakened => Compatibility::Breaking,
+            RelDriftKind::Added | RelDriftKind::Strengthened => Compatibility::Safe,
+        }
+    }
+}
+
+/// One relationship-drift record: the edge's endpoints (each side's own
+/// table names, which may themselves have been renamed - the column
+/// entries already tell that story), what happened, and the confidence on
+/// each side (`None` where the edge does not exist).
+#[derive(Debug, Clone)]
+struct RelDrift {
+    kind: RelDriftKind,
+    from_table: String,
+    from_column: String,
+    to_table: String,
+    to_column: String,
+    old_confidence: Option<Confidence>,
+    new_confidence: Option<Confidence>,
+    reason: String,
+}
+
+impl RelDrift {
+    fn compatibility(&self) -> Compatibility {
+        self.kind.compatibility()
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut obj = json_support::Map::with_capacity(9);
+        obj.insert(
+            "kind".to_string(),
+            JsonValue::from(self.kind.as_str().to_string()),
+        );
+        obj.insert(
+            "from_table".to_string(),
+            JsonValue::from(self.from_table.clone()),
+        );
+        obj.insert(
+            "from_column".to_string(),
+            JsonValue::from(self.from_column.clone()),
+        );
+        obj.insert(
+            "to_table".to_string(),
+            JsonValue::from(self.to_table.clone()),
+        );
+        obj.insert(
+            "to_column".to_string(),
+            JsonValue::from(self.to_column.clone()),
+        );
+        obj.insert(
+            "compatibility".to_string(),
+            JsonValue::from(self.compatibility().label().to_string()),
+        );
+        obj.insert(
+            "old_confidence".to_string(),
+            match self.old_confidence {
+                Some(c) => JsonValue::from(c.as_str().to_string()),
+                None => JsonValue::Null,
+            },
+        );
+        obj.insert(
+            "new_confidence".to_string(),
+            match self.new_confidence {
+                Some(c) => JsonValue::from(c.as_str().to_string()),
+                None => JsonValue::Null,
+            },
+        );
+        obj.insert("reason".to_string(), JsonValue::from(self.reason.clone()));
+        JsonValue::Object(obj)
+    }
+}
+
+/// `DiffColumn` maps rendered as the `ColumnProfile` maps
+/// `detect_relationships` reads: only name/ideal_type/sample_values ever
+/// influence an edge (plus current_type carried for completeness), so the
+/// conversion is total - every other profile field defaults.
+fn diff_profiles_for_graph(
+    tables: &BTreeMap<String, Vec<DiffColumn>>,
+) -> BTreeMap<String, Vec<ColumnProfile>> {
+    tables
+        .iter()
+        .map(|(name, cols)| {
+            (
+                name.clone(),
+                cols.iter()
+                    .map(|c| ColumnProfile {
+                        name: c.name.clone(),
+                        current_type: c.current_type.clone(),
+                        ideal_type: c.ideal_type.clone(),
+                        missing_pct: c.missing_pct,
+                        sample_values: c.sample_values.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Table names one diff entry actually touches: plain entries name their
+/// table directly, but rename entries carry an `"old -> new"` label, so
+/// both sides are extracted (split once - a real table name containing
+/// `" -> "` is pathological, and over-suppressing one such edge beats
+/// mis-attributing drift to the wrong table).
+fn drift_entry_tables(label: &str) -> Vec<&str> {
+    match label.split_once(" -> ") {
+        Some((a, b)) => vec![a, b],
+        None => vec![label],
+    }
+}
+
+/// Join-candidate drift between two snapshots: edges added, removed, or
+/// re-confidenced, computed by running the real `detect_relationships`
+/// over each side's own columns - never a parallel reimplementation, so
+/// drift can never disagree with what profiling itself reports.
+///
+/// Only edges between *stable* endpoints are compared. An edge touching
+/// an added/removed/renamed table or column is skipped outright: the
+/// table/column entries already tell that story, and re-reporting every
+/// one of its incident edges as drift would bury the signal this section
+/// exists for - a join that broke or appeared while its own endpoints
+/// stood still (a type change killing compatibility, new samples
+/// promoting an inference to a measurement, or the reverse). Single-table
+/// inputs never produce drift at all: with one table per side there are
+/// no cross-table pairs to link, on either side.
+fn relationship_drift(
+    old: &BTreeMap<String, Vec<DiffColumn>>,
+    new: &BTreeMap<String, Vec<DiffColumn>>,
+    entries: &[DiffEntry],
+) -> Vec<RelDrift> {
+    let mut touched_tables: HashSet<String> = HashSet::new();
+    let mut touched_columns: HashSet<(String, String)> = HashSet::new();
+    for e in entries {
+        match &e.change {
+            DiffChange::TableAdded | DiffChange::TableRemoved => {
+                touched_tables.insert(e.table.clone());
+            }
+            DiffChange::TableRenamed { from, to, .. } => {
+                touched_tables.insert(from.clone());
+                touched_tables.insert(to.clone());
+            }
+            DiffChange::ColumnAdded { .. } | DiffChange::ColumnRemoved { .. } => {
+                if let Some(col) = &e.column {
+                    for t in drift_entry_tables(&e.table) {
+                        touched_columns.insert((t.to_string(), col.clone()));
+                    }
+                }
+            }
+            DiffChange::ColumnRenamed { from, to, .. } => {
+                for t in drift_entry_tables(&e.table) {
+                    touched_columns.insert((t.to_string(), from.clone()));
+                    touched_columns.insert((t.to_string(), to.clone()));
+                }
+            }
+            // A type or missing-% change on a stable endpoint is exactly
+            // what drift reports on - never suppressed.
+            DiffChange::TypeChanged { .. } | DiffChange::MissingPctChanged { .. } => {}
+        }
+    }
+    let touched = |table: &str, column: &str| {
+        touched_tables.contains(table)
+            || touched_columns.contains(&(table.to_string(), column.to_string()))
+    };
+
+    let old_edges = detect_relationships(&diff_profiles_for_graph(old));
+    let new_edges = detect_relationships(&diff_profiles_for_graph(new));
+    let key = |r: &Relationship| {
+        (
+            r.from_table.clone(),
+            r.from_column.clone(),
+            r.to_table.clone(),
+            r.to_column.clone(),
+        )
+    };
+    let mut old_by_key: BTreeMap<_, _> = BTreeMap::new();
+    for rel in &old_edges {
+        if touched(&rel.from_table, &rel.from_column) || touched(&rel.to_table, &rel.to_column) {
+            continue;
+        }
+        old_by_key.insert(key(rel), rel);
+    }
+    let mut new_by_key: BTreeMap<_, _> = BTreeMap::new();
+    for rel in &new_edges {
+        if touched(&rel.from_table, &rel.from_column) || touched(&rel.to_table, &rel.to_column) {
+            continue;
+        }
+        new_by_key.insert(key(rel), rel);
+    }
+
+    let mut drift = Vec::new();
+    for (k, old_rel) in &old_by_key {
+        match new_by_key.get(k) {
+            None => drift.push(RelDrift {
+                kind: RelDriftKind::Removed,
+                from_table: old_rel.from_table.clone(),
+                from_column: old_rel.from_column.clone(),
+                to_table: old_rel.to_table.clone(),
+                to_column: old_rel.to_column.clone(),
+                old_confidence: Some(old_rel.confidence),
+                new_confidence: None,
+                reason: format!(
+                    "join no longer detected (was {}): {}",
+                    old_rel.confidence.as_str(),
+                    old_rel.reason
+                ),
+            }),
+            Some(new_rel) if new_rel.confidence != old_rel.confidence => {
+                let (kind, verb) = if new_rel.confidence == Confidence::Extracted {
+                    (RelDriftKind::Strengthened, "measured where it was guessed")
+                } else {
+                    (RelDriftKind::Weakened, "guessed where it was measured")
+                };
+                drift.push(RelDrift {
+                    kind,
+                    from_table: new_rel.from_table.clone(),
+                    from_column: new_rel.from_column.clone(),
+                    to_table: new_rel.to_table.clone(),
+                    to_column: new_rel.to_column.clone(),
+                    old_confidence: Some(old_rel.confidence),
+                    new_confidence: Some(new_rel.confidence),
+                    reason: format!(
+                        "link confidence {} → {} ({verb}): {}",
+                        old_rel.confidence.as_str(),
+                        new_rel.confidence.as_str(),
+                        new_rel.reason
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    for (k, new_rel) in &new_by_key {
+        if old_by_key.contains_key(k) {
+            continue;
+        }
+        drift.push(RelDrift {
+            kind: RelDriftKind::Added,
+            from_table: new_rel.from_table.clone(),
+            from_column: new_rel.from_column.clone(),
+            to_table: new_rel.to_table.clone(),
+            to_column: new_rel.to_column.clone(),
+            old_confidence: None,
+            new_confidence: Some(new_rel.confidence),
+            reason: format!(
+                "new join candidate ({}): {}",
+                new_rel.confidence.as_str(),
+                new_rel.reason
+            ),
+        });
+    }
+    drift.sort_by(|a, b| {
+        (
+            &a.from_table,
+            &a.from_column,
+            &a.to_table,
+            &a.to_column,
+            a.kind.as_str(),
+        )
+            .cmp(&(
+                &b.from_table,
+                &b.from_column,
+                &b.to_table,
+                &b.to_column,
+                b.kind.as_str(),
+            ))
+    });
+    drift
 }
 
 fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -> String {
@@ -69687,14 +70121,17 @@ fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -
     md.push_str(&format!("- **Old:** {}\n", old_path.display()));
     md.push_str(&format!("- **New:** {}\n\n", new_path.display()));
 
-    if report.entries.is_empty() && report.unchanged_tables.is_empty() {
+    if report.entries.is_empty()
+        && report.unchanged_tables.is_empty()
+        && report.relationship_drift.is_empty()
+    {
         md.push_str("No differences detected.\n");
         return md;
     }
 
-    if report.entries.is_empty() {
+    if report.entries.is_empty() && report.relationship_drift.is_empty() {
         md.push_str("No differences detected.\n");
-    } else {
+    } else if !report.entries.is_empty() {
         let breaking = report
             .entries
             .iter()
@@ -69720,7 +70157,7 @@ fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -
         ));
     }
 
-    if report.entries.is_empty() {
+    if report.entries.is_empty() && report.relationship_drift.is_empty() {
         return md;
     }
 
@@ -69743,6 +70180,38 @@ fn render_diff_markdown(old_path: &Path, new_path: &Path, report: &DiffReport) -
                 escape_md(&column),
                 diff_change_label(&e.change),
                 escape_md(&e.reason),
+            ));
+        }
+        md.push('\n');
+    }
+
+    // Relationship drift gets its own section, only when non-empty: unlike
+    // the machine-first JSON array below (always present), Markdown is
+    // human-first, and an "everything is linked exactly as before" banner
+    // on every clean diff would be pure noise.
+    if !report.relationship_drift.is_empty() {
+        md.push_str("## Relationship drift\n\n");
+        md.push_str(
+            "Join candidates that appeared, vanished, or changed \
+            confidence between snapshots - endpoints whose table or column \
+            was itself added, removed, or renamed are never listed here; \
+            those entries above already tell that story.\n\n",
+        );
+        md.push_str("| Compat | Link | Change | Detail |\n");
+        md.push_str("|---|---|---|---|\n");
+        for d in &report.relationship_drift {
+            let tag = match d.compatibility() {
+                Compatibility::Safe => "SAFE",
+                Compatibility::Breaking => "BREAKING",
+            };
+            md.push_str(&format!(
+                "| {tag} | {} | {} | {} |\n",
+                escape_md(&format!(
+                    "{}.{} -> {}.{}",
+                    d.from_table, d.from_column, d.to_table, d.to_column
+                )),
+                d.kind.as_str(),
+                escape_md(&d.reason),
             ));
         }
         md.push('\n');
@@ -69847,6 +70316,16 @@ fn render_diff_json(old_path: &Path, new_path: &Path, report: &DiffReport) -> St
     }
     doc.insert("changes".to_string(), JsonValue::Array(arr));
     doc.insert(
+        "relationship_drift".to_string(),
+        JsonValue::Array(
+            report
+                .relationship_drift
+                .iter()
+                .map(RelDrift::to_json)
+                .collect(),
+        ),
+    );
+    doc.insert(
         "unchanged_tables".to_string(),
         JsonValue::Array(
             report
@@ -69883,12 +70362,37 @@ fn render_diff_resolution_sql(report: &DiffReport) -> String {
         .iter()
         .filter(|e| e.compatibility == Compatibility::Breaking)
         .collect();
+    let mut breaking_noted = false;
     if !breaking.is_empty() {
         sql.push_str("--\n-- Breaking changes NOT included below (resolve manually):\n");
         for e in &breaking {
             let column = e.column.as_deref().unwrap_or("(table)");
             sql.push_str(&format!("--   {}.{column}: {}\n", e.table, e.reason));
         }
+        breaking_noted = true;
+    }
+    // A lost or weakened join gets no statement either (there is nothing
+    // to ALTER into existence), but it is named here like every other
+    // breaking change - silently dropping it would hide exactly the
+    // breakage a reviewer needs to see first.
+    for d in report
+        .relationship_drift
+        .iter()
+        .filter(|d| d.compatibility() == Compatibility::Breaking)
+    {
+        if !breaking_noted {
+            sql.push_str("--\n-- Breaking changes NOT included below (resolve manually):\n");
+            breaking_noted = true;
+        }
+        sql.push_str(&format!(
+            "--   {}.{} -> {}.{} (relationship {}): {}\n",
+            d.from_table,
+            d.from_column,
+            d.to_table,
+            d.to_column,
+            d.kind.as_str(),
+            d.reason
+        ));
     }
     sql.push('\n');
 
@@ -70194,6 +70698,10 @@ ARGS:
 
 OPTIONS:
         --output-format <FMT>   md (default) or json
+        --samples <N>           Sample values per column when profiling a
+                                raw data file (default: 3) - deeper samples
+                                strengthen overlap evidence. Dictionaries
+                                already carry their own samples.
     -h, --help                  Print this help
 "#;
 
@@ -70223,6 +70731,10 @@ ARGS:
 
 OPTIONS:
         --output-format <FMT>   md (default) or json
+        --samples <N>           Sample values per column when profiling a
+                                raw data file (default: 3) - deeper samples
+                                strengthen overlap evidence. Dictionaries
+                                already carry their own samples.
     -h, --help                  Print this help
 "#;
 
@@ -70249,6 +70761,10 @@ ARGS:
 
 OPTIONS:
         --output-format <FMT>   md (default) or json
+        --samples <N>           Sample values per column when profiling a
+                                raw data file (default: 3) - deeper samples
+                                strengthen overlap evidence. Dictionaries
+                                already carry their own samples.
     -h, --help                  Print this help
 "#;
 
@@ -70284,10 +70800,17 @@ struct GraphArgs {
     rest: Vec<String>,
     output: Option<PathBuf>,
     format: GraphFormat,
+    /// `--samples` when passed explicitly (`None` means the default 3).
+    /// Only raw data files are ever (re-)profiled, so this only affects
+    /// those; a dictionary already carries whatever samples it was built
+    /// with, and `load_graph_input` says so on stderr rather than
+    /// silently ignoring the flag.
+    samples: Option<usize>,
 }
 
 fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
     let mut output_format = "md".to_string();
+    let mut samples: Option<usize> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0;
     while i < raw.len() {
@@ -70312,6 +70835,16 @@ fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
             };
             match name.as_str() {
                 "output-format" => output_format = value(&mut i)?,
+                "samples" => {
+                    let raw_value = value(&mut i)?;
+                    let parsed: usize = raw_value.parse().map_err(|_| {
+                        anyhow!("--samples must be a positive integer, got {raw_value:?}")
+                    })?;
+                    if parsed == 0 {
+                        bail!("--samples must be a positive integer, got {raw_value:?}");
+                    }
+                    samples = Some(parsed);
+                }
                 other => bail!("unrecognized flag --{other}"),
             }
         } else {
@@ -70329,6 +70862,7 @@ fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
         rest: positionals.collect(),
         output: None,
         format: GraphFormat::parse(&output_format)?,
+        samples,
     })
 }
 
@@ -70371,6 +70905,21 @@ fn emit_graph_output(rendered: &str, output: &Option<PathBuf>, status: &str) -> 
     Ok(())
 }
 
+/// Join a name list for an error message, capped: a several-hundred-table
+/// `--combine` can otherwise turn a helpful "did you mean" list into a
+/// novel. Same capping discipline as overlap evidence (`MAX_OVERLAP_
+/// EVIDENCE`) - bounded output by construction.
+const MAX_NAME_LIST: usize = 10;
+
+fn capped_name_list(mut names: Vec<&str>) -> String {
+    names.sort();
+    if names.len() <= MAX_NAME_LIST {
+        return names.join(", ");
+    }
+    let shown = names[..MAX_NAME_LIST].join(", ");
+    format!("{shown}, +{} more", names.len() - MAX_NAME_LIST)
+}
+
 /// Resolve a column spec against profiled tables: `table.column`
 /// (splitting on the first dot, so flattened `metadata.risk_score`
 /// columns work), or a bare name when it is unique across every table.
@@ -70381,24 +70930,15 @@ fn resolve_graph_column(
 ) -> Result<(String, usize)> {
     if let Some((table, column)) = spec.split_once('.') {
         let cols = tables.get(table).ok_or_else(|| {
-            let mut names: Vec<&String> = tables.keys().collect();
-            names.sort();
             anyhow!(
                 "unknown table {table:?} - available tables: {}",
-                names
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                capped_name_list(tables.keys().map(String::as_str).collect())
             )
         })?;
         let idx = cols.iter().position(|c| c.name == column).ok_or_else(|| {
             anyhow!(
                 "table {table:?} has no column {column:?} - available columns: {}",
-                cols.iter()
-                    .map(|c| c.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                capped_name_list(cols.iter().map(|c| c.name.as_str()).collect())
             )
         })?;
         return Ok((table.to_string(), idx));
@@ -70415,12 +70955,10 @@ fn resolve_graph_column(
         0 => bail!("no column named {spec:?} in any table"),
         1 => Ok(hits.into_iter().next().expect("exactly one hit")),
         _ => {
-            let mut qualified: Vec<String> =
-                hits.iter().map(|(t, _)| format!("{t}.{spec}")).collect();
-            qualified.sort();
+            let qualified: Vec<String> = hits.iter().map(|(t, _)| format!("{t}.{spec}")).collect();
             bail!(
                 "column {spec:?} exists in several tables - qualify it: {}",
-                qualified.join(", ")
+                capped_name_list(qualified.iter().map(String::as_str).collect())
             )
         }
     }
@@ -70479,10 +71017,11 @@ fn render_explain_md(
         seen
     };
     out.push_str(&format!(
-        "- Degree: {} (neighbor{}) · Community: {}\n",
+        "- Degree: {} (neighbor{}) · Community: {} ({})\n",
         edge_indices.len(),
         if neighbors.len() == 1 { "" } else { "s" },
-        community_of(graph, table)
+        community_of(graph, table),
+        community_label(graph, table)
     ));
     if !neighbors.is_empty() {
         out.push_str(&format!(
@@ -70530,7 +71069,7 @@ fn render_explain_json(
     graph: &TableGraph,
     edge_indices: &[usize],
 ) -> Result<String> {
-    let mut doc = json_support::Map::with_capacity(11);
+    let mut doc = json_support::Map::with_capacity(12);
     doc.insert(
         "input".to_string(),
         JsonValue::from(input.display().to_string()),
@@ -70586,6 +71125,10 @@ fn render_explain_json(
         JsonValue::from(community_of(graph, table) as i64),
     );
     doc.insert(
+        "community_label".to_string(),
+        JsonValue::from(community_label(graph, table)),
+    );
+    doc.insert(
         "relationships".to_string(),
         JsonValue::Array(
             edge_indices
@@ -70602,7 +71145,7 @@ fn run_explain(raw: &[String]) -> Result<()> {
     let (positionals, output) = split_graph_rest(&args.rest, 1, "<INPUT> <COLUMN> [OUTPUT_PATH]")?;
     args.output = output;
     let column_spec = positionals[0].clone();
-    let tables = load_graph_input(&args.input)?;
+    let tables = load_graph_input(&args.input, args.samples)?;
     let graph = build_table_graph(&tables);
     let (table, idx) = resolve_graph_column(&tables, &column_spec)?;
     let profile = &tables.get(&table).expect("resolved table exists")[idx];
@@ -70655,6 +71198,25 @@ fn render_path_md(
             rel.confidence.as_str(),
             rel.reason,
         ));
+        let alternates = hop_alternatives(graph, *idx);
+        if !alternates.is_empty() {
+            let listed = alternates
+                .iter()
+                .map(|i| {
+                    let alt = &graph.relationships[*i];
+                    format!(
+                        "{}.{} → {}.{} ({})",
+                        alt.from_table,
+                        alt.from_column,
+                        alt.to_table,
+                        alt.to_column,
+                        alt.confidence.as_str()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("   also via: {listed}\n"));
+        }
     }
     out
 }
@@ -70677,7 +71239,22 @@ fn render_path_json(
         "hops".to_string(),
         JsonValue::Array(
             hops.iter()
-                .map(|idx| graph.relationships[*idx].to_json())
+                .map(|idx| {
+                    let mut hop = match graph.relationships[*idx].to_json() {
+                        JsonValue::Object(map) => map,
+                        _ => json_support::Map::with_capacity(0),
+                    };
+                    hop.insert(
+                        "alternatives".to_string(),
+                        JsonValue::Array(
+                            hop_alternatives(graph, *idx)
+                                .iter()
+                                .map(|i| graph.relationships[*i].to_json())
+                                .collect(),
+                        ),
+                    );
+                    JsonValue::Object(hop)
+                })
                 .collect(),
         ),
     );
@@ -70696,18 +71273,12 @@ fn run_path(raw: &[String]) -> Result<()> {
     if from == to {
         bail!("{from:?} and {to:?} are the same table - a join path needs two different tables");
     }
-    let tables = load_graph_input(&args.input)?;
+    let tables = load_graph_input(&args.input, args.samples)?;
     for name in [&from, &to] {
         if !tables.contains_key(name) {
-            let mut available: Vec<&String> = tables.keys().collect();
-            available.sort();
             bail!(
                 "unknown table {name:?} - available tables: {}",
-                available
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                capped_name_list(tables.keys().map(String::as_str).collect())
             );
         }
     }
@@ -70727,11 +71298,15 @@ fn run_path(raw: &[String]) -> Result<()> {
     emit_graph_output(&rendered, &args.output, &format!("join path {from} → {to}"))
 }
 
-fn render_rank_md(graph: &TableGraph, components: &[Vec<String>]) -> String {
+fn render_rank_md(
+    graph: &TableGraph,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    components: &[Vec<String>],
+) -> String {
     let mut out = String::new();
     out.push_str("# Tables by connectivity\n\n");
-    out.push_str("| Table | Degree | Neighbors | Community |\n");
-    out.push_str("|---|---|---|---|\n");
+    out.push_str("| Table | Rows | Degree | Neighbors | Community |\n");
+    out.push_str("|---|---|---|---|---|\n");
     let mut rows: Vec<(&String, usize, usize, usize)> = graph
         .tables
         .iter()
@@ -70747,9 +71322,14 @@ fn render_rank_md(graph: &TableGraph, components: &[Vec<String>]) -> String {
         .collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     for (table, degree, neighbors, community) in rows {
+        let rows_text = match table_rows(tables, table) {
+            Some(n) => n.to_string(),
+            None => "(unknown)".to_string(),
+        };
         out.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} |\n",
             escape_graph_md(table),
+            rows_text,
             degree,
             neighbors,
             community
@@ -70757,22 +71337,33 @@ fn render_rank_md(graph: &TableGraph, components: &[Vec<String>]) -> String {
     }
     out.push_str("\n## Communities\n\n");
     for (id, members) in components.iter().enumerate() {
-        out.push_str(&format!(
-            "- Community {id} ({} table{}): {}\n",
-            members.len(),
-            if members.len() == 1 { "" } else { "s" },
-            members
-                .iter()
-                .map(|m| escape_graph_md(m))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        if members.len() == 1 {
+            out.push_str(&format!(
+                "- Community {id} (1 table): {}\n",
+                escape_graph_md(&members[0])
+            ));
+        } else {
+            // The label names the community's own hub (see
+            // `community_label`), so a reader never has to cross-reference
+            // the table above to know what a cluster is about.
+            let label = community_label(graph, &members[0]);
+            out.push_str(&format!(
+                "- Community {id} ({label}, {} tables): {}\n",
+                members.len(),
+                members
+                    .iter()
+                    .map(|m| escape_graph_md(m))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     out
 }
 
 fn render_rank_json(
     graph: &TableGraph,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
     components: &[Vec<String>],
     input: &Path,
 ) -> Result<String> {
@@ -70800,8 +71391,15 @@ fn render_rank_json(
         JsonValue::Array(
             rows.iter()
                 .map(|(table, degree, neighbors, community)| {
-                    let mut obj = json_support::Map::with_capacity(4);
+                    let mut obj = json_support::Map::with_capacity(5);
                     obj.insert("table".to_string(), JsonValue::from(table.to_string()));
+                    obj.insert(
+                        "rows".to_string(),
+                        match table_rows(tables, table) {
+                            Some(n) => JsonValue::from(n as i64),
+                            None => JsonValue::Null,
+                        },
+                    );
                     obj.insert("degree".to_string(), JsonValue::from(*degree as i64));
                     obj.insert("neighbors".to_string(), JsonValue::from(*neighbors as i64));
                     obj.insert("community".to_string(), JsonValue::from(*community as i64));
@@ -70817,9 +71415,13 @@ fn render_rank_json(
                 .iter()
                 .enumerate()
                 .map(|(id, members)| {
-                    let mut obj = json_support::Map::with_capacity(3);
+                    let mut obj = json_support::Map::with_capacity(4);
                     obj.insert("id".to_string(), JsonValue::from(id as i64));
                     obj.insert("size".to_string(), JsonValue::from(members.len() as i64));
+                    obj.insert(
+                        "label".to_string(),
+                        JsonValue::from(community_label(graph, &members[0])),
+                    );
                     obj.insert(
                         "members".to_string(),
                         JsonValue::Array(members.iter().cloned().map(JsonValue::from).collect()),
@@ -70837,12 +71439,12 @@ fn run_rank(raw: &[String]) -> Result<()> {
     let (positionals, output) = split_graph_rest(&args.rest, 0, "<INPUT> [OUTPUT_PATH]")?;
     debug_assert!(positionals.is_empty());
     args.output = output;
-    let tables = load_graph_input(&args.input)?;
+    let tables = load_graph_input(&args.input, args.samples)?;
     let graph = build_table_graph(&tables);
     let components = connected_components(&graph);
     let rendered = match args.format {
-        GraphFormat::Md => render_rank_md(&graph, &components),
-        GraphFormat::Json => render_rank_json(&graph, &components, &args.input)?,
+        GraphFormat::Md => render_rank_md(&graph, &tables, &components),
+        GraphFormat::Json => render_rank_json(&graph, &tables, &components, &args.input)?,
     };
     emit_graph_output(
         &rendered,
@@ -70873,6 +71475,143 @@ mod diff_tests {
     fn sample_value_overlap_is_none_when_either_side_has_no_samples() {
         assert_eq!(sample_value_overlap(&[], &["a".to_string()]), None);
         assert_eq!(sample_value_overlap(&["a".to_string()], &[]), None);
+    }
+
+    fn drift_tables(entries: &[(&str, Vec<DiffColumn>)]) -> BTreeMap<String, Vec<DiffColumn>> {
+        entries
+            .iter()
+            .map(|(t, cols)| (t.to_string(), cols.clone()))
+            .collect()
+    }
+
+    fn drift_col(name: &str, ideal: &str, samples: &[&str]) -> DiffColumn {
+        col(name, ideal, 0.0, samples)
+    }
+
+    #[test]
+    fn drift_reports_a_removed_edge_on_a_type_break() {
+        // users.id (i64) <-> orders.user_id (i64) links in old; the new
+        // side stores user_id as text, which cannot join an integer.
+        let old = drift_tables(&[
+            ("users", vec![drift_col("id", "i64", &["1"])]),
+            ("orders", vec![drift_col("user_id", "i64", &["1"])]),
+        ]);
+        let new = drift_tables(&[
+            ("users", vec![drift_col("id", "i64", &["1"])]),
+            ("orders", vec![drift_col("user_id", "String", &["C-1"])]),
+        ]);
+        let report = diff_dictionaries(&old, &new);
+        assert_eq!(report.relationship_drift.len(), 1);
+        let drift = &report.relationship_drift[0];
+        assert_eq!(drift.kind, RelDriftKind::Removed);
+        assert_eq!(drift.compatibility(), Compatibility::Breaking);
+        assert_eq!(drift.old_confidence, Some(Confidence::Extracted));
+        assert_eq!(drift.new_confidence, None);
+        assert!(report.has_breaking());
+    }
+
+    #[test]
+    fn drift_reports_an_added_edge_on_a_safe_widening() {
+        // i64 -> String is a safe widening, and here it genuinely enables
+        // a join that could not exist before (integer vs UUID).
+        let old = drift_tables(&[
+            ("a", vec![drift_col("ref", "UUID", &["abc"])]),
+            ("b", vec![drift_col("ref", "i64", &["1"])]),
+        ]);
+        let new = drift_tables(&[
+            ("a", vec![drift_col("ref", "UUID", &["abc"])]),
+            ("b", vec![drift_col("ref", "String", &["abc"])]),
+        ]);
+        let report = diff_dictionaries(&old, &new);
+        assert_eq!(report.relationship_drift.len(), 1);
+        let drift = &report.relationship_drift[0];
+        assert_eq!(drift.kind, RelDriftKind::Added);
+        assert_eq!(drift.compatibility(), Compatibility::Safe);
+        assert!(!report.has_breaking());
+    }
+
+    #[test]
+    fn drift_reports_weakened_confidence_from_sample_drift_alone() {
+        // Names and types stand still; only the samples move (overlap lost),
+        // so there are no column entries at all - yet the measured link
+        // degrades to a guess. This is the one drift shape with an empty
+        // `entries` list, and it still counts as breaking.
+        let old = drift_tables(&[
+            ("a", vec![drift_col("customer", "String", &["acme"])]),
+            ("b", vec![drift_col("customer_id", "String", &["acme"])]),
+        ]);
+        let new = drift_tables(&[
+            ("a", vec![drift_col("customer", "String", &["acme"])]),
+            ("b", vec![drift_col("customer_id", "String", &["globex"])]),
+        ]);
+        let report = diff_dictionaries(&old, &new);
+        assert!(report.entries.is_empty());
+        assert_eq!(report.relationship_drift.len(), 1);
+        assert_eq!(report.relationship_drift[0].kind, RelDriftKind::Weakened);
+        assert!(report.has_breaking());
+    }
+
+    #[test]
+    fn drift_reports_strengthened_confidence_from_new_overlap() {
+        let old = drift_tables(&[
+            ("a", vec![drift_col("customer", "String", &["acme"])]),
+            ("b", vec![drift_col("customer_id", "String", &["globex"])]),
+        ]);
+        let new = drift_tables(&[
+            ("a", vec![drift_col("customer", "String", &["acme"])]),
+            ("b", vec![drift_col("customer_id", "String", &["acme"])]),
+        ]);
+        let report = diff_dictionaries(&old, &new);
+        assert_eq!(report.relationship_drift.len(), 1);
+        assert_eq!(
+            report.relationship_drift[0].kind,
+            RelDriftKind::Strengthened
+        );
+        assert!(!report.has_breaking());
+    }
+
+    #[test]
+    fn drift_suppresses_edges_touching_renamed_columns() {
+        // users.id -> users.identifier is a rename (same UUID samples);
+        // the old and new edges around it are that entry's own story, not
+        // separate drift.
+        let old = drift_tables(&[
+            ("users", vec![drift_col("id", "UUID", &["abc"])]),
+            ("orders", vec![drift_col("user_id", "UUID", &["abc"])]),
+        ]);
+        let new = drift_tables(&[
+            ("users", vec![drift_col("identifier", "UUID", &["abc"])]),
+            ("orders", vec![drift_col("user_id", "UUID", &["abc"])]),
+        ]);
+        let report = diff_dictionaries(&old, &new);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| matches!(e.change, DiffChange::ColumnRenamed { .. }))
+        );
+        assert!(
+            report.relationship_drift.is_empty(),
+            "rename fallout must not double-report: {:?}",
+            report.relationship_drift
+        );
+    }
+
+    #[test]
+    fn drift_suppresses_edges_touching_added_tables() {
+        let old = drift_tables(&[("users", vec![drift_col("id", "i64", &["1"])])]);
+        let new = drift_tables(&[
+            ("users", vec![drift_col("id", "i64", &["1"])]),
+            ("orders", vec![drift_col("user_id", "i64", &["1"])]),
+        ]);
+        let report = diff_dictionaries(&old, &new);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| matches!(e.change, DiffChange::TableAdded))
+        );
+        assert!(report.relationship_drift.is_empty());
     }
 
     #[test]
@@ -71473,6 +72212,7 @@ mod diff_tests {
                 reason: "not nullable".to_string(),
             }],
             unchanged_tables: vec!["users".to_string(), "products".to_string()],
+            relationship_drift: Vec::new(),
         };
         let json = render_diff_json(Path::new("old.json"), Path::new("new.json"), &report);
         let doc = json_support::from_str(&json).unwrap();
@@ -78917,6 +79657,40 @@ mod tests {
     }
 
     #[test]
+    fn graph_hop_alternatives_list_unchosen_parallel_edges() {
+        // users <-> orders share two links (region exact, id fk-pattern):
+        // the hop reports one, alternatives the other, and a lone edge
+        // reports none.
+        let graph = graph_tables(&[
+            (
+                "users",
+                vec![
+                    rel_col("id", "i64", &["1"]),
+                    rel_col("region", "String", &["n"]),
+                ],
+            ),
+            (
+                "orders",
+                vec![
+                    rel_col("user_id", "i64", &["1"]),
+                    rel_col("region", "String", &["n"]),
+                ],
+            ),
+            ("audit", vec![rel_col("note", "String", &["x"])]),
+        ]);
+        let hops = shortest_path(&graph, "users", "orders").expect("edge exists");
+        assert_eq!(hops.len(), 1);
+        let alternates = hop_alternatives(&graph, hops[0]);
+        assert_eq!(alternates.len(), 1);
+        let alt = &graph.relationships[alternates[0]];
+        let chosen = &graph.relationships[hops[0]];
+        assert_ne!(
+            (alt.from_column.as_str(), alt.to_column.as_str()),
+            (chosen.from_column.as_str(), chosen.to_column.as_str())
+        );
+    }
+
+    #[test]
     fn graph_disconnected_or_unknown_tables_yield_no_path() {
         let graph = graph_tables(&[
             ("a", vec![rel_col("id", "i64", &["1"])]),
@@ -79021,6 +79795,27 @@ mod tests {
     }
 
     #[test]
+    fn graph_name_listings_cap_at_ten_with_a_count() {
+        assert_eq!(capped_name_list(vec!["b", "a"]), "a, b");
+        let many: Vec<String> = (0..15).map(|i| format!("t{i:02}")).collect();
+        let listed = capped_name_list(many.iter().map(String::as_str).collect());
+        assert!(listed.starts_with("t00, t01"), "got: {listed}");
+        assert!(listed.ends_with("+5 more"), "got: {listed}");
+        // The ambiguous-column error itself stays bounded: 12 tables
+        // sharing one column name list 10 candidates, not 12.
+        let names: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        let entries: Vec<(&str, Vec<ColumnProfile>)> = names
+            .iter()
+            .map(|n| (n.as_str(), vec![rel_col("id", "i64", &["1"])]))
+            .collect();
+        let tables = rel_tables(&entries);
+        let err = resolve_graph_column(&tables, "id").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.ends_with("+2 more"), "got: {msg}");
+        assert!(!msg.contains("t11.id"), "got: {msg}");
+    }
+
+    #[test]
     fn graph_column_from_json_keeps_notes_and_tolerates_sparse_objects() {
         let v = json_support::from_str(
             r#"{"name": "zip_code", "ideal_type": "String", "notes": "leading zeros", "unknown_future_key": 1}"#,
@@ -79033,6 +79828,69 @@ mod tests {
         assert!(col.sample_values.is_empty());
         let v = json_support::from_str(r#"{"ideal_type": "i64"}"#).unwrap();
         assert!(graph_column_from_json_owned(v).is_err());
+    }
+
+    fn graph_raw_args(flags: &[&str]) -> Vec<String> {
+        let mut raw = vec!["input.csv".to_string(), "col".to_string()];
+        raw.extend(flags.iter().map(|s| s.to_string()));
+        raw
+    }
+
+    #[test]
+    fn graph_samples_flag_defaults_parses_and_rejects() {
+        let args = parse_graph_args(&graph_raw_args(&[]), EXPLAIN_HELP_TEXT).unwrap();
+        assert_eq!(args.samples, None);
+        let args =
+            parse_graph_args(&graph_raw_args(&["--samples", "50"]), EXPLAIN_HELP_TEXT).unwrap();
+        assert_eq!(args.samples, Some(50));
+        let args = parse_graph_args(&graph_raw_args(&["--samples=10"]), EXPLAIN_HELP_TEXT).unwrap();
+        assert_eq!(args.samples, Some(10));
+        assert!(
+            parse_graph_args(&graph_raw_args(&["--samples", "abc"]), EXPLAIN_HELP_TEXT).is_err()
+        );
+        assert!(parse_graph_args(&graph_raw_args(&["--samples", "0"]), EXPLAIN_HELP_TEXT).is_err());
+        assert!(parse_graph_args(&graph_raw_args(&["--samples"]), EXPLAIN_HELP_TEXT).is_err());
+    }
+
+    #[test]
+    fn graph_community_label_names_the_hub_or_the_singleton() {
+        let graph = graph_tables(&[
+            ("authors", vec![rel_col("author_id", "i64", &["1", "2"])]),
+            (
+                "books",
+                vec![
+                    rel_col("author_id", "i64", &["1"]),
+                    rel_col("publisher_id", "i64", &["9"]),
+                ],
+            ),
+            ("publishers", vec![rel_col("publisher_id", "i64", &["9"])]),
+            ("audit", vec![rel_col("note", "String", &["x"])]),
+        ]);
+        assert_eq!(community_label(&graph, "authors"), "books-centered");
+        assert_eq!(community_label(&graph, "books"), "books-centered");
+        // A singleton's label is itself - there is no hub to name.
+        assert_eq!(community_label(&graph, "audit"), "audit");
+    }
+
+    #[test]
+    fn graph_table_rows_reads_the_first_column_and_admits_unknown() {
+        let mut tables = rel_tables(&[(
+            "t",
+            vec![
+                rel_col("a", "i64", &["1", "2"]),
+                rel_col("b", "String", &["x", "y"]),
+            ],
+        )]);
+        // The first column carries the table total (the documented
+        // convention), even when a later column says otherwise.
+        tables.get_mut("t").expect("t")[0].row_count = 42;
+        tables.get_mut("t").expect("t")[1].row_count = 7;
+        assert_eq!(table_rows(&tables, "t"), Some(42));
+        // A genuinely zero-column table has no count to read - unknown,
+        // not zero.
+        tables.insert("empty".to_string(), Vec::new());
+        assert_eq!(table_rows(&tables, "empty"), None);
+        assert_eq!(table_rows(&tables, "missing"), None);
     }
 
     // `detect_relationships` - cross-table join candidates. A column is
@@ -79101,6 +79959,29 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].confidence, Confidence::Extracted);
         assert!(edges[0].evidence.iter().any(|e| e.contains("foreign-key")));
+        // The orientation is kept, not just the fact: orders.user_id
+        // (many) references users.id (one).
+        let reference = edges[0]
+            .reference
+            .as_ref()
+            .expect("fk edge has a reference");
+        assert_eq!(reference.referencing_table, "orders");
+        assert_eq!(reference.referencing_column, "user_id");
+        assert_eq!(reference.referenced_table, "users");
+        assert_eq!(reference.referenced_column, "id");
+    }
+
+    #[test]
+    fn relationships_exact_name_edge_carries_no_reference() {
+        // Only the foreign-key pattern declares an orientation; an exact
+        // name match is genuinely undirected.
+        let tables = rel_tables(&[
+            ("users", vec![rel_col("region", "String", &["north"])]),
+            ("orders", vec![rel_col("region", "String", &["north"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].reference.is_none());
     }
 
     #[test]

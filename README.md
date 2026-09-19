@@ -14,6 +14,26 @@ Writes Markdown, rich JSON, JSON-Schema, or a runnable SQL script.
 
 Zero runtime dependencies: every reader is hand-rolled pure `std`.
 
+## Relationships and graph queries
+
+Rich JSON output carries a top-level `relationships` array: join
+candidates detected across tables (SQLite, Excel, INI, multi-table
+formats, or `--combine` directories), each tagged `extracted` (measured
+in the data: matching names, a `users.id` ← `orders.user_id` shape, or
+shared samples) or `inferred` (similar names, or a shared UUID/Email
+domain), with per-edge evidence. Three subcommands query the graph
+without re-reading any file - each takes a dictionary or a raw file:
+
+```bash
+sniff-rs explain warehouse.db users.id     # one column: profile + edges
+sniff-rs path warehouse.db orders users    # shortest join chain
+sniff-rs rank warehouse.db                 # god tables + communities
+```
+
+`diff` additionally reports relationship drift: joins that appeared,
+vanished, or changed confidence between snapshots (a lost join is
+breaking, like a removed column).
+
 ## Install
 
 Pick one row. All binaries are the full build (every format, SIMD on).
