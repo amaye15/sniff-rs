@@ -12156,3 +12156,113 @@ fn stdin_input_survives_sql_inline_modes_second_pass_reread() {
     // schema - proves the second pass actually re-read real content.
     assert!(sql.contains("U1001"));
 }
+
+// ---------------------------------------------------------------------------
+// Cross-table relationships (join candidates): `detect_relationships`
+// emits an undirected edge list under every rich-JSON document's own
+// top-level "relationships" key - the "graphify for data" half of this
+// tool (profiling already produces the nodes). Confidence follows
+// Graphify's own EXTRACTED/INFERRED vocabulary: measured in the data
+// itself (matching names, a users.id <- orders.user_id shape, or shared
+// samples) versus worth surfacing but not asserted (similar names only,
+// or a shared identifier domain under different names).
+// ---------------------------------------------------------------------------
+
+/// Finds the edge touching `column` in `table` (either endpoint), or panics
+/// naming what was missing - the integration-level twin of the
+/// `rel_edge` unit-test helper.
+fn find_edge<'a>(
+    rels: &'a [serde_json::Value],
+    table: &str,
+    column: &str,
+) -> &'a serde_json::Value {
+    rels.iter()
+        .find(|e| {
+            (e["from_table"] == table || e["to_table"] == table)
+                && (e["from_column"] == column || e["to_column"] == column)
+        })
+        .unwrap_or_else(|| panic!("no relationship edge for {table}.{column}"))
+}
+
+#[test]
+fn relationships_ini_reports_fk_exact_and_inferred_edges() {
+    let doc = run_json("edge_relationships.ini", &[]);
+    let rels = doc["relationships"].as_array().unwrap();
+    // users.id <-> orders.user_id: foreign-key naming + UUID + a shared
+    // sample - extracted. region <-> region: identical names - extracted.
+    // email <-> contact: shared Email domain, different names - inferred.
+    // orders.order_id (i64) matches nothing and correctly yields no edge.
+    assert_eq!(rels.len(), 3);
+    let fk = find_edge(rels, "users", "id");
+    assert_eq!(fk["confidence"], "extracted");
+    assert!(find_edge(rels, "orders", "user_id").as_object() == fk.as_object());
+    let exact = find_edge(rels, "users", "region");
+    assert_eq!(exact["confidence"], "extracted");
+    let inferred = find_edge(rels, "users", "email");
+    assert_eq!(inferred["confidence"], "inferred");
+    assert!(find_edge(rels, "orders", "contact").as_object() == inferred.as_object());
+    for e in rels {
+        assert_eq!(e["kind"], "join_candidate");
+        assert!(!e["evidence"].as_array().unwrap().is_empty());
+        assert!(!e["reason"].as_str().unwrap().is_empty());
+    }
+    // Edges sorted by (from-table, from-column): all three run orders ->
+    // users here, contact < region < user_id.
+    let cols: Vec<&str> = rels
+        .iter()
+        .map(|e| e["from_column"].as_str().unwrap())
+        .collect();
+    assert_eq!(cols, vec!["contact", "region", "user_id"]);
+}
+
+#[test]
+fn relationships_combine_links_a_shared_column_across_files() {
+    let dir = TempDir::new();
+    std::fs::write(
+        dir.path().join("customers.csv"),
+        "customer_id,name\nC-001,Alice\nC-002,Bob\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("orders.csv"),
+        "order_id,customer_id,total\n1,C-001,9.99\n2,C-002,4.50\n",
+    )
+    .unwrap();
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.json"))).unwrap(),
+    )
+    .unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    // `customer_id` (plain String in both files) is the one honest link:
+    // order_id/total match nothing, and names must not bleed across the
+    // qualified tables.
+    assert_eq!(rels.len(), 1);
+    let edge = &rels[0];
+    assert_eq!(edge["from_column"], "customer_id");
+    assert_eq!(edge["to_column"], "customer_id");
+    assert_ne!(edge["from_table"], edge["to_table"]);
+    assert_eq!(edge["confidence"], "extracted");
+}
+
+#[test]
+fn relationships_single_table_reports_an_empty_array() {
+    // The key is always present (never omitted), so consumers never
+    // distinguish "none found" from "not computed".
+    let doc = run_json("sample.csv", &[]);
+    assert_eq!(doc["relationships"], serde_json::Value::Array(vec![]));
+}

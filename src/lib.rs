@@ -56779,7 +56779,7 @@ fn render_json(
     // `BTreeMap<String, Vec<ColumnProfile>>` for a different, still-valid
     // reason - table-name sorting in a multi-table file's output - so its
     // own key order is deliberately unchanged.
-    let mut doc = json_support::Map::with_capacity(3);
+    let mut doc = json_support::Map::with_capacity(4);
     doc.insert("file".to_string(), JsonValue::from(file_name.to_string()));
     doc.insert(
         "format".to_string(),
@@ -56788,6 +56788,20 @@ fn render_json(
     doc.insert(
         "tables".to_string(),
         JsonValue::Object(tables_to_json(tables)),
+    );
+    // Appended last, per this file's own additive-field convention (see
+    // `ColumnProfile::to_json`): cross-table join candidates, possibly an
+    // empty array for a single-table file - always present, never omitted,
+    // so consumers never have to distinguish "none found" from "not
+    // computed".
+    doc.insert(
+        "relationships".to_string(),
+        JsonValue::Array(
+            detect_relationships(tables)
+                .iter()
+                .map(Relationship::to_json)
+                .collect(),
+        ),
     );
     Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
 }
@@ -56804,7 +56818,7 @@ fn render_combined_json(
     directory_name: &str,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
 ) -> Result<String> {
-    let mut doc = json_support::Map::with_capacity(2);
+    let mut doc = json_support::Map::with_capacity(3);
     doc.insert(
         "directory".to_string(),
         JsonValue::from(directory_name.to_string()),
@@ -56812,6 +56826,18 @@ fn render_combined_json(
     doc.insert(
         "tables".to_string(),
         JsonValue::Object(tables_to_json(tables)),
+    );
+    // Same appended-last convention as `render_json`: this is where
+    // cross-*file* relationships surface, since `--combine`'s qualified
+    // tables all land in the one map this is computed from.
+    doc.insert(
+        "relationships".to_string(),
+        JsonValue::Array(
+            detect_relationships(tables)
+                .iter()
+                .map(Relationship::to_json)
+                .collect(),
+        ),
     );
     Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
 }
@@ -56831,6 +56857,488 @@ fn tables_to_json(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> json_support
         );
     }
     tables_obj
+}
+
+// --- Cross-table relationships (join candidates) ---
+//
+// `detect_relationships` turns one already-profiled `tables` map into a flat
+// list of undirected join-candidate edges - the "graphify for data" half of
+// this tool: profiling already produces the nodes (tables and their typed
+// columns), and this produces the edges between them. It runs on the
+// already-computed `ColumnProfile`s, never on raw values, so it costs no
+// second pass over any file and works identically for single-file
+// multi-table formats (SQLite, Excel, INI), `--combine` directory runs
+// (whose qualified `<file>__<table>` names are just ordinary table names
+// here), and single-table files (which trivially yield zero edges).
+//
+// Confidence follows Graphify's own EXTRACTED/INFERRED vocabulary, mapped
+// onto this project's "trust observed data" philosophy: `extracted` means
+// the data itself declares the link (an identical column name, a
+// conventional `users.id <- orders.user_id` foreign-key shape, or literally
+// shared sample values), while `inferred` means a weaker signal worth
+// surfacing but not asserting (similar names with nothing observed in
+// common, or two columns sharing an identifier-like domain under different
+// names). Every edge carries its own `evidence` list, so no confidence tag
+// ever has to be taken on faith - the same "every edge explained" contract
+// Graphify's own report keeps.
+//
+// Deliberately conservative, the same way every heuristic in this file is:
+//   - Both columns must resolve to *compatible* types first, or there is no
+//     edge at all. Identical `ideal_type`s are compatible; a plain `String`
+//     (or `enum / category`, which is string data) is additionally
+//     compatible with any string-based semantic type, since a UUID stored
+//     as text in one table genuinely does join a UUID column in another.
+//     Anything else mismatched (`i64` vs `String`, `i64` vs `f64` - a lossy
+//     join, not a clean one) is never an edge, however similar the names.
+//     `Vec<...>`, `mixed(...)`, and `struct` columns never participate:
+//     an array or a flattened label is not a join key.
+//   - A bare sample-value overlap with no name signal and no shared
+//     identifier domain is never an edge either. Two `i64` columns that
+//     both happen to contain `1` in three samples prove nothing - the same
+//     "no partial credit on coincidence" rule the adversarial-testing
+//     section already applies to checksum validators.
+//   - Only columns in *different* tables are paired. Within-table
+//     correlations are a different feature, not attempted here.
+//
+// Complexity is pairs-of-tables times pairs-of-columns, each check a handful
+// of short-string compares over already-capped sample lists - milliseconds
+// on any realistic directory, so there is no cap and no truncation to
+// disclose.
+
+/// How a join-candidate edge was established - Graphify's own edge
+/// vocabulary, applied to data instead of code.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Confidence {
+    Extracted,
+    Inferred,
+}
+
+impl Confidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Extracted => "extracted",
+            Confidence::Inferred => "inferred",
+        }
+    }
+}
+
+/// One undirected join-candidate edge between two columns in different
+/// tables. `from_*` is always the lexicographically smaller
+/// (table, column) pair, so the same logical edge serializes identically
+/// regardless of which table was profiled first.
+struct Relationship {
+    from_table: String,
+    from_column: String,
+    to_table: String,
+    to_column: String,
+    confidence: Confidence,
+    evidence: Vec<String>,
+    reason: String,
+}
+
+impl Relationship {
+    fn to_json(&self) -> JsonValue {
+        let mut obj = json_support::Map::with_capacity(7);
+        obj.insert(
+            "from_table".to_string(),
+            JsonValue::from(self.from_table.clone()),
+        );
+        obj.insert(
+            "from_column".to_string(),
+            JsonValue::from(self.from_column.clone()),
+        );
+        obj.insert(
+            "to_table".to_string(),
+            JsonValue::from(self.to_table.clone()),
+        );
+        obj.insert(
+            "to_column".to_string(),
+            JsonValue::from(self.to_column.clone()),
+        );
+        obj.insert(
+            "kind".to_string(),
+            JsonValue::from("join_candidate".to_string()),
+        );
+        obj.insert(
+            "confidence".to_string(),
+            JsonValue::from(self.confidence.as_str().to_string()),
+        );
+        obj.insert(
+            "evidence".to_string(),
+            JsonValue::Array(self.evidence.iter().cloned().map(JsonValue::from).collect()),
+        );
+        obj.insert("reason".to_string(), JsonValue::from(self.reason.clone()));
+        JsonValue::Object(obj)
+    }
+}
+
+/// Canonical column/table name for comparison: lowercase, camelCase split
+/// at letter-digit/upper boundaries, every other separator run collapsed
+/// to one underscore, no leading/trailing underscore. `userId`,
+/// `User-ID`, and `user_id` all canonicalize identically - the same
+/// "more specific match wins, never guess at intent" treatment the
+/// type-detection checks already get, just for names instead of values.
+fn canon_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut need_sep = false;
+    let mut prev_lower_or_digit = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            if c.is_ascii_uppercase() && prev_lower_or_digit && need_sep {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+            need_sep = true;
+            prev_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+        } else if need_sep {
+            out.push('_');
+            need_sep = false;
+            prev_lower_or_digit = false;
+        }
+    }
+    if out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// Best-effort singularization for comparison only (never surfaced): one
+/// trailing `s` off, unless the word is short or ends in `ss`. Consistently
+/// wrong on words like `status` is harmless here, since both sides get the
+/// identical treatment and only equality of the results is ever tested.
+fn singular(word: &str) -> &str {
+    if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
+        &word[..word.len() - 1]
+    } else {
+        word
+    }
+}
+
+/// Strip one trailing key-like suffix (`user_id` -> `user`). Longest suffix
+/// first, so `_uuid`/`_guid`/`_code` are never mis-split as `_id`/`_no`.
+fn strip_id_suffix(canon: &str) -> &str {
+    for suffix in ["_uuid", "_guid", "_code", "_key", "_num", "_id", "_no"] {
+        if let Some(stem) = canon.strip_suffix(suffix)
+            && !stem.is_empty()
+        {
+            return stem;
+        }
+    }
+    canon
+}
+
+/// The join-relevant reading of an `ideal_type`: exact scalar kinds stay
+/// distinct, every string-based semantic keeps its own label (so a UUID
+/// column only ever meets UUID or plain-text data, never an ISBN column
+/// that happens to share a name), and `enum / category` folds into plain
+/// text since it is string data. Anything without a single natural join
+/// domain - pooled arrays, mixed-type columns, flattened struct labels -
+/// is `None` and never participates in an edge. Unrecognized future labels
+/// default to their own distinct domain rather than failing closed: two
+/// columns sharing an unknown-but-identical domain is still a real,
+/// conservative hypothesis, while nothing ever matches across domains.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum JoinBase {
+    Int,
+    Float,
+    Bool,
+    PlainString,
+    Date,
+    Time,
+    Uuid,
+    Ulid,
+    Email,
+    OtherSemantic(String),
+}
+
+impl JoinBase {
+    fn label(&self) -> String {
+        match self {
+            JoinBase::Int => "i64".to_string(),
+            JoinBase::Float => "f64".to_string(),
+            JoinBase::Bool => "bool".to_string(),
+            JoinBase::PlainString => "String".to_string(),
+            JoinBase::Date => "date".to_string(),
+            JoinBase::Time => "time".to_string(),
+            JoinBase::Uuid => "UUID".to_string(),
+            JoinBase::Ulid => "ULID".to_string(),
+            JoinBase::Email => "Email".to_string(),
+            JoinBase::OtherSemantic(s) => s.clone(),
+        }
+    }
+
+    /// Identifier-like domains whose mere co-occurrence across tables is
+    /// worth an `inferred` edge even when the names differ: people really
+    /// do join on UUIDs, ULIDs, and email addresses under different column
+    /// names. Everything else (dates, plain integers, free text) coincides
+    /// across unrelated tables far too often for that to mean anything.
+    fn is_identifier_domain(&self) -> bool {
+        matches!(self, JoinBase::Uuid | JoinBase::Ulid | JoinBase::Email)
+    }
+}
+
+fn join_base(ideal_type: &str) -> Option<JoinBase> {
+    match ideal_type {
+        "i64" => Some(JoinBase::Int),
+        "f64" => Some(JoinBase::Float),
+        "bool" => Some(JoinBase::Bool),
+        "String" | "enum / category" => Some(JoinBase::PlainString),
+        "NaiveDate / DateTime" => Some(JoinBase::Date),
+        "NaiveTime" => Some(JoinBase::Time),
+        "UUID" => Some(JoinBase::Uuid),
+        "ULID" => Some(JoinBase::Ulid),
+        "Email" => Some(JoinBase::Email),
+        "IPv4"
+        | "IPv6"
+        | "URL"
+        | "MAC Address"
+        | "IBAN"
+        | "Credit Card Number"
+        | "ISBN-10"
+        | "ISBN-13"
+        | "EAN-13 / UPC-A"
+        | "SemVer"
+        | "Hex Color"
+        | "IMEI"
+        | "JWT"
+        | "Geographic Coordinates"
+        | "VIN"
+        | "CIDR"
+        | "WKT Geometry"
+        | "Cron Expression" => Some(JoinBase::OtherSemantic(ideal_type.to_string())),
+        _ => {
+            let t = ideal_type.trim();
+            if t.is_empty() || t == "struct" || t.starts_with("Vec<") || t.starts_with("mixed(") {
+                None
+            } else {
+                Some(JoinBase::OtherSemantic(t.to_string()))
+            }
+        }
+    }
+}
+
+/// Two bases can honestly share join keys when they are the same domain,
+/// or when one side is plain text and the other is a string-based semantic
+/// (a UUID stored as text genuinely does join a UUID column). An `i64`
+/// against an `f64` is deliberately incompatible: silently coercing
+/// integers to floats across a join loses precision past 2^53, the same
+/// loss this project's own precision-loss note already refuses to hide.
+fn join_compatible(a: &JoinBase, b: &JoinBase) -> bool {
+    if a == b {
+        return true;
+    }
+    let string_semantic = |x: &JoinBase| {
+        matches!(
+            x,
+            JoinBase::Uuid | JoinBase::Ulid | JoinBase::Email | JoinBase::OtherSemantic(_)
+        )
+    };
+    (*a == JoinBase::PlainString && string_semantic(b))
+        || (string_semantic(a) && *b == JoinBase::PlainString)
+}
+
+/// The conventional `users.id <- orders.user_id` foreign-key shape: one
+/// side is a bare `id` column, the other ends in `_id` with a stem matching
+/// the id side's table (singular-insensitive). The `__`-segment fallback
+/// exists for `--combine`-qualified names (`<file>__<table>`): it splits
+/// the RAW table name, because canonicalization collapses separator runs
+/// and would erase the qualifier boundary first. A genuinely
+/// single-underscore table (`order_items`) never takes this fallback, so
+/// an `item_id` elsewhere cannot be force-matched to it - only to a real
+/// `items` table.
+fn fk_stem_matches(id_table_raw: &str, other_col_canon: &str) -> bool {
+    let stem = match other_col_canon.strip_suffix("_id") {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    if singular(stem) == singular(&canon_name(id_table_raw)) {
+        return true;
+    }
+    match id_table_raw.rsplit("__").next() {
+        Some(last) if last != id_table_raw => singular(stem) == singular(&canon_name(last)),
+        _ => false,
+    }
+}
+
+/// Sorted, de-duplicated intersection of two columns' non-empty sample
+/// values - observed shared data, the strongest single signal an edge can
+/// carry. Samples are already capped upstream (`--samples`), so this is
+/// bounded by construction.
+fn shared_samples(a: &[String], b: &[String]) -> Vec<String> {
+    let mut shared: Vec<String> = a
+        .iter()
+        .filter(|v| !v.is_empty() && b.contains(v))
+        .cloned()
+        .collect();
+    shared.sort();
+    shared.dedup();
+    shared
+}
+
+/// At most this many shared values are listed verbatim in an edge's
+/// evidence; beyond that the count speaks for itself. `--samples` can be
+/// raised arbitrarily, and an edge should never embed an unbounded slice
+/// of one column's data.
+const MAX_OVERLAP_EVIDENCE: usize = 5;
+
+/// One candidate edge between two columns in different tables, or `None`
+/// when nothing observed supports a link. See the module doc comment above
+/// for the full tier rules.
+fn join_candidate(
+    t1: &str,
+    c1: &ColumnProfile,
+    t2: &str,
+    c2: &ColumnProfile,
+) -> Option<Relationship> {
+    let b1 = join_base(&c1.ideal_type)?;
+    let b2 = join_base(&c2.ideal_type)?;
+    if !join_compatible(&b1, &b2) {
+        return None;
+    }
+    let n1 = canon_name(&c1.name);
+    let n2 = canon_name(&c2.name);
+    let exact = n1 == n2;
+    let id_side_1 = n1 == "id" && fk_stem_matches(t1, &n2);
+    let id_side_2 = n2 == "id" && fk_stem_matches(t2, &n1);
+    let fk = id_side_1 || id_side_2;
+    let strong = exact || fk;
+    // A weak name signal: equal once key-like suffixes (and plurals) are
+    // discounted, without being an exact match. Covers `customer` beside
+    // `customer_id` (a natural-key join) and near-miss plurals, but never
+    // fires on its own without either compatible types (checked above) or
+    // observed overlap (checked below).
+    let weak = !strong && singular(strip_id_suffix(&n1)) == singular(strip_id_suffix(&n2));
+    let rare = b1 == b2 && b1.is_identifier_domain();
+    if !(strong || weak || rare) {
+        return None;
+    }
+    let overlap = shared_samples(&c1.sample_values, &c2.sample_values);
+    // Observed shared values promote any weak or domain-only signal to
+    // `extracted`: at that point the link is measured, not guessed. A bare
+    // overlap with no name or domain signal at all never reaches this
+    // function branch - it returned `None` above.
+    let confidence = if strong || !overlap.is_empty() {
+        Confidence::Extracted
+    } else {
+        Confidence::Inferred
+    };
+    let mut evidence = Vec::new();
+    if exact {
+        evidence.push(format!(
+            "column names match (\"{}\" vs \"{}\")",
+            c1.name, c2.name
+        ));
+    } else if fk {
+        let (id_tab, id_col, fk_tab, fk_col) = if id_side_1 {
+            (t1, &c1.name, t2, &c2.name)
+        } else {
+            (t2, &c2.name, t1, &c1.name)
+        };
+        evidence.push(format!(
+            "foreign-key naming pattern (\"{id_col}\" in \"{id_tab}\", \"{fk_col}\" in \"{fk_tab}\")"
+        ));
+    } else if weak {
+        evidence.push(format!(
+            "similar column names (\"{}\" vs \"{}\")",
+            c1.name, c2.name
+        ));
+    } else {
+        evidence.push(format!("shared identifier domain ({})", b1.label()));
+    }
+    evidence.push(format!(
+        "compatible types ({} and {})",
+        b1.label(),
+        b2.label()
+    ));
+    if !overlap.is_empty() {
+        let mut shown: Vec<String> = overlap.iter().take(MAX_OVERLAP_EVIDENCE).cloned().collect();
+        let mut text = format!("{} shared sample value", overlap.len());
+        if overlap.len() != 1 {
+            text.push('s');
+        }
+        if overlap.len() > shown.len() {
+            shown.push(format!("+{} more", overlap.len() - shown.len()));
+        }
+        text.push_str(": ");
+        text.push_str(
+            &shown
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        evidence.push(text);
+    }
+    let why = if exact {
+        "identical column names with compatible types".to_string()
+    } else if fk {
+        "foreign-key naming pattern".to_string()
+    } else if weak && !overlap.is_empty() {
+        "similar column names with observed shared values".to_string()
+    } else if weak {
+        "similar column names but no shared samples yet".to_string()
+    } else if !overlap.is_empty() {
+        format!(
+            "same {} identifier domain with observed shared values",
+            b1.label()
+        )
+    } else {
+        format!(
+            "same {} identifier domain under different column names",
+            b1.label()
+        )
+    };
+    let ((from_table, from_column), (to_table, to_column)) = if (t1, &c1.name) <= (t2, &c2.name) {
+        (
+            (t1.to_string(), c1.name.clone()),
+            (t2.to_string(), c2.name.clone()),
+        )
+    } else {
+        (
+            (t2.to_string(), c2.name.clone()),
+            (t1.to_string(), c1.name.clone()),
+        )
+    };
+    let reason = format!(
+        "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) look like join keys: {why}"
+    );
+    Some(Relationship {
+        from_table,
+        from_column,
+        to_table,
+        to_column,
+        confidence,
+        evidence,
+        reason,
+    })
+}
+
+/// Every cross-table join candidate in a profiled `tables` map, sorted by
+/// (from-table, from-column, to-table, to-column) so output is stable
+/// regardless of profiling order. Single-table inputs yield zero edges.
+fn detect_relationships(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Vec<Relationship> {
+    let tables_vec: Vec<(&String, &Vec<ColumnProfile>)> = tables.iter().collect();
+    let mut out = Vec::new();
+    for (i, (t1, cols1)) in tables_vec.iter().enumerate() {
+        for (t2, cols2) in &tables_vec[i + 1..] {
+            for c1 in cols1.iter() {
+                for c2 in cols2.iter() {
+                    if let Some(rel) = join_candidate(t1, c1, t2, c2) {
+                        out.push(rel);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        (&a.from_table, &a.from_column, &a.to_table, &a.to_column).cmp(&(
+            &b.from_table,
+            &b.from_column,
+            &b.to_table,
+            &b.to_column,
+        ))
+    });
+    out
 }
 
 // --- JSON-Schema-standard output (--output-format json-schema) ---
@@ -77255,5 +77763,266 @@ mod tests {
         assert!(LoadEngine::Sqlite.non_interactive_args().is_empty());
         assert!(LoadEngine::DuckDb.non_interactive_args().is_empty());
         assert!(LoadEngine::MySql.non_interactive_args().is_empty());
+    }
+
+    // `detect_relationships` - cross-table join candidates. A column is
+    // built with just the fields detection reads (name, ideal_type,
+    // sample_values); everything else rides `Default`, the same additive
+    // pattern `numeric_stats` itself established.
+    fn rel_col(name: &str, ideal: &str, samples: &[&str]) -> ColumnProfile {
+        ColumnProfile {
+            name: name.to_string(),
+            ideal_type: ideal.to_string(),
+            sample_values: samples.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn rel_tables(entries: &[(&str, Vec<ColumnProfile>)]) -> BTreeMap<String, Vec<ColumnProfile>> {
+        entries
+            .iter()
+            .map(|(t, cols)| (t.to_string(), cols.clone()))
+            .collect()
+    }
+
+    fn rel_edge<'a>(edges: &'a [Relationship], from: &str, to: &str) -> &'a Relationship {
+        edges
+            .iter()
+            .find(|e| {
+                (e.from_table == from || e.to_table == from)
+                    && (e.from_column == to || e.to_column == to)
+            })
+            .unwrap_or_else(|| panic!("no edge involving table {from} column {to}"))
+    }
+
+    #[test]
+    fn relationships_canon_name_normalizes_separators_and_camel_case() {
+        assert_eq!(canon_name("user_id"), "user_id");
+        assert_eq!(canon_name("userId"), "user_id");
+        assert_eq!(canon_name("User-ID"), "user_id");
+        assert_eq!(canon_name("userID"), "user_id");
+        assert_eq!(canon_name("ID"), "id");
+        assert_eq!(canon_name("  padded  "), "padded");
+    }
+
+    #[test]
+    fn relationships_exact_name_and_type_is_extracted() {
+        let tables = rel_tables(&[
+            ("users", vec![rel_col("region", "String", &["north"])]),
+            (
+                "orders",
+                vec![rel_col("region", "String", &["north", "south"])],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert!(edges[0].evidence.iter().any(|e| e.contains("region")));
+        assert!(edges[0].reason.contains("join keys"));
+    }
+
+    #[test]
+    fn relationships_fk_pattern_users_id_to_orders_user_id() {
+        let tables = rel_tables(&[
+            ("users", vec![rel_col("id", "UUID", &["abc"])]),
+            ("orders", vec![rel_col("user_id", "UUID", &["abc", "def"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert!(edges[0].evidence.iter().any(|e| e.contains("foreign-key")));
+    }
+
+    #[test]
+    fn relationships_fk_pattern_survives_combine_qualified_table_names() {
+        // `--combine` qualifies as `<file>__<table>`; the stem must match
+        // the table segment, not the whole qualified name.
+        let tables = rel_tables(&[
+            ("users__users", vec![rel_col("id", "i64", &["1"])]),
+            (
+                "orders__orders",
+                vec![rel_col("user_id", "i64", &["1", "2"])],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Extracted);
+    }
+
+    #[test]
+    fn relationships_same_uuid_different_names_is_inferred() {
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("owner_ref", "UUID", &["aaa"])]),
+            ("b", vec![rel_col("creator", "UUID", &["bbb"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Inferred);
+        assert!(edges[0].evidence.iter().any(|e| e.contains("UUID")));
+    }
+
+    #[test]
+    fn relationships_incompatible_types_never_link() {
+        // Identical names are not enough when the domains cannot join -
+        // an `i64` against a `String` (or `f64`, a lossy coercion) is
+        // silence, not a guessed edge.
+        for (t1, t2) in [("i64", "String"), ("i64", "f64"), ("bool", "String")] {
+            let tables = rel_tables(&[
+                ("a", vec![rel_col("id", t1, &["1"])]),
+                ("b", vec![rel_col("id", t2, &["1"])]),
+            ]);
+            assert!(
+                detect_relationships(&tables).is_empty(),
+                "unexpected edge for {t1} vs {t2}"
+            );
+        }
+    }
+
+    #[test]
+    fn relationships_string_to_uuid_exact_name_is_extracted() {
+        // A UUID stored as text genuinely does join a UUID column - the
+        // documented weak-compatibility rule, not a promotion.
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("uid", "String", &["abc"])]),
+            ("b", vec![rel_col("uid", "UUID", &["abc"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Extracted);
+    }
+
+    #[test]
+    fn relationships_never_link_within_one_table() {
+        let tables = rel_tables(&[(
+            "only",
+            vec![
+                rel_col("user_id", "UUID", &["abc"]),
+                rel_col("user_id_copy", "UUID", &["abc"]),
+            ],
+        )]);
+        assert!(detect_relationships(&tables).is_empty());
+    }
+
+    #[test]
+    fn relationships_skip_struct_and_pooled_arrays() {
+        // `Vec<UUID>` (a pooled array), `mixed(...)` (inconsistent data),
+        // and `struct` (a flattened label) are never join keys.
+        for ideal in ["Vec<UUID>", "mixed(String: 1, i64: 2)", "struct"] {
+            let tables = rel_tables(&[
+                ("a", vec![rel_col("tags", ideal, &["x"])]),
+                ("b", vec![rel_col("tags", "UUID", &["x"])]),
+            ]);
+            assert!(
+                detect_relationships(&tables).is_empty(),
+                "unexpected edge for {ideal}"
+            );
+        }
+    }
+
+    #[test]
+    fn relationships_sample_overlap_upgrades_weak_name_to_extracted() {
+        // `customer` beside `customer_id`: similar names, and the shared
+        // sample makes the link measured rather than guessed.
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("customer", "String", &["acme"])]),
+            (
+                "b",
+                vec![rel_col("customer_id", "String", &["acme", "globex"])],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert!(edges[0].evidence.iter().any(|e| e.contains("acme")));
+    }
+
+    #[test]
+    fn relationships_weak_name_without_overlap_is_inferred() {
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("customer", "String", &["acme"])]),
+            ("b", vec![rel_col("customer_id", "String", &["globex"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Inferred);
+    }
+
+    #[test]
+    fn relationships_coincidental_overlap_without_name_signal_is_no_edge() {
+        // Both columns contain `1` in tiny samples, but the names are
+        // unrelated and `i64` is a generic domain - coincidence, not a
+        // join. This is the disclosed conservative miss, and it is
+        // intentional: a false edge is worse than a missing one.
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("quantity", "i64", &["1", "2"])]),
+            ("b", vec![rel_col("attempt", "i64", &["1", "3"])]),
+        ]);
+        assert!(detect_relationships(&tables).is_empty());
+    }
+
+    #[test]
+    fn relationships_no_fk_through_single_underscore_table_segment() {
+        // `order_items.id` must NOT claim every `item_id` elsewhere: the
+        // `__`-segment fallback is for `--combine` qualification only, and
+        // a raw single-underscore table takes no fallback at all. The real
+        // `items.id` still matches normally.
+        let tables = rel_tables(&[
+            ("order_items", vec![rel_col("id", "i64", &["7"])]),
+            ("shipments", vec![rel_col("item_id", "i64", &["7"])]),
+            ("items", vec![rel_col("id", "i64", &["7"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        // shipments.item_id <-> items.id (exact-name rule also links the
+        // two same-named id columns; the fk edge is the stem match).
+        assert!(edges.iter().any(|e| {
+            (&e.from_table == "shipments" || &e.to_table == "shipments")
+                && (&e.from_table == "items" || &e.to_table == "items")
+        }));
+        assert!(!edges.iter().any(|e| {
+            (&e.from_table == "shipments" || &e.to_table == "shipments")
+                && (&e.from_table == "order_items" || &e.to_table == "order_items")
+        }));
+    }
+
+    #[test]
+    fn relationships_output_order_is_deterministic() {
+        // From/to assignment follows (table, column) sort order, and the
+        // edge list itself is sorted, so profiling order cannot leak into
+        // the output.
+        let tables = rel_tables(&[
+            ("zeta", vec![rel_col("id", "i64", &["1"])]),
+            ("alpha", vec![rel_col("id", "i64", &["1"])]),
+            ("mid", vec![rel_col("id", "i64", &["1"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 3);
+        let keys: Vec<(&str, &str, &str, &str)> = edges
+            .iter()
+            .map(|e| {
+                (
+                    e.from_table.as_str(),
+                    e.from_column.as_str(),
+                    e.to_table.as_str(),
+                    e.to_column.as_str(),
+                )
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        assert!(keys.iter().all(|(ft, fc, tt, tc)| (ft, fc) <= (tt, tc)));
+    }
+
+    #[test]
+    fn relationships_edge_finder_locates_either_endpoint() {
+        let tables = rel_tables(&[
+            ("users", vec![rel_col("id", "i64", &["1"])]),
+            ("orders", vec![rel_col("user_id", "i64", &["1"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        let e = rel_edge(&edges, "users", "id");
+        assert_eq!(e.confidence, Confidence::Extracted);
+        // Same edge found from the other endpoint.
+        assert!(std::ptr::eq(e, rel_edge(&edges, "orders", "user_id")));
     }
 }
