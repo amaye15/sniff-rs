@@ -11,6 +11,11 @@ name: ci
 
 on:
   push:
+    # Tags are excluded: pushing a v* tag already runs the release
+    # workflow (which rebuilds everything from the tagged commit and
+    # smoke-tests every binary), so a second full CI run on the identical
+    # code would only double CI minutes and duplicate red/green signals.
+    tags-ignore: ["v*"]
   pull_request:
 
 env:
