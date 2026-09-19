@@ -12825,3 +12825,264 @@ fn graph_subcommands_reject_bad_flags_and_explain_helps() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("USAGE"));
 }
+
+// ---------------------------------------------------------------------------
+// Directory robustness: --continue-on-error, --include/--exclude, and the
+// empty-workbook skip. A ragged CSV (header 2 fields, a 3-field row) is
+// the corrupt file, notes.xyz the unrecognized one - both committed inline
+// since each is three lines, unlike the hand-built empty .xlsx below,
+// which lives in fixtures because OOXML can't be written by hand inline.
+// ---------------------------------------------------------------------------
+
+/// A directory with one good CSV, one ragged CSV, and one unrecognized
+/// file, returning (dir, out) TempDirs the caller runs against.
+fn robustness_dir() -> (TempDir, TempDir) {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("good.csv"), "a,b\n1,2\n").unwrap();
+    std::fs::write(dir.path().join("bad.csv"), "a,b\n1,2,3\n").unwrap();
+    std::fs::write(dir.path().join("notes.xyz"), "just some text\n").unwrap();
+    (dir, TempDir::new())
+}
+
+#[test]
+fn directory_without_continue_on_error_still_fails_fast() {
+    let (dir, out) = robustness_dir();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("bad.csv"),
+        "the failure must name the offending file"
+    );
+}
+
+#[test]
+fn directory_continue_on_error_records_failures_in_json_index() {
+    let (dir, out) = robustness_dir();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--output-format",
+            "json",
+            "--continue-on-error",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out.path().join("good.csv.dictionary.json").exists());
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("_index.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["entries"].as_array().unwrap().len(), 1);
+    let failed = doc["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["file"], "bad.csv");
+    assert!(
+        failed[0]["error"].as_str().unwrap().contains("3 fields"),
+        "the recorded chain must carry the real cause"
+    );
+    assert_eq!(doc["unrecognized"], serde_json::json!(["notes.xyz"]));
+    assert_eq!(doc["empty"], serde_json::Value::Array(vec![]));
+}
+
+#[test]
+fn directory_continue_on_error_records_failures_in_markdown_index() {
+    let (dir, out) = robustness_dir();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--continue-on-error",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let index =
+        std::fs::read_to_string(out.path().join("_index.dictionary.md")).unwrap();
+    assert!(index.contains("## Failed"), "got: {index}");
+    assert!(index.contains("bad.csv"), "got: {index}");
+    assert!(index.contains("## Skipped"), "got: {index}");
+}
+
+#[test]
+fn directory_combine_continue_on_error_merges_what_it_can() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("one.csv"), "id\n1\n").unwrap();
+    std::fs::write(dir.path().join("two.csv"), "id\n2\n").unwrap();
+    std::fs::write(dir.path().join("bad.csv"), "a,b\n1,2,3\n").unwrap();
+    let out = TempDir::new();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--combine",
+            "--output-format",
+            "json",
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--continue-on-error",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.json"))).unwrap(),
+    )
+    .unwrap();
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(tables.len(), 2);
+    let failed = doc["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["file"], "bad.csv");
+}
+
+#[test]
+fn directory_include_and_exclude_select_files() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
+    std::fs::write(dir.path().join("b.json"), "[{\"x\": 1}]").unwrap();
+    std::fs::create_dir_all(dir.path().join("skipme")).unwrap();
+    std::fs::write(dir.path().join("skipme").join("c.csv"), "x\n2\n").unwrap();
+
+    // Returns this run's own output TempDir (kept alive by the caller)
+    // plus every top-level output filename inside it.
+    let run = |extra: &[&str]| {
+        let out = TempDir::new();
+        let mut args = vec![
+            dir.path().to_str().unwrap().to_string(),
+            "--output-dir".to_string(),
+            out.path().to_str().unwrap().to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let output = Command::new(bin())
+            .args(&args)
+            .output()
+            .expect("failed to run binary");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut names: Vec<String> = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.unwrap();
+                // Outputs only: a mirrored subdirectory (like skipme/)
+                // holds outputs deeper down, it is not one itself.
+                e.file_type().unwrap().is_file().then(|| {
+                    e.file_name().to_string_lossy().into_owned()
+                })
+            })
+            .filter(|n| n != "_index.dictionary.json")
+            .collect();
+        names.sort();
+        (out, names)
+    };
+
+    // Exclude by extension at any depth; the nested c.csv is still
+    // processed (only *.json is excluded), landing mirrored one level
+    // down - so the top level holds just a.csv's output.
+    let (out, names) = run(&["--exclude", "*.json"]);
+    assert_eq!(names, vec!["a.csv.dictionary.json"]);
+    assert!(out.path().join("skipme").join("c.csv.dictionary.json").exists());
+    // Exclude a whole subtree: nothing under skipme/ is even walked, so
+    // its mirrored directory never appears either.
+    let (out, names) = run(&["--exclude", "skipme/**"]);
+    assert_eq!(names, vec!["a.csv.dictionary.json", "b.json.dictionary.json"]);
+    assert!(!out.path().join("skipme").exists());
+    // Include allow-lists; combined with exclude, both must agree.
+    let (_out, names) = run(&["--include", "*.csv", "--exclude", "skipme/**"]);
+    assert_eq!(names, vec!["a.csv.dictionary.json"]);
+}
+
+#[test]
+fn directory_flags_are_rejected_for_single_file_input() {
+    for flag in ["--continue-on-error", "--include", "--exclude"] {
+        let arg = if flag == "--continue-on-error" {
+            flag.to_string()
+        } else {
+            format!("{flag}=*.csv")
+        };
+        let output = Command::new(bin())
+            .args([fixture("sample.csv").to_str().unwrap(), &arg])
+            .output()
+            .expect("failed to run binary");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("when the input path is a directory"),
+            "got: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn directory_empty_workbook_skips_with_a_note() {
+    let dir = TempDir::new();
+    std::fs::copy(
+        fixture("edge_xlsx_empty_sheets.xlsx"),
+        dir.path().join("empty.xlsx"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("good.csv"), "a,b\n1,2\n").unwrap();
+    let out = TempDir::new();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("_index.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["empty"], serde_json::json!(["empty.xlsx"]));
+    assert_eq!(doc["failed"], serde_json::Value::Array(vec![]));
+}
+
+#[test]
+fn single_file_empty_workbook_keeps_its_clean_error() {
+    let output = Command::new(bin())
+        .args([fixture("edge_xlsx_empty_sheets.xlsx").to_str().unwrap(), "-"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no non-empty sheets found"),
+        "got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

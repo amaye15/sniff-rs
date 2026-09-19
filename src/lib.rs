@@ -3378,6 +3378,34 @@ struct Args {
     /// an actual name collision - see `run_directory_combined`'s own doc
     /// comment for the full design.
     combine: bool,
+    /// Directory-input mode only: keep going past a file that fails
+    /// (corrupt content, an unreadable file, a reader that errors)
+    /// instead of aborting the whole run on it. Each failure is recorded
+    /// - in the top-level index (`failed` list, next to `unrecognized`)
+    /// for the default per-file mode, in the combined document's own
+    /// `failed` list for `--combine --output-format json`, and always on
+    /// stderr - so nothing is ever silently dropped. Without this flag
+    /// the first failure aborts the run immediately (whatever was
+    /// already written stays on disk; nothing is ever rolled back),
+    /// which remains the default: a surprising failure should be loud,
+    /// not something a re-run has to go looking for.
+    continue_on_error: bool,
+    /// Directory-input mode only: only process files matching one of
+    /// these glob patterns (`*` matches any run of characters except `/`,
+    /// `?` matches one character except `/`, `**` matches anything
+    /// including `/`; a pattern with no `/` in it is also tried against
+    /// the bare filename, so `--exclude "*.pdf"` works at any depth).
+    /// Repeatable. Excluded files (and directories, which are pruned
+    /// without descending) are silently ignored, the same way a
+    /// `.gitignore`d path simply isn't there - use `--output-dir` runs
+    /// and the index to see what was actually processed.
+    include: Vec<String>,
+    /// Directory-input mode only: skip files (or whole directories)
+    /// matching one of these glob patterns - same syntax and repeatability
+    /// as `--include` above. When both are given, a file must match an
+    /// `--include` pattern *and* match no `--exclude` pattern to be
+    /// processed.
+    exclude: Vec<String>,
     /// `--list-formats`: print every format this tool knows about (name,
     /// auto-detected extensions, required Cargo feature, and whether
     /// *this build* actually has it compiled in) instead of profiling
@@ -3418,7 +3446,8 @@ USAGE:
     file by default (see --combine below for one combined output
     instead). OUTPUT_PATH is not valid in this mode unless --combine is
     given - use --output-dir. The first file that fails aborts the whole
-    run; a file whose format can't be identified at all is skipped and
+    run (pass --continue-on-error to record failures in the index and keep
+    going instead); a file whose format can't be identified at all is skipped and
     noted, not treated as a failure.
 
     `sniff-rs diff` compares two --output-format json dictionaries, or
@@ -3500,6 +3529,20 @@ OPTIONS:
                                 instead of one output per file. Every table's own
                                 combined name is always <source-file-path>__<table>,
                                 to avoid collisions across different source files.
+        --continue-on-error     Directory-input mode only: keep going past a file
+                                that fails instead of aborting the whole run on
+                                it. Failures are recorded in the index (`failed`
+                                list) and on stderr - never silently dropped.
+        --include <GLOB>        Directory-input mode only (repeatable): only
+                                process files matching one of these patterns.
+                                `*` matches any run except `/`, `?` one
+                                character except `/`, `**` anything; a pattern
+                                with no `/` also matches bare filenames.
+        --exclude <GLOB>        Directory-input mode only (repeatable): skip
+                                files/directories matching one of these
+                                patterns (same syntax). A file must match an
+                                --include pattern, if any are given, and no
+                                --exclude pattern to be processed.
         --list-formats           Print every format this tool knows about (name,
                                 auto-detected extensions, required --features flag, and
                                 whether this build actually has it compiled in) instead
@@ -3534,6 +3577,9 @@ impl Args {
         let mut load_into: Option<String> = None;
         let mut output_dir: Option<PathBuf> = None;
         let mut combine = false;
+        let mut continue_on_error = false;
+        let mut include: Vec<String> = Vec::new();
+        let mut exclude: Vec<String> = Vec::new();
         let mut list_formats = false;
         let mut positionals: Vec<String> = Vec::new();
 
@@ -3612,6 +3658,9 @@ impl Args {
                     "load-into" => load_into = Some(value(&mut i)?),
                     "output-dir" => output_dir = Some(PathBuf::from(value(&mut i)?)),
                     "combine" => combine = true,
+                    "continue-on-error" => continue_on_error = true,
+                    "include" => include.push(value(&mut i)?),
+                    "exclude" => exclude.push(value(&mut i)?),
                     "list-formats" => list_formats = true,
                     other => bail!("unrecognized flag --{other}"),
                 }
@@ -3660,6 +3709,9 @@ impl Args {
             sql_mode,
             load_into,
             combine,
+            continue_on_error,
+            include,
+            exclude,
             list_formats,
         })
     }
@@ -53931,9 +53983,12 @@ fn columns_from_xlsx_calamine(
         out.push((sheet_name, profiles));
     }
 
-    if out.is_empty() {
-        bail!("no non-empty sheets found in {path:?}");
-    }
+    // An empty workbook (no non-empty sheets at all) yields zero tables
+    // rather than an error here: `run_single_file` turns that back into
+    // the same clean "nothing to profile" error as before, while
+    // directory mode skips such a file with a note instead of failing
+    // (or recording a failure under --continue-on-error) over a file
+    // with nothing wrong with it beyond being empty.
     Ok(out)
 }
 
@@ -56643,6 +56698,7 @@ fn render_markdown(
 fn render_combined_markdown(
     directory_name: &str,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    failed: &[BatchFailure],
 ) -> String {
     let table_count = tables.len();
     let col_count: usize = tables.values().map(Vec::len).sum();
@@ -56658,6 +56714,25 @@ fn render_combined_markdown(
     }
     md.push_str("\n\n");
     render_markdown_tables(&mut md, tables);
+    // Files --continue-on-error kept going past surface here (not in the
+    // per-file index, which a combined run never writes): capped like
+    // every other rendered list, full chain per entry.
+    if !failed.is_empty() {
+        md.push_str("\n## Failed files\n\n");
+        md.push_str("| File | Error |\n");
+        md.push_str("|---|---|\n");
+        let shown = failed.len().min(MAX_TOC_ENTRIES);
+        for failure in &failed[..shown] {
+            md.push_str(&format!(
+                "| {} | {} |\n",
+                escape_md(&failure.source_relative),
+                escape_md(&failure.error.replace('\n', " ")),
+            ));
+        }
+        if failed.len() > shown {
+            md.push_str(&format!("| …and {} more | |\n", failed.len() - shown));
+        }
+    }
     md.truncate(md.trim_end_matches('\n').len());
     md.push('\n');
     md
@@ -56830,8 +56905,9 @@ fn render_json(
 fn render_combined_json(
     directory_name: &str,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    failed: &[BatchFailure],
 ) -> Result<String> {
-    let mut doc = json_support::Map::with_capacity(3);
+    let mut doc = json_support::Map::with_capacity(4);
     doc.insert(
         "directory".to_string(),
         JsonValue::from(directory_name.to_string()),
@@ -56850,6 +56926,23 @@ fn render_combined_json(
                 .iter()
                 .map(Relationship::to_json)
                 .collect(),
+        ),
+    );
+    // Files --continue-on-error kept going past: always present (never
+    // omitted when empty), the same convention the per-file index's own
+    // `failed` key already keeps.
+    doc.insert(
+        "failed".to_string(),
+        JsonValue::Array(
+            failed
+                .iter()
+                .map(|f| {
+                    let mut obj = json_support::Map::with_capacity(2);
+                    obj.insert("file".to_string(), JsonValue::from(f.source_relative.clone()));
+                    obj.insert("error".to_string(), JsonValue::from(f.error.clone()));
+                    JsonValue::Object(obj)
+                })
+                .collect::<Vec<_>>(),
         ),
     );
     Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
@@ -57817,6 +57910,9 @@ fn load_graph_input(
         sql_mode: None,
         load_into: None,
         combine: false,
+        continue_on_error: false,
+        include: Vec::new(),
+        exclude: Vec::new(),
         list_formats: false,
     };
     let (tables, _resolved_skip_rows) =
@@ -62095,10 +62191,11 @@ mod xlsx_support {
             out.push((sheet_name, profiles));
         }
 
-        if out.is_empty() {
-            bail!("no non-empty sheets found in {path:?}");
-        }
-        Ok(out)
+            // An empty workbook yields zero tables rather than an error
+            // here (see the identical comment on the OOXML reader's own
+            // empty case above): single-file mode re-raises the clean
+            // error, directory mode skips with a note.
+            Ok(out)
     }
 
     /// The OOXML (`.xlsx`) row-source for `render_sql_inline_flat`'s
@@ -62940,10 +63037,11 @@ mod xlsx_support {
             win.skip_element()?;
         }
 
-        if out.is_empty() {
-            bail!("no non-empty sheets found in {path:?}");
-        }
-        Ok(out)
+            // An empty workbook yields zero tables rather than an error
+            // here (see the identical comment on the OOXML reader's own
+            // empty case above): single-file mode re-raises the clean
+            // error, directory mode skips with a note.
+            Ok(out)
     }
 
     // --- Hand-rolled OLE2 / Compound File Binary Format reader ---
@@ -64082,10 +64180,11 @@ mod xlsx_support {
             out.push((sheet_name, profiles));
         }
 
-        if out.is_empty() {
-            bail!("no non-empty sheets found in {path:?}");
-        }
-        Ok(out)
+            // An empty workbook yields zero tables rather than an error
+            // here (see the identical comment on the OOXML reader's own
+            // empty case above): single-file mode re-raises the clean
+            // error, directory mode skips with a note.
+            Ok(out)
     }
 
     /// The BIFF8 (`.xls`) row-source for `render_sql_inline_flat`'s
@@ -64708,10 +64807,11 @@ mod xlsx_support {
             out.push((entry.name, profiles));
         }
 
-        if out.is_empty() {
-            bail!("no non-empty sheets found in {path:?}");
-        }
-        Ok(out)
+            // An empty workbook yields zero tables rather than an error
+            // here (see the identical comment on the OOXML reader's own
+            // empty case above): single-file mode re-raises the clean
+            // error, directory mode skips with a note.
+            Ok(out)
     }
 
     /// The BIFF12 (`.xlsb`) row-source for `render_sql_inline_flat`'s
@@ -67610,6 +67710,16 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
             "--combine only applies when the input path is a directory - a single file already produces exactly one output"
         );
     }
+    // Selection and resilience flags only mean anything across the many
+    // files of a directory run - on one file there is nothing to select
+    // among and nothing to continue past, so accepting them silently
+    // would be a lie about what they do.
+    if args.continue_on_error {
+        bail!("--continue-on-error only applies when the input path is a directory");
+    }
+    if !args.include.is_empty() || !args.exclude.is_empty() {
+        bail!("--include/--exclude only apply when the input path is a directory");
+    }
 
     // --load-into's own validation, before any real work (decompression,
     // reading) even starts - every check here is answerable from args
@@ -67724,6 +67834,17 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     }
 
     let (tables, resolved_skip_rows) = dispatch_reader(&read_path, &logical_path, format, args)?;
+    // A reader yielding zero tables (an Excel-family workbook with no
+    // non-empty sheets - the only shape that reaches here, since every
+    // other empty input is still a hard error inside its own reader, the
+    // same convention XML's own empty-root error already sets) stays a
+    // clean error in single-file mode, byte-identical to the message the
+    // readers themselves used to raise before it moved up here - so only
+    // directory mode (which skips such a file with a note instead) ever
+    // sees the `Ok(vec![])` shape.
+    if tables.is_empty() {
+        bail!("no non-empty sheets found in {read_path:?}");
+    }
     let table_count = tables.len();
     let col_count: usize = tables.values().map(Vec::len).sum();
 
@@ -67777,7 +67898,85 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
 /// (the same "don't risk a cycle" caution `fd`/`ripgrep` apply by
 /// default), and a broken symlink is silently skipped, since there's
 /// nothing to read either way.
-fn collect_files_sorted(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+/// Whether `pattern` (`--include`/`--exclude`) matches `text`: `*` matches
+/// any run of characters except `/`, `?` matches exactly one character
+/// except `/`, and `**` matches anything including `/` (so `build/**`
+/// swallows a whole subtree while `*.pdf` stays within one level).
+/// Matching is byte-wise and case-sensitive - the same "no guessing"
+/// discipline as everywhere else in this file: a pattern either matches
+/// structurally or it doesn't, never approximately.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn go(pat: &[u8], txt: &[u8]) -> bool {
+        if pat.is_empty() {
+            return txt.is_empty();
+        }
+        // A `/**` boundary consumes its own separator with the wildcard,
+        // so `build/**` also matches the bare directory `build` itself -
+        // without this, the `/` would have to match a character first and
+        // the trailing `**` could never redeem an already-empty remainder.
+        let pat = if pat.len() >= 3 && pat[0] == b'/' && pat[1] == b'*' && pat[2] == b'*' {
+            &pat[1..]
+        } else {
+            pat
+        };
+        if pat.len() >= 2 && pat[0] == b'*' && pat[1] == b'*' {
+            // `**`: zero or more of anything, separators included. Trying
+            // "consume nothing" first keeps `**/x` from needing the rest
+            // of the pattern to align past content it already covers.
+            let mut rest = &pat[2..];
+            if rest.first() == Some(&b'/') {
+                rest = &rest[1..];
+            }
+            return go(rest, txt) || (!txt.is_empty() && go(pat, &txt[1..]));
+        }
+        if txt.is_empty() {
+            // Only a trailing `*` can still succeed against nothing left -
+            // `?` and literals genuinely need one more character, and `**`
+            // is already handled above.
+            return pat[0] == b'*' && go(&pat[1..], txt);
+        }
+        match pat[0] {
+            b'*' => go(&pat[1..], txt) || (txt[0] != b'/' && go(pat, &txt[1..])),
+            b'?' => txt[0] != b'/' && go(&pat[1..], &txt[1..]),
+            c => txt[0] == c && go(&pat[1..], &txt[1..]),
+        }
+    }
+    go(pattern.as_bytes(), text.as_bytes())
+}
+
+/// Whether one walked file survives `--include`/`--exclude` selection:
+/// with `--include` given the file must match at least one of those
+/// patterns, and with `--exclude` given it must match none of those. A
+/// pattern containing no `/` is additionally tried against the bare
+/// filename, so `--exclude "*.pdf"` works at any depth without spelling
+/// out every directory. Paths are compared with forward slashes even on
+/// Windows (see `relative_display_path`), so one pattern shape works on
+/// every OS. Excluded files are silently absent - never counted, listed,
+/// or probed - the same way a `.gitignore`d path simply isn't there.
+fn file_selected(root: &Path, path: &Path, include: &[String], exclude: &[String]) -> bool {
+    if include.is_empty() && exclude.is_empty() {
+        return true;
+    }
+    let relative = relative_display_path(root, path);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let matches_any = |patterns: &[String]| {
+        patterns.iter().any(|p| {
+            glob_match(p, &relative)
+                || (!p.contains('/') && glob_match(p, &file_name))
+        })
+    };
+    (!matches_any(exclude)) && (include.is_empty() || matches_any(include))
+}
+
+fn collect_files_sorted(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    exclude: &[String],
+) -> Result<()> {
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {dir:?}"))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -67800,7 +67999,24 @@ fn collect_files_sorted(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             // broken symlink resolves to an Err above - either way,
             // there's nothing more to do with it than skip it.
         } else if file_type.is_dir() {
-            collect_files_sorted(&path, out)?;
+            // Prune excluded directories without descending: `--exclude
+            // "target/**"` (or a bare `"target"`) never even walks the
+            // tree, which matters more than correctness alone on a
+            // directory with a huge ignored subtree. `--include` never
+            // prunes - a directory that matches no include pattern can
+            // still hold matching files deeper down, so only exclusion
+            // gets to skip the walk.
+            let relative = relative_display_path(root, &path);
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let pruned = exclude.iter().any(|p| {
+                glob_match(p, &relative) || (!p.contains('/') && glob_match(p, &file_name))
+            });
+            if !pruned {
+                collect_files_sorted(root, &path, out, exclude)?;
+            }
         } else if file_type.is_file() {
             out.push(path);
         }
@@ -67988,6 +68204,17 @@ struct BatchIndexEntry {
     col_count: usize,
 }
 
+/// One file `--continue-on-error` kept going past: what failed, and the
+/// full anyhow error chain (not just the top message), so a later reader
+/// - human or script - can diagnose without re-running anything.
+struct BatchFailure {
+    /// Display name, relative to the directory root that was walked
+    /// (same form as `BatchIndexEntry::source_relative`).
+    source_relative: String,
+    /// The complete `format!("{err:?}")` chain for the failure.
+    error: String,
+}
+
 /// Renders the top-level directory index (`--output-format md`): a
 /// `File | Tables | Columns | Output` table (capped at `MAX_TOC_ENTRIES`,
 /// the same cap this project already uses for a single file's own
@@ -68002,6 +68229,8 @@ fn render_directory_index(
     dir: &Path,
     entries: &[BatchIndexEntry],
     unrecognized: &[String],
+    empty: &[String],
+    failed: &[BatchFailure],
     total_tables: usize,
     total_columns: usize,
 ) -> String {
@@ -68015,6 +68244,12 @@ fn render_directory_index(
     ));
     if !unrecognized.is_empty() {
         md.push_str(&format!(" · **Skipped:** {}", unrecognized.len()));
+    }
+    // `failed`/`empty` only ever non-empty after a --continue-on-error run
+    // (or for empty files, which skip unconditionally), so the header stays
+    // byte-identical for every run that never needed either new path.
+    if !failed.is_empty() {
+        md.push_str(&format!(" · **Failed:** {}", failed.len()));
     }
     md.push_str("\n\n");
 
@@ -68055,6 +68290,47 @@ fn render_directory_index(
         md.push('\n');
     }
 
+    // Files that read successfully but held zero tables (an Excel-family
+    // workbook with no non-empty sheets): listed, not hidden - an empty
+    // file is "nothing went wrong", unlike a failure below, but a run
+    // that silently swallowed inputs would be worse than either.
+    if !empty.is_empty() {
+        md.push_str("## Empty\n\n");
+        let shown_empty = empty.len().min(MAX_TOC_ENTRIES);
+        for path in &empty[..shown_empty] {
+            md.push_str(&format!("- {} - no tables to profile\n", escape_md(path)));
+        }
+        if empty.len() > shown_empty {
+            md.push_str(&format!("- …and {} more\n", empty.len() - shown_empty));
+        }
+        md.push('\n');
+    }
+
+    // `--continue-on-error` failures, with enough of each error chain to
+    // diagnose without re-running anything. Capped like every other
+    // rendered list here; the full chain per file is what makes even a
+    // capped entry useful, not just the filename.
+    if !failed.is_empty() {
+        md.push_str("## Failed\n\n");
+        md.push_str("| File | Error |\n");
+        md.push_str("|---|---|\n");
+        let shown_failed = failed.len().min(MAX_TOC_ENTRIES);
+        for failure in &failed[..shown_failed] {
+            md.push_str(&format!(
+                "| {} | {} |\n",
+                escape_md(&failure.source_relative),
+                escape_md(&failure.error.replace('\n', " ")),
+            ));
+        }
+        if failed.len() > shown_failed {
+            md.push_str(&format!(
+                "| …and {} more | |\n",
+                failed.len() - shown_failed
+            ));
+        }
+        md.push('\n');
+    }
+
     md.truncate(md.trim_end_matches('\n').len());
     md.push('\n');
     md
@@ -68077,12 +68353,14 @@ fn render_directory_index_json(
     dir: &Path,
     entries: &[BatchIndexEntry],
     unrecognized: &[String],
+    empty: &[String],
+    failed: &[BatchFailure],
     total_tables: usize,
     total_columns: usize,
 ) -> String {
     use json_support::{Map, Value};
 
-    let mut doc = Map::with_capacity(6);
+    let mut doc = Map::with_capacity(8);
     doc.insert(
         "directory".to_string(),
         Value::from(dir.display().to_string()),
@@ -68118,6 +68396,30 @@ fn render_directory_index_json(
                 .iter()
                 .cloned()
                 .map(Value::from)
+                .collect::<Vec<_>>(),
+        ),
+    );
+
+    // Empty files (read fine, zero tables) and --continue-on-error
+    // failures, in machine shape. Both arrays are always present (never
+    // omitted when empty), so consumers never distinguish "none" from
+    // "not computed" - the same convention the rich profile JSON's own
+    // `relationships` key already keeps.
+    doc.insert(
+        "empty".to_string(),
+        Value::Array(empty.iter().cloned().map(Value::from).collect::<Vec<_>>()),
+    );
+    doc.insert(
+        "failed".to_string(),
+        Value::Array(
+            failed
+                .iter()
+                .map(|f| {
+                    let mut obj = Map::with_capacity(2);
+                    obj.insert("file".to_string(), Value::from(f.source_relative.clone()));
+                    obj.insert("error".to_string(), Value::from(f.error.clone()));
+                    Value::Object(obj)
+                })
                 .collect::<Vec<_>>(),
         ),
     );
@@ -68194,7 +68496,7 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     };
 
     let mut files = Vec::new();
-    collect_files_sorted(dir, &mut files)?;
+    collect_files_sorted(dir, dir, &mut files, &args.exclude)?;
 
     // The index is written wherever the per-file outputs themselves land -
     // co-located with the sources by default, under --output-dir when
@@ -68213,8 +68515,19 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let mut total_columns = 0usize;
     let mut index_entries: Vec<BatchIndexEntry> = Vec::new();
     let mut unrecognized: Vec<String> = Vec::new();
+    // `--continue-on-error` accumulations (both stay empty without the
+    // flag, so every message and rendering below degrades exactly to its
+    // old shape when the flag is off): files that failed with a recorded
+    // error, and files that read fine but held zero tables.
+    let mut failed: Vec<BatchFailure> = Vec::new();
+    let mut empty: Vec<String> = Vec::new();
 
     for path in &files {
+        // Selection first: an excluded file is invisible, not skipped -
+        // never counted, listed, or even probed.
+        if !file_selected(dir, path, &args.include, &args.exclude) {
+            continue;
+        }
         if looks_like_own_output(path) {
             skipped += 1;
             eprintln!(
@@ -68224,8 +68537,25 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             continue;
         }
 
+        // Decompression failures route through the same continue/failed
+        // handling as every later per-file error below (rather than the
+        // unconditional `?` this used to be): a corrupt `.gz` is exactly
+        // the kind of single bad file the flag exists for.
         let (read_path, logical_path, _decompressed_tmp) =
-            decompress_if_needed(path).with_context(|| format!("failed processing {path:?}"))?;
+            match decompress_if_needed(path).with_context(|| format!("failed processing {path:?}")) {
+                Ok(paths) => paths,
+                Err(err) => {
+                    if !args.continue_on_error {
+                        return Err(err);
+                    }
+                    failed.push(BatchFailure {
+                        source_relative: relative_display_path(dir, path),
+                        error: format!("{err:?}"),
+                    });
+                    eprintln!("{}: failed (recorded, continuing)", path.display());
+                    continue;
+                }
+            };
 
         // A file whose format can't be identified at all (no recognized
         // extension, and no sniffable content signature) is skipped, not
@@ -68245,9 +68575,19 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             }
         };
 
-        let outcome = (|| -> Result<(usize, usize, PathBuf)> {
+        let outcome = (|| -> Result<Option<(usize, usize, PathBuf)>> {
             let (tables, resolved_skip_rows) =
                 dispatch_reader(&read_path, &logical_path, format, args)?;
+            // A reader yielding zero tables (an Excel-family workbook with
+            // no non-empty sheets - the only shape that reaches here) is
+            // a skip with a note, not a failure and not a fatal error:
+            // the file read fine, it just holds nothing to profile. The
+            // same file in single-file mode still gets the clean error
+            // (see `run_single_file`), which is the right strictness when
+            // one file is the whole job.
+            if tables.is_empty() {
+                return Ok(None);
+            }
             let file_name = path
                 .file_name()
                 .unwrap_or_default()
@@ -68305,7 +68645,7 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 }
                 let table_count = tables.len();
                 let col_count: usize = tables.values().map(Vec::len).sum();
-                return Ok((table_count, col_count, db_path));
+                return Ok(Some((table_count, col_count, db_path)));
             }
 
             let output_path = batch_output_path(
@@ -68344,11 +68684,34 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
 
             let table_count = tables.len();
             let col_count: usize = tables.values().map(Vec::len).sum();
-            Ok((table_count, col_count, output_path))
+            Ok(Some((table_count, col_count, output_path)))
         })()
-        .with_context(|| format!("failed processing {path:?}"))?;
+        .with_context(|| format!("failed processing {path:?}"));
 
-        let (table_count, col_count, output_path) = outcome;
+        // Three outcomes, each explicit: a rendered file, an empty file
+        // skipped with a note, or - only under --continue-on-error - a
+        // recorded failure the run continues past. Without the flag any
+        // error returns here, the long-standing fail-fast behavior.
+        let (table_count, col_count, output_path) = match outcome {
+            Ok(Some(done)) => done,
+            Ok(None) => {
+                skipped += 1;
+                empty.push(relative_display_path(dir, path));
+                eprintln!("{}: skipped (no tables to profile)", path.display());
+                continue;
+            }
+            Err(err) => {
+                if !args.continue_on_error {
+                    return Err(err);
+                }
+                failed.push(BatchFailure {
+                    source_relative: relative_display_path(dir, path),
+                    error: format!("{err:?}"),
+                });
+                eprintln!("{}: failed (recorded, continuing)", path.display());
+                continue;
+            }
+        };
         processed += 1;
         total_tables += table_count;
         total_columns += col_count;
@@ -68366,7 +68729,18 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     }
 
     if processed == 0 {
-        bail!("no recognized files found in {dir:?} ({skipped} file(s) skipped as unrecognized)");
+        // `failed`/`empty` are only ever non-empty under
+        // --continue-on-error (or for empty files, which skip
+        // unconditionally), so the bare message below stays byte-identical
+        // for every run that never needed either new path.
+        let mut detail = format!("{skipped} file(s) skipped as unrecognized");
+        if !empty.is_empty() {
+            detail.push_str(&format!(", {} empty", empty.len()));
+        }
+        if !failed.is_empty() {
+            detail.push_str(&format!(", {} failed", failed.len()));
+        }
+        bail!("no recognized files found in {dir:?} ({detail})");
     }
 
     // A top-level index alongside every per-file output, regardless of
@@ -68379,6 +68753,8 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             dir,
             &index_entries,
             &unrecognized,
+            &empty,
+            &failed,
             total_tables,
             total_columns,
         ),
@@ -68387,6 +68763,8 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 dir,
                 &index_entries,
                 &unrecognized,
+                &empty,
+                &failed,
                 total_tables,
                 total_columns,
             )
@@ -68395,10 +68773,13 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     fs::write(&index_path, &index_content)
         .with_context(|| format!("failed to write {index_path:?}"))?;
 
-    eprintln!(
-        "{processed} file(s) processed ({skipped} skipped), {total_tables} tables, {total_columns} columns total -> {}",
-        index_path.display()
+    let mut summary = format!(
+        "{processed} file(s) processed ({skipped} skipped), {total_tables} tables, {total_columns} columns total"
     );
+    if !failed.is_empty() {
+        summary.push_str(&format!(", {} failed", failed.len()));
+    }
+    eprintln!("{summary} -> {}", index_path.display());
 
     Ok(())
 }
@@ -68567,13 +68948,21 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
     };
 
     let mut files = Vec::new();
-    collect_files_sorted(dir, &mut files)?;
+    collect_files_sorted(dir, dir, &mut files, &args.exclude)?;
 
     let mut processed = 0usize;
     let mut skipped = 0usize;
     let mut total_tables = 0usize;
     let mut total_columns = 0usize;
     let mut unrecognized: Vec<String> = Vec::new();
+    // `--continue-on-error` failures, recorded rather than fatal. One
+    // honest disclosure for the SQL-streaming shapes (a file failing
+    // mid-stream leaves whatever it already wrote in the script or the
+    // engine behind - output is never rolled back, the same policy the
+    // default fail-fast run already has for whatever it wrote before
+    // aborting): a failed file's partial output stays, and later files
+    // keep appending after it.
+    let mut failed: Vec<BatchFailure> = Vec::new();
     let mut namer = CombinedTableNamer::new();
     let mut combined_tables: BTreeMap<String, Vec<ColumnProfile>> = BTreeMap::new();
 
@@ -68628,6 +69017,9 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
     let mut is_first_table = true;
 
     for path in &files {
+        if !file_selected(dir, path, &args.include, &args.exclude) {
+            continue;
+        }
         if looks_like_own_output(path) {
             skipped += 1;
             eprintln!(
@@ -68638,7 +69030,20 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
         }
 
         let (read_path, logical_path, _decompressed_tmp) =
-            decompress_if_needed(path).with_context(|| format!("failed processing {path:?}"))?;
+            match decompress_if_needed(path).with_context(|| format!("failed processing {path:?}")) {
+                Ok(paths) => paths,
+                Err(err) => {
+                    if !args.continue_on_error {
+                        return Err(err);
+                    }
+                    failed.push(BatchFailure {
+                        source_relative: relative_display_path(dir, path),
+                        error: format!("{err:?}"),
+                    });
+                    eprintln!("{}: failed (recorded, continuing)", path.display());
+                    continue;
+                }
+            };
 
         let format = match detect_format(&read_path, &logical_path, &None) {
             Ok(format) => format,
@@ -68653,9 +69058,16 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
         let relative_path = relative_display_path(dir, path);
         let qualifier = combine_qualifier_from_path(&relative_path);
 
-        (|| -> Result<()> {
+        let counted: Result<bool> = (|| -> Result<bool> {
             let (tables, resolved_skip_rows) =
                 dispatch_reader(&read_path, &logical_path, format, args)?;
+            // Zero tables (an Excel-family workbook with no non-empty
+            // sheets) skips with a note here too - same reasoning as the
+            // per-file loop's own empty case, just without an index entry
+            // to record it in (a combined run has no per-file outputs).
+            if tables.is_empty() {
+                return Ok(false);
+            }
 
             if matches!(sql_mode, Some(SqlMode::Staging)) {
                 // Staging mode works for every format unconditionally
@@ -68732,17 +69144,47 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                     combined_tables.insert(qualified, profiles);
                 }
             }
-            Ok(())
+            Ok(true)
         })()
-        .with_context(|| format!("failed processing {path:?}"))?;
-
-        processed += 1;
-        eprintln!("{}: profiled ({qualifier}__*)", path.display());
+        .with_context(|| format!("failed processing {path:?}"));
+        match counted {
+            Ok(true) => {
+                processed += 1;
+                eprintln!("{}: profiled ({qualifier}__*)", path.display());
+            }
+            Ok(false) => {
+                skipped += 1;
+                eprintln!("{}: skipped (no tables to profile)", path.display());
+            }
+            Err(err) => {
+                if !args.continue_on_error {
+                    return Err(err);
+                }
+                failed.push(BatchFailure {
+                    source_relative: relative_display_path(dir, path),
+                    error: format!("{err:?}"),
+                });
+                eprintln!("{}: failed (recorded, continuing)", path.display());
+            }
+        }
     }
 
     if processed == 0 {
-        bail!("no recognized files found in {dir:?} ({skipped} file(s) skipped as unrecognized)");
+        let mut detail = format!("{skipped} file(s) skipped as unrecognized");
+        if !failed.is_empty() {
+            detail.push_str(&format!(", {} failed", failed.len()));
+        }
+        bail!("no recognized files found in {dir:?} ({detail})");
     }
+
+    // Suffix for every combined-run status line below: empty unless
+    // --continue-on-error actually recorded something, keeping every
+    // status line byte-identical for runs that never needed the flag.
+    let failed_suffix = if failed.is_empty() {
+        String::new()
+    } else {
+        format!(", {} failed", failed.len())
+    };
 
     match output_format {
         OutputFormat::Sql => {
@@ -68766,16 +69208,38 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                     );
                 }
                 eprintln!(
-                    "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> loaded into {} via {}",
+                    "{processed} file(s) combined into {total_tables} tables, {total_columns} columns{failed_suffix} -> loaded into {} via {}",
                     target.target,
                     target.engine.command_name()
                 );
             } else {
+                // Failures stream nowhere but stderr for a file/stdout SQL
+                // script, so name them in a trailing comment instead - a
+                // combined script that silently omits a failed file's
+                // tables would otherwise look complete. (--load-into's own
+                // stdin is already closed above, so that shape keeps
+                // stderr-only reporting.)
+                if !failed.is_empty() {
+                    use std::io::Write as _;
+                    let sink = sql_sink
+                        .as_mut()
+                        .expect("a file/stdout sink is always resolved for --output-format sql");
+                    writeln!(
+                        sink,
+                        "\n-- {} file(s) failed and were skipped by --continue-on-error:",
+                        failed.len()
+                    )?;
+                    for failure in &failed {
+                        for line in failure.error.lines() {
+                            writeln!(sink, "-- {}: {line}", failure.source_relative)?;
+                        }
+                    }
+                }
                 let destination = args.output_path.clone().unwrap_or_else(|| {
                     combine_default_output_path(args, dir, &directory_name, output_format)
                 });
                 eprintln!(
-                    "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> {}",
+                    "{processed} file(s) combined into {total_tables} tables, {total_columns} columns{failed_suffix} -> {}",
                     destination.display()
                 );
             }
@@ -68783,9 +69247,9 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
         OutputFormat::Markdown | OutputFormat::Json | OutputFormat::JsonSchema => {
             let content = match output_format {
                 OutputFormat::Markdown => {
-                    render_combined_markdown(&directory_name, &combined_tables)
+                    render_combined_markdown(&directory_name, &combined_tables, &failed)
                 }
-                OutputFormat::Json => render_combined_json(&directory_name, &combined_tables)?,
+                OutputFormat::Json => render_combined_json(&directory_name, &combined_tables, &failed)?,
                 OutputFormat::JsonSchema => render_json_schema(&directory_name, &combined_tables)?,
                 OutputFormat::Sql => unreachable!("handled in the arm above"),
             };
@@ -68794,13 +69258,13 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                     use std::io::Write as _;
                     std::io::stdout().write_all(content.as_bytes())?;
                     eprintln!(
-                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> (stdout)"
+                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns{failed_suffix} -> (stdout)"
                     );
                 }
                 Some(p) => {
                     fs::write(p, &content).with_context(|| format!("failed to write {p:?}"))?;
                     eprintln!(
-                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> {}",
+                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns{failed_suffix} -> {}",
                         p.display()
                     );
                 }
@@ -68814,7 +69278,7 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                     fs::write(&default_path, &content)
                         .with_context(|| format!("failed to write {default_path:?}"))?;
                     eprintln!(
-                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns -> {}",
+                        "{processed} file(s) combined into {total_tables} tables, {total_columns} columns{failed_suffix} -> {}",
                         default_path.display()
                     );
                 }
@@ -69088,6 +69552,9 @@ fn profile_raw_file_as_diff_columns(
         sql_mode: None,
         load_into: None,
         combine: false,
+        continue_on_error: false,
+        include: Vec::new(),
+        exclude: Vec::new(),
         list_formats: false,
     };
     let (tables, _resolved_skip_rows) =
@@ -79101,7 +79568,7 @@ mod tests {
             index_entry("a.csv", "a.csv.dictionary.md", 1, 3),
             index_entry("sub/b.jsonl", "sub/b.jsonl.dictionary.md", 1, 5),
         ];
-        let md = render_directory_index(Path::new("/tmp/data"), &entries, &[], 2, 8);
+        let md = render_directory_index(Path::new("/tmp/data"), &entries, &[], &[], &[], 2, 8);
         assert!(md.contains("**Files:** 2 · **Tables:** 2 · **Columns:** 8"));
         assert!(!md.contains("**Skipped:**"));
         assert!(md.contains("| a.csv | 1 | 3 | [a.csv.dictionary.md](<a.csv.dictionary.md>) |"));
@@ -79112,7 +79579,7 @@ mod tests {
     fn render_directory_index_lists_unrecognized_files_under_a_skipped_section() {
         let entries = vec![index_entry("a.csv", "a.csv.dictionary.md", 1, 3)];
         let unrecognized = vec!["README.txt".to_string(), "notes.log".to_string()];
-        let md = render_directory_index(Path::new("/tmp/data"), &entries, &unrecognized, 1, 3);
+        let md = render_directory_index(Path::new("/tmp/data"), &entries, &unrecognized, &[], &[], 1, 3);
         assert!(md.contains("**Skipped:** 2"));
         assert!(md.contains("## Skipped"));
         assert!(md.contains("- README.txt - unrecognized format"));
@@ -79135,11 +79602,140 @@ mod tests {
             Path::new("/tmp/data"),
             &entries,
             &[],
+            &[],
+            &[],
             entries.len(),
             entries.len(),
         );
         assert_eq!(md.matches("| f").count(), MAX_TOC_ENTRIES);
         assert!(md.contains("…and 7 more file(s) not shown here"));
+    }
+
+    fn batch_failure(file: &str, error: &str) -> BatchFailure {
+        BatchFailure {
+            source_relative: file.to_string(),
+            error: error.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_directory_index_lists_failed_files_with_their_errors() {
+        let entries = vec![index_entry("a.csv", "a.csv.dictionary.md", 1, 3)];
+        let failed = vec![batch_failure(
+            "b.csv",
+            "failed processing \"b.csv\"\n\nCaused by:\n    0: CSV error: ragged row",
+        )];
+        let md = render_directory_index(
+            Path::new("/tmp/data"),
+            &entries,
+            &[],
+            &[],
+            &failed,
+            1,
+            3,
+        );
+        assert!(md.contains("**Failed:** 1"));
+        assert!(md.contains("## Failed"));
+        // Multi-line chains render on one table row (a raw newline would
+        // corrupt the Markdown table), with the filename intact.
+        assert!(md.contains("| b.csv | failed processing"));
+        assert!(md.contains("Caused by:"));
+        assert!(!md.contains("## Empty"));
+    }
+
+    #[test]
+    fn render_directory_index_lists_empty_files_separately_from_failures() {
+        let entries = vec![index_entry("a.csv", "a.csv.dictionary.md", 1, 3)];
+        let empty = vec!["blank.xlsx".to_string()];
+        let md = render_directory_index(
+            Path::new("/tmp/data"),
+            &entries,
+            &[],
+            &empty,
+            &[],
+            1,
+            3,
+        );
+        assert!(md.contains("## Empty"));
+        assert!(md.contains("- blank.xlsx - no tables to profile"));
+        assert!(!md.contains("## Failed"));
+    }
+
+    #[test]
+    fn render_directory_index_json_carries_failed_and_empty_arrays() {
+        let entries = vec![index_entry("a.csv", "a.csv.dictionary.md", 1, 3)];
+        let failed = vec![batch_failure("b.csv", "boom")];
+        let empty = vec!["blank.xlsx".to_string()];
+        let parsed: serde_json::Value = serde_json::from_str(&render_directory_index_json(
+            Path::new("/tmp/data"),
+            &entries,
+            &[],
+            &empty,
+            &failed,
+            1,
+            3,
+        ))
+        .expect("index JSON must parse via the real serde_json oracle");
+        assert_eq!(parsed["failed"][0]["file"], "b.csv");
+        assert_eq!(parsed["failed"][0]["error"], "boom");
+        assert_eq!(parsed["empty"][0], "blank.xlsx");
+    }
+
+    #[test]
+    fn glob_match_star_question_and_star_star() {
+        // `*` spans anything but `/`.
+        assert!(glob_match("*.csv", "a.csv"));
+        assert!(!glob_match("*.csv", "sub/a.csv"));
+        assert!(glob_match("sub/*.csv", "sub/a.csv"));
+        assert!(!glob_match("sub/*.csv", "sub/deep/a.csv"));
+        // A trailing `*` also matches the empty remainder (not just a
+        // literal tail) - `sub/*` must match `sub/a.csv`, not only
+        // patterns ending in fixed text.
+        assert!(glob_match("sub/*", "sub/a.csv"));
+        assert!(!glob_match("sub/*", "sub/a/b"));
+        assert!(glob_match("*", "anything"));
+        assert!(!glob_match("?", ""));
+        // `?` is exactly one non-separator character.
+        assert!(glob_match("file?.csv", "file1.csv"));
+        assert!(!glob_match("file?.csv", "file12.csv"));
+        assert!(!glob_match("file?.csv", "file/.csv"));
+        // `**` crosses separators, including matching nothing at all.
+        assert!(glob_match("build/**", "build/a/b/c.o"));
+        assert!(glob_match("build/**", "build"));
+        assert!(glob_match("**/target/**", "a/target/b/c"));
+        assert!(!glob_match("a/**/b", "a/b/c"));
+        // Literal text (including dots) matches itself only.
+        assert!(glob_match("data.csv", "data.csv"));
+        assert!(!glob_match("data.csv", "dataXcsv"));
+        assert!(!glob_match("data.csv", "data.csv.bak"));
+        // Empty pattern matches only empty text.
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a.csv"));
+    }
+
+    #[test]
+    fn file_selected_combines_include_and_exclude() {
+        use std::path::Path;
+        let root = Path::new("/data");
+        let csv = Path::new("/data/sub/a.csv");
+        let pdf = Path::new("/data/sub/b.pdf");
+        // No patterns: everything is selected.
+        assert!(file_selected(root, csv, &[], &[]));
+        // A pattern with no `/` also tries the bare filename.
+        assert!(!file_selected(root, pdf, &[], &["*.pdf".to_string()]));
+        assert!(file_selected(root, csv, &[], &["*.pdf".to_string()]));
+        // `--include` is allow-listing: non-matches vanish silently.
+        assert!(file_selected(root, csv, &["*.csv".to_string()], &[]));
+        assert!(!file_selected(root, pdf, &["*.csv".to_string()], &[]));
+        // Exclude wins over include on the same file.
+        assert!(!file_selected(
+            root,
+            csv,
+            &["*.csv".to_string()],
+            &["sub/*".to_string()]
+        ));
+        // Directory-scoped patterns use the relative path.
+        assert!(!file_selected(root, csv, &[], &["sub/**".to_string()]));
     }
 
     // --- --output-format sql ---
