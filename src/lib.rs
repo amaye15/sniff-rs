@@ -3381,14 +3381,13 @@ struct Args {
     /// Directory-input mode only: keep going past a file that fails
     /// (corrupt content, an unreadable file, a reader that errors)
     /// instead of aborting the whole run on it. Each failure is recorded
-    /// - in the top-level index (`failed` list, next to `unrecognized`)
-    /// for the default per-file mode, in the combined document's own
-    /// `failed` list for `--combine --output-format json`, and always on
-    /// stderr - so nothing is ever silently dropped. Without this flag
-    /// the first failure aborts the run immediately (whatever was
-    /// already written stays on disk; nothing is ever rolled back),
-    /// which remains the default: a surprising failure should be loud,
-    /// not something a re-run has to go looking for.
+    /// in the top-level index, in the combined document for `--combine
+    /// --output-format json`, and always on stderr, so nothing is ever
+    /// silently dropped. Without this flag the first failure aborts the
+    /// run immediately (whatever was already written stays on disk;
+    /// nothing is ever rolled back), which remains the default: a
+    /// surprising failure should be loud, not something a re-run has to
+    /// go looking for.
     continue_on_error: bool,
     /// Directory-input mode only: only process files matching one of
     /// these glob patterns (`*` matches any run of characters except `/`,
@@ -3424,7 +3423,8 @@ Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
 INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
-HAR, GeoJSON, vCard, iCalendar, MBOX, or a Delta Lake/Apache Iceberg
+HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), or a
+Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3491,8 +3491,8 @@ OPTIONS:
                                 arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor,
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
-                                sas7bdat, spss, orc, bson, plist, json5, har, geojson,
-                                mbox, vcard, or icalendar - single-file mode only. Run
+                                 sas7bdat, spss, orc, bson, plist, json5, har, geojson,
+                                 mbox, vcard, icalendar, or ipynb - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -51081,6 +51081,118 @@ fn columns_from_ical(
     )
 }
 
+// --- Jupyter notebook reader (opt-in via --features ipynb) ---
+// A `.ipynb` file is standard JSON with a fixed, spec-defined top-level
+// shape (nbformat v4: `{"cells": [...], "metadata": {...}, "nbformat":
+// 4, ...}`), so - exactly like `har_support` for HAR's own `log.entries`
+// - this needs no new parser or bridge type at all, only plumbing over
+// the always-on core `json_support` parser. The natural records array is
+// the top-level `cells` list: one record per cell (code, markdown, and
+// raw cells alike), each flattened through the identical
+// `profile_json_records` path every other array-of-objects JSON-shaped
+// format already uses. A cell's own `source` (a list of line strings in
+// nbformat, not one joined string) pools into a `Vec<String>` column by
+// that path's own existing array convention; `outputs` (a list of
+// result objects) flattens the same way any other nested array of
+// objects would. Notebook-level `metadata`/`nbformat` describe the whole
+// document, not any one cell, so they are deliberately not surfaced as
+// columns - a single document-wide value has no honest per-cell reading,
+// the same "no invented row count" reasoning TOML's own
+// whole-document-as-one-row choice already applies from the other side
+// (there, one document is one row; here, the document's one natural
+// record list is the rows).
+// A document with no top-level `cells` array is a clear, disclosed error
+// naming exactly what's missing, not a guess at some other shape -
+// nbformat v3's own `worksheets` layout falls under this too (real but
+// superseded since 2015, with nothing in this project's fixture corpus
+// to verify a second layout against - the same "no fixture, no trust"
+// boundary SAS7BDAT and old-style BIFF2-5 `.xls` already draw).
+#[cfg(feature = "ipynb")]
+mod ipynb_support {
+    use super::*;
+
+    /// Streams top-level `cells` straight off a `BufReader` via
+    /// `json_support::stream_nested_array` - peak memory is the bounded
+    /// read window plus one cell's own span/tree/accumulator, never the
+    /// whole notebook (a real Colab notebook with thousands of outputs
+    /// can be tens of megabytes of mostly base64-encoded images). Each
+    /// object element folds into a shared `JsonRecordStreamProfiler`;
+    /// anything else (a stray string/number/null element) is a hard,
+    /// disclosed error naming the index, not a silent skip - a `cells`
+    /// array holding non-objects is malformed nbformat, not a shape with
+    /// a meaningful fallback the way top-level scalar JSON arrays have
+    /// their own `value`-column convention elsewhere in this project.
+    pub(crate) fn columns_from_ipynb(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        let mut seen = 0usize;
+        // A malformed element can't use `?` directly inside the callback
+        // (its return type is `ParseError`, not this crate's `Error`), so
+        // the precise shape error is captured here and re-raised once the
+        // scan finishes - surfacing `cells[0] is a ...` rather than
+        // mislabeling valid JSON as unparseable. Same sidecar pattern the
+        // SQL row-sources already use for the identical reason.
+        let mut first_err: Option<Error> = None;
+        let stream_result = json_support::stream_nested_array(reader, &["cells"], |v| match v {
+            JsonValue::Object(_) => {
+                if nrows.is_none_or(|n| seen < n) {
+                    profiler.push(&v);
+                }
+                seen += 1;
+                Ok(())
+            }
+            other => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow!(
+                        "cells[{seen}] is a {other:?}, not an object - not a well-formed notebook cell"
+                    ));
+                }
+                Err(json_support::ParseError::custom("not an object"))
+            }
+        });
+        // The shape error takes precedence over the scan's own abort: the
+        // file *is* valid JSON, it just isn't a notebook.
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        let found = stream_result
+            .map_err(|e| anyhow!("{e}"))
+            .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        if !found {
+            bail!(
+                "{path:?} doesn't look like a Jupyter notebook - expected a top-level \
+                 `cells` array (nbformat v4)"
+            );
+        }
+        Ok(profiler.finish())
+    }
+} // mod ipynb_support
+
+#[cfg(feature = "ipynb")]
+fn columns_from_ipynb(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    ipynb_support::columns_from_ipynb(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "ipynb"))]
+fn columns_from_ipynb(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "Jupyter notebook support isn't compiled in - rebuild with `cargo build --release --features ipynb` (or --features full)"
+    )
+}
+
 // --- MBOX reader (opt-in via --features mbox, hand-rolled RFC 4155
 // reader) --- One record per message. Message boundaries are found the
 // same way real mbox-writing/reading tools do (Python's own `mailbox`
@@ -55414,6 +55526,7 @@ enum InputFormat {
     Mbox,
     Vcard,
     Ical,
+    Ipynb,
     /// A Delta Lake table directory (`_delta_log/` present) - detected
     /// directly from the input path being such a directory, never from an
     /// extension or `--format` (a Delta table has no file extension of its
@@ -55493,6 +55606,7 @@ impl InputFormat {
             InputFormat::Mbox => "mbox",
             InputFormat::Vcard => "vcard",
             InputFormat::Ical => "icalendar",
+            InputFormat::Ipynb => "ipynb",
             InputFormat::DeltaTable => "delta",
             InputFormat::IcebergTable => "iceberg",
         }
@@ -55797,6 +55911,13 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
         directory: false,
     },
     FormatInfo {
+        name: "ipynb",
+        extensions: &["ipynb"],
+        feature: Some("ipynb"),
+        compiled_in: cfg!(feature = "ipynb"),
+        directory: false,
+    },
+    FormatInfo {
         name: "delta",
         // Never `--format`-selectable or extension-detected at all - a
         // Delta table has no file extension of its own, and is instead
@@ -56009,7 +56130,7 @@ mod format_catalog_tests {
         let joined = format_names_joined();
         let piped = format_names_piped();
         assert!(joined.contains("csv"));
-        assert!(joined.contains(", or icalendar"));
+        assert!(joined.contains(", or ipynb"));
         assert!(!joined.contains("delta"));
         assert!(!joined.contains("iceberg"));
         assert!(piped.contains("csv|tsv"));
@@ -56376,6 +56497,7 @@ fn detect_format(
             "mbox" => Ok(InputFormat::Mbox),
             "vcard" | "vcf" => Ok(InputFormat::Vcard),
             "icalendar" | "ical" | "ics" => Ok(InputFormat::Ical),
+            "ipynb" => Ok(InputFormat::Ipynb),
             other => {
                 bail!(
                     "unrecognized --format '{other}' (expected {}) - run `sniff-rs --list-formats` for the full, per-build list",
@@ -56419,6 +56541,7 @@ fn detect_format(
         "mbox" => Ok(InputFormat::Mbox),
         "vcf" => Ok(InputFormat::Vcard),
         "ics" => Ok(InputFormat::Ical),
+        "ipynb" => Ok(InputFormat::Ipynb),
         // The extension alone doesn't tell us - either there isn't one, or
         // it's not one of the above. Before giving up, try the file's own
         // bytes: fixed-width text and the four log formats have no magic
@@ -56938,7 +57061,10 @@ fn render_combined_json(
                 .iter()
                 .map(|f| {
                     let mut obj = json_support::Map::with_capacity(2);
-                    obj.insert("file".to_string(), JsonValue::from(f.source_relative.clone()));
+                    obj.insert(
+                        "file".to_string(),
+                        JsonValue::from(f.source_relative.clone()),
+                    );
                     obj.insert("error".to_string(), JsonValue::from(f.error.clone()));
                     JsonValue::Object(obj)
                 })
@@ -57043,6 +57169,7 @@ struct Relationship {
     to_column: String,
     confidence: Confidence,
     reference: Option<Reference>,
+    context: EdgeContext,
     evidence: Vec<String>,
     reason: String,
 }
@@ -57057,9 +57184,31 @@ struct Reference {
     referenced_column: String,
 }
 
+/// Whether an edge bridges two genuinely different tables or just links
+/// two copies of (nearly) the same schema: versioned snapshots
+/// (`sales_2024`/`sales_2025`), a notebook saved under three names, the
+/// same export run twice. `DuplicateSchema` never hides the edge - every
+/// link is still listed with full evidence - it only labels the pair so a
+/// god-table ranking with forty same-schema links reads honestly instead
+/// of mistaking repetition for importance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EdgeContext {
+    Bridge,
+    DuplicateSchema,
+}
+
+impl EdgeContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            EdgeContext::Bridge => "bridge",
+            EdgeContext::DuplicateSchema => "duplicate_schema",
+        }
+    }
+}
+
 impl Relationship {
     fn to_json(&self) -> JsonValue {
-        let mut obj = json_support::Map::with_capacity(8);
+        let mut obj = json_support::Map::with_capacity(9);
         obj.insert(
             "from_table".to_string(),
             JsonValue::from(self.from_table.clone()),
@@ -57117,6 +57266,12 @@ impl Relationship {
             JsonValue::Array(self.evidence.iter().cloned().map(JsonValue::from).collect()),
         );
         obj.insert("reason".to_string(), JsonValue::from(self.reason.clone()));
+        // Appended last, per the additive-field convention: edge context
+        // postdates every other edge key.
+        obj.insert(
+            "context".to_string(),
+            JsonValue::from(self.context.as_str().to_string()),
+        );
         JsonValue::Object(obj)
     }
 }
@@ -57478,9 +57633,70 @@ fn join_candidate(
             referenced_table: id_tab.to_string(),
             referenced_column: id_col.clone(),
         }),
+        // Upgraded below by `detect_relationships` once the table pair's
+        // own similarity is known - a single column pair cannot tell a
+        // bridge from a duplicate schema on its own.
+        context: EdgeContext::Bridge,
         evidence,
         reason,
     })
+}
+
+/// Jaccard similarity over two tables' canonical column-name sets: shared
+/// names over the union. Both empty is defined as 0.0 (no columns, nothing
+/// in common), not 1.0 - vacuous similarity would flag every pair of
+/// zero-column tables as duplicates of each other.
+fn table_name_similarity(a: &[ColumnProfile], b: &[ColumnProfile]) -> f64 {
+    use std::collections::HashSet;
+    let set_a: HashSet<String> = a.iter().map(|c| canon_name(&c.name)).collect();
+    let set_b: HashSet<String> = b.iter().map(|c| canon_name(&c.name)).collect();
+    if set_a.is_empty() && set_b.is_empty() {
+        return 0.0;
+    }
+    let shared = set_a.intersection(&set_b).count() as f64;
+    let union = set_a.union(&set_b).count() as f64;
+    shared / union
+}
+
+/// Table pairs whose schemas overlap at or above this are near-copies
+/// (versions, re-exports, the same notebook saved thrice) rather than
+/// independently-designed tables that happen to share a key.
+const DUPLICATE_SCHEMA_SIMILARITY: f64 = 0.8;
+
+/// Table pairs worth naming (but not relabeling edges over) live at or
+/// above this: strongly overlapping without meeting the duplicate bar -
+/// same domain, genuinely different tables.
+const OVERLAP_REPORT_SIMILARITY: f64 = 0.5;
+
+/// Every table pair at or above `OVERLAP_REPORT_SIMILARITY`, sorted by
+/// similarity descending (ties by table names): the raw material for
+/// rank's own "similar tables" section. Each entry also says whether the
+/// pair clears the duplicate bar, so callers never recompute it.
+fn similar_tables(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> Vec<(String, String, f64, bool)> {
+    let names: Vec<&String> = tables.keys().collect();
+    let mut pairs = Vec::new();
+    for (i, t1) in names.iter().enumerate() {
+        for t2 in &names[i + 1..] {
+            let sim = table_name_similarity(&tables[*t1], &tables[*t2]);
+            if sim >= OVERLAP_REPORT_SIMILARITY {
+                pairs.push((
+                    (*t1).clone(),
+                    (*t2).clone(),
+                    (sim * 1000.0).round() / 1000.0,
+                    sim >= DUPLICATE_SCHEMA_SIMILARITY,
+                ));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    pairs
 }
 
 /// Every cross-table join candidate in a profiled `tables` map, sorted by
@@ -57488,12 +57704,25 @@ fn join_candidate(
 /// regardless of profiling order. Single-table inputs yield zero edges.
 fn detect_relationships(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Vec<Relationship> {
     let tables_vec: Vec<(&String, &Vec<ColumnProfile>)> = tables.iter().collect();
+    // Table pairs at the duplicate bar, resolved once up front: every edge
+    // between them is tagged `DuplicateSchema` below, so a ranking over
+    // incident edges can tell repetition apart from importance.
+    let mut duplicate_pairs: HashSet<(String, String)> = HashSet::new();
+    for (t1, t2, _, duplicate) in similar_tables(tables) {
+        if duplicate {
+            duplicate_pairs.insert((t1, t2));
+        }
+    }
     let mut out = Vec::new();
     for (i, (t1, cols1)) in tables_vec.iter().enumerate() {
         for (t2, cols2) in &tables_vec[i + 1..] {
+            let duplicate = duplicate_pairs.contains(&((*t1).clone(), (*t2).clone()));
             for c1 in cols1.iter() {
                 for c2 in cols2.iter() {
-                    if let Some(rel) = join_candidate(t1, c1, t2, c2) {
+                    if let Some(mut rel) = join_candidate(t1, c1, t2, c2) {
+                        if duplicate {
+                            rel.context = EdgeContext::DuplicateSchema;
+                        }
                         out.push(rel);
                     }
                 }
@@ -62191,11 +62420,11 @@ mod xlsx_support {
             out.push((sheet_name, profiles));
         }
 
-            // An empty workbook yields zero tables rather than an error
-            // here (see the identical comment on the OOXML reader's own
-            // empty case above): single-file mode re-raises the clean
-            // error, directory mode skips with a note.
-            Ok(out)
+        // An empty workbook yields zero tables rather than an error
+        // here (see the identical comment on the OOXML reader's own
+        // empty case above): single-file mode re-raises the clean
+        // error, directory mode skips with a note.
+        Ok(out)
     }
 
     /// The OOXML (`.xlsx`) row-source for `render_sql_inline_flat`'s
@@ -63037,11 +63266,11 @@ mod xlsx_support {
             win.skip_element()?;
         }
 
-            // An empty workbook yields zero tables rather than an error
-            // here (see the identical comment on the OOXML reader's own
-            // empty case above): single-file mode re-raises the clean
-            // error, directory mode skips with a note.
-            Ok(out)
+        // An empty workbook yields zero tables rather than an error
+        // here (see the identical comment on the OOXML reader's own
+        // empty case above): single-file mode re-raises the clean
+        // error, directory mode skips with a note.
+        Ok(out)
     }
 
     // --- Hand-rolled OLE2 / Compound File Binary Format reader ---
@@ -64180,11 +64409,11 @@ mod xlsx_support {
             out.push((sheet_name, profiles));
         }
 
-            // An empty workbook yields zero tables rather than an error
-            // here (see the identical comment on the OOXML reader's own
-            // empty case above): single-file mode re-raises the clean
-            // error, directory mode skips with a note.
-            Ok(out)
+        // An empty workbook yields zero tables rather than an error
+        // here (see the identical comment on the OOXML reader's own
+        // empty case above): single-file mode re-raises the clean
+        // error, directory mode skips with a note.
+        Ok(out)
     }
 
     /// The BIFF8 (`.xls`) row-source for `render_sql_inline_flat`'s
@@ -64807,11 +65036,11 @@ mod xlsx_support {
             out.push((entry.name, profiles));
         }
 
-            // An empty workbook yields zero tables rather than an error
-            // here (see the identical comment on the OOXML reader's own
-            // empty case above): single-file mode re-raises the clean
-            // error, directory mode skips with a note.
-            Ok(out)
+        // An empty workbook yields zero tables rather than an error
+        // here (see the identical comment on the OOXML reader's own
+        // empty case above): single-file mode re-raises the clean
+        // error, directory mode skips with a note.
+        Ok(out)
     }
 
     /// The BIFF12 (`.xlsb`) row-source for `render_sql_inline_flat`'s
@@ -67271,6 +67500,7 @@ fn dispatch_reader(
             InputFormat::Mbox => columns_from_mbox(read_path, args.nrows, args.samples)?,
             InputFormat::Vcard => columns_from_vcard(read_path, args.nrows, args.samples)?,
             InputFormat::Ical => columns_from_ical(read_path, args.nrows, args.samples)?,
+            InputFormat::Ipynb => columns_from_ipynb(read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
@@ -67963,10 +68193,9 @@ fn file_selected(root: &Path, path: &Path, include: &[String], exclude: &[String
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let matches_any = |patterns: &[String]| {
-        patterns.iter().any(|p| {
-            glob_match(p, &relative)
-                || (!p.contains('/') && glob_match(p, &file_name))
-        })
+        patterns
+            .iter()
+            .any(|p| glob_match(p, &relative) || (!p.contains('/') && glob_match(p, &file_name)))
     };
     (!matches_any(exclude)) && (include.is_empty() || matches_any(include))
 }
@@ -68541,21 +68770,22 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
         // handling as every later per-file error below (rather than the
         // unconditional `?` this used to be): a corrupt `.gz` is exactly
         // the kind of single bad file the flag exists for.
-        let (read_path, logical_path, _decompressed_tmp) =
-            match decompress_if_needed(path).with_context(|| format!("failed processing {path:?}")) {
-                Ok(paths) => paths,
-                Err(err) => {
-                    if !args.continue_on_error {
-                        return Err(err);
-                    }
-                    failed.push(BatchFailure {
-                        source_relative: relative_display_path(dir, path),
-                        error: format!("{err:?}"),
-                    });
-                    eprintln!("{}: failed (recorded, continuing)", path.display());
-                    continue;
+        let (read_path, logical_path, _decompressed_tmp) = match decompress_if_needed(path)
+            .with_context(|| format!("failed processing {path:?}"))
+        {
+            Ok(paths) => paths,
+            Err(err) => {
+                if !args.continue_on_error {
+                    return Err(err);
                 }
-            };
+                failed.push(BatchFailure {
+                    source_relative: relative_display_path(dir, path),
+                    error: format!("{err:?}"),
+                });
+                eprintln!("{}: failed (recorded, continuing)", path.display());
+                continue;
+            }
+        };
 
         // A file whose format can't be identified at all (no recognized
         // extension, and no sniffable content signature) is skipped, not
@@ -69029,21 +69259,22 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
             continue;
         }
 
-        let (read_path, logical_path, _decompressed_tmp) =
-            match decompress_if_needed(path).with_context(|| format!("failed processing {path:?}")) {
-                Ok(paths) => paths,
-                Err(err) => {
-                    if !args.continue_on_error {
-                        return Err(err);
-                    }
-                    failed.push(BatchFailure {
-                        source_relative: relative_display_path(dir, path),
-                        error: format!("{err:?}"),
-                    });
-                    eprintln!("{}: failed (recorded, continuing)", path.display());
-                    continue;
+        let (read_path, logical_path, _decompressed_tmp) = match decompress_if_needed(path)
+            .with_context(|| format!("failed processing {path:?}"))
+        {
+            Ok(paths) => paths,
+            Err(err) => {
+                if !args.continue_on_error {
+                    return Err(err);
                 }
-            };
+                failed.push(BatchFailure {
+                    source_relative: relative_display_path(dir, path),
+                    error: format!("{err:?}"),
+                });
+                eprintln!("{}: failed (recorded, continuing)", path.display());
+                continue;
+            }
+        };
 
         let format = match detect_format(&read_path, &logical_path, &None) {
             Ok(format) => format,
@@ -69249,7 +69480,9 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                 OutputFormat::Markdown => {
                     render_combined_markdown(&directory_name, &combined_tables, &failed)
                 }
-                OutputFormat::Json => render_combined_json(&directory_name, &combined_tables, &failed)?,
+                OutputFormat::Json => {
+                    render_combined_json(&directory_name, &combined_tables, &failed)?
+                }
                 OutputFormat::JsonSchema => render_json_schema(&directory_name, &combined_tables)?,
                 OutputFormat::Sql => unreachable!("handled in the arm above"),
             };
@@ -71541,12 +71774,17 @@ fn render_explain_md(
             } else {
                 (&rel.from_table, &rel.from_column)
             };
+            let context_note = match rel.context {
+                EdgeContext::DuplicateSchema => " [duplicate-schema link]",
+                EdgeContext::Bridge => "",
+            };
             out.push_str(&format!(
-                "| {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {}{} |\n",
                 escape_graph_md(other_table),
                 escape_graph_md(other_column),
                 rel.confidence.as_str(),
                 escape_graph_md(&rel.reason),
+                context_note,
             ));
         }
     }
@@ -71679,8 +71917,15 @@ fn render_path_md(
     ));
     for (n, idx) in hops.iter().enumerate() {
         let rel = &graph.relationships[*idx];
+        // Duplicate-schema hops read differently from bridges: the link
+        // is real, but it joins two copies of one schema, not two
+        // independently-designed tables. Marked, never hidden.
+        let context_note = match rel.context {
+            EdgeContext::DuplicateSchema => " [duplicate-schema link]",
+            EdgeContext::Bridge => "",
+        };
         out.push_str(&format!(
-            "{}. {}.{} → {}.{} ({}) — {}\n",
+            "{}. {}.{} → {}.{} ({}) — {}{}\n",
             n + 1,
             rel.from_table,
             rel.from_column,
@@ -71688,6 +71933,7 @@ fn render_path_md(
             rel.to_column,
             rel.confidence.as_str(),
             rel.reason,
+            context_note,
         ));
         let alternates = hop_alternatives(graph, *idx);
         if !alternates.is_empty() {
@@ -71695,13 +71941,18 @@ fn render_path_md(
                 .iter()
                 .map(|i| {
                     let alt = &graph.relationships[*i];
+                    let note = match alt.context {
+                        EdgeContext::DuplicateSchema => " [duplicate-schema link]",
+                        EdgeContext::Bridge => "",
+                    };
                     format!(
-                        "{}.{} → {}.{} ({})",
+                        "{}.{} → {}.{} ({}){}",
                         alt.from_table,
                         alt.from_column,
                         alt.to_table,
                         alt.to_column,
-                        alt.confidence.as_str()
+                        alt.confidence.as_str(),
+                        note
                     )
                 })
                 .collect::<Vec<_>>()
@@ -71793,6 +72044,7 @@ fn render_rank_md(
     graph: &TableGraph,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
     components: &[Vec<String>],
+    similar: &[(String, String, f64, bool)],
 ) -> String {
     let mut out = String::new();
     out.push_str("# Tables by connectivity\n\n");
@@ -71849,6 +72101,33 @@ fn render_rank_md(
             ));
         }
     }
+    // Table pairs sharing at least half their column names: at the
+    // duplicate bar they are near-copies (versions, re-exports) whose
+    // edges read as `duplicate_schema`; below it they are same-domain
+    // tables whose shared links stay honest `bridge` edges. Capped like
+    // every other rendered list here.
+    if !similar.is_empty() {
+        out.push_str("\n## Similar tables\n\n");
+        out.push_str("| Table A | Table B | Similarity | Reading |\n");
+        out.push_str("|---|---|---|---|\n");
+        let shown = similar.len().min(MAX_TOC_ENTRIES);
+        for (a, b, sim, duplicate) in &similar[..shown] {
+            out.push_str(&format!(
+                "| {} | {} | {:.0}% | {} |\n",
+                escape_graph_md(a),
+                escape_graph_md(b),
+                sim * 100.0,
+                if *duplicate {
+                    "likely duplicate - edges between them read as duplicate_schema"
+                } else {
+                    "strongly overlapping - shared links stay bridge edges"
+                }
+            ));
+        }
+        if similar.len() > shown {
+            out.push_str(&format!("| …and {} more | | | |\n", similar.len() - shown));
+        }
+    }
     out
 }
 
@@ -71856,9 +72135,10 @@ fn render_rank_json(
     graph: &TableGraph,
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
     components: &[Vec<String>],
+    similar: &[(String, String, f64, bool)],
     input: &Path,
 ) -> Result<String> {
-    let mut doc = json_support::Map::with_capacity(3);
+    let mut doc = json_support::Map::with_capacity(4);
     doc.insert(
         "input".to_string(),
         JsonValue::from(input.display().to_string()),
@@ -71922,6 +72202,34 @@ fn render_rank_json(
                 .collect(),
         ),
     );
+    // Always present (never omitted when empty), like every other
+    // machine-first array in this tool's JSON shapes.
+    doc.insert(
+        "similar_tables".to_string(),
+        JsonValue::Array(
+            similar
+                .iter()
+                .map(|(a, b, sim, duplicate)| {
+                    let mut obj = json_support::Map::with_capacity(4);
+                    obj.insert("table_a".to_string(), JsonValue::from(a.clone()));
+                    obj.insert("table_b".to_string(), JsonValue::from(b.clone()));
+                    obj.insert("similarity".to_string(), JsonValue::from(*sim));
+                    obj.insert(
+                        "reading".to_string(),
+                        JsonValue::from(
+                            if *duplicate {
+                                "likely_duplicate"
+                            } else {
+                                "strongly_overlapping"
+                            }
+                            .to_string(),
+                        ),
+                    );
+                    JsonValue::Object(obj)
+                })
+                .collect(),
+        ),
+    );
     Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
 }
 
@@ -71933,9 +72241,10 @@ fn run_rank(raw: &[String]) -> Result<()> {
     let tables = load_graph_input(&args.input, args.samples)?;
     let graph = build_table_graph(&tables);
     let components = connected_components(&graph);
+    let similar = similar_tables(&tables);
     let rendered = match args.format {
-        GraphFormat::Md => render_rank_md(&graph, &tables, &components),
-        GraphFormat::Json => render_rank_json(&graph, &tables, &components, &args.input)?,
+        GraphFormat::Md => render_rank_md(&graph, &tables, &components, &similar),
+        GraphFormat::Json => render_rank_json(&graph, &tables, &components, &similar, &args.input)?,
     };
     emit_graph_output(
         &rendered,
@@ -79579,7 +79888,15 @@ mod tests {
     fn render_directory_index_lists_unrecognized_files_under_a_skipped_section() {
         let entries = vec![index_entry("a.csv", "a.csv.dictionary.md", 1, 3)];
         let unrecognized = vec!["README.txt".to_string(), "notes.log".to_string()];
-        let md = render_directory_index(Path::new("/tmp/data"), &entries, &unrecognized, &[], &[], 1, 3);
+        let md = render_directory_index(
+            Path::new("/tmp/data"),
+            &entries,
+            &unrecognized,
+            &[],
+            &[],
+            1,
+            3,
+        );
         assert!(md.contains("**Skipped:** 2"));
         assert!(md.contains("## Skipped"));
         assert!(md.contains("- README.txt - unrecognized format"));
@@ -79625,15 +79942,7 @@ mod tests {
             "b.csv",
             "failed processing \"b.csv\"\n\nCaused by:\n    0: CSV error: ragged row",
         )];
-        let md = render_directory_index(
-            Path::new("/tmp/data"),
-            &entries,
-            &[],
-            &[],
-            &failed,
-            1,
-            3,
-        );
+        let md = render_directory_index(Path::new("/tmp/data"), &entries, &[], &[], &failed, 1, 3);
         assert!(md.contains("**Failed:** 1"));
         assert!(md.contains("## Failed"));
         // Multi-line chains render on one table row (a raw newline would
@@ -79647,15 +79956,7 @@ mod tests {
     fn render_directory_index_lists_empty_files_separately_from_failures() {
         let entries = vec![index_entry("a.csv", "a.csv.dictionary.md", 1, 3)];
         let empty = vec!["blank.xlsx".to_string()];
-        let md = render_directory_index(
-            Path::new("/tmp/data"),
-            &entries,
-            &[],
-            &empty,
-            &[],
-            1,
-            3,
-        );
+        let md = render_directory_index(Path::new("/tmp/data"), &entries, &[], &empty, &[], 1, 3);
         assert!(md.contains("## Empty"));
         assert!(md.contains("- blank.xlsx - no tables to profile"));
         assert!(!md.contains("## Failed"));
@@ -80506,6 +80807,117 @@ mod tests {
         assert_eq!(community_label(&graph, "books"), "books-centered");
         // A singleton's label is itself - there is no hub to name.
         assert_eq!(community_label(&graph, "audit"), "audit");
+    }
+
+    #[test]
+    fn graph_table_similarity_is_jaccard_over_canon_names() {
+        let cols = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| rel_col(n, "String", &["x"]))
+                .collect::<Vec<_>>()
+        };
+        // Identical schemas: 1.0. Disjoint: 0.0. Two of four shared: 0.5.
+        assert_eq!(
+            table_name_similarity(&cols(&["a", "b"]), &cols(&["a", "b"])),
+            1.0
+        );
+        assert_eq!(
+            table_name_similarity(&cols(&["a", "b"]), &cols(&["c", "d"])),
+            0.0
+        );
+        assert_eq!(
+            table_name_similarity(&cols(&["a", "b", "c"]), &cols(&["b", "c", "d"])),
+            0.5
+        );
+        // Canonicalization counts: userId and user_id are the same name.
+        assert_eq!(
+            table_name_similarity(&cols(&["userId"]), &cols(&["user_id"])),
+            1.0
+        );
+        // No columns on both sides is 0.0, not vacuous 1.0 - two empty
+        // tables must never read as duplicates of each other.
+        assert_eq!(table_name_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn graph_similar_tables_reports_and_buckets_pairs() {
+        let tables = rel_tables(&[
+            (
+                "v1",
+                vec![rel_col("a", "i64", &["1"]), rel_col("b", "i64", &["2"])],
+            ),
+            (
+                "v2",
+                vec![rel_col("a", "i64", &["1"]), rel_col("b", "i64", &["2"])],
+            ),
+            (
+                "other",
+                vec![
+                    rel_col("a", "i64", &["1"]),
+                    rel_col("b", "i64", &["2"]),
+                    rel_col("z", "i64", &["9"]),
+                ],
+            ),
+        ]);
+        let pairs = similar_tables(&tables);
+        // v1/v2 identical (1.0, duplicate); each shares 2 of 3 names with
+        // other (0.667, overlapping); sorted by similarity.
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, "v1");
+        assert_eq!(pairs[0].1, "v2");
+        assert_eq!(pairs[0].2, 1.0);
+        assert!(pairs[0].3);
+        assert!(!pairs[1].3 && !pairs[2].3);
+    }
+
+    #[test]
+    fn graph_duplicate_pair_edges_read_duplicate_schema() {
+        // v1/v2 are column-identical (similarity 1.0): every edge between
+        // them reads duplicate_schema. w shares one column with each -
+        // same exact-name rule, but a 0.25-similarity pair, so those edges
+        // stay honest bridges.
+        let quad = || {
+            ["a", "b", "c", "d"]
+                .iter()
+                .map(|n| rel_col(n, "i64", &["1"]))
+                .collect::<Vec<_>>()
+        };
+        let tables = rel_tables(&[
+            ("v1", quad()),
+            ("v2", quad()),
+            (
+                "w",
+                vec![
+                    rel_col("a", "i64", &["1"]),
+                    rel_col("zzz", "String", &["q"]),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        let dup_edges: Vec<&Relationship> = edges
+            .iter()
+            .filter(|e| {
+                (e.from_table == "v1" || e.to_table == "v1")
+                    && (e.from_table == "v2" || e.to_table == "v2")
+            })
+            .collect();
+        assert_eq!(dup_edges.len(), 4);
+        assert!(
+            dup_edges
+                .iter()
+                .all(|e| e.context == EdgeContext::DuplicateSchema)
+        );
+        let bridge_edges: Vec<&Relationship> = edges
+            .iter()
+            .filter(|e| e.from_table == "w" || e.to_table == "w")
+            .collect();
+        assert_eq!(bridge_edges.len(), 2);
+        assert!(
+            bridge_edges
+                .iter()
+                .all(|e| e.context == EdgeContext::Bridge)
+        );
     }
 
     #[test]

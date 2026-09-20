@@ -12812,6 +12812,69 @@ fn graph_blank_headers_neither_link_nor_break_queries() {
 }
 
 #[test]
+fn graph_rank_reports_similar_tables_and_edge_context() {
+    // v1/v2 are column-identical (similarity 1.0): their shared edges
+    // read duplicate_schema. w shares one column with each (0.33) - below
+    // the reporting bar entirely - and those edges stay bridges.
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("v1.csv"), "id,name\n1,Alice\n2,Bob\n").unwrap();
+    std::fs::write(dir.path().join("v2.csv"), "id,name\n1,Alice\n2,Bob\n").unwrap();
+    std::fs::write(dir.path().join("w.csv"), "id,city\n1,Paris\n").unwrap();
+    let out = TempDir::new();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--combine",
+            "--output-format",
+            "json",
+            "--output-dir",
+            out.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let dict = out.path().join(format!("{dir_name}.dictionary.json"));
+
+    let output = run_graph(&["rank", dict.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("## Similar tables"), "got: {stdout}");
+    assert!(stdout.contains("likely duplicate"), "got: {stdout}");
+
+    let output = run_graph(&["rank", dict.to_str().unwrap(), "--output-format", "json"]);
+    assert!(output.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    let similar = doc["similar_tables"].as_array().unwrap();
+    assert_eq!(similar.len(), 1);
+    assert_eq!(similar[0]["similarity"], 1.0);
+    assert_eq!(similar[0]["reading"], "likely_duplicate");
+
+    // Edge contexts straight from the combined dictionary itself.
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dict).unwrap()).unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    assert!(!rels.is_empty());
+    assert!(
+        rels.iter().any(|e| e["context"] == "duplicate_schema"),
+        "v1/v2 edges must be tagged"
+    );
+    assert!(
+        rels.iter().any(|e| e["context"] == "bridge"),
+        "w edges must stay bridges"
+    );
+}
+
+#[test]
 fn graph_subcommands_reject_bad_flags_and_explain_helps() {
     let output = run_graph(&[
         "explain",
@@ -12913,8 +12976,7 @@ fn directory_continue_on_error_records_failures_in_markdown_index() {
         .output()
         .expect("failed to run binary");
     assert!(output.status.success());
-    let index =
-        std::fs::read_to_string(out.path().join("_index.dictionary.md")).unwrap();
+    let index = std::fs::read_to_string(out.path().join("_index.dictionary.md")).unwrap();
     assert!(index.contains("## Failed"), "got: {index}");
     assert!(index.contains("bad.csv"), "got: {index}");
     assert!(index.contains("## Skipped"), "got: {index}");
@@ -12991,9 +13053,10 @@ fn directory_include_and_exclude_select_files() {
                 let e = e.unwrap();
                 // Outputs only: a mirrored subdirectory (like skipme/)
                 // holds outputs deeper down, it is not one itself.
-                e.file_type().unwrap().is_file().then(|| {
-                    e.file_name().to_string_lossy().into_owned()
-                })
+                e.file_type()
+                    .unwrap()
+                    .is_file()
+                    .then(|| e.file_name().to_string_lossy().into_owned())
             })
             .filter(|n| n != "_index.dictionary.json")
             .collect();
@@ -13006,11 +13069,19 @@ fn directory_include_and_exclude_select_files() {
     // down - so the top level holds just a.csv's output.
     let (out, names) = run(&["--exclude", "*.json"]);
     assert_eq!(names, vec!["a.csv.dictionary.json"]);
-    assert!(out.path().join("skipme").join("c.csv.dictionary.json").exists());
+    assert!(
+        out.path()
+            .join("skipme")
+            .join("c.csv.dictionary.json")
+            .exists()
+    );
     // Exclude a whole subtree: nothing under skipme/ is even walked, so
     // its mirrored directory never appears either.
     let (out, names) = run(&["--exclude", "skipme/**"]);
-    assert_eq!(names, vec!["a.csv.dictionary.json", "b.json.dictionary.json"]);
+    assert_eq!(
+        names,
+        vec!["a.csv.dictionary.json", "b.json.dictionary.json"]
+    );
     assert!(!out.path().join("skipme").exists());
     // Include allow-lists; combined with exclude, both must agree.
     let (_out, names) = run(&["--include", "*.csv", "--exclude", "skipme/**"]);
@@ -13031,8 +13102,7 @@ fn directory_flags_are_rejected_for_single_file_input() {
             .expect("failed to run binary");
         assert!(!output.status.success());
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("when the input path is a directory"),
+            String::from_utf8_lossy(&output.stderr).contains("when the input path is a directory"),
             "got: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -13076,7 +13146,10 @@ fn directory_empty_workbook_skips_with_a_note() {
 #[test]
 fn single_file_empty_workbook_keeps_its_clean_error() {
     let output = Command::new(bin())
-        .args([fixture("edge_xlsx_empty_sheets.xlsx").to_str().unwrap(), "-"])
+        .args([
+            fixture("edge_xlsx_empty_sheets.xlsx").to_str().unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -13085,4 +13158,90 @@ fn single_file_empty_workbook_keeps_its_clean_error() {
         "got: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Jupyter notebooks (.ipynb, --features ipynb): standard JSON with a fixed
+// top-level shape (nbformat v4), so the reader is plumbing over the
+// always-on core JSON parser - one record per object in the top-level
+// `cells` array, flattened exactly like any other array-of-objects JSON.
+// A cell's own `source` (a list of line strings, not one joined string)
+// pools into a Vec<String> column by the existing array convention.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(feature = "ipynb")]
+fn ipynb_profiles_cells_as_records() {
+    let doc = run_json("sample.ipynb", &[]);
+    assert_eq!(doc["format"], "ipynb");
+    let cols = table(&doc, "sample");
+    // One row per cell: markdown + two code cells.
+    assert_eq!(column(cols, "cell_type")["ideal_type"], "String");
+    assert_eq!(column(cols, "source")["ideal_type"], "Vec<String>");
+    // Only the two code cells carry an execution count - the markdown
+    // cell's absence is a real missing value, not a zero.
+    let count = column(cols, "execution_count");
+    assert_eq!(count["ideal_type"], "i64");
+    assert_eq!(count["missing_pct"], 33.3);
+    // Nested outputs flatten like any other nested JSON object.
+    assert_eq!(
+        column(cols, "outputs.output_type")["ideal_type"],
+        "enum / category"
+    );
+}
+
+#[test]
+#[cfg(feature = "ipynb")]
+fn ipynb_recognizes_semantic_types_through_cells() {
+    // Scalar leaves pooled across cells keep their precise type (a real
+    // array literal would wrap as Vec<T> instead - see source above).
+    let doc = run_json("type_detection.ipynb", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(column(cols, "metadata.user_uuid")["ideal_type"], "UUID");
+    assert_eq!(
+        column(cols, "metadata.contact_email")["ideal_type"],
+        "Email"
+    );
+    assert_eq!(column(cols, "metadata.ip_address")["ideal_type"], "IPv4");
+    assert_eq!(
+        column(cols, "metadata.signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+}
+
+#[test]
+#[cfg(feature = "ipynb")]
+fn ipynb_without_cells_array_is_an_actionable_error() {
+    let output = Command::new(bin())
+        .args([fixture("edge_ipynb_no_cells.ipynb").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("doesn't look like a Jupyter notebook"),
+        "got: {stderr}"
+    );
+    assert!(stderr.contains("`cells`"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "ipynb")]
+fn ipynb_non_object_cell_is_an_actionable_error() {
+    // Valid JSON, invalid notebook: the error must name the malformed
+    // element, not mislabel the file as unparseable.
+    let output = Command::new(bin())
+        .args([fixture("edge_ipynb_scalar_cell.ipynb").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not an object"), "got: {stderr}");
+    assert!(!stderr.contains("failed to parse"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "ipynb")]
+fn malformed_ipynb_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.ipynb");
 }

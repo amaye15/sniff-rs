@@ -47,7 +47,7 @@ default = ["full"]
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "delta", "iceberg", "simd"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "ipynb", "delta", "iceberg", "simd"]
 sqlite = []
 msgpack = []
 toml = []
@@ -97,6 +97,11 @@ vcard = []
 # Hand-rolled, no dep - a hand-rolled RFC 5545 iCalendar property-line
 # parser (ical_support), one record per VEVENT/VTODO component.
 icalendar = []
+# Hand-rolled, no dep - Jupyter notebooks are standard JSON with a fixed
+# top-level shape (nbformat v4), so ipynb_support just reuses the
+# always-on json_support parser and extracts the top-level cells array
+# as the records array, one record per cell.
+ipynb = []
 # Delta Lake table awareness (delta_support): auto-detected directly from
 # the input path being a directory containing `_delta_log/` - resolves
 # the transaction log's own JSON commits to the table's current schema
