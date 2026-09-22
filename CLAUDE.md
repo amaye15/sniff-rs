@@ -15192,6 +15192,129 @@ unmodified `main`).
   none of them related to this fix. Clean across default/`pdf`/`full`,
   matching each build's own established clippy baseline exactly.
 
+**A follow-up pass closed the "encrypted" boundary for its own real
+common case - the Standard Security Handler decrypted with an empty
+user password - rather than leaving it a blanket refusal.** Checked
+directly against the real 666-PDF corpus's own 7 encrypted files (via
+`pikepdf`, kept purely as an external verification tool for this pass,
+never a project dependency) before writing a line of Rust: every single
+one opens with an empty user password - the overwhelming common
+real-world shape for "encrypted" PDF: a real *owner* password
+restricting printing/copying/editing, but no *user* password at all, so
+any ordinary PDF viewer's plain "open the file" flow already reads them
+with nothing a human would type in. That's a materially different,
+easily-justified case from a file a real human password genuinely
+guards, and one this project can responsibly decrypt without ever
+needing to ask for or store a credential.
+
+Scoped to the Standard Security Handler's classic revisions - `/V` 1/2
+(RC4, `/R` 2/3) and `/V` 4 (RC4 or AES-128 "AESV2", `/R` 4) - covering
+every encrypted file the real corpus actually has except one (`/V` 5,
+AES-256, `/R` 6 - a disclosed, not-yet-implemented gap, see Known
+limitations, since it needs a second, SHA-256/384/512-based "hardened
+hash" key derivation this project doesn't hand-roll yet). Three new
+hand-rolled primitives back it, verified against known reference
+vectors before being trusted the same way every other hand-rolled
+cipher/hash in this project already is: **MD5** (RFC 1321, checked
+against the RFC's own test suite - the empty string, `"abc"`, the
+classic pangram), **RC4** (checked against a standard, widely-published
+`"Key"`/`"Plaintext"` vector, cross-verified against PyCryptodome's own
+`ARC4`), and **AES-128 decrypt** (FIPS-197's straightforward Inverse
+Cipher - not the "Equivalent Inverse Cipher" variant, since this
+project never encrypts, so there's no encryption-side key-schedule
+reuse to optimize for - checked against Appendix B's own worked
+example, plus a real AES-128-CBC/PKCS#7 ciphertext generated
+independently via PyCryptodome).
+
+**Key derivation itself (ISO 32000-1 7.6.3.3 "Algorithm 2", the file
+encryption key; "Algorithm 4"/"Algorithm 5", the `/U` password check)
+was verified against a real encrypted file's own real numbers before
+being trusted, not just the algorithm's prose** - a from-scratch Python
+re-implementation (`hashlib.md5` + PyCryptodome's `ARC4`) computed the
+exact same 16-byte file key `pikepdf` itself already reported via its
+own `encryption_key` property for a real, genuinely-encrypted CTP
+insurance receipt from the corpus, and the exact same `/U` prefix the
+file's own trailer already stores - both cross-checks passing before
+either derivation function was ported to Rust. Every object gets its
+own key (Algorithm 1: the file key mixed with that object's own
+number/generation, plus a fixed AES salt), so a per-object RC4
+keystream or AES key never repeats across the file.
+
+**A real, non-obvious bug was found this way, not assumed away**:
+`walk_xref_chain`'s own `merge_trailer_dict` only ever copied `/Root`
+and `/Encrypt` forward from each trailer it walked - `/ID` (the
+document's own file-identifier pair, a direct input to Algorithm 2)
+was silently dropped, since nothing had ever needed it before this
+feature. The symptom was a genuinely wrong file key on every real
+file tested (derived with an empty `/ID` instead of the real 16 bytes),
+caught immediately by the same Python cross-check rather than shipped
+silently - `merge_trailer_dict` now carries `/ID` forward the identical
+"newest update wins, first-seen field kept" way `/Root`/`/Encrypt`
+already do.
+
+Wired into `load_stream` (the one place every stream's raw bytes are
+read, before its own `/Filter` chain ever runs - matching the spec's
+own "encryption happens beneath compression" layering): a cross-
+reference stream is the one stream type the spec carves out as never
+encrypted, protected here by simple bootstrap ordering (`self.
+encryption` is only ever populated in `open`, strictly after
+`walk_xref_chain` has already finished reading every xref stream the
+file has) plus a direct `/Type /XRef` check as a second guard. String
+values (a dictionary's own `/Title`, and similar) are a deliberate,
+disclosed non-goal for this pass - every place this project's page-text
+extraction actually reads a string, it's already inside an already-
+decrypted content stream's own bytes (a `(Hello) Tj` operand is never
+separately re-encrypted at the string-object level; only the *stream*
+that contains it is), so decrypting dictionary-level strings would add
+real complexity toward metadata fields nothing here consumes.
+
+A genuine non-empty user password fails the `/U` check (Algorithm 4/5)
+and refuses distinctly and cleanly, naming that specific case rather
+than folding it into either the old generic "is encrypted" message or a
+silent wrong-key decrypt into garbage text.
+
+Verified with new unit tests (`compute_file_key`/`compute_u_r34`
+reproducing the real corpus file's own numbers exactly, hardcoded as
+permanent constants rather than only checked once by hand; an object-
+key round-trip proving two different object numbers never derive the
+same RC4 key; a wrong key provably failing to reproduce a real file's
+own stored `/U`) plus four new integration tests and four new,
+`pikepdf`-generated fixtures (`edge_pdf_encrypted_rc4.pdf`/`_aes128.pdf`
+- real R3/R4 files with an empty user password, decrypting to the exact
+original plaintext; `_aes256.pdf` - a real R6 file correctly refused
+with its own specific, disclosed "not yet supported" message, naming
+the actual revision; `_real_password.pdf` - a real, genuinely password-
+protected file correctly refused, distinctly from every other case).
+The pre-existing `edge_pdf_encrypted.pdf` fixture (a deliberately
+minimal, incomplete `/Encrypt` dict with no `/R`/`/O`/`/U`/`/P` at all)
+now gets a more specific, actionable error naming exactly which
+required field is missing, rather than the old generic refusal -
+confirmed as the fixture's *only* behavior change via `diff` against
+the pre-change binary, with every other committed PDF fixture
+byte-identical. Re-run against the real 666-PDF corpus: 5 of the 6
+originally-disclosed "encrypted" failures now succeed (RC4/R3 and four
+AES-128/R4 files, cross-checked against `pdfminer.six`'s own
+independent extraction for real, meaningful text - names, dates,
+addresses, VINs - not just "didn't crash"), plus one further,
+previously-uncounted encrypted file (a real ~380-page book, R4/AES-128)
+that also now succeeds - total PDF failures in the corpus dropped from
+59 to 54, with the sole remaining encryption-related failure being the
+one disclosed, out-of-scope AES-256/R6 case. One of the newly-decrypting
+real files (`China Town Rental/207 Lease 2025.pdf`) surfaced a genuine,
+separate, pre-existing scope boundary while verifying this fix, not a
+defect in it: its own real page text lives inside Form XObjects (nested
+`/Do`-invoked content streams a signature-request tool commonly uses
+for e-signature caption overlays), and this reader has never recursed
+into a Form XObject's own content at all - confirmed directly (this
+project's own source has zero mentions of `/XObject` anywhere) rather
+than assumed, and left named here as a real, disclosed, separately-
+scoped future gap rather than folded into this pass. Clean across
+default/`pdf`/`full`, matching each build's own established clippy
+baseline exactly (two new findings this pass's own code introduced -
+a `chunks_exact`-on-a-constant-size lint in the new MD5/AES code, and a
+manual modulo-divisibility check clippy prefers as `.is_multiple_of()` -
+were both fixed rather than added to the tolerated baseline).
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15508,10 +15631,19 @@ established baselines exactly.
   no pypdf) would break the "no fixture, no trust" rule, and CID codes
   without a CMap are genuinely unmappable (Adobe's public ROS CMaps were
   judged out of scope). Subset-gid (`/g0`) and fragment (`parenlefttp`)
-  glyph names, LZWDecode streams,
-  encrypted files, and image-only scanned pages (present record, missing
-  text - OCR is out of scope) round out the same disclosed-boundary set;
-  annotations and AcroForm field values are not surfaced at all. A
+  glyph names, LZWDecode streams, a Form XObject's own nested content
+  (a `/Do`-invoked form - as opposed to an image - never recursed into
+  at all, so any real page text living only inside one, a common shape
+  for e-signature caption overlays, isn't extracted), and image-only
+  scanned pages (present record, missing text - OCR is out of scope)
+  round out the same disclosed-boundary set; annotations and AcroForm
+  field values are not surfaced at all. Encryption is decrypted with an
+  empty user password (the Standard Security Handler's classic `/V`
+  1/2/4 revisions, RC4 and AES-128) - a genuine non-empty user password,
+  or `/V` 5 (AES-256, `/R` 5/6, which needs a second, SHA-256/384/512-
+  based key derivation this project doesn't hand-roll yet), both refuse
+  cleanly rather than guess at a password or attempt an unsupported
+  cipher. A
   content stream's FlateDecode payload that's genuinely truncated
   mid-DEFLATE-block (a real, common corpus shape - an interrupted
   download or write) is no longer an automatic refusal: every complete

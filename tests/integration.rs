@@ -13490,13 +13490,87 @@ fn pdf_follows_incremental_updates_to_the_newest_content() {
 #[test]
 #[cfg(feature = "pdf")]
 fn pdf_encrypted_is_a_clean_refusal() {
+    // A malformed `/Encrypt` dictionary (real `/Filter /Standard`, but
+    // missing every field the Standard Security Handler actually needs
+    // to derive a key) still fails cleanly, naming the missing field -
+    // never a crash or a silent wrong-key decrypt.
     let output = Command::new(bin())
         .args([fixture("edge_pdf_encrypted.pdf").to_str().unwrap()])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("is encrypted"), "got: {stderr}");
+    assert!(
+        stderr.contains("/Encrypt dictionary without /R"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_decrypts_rc4_and_aes128_with_an_empty_user_password() {
+    // Both fixtures are real, pikepdf-encrypted PDFs (RC4/R3 and
+    // AES-128/R4 "AESV2" respectively) protected only by an owner
+    // password - no user password at all, the overwhelming common
+    // real-world shape ("restrict printing/editing", not "require a
+    // password to even open it"). Both must decrypt to the exact same
+    // plaintext the unencrypted source document had.
+    for name in [
+        "edge_pdf_encrypted_rc4.pdf",
+        "edge_pdf_encrypted_aes128.pdf",
+    ] {
+        let doc = run_json(name, &[]);
+        let table_name = name.trim_end_matches(".pdf");
+        assert_eq!(
+            column(table(&doc, table_name), "text")["sample_values"],
+            serde_json::json!(["This PDF is encrypted but the user password is empty."]),
+            "fixture {name} did not decrypt to the expected plaintext"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_aes256_encryption_is_a_disclosed_not_yet_supported_gap() {
+    // A real, pikepdf-encrypted R6/AES-256 file (also an empty user
+    // password) - this project's Standard Security Handler support is
+    // deliberately scoped to the classic RC4/AES-128 revisions (2-4)
+    // only, so this must fail with a clear, specific, disclosed message
+    // naming the actual revision, not a generic refusal and never a
+    // silent wrong-key decrypt.
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_encrypted_aes256.pdf").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("encryption revision 6 (AES-256, /V 5) - not yet supported"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_with_a_real_user_password_refuses_distinctly_from_a_malformed_encrypt_dict() {
+    // A real, pikepdf-encrypted file whose user password is genuinely
+    // non-empty ("realuserpassword") - this must fail the Standard
+    // Security Handler's own /U password check (Algorithm 5) and refuse
+    // cleanly, distinctly from both the malformed-/Encrypt-dict case
+    // above and a successful empty-password decrypt - never silently
+    // decrypt every stream to garbage with the wrong key.
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_encrypted_real_password.pdf")
+            .to_str()
+            .unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("encrypted with a real user password"),
+        "got: {stderr}"
+    );
 }
 
 #[test]

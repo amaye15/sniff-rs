@@ -51229,6 +51229,418 @@ mod pdf_support {
     /// guard in this project already keeps.
     const MAX_PDF_DEPTH: usize = 64;
 
+    /// Hand-rolled MD5 (RFC 1321) and RC4, plus AES-128 decrypt-only (the
+    /// straightforward FIPS-197 Inverse Cipher, no key-schedule
+    /// optimization needed since this project never encrypts) - the three
+    /// primitives the PDF Standard Security Handler's classic (`/V`
+    /// 1/2/4, `/R` 2/3/4) key derivation and object decryption need.
+    /// Every constant and algorithm here is a direct, well-known,
+    /// published construction (RFC 1321's own per-round shift/constant
+    /// tables, RC4's own two-phase KSA/PRGA, FIPS-197's own S-box/
+    /// round-constant tables) - verified against Python's `hashlib`/
+    /// `pycryptodome` on known reference vectors (RFC 1321's own MD5
+    /// test suite, a standard RC4 "Key"/"Plaintext" vector, and FIPS-197
+    /// Appendix B's own AES-128 worked example) before being trusted,
+    /// the same "verify before relying on it" discipline every other
+    /// hand-rolled hash/cipher in this project already follows.
+    mod pdf_crypto {
+        use super::*;
+
+        /// RFC 1321 3.4's per-round left-rotate amounts, one set of 16 per
+        /// round (repeated for the round they apply to, laid out flat).
+        const MD5_SHIFTS: [u32; 64] = [
+            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20,
+            5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+            6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        ];
+
+        /// RFC 1321's own `T[i] = floor(2^32 * abs(sin(i + 1)))` table,
+        /// quoted directly from the RFC rather than recomputed - the RFC
+        /// itself gives all 64 values as literal hex constants.
+        const MD5_K: [u32; 64] = [
+            0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+            0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+            0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+            0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+            0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+            0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+            0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+            0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+            0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+            0xeb86d391,
+        ];
+
+        /// MD5 over an arbitrary-length message - padding (a mandatory
+        /// `0x80` byte, zero-fill, then the original bit length as a
+        /// little-endian `u64`) plus the standard four-round compression
+        /// function, straight from RFC 1321 3.3/3.4.
+        pub(super) fn md5(message: &[u8]) -> [u8; 16] {
+            let mut a0: u32 = 0x67452301;
+            let mut b0: u32 = 0xefcdab89;
+            let mut c0: u32 = 0x98badcfe;
+            let mut d0: u32 = 0x10325476;
+
+            let bit_len = (message.len() as u64).wrapping_mul(8);
+            let mut padded = message.to_vec();
+            padded.push(0x80);
+            while padded.len() % 64 != 56 {
+                padded.push(0);
+            }
+            padded.extend_from_slice(&bit_len.to_le_bytes());
+
+            for block in 0..padded.len() / 64 {
+                let chunk = &padded[block * 64..block * 64 + 64];
+                let mut m = [0u32; 16];
+                for (i, word) in m.iter_mut().enumerate() {
+                    *word = u32::from_le_bytes([
+                        chunk[i * 4],
+                        chunk[i * 4 + 1],
+                        chunk[i * 4 + 2],
+                        chunk[i * 4 + 3],
+                    ]);
+                }
+                let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+                for i in 0..64 {
+                    let (f, g) = match i {
+                        0..=15 => ((b & c) | (!b & d), i),
+                        16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                        32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                        _ => (c ^ (b | !d), (7 * i) % 16),
+                    };
+                    let f = f.wrapping_add(a).wrapping_add(MD5_K[i]).wrapping_add(m[g]);
+                    a = d;
+                    d = c;
+                    c = b;
+                    b = b.wrapping_add(f.rotate_left(MD5_SHIFTS[i]));
+                }
+                a0 = a0.wrapping_add(a);
+                b0 = b0.wrapping_add(b);
+                c0 = c0.wrapping_add(c);
+                d0 = d0.wrapping_add(d);
+            }
+
+            let mut out = [0u8; 16];
+            out[0..4].copy_from_slice(&a0.to_le_bytes());
+            out[4..8].copy_from_slice(&b0.to_le_bytes());
+            out[8..12].copy_from_slice(&c0.to_le_bytes());
+            out[12..16].copy_from_slice(&d0.to_le_bytes());
+            out
+        }
+
+        /// RC4: a 256-byte permutation initialized from `key` (the
+        /// key-scheduling algorithm, repeating the key as many times as
+        /// needed), then XORed with a keystream generated one byte at a
+        /// time (the pseudo-random generation algorithm) - symmetric, so
+        /// this same function is both RC4's own encrypt and decrypt.
+        pub(super) fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut s: [u8; 256] = std::array::from_fn(|i| i as u8);
+            let mut j: u8 = 0;
+            for i in 0..256 {
+                j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len().max(1)]);
+                s.swap(i, j as usize);
+            }
+            let mut out = Vec::with_capacity(data.len());
+            let (mut i, mut j) = (0u8, 0u8);
+            for &byte in data {
+                i = i.wrapping_add(1);
+                j = j.wrapping_add(s[i as usize]);
+                s.swap(i as usize, j as usize);
+                let k = s[(s[i as usize].wrapping_add(s[j as usize])) as usize];
+                out.push(byte ^ k);
+            }
+            out
+        }
+
+        /// FIPS-197's own forward S-box (Table 4).
+        #[rustfmt::skip]
+        const SBOX: [u8; 256] = [
+            0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+            0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+            0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+            0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+            0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+            0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+            0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+            0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+            0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+            0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+            0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+            0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+            0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+            0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+            0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+            0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+        ];
+
+        /// FIPS-197's own inverse S-box (Table 6), derived once as the
+        /// forward table's own permutation-inverse - `INV_SBOX[SBOX[x]]
+        /// == x` for every byte, checked directly by this module's own
+        /// unit test rather than assumed from the derivation.
+        fn inv_sbox() -> [u8; 256] {
+            let mut inv = [0u8; 256];
+            for (i, &s) in SBOX.iter().enumerate() {
+                inv[s as usize] = i as u8;
+            }
+            inv
+        }
+
+        /// FIPS-197 Table 5's round constants (`Rcon[i]`, `i` 1-based) -
+        /// only the first 10 are ever needed (AES-128's 10 rounds).
+        const RCON: [u8; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+
+        /// FIPS-197 5.2's `KeyExpansion`, specialized to `Nk = 4`
+        /// (AES-128) - 11 round keys (44 32-bit words) from the original
+        /// 16-byte key.
+        fn key_expansion_128(key: &[u8; 16]) -> [[u8; 4]; 44] {
+            let mut w: [[u8; 4]; 44] = [[0; 4]; 44];
+            for i in 0..4 {
+                w[i] = [key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]];
+            }
+            for i in 4..44 {
+                let mut temp = w[i - 1];
+                if i % 4 == 0 {
+                    temp = [temp[1], temp[2], temp[3], temp[0]];
+                    for b in &mut temp {
+                        *b = SBOX[*b as usize];
+                    }
+                    temp[0] ^= RCON[i / 4 - 1];
+                }
+                w[i] = [
+                    w[i - 4][0] ^ temp[0],
+                    w[i - 4][1] ^ temp[1],
+                    w[i - 4][2] ^ temp[2],
+                    w[i - 4][3] ^ temp[3],
+                ];
+            }
+            w
+        }
+
+        /// GF(2^8) multiplication under AES's own reduction polynomial
+        /// (`x^8 + x^4 + x^3 + x + 1`) - the "Russian peasant" carry-less
+        /// multiply-and-reduce shared by every fixed multiplier
+        /// `InvMixColumns` needs (0x09, 0x0b, 0x0d, 0x0e).
+        fn gmul(mut a: u8, mut b: u8) -> u8 {
+            let mut p = 0u8;
+            for _ in 0..8 {
+                if b & 1 != 0 {
+                    p ^= a;
+                }
+                let hi = a & 0x80;
+                a <<= 1;
+                if hi != 0 {
+                    a ^= 0x1b;
+                }
+                b >>= 1;
+            }
+            p
+        }
+
+        /// FIPS-197 5.3's straightforward Inverse Cipher (not the
+        /// "Equivalent Inverse Cipher" variant - this project only ever
+        /// decrypts, so there's no encryption-side reuse to optimize
+        /// for), specialized to AES-128 (`Nr = 10`). `state` is one
+        /// 16-byte block, column-major per the spec's own layout
+        /// (`state[r + 4c]`).
+        fn inv_cipher_block(state: &mut [u8; 16], round_keys: &[[u8; 4]; 44]) {
+            let inv_sbox = inv_sbox();
+            let add_round_key = |state: &mut [u8; 16], round: usize| {
+                for c in 0..4 {
+                    for r in 0..4 {
+                        state[r + 4 * c] ^= round_keys[round * 4 + c][r];
+                    }
+                }
+            };
+            let inv_shift_rows = |state: &mut [u8; 16]| {
+                for r in 1..4 {
+                    let mut row = [0u8; 4];
+                    for c in 0..4 {
+                        row[c] = state[r + 4 * c];
+                    }
+                    for c in 0..4 {
+                        state[r + 4 * ((c + r) % 4)] = row[c];
+                    }
+                }
+            };
+            let inv_sub_bytes = |state: &mut [u8; 16]| {
+                for b in state.iter_mut() {
+                    *b = inv_sbox[*b as usize];
+                }
+            };
+            let inv_mix_columns = |state: &mut [u8; 16]| {
+                for c in 0..4 {
+                    let col = [
+                        state[4 * c],
+                        state[4 * c + 1],
+                        state[4 * c + 2],
+                        state[4 * c + 3],
+                    ];
+                    state[4 * c] = gmul(col[0], 0x0e)
+                        ^ gmul(col[1], 0x0b)
+                        ^ gmul(col[2], 0x0d)
+                        ^ gmul(col[3], 0x09);
+                    state[4 * c + 1] = gmul(col[0], 0x09)
+                        ^ gmul(col[1], 0x0e)
+                        ^ gmul(col[2], 0x0b)
+                        ^ gmul(col[3], 0x0d);
+                    state[4 * c + 2] = gmul(col[0], 0x0d)
+                        ^ gmul(col[1], 0x09)
+                        ^ gmul(col[2], 0x0e)
+                        ^ gmul(col[3], 0x0b);
+                    state[4 * c + 3] = gmul(col[0], 0x0b)
+                        ^ gmul(col[1], 0x0d)
+                        ^ gmul(col[2], 0x09)
+                        ^ gmul(col[3], 0x0e);
+                }
+            };
+
+            add_round_key(state, 10);
+            for round in (1..10).rev() {
+                inv_shift_rows(state);
+                inv_sub_bytes(state);
+                add_round_key(state, round);
+                inv_mix_columns(state);
+            }
+            inv_shift_rows(state);
+            inv_sub_bytes(state);
+            add_round_key(state, 0);
+        }
+
+        /// AES-128-CBC decrypt with PKCS#7 unpadding, over a `key`-sized
+        /// key and a `data` blob shaped exactly as the PDF spec's own
+        /// "AESV2" convention lays it out: a 16-byte IV, then one or
+        /// more 16-byte ciphertext blocks. Returns an error rather than
+        /// panicking on any length that doesn't cleanly fit that shape
+        /// or whose final padding byte doesn't validate - real, if rare,
+        /// shapes a corrupted or wrongly-keyed decrypt can produce.
+        pub(super) fn aes128_cbc_decrypt_pdf(key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>> {
+            if data.len() < 16 || !(data.len() - 16).is_multiple_of(16) {
+                bail!("AES-encrypted PDF stream/string isn't a whole number of 16-byte blocks");
+            }
+            let round_keys = key_expansion_128(key);
+            let mut prev: [u8; 16] = data[0..16].try_into().expect("checked length");
+            let mut out = Vec::with_capacity(data.len() - 16);
+            let ciphertext_blocks = data[16..].len() / 16;
+            for i in 0..ciphertext_blocks {
+                let block = &data[16 + i * 16..16 + i * 16 + 16];
+                let mut state: [u8; 16] = block.try_into().expect("checked length");
+                let ciphertext = state;
+                inv_cipher_block(&mut state, &round_keys);
+                for i in 0..16 {
+                    state[i] ^= prev[i];
+                }
+                out.extend_from_slice(&state);
+                prev = ciphertext;
+            }
+            // PKCS#7: the last byte names how many padding bytes were
+            // appended (1-16) - every one of them must equal that same
+            // value, or the key/data is wrong.
+            let pad = *out.last().unwrap_or(&0) as usize;
+            if pad == 0
+                || pad > 16
+                || pad > out.len()
+                || !out[out.len() - pad..].iter().all(|&b| b as usize == pad)
+            {
+                bail!("AES-decrypted PDF data has invalid PKCS#7 padding");
+            }
+            out.truncate(out.len() - pad);
+            Ok(out)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn md5_matches_the_rfc_1321_test_suite() {
+                assert_eq!(
+                    md5(b""),
+                    [
+                        0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98,
+                        0xec, 0xf8, 0x42, 0x7e
+                    ]
+                );
+                assert_eq!(
+                    md5(b"abc"),
+                    [
+                        0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d,
+                        0x28, 0xe1, 0x7f, 0x72
+                    ]
+                );
+                assert_eq!(
+                    md5(b"The quick brown fox jumps over the lazy dog"),
+                    [
+                        0x9e, 0x10, 0x7d, 0x9d, 0x37, 0x2b, 0xb6, 0x82, 0x6b, 0xd8, 0x1d, 0x35,
+                        0x42, 0xa4, 0x19, 0xd6
+                    ]
+                );
+            }
+
+            #[test]
+            fn rc4_matches_a_standard_reference_vector() {
+                // key="Key", plaintext="Plaintext" - a widely published
+                // RC4 test vector, cross-checked directly against
+                // PyCryptodome's own `ARC4` before being trusted.
+                assert_eq!(
+                    rc4(b"Key", b"Plaintext"),
+                    [0xbb, 0xf3, 0x16, 0xe8, 0xd9, 0x40, 0xaf, 0x0a, 0xd3]
+                );
+            }
+
+            #[test]
+            fn inv_sbox_is_the_forward_sbox_permutation_inverse() {
+                let inv = inv_sbox();
+                for x in 0..=255u8 {
+                    assert_eq!(inv[SBOX[x as usize] as usize], x);
+                }
+            }
+
+            #[test]
+            fn aes128_decrypts_the_fips_197_appendix_b_vector() {
+                // FIPS-197 Appendix B's own worked example, wrapped as a
+                // one-block CBC "message" with a zero IV so the direct
+                // ECB-equivalent ciphertext round-trips unchanged.
+                let key: [u8; 16] = [
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f,
+                ];
+                let plaintext: [u8; 16] = [
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff,
+                ];
+                let ciphertext: [u8; 16] = [
+                    0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70,
+                    0xb4, 0xc5, 0x5a,
+                ];
+                let round_keys = key_expansion_128(&key);
+                let mut state = ciphertext;
+                inv_cipher_block(&mut state, &round_keys);
+                assert_eq!(state, plaintext);
+            }
+
+            #[test]
+            fn aes128_cbc_pdf_round_trips_and_rejects_bad_padding() {
+                // Encrypted independently via PyCryptodome (AES-128-CBC,
+                // a random IV, PKCS#7 padding) and decoded here to
+                // confirm this decoder agrees with a real implementation
+                // on real ciphertext, not just its own encoder.
+                let key: [u8; 16] = *b"0123456789abcdef";
+                // IV || one padded block of "Hello, PDF!" (11 bytes + 5
+                // bytes of 0x05 padding), generated with PyCryptodome
+                // using this exact key and a fixed IV for reproducibility.
+                let data: [u8; 32] = [
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f, 0x5e, 0xf0, 0x7e, 0x8f, 0x4a, 0x7b, 0x81, 0x8d, 0x33, 0x6f,
+                    0xfb, 0x60, 0x11, 0xe6, 0x36, 0xa5,
+                ];
+                assert_eq!(aes128_cbc_decrypt_pdf(&key, &data).unwrap(), b"Hello, PDF!");
+                let mut corrupted = data;
+                let last = corrupted.len() - 1;
+                corrupted[last] ^= 0xFF;
+                assert!(aes128_cbc_decrypt_pdf(&key, &corrupted).is_err());
+            }
+        }
+    }
+
     /// A PDF object value. `Str` holds raw bytes (font decoding is a
     /// separate, later step - these bytes are whatever the content stream
     /// literally contained, escapes already processed). `Name` holds raw
@@ -51834,6 +52246,126 @@ mod pdf_support {
         Compressed { objstm: u32, index: usize },
     }
 
+    /// The Standard Security Handler's own padding string (ISO 32000-1
+    /// 7.6.3.3, "Algorithm 2") - XORed/appended to a user password before
+    /// hashing, always used bare here since this reader only ever
+    /// attempts an empty password (see `PdfReader::setup_encryption`'s
+    /// own doc comment for why that's the right assumption).
+    #[rustfmt::skip]
+    const PDF_PASSWORD_PAD: [u8; 32] = [
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41,
+        0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+        0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80,
+        0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+    ];
+
+    /// ISO 32000-1 7.6.3.3 "Algorithm 2": the file's own encryption key,
+    /// derived from the (empty) user password padded to 32 bytes, the
+    /// owner-password hash `/O`, `/P`'s own permission bits, the
+    /// document's first `/ID` element, and - revision 4+ with
+    /// `/EncryptMetadata false` - a trailing all-ones marker. `/R 3`
+    /// onward re-hashes the first `key_len` bytes of the digest through
+    /// MD5 fifty more times, deliberately slow by the spec's own design.
+    fn pdf_compute_file_key(
+        o: &[u8],
+        p: i32,
+        id0: &[u8],
+        r: i64,
+        key_len: usize,
+        encrypt_metadata: bool,
+    ) -> Vec<u8> {
+        let mut input = Vec::with_capacity(32 + o.len() + 4 + id0.len() + 4);
+        input.extend_from_slice(&PDF_PASSWORD_PAD);
+        input.extend_from_slice(o);
+        input.extend_from_slice(&p.to_le_bytes());
+        input.extend_from_slice(id0);
+        if r >= 4 && !encrypt_metadata {
+            input.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+        let mut digest = pdf_crypto::md5(&input).to_vec();
+        if r >= 3 {
+            for _ in 0..50 {
+                digest = pdf_crypto::md5(&digest[..key_len]).to_vec();
+            }
+        }
+        digest.truncate(key_len);
+        digest
+    }
+
+    /// ISO 32000-1 7.6.3.4 "Algorithm 4" (`/R 2`): confirms an empty user
+    /// password by recomputing `/U` - RC4 of the bare padding string
+    /// under the file key - and comparing the full 32 bytes.
+    fn pdf_compute_u_r2(key: &[u8]) -> Vec<u8> {
+        pdf_crypto::rc4(key, &PDF_PASSWORD_PAD)
+    }
+
+    /// ISO 32000-1 7.6.3.4 "Algorithm 5" (`/R 3`/`/R 4`): recomputes
+    /// `/U`'s own leading 16 bytes (MD5 of the padding string plus
+    /// `/ID[0]`, RC4-encrypted once under the file key and then 19 more
+    /// times under that key XORed byte-for-byte with the iteration
+    /// number) - the spec leaves `/U`'s trailing 16 bytes arbitrary at
+    /// creation time, so only the first 16 are ever meaningful to check.
+    fn pdf_compute_u_r34(key: &[u8], id0: &[u8]) -> Vec<u8> {
+        let mut input = Vec::with_capacity(32 + id0.len());
+        input.extend_from_slice(&PDF_PASSWORD_PAD);
+        input.extend_from_slice(id0);
+        let digest = pdf_crypto::md5(&input);
+        let mut result = pdf_crypto::rc4(key, &digest);
+        for i in 1u8..=19 {
+            let xored: Vec<u8> = key.iter().map(|b| b ^ i).collect();
+            result = pdf_crypto::rc4(&xored, &result);
+        }
+        result
+    }
+
+    /// Which cipher the Standard Security Handler actually uses once the
+    /// file key is known - resolved once in `setup_encryption` from
+    /// `/V`/`/CF`, not re-derived per object.
+    #[derive(Clone, Copy, PartialEq)]
+    enum PdfCipher {
+        Rc4,
+        Aes128,
+    }
+
+    /// One document's own resolved decryption state - the file key
+    /// (already derived assuming an empty user password) plus which
+    /// cipher every stream actually uses. `object_key` is ISO 32000-1
+    /// 7.6.2 "Algorithm 1": every object gets its own key, the file key
+    /// mixed with that object's own (number, generation) pair (and, for
+    /// AES, a fixed 4-byte salt - purely so an object's RC4 and AES keys
+    /// can never coincide, not a secret).
+    struct PdfEncryption {
+        file_key: Vec<u8>,
+        cipher: PdfCipher,
+    }
+
+    impl PdfEncryption {
+        fn object_key(&self, num: u32, gen_num: u16) -> Vec<u8> {
+            let mut input = self.file_key.clone();
+            input.extend_from_slice(&num.to_le_bytes()[..3]);
+            input.extend_from_slice(&gen_num.to_le_bytes()[..2]);
+            if self.cipher == PdfCipher::Aes128 {
+                input.extend_from_slice(b"sAlT");
+            }
+            let digest = pdf_crypto::md5(&input);
+            let n = (self.file_key.len() + 5).min(16);
+            digest[..n].to_vec()
+        }
+
+        fn decrypt(&self, num: u32, gen_num: u16, data: &[u8]) -> Result<Vec<u8>> {
+            let key = self.object_key(num, gen_num);
+            match self.cipher {
+                PdfCipher::Rc4 => Ok(pdf_crypto::rc4(&key, data)),
+                PdfCipher::Aes128 => {
+                    let key16: [u8; 16] = key
+                        .try_into()
+                        .map_err(|_| anyhow!("AES object key must be 16 bytes"))?;
+                    pdf_crypto::aes128_cbc_decrypt_pdf(&key16, data)
+                }
+            }
+        }
+    }
+
     /// An open PDF with its cross-reference index resolved: the trailer
     /// dict (merged newest-first across every `/Prev` update, so the
     /// latest `/Root` always wins) plus one entry per object number. The
@@ -51843,13 +52375,16 @@ mod pdf_support {
     /// page-graph walks. Decoded object streams are the one thing cached
     /// (`objstm_cache`), since one stream routinely backs dozens of
     /// separate references and re-inflating it per lookup would redo the
-    /// same decompression once per reference.
+    /// same decompression once per reference. `encryption` is `None` for
+    /// the overwhelming majority of real files (no `/Encrypt` at all);
+    /// see `setup_encryption` for what it takes to populate it.
     struct PdfReader {
         file: fs::File,
         file_len: u64,
         xref: BTreeMap<u32, XrefEntry>,
         trailer: BTreeMap<Vec<u8>, PdfObj>,
         objstm_cache: HashMap<u32, Vec<PdfObj>>,
+        encryption: Option<PdfEncryption>,
     }
 
     impl PdfReader {
@@ -51868,6 +52403,7 @@ mod pdf_support {
                 xref: BTreeMap::new(),
                 trailer: BTreeMap::new(),
                 objstm_cache: HashMap::new(),
+                encryption: None,
             };
             // The header lives in the first bytes (`%PDF-1.x`); some
             // writers prepend garbage (a BOM, transfer noise), so the
@@ -51884,15 +52420,131 @@ mod pdf_support {
             }
             let startxref = Self::find_startxref(&mut reader.file, file_len)?;
             reader.walk_xref_chain(startxref, path)?;
-            if let Some(enc) = reader.trailer.get(b"Encrypt".as_slice())
+            if let Some(enc) = reader.trailer.get(b"Encrypt".as_slice()).cloned()
                 && !matches!(enc, PdfObj::Null)
             {
-                bail!(
-                    "{path:?} is encrypted - decryption is out of scope, \
-                     remove the password/encryption first"
-                );
+                reader.encryption = Some(reader.setup_encryption(&enc, path)?);
             }
             Ok(reader)
+        }
+
+        /// Resolves `/Encrypt` into live decryption state, assuming an
+        /// empty user password - the overwhelming common real-world
+        /// shape for a PDF this tool is ever pointed at: a document
+        /// "protected" purely to restrict printing/copying/editing (a
+        /// real *owner* password, but no *user* password at all) opens
+        /// exactly the way any PDF viewer's plain "open the file" flow
+        /// already does, with nothing a human would ever need to type
+        /// in. Scoped to the Standard Security Handler's classic
+        /// revisions - `/V` 1/2 (RC4, `/R` 2/3) and `/V` 4 (RC4 or
+        /// AES-128 "AESV2", `/R` 4) - since that's every encrypted file
+        /// this project's own real-world corpus sweep ever found; `/V` 5
+        /// (AES-256, `/R` 5/6) needs a second, SHA-256/384/512-based key
+        /// derivation this project doesn't hand-roll yet, and is a
+        /// disclosed, not-yet-implemented gap - see Known limitations.
+        /// A genuine non-empty user password fails the `/U` check
+        /// (Algorithm 4/5) and refuses cleanly, distinctly, rather than
+        /// silently decrypting every stream to garbage with the wrong
+        /// key.
+        fn setup_encryption(&mut self, enc_ref: &PdfObj, path: &Path) -> Result<PdfEncryption> {
+            let dict = match self.resolve(enc_ref, 0, path)? {
+                PdfObj::Dict(d) => d,
+                _ => bail!("{path:?} has a malformed /Encrypt dictionary"),
+            };
+            if !matches!(dict.get(b"Filter".as_slice()), Some(PdfObj::Name(n)) if n == b"Standard")
+            {
+                bail!("{path:?} uses a non-Standard PDF security handler - unsupported");
+            }
+            let v = dict
+                .get(b"V".as_slice())
+                .and_then(PdfObj::as_int)
+                .unwrap_or(0);
+            let r = dict
+                .get(b"R".as_slice())
+                .and_then(PdfObj::as_int)
+                .ok_or_else(|| anyhow!("{path:?} has an /Encrypt dictionary without /R"))?;
+            if !(2..=4).contains(&r) {
+                bail!(
+                    "{path:?} uses PDF encryption revision {r} (AES-256, /V 5) - \
+                     not yet supported, only classic RC4/AES-128 (revisions 2-4)"
+                );
+            }
+            let o = match dict.get(b"O".as_slice()) {
+                Some(PdfObj::Str(b)) => b.clone(),
+                _ => bail!("{path:?} has an /Encrypt dictionary without /O"),
+            };
+            let u = match dict.get(b"U".as_slice()) {
+                Some(PdfObj::Str(b)) => b.clone(),
+                _ => bail!("{path:?} has an /Encrypt dictionary without /U"),
+            };
+            let p = dict
+                .get(b"P".as_slice())
+                .and_then(PdfObj::as_int)
+                .ok_or_else(|| anyhow!("{path:?} has an /Encrypt dictionary without /P"))?
+                as i32;
+            let id0 = match self.trailer.get(b"ID".as_slice()) {
+                Some(PdfObj::Array(items)) => match items.first() {
+                    Some(PdfObj::Str(b)) => b.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let encrypt_metadata = !matches!(
+                dict.get(b"EncryptMetadata".as_slice()),
+                Some(PdfObj::Bool(false))
+            );
+            let key_len_bits = dict
+                .get(b"Length".as_slice())
+                .and_then(PdfObj::as_int)
+                .unwrap_or(40);
+            let key_len = (key_len_bits / 8).clamp(5, 16) as usize;
+
+            let cipher = if v >= 4 {
+                // `/CF /StdCF /CFM` names the real cipher; every file
+                // this project's own corpus sweep found names /StdCF for
+                // both /StmF and /StrF - anything naming a different
+                // filter, or a /CFM other than AESV2/V2, is a disclosed
+                // gap rather than a guess.
+                let cfm = dict.get(b"CF".as_slice()).and_then(|c| {
+                    if let PdfObj::Dict(cf) = c {
+                        cf.get(b"StdCF".as_slice())
+                    } else {
+                        None
+                    }
+                });
+                let cfm = match cfm {
+                    Some(PdfObj::Dict(d)) => d.get(b"CFM".as_slice()),
+                    _ => None,
+                };
+                match cfm {
+                    Some(PdfObj::Name(n)) if n == b"AESV2" => PdfCipher::Aes128,
+                    Some(PdfObj::Name(n)) if n == b"V2" => PdfCipher::Rc4,
+                    Some(PdfObj::Name(n)) if n == b"Identity" => {
+                        bail!("{path:?} declares an Identity crypt filter - nothing to decrypt")
+                    }
+                    _ => bail!(
+                        "{path:?} uses an unsupported /V 4 crypt filter - only \
+                         AESV2/V2 are supported"
+                    ),
+                }
+            } else {
+                PdfCipher::Rc4
+            };
+
+            let file_key = pdf_compute_file_key(&o, p, &id0, r, key_len, encrypt_metadata);
+            let valid = if r == 2 {
+                pdf_compute_u_r2(&file_key) == u
+            } else {
+                let expected = pdf_compute_u_r34(&file_key, &id0);
+                u.len() >= 16 && expected[..16] == u[..16]
+            };
+            if !valid {
+                bail!(
+                    "{path:?} is encrypted with a real user password - can't \
+                     decrypt without it"
+                );
+            }
+            Ok(PdfEncryption { file_key, cipher })
         }
 
         /// The byte offset of the live cross-reference section: the last
@@ -52107,6 +52759,16 @@ mod pdf_support {
                 && !self.trailer.contains_key(b"Encrypt".as_slice())
             {
                 self.trailer.insert(b"Encrypt".to_vec(), enc.clone());
+            }
+            // `/ID` (the document's own file-identifier pair) is never
+            // itself needed to walk the xref chain, but it feeds directly
+            // into the Standard Security Handler's own key derivation
+            // (Algorithm 2/4/5) once `/Encrypt` is found - same
+            // newest-update-wins rule as `/Root`/`/Encrypt` above.
+            if let Some(id) = trailer.get(b"ID".as_slice())
+                && !self.trailer.contains_key(b"ID".as_slice())
+            {
+                self.trailer.insert(b"ID".to_vec(), id.clone());
             }
         }
 
@@ -52395,8 +53057,9 @@ mod pdf_support {
                 .parse_int_at()
                 .map(|n| n as u32)
                 .map_err(|_| anyhow!("{path:?} has a broken object header"))?;
-            header
+            let gen_num = header
                 .parse_int_at()
+                .map(|n| n as u16)
                 .map_err(|_| anyhow!("{path:?} has a broken object header"))?;
             header.skip_ws();
             if !header.data[header.pos..].starts_with(b"obj")
@@ -52470,7 +53133,7 @@ mod pdf_support {
                         .get(lexer.pos + 6)
                         .is_none_or(|b| !b.is_ascii_alphanumeric())
                 {
-                    return self.load_stream(num, dict, offset, lexer.pos + 6, path);
+                    return self.load_stream(num, gen_num, dict, offset, lexer.pos + 6, path);
                 }
                 value = PdfObj::Dict(dict);
             }
@@ -52485,6 +53148,7 @@ mod pdf_support {
         fn load_stream(
             &mut self,
             num: u32,
+            gen_num: u16,
             dict: BTreeMap<Vec<u8>, PdfObj>,
             offset: u64,
             dict_end: usize,
@@ -52533,6 +53197,27 @@ mod pdf_support {
             if !tail.starts_with(b"endstream") {
                 bail!("{path:?} has a stream without endstream");
             }
+            // Decrypt before the /Filter chain ever runs - a stream's raw
+            // bytes are what the Standard Security Handler actually
+            // encrypted, before any Flate/ASCII85/etc. filter is applied
+            // on top. Cross-reference streams are the one stream type the
+            // spec carves out as never encrypted (a reader has to be able
+            // to walk the xref table before it even knows /Encrypt
+            // exists) - by construction, every one of those is already
+            // fully loaded during `walk_xref_chain`, before `self.
+            // encryption` is ever populated in `open`, but the `/Type`
+            // check here is kept as a second, direct guard in case some
+            // other part of a document ever re-resolves that same object
+            // by reference afterward.
+            let data = match &self.encryption {
+                Some(enc)
+                    if dict.get(b"Type".as_slice()) != Some(&PdfObj::Name(b"XRef".to_vec())) =>
+                {
+                    enc.decrypt(num, gen_num, &data)
+                        .with_context(|| format!("decrypting stream in object {num}"))?
+                }
+                _ => data,
+            };
             let decoded = self
                 .decode_stream(&dict, data, path)
                 .with_context(|| format!("decoding stream in object {num}"))?;
@@ -55033,6 +55718,7 @@ mod pdf_support {
                 xref: BTreeMap::new(),
                 trailer: BTreeMap::new(),
                 objstm_cache: HashMap::new(),
+                encryption: None,
             };
             reader.read_xref_stream(&map, &data, tpath()).unwrap();
             assert_eq!(reader.xref.get(&0), Some(&XrefEntry::Free));
@@ -55065,6 +55751,77 @@ mod pdf_support {
             ));
             std::fs::write(&path, seed).unwrap();
             (fs::File::open(&path).unwrap(), path)
+        }
+    }
+
+    #[cfg(test)]
+    mod encryption_tests {
+        use super::*;
+
+        // Every expected value below is a real Standard Security
+        // Handler `/Encrypt` dictionary lifted byte-for-byte from a real
+        // encrypted PDF (a genuine CTP insurance receipt, R3/RC4/128-bit,
+        // an empty user password) and independently cross-checked
+        // against both `pikepdf`'s own exposed `encryption_key` and a
+        // from-scratch Python re-implementation of Algorithm 2/5 (using
+        // `hashlib.md5`/PyCryptodome's `ARC4`) before being hardcoded
+        // here - not derived from this project's own code and assumed
+        // correct.
+        const REAL_O: [u8; 32] = [
+            0xb0, 0x1a, 0x9b, 0x28, 0x08, 0x86, 0x18, 0xb4, 0x84, 0x9d, 0x1e, 0x1f, 0xac, 0xf1,
+            0xa3, 0x8a, 0xb3, 0x4b, 0x2c, 0x52, 0xd9, 0xc8, 0xfc, 0x8d, 0x7f, 0x13, 0x66, 0x01,
+            0x6e, 0xcf, 0xa3, 0xa0,
+        ];
+        const REAL_ID0: [u8; 16] = [
+            0xf4, 0x54, 0xcd, 0x91, 0x2a, 0x26, 0xe6, 0xff, 0x19, 0x93, 0xb9, 0x5a, 0xc2, 0xb5,
+            0xa3, 0xaf,
+        ];
+        const REAL_FILE_KEY: [u8; 16] = [
+            0x6f, 0x7f, 0x1b, 0x54, 0x89, 0x07, 0x00, 0x45, 0xeb, 0x16, 0x6e, 0x8f, 0x3a, 0x80,
+            0xc2, 0x43,
+        ];
+        const REAL_U_PREFIX: [u8; 16] = [
+            0x1c, 0x2a, 0xb5, 0xc7, 0xc9, 0xce, 0x95, 0x62, 0xe9, 0x7c, 0x6f, 0x98, 0xd2, 0x27,
+            0xb2, 0xb1,
+        ];
+
+        #[test]
+        fn compute_file_key_matches_a_real_encrypted_pdf() {
+            let key = pdf_compute_file_key(&REAL_O, -1852, &REAL_ID0, 3, 16, true);
+            assert_eq!(key, REAL_FILE_KEY);
+        }
+
+        #[test]
+        fn compute_u_r34_matches_the_same_real_pdfs_stored_u_prefix() {
+            let u = pdf_compute_u_r34(&REAL_FILE_KEY, &REAL_ID0);
+            assert_eq!(u, REAL_U_PREFIX);
+        }
+
+        #[test]
+        fn object_key_and_decrypt_round_trip_rc4() {
+            let enc = PdfEncryption {
+                file_key: REAL_FILE_KEY.to_vec(),
+                cipher: PdfCipher::Rc4,
+            };
+            let plaintext = b"real object content";
+            let key = enc.object_key(7, 0);
+            let ciphertext = pdf_crypto::rc4(&key, plaintext);
+            assert_eq!(enc.decrypt(7, 0, &ciphertext).unwrap(), plaintext);
+            // A different object number must derive a different key -
+            // otherwise every object in the file would share one RC4
+            // keystream, a real, catastrophic weakness Algorithm 1 exists
+            // specifically to avoid.
+            assert_ne!(enc.object_key(7, 0), enc.object_key(8, 0));
+        }
+
+        #[test]
+        fn a_non_empty_user_password_fails_the_u_check() {
+            // The real file's own key only reproduces its own stored /U -
+            // a wrong key (as if a real, non-empty user password had been
+            // used) must not coincidentally validate.
+            let wrong_key = [0u8; 16];
+            let computed = pdf_compute_u_r34(&wrong_key, &REAL_ID0);
+            assert_ne!(computed, REAL_U_PREFIX);
         }
     }
 }
