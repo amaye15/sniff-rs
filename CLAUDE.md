@@ -3428,6 +3428,125 @@ fixture pair - which has no genuinely unchanged table - is unaffected).
 Clean across default/`full`, matching each build's own established
 clippy baseline exactly.
 
+## Cross-table relationship graph (`sniff-rs explain`/`path`/`rank`)
+
+Three more CLI subcommands, dispatched the same way `diff` is (the
+literal first positional argument checked before `Args::parse` ever
+runs) - `sniff-rs explain <TABLE> <INPUT> [OUTPUT_PATH] [OPTIONS]`,
+`sniff-rs path <FROM> <TO> <INPUT> [OUTPUT_PATH] [OPTIONS]`, and
+`sniff-rs rank <INPUT> [OUTPUT_PATH] [OPTIONS]` - all querying one
+shared relationship graph built over an already-profiled multi-table
+dictionary. `<INPUT>` follows the identical three-way resolution
+`sniff-rs diff` already established: an already-generated
+`--output-format json` dictionary, a `--combine` directory dictionary,
+or a raw multi-table file/directory profiled fresh. This entire feature
+- five commits' worth, `join_candidate`/`detect_relationships`
+detection, the graph algorithms, and all three subcommands - shipped
+with no CLAUDE.md writeup at all until this entry, a real documentation
+gap this section closes retroactively, including a genuine bug found
+and fixed in this same pass (see below).
+
+**Detecting a relationship between two columns in different tables**
+(`join_candidate`) is a heuristic stack, most-confident signal first,
+matching this project's own "no partial credit" philosophy elsewhere:
+an exact column-name match (case-insensitive) between two tables is
+`Confidence::Extracted`; a foreign-key naming pattern (`orders.user_id`
+matching `users.id`, via a fixed `_id`/`Id` suffix-stripping rule) is
+also `Extracted`; a shared identifier-domain heuristic (both columns
+resolve to the same semantic `ideal_type` - UUID, a numeric ID shape -
+with a fuzzy name match) is `Confidence::Inferred`; sample-value overlap
+between the two columns' own `sample_values` is an optional
+corroborating signal on top of either tier, never a standalone one.
+`detect_relationships` runs this pairwise across every table pair in the
+dictionary, producing the graph's edge list.
+
+**`EdgeContext::Bridge` vs. `EdgeContext::DuplicateSchema`** is the one
+piece of this feature's own design that was documented in the enum's own
+doc comment from the start but never actually wired into anything
+downstream until this session's fix (see below): `table_name_similarity`
+(Jaccard similarity over two tables' canonical column-name sets) tags
+every edge between a pair of tables at or above `DUPLICATE_SCHEMA_
+SIMILARITY` (0.8) as `DuplicateSchema` rather than `Bridge` - the
+near-identical-tables case (versioned exports, or hundreds of files
+sharing one fixed schema, the PDF reader's own `page_number`/`text`
+schema being the starkest real example). A weaker-but-still-notable
+match, at or above `OVERLAP_REPORT_SIMILARITY` (0.5) but below the
+duplicate-schema bar, is reported in `explain`'s own table-similarity
+section without changing the edge's own `Bridge` context.
+
+**`TableGraph`** (`tables: Vec<String>`, an adjacency map, and the flat
+`relationships: Vec<Relationship>` list) is built once by
+`build_table_graph` and shared by all three subcommands via a handful of
+pure query functions: `incident_edges` (every relationship touching one
+table), `shortest_path` (plain BFS, used by `path`), `connected_
+components` (the graph's own communities - tables linked by any chain of
+joins, largest first), and `community_of`/`community_label` (which
+component a table belongs to, and what to call it).
+
+**The bug this session found and fixed**: `rank`'s Degree column and
+`community_label`'s own hub-selection tie-break both used *raw* incident-
+edge counts - Bridge and DuplicateSchema summed together, undiscriminated
+- despite `EdgeContext`'s own doc comment already promising the opposite
+("a god-table ranking with forty same-schema links should read honestly
+instead of mistaking repetition for importance"). On a directory
+dominated by near-identical tables (603 profiled PDFs, every one sharing
+the fixed `page_number`/`text` schema - confirmed against a real 666-PDF
+test-case directory), this produced a single giant, fully-connected
+"community" with an arbitrary member crowned as a misleading "hub," and
+every table showing an artificially inflated Degree of 600-3,000+ that
+had nothing to do with genuine cross-schema connectivity - a real,
+reproducible instance of exactly the failure mode `EdgeContext` was
+supposedly already guarding against.
+
+**The fix**: `bridge_degree`/`duplicate_degree` (new helpers, each
+filtering `incident_edges` down to one `EdgeContext` variant before
+counting) replace every raw-degree computation that matters for ranking.
+`community_label` now selects its hub by `bridge_degree` rather than
+total degree, and falls back to a schema-based label
+(`"duplicate schema: col1, col2, ..."`, first 6 column names) when every
+member's `bridge_degree` is zero - a pure-duplicate-schema cluster with
+no genuine hub to name. `rank`'s Markdown/JSON output gained a separate
+`Duplicates` column/field alongside the now bridge-only `Degree`, sorted
+bridge-descending then duplicate-descending then name-ascending.
+`explain`'s relationship listing now sorts Bridge edges first, caps the
+Markdown table at `MAX_TOC_ENTRIES` (50, the same cap this project's
+directory-index/table-of-contents features already use) with a trailing
+disclosure line naming how many more of each kind exist beyond it -
+`--output-format json` stays fully uncapped, per this project's own
+established "JSON is for machines, never truncated" convention. `explain`'s
+Degree line now reads `"Degree: N (B bridge, D duplicate-schema)"`
+instead of one undifferentiated number.
+
+Verified with new/updated unit tests (`graph_community_label_names_the_
+hub_or_the_singleton` updated to pass the new `tables` parameter;
+`graph_community_label_falls_back_to_schema_when_every_edge_is_
+duplicate`, new - three tables sharing an identical `id`/`text` schema
+correctly report `bridge_degree == 0` for all three and a
+`"duplicate schema: id, text"` label) and integration tests
+(`graph_rank_lists_the_link_table_first_with_communities`/`graph_rank_
+single_table_reports_zero_degree` updated for the new column layout;
+`graph_rank_reports_similar_tables_and_edge_context` strengthened with
+real bridge/duplicate-degree assertions - a genuine bridge table (`w`)
+correctly ranks first with `degree: 2, duplicate_degree: 0` while two
+near-identical tables sharing `id`/`name` correctly show
+`degree: 1, duplicate_degree: 2` each; new `graph_explain_caps_
+duplicate_schema_noise_and_leads_with_the_real_bridge` - 55 near-
+identical tables plus one real bridge table, confirming the Degree line
+reads `"55 (1 bridge, 54 duplicate-schema)"`, the bridge table's own row
+appears before the first duplicate-schema-link row, Markdown truncates
+at exactly 50 relationship rows with a correct disclosure line, and JSON
+stays uncapped with `bridge_degree`/`duplicate_degree` both correct).
+Full test suite (555 unit + 652 integration) passing, `cargo +nightly
+fmt --check` clean, and `cargo +nightly clippy --release --all-targets
+-- -D warnings` matching the pre-existing baseline exactly (verified via
+`git stash` against unmodified `main` - zero new findings). Re-verified
+at real scale against the 666-PDF `test-case` directory's own `--combine`
+dictionary: `resume_resume_andrew_mayes_pub` (one specific PDF, arbitrarily
+picked as the pre-fix "hub") went from `Degree: 1204` to `Degree: 0,
+Duplicates: 1204`, and its community's label changed from that same
+arbitrary PDF's own filename to `"duplicate schema: page_number, text"` -
+the real-world improvement this fix set out to make.
+
 ## Numeric/statistical column summaries
 
 `ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,

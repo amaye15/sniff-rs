@@ -61697,11 +61697,51 @@ fn community_of(graph: &TableGraph, table: &str) -> usize {
         .expect("every profiled table belongs to exactly one component")
 }
 
-/// Human label for one table's community: its highest-degree member
-/// ("orders-centered"), or the member itself for a singleton. Degree ties
-/// keep the alphabetically first member (members arrive sorted, and only
-/// a strictly greater degree replaces the leader).
-fn community_label(graph: &TableGraph, table: &str) -> String {
+/// The `Bridge` half of `table`'s incident relationships - the signal a
+/// "god table" ranking should actually rank on. See `EdgeContext`'s own
+/// doc comment for why: a table linked to forty near-identical copies of
+/// itself is not forty times more important, it is one schema repeated
+/// forty times. This is what `rank`'s own Degree column, and
+/// `community_label`'s own hub selection, both key off - `duplicate_
+/// degree` (below) carries the other half so neither count is ever
+/// silently dropped, only kept apart.
+fn bridge_degree(graph: &TableGraph, table: &str) -> usize {
+    incident_edges(graph, table)
+        .into_iter()
+        .filter(|&idx| graph.relationships[idx].context == EdgeContext::Bridge)
+        .count()
+}
+
+/// The `DuplicateSchema` half of `table`'s incident relationships -
+/// reported alongside `bridge_degree` (never folded into it) so a real
+/// hub is never confused with a table that merely has many near-identical
+/// copies, and vice versa.
+fn duplicate_degree(graph: &TableGraph, table: &str) -> usize {
+    incident_edges(graph, table)
+        .into_iter()
+        .filter(|&idx| graph.relationships[idx].context == EdgeContext::DuplicateSchema)
+        .count()
+}
+
+/// Human label for one table's community: its highest-*bridge*-degree
+/// member ("orders-centered"), or the member itself for a singleton.
+/// Degree ties keep the alphabetically first member (members arrive
+/// sorted, and only a strictly greater degree replaces the leader).
+/// Ranking hub selection on raw degree (rather than `bridge_degree`)
+/// would let a member's own duplicate-schema copies dominate the
+/// tie-break and crown an arbitrary near-duplicate as "the hub" - see
+/// `EdgeContext`'s own doc comment. A community with no bridge edge
+/// anywhere in it (every link a duplicate-schema copy - the same export
+/// saved under many names, or hundreds of profiled files that all share
+/// one fixed schema) has no real hub to name at all, so it's labelled by
+/// what actually ties its members together instead: their shared column
+/// names, taken from any one member since a duplicate-schema pair is by
+/// definition near-identical.
+fn community_label(
+    graph: &TableGraph,
+    table: &str,
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> String {
     let components = connected_components(graph);
     let members = components
         .iter()
@@ -61713,13 +61753,24 @@ fn community_label(graph: &TableGraph, table: &str) -> String {
     let mut best = &members[0];
     let mut best_degree = 0;
     for member in members {
-        let degree = incident_edges(graph, member).len();
+        let degree = bridge_degree(graph, member);
         if degree > best_degree {
             best_degree = degree;
             best = member;
         }
     }
-    format!("{best}-centered")
+    if best_degree > 0 {
+        return format!("{best}-centered");
+    }
+    let names: Vec<&str> = tables
+        .get(&members[0])
+        .map(|cols| cols.iter().map(|c| c.name.as_str()).take(6).collect())
+        .unwrap_or_default();
+    if names.is_empty() {
+        "duplicate schema (no columns)".to_string()
+    } else {
+        format!("duplicate schema: {}", names.join(", "))
+    }
 }
 
 /// Row count of one table: its first column's `row_count`, the documented
@@ -75192,6 +75243,11 @@ USAGE:
     names from flattened nesting (`metadata.risk_score`) work: the table
     is everything before the first dot, the column everything after it.
 
+    Relationships are listed bridge edges first (the genuinely
+    informative ones), then duplicate-schema links; the md report caps
+    the table at 50 rows and discloses how many more of each kind exist
+    beyond it - --output-format json always carries the full list.
+
 ARGS:
     <INPUT>                 Dictionary or raw data file to query
     <COLUMN>                table.column, or a unique bare column name
@@ -75245,12 +75301,19 @@ const RANK_HELP_TEXT: &str = r#"sniff-rs rank - god tables and communities
 USAGE:
     sniff-rs rank <INPUT> [OUTPUT_PATH] [OPTIONS]
 
-    Ranks every table by connectivity (incident relationship count - the
-    data equivalent of Graphify's god nodes: fact tables surface above
-    dimensions with no configuration) and groups tables into communities
-    (connected components: tables linked by any chain of joins, largest
-    first). Isolated tables rank with degree zero in single-member
-    communities rather than vanishing.
+    Ranks every table by real cross-schema connectivity (bridge-edge
+    count - the data equivalent of Graphify's god nodes: fact tables
+    surface above dimensions with no configuration) and groups tables
+    into communities (connected components: tables linked by any chain
+    of joins, largest first). Duplicate-schema links (near-identical
+    tables: versioned exports, or hundreds of files sharing one fixed
+    schema - many profiled PDFs, say, each just page_number/text) are
+    counted separately as Duplicates rather than inflating Degree, so a
+    directory dominated by copies never crowds out the tables that
+    actually bridge different schemas; a community with no bridge edge
+    anywhere in it is labelled by its shared columns instead of naming
+    an arbitrary member "the hub". Isolated tables rank with degree zero
+    in single-member communities rather than vanishing.
 
     <INPUT> follows the same dictionary-or-raw-file rule as
     `sniff-rs explain` (see `sniff-rs explain --help`); directories are
@@ -75476,6 +75539,7 @@ fn render_explain_md(
     profile: &ColumnProfile,
     graph: &TableGraph,
     edge_indices: &[usize],
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}.{}\n\n", table, profile.name));
@@ -75518,12 +75582,21 @@ fn render_explain_md(
         }
         seen
     };
+    // Bridge/duplicate-schema split, mirroring `rank`'s own Degree/
+    // Duplicates columns: a table wired to hundreds of near-identical
+    // copies (many profiled PDFs, say, all sharing one fixed page_number/
+    // text schema) should never read as if it had hundreds of genuine
+    // cross-schema relationships. See `EdgeContext`'s own doc comment.
+    let bridge_count = edge_indices
+        .iter()
+        .filter(|&&idx| graph.relationships[idx].context == EdgeContext::Bridge)
+        .count();
+    let duplicate_count = edge_indices.len() - bridge_count;
     out.push_str(&format!(
-        "- Degree: {} (neighbor{}) · Community: {} ({})\n",
+        "- Degree: {} ({bridge_count} bridge, {duplicate_count} duplicate-schema) · Community: {} ({})\n",
         edge_indices.len(),
-        if neighbors.len() == 1 { "" } else { "s" },
         community_of(graph, table),
-        community_label(graph, table)
+        community_label(graph, table, tables)
     ));
     if !neighbors.is_empty() {
         out.push_str(&format!(
@@ -75542,10 +75615,23 @@ fn render_explain_md(
             input.display()
         ));
     } else {
+        // Bridge edges first: they are the genuinely informative evidence,
+        // and a column with hundreds of duplicate-schema copies (see
+        // above) would otherwise bury the one real bridge under an
+        // unbounded wall of near-identical rows. Capped like every other
+        // rendered list in this project (`MAX_TOC_ENTRIES`) - the `json`
+        // output stays uncapped for a machine consumer, per that
+        // constant's own established convention.
+        let mut ordered: Vec<usize> = edge_indices.to_vec();
+        ordered.sort_by_key(|&idx| match graph.relationships[idx].context {
+            EdgeContext::Bridge => 0,
+            EdgeContext::DuplicateSchema => 1,
+        });
         out.push_str("## Relationships\n\n");
         out.push_str("| Table | Column | Confidence | Why |\n");
         out.push_str("|---|---|---|---|\n");
-        for idx in edge_indices {
+        let shown = ordered.len().min(MAX_TOC_ENTRIES);
+        for idx in &ordered[..shown] {
             let rel = &graph.relationships[*idx];
             let (other_table, other_column) = if rel.from_table == table {
                 (&rel.to_table, &rel.to_column)
@@ -75565,6 +75651,18 @@ fn render_explain_md(
                 context_note,
             ));
         }
+        if ordered.len() > shown {
+            let remaining_duplicate = ordered[shown..]
+                .iter()
+                .filter(|&&idx| graph.relationships[idx].context == EdgeContext::DuplicateSchema)
+                .count();
+            let remaining_bridge = ordered.len() - shown - remaining_duplicate;
+            out.push_str(&format!(
+                "\n…and {} more relationship{} not shown ({remaining_bridge} bridge, {remaining_duplicate} duplicate-schema) - see `--output-format json` for the full list.\n",
+                ordered.len() - shown,
+                if ordered.len() - shown == 1 { "" } else { "s" },
+            ));
+        }
     }
     out
 }
@@ -75575,6 +75673,7 @@ fn render_explain_json(
     profile: &ColumnProfile,
     graph: &TableGraph,
     edge_indices: &[usize],
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
 ) -> Result<String> {
     let mut doc = json_support::Map::with_capacity(12);
     doc.insert(
@@ -75622,9 +75721,22 @@ fn render_explain_json(
         }
         seen.into_iter().map(JsonValue::from).collect()
     };
+    let bridge_count = edge_indices
+        .iter()
+        .filter(|&&idx| graph.relationships[idx].context == EdgeContext::Bridge)
+        .count();
+    let duplicate_count = edge_indices.len() - bridge_count;
     doc.insert(
         "degree".to_string(),
         JsonValue::from(edge_indices.len() as i64),
+    );
+    doc.insert(
+        "bridge_degree".to_string(),
+        JsonValue::from(bridge_count as i64),
+    );
+    doc.insert(
+        "duplicate_degree".to_string(),
+        JsonValue::from(duplicate_count as i64),
     );
     doc.insert("neighbors".to_string(), JsonValue::Array(neighbors));
     doc.insert(
@@ -75633,7 +75745,7 @@ fn render_explain_json(
     );
     doc.insert(
         "community_label".to_string(),
-        JsonValue::from(community_label(graph, table)),
+        JsonValue::from(community_label(graph, table, tables)),
     );
     doc.insert(
         "relationships".to_string(),
@@ -75666,9 +75778,11 @@ fn run_explain(raw: &[String]) -> Result<()> {
         .collect::<Vec<_>>();
     edge_indices.sort();
     let rendered = match args.format {
-        GraphFormat::Md => render_explain_md(&args.input, &table, profile, &graph, &edge_indices),
+        GraphFormat::Md => {
+            render_explain_md(&args.input, &table, profile, &graph, &edge_indices, &tables)
+        }
         GraphFormat::Json => {
-            render_explain_json(&args.input, &table, profile, &graph, &edge_indices)?
+            render_explain_json(&args.input, &table, profile, &graph, &edge_indices, &tables)?
         }
     };
     emit_graph_output(
@@ -75826,32 +75940,42 @@ fn render_rank_md(
 ) -> String {
     let mut out = String::new();
     out.push_str("# Tables by connectivity\n\n");
-    out.push_str("| Table | Rows | Degree | Neighbors | Community |\n");
-    out.push_str("|---|---|---|---|---|\n");
-    let mut rows: Vec<(&String, usize, usize, usize)> = graph
+    // Degree counts `Bridge` edges only - the real, distinct-schema
+    // connectivity a "god table" ranking exists to surface. Duplicates
+    // is the `DuplicateSchema` count reported alongside it, never folded
+    // in: a table with hundreds of near-identical copies (many profiled
+    // PDFs, say, all sharing one fixed page_number/text schema) would
+    // otherwise rank as if it were hundreds of times more central than a
+    // table that genuinely bridges two different schemas once. See
+    // `EdgeContext`'s own doc comment for the full reasoning.
+    out.push_str("| Table | Rows | Degree | Duplicates | Neighbors | Community |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+    let mut rows: Vec<(&String, usize, usize, usize, usize)> = graph
         .tables
         .iter()
         .map(|t| {
-            let degree: usize = graph
-                .adj
-                .get(t)
-                .map(|m| m.values().map(Vec::len).sum())
-                .unwrap_or(0);
+            let bridge = bridge_degree(graph, t);
+            let duplicate = duplicate_degree(graph, t);
             let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
-            (t, degree, neighbors, community_of(graph, t))
+            (t, bridge, duplicate, neighbors, community_of(graph, t))
         })
         .collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    for (table, degree, neighbors, community) in rows {
+    rows.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(b.0))
+    });
+    for (table, bridge, duplicate, neighbors, community) in rows {
         let rows_text = match table_rows(tables, table) {
             Some(n) => n.to_string(),
             None => "(unknown)".to_string(),
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
             escape_graph_md(table),
             rows_text,
-            degree,
+            bridge,
+            duplicate,
             neighbors,
             community
         ));
@@ -75867,7 +75991,7 @@ fn render_rank_md(
             // The label names the community's own hub (see
             // `community_label`), so a reader never has to cross-reference
             // the table above to know what a cluster is about.
-            let label = community_label(graph, &members[0]);
+            let label = community_label(graph, &members[0], tables);
             out.push_str(&format!(
                 "- Community {id} ({label}, {} tables): {}\n",
                 members.len(),
@@ -75921,26 +76045,27 @@ fn render_rank_json(
         "input".to_string(),
         JsonValue::from(input.display().to_string()),
     );
-    let mut rows: Vec<(&String, usize, usize, usize)> = graph
+    let mut rows: Vec<(&String, usize, usize, usize, usize)> = graph
         .tables
         .iter()
         .map(|t| {
-            let degree: usize = graph
-                .adj
-                .get(t)
-                .map(|m| m.values().map(Vec::len).sum())
-                .unwrap_or(0);
+            let bridge = bridge_degree(graph, t);
+            let duplicate = duplicate_degree(graph, t);
             let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
-            (t, degree, neighbors, community_of(graph, t))
+            (t, bridge, duplicate, neighbors, community_of(graph, t))
         })
         .collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    rows.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(b.0))
+    });
     doc.insert(
         "tables".to_string(),
         JsonValue::Array(
             rows.iter()
-                .map(|(table, degree, neighbors, community)| {
-                    let mut obj = json_support::Map::with_capacity(5);
+                .map(|(table, bridge, duplicate, neighbors, community)| {
+                    let mut obj = json_support::Map::with_capacity(6);
                     obj.insert("table".to_string(), JsonValue::from(table.to_string()));
                     obj.insert(
                         "rows".to_string(),
@@ -75949,7 +76074,16 @@ fn render_rank_json(
                             None => JsonValue::Null,
                         },
                     );
-                    obj.insert("degree".to_string(), JsonValue::from(*degree as i64));
+                    // `degree` is `Bridge`-only (real cross-schema
+                    // connectivity, what "god table" ranking means) -
+                    // `duplicate_degree` carries the `DuplicateSchema`
+                    // count separately rather than folding it in, per
+                    // `EdgeContext`'s own doc comment.
+                    obj.insert("degree".to_string(), JsonValue::from(*bridge as i64));
+                    obj.insert(
+                        "duplicate_degree".to_string(),
+                        JsonValue::from(*duplicate as i64),
+                    );
                     obj.insert("neighbors".to_string(), JsonValue::from(*neighbors as i64));
                     obj.insert("community".to_string(), JsonValue::from(*community as i64));
                     JsonValue::Object(obj)
@@ -75969,7 +76103,7 @@ fn render_rank_json(
                     obj.insert("size".to_string(), JsonValue::from(members.len() as i64));
                     obj.insert(
                         "label".to_string(),
-                        JsonValue::from(community_label(graph, &members[0])),
+                        JsonValue::from(community_label(graph, &members[0], tables)),
                     );
                     obj.insert(
                         "members".to_string(),
@@ -84570,7 +84704,7 @@ mod tests {
 
     #[test]
     fn graph_community_label_names_the_hub_or_the_singleton() {
-        let graph = graph_tables(&[
+        let entries = [
             ("authors", vec![rel_col("author_id", "i64", &["1", "2"])]),
             (
                 "books",
@@ -84581,11 +84715,62 @@ mod tests {
             ),
             ("publishers", vec![rel_col("publisher_id", "i64", &["9"])]),
             ("audit", vec![rel_col("note", "String", &["x"])]),
-        ]);
-        assert_eq!(community_label(&graph, "authors"), "books-centered");
-        assert_eq!(community_label(&graph, "books"), "books-centered");
+        ];
+        let tables = rel_tables(&entries);
+        let graph = build_table_graph(&tables);
+        assert_eq!(
+            community_label(&graph, "authors", &tables),
+            "books-centered"
+        );
+        assert_eq!(community_label(&graph, "books", &tables), "books-centered");
         // A singleton's label is itself - there is no hub to name.
-        assert_eq!(community_label(&graph, "audit"), "audit");
+        assert_eq!(community_label(&graph, "audit", &tables), "audit");
+    }
+
+    #[test]
+    fn graph_community_label_falls_back_to_schema_when_every_edge_is_duplicate() {
+        // Three exact-schema copies (versioned exports, or - the real
+        // motivating case - many profiled PDFs that all share one fixed
+        // page_number/text schema): every edge among them is
+        // `DuplicateSchema`, so there is no real hub to crown. The label
+        // should disclose the shared columns instead of naming an
+        // arbitrary member "-centered".
+        let entries = [
+            (
+                "v1",
+                vec![
+                    rel_col("id", "i64", &["1", "2"]),
+                    rel_col("text", "String", &["a", "b"]),
+                ],
+            ),
+            (
+                "v2",
+                vec![
+                    rel_col("id", "i64", &["1", "2"]),
+                    rel_col("text", "String", &["a", "b"]),
+                ],
+            ),
+            (
+                "v3",
+                vec![
+                    rel_col("id", "i64", &["1", "2"]),
+                    rel_col("text", "String", &["a", "b"]),
+                ],
+            ),
+        ];
+        let tables = rel_tables(&entries);
+        let graph = build_table_graph(&tables);
+        for name in ["v1", "v2", "v3"] {
+            assert_eq!(
+                bridge_degree(&graph, name),
+                0,
+                "no genuine bridge in {name}"
+            );
+            assert_eq!(
+                community_label(&graph, name, &tables),
+                "duplicate schema: id, text"
+            );
+        }
     }
 
     #[test]

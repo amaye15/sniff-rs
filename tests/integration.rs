@@ -12525,10 +12525,10 @@ fn graph_rank_lists_the_link_table_first_with_communities() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let orders = stdout
-        .find("| orders | 1 | 2 | 2 | 0 |")
+        .find("| orders | 1 | 2 | 0 | 2 | 0 |")
         .expect("orders row");
     let customers = stdout
-        .find("| customers | 1 | 1 | 1 | 0 |")
+        .find("| customers | 1 | 1 | 0 | 1 | 0 |")
         .expect("customers row");
     assert!(orders < customers, "god table must rank first: {stdout}");
     assert!(
@@ -12552,6 +12552,7 @@ fn graph_rank_lists_the_link_table_first_with_communities() {
     let tables = doc["tables"].as_array().unwrap();
     assert_eq!(tables[0]["table"], "orders");
     assert_eq!(tables[0]["degree"], 2);
+    assert_eq!(tables[0]["duplicate_degree"], 0);
     assert_eq!(tables[0]["rows"], 1);
     let communities = doc["communities"].as_array().unwrap();
     assert_eq!(communities.len(), 2);
@@ -12571,7 +12572,7 @@ fn graph_rank_single_table_reports_zero_degree() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("| sample | 5 | 0 | 0 | 0 |"),
+        stdout.contains("| sample | 5 | 0 | 0 | 0 | 0 |"),
         "got: {stdout}"
     );
 }
@@ -12859,6 +12860,35 @@ fn graph_rank_reports_similar_tables_and_edge_context() {
     assert_eq!(similar[0]["similarity"], 1.0);
     assert_eq!(similar[0]["reading"], "likely_duplicate");
 
+    // The real fix under test: `w` genuinely bridges v1 and v2 (it shares
+    // `id` with each), while v1/v2 are merely two copies of one schema.
+    // Ranking on raw incident-edge count would put v1/v2 (3 edges each -
+    // 1 bridge to `w`, 2 duplicate-schema to each other) above `w` (2
+    // edges, both bridges); ranking on `Bridge`-only degree - the actual
+    // "god table" signal - must put `w` first instead, with its
+    // duplicate-schema copies visible but demoted to their own column.
+    let tables = doc["tables"].as_array().unwrap();
+    let w = tables.iter().find(|t| t["table"] == "w__w").unwrap();
+    let v1 = tables.iter().find(|t| t["table"] == "v1__v1").unwrap();
+    let v2 = tables.iter().find(|t| t["table"] == "v2__v2").unwrap();
+    assert_eq!(w["degree"], 2, "w bridges both v1 and v2: {tables:?}");
+    assert_eq!(w["duplicate_degree"], 0);
+    assert_eq!(v1["degree"], 1, "v1's only real bridge is to w: {tables:?}");
+    assert_eq!(
+        v1["duplicate_degree"], 2,
+        "v1<->v2 share id and name: {tables:?}"
+    );
+    assert_eq!(v2["degree"], 1);
+    assert_eq!(v2["duplicate_degree"], 2);
+    assert_eq!(
+        tables[0]["table"], "w__w",
+        "the real bridge must rank first: {tables:?}"
+    );
+    // The community's hub is named off bridge degree too - `w`, not an
+    // arbitrary v1/v2 tie-break inflated by their own duplicate edges.
+    let communities = doc["communities"].as_array().unwrap();
+    assert_eq!(communities[0]["label"], "w__w-centered");
+
     // Edge contexts straight from the combined dictionary itself.
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&dict).unwrap()).unwrap();
@@ -12872,6 +12902,103 @@ fn graph_rank_reports_similar_tables_and_edge_context() {
         rels.iter().any(|e| e["context"] == "bridge"),
         "w edges must stay bridges"
     );
+}
+
+#[test]
+fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
+    // The real-world shape this locks in: many near-identical tables
+    // (hundreds of profiled PDFs, all sharing one fixed page_number/text
+    // schema, is the motivating case) plus one genuinely different table
+    // that bridges them all via a shared id. Explaining one duplicate's
+    // own id column should surface the one real bridge first, cap the
+    // wall of duplicate-schema copies at 50 rows, and disclose exactly
+    // how many more of each kind exist beyond the cap.
+    let dir = TempDir::new();
+    for i in 0..55 {
+        std::fs::write(
+            dir.path().join(format!("t{i}.csv")),
+            "id,text\n1,hello\n2,world\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.path().join("hub.csv"), "id\n1\n2\n").unwrap();
+    let out = TempDir::new();
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--combine",
+            "--output-format",
+            "json",
+            "--output-dir",
+            out.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let dict = out.path().join(format!("{dir_name}.dictionary.json"));
+
+    // `t0`'s own `id` column: 1 real bridge (to hub) + 54 duplicate-schema
+    // links (to every other t*) = 55 edges, past the 50-row md cap.
+    let output = run_graph(&["explain", dict.to_str().unwrap(), "t0__t0.id"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("- Degree: 55 (1 bridge, 54 duplicate-schema)"),
+        "got: {stdout}"
+    );
+    // The one real bridge (to hub) must appear before any duplicate-schema
+    // row, not wherever alphabetical table-name order happens to place it.
+    let hub_pos = stdout.find("hub__hub").expect("hub row present");
+    let first_dup_pos = stdout
+        .find("[duplicate-schema link]")
+        .expect("a duplicate-schema row is present");
+    assert!(
+        hub_pos < first_dup_pos,
+        "the real bridge must be listed before duplicate-schema noise: {stdout}"
+    );
+    assert!(
+        stdout.contains("…and 5 more relationships not shown (0 bridge, 5 duplicate-schema)"),
+        "got: {stdout}"
+    );
+    // Bounded, not unbounded: exactly 50 relationship rows in the table
+    // (one header separator line plus 50 data rows).
+    assert_eq!(
+        stdout.matches("[duplicate-schema link]").count()
+            + stdout.matches("hub__hub | id | extracted").count(),
+        50,
+        "got: {stdout}"
+    );
+
+    // JSON stays uncapped (the machine-consumable form), per this
+    // project's own established `MAX_TOC_ENTRIES` convention, and
+    // carries the bridge/duplicate breakdown as real fields.
+    let output = run_graph(&[
+        "explain",
+        dict.to_str().unwrap(),
+        "t0__t0.id",
+        "--output-format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    assert_eq!(doc["degree"], 55);
+    assert_eq!(doc["bridge_degree"], 1);
+    assert_eq!(doc["duplicate_degree"], 54);
+    assert_eq!(doc["relationships"].as_array().unwrap().len(), 55);
+
+    // The community as a whole has a real bridge (hub) - its label should
+    // name that hub, not an arbitrary near-duplicate.
+    assert_eq!(doc["community_label"], "hub__hub-centered");
 }
 
 #[test]
