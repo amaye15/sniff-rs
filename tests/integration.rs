@@ -13587,3 +13587,20 @@ fn pdf_inherits_resources_from_pages_ancestors() {
         serde_json::json!(["Inherited resources work"])
     );
 }
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_salvages_page_text_from_a_flate_stream_truncated_partway_through() {
+    // A content stream's own FlateDecode payload cut off before its
+    // fourth (and final) `Tj` operator ever closes - the shape a real,
+    // interrupted download or write leaves behind. The three already-
+    // complete text-showing operations before the cut are real, valid
+    // text and must survive; only the incomplete fourth line is lost.
+    let doc = run_json("edge_pdf_truncated_flate_salvage.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_truncated_flate_salvage"), "text")["sample_values"],
+        serde_json::json!([
+            "First recoverable line of real text. Second recoverable line of real text. Third recoverable line of real text."
+        ])
+    );
+}

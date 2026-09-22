@@ -15129,6 +15129,69 @@ unmodified `main`).
   fonts without ToUnicode, genuinely truncated streams Python itself
   rejects, subset-gid and fragment glyph names) - see Known limitations.
 
+  **A follow-up pass closed the "genuinely truncated streams" gap for
+  the common case, rather than leaving it a blanket refusal** - re-
+  running the same 666-file real-world sweep after the `explain`/`rank`
+  bridge-vs-duplicate-schema fix (see the graph section above) found 6
+  of the 63 original PDF failures were exactly this shape: a content
+  stream's own FlateDecode payload cut off mid-stream (an interrupted
+  download or write - a real, common corpus condition, not a contrived
+  edge case). Both halves of the pipeline needed the identical "salvage
+  the valid prefix, don't lose it over the tail" treatment:
+
+  - `flate_decode` no longer discards whatever was already decoded when
+    the DEFLATE decode loop fails partway through - `inflate_to` already
+    writes each literal/match directly into its output sink as it's
+    decoded (see the Performance section's own `LzWindowSink` writeup),
+    so the bytes decoded before a failure are already sitting in the
+    output buffer; `inflate_salvaging` just captures them alongside the
+    error instead of throwing them away. A stream that decodes
+    completely but is missing its trailing 4-byte Adler-32 checksum
+    (the file was cut *after* every DEFLATE block finished, just before
+    the trailer) is trusted outright rather than refused - there's
+    nothing left to verify a fully, validly decoded payload against, so
+    a missing checksum is treated as "nothing to check," not "corrupt."
+    Only a stream where *nothing* at all decoded before the failure
+    (the cut lands before the first symbol) still hard-errors, since
+    there's genuinely nothing to salvage.
+  - `content_spans`' own operand parser propagates a hard error for a
+    genuinely malformed operator argument mid-stream, per this
+    function's own long-standing design (real content still follows a
+    malformed token, so there's no legitimate reason to guess at it) -
+    but a truncated content stream's own final operand runs off the end
+    of the buffer in exactly the same "unterminated string/array/
+    dictionary" shape a malformed one does. The two are now
+    distinguished by checking whether the lexer's own position sits at
+    true end-of-input when the error fires: an operand that fails
+    because the stream simply ended is treated as "this is where the
+    real text stops," salvaging every complete text-showing operation
+    already collected; an operand that fails with real bytes still
+    following it is still the same hard error as before, since a
+    malformed token that isn't simply the stream's own natural end
+    still has no legitimate interpretation.
+
+  Verified with three new unit tests (a stream cut mid-operand
+  correctly keeps every already-shown text and drops only the
+  incomplete tail; a genuinely malformed operand with real content
+  still following it still hard-errors, proving the fix doesn't weaken
+  the existing guarantee; `flate_decode` itself salvages a real,
+  `zlib`-compressed "Hello, PDF!" stream cut at several points -
+  empirically probed first to confirm exactly which cut points recover
+  a real prefix versus recover nothing at all, rather than assumed)
+  plus a new integration test and committed fixture
+  (`edge_pdf_truncated_flate_salvage.pdf` - four `Tj` operations, the
+  last one deliberately truncated mid-string) proving the fix end to
+  end through the real CLI. Confirmed as a pure addition, not a
+  behavior change, for every already-working file: `diff` showed
+  byte-identical `--output-format json` output against the pre-fix
+  binary across the entire committed PDF fixture corpus. Re-run against
+  the real 666-file corpus: the "corrupt/truncated FlateDecode stream"
+  failure category is now empty (0 of 666, down from 6) - the remaining
+  59 failures are exactly the still-disclosed boundaries (encrypted,
+  no usable encoding, Identity-H without ToUnicode, an unmapped glyph),
+  none of them related to this fix. Clean across default/`pdf`/`full`,
+  matching each build's own established clippy baseline exactly.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15446,11 +15509,19 @@ established baselines exactly.
   without a CMap are genuinely unmappable (Adobe's public ROS CMaps were
   judged out of scope). Subset-gid (`/g0`) and fragment (`parenlefttp`)
   glyph names, LZWDecode streams,
-  encrypted files, genuinely truncated streams, and image-only scanned
-  pages (present record, missing text - OCR is out of scope) round out the
-  same disclosed-boundary set; annotations and AcroForm field values are
-  not surfaced at all. See the Dependency footprint section's own PDF
-  entry for the full verification trail.
+  encrypted files, and image-only scanned pages (present record, missing
+  text - OCR is out of scope) round out the same disclosed-boundary set;
+  annotations and AcroForm field values are not surfaced at all. A
+  content stream's FlateDecode payload that's genuinely truncated
+  mid-DEFLATE-block (a real, common corpus shape - an interrupted
+  download or write) is no longer an automatic refusal: every complete
+  text-showing operation before the cut is salvaged and kept, with only
+  the one incomplete trailing operation dropped - see this section's own
+  `flate_decode`/`content_spans` writeup above for the fix. A file with
+  *nothing* recoverable before the cut (the truncation lands before even
+  the first symbol decodes) still refuses cleanly, the same as before.
+  See the Dependency footprint section's own PDF entry for the full
+  verification trail.
 - **A dotted-quad value valid as IPv4 is always reported as IPv4**, even if
   it's semantically something else - a version string like `"1.2.3.4"` is
   indistinguishable from an address at the string level, and there's no

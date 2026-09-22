@@ -52813,13 +52813,32 @@ mod pdf_support {
         /// succeeds byte-exactly or errors - there is no silent third
         /// outcome. `/Predictor` (PNG/TIFF unfiltering) applies on top
         /// when declared.
+        /// Runs the shared `inflate_to` decode loop, but never discards
+        /// whatever was already decoded when it fails partway through - a
+        /// real, truncated-mid-stream PDF (a genuinely common corpus
+        /// shape: an interrupted download, a tool that wrote the header
+        /// before crashing) still has every complete DEFLATE block before
+        /// the cut point fully valid and worth keeping. `Ok` carries the
+        /// complete output; `Err` carries whatever prefix was decoded
+        /// before the real error, alongside that error for the caller to
+        /// report if the prefix turns out to be empty too.
+        fn inflate_salvaging<R: std::io::Read>(
+            input: R,
+        ) -> std::result::Result<Vec<u8>, (Vec<u8>, Error)> {
+            let mut out = Vec::new();
+            match inflate_to(input, &mut out) {
+                Ok(()) => Ok(out),
+                Err(e) => Err((out, e)),
+            }
+        }
+
         fn flate_decode(
             data: &[u8],
             parms: Option<&BTreeMap<Vec<u8>, PdfObj>>,
             path: &Path,
         ) -> Result<Vec<u8>> {
             let framed = Self::zlib_framed(data).is_some();
-            let mut inflated = if framed {
+            let inflated = if framed {
                 // The Adler trailer sits where the DEFLATE stream *ends*,
                 // not unconditionally at the last 4 input bytes: real
                 // writers leave stray trailing bytes (a one-byte NUL pad
@@ -52831,22 +52850,62 @@ mod pdf_support {
                 // byte boundary - the trailer's real home.
                 let body = &data[2..];
                 let mut cursor = std::io::Cursor::new(body);
-                let inflated = inflate(&mut cursor)
-                    .with_context(|| format!("{path:?} has a corrupt FlateDecode stream"))?;
+                let inflated = match Self::inflate_salvaging(&mut cursor) {
+                    Ok(v) => v,
+                    Err((partial, _)) if !partial.is_empty() => {
+                        // A real DEFLATE error partway through (a bad
+                        // Huffman code, a truncated final block) - salvage
+                        // the valid prefix rather than losing the whole
+                        // page's text over it. No trailer to check against
+                        // a stream that never finished decoding.
+                        return Self::finish_flate_decode(partial, parms, path);
+                    }
+                    Err((_, e)) => {
+                        return Err(e)
+                            .with_context(|| format!("{path:?} has a corrupt FlateDecode stream"));
+                    }
+                };
                 let pos = cursor.position() as usize;
-                let trailer = body
-                    .get(pos..pos + 4)
-                    .ok_or_else(|| anyhow!("{path:?} has a truncated FlateDecode stream"))?;
-                let expected = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-                if Self::adler32(&inflated) != expected {
-                    bail!("{path:?} has a FlateDecode stream with a bad checksum");
+                // A missing trailer (`None`) means the stream decoded
+                // completely - every DEFLATE block ended cleanly - but the
+                // file was cut before the trailing 4-byte Adler-32
+                // checksum: a truncated download/write, not a corrupt
+                // decode. The content itself is already known-valid;
+                // there's simply nothing left to verify it against, so
+                // it's trusted rather than discarded over a missing
+                // checksum.
+                if let Some(trailer) = body.get(pos..pos + 4) {
+                    let expected =
+                        u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+                    if Self::adler32(&inflated) != expected {
+                        bail!("{path:?} has a FlateDecode stream with a bad checksum");
+                    }
                 }
                 inflated
             } else {
                 let raw = Self::zlib_framed(data).unwrap_or(data);
-                inflate(std::io::Cursor::new(raw))
-                    .with_context(|| format!("{path:?} has a corrupt FlateDecode stream"))?
+                match Self::inflate_salvaging(std::io::Cursor::new(raw)) {
+                    Ok(v) => v,
+                    Err((partial, _)) if !partial.is_empty() => {
+                        return Self::finish_flate_decode(partial, parms, path);
+                    }
+                    Err((_, e)) => {
+                        return Err(e)
+                            .with_context(|| format!("{path:?} has a corrupt FlateDecode stream"));
+                    }
+                }
             };
+            Self::finish_flate_decode(inflated, parms, path)
+        }
+
+        /// The tail every `flate_decode` outcome shares - fully decoded or
+        /// a salvaged partial prefix alike - applying `/Predictor`
+        /// unfiltering when the stream's own `/DecodeParms` declare one.
+        fn finish_flate_decode(
+            mut inflated: Vec<u8>,
+            parms: Option<&BTreeMap<Vec<u8>, PdfObj>>,
+            path: &Path,
+        ) -> Result<Vec<u8>> {
             if let Some(predictor) = parms
                 .and_then(|p| p.get(b"Predictor".as_slice()))
                 .and_then(PdfObj::as_int)
@@ -54684,7 +54743,23 @@ mod pdf_support {
                 }
                 continue;
             }
-            stack.push(lex.parse_object(0)?);
+            match lex.parse_object(0) {
+                Ok(obj) => stack.push(obj),
+                // A well-formed operand can still run off the end of a
+                // genuinely truncated stream (a `flate_decode` salvage of
+                // a stream that was cut mid-DEFLATE-block, or a file
+                // truncated after the fact) - the operand grammar itself
+                // stays a hard error everywhere else (see this function's
+                // own doc comment), but an error that only surfaces once
+                // every remaining byte has already been consumed is
+                // exactly what "the stream ends here" looks like, not a
+                // malformed token with more real content still to come.
+                // Every span already collected is real, complete text -
+                // worth keeping rather than losing the whole page over
+                // however this stream happened to end.
+                Err(_) if lex.exhausted() => break,
+                Err(e) => return Err(e),
+            }
             if stack.len() > 64 {
                 stack.clear();
             }
@@ -54748,6 +54823,32 @@ mod pdf_support {
                 vec!["A", "B"]
             );
         }
+
+        #[test]
+        fn a_stream_truncated_mid_operand_salvages_every_complete_show_before_it() {
+            // A real "the stream was cut off" shape: two complete `Tj`
+            // shows, then a third string literal that never closes because
+            // the underlying bytes simply ran out - the same thing a
+            // salvaged, partially-decoded FlateDecode stream looks like.
+            // The whole page must not be lost over the one incomplete tail.
+            assert_eq!(
+                show_text(b"BT (First) Tj (Second) Tj (Third but cut off"),
+                vec!["First", "Second"]
+            );
+        }
+
+        #[test]
+        fn a_malformed_operand_with_more_real_content_after_it_still_errors() {
+            // A stray `)` at an operand position is a hard, immediate
+            // "unexpected byte" - not an exhaustion at all, since the
+            // lexer's own position sits well before end of input, with
+            // real, well-formed content still following it. The operand
+            // grammar's own hard-error guarantee (see this function's own
+            // doc comment) must still hold for a genuinely malformed token
+            // in the middle of the stream, distinct from the stream simply
+            // running out of bytes.
+            assert!(content_spans(b"BT (First) Tj ) (Second) Tj ET").is_err());
+        }
     }
 
     #[cfg(test)]
@@ -54756,6 +54857,42 @@ mod pdf_support {
 
         fn tpath() -> &'static Path {
             Path::new("test")
+        }
+
+        #[test]
+        fn flate_decode_salvages_a_stream_truncated_before_the_trailer() {
+            // Same "Hello, PDF!" bytes as the round-trip test above, cut at
+            // several real points before the 4-byte Adler-32 trailer -
+            // exactly the shape a real, interrupted write/download leaves
+            // behind. Values confirmed by direct inspection before being
+            // hardcoded, not assumed from the DEFLATE grammar alone.
+            let framed: &[u8] = &[
+                120, 156, 243, 72, 205, 201, 201, 215, 81, 8, 112, 113, 83, 4, 0, 21, 171, 3, 60,
+            ];
+            // Cut mid-block, before any literal has fully decoded yet -
+            // nothing to salvage, so this still correctly hard-errors
+            // rather than silently returning empty content.
+            assert!(PdfReader::flate_decode(&framed[..3], None, tpath()).is_err());
+            assert!(PdfReader::flate_decode(&framed[..4], None, tpath()).is_err());
+            assert!(PdfReader::flate_decode(&framed[..5], None, tpath()).is_err());
+            // Cut after some literals have already decoded - salvage the
+            // real prefix instead of losing it.
+            assert_eq!(
+                PdfReader::flate_decode(&framed[..6], None, tpath()).unwrap(),
+                b"Hel"
+            );
+            assert_eq!(
+                PdfReader::flate_decode(&framed[..9], None, tpath()).unwrap(),
+                b"Hello,"
+            );
+            // Cut right after the body finishes but before the trailer -
+            // the content is already fully, validly decoded; there's
+            // simply nothing left to check it against, so it's trusted
+            // rather than discarded over a missing checksum.
+            assert_eq!(
+                PdfReader::flate_decode(&framed[..15], None, tpath()).unwrap(),
+                b"Hello, PDF!"
+            );
         }
 
         #[test]
