@@ -47,7 +47,7 @@ default = ["full"]
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "ipynb", "delta", "iceberg", "simd"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "ipynb", "pdf", "delta", "iceberg", "simd"]
 sqlite = []
 msgpack = []
 toml = []
@@ -102,6 +102,12 @@ icalendar = []
 # always-on json_support parser and extracts the top-level cells array
 # as the records array, one record per cell.
 ipynb = []
+# Hand-rolled, no dep - PDF page-text extraction (pdf_support): xref
+# table/stream navigation, FlateDecode (+ASCII85/ASCIIHex), WinAnsi/
+# MacRoman/Differences/ToUnicode-backed text, one record per page.
+# Pure std (reuses the existing hand-rolled inflate); never a runtime
+# dependency on a PDF crate.
+pdf = []
 # Delta Lake table awareness (delta_support): auto-detected directly from
 # the input path being a directory containing `_delta_log/` - resolves
 # the transaction log's own JSON commits to the table's current schema

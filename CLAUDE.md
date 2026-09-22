@@ -7,7 +7,8 @@ Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
 logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON,
 Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
-vCard, and iCalendar — any of them gzip- or zstd-compressed too — plus
+vCard, iCalendar, Jupyter notebooks (.ipynb), and PDF page text — any of
+them gzip- or zstd-compressed too — plus
 Delta Lake and Apache Iceberg tables (a directory profiled as one
 logical table by resolving its own transaction log / metadata chain) —
 and writes Markdown, this tool's own rich JSON, json-schema.org-standard
@@ -95,6 +96,8 @@ reaching for it.
 | vCard | `.vcf` | `--features vcard` | one record per `BEGIN:VCARD`/`END:VCARD` block (RFC 6350); a repeated property (multiple `EMAIL`/`TEL` lines) pools into an array column, the same convention this tool's INI reader already uses for a repeated key |
 | iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
 | MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
+| Jupyter notebooks (.ipynb) | `.ipynb` | `--features ipynb` | standard JSON with a fixed top-level shape (nbformat v4); the top-level `cells` array is the natural records array, one record per object in it; a cell's own `source` line-list pools into a `Vec<String>` column by the existing array convention |
+| PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode) - see the Dependency footprint section |
 | Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
 | Apache Iceberg | *(directory)* | `--features iceberg` | also detected from directory structure (a `metadata/` subdirectory with a real `*.metadata.json` file); resolves the current metadata.json's own snapshot to a manifest-list (Avro) naming manifest files (Avro) naming live Parquet data files, then profiles them the same "one merged table" way - see "Lakehouse table formats" below |
 
@@ -14947,6 +14950,66 @@ baselines exactly (the same pre-existing `chunks_exact`/question-mark
 clippy findings from a newer clippy version, confirmed identical on
 unmodified `main`).
 
+- **PDF page text (`pdf_support`), hand-rolled from the start** - the
+  same "never a runtime dependency to begin with" shape as SPSS/ORC
+  rather than a crate this project ever depended on and later replaced.
+  No pure-Rust PDF text extractor on crates.io was judged verifiable
+  enough to serve even as a dev-only oracle (the one candidate examined
+  for the neighboring MBOX format turned out to have two real bugs of
+  its own - see that entry above - which settled the question for this
+  format too), so verification rests on hand-built fixtures plus a
+  666-file real-world sweep, not a second implementation.
+
+  The reader layers the way the format does: a byte lexer (`PdfLexer`,
+  with the same nesting cap every other nested format carries) parses
+  objects - indirect references resolved by a two-integer probe that
+  took three attempts to get right (`12 0 R` needs whitespace skipped
+  *before* `R`, the generation slice captured *before* that skip, and
+  `R` accepted at any token boundary rather than only before a
+  delimiter - each version caught by a unit test or the first real
+  file, never by inspection); the trailer/xref resolves newest-first
+  across table, stream, and `/Prev` shapes (bare-trailer files, which
+  real merge tools emit with no `xref` keyword at all, fall back to a
+  bounded whole-file scan for `N G obj` headers); object streams decode
+  once (a double-decode of an already-decoded payload shipped briefly
+  and failed the first real Flate-filtered object stream - pinned by a
+  filtered-ObjStm fixture whose plaintext provably cannot re-inflate);
+  streams run their `/Filter` chains (ASCIIHex/ASCII85/Flate/RunLength,
+  stacked - `~>` terminates ASCII85, anything else outside `!`..`u` is
+  malformed); Flate verifies Adler-32 where the DEFLATE stream actually
+  ends (cursor position, tolerating real writers' trailing pad bytes)
+  rather than unconditionally at input end.
+
+  Text itself decodes per page through the `/Tf`-selected font:
+  WinAnsi/cp1252 and MacRoman tables both byte-verified against `iconv`
+  (which caught a real transcription error, `0xDB` = U+20AC), AGL glyph
+  names in four real-file-driven waves (ASCII punctuation, Eastern
+  European precomposed, Greek + tonos variants, math/technical, TeX
+  delimiter families - each wave verified by re-sweeping rather than
+  assumed complete), `uniXXXX`/`uXXXX` codepoint names, subset-suffix
+  basenames (`Euro.069`), mechanical `X_y` ligatures, and
+  single-letter smallcaps; a full ToUnicode CMap parser
+  (`bfchar`/`bfrange` with range/total caps, `begincmap` consumed rather
+  than skipped); a required-codes coverage rule that accepts a
+  base-less Differences font exactly when every shown code is mapped
+  (no WinAnsi guessing, no blanket refusal). Content streams walk an
+  operand stack past the hundreds of graphics operators (ignored, since
+  the vocabulary is open-ended) to the text-showing ones, joining
+  `TJ` fragments without spaces and skipping inline images by byte
+  search. One record per page (`page_number`, `text`); an image-only
+  scanned page is a present record with missing text (verified against
+  a real birth certificate), not an error.
+
+  Real-file testing found every bug above plus three structural gaps
+  closed the same way: xref-trailer windows that fit the subsections
+  but not linearized files' large trailers (both now share one
+  grow-and-retry loop), and `/Prev 0` treated as chain end. The 666-file
+  sweep (resumes, bank statements, textbooks, government forms) runs
+  with zero panics; the remaining refusals are all disclosed boundaries
+  (encrypted, LZW, Standard/Symbol/custom bases and CID/composite
+  fonts without ToUnicode, genuinely truncated streams Python itself
+  rejects, subset-gid and fragment glyph names) - see Known limitations.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15254,6 +15317,21 @@ established baselines exactly.
   declaring one of them is a clear, disclosed error rather than a guess,
   the same dependency-weight tradeoff already declined for dBase's own
   ~20-codepage gap and for SPSS/DuckDB entirely (see below).
+- **PDF text decoding is limited to WinAnsi/MacRoman/Differences/ToUnicode
+  fonts.** A font naming StandardEncoding, Symbol, another custom base, or
+  a composite/CID font (including TeX built-ins like CMSY10) with no
+  `/ToUnicode` and no usable `/Differences` coverage is a clear, disclosed
+  error naming the font - shipping a from-memory StandardEncoding table
+  with no machine-checkable oracle in this environment (no `iconv` codec,
+  no pypdf) would break the "no fixture, no trust" rule, and CID codes
+  without a CMap are genuinely unmappable (Adobe's public ROS CMaps were
+  judged out of scope). Subset-gid (`/g0`) and fragment (`parenlefttp`)
+  glyph names, LZWDecode streams,
+  encrypted files, genuinely truncated streams, and image-only scanned
+  pages (present record, missing text - OCR is out of scope) round out the
+  same disclosed-boundary set; annotations and AcroForm field values are
+  not surfaced at all. See the Dependency footprint section's own PDF
+  entry for the full verification trail.
 - **A dotted-quad value valid as IPv4 is always reported as IPv4**, even if
   it's semantically something else - a version string like `"1.2.3.4"` is
   indistinguishable from an address at the string level, and there's no

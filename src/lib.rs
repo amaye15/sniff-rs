@@ -3423,8 +3423,8 @@ Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
 INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
-HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), or a
-Delta Lake/Apache Iceberg
+HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
+text, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3492,7 +3492,7 @@ OPTIONS:
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
                                  sas7bdat, spss, orc, bson, plist, json5, har, geojson,
-                                 mbox, vcard, icalendar, or ipynb - single-file mode only. Run
+                                 mbox, vcard, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -51193,6 +51193,3765 @@ fn columns_from_ipynb(
     )
 }
 
+// --- PDF reader (opt-in via --features pdf, hand-rolled page-text
+// extraction) --- One record per page (`page_number`, `text`), built from
+// the file's own cross-reference index backward from the trailer - never a
+// whole-file buffer, the same Seek-tier discipline Parquet's/SQLite's own
+// streaming phases already established for tail-anchored formats. Only
+// what a full sequential page-text scan needs is ever implemented: classic
+// xref tables and xref streams (with /Prev chains, plus bare-trailer
+// files via index rebuild), object streams, FlateDecode (+ASCII85/
+// ASCIIHex/RunLength, stacked), WinAnsi/MacRoman/Differences/ToUnicode-
+// backed text (with `uniXXXX` and subset-suffixed glyph names), and the
+// showing/positioning operators. Everything else is a clear, disclosed
+// refusal rather than a guess: encrypted files, LZWDecode, Standard/
+// Symbol/custom base encodings without ToUnicode (no machine-checkable
+// oracle for a from-memory table exists in this environment),
+// composite/CID fonts with no usable mapping, and image-only pages (a
+// scanned page has no text layer - its record is present with missing
+// text, not an error). Text comes from page content streams only:
+// annotations and AcroForm field values are out of scope (not surfaced,
+// not errored), and line layout follows operator order, not geometry.
+// Verified three ways: both base-encoding tables byte-checked against
+// `iconv`, hand-built fixtures per structural shape, and a 666-file
+// real-world sweep (resumes, bank statements, textbooks, government
+// forms) with zero panics - see this module's tests and the Dependency
+// footprint section.
+#[cfg(feature = "pdf")]
+mod pdf_support {
+    use super::*;
+
+    /// Nesting cap for `[...]`/`<<...>>`/indirect-resolution chains. PDF
+    /// structures are shallow by construction (a handful of levels from
+    /// trailer to page content); anything deeper is corrupt or
+    /// adversarial, never a real file - the same "bounded, never
+    /// stack-permitting" contract every other nested format's own depth
+    /// guard in this project already keeps.
+    const MAX_PDF_DEPTH: usize = 64;
+
+    /// A PDF object value. `Str` holds raw bytes (font decoding is a
+    /// separate, later step - these bytes are whatever the content stream
+    /// literally contained, escapes already processed). `Name` holds raw
+    /// bytes too (`#XX` escapes decoded), compared as bytes throughout -
+    /// dictionary keys are never decoded to text for lookup. `Ref` is
+    /// always an indirect reference, resolved lazily through the xref
+    /// table by `resolve`.
+    #[derive(Clone, Debug, PartialEq)]
+    enum PdfObj {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float(f64),
+        Name(Vec<u8>),
+        Str(Vec<u8>),
+        Array(Vec<PdfObj>),
+        Dict(BTreeMap<Vec<u8>, PdfObj>),
+        Ref(u32, u32),
+        Stream {
+            dict: BTreeMap<Vec<u8>, PdfObj>,
+            data: Vec<u8>,
+        },
+    }
+
+    impl PdfObj {
+        fn as_int(&self) -> Option<i64> {
+            match self {
+                PdfObj::Int(n) => Some(*n),
+                _ => None,
+            }
+        }
+
+        fn as_name(&self) -> Option<&[u8]> {
+            match self {
+                PdfObj::Name(n) => Some(n),
+                _ => None,
+            }
+        }
+    }
+
+    /// Byte cursor over a slice, with save/restore positions (plain
+    /// `usize` copies) so speculative parses - `12 0 R` detection, stream
+    /// keyword checks - backtrack for free. Serves both the object parser
+    /// below and xref/trailer scanning, but never content-stream operator
+    /// interpretation, which walks spans with its own lightweight cursor
+    /// for a different reason (operator arity, not value grammar).
+    struct PdfLexer<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> PdfLexer<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            PdfLexer { data, pos: 0 }
+        }
+
+        fn exhausted(&self) -> bool {
+            self.pos >= self.data.len()
+        }
+
+        /// Whitespace (NUL TAB LF FF CR space) plus `%`-to-end-of-line
+        /// comments. A comment runs through the line break itself, so a
+        /// `%` at the very start of a stream's data region could in
+        /// principle eat real bytes - in practice this lexer only ever
+        /// runs over structural regions (xref, trailer, object headers,
+        /// dictionaries), never raw stream payloads, which are sliced by
+        /// known length instead.
+        fn skip_ws(&mut self) {
+            while self.pos < self.data.len() {
+                match self.data[self.pos] {
+                    0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20 => self.pos += 1,
+                    b'%' => {
+                        while self.pos < self.data.len()
+                            && !matches!(self.data[self.pos], b'\r' | b'\n')
+                        {
+                            self.pos += 1;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        fn peek(&mut self) -> Option<u8> {
+            self.skip_ws();
+            self.data.get(self.pos).copied()
+        }
+
+        fn expect(&mut self, token: &[u8]) -> Result<()> {
+            self.skip_ws();
+            if self.data[self.pos..].starts_with(token) {
+                self.pos += token.len();
+                Ok(())
+            } else {
+                bail!("expected {token:?} while parsing a PDF value");
+            }
+        }
+
+        fn parse_int_at(&mut self) -> Result<i64> {
+            self.skip_ws();
+            let start = self.pos;
+            if self.data.get(self.pos) == Some(&b'+') || self.data.get(self.pos) == Some(&b'-') {
+                self.pos += 1;
+            }
+            let digits = self.pos;
+            while self.data.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                self.pos += 1;
+            }
+            if digits == self.pos {
+                bail!("expected an integer while parsing a PDF value");
+            }
+            std::str::from_utf8(&self.data[start..self.pos])
+                .map_err(|_| anyhow!("non-UTF8 digits while parsing a PDF integer"))?
+                .parse::<i64>()
+                .map_err(|_| anyhow!("integer out of range while parsing a PDF value"))
+        }
+
+        fn parse_number_or_ref(&mut self) -> Result<PdfObj> {
+            let start = self.pos;
+            // A number carries an optional fraction/exponent tail; an
+            // integer is additionally the possible head of an indirect
+            // reference (`12 0 R`), resolved by peeking (not committing)
+            // at what follows. `start` rewinds either way, so no branch
+            // below can leave the cursor mid-token on failure.
+            let mut end = start;
+            if self.data.get(end) == Some(&b'+') || self.data.get(end) == Some(&b'-') {
+                end += 1;
+            }
+            while self.data.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            let mut is_float = false;
+            let mut tail = end;
+            if self.data.get(tail) == Some(&b'.') {
+                is_float = true;
+                tail += 1;
+                while self.data.get(tail).is_some_and(u8::is_ascii_digit) {
+                    tail += 1;
+                }
+            }
+            if matches!(self.data.get(tail), Some(b'e') | Some(b'E')) {
+                is_float = true;
+                tail += 1;
+                if self.data.get(tail) == Some(&b'+') || self.data.get(tail) == Some(&b'-') {
+                    tail += 1;
+                }
+                while self.data.get(tail).is_some_and(u8::is_ascii_digit) {
+                    tail += 1;
+                }
+            }
+            if tail == start || (tail == start + 1 && !self.data[start].is_ascii_digit()) {
+                bail!("expected a number while parsing a PDF value");
+            }
+            if !is_float {
+                // Possible `num gen R`: only an integer head with exactly
+                // two integer components followed by a bare `R` qualifies.
+                // `R` must end at a token boundary - end of input,
+                // whitespace, or a delimiter - so `12 0 Root` never
+                // misreads as a reference plus a stray suffix, while the
+                // overwhelmingly common `3 0 R 4 0 R` (reference followed
+                // by another object) still resolves. An earlier draft
+                // skipped whitespace *after* `R` and then demanded a
+                // delimiter, which accepted only `R]`/`R>>`/EOF and
+                // rejected every real reference followed by another token
+                // - caught by the first real file, whose every Kids entry
+                // failed, not by any unit test (all of which ended at
+                // input end).
+                // The generation digits are sliced out of the probe's own
+                // already-validated span, never recomputed from the outer
+                // offsets (an earlier draft did the latter and sliced a
+                // space instead of the digits - caught by the `12 0 R`
+                // unit test, not by inspection).
+                let mut probe = PdfLexer::new(&self.data[end..]);
+                probe.skip_ws();
+                let gen_start = probe.pos;
+                while probe.data.get(probe.pos).is_some_and(u8::is_ascii_digit) {
+                    probe.pos += 1;
+                }
+                // Whitespace between the generation number and `R` is
+                // legal (`12 0 R`) - without this skip the probe only
+                // ever matched the never-written `12 0R` shape, and both
+                // the `12 0 R` unit test and the xref-trailer parse
+                // failed on the identical missing step. `gen_end` is
+                // captured before the skip: the generation slice must
+                // cover digits only, never the trailing space (an
+                // earlier revision of this very fix sliced `..probe.pos`
+                // after skipping and `"0 ".parse::<u32>()` failed on
+                // every real reference - caught by the same two tests,
+                // not by inspection).
+                let gen_end = probe.pos;
+                probe.skip_ws();
+                if gen_end > gen_start
+                    && probe.data[probe.pos..].starts_with(b"R")
+                    && probe
+                        .data
+                        .get(probe.pos + 1)
+                        .is_none_or(|b| b.is_ascii_whitespace() || is_pdf_delimiter(*b))
+                {
+                    let num: u32 = std::str::from_utf8(&self.data[start..end])
+                        .map_err(|_| anyhow!("non-UTF8 digits in a PDF reference"))?
+                        .parse()
+                        .map_err(|_| anyhow!("reference number out of range"))?;
+                    let gen_num: u32 = std::str::from_utf8(&probe.data[gen_start..gen_end])
+                        .map_err(|_| anyhow!("non-UTF8 digits in a PDF reference"))?
+                        .parse()
+                        .map_err(|_| anyhow!("reference generation out of range"))?;
+                    // Past `R` itself; any following whitespace belongs to
+                    // the normal inter-token skipping, not this reference.
+                    self.pos = end + probe.pos + 1;
+                    return Ok(PdfObj::Ref(num, gen_num));
+                }
+                self.pos = end;
+                let value: i64 = std::str::from_utf8(&self.data[start..end])
+                    .map_err(|_| anyhow!("non-UTF8 digits while parsing a PDF integer"))?
+                    .parse()
+                    .map_err(|_| anyhow!("integer out of range while parsing a PDF value"))?;
+                return Ok(PdfObj::Int(value));
+            }
+            self.pos = tail;
+            let value: f64 = std::str::from_utf8(&self.data[start..tail])
+                .map_err(|_| anyhow!("non-UTF8 digits while parsing a PDF number"))?
+                .parse()
+                .map_err(|_| anyhow!("malformed number while parsing a PDF value"))?;
+            Ok(PdfObj::Float(value))
+        }
+
+        fn parse_name(&mut self) -> Result<PdfObj> {
+            // Caller has consumed the leading `/`.
+            let mut out = Vec::new();
+            while let Some(&b) = self.data.get(self.pos) {
+                if is_pdf_delimiter(b) || b.is_ascii_whitespace() {
+                    break;
+                }
+                if b == b'#' {
+                    let hex = self
+                        .data
+                        .get(self.pos + 1..self.pos + 3)
+                        .ok_or_else(|| anyhow!("truncated `#` escape in a PDF name"))?;
+                    let digits = std::str::from_utf8(hex)
+                        .map_err(|_| anyhow!("non-UTF8 `#` escape in a PDF name"))?;
+                    let byte = u8::from_str_radix(digits, 16)
+                        .map_err(|_| anyhow!("malformed `#` escape in a PDF name"))?;
+                    out.push(byte);
+                    self.pos += 3;
+                } else {
+                    out.push(b);
+                    self.pos += 1;
+                }
+            }
+            if out.is_empty() {
+                bail!("empty name while parsing a PDF value");
+            }
+            Ok(PdfObj::Name(out))
+        }
+
+        fn parse_literal_string(&mut self) -> Result<PdfObj> {
+            // Caller has consumed the opening `(`. Nesting counts, every
+            // backslash escape resolves to its real byte (`\ddd` octal up
+            // to 3 digits, `\<newline>` line continuation contributing
+            // nothing), and an unbalanced end is a clean error, never a
+            // silent truncation.
+            let mut out = Vec::new();
+            let mut depth = 1usize;
+            while depth > 0 {
+                let Some(&b) = self.data.get(self.pos) else {
+                    bail!("unterminated string while parsing a PDF value");
+                };
+                self.pos += 1;
+                match b {
+                    b'(' => {
+                        depth += 1;
+                        out.push(b);
+                    }
+                    b')' => {
+                        depth -= 1;
+                        if depth > 0 {
+                            out.push(b);
+                        }
+                    }
+                    b'\\' => {
+                        let Some(&e) = self.data.get(self.pos) else {
+                            bail!("unterminated escape while parsing a PDF value");
+                        };
+                        self.pos += 1;
+                        match e {
+                            b'n' => out.push(b'\n'),
+                            b'r' => out.push(b'\r'),
+                            b't' => out.push(b'\t'),
+                            b'b' => out.push(0x08),
+                            b'f' => out.push(0x0C),
+                            b'(' => out.push(b'('),
+                            b')' => out.push(b')'),
+                            b'\\' => out.push(b'\\'),
+                            b'\r' => {
+                                if self.data.get(self.pos) == Some(&b'\n') {
+                                    self.pos += 1;
+                                }
+                            }
+                            b'\n' => {}
+                            d if d.is_ascii_digit() => {
+                                let mut value = (d - b'0') as u32;
+                                for _ in 0..2 {
+                                    if let Some(&o) = self.data.get(self.pos) {
+                                        if !(b'0'..=b'7').contains(&o) {
+                                            break;
+                                        }
+                                        value = value * 8 + u32::from(o - b'0');
+                                        self.pos += 1;
+                                    }
+                                }
+                                // Octal escapes wrap at a byte by
+                                // construction (`\777` is 511 = 0x1FF) -
+                                // PDF readers take the low byte.
+                                out.push((value & 0xFF) as u8);
+                            }
+                            _ => out.push(e),
+                        }
+                    }
+                    _ => out.push(b),
+                }
+            }
+            Ok(PdfObj::Str(out))
+        }
+
+        fn parse_hex_string(&mut self) -> Result<PdfObj> {
+            // Caller has consumed the opening `<` (and it isn't `<<`).
+            // Whitespace inside is ignored; an odd trailing nibble pads
+            // with a zero low half, per the spec.
+            let mut out = Vec::new();
+            let mut high: Option<u8> = None;
+            loop {
+                let Some(&b) = self.data.get(self.pos) else {
+                    bail!("unterminated hex string while parsing a PDF value");
+                };
+                self.pos += 1;
+                if b == b'>' {
+                    break;
+                }
+                if b.is_ascii_whitespace() {
+                    continue;
+                }
+                let digit = (b as char)
+                    .to_digit(16)
+                    .ok_or_else(|| anyhow!("non-hex digit inside a PDF hex string"))?
+                    as u8;
+                match high.take() {
+                    None => high = Some(digit),
+                    Some(h) => out.push(h << 4 | digit),
+                }
+            }
+            if let Some(h) = high {
+                out.push(h << 4);
+            }
+            Ok(PdfObj::Str(out))
+        }
+
+        fn parse_array(&mut self, depth: usize) -> Result<PdfObj> {
+            if depth >= MAX_PDF_DEPTH {
+                bail!("PDF value nested too deep - refusing rather than recursing without bound");
+            }
+            let mut items = Vec::new();
+            loop {
+                match self.peek() {
+                    None => bail!("unterminated array while parsing a PDF value"),
+                    Some(b']') => {
+                        self.pos += 1;
+                        return Ok(PdfObj::Array(items));
+                    }
+                    _ => items.push(self.parse_object(depth + 1)?),
+                }
+            }
+        }
+
+        fn parse_dict(&mut self, depth: usize) -> Result<PdfObj> {
+            if depth >= MAX_PDF_DEPTH {
+                bail!("PDF value nested too deep - refusing rather than recursing without bound");
+            }
+            let mut map = BTreeMap::new();
+            loop {
+                match self.peek() {
+                    None => bail!("unterminated dictionary while parsing a PDF value"),
+                    Some(b'/') => {
+                        self.pos += 1;
+                        let PdfObj::Name(key) = self.parse_name()? else {
+                            unreachable!("parse_name always returns a Name");
+                        };
+                        let value = self.parse_object(depth + 1)?;
+                        map.insert(key, value);
+                    }
+                    _ => {
+                        self.expect(b">>")?;
+                        return Ok(PdfObj::Dict(map));
+                    }
+                }
+            }
+        }
+
+        fn parse_object(&mut self, depth: usize) -> Result<PdfObj> {
+            if depth >= MAX_PDF_DEPTH {
+                bail!("PDF value nested too deep - refusing rather than recursing without bound");
+            }
+            match self.peek() {
+                None => bail!("unexpected end of input while parsing a PDF value"),
+                Some(b'[') => {
+                    self.pos += 1;
+                    self.parse_array(depth)
+                }
+                Some(b'<') => {
+                    // `<<` opens a dictionary, `<` a hex string - one byte
+                    // of lookahead, no backtracking needed either way.
+                    if self.data.get(self.pos + 1) == Some(&b'<') {
+                        self.pos += 2;
+                        self.parse_dict(depth)
+                    } else {
+                        self.pos += 1;
+                        self.parse_hex_string()
+                    }
+                }
+                Some(b'(') => {
+                    self.pos += 1;
+                    self.parse_literal_string()
+                }
+                Some(b'/') => {
+                    self.pos += 1;
+                    self.parse_name()
+                }
+                Some(b) if b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.' => {
+                    self.parse_number_or_ref()
+                }
+                Some(b) if b.is_ascii_alphabetic() => {
+                    let start = self.pos;
+                    while self
+                        .data
+                        .get(self.pos)
+                        .is_some_and(|c| c.is_ascii_alphanumeric())
+                    {
+                        self.pos += 1;
+                    }
+                    match &self.data[start..self.pos] {
+                        b"true" => Ok(PdfObj::Bool(true)),
+                        b"false" => Ok(PdfObj::Bool(false)),
+                        b"null" => Ok(PdfObj::Null),
+                        other => bail!(
+                            "unexpected keyword while parsing a PDF value: {}",
+                            String::from_utf8_lossy(other)
+                        ),
+                    }
+                }
+                Some(b) => bail!("unexpected byte {b:#04x} while parsing a PDF value"),
+            }
+        }
+    }
+
+    /// PDF delimiter bytes: every token boundary in the format's grammar.
+    /// `{`/`}` are reserved, never legal in a real file - treated as
+    /// delimiters here anyway so they fail at lookup time with a clean
+    /// message rather than gluing two tokens into one.
+    fn is_pdf_delimiter(b: u8) -> bool {
+        matches!(
+            b,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+    }
+
+    #[cfg(test)]
+    mod lexer_tests {
+        use super::*;
+
+        fn parse(s: &[u8]) -> PdfObj {
+            PdfLexer::new(s)
+                .parse_object(0)
+                .expect("test input must parse")
+        }
+
+        #[test]
+        fn primitives_and_keywords() {
+            assert_eq!(parse(b"42"), PdfObj::Int(42));
+            assert_eq!(parse(b"-7"), PdfObj::Int(-7));
+            assert_eq!(parse(b"3.125"), PdfObj::Float(3.125));
+            assert_eq!(parse(b"true"), PdfObj::Bool(true));
+            assert_eq!(parse(b"false"), PdfObj::Bool(false));
+            assert_eq!(parse(b"null"), PdfObj::Null);
+            assert_eq!(parse(b"12 0 R"), PdfObj::Ref(12, 0));
+            // A reference followed by another token (the overwhelmingly
+            // common real shape - `/Kids [3 0 R 4 0 R]`) must resolve too,
+            // not just one at end of input: an earlier draft demanded a
+            // delimiter after `R` and rejected all of these, caught by the
+            // first real file rather than any test that ended at EOF.
+            assert_eq!(
+                parse(b"[3 0 R 4 0 R]"),
+                PdfObj::Array(vec![PdfObj::Ref(3, 0), PdfObj::Ref(4, 0)])
+            );
+            // A trailing `R` without two integers ahead is not a reference.
+            assert!(PdfLexer::new(b"R").parse_object(0).is_err());
+        }
+
+        #[test]
+        fn names_decode_hash_escapes() {
+            assert_eq!(parse(b"/Type"), PdfObj::Name(b"Type".to_vec()));
+            assert_eq!(parse(b"/A#20B"), PdfObj::Name(b"A B".to_vec()));
+            assert!(PdfLexer::new(b"/").parse_object(0).is_err());
+        }
+
+        #[test]
+        fn literal_strings_handle_nesting_and_escapes() {
+            assert_eq!(parse(b"(a(b)c)"), PdfObj::Str(b"a(b)c".to_vec()));
+            // `\n` newline, `\)` escaped paren, `\101` octal `A`. The
+            // nested `(b...` pair's own closer is data (pushed), only the
+            // final `)` terminates - so the content ends `...cA)`, not
+            // `...cA`. An earlier draft of this very expectation forgot
+            // that closer and blamed the parser; a step-trace of the
+            // depth counter proved the parser right and the expectation
+            // wrong, which is exactly why this comment exists.
+            assert_eq!(
+                parse(b"(a\n(b\\)c\\101))"),
+                PdfObj::Str(b"a\n(b)cA)".to_vec())
+            );
+            // `\<newline>` contributes nothing (line continuation).
+            assert_eq!(parse(b"(a\\\n b)"), PdfObj::Str(b"a b".to_vec()));
+            assert!(PdfLexer::new(b"(abc").parse_object(0).is_err());
+        }
+
+        #[test]
+        fn hex_strings_ignore_whitespace_and_pad_odd_nibbles() {
+            assert_eq!(parse(b"<4142>"), PdfObj::Str(b"AB".to_vec()));
+            assert_eq!(parse(b"<41 42>"), PdfObj::Str(b"AB".to_vec()));
+            assert_eq!(parse(b"<4>"), PdfObj::Str(b"@".to_vec()));
+            assert!(PdfLexer::new(b"<41").parse_object(0).is_err());
+            assert!(PdfLexer::new(b"<zz>").parse_object(0).is_err());
+        }
+
+        #[test]
+        fn arrays_and_dicts_nest() {
+            assert_eq!(
+                parse(b"[1 /A (x)]"),
+                PdfObj::Array(vec![
+                    PdfObj::Int(1),
+                    PdfObj::Name(b"A".to_vec()),
+                    PdfObj::Str(b"x".to_vec()),
+                ])
+            );
+            let mut map = BTreeMap::new();
+            map.insert(b"Type".to_vec(), PdfObj::Name(b"Page".to_vec()));
+            map.insert(b"Count".to_vec(), PdfObj::Int(3));
+            // Keys compare as raw bytes either way.
+            assert_eq!(parse(b"<< /Type /Page /Count 3 >>"), PdfObj::Dict(map));
+            assert!(PdfLexer::new(b"[1 2").parse_object(0).is_err());
+        }
+
+        #[test]
+        fn comments_and_whitespace_are_ignored() {
+            assert_eq!(parse(b"% comment\n42"), PdfObj::Int(42));
+        }
+    }
+
+    /// Profiles a PDF as one record per page (`page_number`, `text`) -
+    /// the natural record shape the way MBOX is one record per message:
+    /// a whole document as one row would lose all per-page signal, and
+    /// pages are the finest structural unit with independent content.
+    /// `--nrows` bounds pages decoded (streams decode on demand per page,
+    /// so an early stop never touches later pages' bytes at all). A PDF
+    /// with no pages yields no columns, the same empty-table shape every
+    /// other reader already produces for schema-less input.
+    pub(crate) fn columns_from_pdf(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let mut reader = PdfReader::open(path)?;
+        let pages = reader.page_list(path)?;
+        let mut num_acc = ColumnAccumulatorState::new();
+        let mut text_acc = ColumnAccumulatorState::new();
+        let mut font_cache: HashMap<(usize, Vec<u8>), PdfFont> = HashMap::new();
+        let mut kept = 0usize;
+        for (idx, (page, resources)) in pages.iter().enumerate() {
+            if nrows.is_some_and(|limit| kept >= limit) {
+                break;
+            }
+            num_acc.push((idx + 1).to_string(), n_samples);
+            let text = reader.page_text(page, resources, idx, &mut font_cache, path)?;
+            if !text.is_empty() {
+                text_acc.push(text, n_samples);
+            }
+            kept += 1;
+        }
+        if kept == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![
+            num_acc.into_profile("page_number".to_string(), kept),
+            text_acc.into_profile("text".to_string(), kept),
+        ])
+    }
+
+    /// One cross-reference entry: where object `n` lives. `Free` covers
+    /// both genuinely free slots and numbers the table never mentions at
+    /// all (both resolve to null, per the spec's own dangling-reference
+    /// rule) - no separate "unknown" state is needed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum XrefEntry {
+        Free,
+        Offset(u64),
+        Compressed { objstm: u32, index: usize },
+    }
+
+    /// An open PDF with its cross-reference index resolved: the trailer
+    /// dict (merged newest-first across every `/Prev` update, so the
+    /// latest `/Root` always wins) plus one entry per object number. The
+    /// file itself is never buffered whole - every object and stream is
+    /// read on demand with `Seek`+`read_exact`, the same page-at-a-time
+    /// discipline SQLite's own reader already established for its own
+    /// page-graph walks. Decoded object streams are the one thing cached
+    /// (`objstm_cache`), since one stream routinely backs dozens of
+    /// separate references and re-inflating it per lookup would redo the
+    /// same decompression once per reference.
+    struct PdfReader {
+        file: fs::File,
+        file_len: u64,
+        xref: BTreeMap<u32, XrefEntry>,
+        trailer: BTreeMap<Vec<u8>, PdfObj>,
+        objstm_cache: HashMap<u32, Vec<PdfObj>>,
+    }
+
+    impl PdfReader {
+        fn open(path: &Path) -> Result<Self> {
+            let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+            let file_len = file
+                .metadata()
+                .with_context(|| format!("failed to stat {path:?}"))?
+                .len();
+            if file_len < 8 {
+                bail!("{path:?} is too small to be a PDF file");
+            }
+            let mut reader = PdfReader {
+                file,
+                file_len,
+                xref: BTreeMap::new(),
+                trailer: BTreeMap::new(),
+                objstm_cache: HashMap::new(),
+            };
+            // The header lives in the first bytes (`%PDF-1.x`); some
+            // writers prepend garbage (a BOM, transfer noise), so the
+            // first kilobyte is searched rather than only byte zero -
+            // anything without the magic anywhere up there is not a PDF,
+            // not a truncated one.
+            let head_len = file_len.min(1024);
+            let mut head = vec![0u8; head_len as usize];
+            use std::io::{Read as _, Seek as _};
+            reader.file.seek(std::io::SeekFrom::Start(0))?;
+            reader.file.read_exact(&mut head)?;
+            if !head.windows(5).any(|w| w == b"%PDF-") {
+                bail!("{path:?} doesn't look like a PDF file - no %PDF- magic");
+            }
+            let startxref = Self::find_startxref(&mut reader.file, file_len)?;
+            reader.walk_xref_chain(startxref, path)?;
+            if let Some(enc) = reader.trailer.get(b"Encrypt".as_slice())
+                && !matches!(enc, PdfObj::Null)
+            {
+                bail!(
+                    "{path:?} is encrypted - decryption is out of scope, \
+                     remove the password/encryption first"
+                );
+            }
+            Ok(reader)
+        }
+
+        /// The byte offset of the live cross-reference section: the last
+        /// `startxref` in the file, with its integer on the following
+        /// line. Only the tail is ever read (at most 2 KiB), never the
+        /// whole file - trailers can legally be followed by garbage
+        /// (`%%EOF` plus anything), so searching backward from the end is
+        /// the correct rule, not parsing forward from the start.
+        fn find_startxref(file: &mut fs::File, file_len: u64) -> Result<u64> {
+            use std::io::{Read as _, Seek as _};
+            let tail_len = file_len.min(2048);
+            let mut tail = vec![0u8; tail_len as usize];
+            file.seek(std::io::SeekFrom::End(-(tail_len as i64)))?;
+            file.read_exact(&mut tail)?;
+            let marker = tail
+                .windows(9)
+                .rposition(|w| w == b"startxref")
+                .ok_or_else(|| anyhow!("no startxref found - not a readable PDF"))?;
+            let mut lexer = PdfLexer::new(&tail[marker + 9..]);
+            lexer
+                .parse_int_at()
+                .map(|n| n as u64)
+                .map_err(|_| anyhow!("malformed startxref offset - not a readable PDF"))
+        }
+
+        /// Follows one xref section plus every `/Prev` update behind it
+        /// (newest first - the first `/Root` seen wins, since it names the
+        /// live document catalog). A visited-set plus an update cap keeps
+        /// a cyclic or absurd `/Prev` chain from looping forever: real
+        /// incremental updates are a handful of links, never dozens.
+        fn walk_xref_chain(&mut self, mut offset: u64, path: &Path) -> Result<()> {
+            use std::io::{Read as _, Seek as _};
+            let mut seen_offsets = std::collections::HashSet::new();
+            for _ in 0..64 {
+                if offset >= self.file_len || !seen_offsets.insert(offset) {
+                    bail!("{path:?} has a broken cross-reference chain");
+                }
+                self.file.seek(std::io::SeekFrom::Start(offset))?;
+                let mut head = [0u8; 4];
+                self.file
+                    .read_exact(&mut head)
+                    .with_context(|| format!("{path:?} has a truncated cross-reference section"))?;
+                // An xref *stream* is a regular indirect object, told
+                // apart from the `xref` keyword by its leading digit
+                // (every object header starts `N G obj`).
+                if head[0].is_ascii_digit() {
+                    let (_, value) = self.load_object_at(offset, path)?;
+                    let (dict, data) = match value {
+                        PdfObj::Stream { dict, data } => (dict, data),
+                        _ => bail!("{path:?} has a broken cross-reference stream"),
+                    };
+                    let prev = dict.get(b"Prev".as_slice()).and_then(PdfObj::as_int);
+                    self.read_xref_stream(&dict, &data, path)?;
+                    self.merge_trailer_dict(&dict);
+                    match prev {
+                        Some(p) if p >= 0 => offset = p as u64,
+                        _ => break,
+                    }
+                } else {
+                    if &head != b"xref" {
+                        // Some writers (scanners, merge tools) emit a bare
+                        // trailer dict where the xref section belongs - no
+                        // `xref` keyword at all. If the bytes there parse
+                        // as a dict holding /Root, it names the live
+                        // catalog exactly like a real trailer; with no
+                        // index anywhere, the offsets are rebuilt by
+                        // scanning for object headers (below). Anything
+                        // else is still a clean refusal, not a guess.
+                        match self.read_bare_trailer(offset, path)? {
+                            Some(trailer) => {
+                                let prev = trailer.get(b"Prev".as_slice()).and_then(PdfObj::as_int);
+                                self.merge_trailer_dict(&trailer);
+                                if self.xref.is_empty() {
+                                    self.rebuild_xref_by_scan(path)?;
+                                }
+                                match prev {
+                                    Some(p) if p > 0 => offset = p as u64,
+                                    _ => break,
+                                }
+                            }
+                            None => bail!("{path:?} has a broken cross-reference section"),
+                        }
+                        continue;
+                    }
+                    let trailer = self.read_xref_table(path)?;
+                    let prev = trailer.get(b"Prev".as_slice()).and_then(PdfObj::as_int);
+                    self.merge_trailer_dict(&trailer);
+                    match prev {
+                        Some(p) if p > 0 => offset = p as u64,
+                        _ => break,
+                    }
+                }
+            }
+            if !self.trailer.contains_key(b"Root".as_slice()) {
+                bail!("{path:?} has no document catalog (/Root) in its trailer");
+            }
+            Ok(())
+        }
+
+        /// Reads a bare trailer dict sitting where an xref section was
+        /// expected (see above): parses `<<...>>` from a bounded window
+        /// and returns it only if it actually holds `/Root` - otherwise
+        /// `None`, and the caller keeps its refusal. `None` also covers a
+        /// dict that runs past the window cap (genuinely too big to be a
+        /// trailer, not worth an unbounded read for a fallback path).
+        fn read_bare_trailer(
+            &mut self,
+            offset: u64,
+            path: &Path,
+        ) -> Result<Option<BTreeMap<Vec<u8>, PdfObj>>> {
+            let window = self.read_at(offset, 8192.min((self.file_len - offset) as usize), path)?;
+            if !window.starts_with(b"<<") {
+                return Ok(None);
+            }
+            let mut lexer = PdfLexer::new(&window);
+            match lexer.parse_object(0) {
+                Ok(PdfObj::Dict(d)) if d.contains_key(b"Root".as_slice()) => Ok(Some(d)),
+                Ok(_) => Ok(None),
+                Err(_) => Ok(None),
+            }
+        }
+
+        /// Rebuilds a missing index by scanning for `N G obj` headers
+        /// (the standard fallback real readers apply to index-less
+        /// files). One forward pass in 1 MiB chunks with a 32-byte
+        /// overlap (headers are far shorter); only the offset map is
+        /// retained, never file content. First occurrence wins - a
+        /// rebuilt index has no update ordering to honor. A candidate
+        /// header parses its two integers strictly (digits only, real
+        /// `obj` boundary after) so binary payloads containing
+        /// digit-like runs can't fabricate entries; anything failing
+        /// that check is skipped, not trusted.
+        fn rebuild_xref_by_scan(&mut self, path: &Path) -> Result<()> {
+            use std::io::{Read as _, Seek as _};
+            const CHUNK: u64 = 1024 * 1024;
+            const OVERLAP: usize = 32;
+            let mut carry: Vec<u8> = Vec::new();
+            let mut base = 0u64;
+            while base < self.file_len {
+                let len = CHUNK.min(self.file_len - base) as usize;
+                let mut buf = vec![0u8; len];
+                self.file.seek(std::io::SeekFrom::Start(base))?;
+                self.file.read_exact(&mut buf)?;
+                let mut window = std::mem::take(&mut carry);
+                let window_base = base - window.len() as u64;
+                window.extend_from_slice(&buf);
+                let mut i = 0;
+                while i < window.len() {
+                    if !window[i].is_ascii_digit() {
+                        i += 1;
+                        continue;
+                    }
+                    let mut j = i;
+                    while window.get(j).is_some_and(|b| b.is_ascii_digit()) {
+                        j += 1;
+                    }
+                    let after_num = j;
+                    while window.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+                        j += 1;
+                    }
+                    let mut k = j;
+                    while window.get(k).is_some_and(|b| b.is_ascii_digit()) {
+                        k += 1;
+                    }
+                    if k == j {
+                        i = after_num;
+                        continue;
+                    }
+                    while window.get(k).is_some_and(|b| b.is_ascii_whitespace()) {
+                        k += 1;
+                    }
+                    if window.get(k..k + 3) == Some(b"obj".as_slice())
+                        && window.get(k + 3).is_none_or(|b| !b.is_ascii_alphanumeric())
+                    {
+                        let num = std::str::from_utf8(&window[i..after_num])
+                            .ok()
+                            .and_then(|s| s.parse::<u32>().ok());
+                        let gen_ok = std::str::from_utf8(&window[j..k])
+                            .ok()
+                            .is_some_and(|s| s.parse::<u32>().is_ok());
+                        if let Some(num) = num
+                            && gen_ok
+                        {
+                            let at = window_base + i as u64;
+                            self.xref.entry(num).or_insert(XrefEntry::Offset(at));
+                        }
+                        i = k + 3;
+                    } else {
+                        i = after_num;
+                    }
+                }
+                carry = window[window.len().saturating_sub(OVERLAP)..].to_vec();
+                base += len as u64;
+            }
+            if self.xref.is_empty() {
+                bail!("{path:?} has no readable objects to rebuild an index from");
+            }
+            Ok(())
+        }
+
+        /// Folds one section's trailer keys into the merged trailer:
+        /// first-seen `/Root` wins (sections walk newest-first),
+        /// `/Encrypt` is sticky (any update declaring it counts).
+        fn merge_trailer_dict(&mut self, trailer: &BTreeMap<Vec<u8>, PdfObj>) {
+            if !self.trailer.contains_key(b"Root".as_slice())
+                && let Some(root) = trailer.get(b"Root".as_slice())
+            {
+                self.trailer.insert(b"Root".to_vec(), root.clone());
+            }
+            if let Some(enc) = trailer.get(b"Encrypt".as_slice())
+                && !matches!(enc, PdfObj::Null)
+                && !self.trailer.contains_key(b"Encrypt".as_slice())
+            {
+                self.trailer.insert(b"Encrypt".to_vec(), enc.clone());
+            }
+        }
+
+        /// Reads one classic `xref` subsection run at the current position
+        /// (just past the keyword): `first count` headers with fixed
+        /// 20-byte entries, then the `trailer` dictionary, which is
+        /// returned for merging. Entry offsets past end-of-file are
+        /// refused outright - a forward reference into nonexistent bytes
+        /// can never resolve to anything real. The whole run is bounded
+        /// (a 64 KiB window, grown only while a subsection header is cut
+        /// in half by the window edge), so a corrupt count field cannot
+        /// force an unbounded read.
+        fn read_xref_table(&mut self, path: &Path) -> Result<BTreeMap<Vec<u8>, PdfObj>> {
+            use std::io::{Read as _, Seek as _};
+            let base = self.file.stream_position()?;
+            let remaining = (self.file_len - base.min(self.file_len)) as usize;
+            // Subsection headers are two small integers; a 4 KiB first
+            // window already holds any real one, and growth only ever
+            // covers a header split across the window edge - past 1 MiB
+            // of "header" the file is corrupt, not unlucky.
+            let mut window_len = remaining.min(4096);
+            loop {
+                let mut window = vec![0u8; window_len];
+                self.file.seek(std::io::SeekFrom::Start(base))?;
+                self.file
+                    .read_exact(&mut window)
+                    .with_context(|| format!("{path:?} has a truncated cross-reference table"))?;
+                // Subsections and trailer parse from the same window, and
+                // *both* can outgrow it: linearized files carry large
+                // trailers (/ID, /Info, /Prev chains) that sail past 4 KiB
+                // while the subsections fit. An earlier draft only retried
+                // subsection truncation and parsed the trailer once, so
+                // every big-trailer file died here with "unterminated
+                // dictionary" - caught by real lecture-slide PDFs, never
+                // by a synthetic fixture. When the window already covers
+                // everything to end-of-file the error is genuine, so the
+                // original surfaces instead of the generic fallback.
+                let attempt: Result<BTreeMap<Vec<u8>, PdfObj>> = (|| {
+                    let mut lexer = PdfLexer::new(&window);
+                    if !Self::parse_xref_subsections(&mut lexer, &mut self.xref, self.file_len)? {
+                        bail!("cross-reference window ended mid-subsection");
+                    }
+                    lexer.skip_ws();
+                    lexer.expect(b"trailer")?;
+                    match lexer.parse_object(0)? {
+                        PdfObj::Dict(trailer) => Ok(trailer),
+                        _ => bail!("{path:?} has a broken trailer dictionary"),
+                    }
+                })();
+                match attempt {
+                    Ok(trailer) => return Ok(trailer),
+                    Err(e) => {
+                        if window_len >= remaining {
+                            return Err(e);
+                        }
+                        if window_len >= 1024 * 1024 {
+                            bail!("{path:?} has a broken cross-reference table");
+                        }
+                        window_len = (window_len * 2).min(remaining).min(1024 * 1024);
+                    }
+                }
+            }
+        }
+
+        /// Parses subsection headers and their entries from an in-memory
+        /// window, stopping at (not consuming) the `trailer` keyword.
+        /// Returns `true` once `trailer` is reached; `false` means the
+        /// window ended mid-subsection and the caller should grow it and
+        /// retry. Entry text is matched structurally (10 digits, space, 5
+        /// digits, space, `f`/`n`, line break), not with fixed byte
+        /// offsets past the counts - real files vary the EOL shape
+        /// (`\r\n` vs `\n`), and a rigid 20-byte stride misreads every
+        /// entry after the first `\n`-only one.
+        fn parse_xref_subsections(
+            lexer: &mut PdfLexer<'_>,
+            xref: &mut BTreeMap<u32, XrefEntry>,
+            file_len: u64,
+        ) -> Result<bool> {
+            loop {
+                lexer.skip_ws();
+                if lexer.data[lexer.pos..].starts_with(b"trailer") {
+                    return Ok(true);
+                }
+                if lexer.pos >= lexer.data.len() {
+                    return Ok(false);
+                }
+                let first = lexer.parse_int_at()? as u64;
+                let count = lexer.parse_int_at()?;
+                if count < 0 || first > u32::MAX as u64 {
+                    bail!("malformed cross-reference subsection header");
+                }
+                for i in 0..count as u64 {
+                    lexer.skip_ws();
+                    let entry = lexer
+                        .data
+                        .get(lexer.pos..lexer.pos + 18)
+                        .ok_or_else(|| anyhow!("truncated cross-reference entry"))?;
+                    let offset: u64 = std::str::from_utf8(&entry[0..10])
+                        .map_err(|_| anyhow!("malformed cross-reference entry"))?
+                        .parse()
+                        .map_err(|_| anyhow!("malformed cross-reference entry"))?;
+                    if entry[10] != b' ' || entry[16] != b' ' {
+                        bail!("malformed cross-reference entry");
+                    }
+                    let _gen: u32 = std::str::from_utf8(&entry[11..16])
+                        .map_err(|_| anyhow!("malformed cross-reference entry"))?
+                        .parse()
+                        .map_err(|_| anyhow!("malformed cross-reference entry"))?;
+                    let kind = entry[17];
+                    lexer.pos += 18;
+                    // One line break, either shape - consumed, never
+                    // counted as part of the next entry.
+                    if lexer.data.get(lexer.pos) == Some(&b'\r') {
+                        lexer.pos += 1;
+                    }
+                    if lexer.data.get(lexer.pos) == Some(&b'\n') {
+                        lexer.pos += 1;
+                    }
+                    if kind != b'f' && kind != b'n' {
+                        bail!("malformed cross-reference entry");
+                    }
+                    let Some(num) = first
+                        .checked_add(i)
+                        .filter(|n| *n <= u32::MAX as u64)
+                        .map(|n| n as u32)
+                    else {
+                        continue;
+                    };
+                    if kind == b'n' {
+                        if offset >= file_len {
+                            bail!("cross-reference points past end of file");
+                        }
+                        // First-writer-wins: sections walk newest-first,
+                        // so an older update must never overwrite what a
+                        // newer one already recorded. Xref streams merge
+                        // through the same rule below.
+                        xref.entry(num).or_insert(XrefEntry::Offset(offset));
+                    } else {
+                        xref.entry(num).or_insert(XrefEntry::Free);
+                    }
+                }
+                if lexer.pos >= lexer.data.len() {
+                    return Ok(false);
+                }
+            }
+        }
+
+        /// Parses an xref *stream's* binary entries: `/W` gives the three
+        /// field widths (a zero-width type field defaults to type 1 -
+        /// uncompressed - per the spec), `/Index` selects the covered
+        /// object ranges (defaulting to the whole `[0 /Size)` run), and
+        /// each entry decodes by its leading type byte: 0 = free,
+        /// 1 = offset + generation, 2 = object-stream number + index
+        /// within it. Same first-writer-wins merge rule as classic
+        /// tables. An overlong `/Index` run is truncated to `/Size`
+        /// rather than trusted: entry bytes past the declared size are,
+        /// by construction, not real entries.
+        fn read_xref_stream(
+            &mut self,
+            dict: &BTreeMap<Vec<u8>, PdfObj>,
+            data: &[u8],
+            path: &Path,
+        ) -> Result<()> {
+            let widths = match dict.get(b"W".as_slice()) {
+                Some(PdfObj::Array(items)) if items.len() == 3 => {
+                    let mut w = [0usize; 3];
+                    for (i, item) in items.iter().enumerate() {
+                        w[i] = item.as_int().filter(|&n| n >= 0).unwrap_or(0) as usize;
+                        if w[i] > 8 {
+                            bail!("{path:?} has an impossible cross-reference width");
+                        }
+                    }
+                    w
+                }
+                _ => bail!("{path:?} has a cross-reference stream without /W"),
+            };
+            let size = dict
+                .get(b"Size".as_slice())
+                .and_then(PdfObj::as_int)
+                .filter(|&n| n >= 0)
+                .ok_or_else(|| anyhow!("{path:?} has a cross-reference stream without /Size"))?
+                as u64;
+            let index: Vec<u64> = match dict.get(b"Index".as_slice()) {
+                Some(PdfObj::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_int()
+                            .filter(|&n| n >= 0)
+                            .map(|n| n as u64)
+                            .ok_or_else(|| anyhow!("malformed /Index in a cross-reference stream"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => vec![0, size],
+            };
+            if !index.len().is_multiple_of(2) {
+                bail!("{path:?} has a malformed /Index in a cross-reference stream");
+            }
+            let entry_len = widths[0] + widths[1] + widths[2];
+            if entry_len == 0 {
+                bail!("{path:?} has a cross-reference stream with zero-width entries");
+            }
+            let mut cursor = 0usize;
+            let mut field = |width: usize| -> Result<u64> {
+                if width == 0 {
+                    return Ok(0);
+                }
+                let bytes = data
+                    .get(cursor..cursor + width)
+                    .ok_or_else(|| anyhow!("{path:?} has a truncated cross-reference stream"))?;
+                cursor += width;
+                let mut value = 0u64;
+                for &b in bytes {
+                    value = value * 256 + u64::from(b);
+                }
+                Ok(value)
+            };
+            for chunk in index.as_chunks::<2>().0 {
+                let (mut first, mut count) = (chunk[0], chunk[1]);
+                if first >= size {
+                    continue;
+                }
+                count = count.min(size - first);
+                for _ in 0..count {
+                    let entry_type = if widths[0] == 0 { 1 } else { field(widths[0])? };
+                    let f1 = field(widths[1])?;
+                    let f2 = field(widths[2])?;
+                    let num = first as u32;
+                    first += 1;
+                    match entry_type {
+                        0 => {
+                            self.xref.entry(num).or_insert(XrefEntry::Free);
+                        }
+                        1 => {
+                            if f1 >= self.file_len {
+                                bail!("cross-reference points past end of file");
+                            }
+                            self.xref.entry(num).or_insert(XrefEntry::Offset(f1));
+                        }
+                        2 => {
+                            if f1 > u32::MAX as u64 || f2 > usize::MAX as u64 {
+                                bail!("cross-reference names an impossible object stream");
+                            }
+                            self.xref.entry(num).or_insert(XrefEntry::Compressed {
+                                objstm: f1 as u32,
+                                index: f2 as usize,
+                            });
+                        }
+                        _ => bail!("{path:?} has an unknown cross-reference entry type"),
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Reads one windowed slice of the file: `len` bytes at `offset`,
+        /// refused outright past end-of-file rather than short-read.
+        fn read_at(&mut self, offset: u64, len: usize, path: &Path) -> Result<Vec<u8>> {
+            use std::io::{Read as _, Seek as _};
+            if offset.saturating_add(len as u64) > self.file_len {
+                bail!("{path:?} is truncated - an object runs past end of file");
+            }
+            let mut buf = vec![0u8; len];
+            self.file.seek(std::io::SeekFrom::Start(offset))?;
+            self.file.read_exact(&mut buf)?;
+            Ok(buf)
+        }
+
+        /// Loads the object at an xref offset: `(number, value)`. The
+        /// object header (`N G obj`) is matched structurally (with a
+        /// trailing-boundary check so `object` never misreads as `obj`),
+        /// then the value parses from a window that grows (8 KiB doubling
+        /// to 4 MiB) only while the current window ends mid-value - a
+        /// corrupt length or count field can never force an unbounded
+        /// read, and a value that still fails at the cap surfaces its own
+        /// parse error, not a truncation guess. Stream payloads are never
+        /// part of the window: `/Length` (resolved first, and itself
+        /// bounded by the file size) sizes one exact follow-up read
+        /// instead.
+        fn load_object_at(&mut self, offset: u64, path: &Path) -> Result<(u32, PdfObj)> {
+            // Header first, from a small fixed window: `N G obj` plus the
+            // value's own opening bytes are always within the first
+            // kilobytes of any real object.
+            let window = self.read_at(offset, 8192.min((self.file_len - offset) as usize), path)?;
+            let mut header = PdfLexer::new(&window);
+            let num = header
+                .parse_int_at()
+                .map(|n| n as u32)
+                .map_err(|_| anyhow!("{path:?} has a broken object header"))?;
+            header
+                .parse_int_at()
+                .map_err(|_| anyhow!("{path:?} has a broken object header"))?;
+            header.skip_ws();
+            if !header.data[header.pos..].starts_with(b"obj")
+                || header
+                    .data
+                    .get(header.pos + 3)
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+            {
+                bail!("{path:?} has a broken object header");
+            }
+            header.pos += 3;
+            let value_start = header.pos;
+            let mut window_len: usize = 8192;
+            let parsed: Option<(PdfObj, usize)> = loop {
+                let window = self.read_at(
+                    offset,
+                    window_len.min((self.file_len - offset) as usize),
+                    path,
+                )?;
+                // The header never moves: re-skip exactly what the fixed
+                // window above already consumed.
+                let mut lexer = PdfLexer::new(&window);
+                lexer.pos = value_start.min(window.len());
+                match lexer.parse_object(0) {
+                    Ok(value) => break Some((value, lexer.pos)),
+                    Err(_) => {
+                        if window_len >= 4 * 1024 * 1024
+                            || window_len >= (self.file_len - offset) as usize
+                        {
+                            break None;
+                        }
+                        window_len = (window_len * 2)
+                            .min((self.file_len - offset) as usize)
+                            .min(4 * 1024 * 1024);
+                    }
+                }
+            };
+            let (mut value, value_end) = match parsed {
+                Some(v) => v,
+                None => {
+                    // Re-parse at the cap (or whole tail) so the surfaced
+                    // error describes the value, not the window boundary.
+                    let window = self.read_at(
+                        offset,
+                        window_len.min((self.file_len - offset) as usize),
+                        path,
+                    )?;
+                    let mut lexer = PdfLexer::new(&window);
+                    lexer.pos = value_start.min(window.len());
+                    return lexer
+                        .parse_object(0)
+                        .map(|v| (num, v))
+                        .with_context(|| format!("{path:?} has a broken object ({num} 0 obj)"));
+                }
+            };
+            if let PdfObj::Dict(dict) = value {
+                // A `stream` keyword right after the dictionary (one
+                // optional EOL later) means payload follows; anything else
+                // means a plain dictionary object.
+                let window = self.read_at(
+                    offset,
+                    window_len.min((self.file_len - offset) as usize),
+                    path,
+                )?;
+                let mut lexer = PdfLexer::new(&window);
+                lexer.pos = value_end.min(window.len());
+                lexer.skip_ws();
+                if lexer.data[lexer.pos..].starts_with(b"stream")
+                    && lexer
+                        .data
+                        .get(lexer.pos + 6)
+                        .is_none_or(|b| !b.is_ascii_alphanumeric())
+                {
+                    return self.load_stream(num, dict, offset, lexer.pos + 6, path);
+                }
+                value = PdfObj::Dict(dict);
+            }
+            Ok((num, value))
+        }
+
+        /// Reads one stream's payload: `/Length` resolved first (an
+        /// indirect length is ordinary, and anything past end-of-file is
+        /// corruption, not a big stream), then exactly that many bytes
+        /// after the `stream` EOL, then an `endstream` keyword preceded by
+        /// at most one line break.
+        fn load_stream(
+            &mut self,
+            num: u32,
+            dict: BTreeMap<Vec<u8>, PdfObj>,
+            offset: u64,
+            dict_end: usize,
+            path: &Path,
+        ) -> Result<(u32, PdfObj)> {
+            let length = match dict.get(b"Length".as_slice()) {
+                Some(PdfObj::Int(n)) => *n,
+                Some(other) => self
+                    .resolve(other, 0, path)?
+                    .as_int()
+                    .ok_or_else(|| anyhow!("{path:?} has a stream with a non-integer /Length"))?,
+                None => bail!("{path:?} has a stream without /Length"),
+            };
+            if length < 0 || length as u64 > self.file_len {
+                bail!("{path:?} has a stream with an impossible /Length");
+            }
+            // Exactly one EOL (`\r\n`, `\n`, or `\r`) separates the
+            // keyword from the payload - consume it so `data` starts at
+            // the real first payload byte.
+            let mut data_start = offset + dict_end as u64;
+            let eol = self.read_at(
+                data_start,
+                2.min((self.file_len - data_start) as usize),
+                path,
+            )?;
+            if eol.first() == Some(&b'\r') {
+                data_start += 1;
+                if eol.get(1) == Some(&b'\n') {
+                    data_start += 1;
+                }
+            } else if eol.first() == Some(&b'\n') {
+                data_start += 1;
+            }
+            let data = self.read_at(data_start, length as usize, path)?;
+            let mut tail = self.read_at(
+                data_start + length as u64,
+                12.min((self.file_len - data_start - length as u64) as usize),
+                path,
+            )?;
+            if tail.first() == Some(&b'\r') {
+                tail.remove(0);
+            }
+            if tail.first() == Some(&b'\n') {
+                tail.remove(0);
+            }
+            if !tail.starts_with(b"endstream") {
+                bail!("{path:?} has a stream without endstream");
+            }
+            let decoded = self
+                .decode_stream(&dict, data, path)
+                .with_context(|| format!("decoding stream in object {num}"))?;
+            Ok((
+                num,
+                PdfObj::Stream {
+                    dict,
+                    data: decoded,
+                },
+            ))
+        }
+
+        /// Resolves indirect references through the xref table (depth-
+        /// guarded - self-referential `/Parent` chains and reference loops
+        /// are real in corrupt files). A missing entry and a free slot
+        /// both yield null, per the spec's own dangling-reference rule,
+        /// rather than an error that would fail a file over one bad link.
+        /// Anything else clones through untouched.
+        fn resolve(&mut self, obj: &PdfObj, depth: usize, path: &Path) -> Result<PdfObj> {
+            if depth > MAX_PDF_DEPTH {
+                bail!(
+                    "PDF references nested too deep - refusing rather than recursing without bound"
+                );
+            }
+            let num = match obj {
+                PdfObj::Ref(n, _) => *n,
+                _ => return Ok(obj.clone()),
+            };
+            match self.xref.get(&num).copied().unwrap_or(XrefEntry::Free) {
+                XrefEntry::Free => Ok(PdfObj::Null),
+                XrefEntry::Offset(offset) => {
+                    let (_, value) = self.load_object_at(offset, path)?;
+                    if matches!(value, PdfObj::Ref(_, _)) {
+                        self.resolve(&value, depth + 1, path)
+                    } else {
+                        Ok(value)
+                    }
+                }
+                XrefEntry::Compressed { objstm, index } => {
+                    let objects = self.load_objstm(objstm, path)?;
+                    objects
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("object stream index out of range"))
+                }
+            }
+        }
+
+        /// Decodes one object stream's payload into its object list:
+        /// `N` (object, index) header pairs, then each object parsed at
+        /// its own `First`-relative offset - independently, so one odd
+        /// entry can't desync the rest. Decoded once per stream and
+        /// cached (`objstm_cache`).
+        fn load_objstm(&mut self, num: u32, path: &Path) -> Result<Vec<PdfObj>> {
+            if let Some(cached) = self.objstm_cache.get(&num) {
+                return Ok(cached.clone());
+            }
+            let offset = match self.xref.get(&num).copied().unwrap_or(XrefEntry::Free) {
+                XrefEntry::Offset(o) => o,
+                _ => bail!("object stream {num} is not directly addressable"),
+            };
+            let (_, value) = self.load_object_at(offset, path)?;
+            let (dict, data) = match value {
+                PdfObj::Stream { dict, data } => (dict, data),
+                _ => bail!("object stream {num} is not a stream"),
+            };
+            let count = dict
+                .get(b"N".as_slice())
+                .and_then(PdfObj::as_int)
+                .filter(|&n| n >= 0)
+                .ok_or_else(|| anyhow!("object stream {num} is missing /N"))?
+                as usize;
+            let first = dict
+                .get(b"First".as_slice())
+                .and_then(PdfObj::as_int)
+                .filter(|&n| n >= 0)
+                .ok_or_else(|| anyhow!("object stream {num} is missing /First"))?
+                as usize;
+            // `load_object_at` (via `load_stream`) already ran this
+            // payload through its `/Filter` chain - decoding here again
+            // would inflate plaintext a second time. This double-decode
+            // shipped unnoticed because the only objstm fixture at the
+            // time was unfiltered (identity either way); the first real
+            // Flate-filtered object stream failed on it, fixed here.
+            let decoded = data;
+            let mut header = PdfLexer::new(&decoded);
+            let mut offsets = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let obj_num = header.parse_int_at()?;
+                let off = header.parse_int_at()?;
+                if obj_num < 0 || off < 0 {
+                    bail!("object stream {num} has a malformed header");
+                }
+                offsets.push((obj_num as u32, off as usize));
+            }
+            let mut objects = Vec::with_capacity(count.min(1024));
+            for (_, off) in &offsets {
+                let at = first
+                    .checked_add(*off)
+                    .ok_or_else(|| anyhow!("object stream {num} has an out-of-range entry"))?;
+                if at >= decoded.len() {
+                    bail!("object stream {num} has an out-of-range entry");
+                }
+                let mut lexer = PdfLexer::new(&decoded[at..]);
+                objects.push(lexer.parse_object(0)?);
+            }
+            if objects.len() != count {
+                bail!("object stream {num} has a malformed header");
+            }
+            self.objstm_cache.insert(num, objects.clone());
+            Ok(objects)
+        }
+
+        /// Decodes a stream's payload through its `/Filter` chain (a bare
+        /// name or an array, applied in order, each with its own optional
+        /// `DecodeParms` entry): ASCIIHex, ASCII85, Flate (zlib-framed or,
+        /// leniently, raw DEFLATE - see below), and RunLength. Anything
+        /// else is a clean, specific error: LZW is genuinely unimplemented
+        /// (rare in text-bearing streams), and the image-only codecs
+        /// (DCT/CCITT/JBIG2) on a content stream mean the file, not this
+        /// reader, is confused.
+        fn decode_stream(
+            &mut self,
+            dict: &BTreeMap<Vec<u8>, PdfObj>,
+            data: Vec<u8>,
+            path: &Path,
+        ) -> Result<Vec<u8>> {
+            let filters: Vec<PdfObj> = match dict.get(b"Filter".as_slice()) {
+                None => Vec::new(),
+                Some(PdfObj::Name(_)) => vec![dict[b"Filter".as_slice()].clone()],
+                Some(PdfObj::Array(items)) => items.clone(),
+                Some(other) => {
+                    bail!("{path:?} has a stream with a malformed /Filter: {other:?}")
+                }
+            };
+            let parms: Vec<Option<BTreeMap<Vec<u8>, PdfObj>>> =
+                match dict.get(b"DecodeParms".as_slice()) {
+                    None => vec![None; filters.len()],
+                    Some(PdfObj::Dict(d)) => {
+                        let mut v = vec![None; filters.len()];
+                        if !v.is_empty() {
+                            v[0] = Some(d.clone());
+                        }
+                        v
+                    }
+                    Some(PdfObj::Array(items)) => {
+                        let mut v = vec![None; filters.len()];
+                        for (slot, item) in v.iter_mut().zip(items.iter()) {
+                            if let PdfObj::Dict(d) = item {
+                                *slot = Some(d.clone());
+                            }
+                        }
+                        v
+                    }
+                    _ => vec![None; filters.len()],
+                };
+            let mut bytes = data;
+            for (filter, parm) in filters.iter().zip(parms.iter()) {
+                let PdfObj::Name(name) = filter else {
+                    bail!("{path:?} has a stream with a malformed /Filter entry")
+                };
+                bytes = match name.as_slice() {
+                    b"ASCIIHexDecode" => Self::ascii_hex_decode(&bytes, path)?,
+                    b"ASCII85Decode" => Self::ascii85_decode(&bytes, path)?,
+                    b"FlateDecode" => Self::flate_decode(&bytes, parm.as_ref(), path)?,
+                    b"RunLengthDecode" => Self::run_length_decode(&bytes, path)?,
+                    b"LZWDecode" => bail!(
+                        "{path:?} uses LZWDecode, which this reader doesn't implement - \
+                         re-save with FlateDecode"
+                    ),
+                    b"DCTDecode" | b"CCITTFaxDecode" | b"JBIG2Decode" | b"JPXDecode" => {
+                        bail!("{path:?} applies an image codec outside a content stream context")
+                    }
+                    b"Crypt" => bail!("{path:?} has a per-stream Crypt filter - unsupported"),
+                    other => bail!(
+                        "{path:?} uses an unknown stream filter: {}",
+                        String::from_utf8_lossy(other)
+                    ),
+                };
+            }
+            Ok(bytes)
+        }
+
+        /// ASCIIHexDecode: hex pairs, whitespace ignored, terminated by
+        /// `>`. An odd trailing nibble pads with zero, per the spec.
+        fn ascii_hex_decode(data: &[u8], path: &Path) -> Result<Vec<u8>> {
+            let end = data
+                .iter()
+                .position(|&b| b == b'>')
+                .ok_or_else(|| anyhow!("{path:?} has an unterminated ASCIIHex stream"))?;
+            let mut out = Vec::with_capacity(end / 2);
+            let mut high: Option<u8> = None;
+            for &b in &data[..end] {
+                if b.is_ascii_whitespace() {
+                    continue;
+                }
+                let digit = (b as char)
+                    .to_digit(16)
+                    .ok_or_else(|| anyhow!("{path:?} has a non-hex digit in an ASCIIHex stream"))?
+                    as u8;
+                match high.take() {
+                    None => high = Some(digit),
+                    Some(h) => out.push(h << 4 | digit),
+                }
+            }
+            if let Some(h) = high {
+                out.push(h << 4);
+            }
+            Ok(out)
+        }
+
+        /// ASCII85Decode (Adobe variant): `z` is four zero bytes,
+        /// whitespace ignored, `~>` ends the data (anything after it is
+        /// not decoded), and a final short group of k>1 characters yields
+        /// k-1 bytes. A lone trailing character is malformed, not
+        /// silently dropped.
+        fn ascii85_decode(data: &[u8], path: &Path) -> Result<Vec<u8>> {
+            let mut out = Vec::with_capacity(data.len());
+            let mut group: u64 = 0;
+            let mut count = 0u8;
+            let mut chars = data.iter().peekable();
+            while let Some(&b) = chars.next() {
+                if b.is_ascii_whitespace() {
+                    continue;
+                }
+                if b == b'z' {
+                    if count != 0 {
+                        bail!("{path:?} has a misplaced `z` in an ASCII85 stream");
+                    }
+                    out.extend_from_slice(&[0, 0, 0, 0]);
+                    continue;
+                }
+                // `~>` is the end-of-data marker (the `~` never appears
+                // otherwise - it is outside the `!`..`u` alphabet). Real
+                // writers terminate nearly every ASCII85 stream with it;
+                // without this arm the first such file failed here, not on
+                // any synthetic fixture.
+                if b == b'~' {
+                    if chars.next() != Some(&b'>') {
+                        bail!("{path:?} has a malformed end-of-data marker in an ASCII85 stream");
+                    }
+                    break;
+                }
+                if !(b'!'..=b'u').contains(&b) {
+                    bail!("{path:?} has an invalid byte in an ASCII85 stream");
+                }
+                group = group * 85 + u64::from(b - b'!');
+                count += 1;
+                if count == 5 {
+                    for i in 0..4 {
+                        out.push((group >> (24 - 8 * i)) as u8);
+                    }
+                    group = 0;
+                    count = 0;
+                }
+            }
+            if count == 1 {
+                bail!("{path:?} has a truncated final group in an ASCII85 stream");
+            }
+            if count > 1 {
+                for _ in count..5 {
+                    group = group * 85 + 84;
+                }
+                for i in 0..count - 1 {
+                    out.push((group >> (24 - 8 * u64::from(i))) as u8);
+                }
+            }
+            Ok(out)
+        }
+
+        /// FlateDecode: zlib-framed DEFLATE (header verified, Adler-32
+        /// trailer verified against the decompressed bytes - both via the
+        /// same primitives the gzip reader already trusts), falling back
+        /// to raw DEFLATE only when the bytes carry no valid zlib header
+        /// at all. That fallback is deliberate leniency, not sloppiness:
+        /// a handful of real writers emit raw deflate despite the spec
+        /// requiring the wrapper, and inflating either shape either
+        /// succeeds byte-exactly or errors - there is no silent third
+        /// outcome. `/Predictor` (PNG/TIFF unfiltering) applies on top
+        /// when declared.
+        fn flate_decode(
+            data: &[u8],
+            parms: Option<&BTreeMap<Vec<u8>, PdfObj>>,
+            path: &Path,
+        ) -> Result<Vec<u8>> {
+            let framed = Self::zlib_framed(data).is_some();
+            let mut inflated = if framed {
+                // The Adler trailer sits where the DEFLATE stream *ends*,
+                // not unconditionally at the last 4 input bytes: real
+                // writers leave stray trailing bytes (a one-byte NUL pad
+                // from ASCII85-group rounding was the first case found),
+                // and cutting the trailer at input end mis-verifies those
+                // files. `BitReader` never over-reads past the final
+                // block (single-byte reads, leftovers under a byte), so
+                // the cursor position after `inflate` is exactly the next
+                // byte boundary - the trailer's real home.
+                let body = &data[2..];
+                let mut cursor = std::io::Cursor::new(body);
+                let inflated = inflate(&mut cursor)
+                    .with_context(|| format!("{path:?} has a corrupt FlateDecode stream"))?;
+                let pos = cursor.position() as usize;
+                let trailer = body
+                    .get(pos..pos + 4)
+                    .ok_or_else(|| anyhow!("{path:?} has a truncated FlateDecode stream"))?;
+                let expected = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+                if Self::adler32(&inflated) != expected {
+                    bail!("{path:?} has a FlateDecode stream with a bad checksum");
+                }
+                inflated
+            } else {
+                let raw = Self::zlib_framed(data).unwrap_or(data);
+                inflate(std::io::Cursor::new(raw))
+                    .with_context(|| format!("{path:?} has a corrupt FlateDecode stream"))?
+            };
+            if let Some(predictor) = parms
+                .and_then(|p| p.get(b"Predictor".as_slice()))
+                .and_then(PdfObj::as_int)
+            {
+                inflated = Self::apply_predictor(
+                    &inflated,
+                    predictor,
+                    parms
+                        .and_then(|p| p.get(b"Columns".as_slice()))
+                        .and_then(PdfObj::as_int),
+                    parms
+                        .and_then(|p| p.get(b"Colors".as_slice()))
+                        .and_then(PdfObj::as_int),
+                    parms
+                        .and_then(|p| p.get(b"BitsPerComponent".as_slice()))
+                        .and_then(PdfObj::as_int),
+                    path,
+                )?;
+            }
+            Ok(inflated)
+        }
+
+        /// Splits zlib framing from raw DEFLATE: `Some(body)` when the
+        /// two-byte header is a valid RFC 1950 header (CM 8, sane CINFO,
+        /// correct FCHECK) and a 4-byte trailer exists, else `None` (the
+        /// caller inflates the whole input as raw DEFLATE instead).
+        fn zlib_framed(data: &[u8]) -> Option<&[u8]> {
+            if data.len() < 6 {
+                return None;
+            }
+            let (cmf, flg) = (data[0], data[1]);
+            if cmf & 0x0F != 8 || (cmf >> 4) > 7 {
+                return None;
+            }
+            if (u16::from(cmf) * 256 + u16::from(flg)) % 31 != 0 {
+                return None;
+            }
+            Some(&data[2..data.len() - 4])
+        }
+
+        /// Minimal Adler-32 over decompressed bytes (the zlib trailer
+        /// check in `flate_decode` above). A deliberately local duplicate
+        /// of the spss/zlib one rather than a cross-feature import:
+        /// `pdf` and `spss` are independently togglable features that must
+        /// never depend on each other (the same controlled duplication
+        /// the two XML parsers already accept for the identical reason).
+        fn adler32(data: &[u8]) -> u32 {
+            const MOD_ADLER: u32 = 65521;
+            let (mut a, mut b) = (1u32, 0u32);
+            for &byte in data {
+                a = (a + u32::from(byte)) % MOD_ADLER;
+                b = (b + a) % MOD_ADLER;
+            }
+            (b << 16) | a
+        }
+
+        /// PNG/TIFF predictor unfiltering for Flate-decoded data carrying
+        /// `/Predictor`: 1 (or absent) is a pass-through; 2 is TIFF
+        /// horizontal differencing; 10-15 are PNG None/Sub/Up/Average/Paeth
+        /// (10 = auto-detect per row via the leading filter byte, 11-15
+        /// fix one). Rows are `Columns × Colors` bytes wide at 8 bits per
+        /// component (the only width implemented - anything else is a
+        /// clean error, since sub-byte sample packing is a different
+        /// decoder, not a parameter tweak). `/Columns` and `/Colors`
+        /// default to 1 per the spec when absent.
+        fn apply_predictor(
+            data: &[u8],
+            predictor: i64,
+            columns: Option<i64>,
+            colors: Option<i64>,
+            bits: Option<i64>,
+            path: &Path,
+        ) -> Result<Vec<u8>> {
+            if predictor == 1 {
+                return Ok(data.to_vec());
+            }
+            let bits = bits.unwrap_or(8);
+            if bits != 8 {
+                bail!("{path:?} uses an unsupported predictor bit depth");
+            }
+            let columns = columns.unwrap_or(1).max(1) as usize;
+            let colors = colors.unwrap_or(1).max(1) as usize;
+            let stride = columns.saturating_mul(colors);
+            if stride == 0 || stride > 1024 * 1024 {
+                bail!("{path:?} has an impossible predictor row width");
+            }
+            if predictor == 2 {
+                // TIFF horizontal differencing: each byte adds the byte
+                // `colors` positions behind it (the same component of the
+                // previous pixel), starting a row from zero.
+                let mut out = Vec::with_capacity(data.len());
+                for (i, &b) in data.iter().enumerate() {
+                    let left = if i % stride < colors {
+                        0
+                    } else {
+                        out[i - colors]
+                    };
+                    out.push(b.wrapping_add(left));
+                }
+                return Ok(out);
+            }
+            if !(10..=15).contains(&predictor) {
+                bail!("{path:?} uses an unsupported predictor");
+            }
+            let fixed = if predictor > 10 {
+                Some((predictor - 10) as u8)
+            } else {
+                None
+            };
+            let row_len = stride + 1;
+            if !data.len().is_multiple_of(row_len) {
+                bail!("{path:?} has predictor data that is not a whole number of rows");
+            }
+            let mut out = Vec::with_capacity(data.len() - data.len() / row_len);
+            let mut prev = vec![0u8; stride];
+            for row in data.chunks_exact(row_len) {
+                let kind = fixed.unwrap_or(row[0]);
+                if kind > 4 {
+                    bail!("{path:?} has an unknown PNG predictor row type");
+                }
+                let mut cur = vec![0u8; stride];
+                for i in 0..stride {
+                    let (left, up, up_left) = (
+                        if i >= colors { cur[i - colors] } else { 0 },
+                        prev[i],
+                        if i >= colors { prev[i - colors] } else { 0 },
+                    );
+                    let predicted = match kind {
+                        0 => 0,
+                        1 => left,
+                        2 => up,
+                        3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                        _ => {
+                            let p = i64::from(left) + i64::from(up) - i64::from(up_left);
+                            let (pa, pb, pc) = (
+                                (p - i64::from(left)).abs(),
+                                (p - i64::from(up)).abs(),
+                                (p - i64::from(up_left)).abs(),
+                            );
+                            if pa <= pb && pa <= pc {
+                                left
+                            } else if pb <= pc {
+                                up
+                            } else {
+                                up_left
+                            }
+                        }
+                    };
+                    cur[i] = row[i + 1].wrapping_add(predicted);
+                }
+                out.extend_from_slice(&cur);
+                prev = cur;
+            }
+            Ok(out)
+        }
+
+        /// RunLengthDecode: `<128` starts a literal run, `>128` repeats
+        /// the next byte, `128` ends the data. Truncation (a length that
+        /// overruns the input) is a clean error, not a short read.
+        fn run_length_decode(data: &[u8], path: &Path) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut i = 0usize;
+            while i < data.len() {
+                let len = data[i];
+                i += 1;
+                if len == 128 {
+                    break;
+                } else if len < 128 {
+                    let run = len as usize + 1;
+                    let bytes = data
+                        .get(i..i + run)
+                        .ok_or_else(|| anyhow!("{path:?} has a truncated RunLength stream"))?;
+                    out.extend_from_slice(bytes);
+                    i += run;
+                } else {
+                    let byte = *data
+                        .get(i)
+                        .ok_or_else(|| anyhow!("{path:?} has a truncated RunLength stream"))?;
+                    i += 1;
+                    out.extend(std::iter::repeat_n(byte, 257 - len as usize));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// WinAnsiEncoding (cp1252) byte-to-char. `0x00-0x7F` is ASCII and
+    /// `0xA0-0xFF` is Latin-1 identity (both fall through to `byte as
+    /// char`); only the `0x80-0x9F` window needs a real table, and its
+    /// five undefined positions map to U+FFFD rather than a guessed
+    /// letter. Every entry below was verified byte-for-byte against
+    /// `iconv -f WINDOWS-1252` on this machine before being trusted.
+    fn winansi_decode(byte: u8) -> char {
+        match byte {
+            0x80 => '\u{20AC}',
+            0x82 => '\u{201A}',
+            0x83 => '\u{0192}',
+            0x84 => '\u{201E}',
+            0x85 => '\u{2026}',
+            0x86 => '\u{2020}',
+            0x87 => '\u{2021}',
+            0x88 => '\u{02C6}',
+            0x89 => '\u{2030}',
+            0x8A => '\u{0160}',
+            0x8B => '\u{2039}',
+            0x8C => '\u{0152}',
+            0x8E => '\u{017D}',
+            0x91 => '\u{2018}',
+            0x92 => '\u{2019}',
+            0x93 => '\u{201C}',
+            0x94 => '\u{201D}',
+            0x95 => '\u{2022}',
+            0x96 => '\u{2013}',
+            0x97 => '\u{2014}',
+            0x98 => '\u{02DC}',
+            0x99 => '\u{2122}',
+            0x9A => '\u{0161}',
+            0x9B => '\u{203A}',
+            0x9C => '\u{0153}',
+            0x9E => '\u{017E}',
+            0x9F => '\u{0178}',
+            0x81 | 0x8D | 0x8F | 0x90 | 0x9D => '\u{FFFD}',
+            _ => byte as char,
+        }
+    }
+
+    /// MacRomanEncoding upper half (`0x80-0xFF`; the low half is ASCII
+    /// identity like every other encoding here). Transcribed, then
+    /// verified byte-for-byte against `iconv -f MACROMAN` - which caught
+    /// one real error before it shipped (`0xDB` is U+20AC, not U+00A4).
+    const MAC_ROMAN_HIGH: [u32; 128] = [
+        0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1, 0x00E0, 0x00E2, 0x00E4,
+        0x00E3, 0x00E5, 0x00E7, 0x00E9, 0x00E8, 0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF,
+        0x00F1, 0x00F3, 0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC, 0x2020,
+        0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF, 0x00AE, 0x00A9, 0x2122, 0x00B4,
+        0x00A8, 0x2260, 0x00C6, 0x00D8, 0x221E, 0x00B1, 0x2264, 0x2265, 0x00A5, 0x00B5, 0x2202,
+        0x2211, 0x220F, 0x03C0, 0x222B, 0x00AA, 0x00BA, 0x03A9, 0x00E6, 0x00F8, 0x00BF, 0x00A1,
+        0x00AC, 0x221A, 0x0192, 0x2248, 0x2206, 0x00AB, 0x00BB, 0x2026, 0x00A0, 0x00C0, 0x00C3,
+        0x00D5, 0x0152, 0x0153, 0x2013, 0x2014, 0x201C, 0x201D, 0x2018, 0x2019, 0x00F7, 0x25CA,
+        0x00FF, 0x0178, 0x2044, 0x20AC, 0x2039, 0x203A, 0xFB01, 0xFB02, 0x2021, 0x00B7, 0x201A,
+        0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1, 0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC,
+        0x00D3, 0x00D4, 0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC, 0x00AF,
+        0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7,
+    ];
+
+    fn macroman_decode(byte: u8) -> char {
+        if byte < 0x80 {
+            byte as char
+        } else {
+            char::from_u32(MAC_ROMAN_HIGH[(byte - 0x80) as usize]).unwrap_or('\u{FFFD}')
+        }
+    }
+
+    /// `uni2010` / `u2010` glyph names: literal Unicode codepoints, the
+    /// convention subsetted fonts use instead of AGL names (`uni` + 4 hex
+    /// digits, or `u` + 4-6 hex). Surrogates and out-of-range values are
+    /// `None` - an unknown glyph error, not a replacement char smuggled
+    /// through a code path that promises exactness.
+    fn uni_name_to_char(name: &[u8]) -> Option<char> {
+        let hex = if let Some(h) = name.strip_prefix(b"uni") {
+            if h.len() != 4 {
+                return None;
+            }
+            h
+        } else {
+            let h = name.strip_prefix(b"u")?;
+            if !(4..=6).contains(&h.len()) {
+                return None;
+            }
+            h
+        };
+        if !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let s = std::str::from_utf8(hex).ok()?;
+        char::from_u32(u32::from_str_radix(s, 16).ok()?)
+    }
+
+    /// Adobe Glyph List subset: glyph names a `/Differences` array can
+    /// plausibly carry, to Unicode. Single letters/digits are the byte
+    /// itself (handled by the caller, not here); anything unlisted is
+    /// `None`, and the caller refuses the font naming the glyph rather
+    /// than guessing. Greek is included (Symbol-flavored Differences
+    /// without ToUnicode are rare but real); anything beyond this -
+    /// exotic ligatures, small-caps variants - is a clean error, not a
+    /// fallback glyph.
+    fn agl_lookup(name: &[u8]) -> Option<char> {
+        Some(match name {
+            b"space" => ' ',
+            b"nobreakspace" => '\u{00A0}',
+            b"hyphen" => '-',
+            b"endash" => '\u{2013}',
+            b"emdash" => '\u{2014}',
+            b"quoteleft" => '\u{2018}',
+            b"quoteright" => '\u{2019}',
+            b"quotesinglbase" => '\u{201A}',
+            b"quotedblleft" => '\u{201C}',
+            b"quotedblright" => '\u{201D}',
+            b"quotedblbase" => '\u{201E}',
+            b"quotesingle" => '\'',
+            b"quotedbl" => '"',
+            b"grave" => '`',
+            b"acute" => '\u{00B4}',
+            b"bullet" => '\u{2022}',
+            b"ellipsis" => '\u{2026}',
+            b"dagger" => '\u{2020}',
+            b"daggerdbl" => '\u{2021}',
+            b"section" => '\u{00A7}',
+            b"paragraph" => '\u{00B6}',
+            b"copyright" => '\u{00A9}',
+            b"registered" => '\u{00AE}',
+            b"trademark" => '\u{2122}',
+            b"degree" => '\u{00B0}',
+            b"perthousand" => '\u{2030}',
+            b"Euro" => '\u{20AC}',
+            b"florin" => '\u{0192}',
+            b"guilsinglleft" => '\u{2039}',
+            b"guilsinglright" => '\u{203A}',
+            b"guillemotleft" => '\u{00AB}',
+            b"guillemotright" => '\u{00BB}',
+            b"fi" => '\u{FB01}',
+            b"fl" => '\u{FB02}',
+            b"ff" => '\u{FB00}',
+            b"ffi" => '\u{FB03}',
+            b"ffl" => '\u{FB04}',
+            // Underscore ligature variants: subsetted fonts commonly
+            // rename the same glyphs `f_i`/`f_l`/...
+            b"f_i" => '\u{FB01}',
+            b"f_l" => '\u{FB02}',
+            b"f_f" => '\u{FB00}',
+            b"f_f_i" => '\u{FB03}',
+            b"f_f_l" => '\u{FB04}',
+            // `.notdef` is the undefined-glyph marker, not a real
+            // character: U+FFFD is its honest equivalent, never a guess
+            // at what the missing glyph should have been.
+            b".notdef" => '\u{FFFD}',
+            // Full ASCII punctuation + digits under their AGL names:
+            // subsetted fonts address plain `,`/`.`/`@` as
+            // `/comma`/period`/`at`, and the first real-file sweep
+            // failed three separate fonts on exactly these.
+            b"exclam" => '!',
+            b"numbersign" => '#',
+            b"dollar" => '$',
+            b"percent" => '%',
+            b"ampersand" => '&',
+            b"parenleft" => '(',
+            b"parenright" => ')',
+            b"asterisk" => '*',
+            b"plus" => '+',
+            b"comma" => ',',
+            b"period" => '.',
+            b"slash" => '/',
+            b"colon" => ':',
+            b"semicolon" => ';',
+            b"less" => '<',
+            b"equal" => '=',
+            b"greater" => '>',
+            b"question" => '?',
+            b"at" => '@',
+            b"bracketleft" => '[',
+            b"backslash" => '\\',
+            b"bracketright" => ']',
+            b"asciicircum" => '^',
+            b"underscore" => '_',
+            b"braceleft" => '{',
+            b"bar" => '|',
+            b"braceright" => '}',
+            b"asciitilde" => '~',
+            b"zero" => '0',
+            b"one" => '1',
+            b"two" => '2',
+            b"three" => '3',
+            b"four" => '4',
+            b"five" => '5',
+            b"six" => '6',
+            b"seven" => '7',
+            b"eight" => '8',
+            b"nine" => '9',
+            b"minus" => '\u{2212}',
+            b"multiply" => '\u{00D7}',
+            b"divide" => '\u{00F7}',
+            b"plusminus" => '\u{00B1}',
+            b"sterling" => '\u{00A3}',
+            b"yen" => '\u{00A5}',
+            b"onehalf" => '\u{00BD}',
+            b"onequarter" => '\u{00BC}',
+            b"threequarters" => '\u{00BE}',
+            b"onesuperior" => '\u{00B9}',
+            b"twosuperior" => '\u{00B2}',
+            b"threesuperior" => '\u{00B3}',
+            b"breve" => '\u{02D8}',
+            b"caron" => '\u{02C7}',
+            b"circumflex" => '\u{02C6}',
+            b"dieresis" => '\u{00A8}',
+            b"dotaccent" => '\u{02D9}',
+            b"hungarumlaut" => '\u{02DD}',
+            b"macron" => '\u{00AF}',
+            b"ogonek" => '\u{02DB}',
+            b"Eogonek" => '\u{0118}',
+            b"eogonek" => '\u{0119}',
+            b"ring" => '\u{02DA}',
+            b"tilde" => '\u{02DC}',
+            b"Ccirc" => '\u{0108}',
+            b"ccirc" => '\u{0109}',
+            b"Ccircumflex" => '\u{0108}',
+            b"ccircumflex" => '\u{0109}',
+            b"Gcirc" => '\u{011C}',
+            b"gcirc" => '\u{011D}',
+            b"Gcircumflex" => '\u{011C}',
+            b"gcircumflex" => '\u{011D}',
+            b"Hcirc" => '\u{0124}',
+            b"hcirc" => '\u{0125}',
+            b"Hcircumflex" => '\u{0124}',
+            b"hcircumflex" => '\u{0125}',
+            b"Jcirc" => '\u{0134}',
+            b"jcirc" => '\u{0135}',
+            b"Jcircumflex" => '\u{0134}',
+            b"jcircumflex" => '\u{0135}',
+            b"Scirc" => '\u{015C}',
+            b"scirc" => '\u{015D}',
+            b"Scircumflex" => '\u{015C}',
+            b"scircumflex" => '\u{015D}',
+            // Second wave: every one of these surfaced from real files
+            // (French payslips, bank statements, Eastern European text)
+            // after the first sweep refused their fonts. Same fixed,
+            // checkable mappings as everything above - no guessing.
+            b"periodcentered" => '\u{00B7}',
+            b"cent" => '\u{00A2}',
+            b"currency" => '\u{00A4}',
+            b"brokenbar" => '\u{00A6}',
+            b"logicalnot" => '\u{00AC}',
+            b"sfthyphen" => '\u{00AD}',
+            b"ordfeminine" => '\u{00AA}',
+            b"ordmasculine" => '\u{00BA}',
+            b"questiondown" => '\u{00BF}',
+            b"exclamdown" => '\u{00A1}',
+            b"infinity" => '\u{221E}',
+            b"lessequal" => '\u{2264}',
+            b"greaterequal" => '\u{2265}',
+            b"notequal" => '\u{2260}',
+            b"approxequal" => '\u{2248}',
+            b"integral" => '\u{222B}',
+            b"radical" => '\u{221A}',
+            b"lozenge" => '\u{25CA}',
+            b"arrowleft" => '\u{2190}',
+            b"arrowright" => '\u{2192}',
+            b"arrowup" => '\u{2191}',
+            b"arrowdown" => '\u{2193}',
+            b"arrowboth" => '\u{2194}',
+            b"checkmark" => '\u{2713}',
+            b"st" => '\u{FB06}',
+            b"Germandbls" => '\u{1E9E}',
+            b"zerooldstyle" => '0',
+            b"oneoldstyle" => '1',
+            b"twooldstyle" => '2',
+            b"threeoldstyle" => '3',
+            b"fouroldstyle" => '4',
+            b"fiveoldstyle" => '5',
+            b"sixoldstyle" => '6',
+            b"sevenoldstyle" => '7',
+            b"eightoldstyle" => '8',
+            b"nineoldstyle" => '9',
+            b"Lslash" => '\u{0141}',
+            b"lslash" => '\u{0142}',
+            b"Zacute" => '\u{0179}',
+            b"zacute" => '\u{017A}',
+            b"Sacute" => '\u{015A}',
+            b"sacute" => '\u{015B}',
+            b"Cacute" => '\u{0106}',
+            b"cacute" => '\u{0107}',
+            b"Ccaron" => '\u{010C}',
+            b"ccaron" => '\u{010D}',
+            b"Dcaron" => '\u{010E}',
+            b"dcaron" => '\u{010F}',
+            b"Tcaron" => '\u{0164}',
+            b"tcaron" => '\u{0165}',
+            b"Ecaron" => '\u{011A}',
+            b"ecaron" => '\u{011B}',
+            b"Racute" => '\u{0154}',
+            b"racute" => '\u{0155}',
+            b"Rcaron" => '\u{0158}',
+            b"rcaron" => '\u{0159}',
+            b"Nacute" => '\u{0143}',
+            b"nacute" => '\u{0144}',
+            b"Uring" => '\u{016E}',
+            b"uring" => '\u{016F}',
+            b"Abreve" => '\u{0102}',
+            b"abreve" => '\u{0103}',
+            b"Gbreve" => '\u{011E}',
+            b"gbreve" => '\u{011F}',
+            b"Idotaccent" => '\u{0130}',
+            b"Scedilla" => '\u{015E}',
+            b"scedilla" => '\u{015F}',
+            b"Scommaaccent" => '\u{0218}',
+            b"scommaaccent" => '\u{0219}',
+            b"Tcommaaccent" => '\u{021A}',
+            b"tcommaaccent" => '\u{021B}',
+            b"IJ" => '\u{0132}',
+            b"ij" => '\u{0133}',
+            b"Eng" => '\u{014A}',
+            b"eng" => '\u{014B}',
+            // Third wave: math/technical names from the same sweep
+            // (textbook PDF, bank forms). Same fixed-mapping discipline.
+            b"summation" => '\u{2211}',
+            b"product" => '\u{220F}',
+            b"partialdiff" => '\u{2202}',
+            b"gradient" => '\u{2207}',
+            b"universal" => '\u{2200}',
+            b"existential" => '\u{2203}',
+            b"emptyset" => '\u{2205}',
+            b"element" => '\u{2208}',
+            b"owner" => '\u{220B}',
+            b"angle" => '\u{2220}',
+            b"perpendicular" => '\u{22A5}',
+            b"therefore" => '\u{2234}',
+            b"because" => '\u{2235}',
+            b"similar" => '\u{223C}',
+            b"congruent" => '\u{2245}',
+            b"equivalence" => '\u{2261}',
+            b"proportional" => '\u{221D}',
+            b"aleph" => '\u{2135}',
+            b"weierstrass" => '\u{2118}',
+            b"Ohm" => '\u{2126}',
+            b"ohm" => '\u{2126}',
+            b"Angstrom" => '\u{212B}',
+            b"increment" => '\u{2206}',
+            b"coproduct" => '\u{2210}',
+            b"union" => '\u{222A}',
+            b"intersection" => '\u{2229}',
+            b"logicaland" => '\u{2227}',
+            b"logicalor" => '\u{2228}',
+            b"openbullet" => '\u{25E6}',
+            // The combining negation slash (U+0338): math fonts address
+            // it as `negationslash` per the AGL, overlaid on a base
+            // symbol rather than precomposed.
+            b"Delta1" => '\u{0394}',
+            b"Cdotaccent" => '\u{010A}',
+            b"cdotaccent" => '\u{010B}',
+            b"SI" => '\u{000F}',
+            b"SO" => '\u{000E}',
+            b"negationslash" => '\u{0338}',
+            b"Omega1" => '\u{03A9}',
+            b"bracketleftbig" => '[',
+            b"bracketrightbig" => ']',
+            b"parenleftbig" => '(',
+            b"parenrightbig" => ')',
+            b"parenleftBig" => '(',
+            b"parenrightBig" => ')',
+            b"bracketleftBig" => '[',
+            b"bracketrightBig" => ']',
+            b"braceleftBig" => '{',
+            b"bracerightBig" => '}',
+            b"Ebreve" => '\u{0114}',
+            b"ebreve" => '\u{0115}',
+            b"Edotaccent" => '\u{0116}',
+            b"edotaccent" => '\u{0117}',
+            // C0 controls + DEL under their standard names: custom
+            // text encodings use them as filler slots (like DC1-DC4/SI
+            // above) - honoring the declared name, not guessing content.
+            b"NUL" => '\u{0000}',
+            b"SOH" => '\u{0001}',
+            b"STX" => '\u{0002}',
+            b"ETX" => '\u{0003}',
+            b"EOT" => '\u{0004}',
+            b"ENQ" => '\u{0005}',
+            b"ACK" => '\u{0006}',
+            b"BEL" => '\u{0007}',
+            b"BS" => '\u{0008}',
+            b"HT" => '\u{0009}',
+            b"LF" => '\u{000A}',
+            b"VT" => '\u{000B}',
+            b"FF" => '\u{000C}',
+            b"CR" => '\u{000D}',
+            b"DLE" => '\u{0010}',
+            b"NAK" => '\u{0015}',
+            b"SYN" => '\u{0016}',
+            b"ETB" => '\u{0017}',
+            b"CAN" => '\u{0018}',
+            b"EM" => '\u{0019}',
+            b"SUB" => '\u{001A}',
+            b"ESC" => '\u{001B}',
+            b"FS" => '\u{001C}',
+            b"GS" => '\u{001D}',
+            b"RS" => '\u{001E}',
+            b"US" => '\u{001F}',
+            b"DEL" => '\u{007F}',
+            b"parenleftbigg" => '(',
+            b"parenrightbigg" => ')',
+            b"bracketleftbigg" => '[',
+            b"bracketrightbigg" => ']',
+            b"parenleftBigg" => '(',
+            b"parenrightBigg" => ')',
+            b"bracketleftBigg" => '[',
+            b"bracketrightBigg" => ']',
+            b"braceleftbig" => '{',
+            b"bracerightbig" => '}',
+            b"braceleftbigg" => '{',
+            b"bracerightbigg" => '}',
+            b"braceleftBigg" => '{',
+            b"bracerightBigg" => '}',
+            b"Aringa" => '\u{01FA}',
+            b"aringa" => '\u{01FB}',
+            b"Aringacute" => '\u{01FA}',
+            b"aringacute" => '\u{01FB}',
+            // TeX delimiter families (cmex-style big variants): angle,
+            // floor, ceil, slash - each in big/Big/bigg/Bigg spellings,
+            // all reading as their base character. Fragment pieces
+            // (`parenlefttp`, `bracketrightbt`, ...) are deliberately
+            // absent: a fragment is not its whole delimiter.
+            b"angleleftbig" => '\u{2329}',
+            b"anglerightbig" => '\u{232A}',
+            b"angleleftBig" => '\u{2329}',
+            b"anglerightBig" => '\u{232A}',
+            b"angleleftbigg" => '\u{2329}',
+            b"anglerightbigg" => '\u{232A}',
+            b"angleleftBigg" => '\u{2329}',
+            b"anglerightBigg" => '\u{232A}',
+            b"floorleftbig" => '\u{230A}',
+            b"floorrightbig" => '\u{230B}',
+            b"floorleftBig" => '\u{230A}',
+            b"floorrightBig" => '\u{230B}',
+            b"floorleftbigg" => '\u{230A}',
+            b"floorrightbigg" => '\u{230B}',
+            b"floorleftBigg" => '\u{230A}',
+            b"floorrightBigg" => '\u{230B}',
+            b"ceilleftbig" => '\u{2308}',
+            b"ceilrightbig" => '\u{2309}',
+            b"ceilleftBig" => '\u{2308}',
+            b"ceilrightBig" => '\u{2309}',
+            b"ceilleftbigg" => '\u{2308}',
+            b"ceilrightbigg" => '\u{2309}',
+            b"ceilleftBigg" => '\u{2308}',
+            b"ceilrightBigg" => '\u{2309}',
+            b"slashbig" => '/',
+            b"slashBig" => '/',
+            b"slashbigg" => '/',
+            b"slashBigg" => '/',
+            b"backslashbig" => '\\',
+            b"backslashBig" => '\\',
+            b"backslashbigg" => '\\',
+            b"backslashBigg" => '\\',
+            b"Aogonek" => '\u{0104}',
+            b"aogonek" => '\u{0105}',
+            b"Aogone" => '\u{0104}',
+            b"aogone" => '\u{0105}',
+            b"Sigma1" => '\u{03A3}',
+            b"Amacron" => '\u{0100}',
+            b"amacron" => '\u{0101}',
+            b"Emacron" => '\u{0112}',
+            b"emacron" => '\u{0113}',
+            b"Imacron" => '\u{012A}',
+            b"imacron" => '\u{012B}',
+            b"Omacron" => '\u{014C}',
+            b"omacron" => '\u{014D}',
+            b"Umacron" => '\u{016A}',
+            b"umacron" => '\u{016B}',
+            b"Ymacron" => '\u{0232}',
+            b"ymacron" => '\u{0233}',
+            b"DC1" => '\u{0011}',
+            b"DC2" => '\u{0012}',
+            b"DC3" => '\u{0013}',
+            b"DC4" => '\u{0014}',
+            b"asteriskmath" => '\u{2217}',
+            b"circleplus" => '\u{2295}',
+            b"circlemultiply" => '\u{2297}',
+            b"circledot" => '\u{2299}',
+            b"spade" => '\u{2660}',
+            b"club" => '\u{2663}',
+            b"heart" => '\u{2665}',
+            b"diamond" => '\u{2666}',
+            b"telephone" => '\u{260E}',
+            b"scissors" => '\u{2702}',
+            b"carriagereturn" => '\u{21B5}',
+            b"arrowupdn" => '\u{2195}',
+            b"arrowdblleft" => '\u{21D0}',
+            b"arrowdblright" => '\u{21D2}',
+            b"arrowdblboth" => '\u{21D4}',
+            b"arrowdblup" => '\u{21D1}',
+            b"arrowdbldown" => '\u{21D3}',
+            b"angleleft" => '\u{2329}',
+            b"angleright" => '\u{232A}',
+            b"pilcrow" => '\u{00B6}',
+            b"referencemark" => '\u{203B}',
+            b"minute" => '\u{2032}',
+            b"second" => '\u{2033}',
+            b"prime" => '\u{2032}',
+            b"quoteprime" => '\u{2032}',
+            b"quotedblprime" => '\u{2033}',
+            b"tripleprime" => '\u{2034}',
+            b"figuredash" => '\u{2012}',
+            b"fraction" => '\u{2044}',
+            b"numero" => '\u{2116}',
+            b"apple" => '\u{F8FF}',
+            b"longs" => '\u{017F}',
+            b"Lacute" => '\u{0139}',
+            b"lacute" => '\u{013A}',
+            b"Dcroat" => '\u{0110}',
+            b"dcroat" => '\u{0111}',
+            b"Gcommaaccent" => '\u{0122}',
+            b"gcommaaccent" => '\u{0123}',
+            b"Schwa" => '\u{018F}',
+            b"schwa" => '\u{0259}',
+            b"subset" => '\u{2282}',
+            b"superset" => '\u{2283}',
+            b"subseteq" => '\u{2286}',
+            b"superseteq" => '\u{2287}',
+            b"propersubset" => '\u{228A}',
+            b"propersuperset" => '\u{228B}',
+            b"nbspace" => '\u{00A0}',
+            b"Alphatonos" => '\u{0386}',
+            b"Epsilontonos" => '\u{0388}',
+            b"Etatonos" => '\u{0389}',
+            b"Iotatonos" => '\u{038A}',
+            b"Omicrontonos" => '\u{038C}',
+            b"Upsilontonos" => '\u{038E}',
+            b"Omegatonos" => '\u{038F}',
+            b"alphatonos" => '\u{03AC}',
+            b"epsilontonos" => '\u{03AD}',
+            b"etatonos" => '\u{03AE}',
+            b"iotatonos" => '\u{03AF}',
+            b"omicrontonos" => '\u{03CC}',
+            b"upsilontonos" => '\u{03CD}',
+            b"omegatonos" => '\u{03CE}',
+            b"iotadieresistonos" => '\u{0390}',
+            b"upsilondieresistonos" => '\u{03B0}',
+            b"theta1" => '\u{03D1}',
+            b"phi1" => '\u{03D5}',
+            b"sigma1" => '\u{03C2}',
+            b"zeroinferior" => '\u{2080}',
+            b"oneinferior" => '\u{2081}',
+            b"twoinferior" => '\u{2082}',
+            b"threeinferior" => '\u{2083}',
+            b"fourinferior" => '\u{2084}',
+            b"fiveinferior" => '\u{2085}',
+            b"sixinferior" => '\u{2086}',
+            b"seveninferior" => '\u{2087}',
+            b"eightinferior" => '\u{2088}',
+            b"nineinferior" => '\u{2089}',
+            b"zerosuperior" => '\u{2070}',
+            b"foursuperior" => '\u{2074}',
+            b"fivesuperior" => '\u{2075}',
+            b"sixsuperior" => '\u{2076}',
+            b"sevensuperior" => '\u{2077}',
+            b"eightsuperior" => '\u{2078}',
+            b"ninesuperior" => '\u{2079}',
+            b"plusinferior" => '\u{208A}',
+            b"minusinferior" => '\u{208B}',
+            b"plussuperior" => '\u{207A}',
+            b"minussuperior" => '\u{207B}',
+            b"parenleftsuperior" => '\u{207D}',
+            b"parenrightsuperior" => '\u{207E}',
+            b"oneeighth" => '\u{215B}',
+            b"threeeighths" => '\u{215C}',
+            b"fiveeighths" => '\u{215D}',
+            b"seveneighths" => '\u{215E}',
+            b"onethird" => '\u{2153}',
+            b"twothirds" => '\u{2154}',
+            b"copyrightsans" => '\u{00A9}',
+            b"copyrightserif" => '\u{00A9}',
+            b"registersans" => '\u{00AE}',
+            b"registerserif" => '\u{00AE}',
+            b"trademarksans" => '\u{2122}',
+            b"trademarkserif" => '\u{2122}',
+            b"dotlessi" => '\u{0131}',
+            b"dotlessj" => '\u{0237}',
+            b"germandbls" => '\u{00DF}',
+            b"Agrave" => '\u{00C0}',
+            b"Aacute" => '\u{00C1}',
+            b"Acircumflex" => '\u{00C2}',
+            b"Atilde" => '\u{00C3}',
+            b"Adieresis" => '\u{00C4}',
+            b"Aring" => '\u{00C5}',
+            b"AE" => '\u{00C6}',
+            b"AEacute" => '\u{01FC}',
+            b"aeacute" => '\u{01FD}',
+            b"Ccedilla" => '\u{00C7}',
+            b"Egrave" => '\u{00C8}',
+            b"Eacute" => '\u{00C9}',
+            b"Ecircumflex" => '\u{00CA}',
+            b"Edieresis" => '\u{00CB}',
+            b"Igrave" => '\u{00CC}',
+            b"Iacute" => '\u{00CD}',
+            b"Icircumflex" => '\u{00CE}',
+            b"Idieresis" => '\u{00CF}',
+            b"Eth" => '\u{00D0}',
+            b"Ntilde" => '\u{00D1}',
+            b"Ograve" => '\u{00D2}',
+            b"Oacute" => '\u{00D3}',
+            b"Ocircumflex" => '\u{00D4}',
+            b"Otilde" => '\u{00D5}',
+            b"Odieresis" => '\u{00D6}',
+            b"Oslash" => '\u{00D8}',
+            b"Ugrave" => '\u{00D9}',
+            b"Uacute" => '\u{00DA}',
+            b"Ucircumflex" => '\u{00DB}',
+            b"Udieresis" => '\u{00DC}',
+            b"Yacute" => '\u{00DD}',
+            b"Thorn" => '\u{00DE}',
+            b"Scaron" => '\u{0160}',
+            b"OE" => '\u{0152}',
+            b"Ydieresis" => '\u{0178}',
+            b"Zcaron" => '\u{017D}',
+            b"agrave" => '\u{00E0}',
+            b"aacute" => '\u{00E1}',
+            b"acircumflex" => '\u{00E2}',
+            b"atilde" => '\u{00E3}',
+            b"adieresis" => '\u{00E4}',
+            b"aring" => '\u{00E5}',
+            b"ae" => '\u{00E6}',
+            b"ccedilla" => '\u{00E7}',
+            b"egrave" => '\u{00E8}',
+            b"eacute" => '\u{00E9}',
+            b"ecircumflex" => '\u{00EA}',
+            b"edieresis" => '\u{00EB}',
+            b"igrave" => '\u{00EC}',
+            b"iacute" => '\u{00ED}',
+            b"icircumflex" => '\u{00EE}',
+            b"idieresis" => '\u{00EF}',
+            b"eth" => '\u{00F0}',
+            b"ntilde" => '\u{00F1}',
+            b"ograve" => '\u{00F2}',
+            b"oacute" => '\u{00F3}',
+            b"ocircumflex" => '\u{00F4}',
+            b"otilde" => '\u{00F5}',
+            b"odieresis" => '\u{00F6}',
+            b"oslash" => '\u{00F8}',
+            b"ugrave" => '\u{00F9}',
+            b"uacute" => '\u{00FA}',
+            b"ucircumflex" => '\u{00FB}',
+            b"udieresis" => '\u{00FC}',
+            b"yacute" => '\u{00FD}',
+            b"thorn" => '\u{00FE}',
+            b"ydieresis" => '\u{00FF}',
+            b"scaron" => '\u{0161}',
+            b"oe" => '\u{0153}',
+            b"zcaron" => '\u{017E}',
+            b"Alpha" => '\u{0391}',
+            b"Beta" => '\u{0392}',
+            b"Gamma" => '\u{0393}',
+            b"Delta" => '\u{0394}',
+            b"Epsilon" => '\u{0395}',
+            b"Zeta" => '\u{0396}',
+            b"Eta" => '\u{0397}',
+            b"Theta" => '\u{0398}',
+            b"Iota" => '\u{0399}',
+            b"Kappa" => '\u{039A}',
+            b"Lambda" => '\u{039B}',
+            b"Mu" => '\u{039C}',
+            b"Nu" => '\u{039D}',
+            b"Xi" => '\u{039E}',
+            b"Omicron" => '\u{039F}',
+            b"Pi" => '\u{03A0}',
+            b"Rho" => '\u{03A1}',
+            b"Sigma" => '\u{03A3}',
+            b"Tau" => '\u{03A4}',
+            b"Upsilon" => '\u{03A5}',
+            b"Phi" => '\u{03A6}',
+            b"Chi" => '\u{03A7}',
+            b"Psi" => '\u{03A8}',
+            b"Omega" => '\u{03A9}',
+            b"alpha" => '\u{03B1}',
+            b"beta" => '\u{03B2}',
+            b"gamma" => '\u{03B3}',
+            b"delta" => '\u{03B4}',
+            b"epsilon" => '\u{03B5}',
+            b"zeta" => '\u{03B6}',
+            b"eta" => '\u{03B7}',
+            b"theta" => '\u{03B8}',
+            b"iota" => '\u{03B9}',
+            b"kappa" => '\u{03BA}',
+            b"lambda" => '\u{03BB}',
+            b"mu" => '\u{03BC}',
+            b"nu" => '\u{03BD}',
+            b"xi" => '\u{03BE}',
+            b"omicron" => '\u{03BF}',
+            b"pi" => '\u{03C0}',
+            b"rho" => '\u{03C1}',
+            b"sigma" => '\u{03C3}',
+            b"tau" => '\u{03C4}',
+            b"upsilon" => '\u{03C5}',
+            b"phi" => '\u{03C6}',
+            b"chi" => '\u{03C7}',
+            b"psi" => '\u{03C8}',
+            b"omega" => '\u{03C9}',
+            _ => return None,
+        })
+    }
+
+    /// `T_h`: two single ASCII letters joined by one underscore - the
+    /// mechanical subset-font ligature name for that letter pair ("Th").
+    /// Strict shape only (exactly 3 bytes, a letter on each side);
+    /// `f_i` never reaches here (the AGL table claims it first as
+    /// U+FB01), and anything longer/suffixed goes through the normal
+    /// chain instead.
+    fn split_ligature(name: &[u8]) -> Option<String> {
+        if name.len() == 3
+            && name[1] == b'_'
+            && name[0].is_ascii_alphabetic()
+            && name[2].is_ascii_alphabetic()
+        {
+            Some(format!("{}{}", name[0] as char, name[2] as char))
+        } else {
+            None
+        }
+    }
+
+    /// Resolves one Differences glyph name to its text: a single byte is
+    /// itself; `uniXXXX`/`uXXXX` codepoints, the AGL table, mechanical
+    /// `X_y` ligatures, then a subset-suffix basename retry
+    /// (`Euro.069` -> `Euro`). `None` is an unknown glyph error, never a
+    /// guessed character.
+    fn glyph_to_string(glyph: &[u8]) -> Option<String> {
+        if glyph.len() == 1 {
+            return Some((glyph[0] as char).to_string());
+        }
+        if let Some(c) = uni_name_to_char(glyph) {
+            return Some(c.to_string());
+        }
+        if let Some(c) = agl_lookup(glyph) {
+            return Some(c.to_string());
+        }
+        if let Some(s) = split_ligature(glyph) {
+            return Some(s);
+        }
+        if let Some(dot) = glyph.iter().position(|&b| b == b'.')
+            && dot > 0
+        {
+            return glyph_to_string(&glyph[..dot]);
+        }
+        None
+    }
+
+    /// One font's decoding state: a ToUnicode CMap (authoritative whenever
+    /// present - it exists precisely because the byte codes are custom)
+    /// plus a 256-entry base table (WinAnsi, MacRoman, or either with
+    /// `/Differences` applied) covering codes the CMap doesn't map.
+    struct PdfFont {
+        cmap: HashMap<Vec<u8>, String>,
+        table: [String; 256],
+    }
+
+    impl PdfFont {
+        /// Decodes one content-stream string's raw bytes. CMap lookup is
+        /// longest-match (4 down to 1 byte - CJK fonts use 2-byte codes,
+        /// simple fonts 1); an unmapped byte falls back to the base
+        /// table, which for space/controls (the usual unmapped codes) is
+        /// identical across every encoding anyway.
+        fn decode(&self, bytes: &[u8]) -> String {
+            let mut out = String::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                let mut matched: Option<(&String, usize)> = None;
+                for len in (1..=4.min(bytes.len() - i)).rev() {
+                    if let Some(s) = self.cmap.get(&bytes[i..i + len]) {
+                        matched = Some((s, len));
+                        break;
+                    }
+                }
+                match matched {
+                    Some((s, len)) => {
+                        out.push_str(s);
+                        i += len;
+                    }
+                    None => {
+                        out.push_str(&self.table[bytes[i] as usize]);
+                        i += 1;
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    /// Fills a 256-entry table from a base encoding (the same loop at
+    /// every WinAnsi/MacRoman site in `build_font`, factored once).
+    fn fill_base_table(table: &mut [String; 256], macroman: bool) {
+        for (i, slot) in table.iter_mut().enumerate() {
+            *slot = if macroman {
+                macroman_decode(i as u8).to_string()
+            } else {
+                winansi_decode(i as u8).to_string()
+            };
+        }
+    }
+
+    /// Builds a font's decoding state from its font dictionary. ToUnicode
+    /// wins when present; otherwise `/Encoding` must resolve to
+    /// WinAnsi/MacRoman (optionally with `/Differences`). Anything else -
+    /// StandardEncoding, Symbol, a custom base without ToUnicode - is a
+    /// clean error naming the font, not a guessed table: shipping a
+    /// from-memory StandardEncoding table with no machine-checkable
+    /// oracle in this environment (no iconv codec, no pypdf) would break
+    /// the "no fixture, no trust" rule every other hand-roll here holds
+    /// itself to.
+    fn build_font(
+        reader: &mut PdfReader,
+        font_obj: &PdfObj,
+        font_desc: &str,
+        required: &HashSet<u8>,
+        path: &Path,
+    ) -> Result<PdfFont> {
+        let font = reader.resolve(font_obj, 0, path)?;
+        let PdfObj::Dict(dict) = &font else {
+            bail!("{path:?} font {font_desc} is not a dictionary");
+        };
+        let mut cmap = HashMap::new();
+        if let Some(tounicode) = dict.get(b"ToUnicode".as_slice()) {
+            let resolved = reader.resolve(tounicode, 0, path)?;
+            let PdfObj::Stream { data, .. } = &resolved else {
+                bail!("{path:?} font {font_desc} has a non-stream /ToUnicode");
+            };
+            cmap = parse_tounicode(data, font_desc, path)?;
+        }
+        // Base table: WinAnsi unless the font says MacRoman. Unknown
+        // base names are fine *with* a CMap (it only backs unmapped
+        // codes) but fatal without one.
+        let mut table = std::array::from_fn(|_| "\u{FFFD}".to_string());
+        if let Some(enc) = dict.get(b"Encoding".as_slice()) {
+            let resolved = reader.resolve(enc, 0, path)?;
+            match &resolved {
+                PdfObj::Name(n) if n == b"WinAnsiEncoding" => {
+                    fill_base_table(&mut table, false);
+                }
+                PdfObj::Name(n) if n == b"MacRomanEncoding" => {
+                    fill_base_table(&mut table, true);
+                }
+                PdfObj::Name(n) => {
+                    if cmap.is_empty() {
+                        bail!(
+                            "{path:?} font {font_desc} uses /{} without /ToUnicode - re-save with WinAnsi/MacRoman or an embedded ToUnicode CMap",
+                            String::from_utf8_lossy(n)
+                        );
+                    }
+                    fill_base_table(&mut table, false);
+                }
+                PdfObj::Dict(d) => {
+                    // No usable base and no CMap leaves only Differences-
+                    // mapped codes decodable. Rather than assume a base
+                    // (silently mistranslating unlisted codes) or refuse
+                    // outright (losing real subset-embedded fonts whose
+                    // content stays inside the mapped range), the page's
+                    // actually-shown codes must be covered below - every
+                    // decoded byte then has an explicit mapping, and
+                    // anything outside fails naming the exact code.
+                    let mut needs_coverage_check = false;
+                    if let Some(base) = d.get(b"BaseEncoding".as_slice()) {
+                        let base_resolved = reader.resolve(base, 0, path)?;
+                        match &base_resolved {
+                            PdfObj::Name(n) if n == b"WinAnsiEncoding" => {
+                                fill_base_table(&mut table, false);
+                            }
+                            PdfObj::Name(n) if n == b"MacRomanEncoding" => {
+                                fill_base_table(&mut table, true);
+                            }
+                            PdfObj::Name(n) => {
+                                if cmap.is_empty() {
+                                    bail!(
+                                        "{path:?} font {font_desc} uses /{} without /ToUnicode - re-save with WinAnsi/MacRoman or an embedded ToUnicode CMap",
+                                        String::from_utf8_lossy(n)
+                                    );
+                                }
+                                fill_base_table(&mut table, false);
+                            }
+                            _ => bail!("{path:?} font {font_desc} has a malformed /BaseEncoding"),
+                        }
+                    } else if cmap.is_empty() {
+                        needs_coverage_check = true;
+                    } else {
+                        fill_base_table(&mut table, false);
+                    }
+                    let mut mapped: HashSet<u8> = HashSet::new();
+                    if let Some(diffs) = d.get(b"Differences".as_slice()) {
+                        let diff_resolved = reader.resolve(diffs, 0, path)?;
+                        let PdfObj::Array(items) = &diff_resolved else {
+                            bail!("{path:?} font {font_desc} has a malformed /Differences");
+                        };
+                        let mut code: i64 = -1;
+                        for item in items {
+                            match item {
+                                PdfObj::Int(n) => {
+                                    if *n < 0 || *n > 255 {
+                                        bail!(
+                                            "{path:?} font {font_desc} has a /Differences code out of range: {n}"
+                                        );
+                                    }
+                                    code = *n;
+                                }
+                                PdfObj::Name(glyph) => {
+                                    if code < 0 {
+                                        bail!(
+                                            "{path:?} font {font_desc} has a /Differences name before any code"
+                                        );
+                                    }
+                                    // Small caps (`r.sc`, `A.sc`): semantically
+                                    // lowercase, rendered small - mapping to
+                                    // the lowercase letter reads correctly
+                                    // downstream, which is what a data tool
+                                    // needs (even the strict small-capital
+                                    // codepoints would be less useful here).
+                                    // Everything else resolves through the
+                                    // shared chain (uni/AGL/ligature/suffix).
+                                    let text = if let Some(base) = glyph.strip_suffix(b".sc")
+                                        && base.len() == 1
+                                        && base[0].is_ascii_alphabetic()
+                                    {
+                                        (base[0].to_ascii_lowercase() as char).to_string()
+                                    } else {
+                                        glyph_to_string(glyph).ok_or_else(|| {
+                                            anyhow!(
+                                                "{path:?} font {font_desc} maps code {code} to unknown glyph /{}",
+                                                String::from_utf8_lossy(glyph)
+                                            )
+                                        })?
+                                    };
+                                    table[code as usize] = text;
+                                    mapped.insert(code as u8);
+                                    code += 1;
+                                }
+                                _ => bail!(
+                                    "{path:?} font {font_desc} has a malformed /Differences entry"
+                                ),
+                            }
+                        }
+                    }
+                    if needs_coverage_check
+                        && let Some(&missing) = required.iter().find(|c| !mapped.contains(c))
+                    {
+                        bail!(
+                            "{path:?} font {font_desc} shows code {missing} with no mapping (no base encoding, no ToUnicode)"
+                        );
+                    }
+                }
+                _ => bail!("{path:?} font {font_desc} has a malformed /Encoding"),
+            }
+        } else if cmap.is_empty() {
+            bail!("{path:?} font {font_desc} has no usable encoding (no /Encoding, no /ToUnicode)");
+        } else {
+            fill_base_table(&mut table, false);
+        }
+        Ok(PdfFont { cmap, table })
+    }
+
+    /// UTF-16BE bytes to `String` (ToUnicode destinations). Surrogate
+    /// pairs combine; lone surrogates and a dangling odd byte become
+    /// U+FFFD rather than failing the whole CMap over one bad entry.
+    /// Iterates plain `.chunks(2)` (not `chunks_exact`, which a newer
+    /// clippy flags for constant sizes elsewhere in this file) and matches
+    /// on each chunk's real length, so the odd-tail case needs no
+    /// separate remainder check.
+    fn utf16be_to_string(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        let mut chunks = bytes.chunks(2);
+        while let Some(chunk) = chunks.next() {
+            let unit = match chunk {
+                [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+                [_] => {
+                    out.push('\u{FFFD}');
+                    continue;
+                }
+                _ => continue,
+            };
+            if (0xD800..0xDC00).contains(&unit) {
+                match chunks.next() {
+                    Some([hi, lo]) => {
+                        let low = u16::from_be_bytes([*hi, *lo]);
+                        if (0xDC00..0xE000).contains(&low) {
+                            let c = 0x10000
+                                + (u32::from(unit - 0xD800) << 10)
+                                + u32::from(low - 0xDC00);
+                            out.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
+                        } else {
+                            out.push('\u{FFFD}');
+                        }
+                    }
+                    _ => out.push('\u{FFFD}'),
+                }
+            } else if (0xDC00..0xE000).contains(&unit) {
+                out.push('\u{FFFD}');
+            } else {
+                out.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+            }
+        }
+        out
+    }
+
+    /// Parses a `/ToUnicode` CMap stream into source-bytes to Unicode
+    /// text. Only `bfchar`/`bfrange` carry mappings - `codespacerange`,
+    /// `notdef` ranges, and the PostScript prologue (`/CIDInit ... def`,
+    /// `begincmap` boilerplate) are skipped by matching their own
+    /// begin/end markers, never parsed for meaning. Entry counts after
+    /// `beginbfchar` are not trusted (real CMaps miscount); entries are
+    /// read until the matching end marker instead. Range expansion is
+    /// capped: a single range over 65536 entries or a map over 200000
+    /// total is a clean error, since a 3-byte full range would otherwise
+    /// mean 16M HashMap entries from a few input bytes.
+    fn parse_tounicode(
+        data: &[u8],
+        font_desc: &str,
+        path: &Path,
+    ) -> Result<HashMap<Vec<u8>, String>> {
+        fn be_int(bytes: &[u8]) -> u32 {
+            bytes.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b))
+        }
+        fn int_be(mut value: u32, len: usize) -> Vec<u8> {
+            let mut out = vec![0u8; len];
+            for slot in out.iter_mut().rev() {
+                *slot = (value & 0xFF) as u8;
+                value >>= 8;
+            }
+            out
+        }
+        let mut map = HashMap::new();
+        let mut lex = PdfLexer::new(data);
+        loop {
+            lex.skip_ws();
+            if lex.exhausted() {
+                break;
+            }
+            let rest = &lex.data[lex.pos..];
+            if rest.starts_with(b"beginbfchar") {
+                lex.pos += 11;
+                loop {
+                    lex.skip_ws();
+                    if lex.data[lex.pos..].starts_with(b"endbfchar") {
+                        lex.pos += 9;
+                        break;
+                    }
+                    if lex.exhausted() {
+                        bail!("{path:?} font {font_desc} has an unterminated bfchar block");
+                    }
+                    let src = lex.parse_object(0)?;
+                    let dst = lex.parse_object(0)?;
+                    let (PdfObj::Str(s), PdfObj::Str(d)) = (src, dst) else {
+                        bail!("{path:?} font {font_desc} has a malformed bfchar entry");
+                    };
+                    map.insert(s, utf16be_to_string(&d));
+                    if map.len() > 200_000 {
+                        bail!("{path:?} font {font_desc} has a suspiciously large ToUnicode map");
+                    }
+                }
+            } else if rest.starts_with(b"beginbfrange") {
+                lex.pos += 12;
+                loop {
+                    lex.skip_ws();
+                    if lex.data[lex.pos..].starts_with(b"endbfrange") {
+                        lex.pos += 10;
+                        break;
+                    }
+                    if lex.exhausted() {
+                        bail!("{path:?} font {font_desc} has an unterminated bfrange block");
+                    }
+                    let lo = lex.parse_object(0)?;
+                    let hi = lex.parse_object(0)?;
+                    let dst = lex.parse_object(0)?;
+                    let (PdfObj::Str(lo_b), PdfObj::Str(hi_b)) = (lo, hi) else {
+                        bail!("{path:?} font {font_desc} has a malformed bfrange range");
+                    };
+                    if lo_b.len() != hi_b.len() || lo_b.is_empty() || lo_b.len() > 4 {
+                        bail!("{path:?} font {font_desc} has a malformed bfrange range");
+                    }
+                    let (lo_n, hi_n) = (be_int(&lo_b), be_int(&hi_b));
+                    if hi_n < lo_n || hi_n - lo_n > 65536 {
+                        bail!("{path:?} font {font_desc} has a bfrange too large to expand");
+                    }
+                    match dst {
+                        PdfObj::Str(d) => {
+                            let width = d.len();
+                            let base = be_int(&d);
+                            for step in 0..=(hi_n - lo_n) {
+                                map.insert(
+                                    int_be(lo_n + step, lo_b.len()),
+                                    utf16be_to_string(&int_be(base + step, width)),
+                                );
+                            }
+                        }
+                        PdfObj::Array(items) => {
+                            if items.len() as u32 != hi_n - lo_n + 1 {
+                                bail!(
+                                    "{path:?} font {font_desc} has a bfrange array of the wrong length"
+                                );
+                            }
+                            for (step, item) in items.iter().enumerate() {
+                                let PdfObj::Str(d) = item else {
+                                    bail!(
+                                        "{path:?} font {font_desc} has a malformed bfrange array entry"
+                                    );
+                                };
+                                map.insert(
+                                    int_be(lo_n + step as u32, lo_b.len()),
+                                    utf16be_to_string(d),
+                                );
+                            }
+                        }
+                        _ => bail!("{path:?} font {font_desc} has a malformed bfrange destination"),
+                    }
+                    if map.len() > 200_000 {
+                        bail!("{path:?} font {font_desc} has a suspiciously large ToUnicode map");
+                    }
+                }
+            } else if rest.starts_with(b"begin") {
+                // `begincmap`, `begincodespacerange`, `beginnotdefrange`,
+                // ... - skip to the matching end marker rather than
+                // parsing PostScript boilerplate for meaning. A *bare*
+                // `begin` is different: a dict-stack operator from the
+                // prologue (`/CIDInit /ProcSet findresource begin`), not
+                // a block - consuming just the word. Getting this wrong
+                // eats the first real block: the end-search for a bare
+                // `begin` lands on the `end` inside `endbfchar`, swallowing
+                // every mapping with it (caught by the bfchar unit test,
+                // whose prologue has exactly this shape).
+                let mut e = lex.pos + 5;
+                while lex.data.get(e).is_some_and(|b| b.is_ascii_alphanumeric()) {
+                    e += 1;
+                }
+                if e == lex.pos + 5 {
+                    lex.pos = e;
+                    continue;
+                }
+                // `begincmap` is only a wrapper: the bfchar/bfrange blocks
+                // that carry the real mappings live *inside* it, so it is
+                // consumed, not skipped (an earlier draft skipped to
+                // `endcmap` and every ToUnicode font came out empty -
+                // caught by the first real two-font file, whose CMap font
+                // then failed as "no usable encoding").
+                if &lex.data[lex.pos + 5..e] == b"cmap" {
+                    lex.pos = e;
+                    continue;
+                }
+                let suffix = lex.data[lex.pos + 5..e].to_vec();
+                let mut end = Vec::with_capacity(3 + suffix.len());
+                end.extend_from_slice(b"end");
+                end.extend_from_slice(&suffix);
+                match lex.data[e..]
+                    .windows(end.len())
+                    .position(|w| w == end.as_slice())
+                {
+                    Some(off) => lex.pos = e + off + end.len(),
+                    None => bail!("{path:?} font {font_desc} has an unterminated CMap block"),
+                }
+            } else if rest.starts_with(b"end") {
+                let mut e = lex.pos + 3;
+                while lex.data.get(e).is_some_and(|b| b.is_ascii_alphanumeric()) {
+                    e += 1;
+                }
+                lex.pos = e;
+            } else if rest.first().is_some_and(|b| b.is_ascii_alphabetic()) {
+                // PostScript prologue operators (`def`, `dup`, `put`,
+                // `findresource`, ...) - consumed and discarded.
+                let mut e = lex.pos;
+                while lex.data.get(e).is_some_and(|b| b.is_ascii_alphanumeric()) {
+                    e += 1;
+                }
+                lex.pos = e;
+            } else {
+                // Numbers, names, hex strings, arrays - parsed and
+                // discarded (counts, `CMapName`, ...).
+                lex.parse_object(0).map(|_| ())?;
+            }
+        }
+        Ok(map)
+    }
+
+    /// One page plus its effective (inherited) resources - the pair
+    /// `page_list` walks and `page_text` consumes.
+    type ResolvedPage = (BTreeMap<Vec<u8>, PdfObj>, BTreeMap<Vec<u8>, PdfObj>);
+
+    impl PdfReader {
+        /// Walks the page tree from the catalog, returning each page's own
+        /// dictionary alongside its effective `/Resources` (inherited down
+        /// through every `/Pages` ancestor that provides one - the spec's
+        /// own inheritable-attributes rule, of which only Resources
+        /// matters for text). Document order is preserved (kids pushed
+        /// reversed onto an explicit stack, no recursion). A node with no
+        /// `/Type` but with `/Kids` (or `/Contents`) is treated as
+        /// Pages (or Page) on that structural evidence alone - real
+        /// writers sometimes omit the marker. Anything else is a clean
+        /// error, never a skipped subtree that would silently lose pages.
+        fn page_list(&mut self, path: &Path) -> Result<Vec<ResolvedPage>> {
+            let root_ref = self
+                .trailer
+                .get(b"Root".as_slice())
+                .cloned()
+                .unwrap_or(PdfObj::Null);
+            let root = self.resolve(&root_ref, 0, path)?;
+            let PdfObj::Dict(root_d) = &root else {
+                bail!("{path:?} has no document catalog (/Root)");
+            };
+            let pages_ref = root_d
+                .get(b"Pages".as_slice())
+                .cloned()
+                .unwrap_or(PdfObj::Null);
+            let pages = self.resolve(&pages_ref, 0, path)?;
+            let mut out = Vec::new();
+            let mut stack = vec![(pages, BTreeMap::new(), 0usize)];
+            while let Some((node, resources, depth)) = stack.pop() {
+                if depth > MAX_PDF_DEPTH {
+                    bail!("{path:?} has a page tree nested too deep");
+                }
+                let node = self.resolve(&node, 0, path)?;
+                let PdfObj::Dict(d) = &node else {
+                    bail!("{path:?} has a page tree node that is not a dictionary");
+                };
+                let kind = d.get(b"Type".as_slice()).and_then(PdfObj::as_name);
+                let resources = match d.get(b"Resources".as_slice()) {
+                    Some(r) => match self.resolve(r, 0, path)? {
+                        PdfObj::Dict(m) => m,
+                        PdfObj::Null => resources,
+                        _ => bail!("{path:?} has a page with /Resources that is not a dictionary"),
+                    },
+                    None => resources,
+                };
+                let is_pages = kind == Some(b"Pages".as_slice())
+                    || (kind.is_none() && d.contains_key(b"Kids".as_slice()));
+                let is_page = kind == Some(b"Page".as_slice())
+                    || (kind.is_none() && d.contains_key(b"Contents".as_slice()));
+                if is_pages {
+                    let kids_ref = d.get(b"Kids".as_slice()).cloned().unwrap_or(PdfObj::Null);
+                    let kids = self.resolve(&kids_ref, 0, path)?;
+                    let PdfObj::Array(kids) = kids else {
+                        bail!("{path:?} has a /Pages node whose /Kids is not an array");
+                    };
+                    for kid in kids.iter().rev() {
+                        stack.push((kid.clone(), resources.clone(), depth + 1));
+                    }
+                } else if is_page {
+                    out.push((d.clone(), resources));
+                } else {
+                    bail!("{path:?} has a page tree node that is neither /Pages nor /Page");
+                }
+            }
+            Ok(out)
+        }
+
+        /// Extracts one page's text: every `/Contents` stream (single or
+        /// array, concatenated with a newline so no operator can glue
+        /// across the boundary) walked for text-showing operators, each
+        /// span decoded through its `/Tf`-selected font. A page with no
+        /// `/Contents` is blank, not broken - empty text, still a record.
+        /// Fonts build once per (page, name) and cache in the caller-held
+        /// map: the same name can mean different fonts on different pages,
+        /// so the page index is part of the key, not just the name.
+        fn page_text(
+            &mut self,
+            page: &BTreeMap<Vec<u8>, PdfObj>,
+            resources: &BTreeMap<Vec<u8>, PdfObj>,
+            page_idx: usize,
+            font_cache: &mut HashMap<(usize, Vec<u8>), PdfFont>,
+            path: &Path,
+        ) -> Result<String> {
+            let page_no = page_idx + 1;
+            let contents = match page.get(b"Contents".as_slice()) {
+                None => return Ok(String::new()),
+                Some(c) => self.resolve(c, 0, path)?,
+            };
+            let mut datas: Vec<Vec<u8>> = Vec::new();
+            match contents {
+                PdfObj::Stream { data, .. } => datas.push(data),
+                PdfObj::Array(items) => {
+                    for item in items {
+                        match self.resolve(&item, 0, path)? {
+                            PdfObj::Stream { data, .. } => datas.push(data),
+                            _ => bail!("{path:?} page {page_no} has a non-stream /Contents entry"),
+                        }
+                    }
+                }
+                PdfObj::Null => return Ok(String::new()),
+                _ => bail!("{path:?} page {page_no} has a malformed /Contents"),
+            }
+            let mut data = Vec::new();
+            for (i, d) in datas.iter().enumerate() {
+                if i > 0 {
+                    data.push(b'\n');
+                }
+                data.extend_from_slice(d);
+            }
+            let spans = content_spans(&data)
+                .with_context(|| format!("failed reading page {page_no} of {path:?}"))?;
+            let fonts: BTreeMap<Vec<u8>, PdfObj> = match resources.get(b"Font".as_slice()) {
+                None => BTreeMap::new(),
+                Some(f) => match self.resolve(f, 0, path)? {
+                    PdfObj::Dict(m) => m,
+                    PdfObj::Null => BTreeMap::new(),
+                    _ => bail!(
+                        "{path:?} page {page_no} has /Font resources that are not a dictionary"
+                    ),
+                },
+            };
+            let ends_ws = |s: &str| s.ends_with(' ') || s.ends_with('\n');
+            // Codes each font actually shows on this page: a Differences-
+            // only font (no base, no CMap) is accepted exactly when every
+            // shown code has an explicit mapping - computed up front from
+            // the raw spans, before any font builds.
+            let mut required: HashMap<Vec<u8>, HashSet<u8>> = HashMap::new();
+            for span in &spans {
+                if let CSpan::Show { font, bytes, .. } = span {
+                    required
+                        .entry(font.clone())
+                        .or_default()
+                        .extend(bytes.iter().copied());
+                }
+            }
+            let no_codes: HashSet<u8> = HashSet::new();
+            let mut out = String::new();
+            for span in spans {
+                match span {
+                    CSpan::Show { font, bytes, glue } => {
+                        if font.is_empty() {
+                            bail!("{path:?} page {page_no} shows text before any font is selected");
+                        }
+                        let key = (page_idx, font.clone());
+                        if !font_cache.contains_key(&key) {
+                            let fdict = fonts.get(&font).ok_or_else(|| {
+                                anyhow!(
+                                    "{path:?} page {page_no} uses undefined font /{}",
+                                    String::from_utf8_lossy(&font)
+                                )
+                            })?;
+                            let desc = format!("/{}/page{page_no}", String::from_utf8_lossy(&font));
+                            let req = required.get(&font).unwrap_or(&no_codes);
+                            let built = build_font(self, fdict, &desc, req, path)?;
+                            font_cache.insert(key.clone(), built);
+                        }
+                        let text = font_cache
+                            .get(&key)
+                            .map(|f| f.decode(&bytes))
+                            .unwrap_or_default();
+                        // An empty show contributes nothing - not even its
+                        // word separator (otherwise `() Tj` would spray
+                        // double spaces through the text).
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if !glue && !out.is_empty() && !ends_ws(&out) {
+                            out.push(' ');
+                        }
+                        out.push_str(&text);
+                    }
+                    CSpan::Space => {
+                        if !out.is_empty() && !ends_ws(&out) {
+                            out.push(' ');
+                        }
+                    }
+                    CSpan::NewLine => {
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+            Ok(out.trim().to_string())
+        }
+    }
+
+    #[cfg(test)]
+    mod font_tests {
+        use super::*;
+
+        #[test]
+        fn glyph_chain_resolves_ligatures_and_suffixes() {
+            // Mechanical `X_y` ligatures read as their letters; subset
+            // tags retry the basename; `f_i` still takes the AGL
+            // ligature, not the split.
+            assert_eq!(glyph_to_string(b"T_h").as_deref(), Some("Th"));
+            assert_eq!(glyph_to_string(b"f_i").as_deref(), Some("ﬁ"));
+            assert_eq!(glyph_to_string(b"Euro.069").as_deref(), Some("€"));
+            assert_eq!(glyph_to_string(b"uni2010"), Some("\u{2010}".to_string()));
+            assert_eq!(glyph_to_string(b"g0"), None);
+        }
+
+        #[test]
+        fn agl_covers_ascii_punct_greek_and_math_waves() {
+            assert_eq!(agl_lookup(b"comma"), Some(','));
+            assert_eq!(agl_lookup(b"period"), Some('.'));
+            assert_eq!(agl_lookup(b"at"), Some('@'));
+            assert_eq!(agl_lookup(b"zero"), Some('0'));
+            assert_eq!(agl_lookup(b"f_i"), Some('\u{FB01}'));
+            assert_eq!(agl_lookup(b".notdef"), Some('\u{FFFD}'));
+            assert_eq!(agl_lookup(b"periodcentered"), Some('\u{00B7}'));
+            assert_eq!(agl_lookup(b"summation"), Some('\u{2211}'));
+            assert_eq!(agl_lookup(b"telephone"), Some('\u{260E}'));
+            assert_eq!(agl_lookup(b"negationslash"), Some('\u{0338}'));
+            assert_eq!(agl_lookup(b"Delta1"), Some('\u{0394}'));
+            assert_eq!(agl_lookup(b"Cdotaccent"), Some('\u{010A}'));
+            assert_eq!(agl_lookup(b"SI"), Some('\u{000F}'));
+            assert_eq!(agl_lookup(b"Omega1"), Some('\u{03A9}'));
+            assert_eq!(agl_lookup(b"bracketleftbig"), Some('['));
+            assert_eq!(agl_lookup(b"Amacron"), Some('\u{0100}'));
+            assert_eq!(agl_lookup(b"DC2"), Some('\u{0012}'));
+            assert_eq!(agl_lookup(b"openbullet"), Some('\u{25E6}'));
+            assert_eq!(agl_lookup(b"nosuchglyph"), None);
+        }
+
+        #[test]
+        fn uni_names_decode_codepoints_and_reject_bad_shapes() {
+            assert_eq!(uni_name_to_char(b"uni2010"), Some('\u{2010}'));
+            assert_eq!(uni_name_to_char(b"u0041"), Some('A'));
+            // Lone surrogate: not a character, so not a decoding.
+            assert_eq!(uni_name_to_char(b"uniD834"), None);
+            assert_eq!(uni_name_to_char(b"uni201"), None);
+            assert_eq!(uni_name_to_char(b"udieresis"), None);
+        }
+
+        #[test]
+        fn winansi_covers_ascii_latin1_and_the_cp1252_window() {
+            assert_eq!(winansi_decode(0x41), 'A');
+            assert_eq!(winansi_decode(0xE9), '\u{00E9}');
+            assert_eq!(winansi_decode(0x80), '\u{20AC}');
+            assert_eq!(winansi_decode(0x93), '\u{201C}');
+            assert_eq!(winansi_decode(0x81), '\u{FFFD}');
+        }
+
+        #[test]
+        fn macroman_matches_iconv_verified_anchors_including_the_0xdb_fix() {
+            assert_eq!(macroman_decode(0x41), 'A');
+            assert_eq!(macroman_decode(0x80), '\u{00C4}');
+            // `0xDB` was transcribed as U+00A4 first and corrected to
+            // U+20AC by the `iconv -f MACROMAN` oracle check.
+            assert_eq!(macroman_decode(0xDB), '\u{20AC}');
+            assert_eq!(macroman_decode(0xF0), '\u{F8FF}');
+        }
+
+        #[test]
+        fn utf16be_handles_pairs_and_lone_surrogates() {
+            assert_eq!(utf16be_to_string(&[0x00, 0x41]), "A");
+            // U+1D11E (musical G clef) as a real surrogate pair.
+            assert_eq!(utf16be_to_string(&[0xD8, 0x34, 0xDD, 0x1E]), "\u{1D11E}");
+            assert_eq!(utf16be_to_string(&[0xD8, 0x34]), "\u{FFFD}");
+        }
+
+        #[test]
+        fn tounicode_reads_bfchar_and_bfrange() {
+            let tpath = Path::new("test");
+            let cmap = b"/CIDInit /ProcSet findresource begin\n2 beginbfchar\n<00> <0041>\n<01> <0042>\nendbfchar\n1 beginbfrange\n<10> <12> <0061>\nendbfrange\nendcmap\n";
+            let map = parse_tounicode(cmap, "F1", tpath).unwrap();
+            assert_eq!(map.get(b"\x00".as_slice()).map(String::as_str), Some("A"));
+            assert_eq!(map.get(b"\x11".as_slice()).map(String::as_str), Some("b"));
+            assert_eq!(map.len(), 5);
+        }
+
+        #[test]
+        fn tounicode_rejects_an_oversized_range() {
+            let tpath = Path::new("test");
+            let cmap = b"1 beginbfrange\n<000000> <FFFFFF> <0000>\nendbfrange\n";
+            assert!(parse_tounicode(cmap, "F1", tpath).is_err());
+        }
+    }
+
+    /// One text-showing event from a content stream, in order. `Show.glue`
+    /// marks a `TJ`-array continuation (`[(Hel) 120 (lo)]` must join as
+    /// `Hello`, not `Hel lo`); every other show starts a new unit that
+    /// gets a separating space at join time unless the output already
+    /// ends in whitespace.
+    enum CSpan {
+        Show {
+            font: Vec<u8>,
+            bytes: Vec<u8>,
+            glue: bool,
+        },
+        Space,
+        NewLine,
+    }
+
+    /// Walks a page content stream's operators, returning text-showing
+    /// events in order. Operands ride a small stack (`12 /F1 Tf`,
+    /// `(Hello) Tj`); every operator clears it, so memory stays bounded
+    /// no matter how long the stream is. Only text-relevant operators are
+    /// interpreted - the hundreds of graphics/marked-content operators are
+    /// ignored, not errors, since the operator vocabulary is genuinely
+    /// open-ended and erroring on an unlisted one would fail nearly every
+    /// real file. A token that is not a well-formed *operand*, by contrast,
+    /// is a hard error: operands use the real object grammar, so there is
+    /// no lenient path that could silently mis-tokenize them.
+    fn content_spans(data: &[u8]) -> Result<Vec<CSpan>> {
+        let mut lex = PdfLexer::new(data);
+        let mut stack: Vec<PdfObj> = Vec::new();
+        let mut cur_font: Vec<u8> = Vec::new();
+        let mut spans: Vec<CSpan> = Vec::new();
+        // Pops a string operand; anything else (or nothing) drops the
+        // span, not the page - one malformed text operand is not worth a
+        // whole page of otherwise good text.
+        fn pop_str(stack: &mut Vec<PdfObj>) -> Option<Vec<u8>> {
+            match stack.pop() {
+                Some(PdfObj::Str(b)) => Some(b),
+                _ => None,
+            }
+        }
+        loop {
+            lex.skip_ws();
+            if lex.exhausted() {
+                break;
+            }
+            let b = lex.data[lex.pos];
+            if b == b'\'' || b == b'"' {
+                lex.pos += 1;
+                // `'` shows with a line move; `"` additionally takes two
+                // ignored spacing operands (word space, char space).
+                if b == b'"' {
+                    stack.pop();
+                    stack.pop();
+                }
+                if let Some(s) = pop_str(&mut stack) {
+                    spans.push(CSpan::NewLine);
+                    spans.push(CSpan::Show {
+                        font: cur_font.clone(),
+                        bytes: s,
+                        glue: false,
+                    });
+                }
+                stack.clear();
+                continue;
+            }
+            if b.is_ascii_alphabetic() {
+                let mut e = lex.pos;
+                while lex
+                    .data
+                    .get(e)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'*')
+                {
+                    e += 1;
+                }
+                let word = lex.data[lex.pos..e].to_vec();
+                lex.pos = e;
+                match word.as_slice() {
+                    b"true" => stack.push(PdfObj::Bool(true)),
+                    b"false" => stack.push(PdfObj::Bool(false)),
+                    b"null" => stack.push(PdfObj::Null),
+                    b"Tj" => {
+                        if let Some(s) = pop_str(&mut stack) {
+                            spans.push(CSpan::Show {
+                                font: cur_font.clone(),
+                                bytes: s,
+                                glue: false,
+                            });
+                        }
+                        stack.clear();
+                    }
+                    b"TJ" => {
+                        if let Some(PdfObj::Array(items)) = stack.pop() {
+                            let mut first = true;
+                            for item in items {
+                                if let PdfObj::Str(s) = item {
+                                    spans.push(CSpan::Show {
+                                        font: cur_font.clone(),
+                                        bytes: s,
+                                        glue: !first,
+                                    });
+                                    first = false;
+                                }
+                            }
+                        }
+                        stack.clear();
+                    }
+                    b"Tf" => {
+                        // Operands read `font size Tf`: the size sits on
+                        // top, so the first pop is the size, not the name
+                        // (an earlier draft had these backwards and no
+                        // font was ever selected - caught by the first
+                        // real file, whose every page then failed).
+                        if let (Some(_size), Some(name)) = (stack.pop(), stack.pop())
+                            && let PdfObj::Name(n) = name
+                        {
+                            cur_font = n;
+                        }
+                        stack.clear();
+                    }
+                    b"Td" | b"TD" | b"Tm" => {
+                        spans.push(CSpan::Space);
+                        stack.clear();
+                    }
+                    b"T*" | b"ET" => {
+                        spans.push(CSpan::NewLine);
+                        stack.clear();
+                    }
+                    b"BI" => {
+                        // Inline image: `BI <params> ID <raw bytes> EI`.
+                        // Params parse as ordinary objects and are
+                        // discarded; the payload itself is skipped by byte
+                        // search, never tokenized - it can contain
+                        // anything, including parens and brackets that
+                        // would desync a real parse. Exactly one whitespace
+                        // byte separates `ID` from the payload; `EI` must
+                        // sit between whitespace on both sides. A payload
+                        // that itself contains that sequence ends early -
+                        // accepted, disclosed: no byte search can tell a
+                        // real terminator from coincidental image bytes.
+                        stack.clear();
+                        // Params are `name value` pairs, discarded; `ID`
+                        // (exactly those two letters plus a whitespace
+                        // separator - `/IDENT` can never match) ends them.
+                        loop {
+                            lex.skip_ws();
+                            if lex.exhausted() {
+                                bail!("unterminated inline image in a content stream");
+                            }
+                            if lex.data[lex.pos..].starts_with(b"ID")
+                                && lex
+                                    .data
+                                    .get(lex.pos + 2)
+                                    .is_some_and(|c| c.is_ascii_whitespace())
+                            {
+                                let f = lex.pos + 2;
+                                lex.pos = f + 1;
+                                if lex.data.get(f) == Some(&b'\r')
+                                    && lex.data.get(f + 1) == Some(&b'\n')
+                                {
+                                    lex.pos = f + 2;
+                                }
+                                break;
+                            }
+                            lex.parse_object(0).map(|_| ())?;
+                            lex.parse_object(0).map(|_| ())?;
+                        }
+                        let mut found = None;
+                        let mut i = lex.pos;
+                        while i + 1 < lex.data.len() {
+                            if lex.data[i] == b'E'
+                                && lex.data[i + 1] == b'I'
+                                && i > 0
+                                && lex.data[i - 1].is_ascii_whitespace()
+                                && (i + 2 >= lex.data.len()
+                                    || lex.data[i + 2].is_ascii_whitespace())
+                            {
+                                found = Some(i + 2);
+                                break;
+                            }
+                            i += 1;
+                        }
+                        lex.pos = found.ok_or_else(|| {
+                            anyhow!("unterminated inline image in a content stream")
+                        })?;
+                    }
+                    _ => {
+                        stack.clear();
+                    }
+                }
+                continue;
+            }
+            stack.push(lex.parse_object(0)?);
+            if stack.len() > 64 {
+                stack.clear();
+            }
+        }
+        Ok(spans)
+    }
+
+    #[cfg(test)]
+    mod content_tests {
+        use super::*;
+
+        fn show_text(data: &[u8]) -> Vec<String> {
+            // Test helper: fonts are irrelevant to operator routing, so
+            // every span decodes through a WinAnsi table directly.
+            let font = PdfFont {
+                cmap: HashMap::new(),
+                table: {
+                    let mut t = std::array::from_fn(|_| "\u{FFFD}".to_string());
+                    for (i, slot) in t.iter_mut().enumerate() {
+                        *slot = winansi_decode(i as u8).to_string();
+                    }
+                    t
+                },
+            };
+            let mut out = Vec::new();
+            for span in content_spans(data).expect("test content must parse") {
+                if let CSpan::Show { bytes, .. } = span {
+                    out.push(font.decode(&bytes));
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn tj_tj_array_and_quote_operators_show_text() {
+            assert_eq!(show_text(b"BT /F1 12 Tf (Hello) Tj ET"), vec!["Hello"]);
+            // `TJ` fragments join without a space; separate `Tj`s don't.
+            assert_eq!(
+                show_text(b"BT /F1 12 Tf [(Hel) 120 (lo)] TJ (World) Tj ET"),
+                vec!["Hel", "lo", "World"]
+            );
+            assert_eq!(show_text(b"BT (Line) ' ET"), vec!["Line"]);
+        }
+
+        #[test]
+        fn unknown_operators_are_ignored_not_errors() {
+            // Graphics/marked-content/no-op operators with operands must
+            // not disturb the text on either side of them.
+            assert_eq!(
+                show_text(b"BT 1 0 0 1 72 712 cm /F1 12 Tf (A) Tj q 0.5 w (B) Tj Q ET"),
+                vec!["A", "B"]
+            );
+        }
+
+        #[test]
+        fn inline_images_skip_arbitrary_bytes() {
+            // Payload holds parens, brackets, and a fake `Tj` - none of
+            // which may leak into the text.
+            assert_eq!(
+                show_text(b"BT (A) Tj BI /W 2 /H 1 /BPC 8 ID \x89()\x00] Tj EI (B) Tj ET"),
+                vec!["A", "B"]
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod stream_tests {
+        use super::*;
+
+        fn tpath() -> &'static Path {
+            Path::new("test")
+        }
+
+        #[test]
+        fn flate_round_trips_a_zlib_stream_and_rejects_a_bad_checksum() {
+            // Bytes produced once by CPython's own zlib.compress (not
+            // hand-assembled): `Hello, PDF!` framed per RFC 1950.
+            let framed: &[u8] = &[
+                120, 156, 243, 72, 205, 201, 201, 215, 81, 8, 112, 113, 83, 4, 0, 21, 171, 3, 60,
+            ];
+            assert_eq!(
+                PdfReader::flate_decode(framed, None, tpath()).unwrap(),
+                b"Hello, PDF!"
+            );
+            // Same bytes with a corrupted Adler-32 trailer must fail, not
+            // silently decode.
+            let mut bad = framed.to_vec();
+            let last = bad.len() - 1;
+            bad[last] ^= 0xFF;
+            assert!(PdfReader::flate_decode(&bad, None, tpath()).is_err());
+            // Raw DEFLATE with no zlib framing decodes too (lenient real
+            // writers), via the identical `inflate` both paths share.
+            assert_eq!(
+                PdfReader::flate_decode(&framed[2..framed.len() - 4], None, tpath()).unwrap(),
+                b"Hello, PDF!"
+            );
+        }
+
+        #[test]
+        fn ascii85_decodes_adobe_variant_vectors() {
+            // Encoded once by CPython's own base64.a85encode (raw, no
+            // `<~` framing): `Hello world`.
+            let encoded = b"87cURD]j7BEbo7";
+            assert_eq!(
+                PdfReader::ascii85_decode(encoded, tpath()).unwrap(),
+                b"Hello world"
+            );
+            // `z` is four zero bytes; a lone trailing character is
+            // malformed, not silently dropped.
+            assert_eq!(
+                PdfReader::ascii85_decode(b"z", tpath()).unwrap(),
+                &[0, 0, 0, 0]
+            );
+            // An 11-character tail is a lone final character (k == 1),
+            // malformed rather than silently dropped (`87cURD]j7BE` =
+            // 5 + 5 + 1); trailing whitespace is fine.
+            assert!(PdfReader::ascii85_decode(b"87cURD]j7BE", tpath()).is_err());
+            assert!(PdfReader::ascii85_decode(b"87cURD]j7BEbo7 ", tpath()).is_ok());
+        }
+
+        #[test]
+        fn ascii_hex_ignores_whitespace_and_pads_odd_nibbles() {
+            // Payload only (no `<` opener - stream data never includes
+            // delimiters); the `>` terminator is required.
+            assert_eq!(
+                PdfReader::ascii_hex_decode(b"48656c6c6f>", tpath()).unwrap(),
+                b"Hello"
+            );
+            assert_eq!(
+                PdfReader::ascii_hex_decode(b"48 65 6c\n6c 6f>", tpath()).unwrap(),
+                b"Hello"
+            );
+            assert_eq!(PdfReader::ascii_hex_decode(b"4>", tpath()).unwrap(), b"@");
+            assert!(PdfReader::ascii_hex_decode(b"48", tpath()).is_err());
+            assert!(PdfReader::ascii_hex_decode(b"zz>", tpath()).is_err());
+        }
+
+        #[test]
+        fn run_length_handles_literal_repeat_and_end() {
+            // Hand-computed: 3 literals, 3 repeats of `x`, end.
+            assert_eq!(
+                PdfReader::run_length_decode(&[0x02, b'A', b'B', b'C', 0xFE, b'x', 0x80], tpath())
+                    .unwrap(),
+                b"ABCxxx"
+            );
+            assert!(PdfReader::run_length_decode(&[0x05, b'A'], tpath()).is_err());
+        }
+
+        #[test]
+        fn png_predictor_reconstructs_sub_rows() {
+            // Hand-computed, Columns 2 × Colors 1: row [1, 10, 20] means
+            // Sub filter with deltas 10, 20 -> values 10, 30.
+            let data = [1u8, 10, 20, 1, 30, 40];
+            assert_eq!(
+                PdfReader::apply_predictor(&data, 10, Some(2), Some(1), Some(8), tpath()).unwrap(),
+                vec![10, 30, 30, 70]
+            );
+            // Predictor 1 is a pass-through; unknown predictors and ragged
+            // rows are clean errors.
+            assert_eq!(
+                PdfReader::apply_predictor(&data, 1, None, None, None, tpath()).unwrap(),
+                data.to_vec()
+            );
+            assert!(PdfReader::apply_predictor(&data, 99, None, None, None, tpath()).is_err());
+            assert!(
+                PdfReader::apply_predictor(&[1, 10], 10, Some(2), Some(1), Some(8), tpath())
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn xref_table_parses_subsections_and_trailer() {
+            let bytes = b"xref\n0 2\n0000000000 65535 f\r\n0000000017 00000 n\r\ntrailer\n<< /Size 2 /Root 1 0 R >>";
+            let mut lexer = PdfLexer::new(bytes);
+            // Skip the `xref` keyword the caller consumes in production.
+            lexer.expect(b"xref").unwrap();
+            let mut xref = BTreeMap::new();
+            assert!(PdfReader::parse_xref_subsections(&mut lexer, &mut xref, 9999).unwrap());
+            assert_eq!(xref.get(&0), Some(&XrefEntry::Free));
+            assert_eq!(xref.get(&1), Some(&XrefEntry::Offset(17)));
+            lexer.skip_ws();
+            lexer.expect(b"trailer").unwrap();
+            let PdfObj::Dict(trailer) = lexer.parse_object(0).unwrap() else {
+                panic!("trailer must parse as a dictionary");
+            };
+            assert_eq!(trailer.get(b"Size".as_slice()), Some(&PdfObj::Int(2)));
+        }
+
+        #[test]
+        fn xref_stream_decodes_all_three_entry_types() {
+            // Hand-built: W[1 4 2], Size 3, no /Index (whole run).
+            // Entry 0: type 0 (free). Entry 1: type 1, offset 10.
+            // Entry 2: type 2, objstm 1, index 5.
+            let data = [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, //
+                0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, //
+            ];
+            let mut map = BTreeMap::new();
+            map.insert(
+                b"W".to_vec(),
+                PdfObj::Array(vec![PdfObj::Int(1), PdfObj::Int(4), PdfObj::Int(2)]),
+            );
+            map.insert(b"Size".to_vec(), PdfObj::Int(3));
+            let (file, scratch) = tempfile_for_test(b"");
+            let mut reader = PdfReader {
+                file,
+                file_len: 64,
+                xref: BTreeMap::new(),
+                trailer: BTreeMap::new(),
+                objstm_cache: HashMap::new(),
+            };
+            reader.read_xref_stream(&map, &data, tpath()).unwrap();
+            assert_eq!(reader.xref.get(&0), Some(&XrefEntry::Free));
+            assert_eq!(reader.xref.get(&1), Some(&XrefEntry::Offset(10)));
+            assert_eq!(
+                reader.xref.get(&2),
+                Some(&XrefEntry::Compressed {
+                    objstm: 1,
+                    index: 5
+                })
+            );
+            drop(reader);
+            std::fs::remove_file(&scratch).unwrap();
+        }
+
+        /// A throwaway empty file handle for tests that never touch disk -
+        /// xref-stream decoding is pure in-memory work, but the reader
+        /// owns its `File`, so one has to exist. Returns the path too so
+        /// the test can remove it after dropping the reader (Windows
+        /// refuses to delete an open file, so the drop-then-remove order
+        /// matters there).
+        fn tempfile_for_test(seed: &[u8]) -> (fs::File, std::path::PathBuf) {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "sniff-rs-test-{}.tmp",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::write(&path, seed).unwrap();
+            (fs::File::open(&path).unwrap(), path)
+        }
+    }
+}
+
+#[cfg(feature = "pdf")]
+fn columns_from_pdf(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    pdf_support::columns_from_pdf(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "pdf"))]
+fn columns_from_pdf(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "PDF support isn't compiled in - rebuild with `cargo build --release --features pdf` (or --features full)"
+    )
+}
+
 // --- MBOX reader (opt-in via --features mbox, hand-rolled RFC 4155
 // reader) --- One record per message. Message boundaries are found the
 // same way real mbox-writing/reading tools do (Python's own `mailbox`
@@ -55527,6 +59286,7 @@ enum InputFormat {
     Vcard,
     Ical,
     Ipynb,
+    Pdf,
     /// A Delta Lake table directory (`_delta_log/` present) - detected
     /// directly from the input path being such a directory, never from an
     /// extension or `--format` (a Delta table has no file extension of its
@@ -55607,6 +59367,7 @@ impl InputFormat {
             InputFormat::Vcard => "vcard",
             InputFormat::Ical => "icalendar",
             InputFormat::Ipynb => "ipynb",
+            InputFormat::Pdf => "pdf",
             InputFormat::DeltaTable => "delta",
             InputFormat::IcebergTable => "iceberg",
         }
@@ -55918,6 +59679,13 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
         directory: false,
     },
     FormatInfo {
+        name: "pdf",
+        extensions: &["pdf"],
+        feature: Some("pdf"),
+        compiled_in: cfg!(feature = "pdf"),
+        directory: false,
+    },
+    FormatInfo {
         name: "delta",
         // Never `--format`-selectable or extension-detected at all - a
         // Delta table has no file extension of its own, and is instead
@@ -56130,7 +59898,7 @@ mod format_catalog_tests {
         let joined = format_names_joined();
         let piped = format_names_piped();
         assert!(joined.contains("csv"));
-        assert!(joined.contains(", or ipynb"));
+        assert!(joined.contains(", or pdf"));
         assert!(!joined.contains("delta"));
         assert!(!joined.contains("iceberg"));
         assert!(piped.contains("csv|tsv"));
@@ -56296,6 +60064,13 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
     }
     if head.starts_with(b"$FL2") || head.starts_with(b"$FL3") {
         return Some(InputFormat::Spss);
+    }
+    if head.starts_with(b"%PDF-") {
+        // No other format this tool reads opens with `%PDF-` - a fixed
+        // 5-byte prefix, no corroborating check needed. (Files with junk
+        // *before* the magic still work by extension; sniffing stays
+        // strict here, the same conservative bar as every magic above.)
+        return Some(InputFormat::Pdf);
     }
     if head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
         // OLE2/Compound File Binary magic - the pre-2007 .xls container
@@ -56498,6 +60273,7 @@ fn detect_format(
             "vcard" | "vcf" => Ok(InputFormat::Vcard),
             "icalendar" | "ical" | "ics" => Ok(InputFormat::Ical),
             "ipynb" => Ok(InputFormat::Ipynb),
+            "pdf" => Ok(InputFormat::Pdf),
             other => {
                 bail!(
                     "unrecognized --format '{other}' (expected {}) - run `sniff-rs --list-formats` for the full, per-build list",
@@ -56542,6 +60318,7 @@ fn detect_format(
         "vcf" => Ok(InputFormat::Vcard),
         "ics" => Ok(InputFormat::Ical),
         "ipynb" => Ok(InputFormat::Ipynb),
+        "pdf" => Ok(InputFormat::Pdf),
         // The extension alone doesn't tell us - either there isn't one, or
         // it's not one of the above. Before giving up, try the file's own
         // bytes: fixed-width text and the four log formats have no magic
@@ -67501,6 +71278,7 @@ fn dispatch_reader(
             InputFormat::Vcard => columns_from_vcard(read_path, args.nrows, args.samples)?,
             InputFormat::Ical => columns_from_ical(read_path, args.nrows, args.samples)?,
             InputFormat::Ipynb => columns_from_ipynb(read_path, args.nrows, args.samples)?,
+            InputFormat::Pdf => columns_from_pdf(read_path, args.nrows, args.samples)?,
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
@@ -76321,6 +80099,7 @@ mod tests {
 
         sniff_matches(b"$FL2rest of a real SPSS header...", "spss");
         sniff_matches(b"$FL3rest of a real SPSS header (zsav)...", "spss");
+        sniff_matches(b"%PDF-1.4 rest of a real PDF header...", "pdf");
 
         // ORC's own header magic ("ORC") plus a plausible trailing
         // postscript-length byte that actually fits within the file.

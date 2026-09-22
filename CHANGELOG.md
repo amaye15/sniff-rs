@@ -6,6 +6,15 @@ All notable changes to sniff-rs are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- PDF page-text reader (`--features pdf`, in `full`): one record per page
+  (`page_number`, `text`). Hand-rolled, pure `std` - xref tables/streams
+  with `/Prev` chains (plus bare-trailer files via index rebuild), object
+  streams, FlateDecode (+ASCII85/ASCIIHex/RunLength, stacked),
+  WinAnsi/MacRoman/Differences/ToUnicode font decoding, `%PDF-` content
+  sniffing. Encrypted files, LZWDecode, and fonts with no usable mapping
+  are clean, disclosed refusals, not guesses.
+
 ### Changed
 - Default build is now every format plus SIMD (`default = ["full"]`).
   A plain build requires a nightly toolchain; `--no-default-features`

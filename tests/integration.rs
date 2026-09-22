@@ -13245,3 +13245,218 @@ fn ipynb_non_object_cell_is_an_actionable_error() {
 fn malformed_ipynb_fails_cleanly() {
     assert_fails_without_panicking("malformed_garbage.ipynb");
 }
+
+// ---------------------------------------------------------------------------
+// PDF text (.pdf, --features pdf): hand-rolled page-text reader - xref
+// table/stream walk, FlateDecode/ASCII85/ASCIIHex/RunLength streams,
+// WinAnsi/MacRoman/Differences/ToUnicode font decoding, one record per
+// page (`page_number`, `text`). Fixtures are hand-built (byte-assembled
+// with computed xref offsets, not written by any PDF library - none is
+// installed here), each exercising one structural shape.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_profiles_pages_as_records() {
+    let doc = run_json("sample.pdf", &[]);
+    assert_eq!(doc["format"], "pdf");
+    let cols = table(&doc, "sample");
+    let num = column(cols, "page_number");
+    assert_eq!(num["ideal_type"], "i64");
+    assert_eq!(num["missing_pct"], 0.0);
+    let text = column(cols, "text");
+    assert_eq!(text["ideal_type"], "String");
+    // Page 3 carries no /Contents: a real missing value, not an empty
+    // string standing in for one.
+    assert_eq!(text["missing_pct"], 33.3);
+    // A TJ fragment pair joins without a space; separate shows don't.
+    assert_eq!(
+        text["sample_values"],
+        serde_json::json!(["Hello, World!\nHello", "Cab"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_decodes_winansi_macroman_and_tounicode_faithfully() {
+    // Byte 0x80 through WinAnsi is U+20AC; MacRoman 0xDE is the `fi`
+    // ligature and 0xDB is U+20AC (the iconv-oracle fix); the CMap page
+    // maps custom codes to CJK. Any of these coming back wrong means the
+    // font layer mangled real bytes, not a heuristic disagreement.
+    let doc = run_json("type_detection.pdf", &[]);
+    let cols = table(&doc, "type_detection");
+    assert_eq!(
+        column(cols, "text")["sample_values"],
+        serde_json::json!(["Price: €50, mail a@b.com", "ﬁsh €50", "中文"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_reads_flate_content_and_differences_fonts() {
+    let doc = run_json("edge_pdf_flate_content.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_flate_content"), "text")["sample_values"],
+        serde_json::json!(["Compressed hello"])
+    );
+    // `/Differences [65 /Aacute 66 /Beta 67 /uni2010 68 /Euro.069
+    // 69 /AEacute]` over a WinAnsi base: AGL names, `uniXXXX` names,
+    // subset-suffixed names, and precomposed AE-acute alike.
+    let doc = run_json("edge_pdf_differences.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_differences"), "text")["sample_values"],
+        serde_json::json!(["ÁΒ‐€Ǽ"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_accepts_differences_without_a_base_when_content_stays_mapped() {
+    // No /BaseEncoding, no /ToUnicode: accepted exactly when every shown
+    // code has an explicit mapping (the real subset-font shape).
+    let doc = run_json("edge_pdf_differences_nobase.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_differences_nobase"), "text")["sample_values"],
+        serde_json::json!(["Hi!"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_unmapped_code_without_a_base_names_the_code() {
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_differences_unmapped.pdf")
+            .to_str()
+            .unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("shows code 66"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_reads_xref_streams_and_object_streams() {
+    // Modern writer shape: no `xref` table at all, object offsets from a
+    // compressed xref stream, and the font dictionary itself packed into
+    // an object stream (type-2 entries).
+    let doc = run_json("edge_pdf_xref_stream.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_xref_stream"), "text")["sample_values"],
+        serde_json::json!(["Streamed xref hello"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_follows_incremental_updates_to_the_newest_content() {
+    // Two xref sections joined by /Prev; the update rewrites the page to
+    // point at new content. Newest-first merge must win.
+    let doc = run_json("edge_pdf_incremental.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_incremental"), "text")["sample_values"],
+        serde_json::json!(["version two"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_encrypted_is_a_clean_refusal() {
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_encrypted.pdf").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is encrypted"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_lzw_is_a_clean_refusal() {
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_lzw.pdf").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("LZWDecode"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_standard_encoding_without_tounicode_is_a_clean_refusal() {
+    // A standard-14 font with neither /Encoding nor /ToUnicode has no
+    // machine-checkable table in this environment (no iconv codec, no
+    // pypdf oracle) - refusing loudly rather than shipping a
+    // from-memory StandardEncoding table no test could verify.
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_standard_encoding.pdf").to_str().unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no usable encoding"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn malformed_pdf_fails_cleanly() {
+    assert_fails_without_panicking("malformed_garbage.pdf");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_empty_pages_produces_an_empty_table() {
+    let doc = run_json("edge_pdf_empty_pages.pdf", &[]);
+    assert_eq!(
+        doc["tables"]["edge_pdf_empty_pages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_nrows_bounds_pages_decoded() {
+    let doc = run_json("sample.pdf", &["--nrows", "2"]);
+    let cols = table(&doc, "sample");
+    assert_eq!(column(cols, "page_number")["row_count"], 2);
+    // The blank third page falls outside the cutoff, so no missing %.
+    assert_eq!(column(cols, "text")["missing_pct"], 0.0);
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn content_sniffing_pdf_without_extension() {
+    let doc = run_json("edge_sniff_pdf_no_ext", &[]);
+    assert_eq!(doc["format"], "pdf");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_tolerates_trailing_pad_after_a_zlib_stream() {
+    // A real writer artifact (first found in a French university PDF):
+    // one stray NUL after the zlib end. The Adler trailer is verified
+    // where the DEFLATE stream actually ends, not at input end.
+    let doc = run_json("edge_pdf_flate_trailing_pad.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_flate_trailing_pad"), "text")["sample_values"],
+        serde_json::json!(["Trailing pad tolerated"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_inherits_resources_from_pages_ancestors() {
+    // `/Resources` lives on the `/Pages` node, not the page itself -
+    // the spec's inheritable-attributes rule, not a redundant copy.
+    let doc = run_json("edge_pdf_inherited_resources.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_inherited_resources"), "text")["sample_values"],
+        serde_json::json!(["Inherited resources work"])
+    );
+}
