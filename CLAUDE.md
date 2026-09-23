@@ -15412,6 +15412,99 @@ happened to open with a dash, misread as an unindented markdown list
 continuation, the same lint class this project has hit before) was
 fixed by rewording rather than added to the tolerated baseline.
 
+**A follow-up pass closed the one remaining disclosed encryption gap -
+`/V` 5 (AES-256, `/R` 5/6) - completing empty-user-password decryption
+for every Standard Security Handler revision this project's own real
+corpus, or the wider PDF spec, actually uses.** `/V` 5 is a genuinely
+different key-derivation scheme from the classic `/V` 1/2/4 path
+(ISO 32000-2 7.6.4.3.3/7.6.4.3.4 "Algorithm 2.A"/"Algorithm 2.B"), not
+just a wider key: there's no `/O`/`/P`/`/ID`-mixing Algorithm 2 at all;
+`/U` (48 bytes - a hash, an 8-byte validation salt, an 8-byte key salt)
+and `/UE` (32 bytes of raw AES-256-CBC ciphertext, zero IV, no PKCS#7
+padding) are the only fields this reader's own empty-password-only
+scope needs: hash the empty password against the validation salt and
+compare to `/U`'s own leading 32 bytes; hash it again against the key
+salt to get an intermediate key; AES-256-CBC-decrypt `/UE` under that
+key to recover the real file key directly. Every stream/string is then
+encrypted straight under that file key with no further per-object
+mixing at all - Algorithm 1's own MD5-based object-key derivation
+(still very much in effect for classic `/V` 1/2/4) simply doesn't apply
+once the file itself already carries a real, password-derived 256-bit
+key.
+
+**Three new crypto primitives needed hand-rolling to get there, each
+verified against known reference vectors independently computed rather
+than transcribed from memory** - the same discipline every other hand-
+rolled hash/cipher in this project already follows: **SHA-256** and
+**SHA-512/384** (RFC 6234/FIPS 180-4 - SHA-384 is exactly SHA-512 with a
+different initial hash and its output truncated to 384 of 512 bits, so
+one shared compression function backs both), each checked against
+`hashlib`'s own output for the empty string and `"abc"`; their own round
+constants (the first 32/64 bits of the fractional parts of the cube
+roots of the first 64/80 primes) were independently computed via a small
+Python script (`sympy`'s arbitrary-precision cube roots), not copied
+from a reference table, the same "verify the constants, don't just copy
+them" discipline this project's zstd/Brotli hand-rolls already used for
+their own tables. **AES generalized to `Nk = 8`/AES-256** (`Nr = 14`,
+FIPS-197 5.2's own extra mid-schedule `SubWord` step for keys wider than
+AES-192) on top of the already-shipped AES-128 hand-roll, plus a
+**forward `Cipher`** (FIPS-197 5.1 - every prior AES use in this reader
+only ever decrypted; the `/R` 6 "hardened hash" mixing loop below needs
+real AES *encryption*) verified as the true inverse of the
+already-FIPS-197-Appendix-B-verified `InvCipher` by round-tripping the
+same vector through both directions.
+
+**ISO 32000-2 Algorithm 2.B, the `/R` 6 "hardened hash"** - a
+deliberately slow KDF mixing `password + K` forward through 64+ rounds
+of real AES-128 encryption, re-hashing the AES output with one of
+SHA-256/384/512 chosen by the output's own bytes each round, until a
+termination condition tied to the last output byte and the round
+count - was implemented directly from the ISO text's own algorithm
+description rather than a second-hand summary, and verified the same
+way the classic-revision key derivation was in the earlier encryption
+pass: a from-scratch Python re-implementation (`hashlib` + PyCryptodome)
+reproduced `pikepdf`'s own reported file key exactly for a real,
+`pikepdf`-encrypted AES-256 file, *before* either the Python reference
+or the Rust port were trusted. **`/R` 5 - Adobe's own deprecated,
+pre-ISO-standardization draft of AES-256 support - turned out both
+real and independently verifiable, not left as a further disclosed
+gap**: `pikepdf` can still generate one (with a deprecation warning),
+and reading its own key derivation showed it's exactly `hardened_hash`
+with the 64-round mixing loop skipped entirely - a single SHA-256 round
+over `password + salt` - so one function, parameterized by revision,
+correctly serves both rather than needing two independent
+implementations.
+
+Verified with new unit tests (`hardened_hash` reproducing the real,
+independently-verified file key for both a real `/R` 6 and a real `/R`
+5 fixture; a tampered validation salt correctly failing to reproduce
+`/U`'s own stored hash; `sha256`/`sha512`/`sha384` against `hashlib`'s
+own vectors; the generalized `key_expansion`/forward `Cipher` round-
+tripping a 32-byte key through both cipher directions) plus a new
+integration test and two real, `pikepdf`-generated fixtures
+(`edge_pdf_encrypted_aes256.pdf`, `/R` 6; `edge_pdf_encrypted_r5.pdf`,
+`/R` 5 - both decrypting to the exact original plaintext). Confirmed as
+a pure addition for every already-working file via `diff` against the
+pre-change binary across the entire committed PDF fixture corpus - the
+only fixture whose behavior changed at all is `edge_pdf_encrypted_
+aes256.pdf` itself, deliberately, from a disclosed refusal to a real
+successful decrypt. Re-run against the real 666-PDF corpus: the real
+`/R` 6 file (a scanned criminal-record certificate) now decrypts
+cleanly too - confirmed genuinely, independently image-only with zero
+extractable text via `pdfminer.six`, not a masked decryption bug -
+and total PDF failures dropped from 54 to 53, with the "encrypted"
+failure category now fully empty: every encrypted file this project's
+own real-world corpus has ever found, across every Standard Security
+Handler revision the PDF spec defines, now decrypts with an empty user
+password. Clean across default/`pdf`/`full`, matching each build's own
+established clippy baseline exactly - two new findings this pass's own
+code introduced (a second `doc_lazy_continuation`, this time from a
+doc-comment line wrapping onto a line starting with `+ 6\`` - CommonMark
+reads a leading `+ ` exactly like a leading `-` as an unordered-list
+marker; two more `chunks_exact`-on-a-constant-size lints in the new
+no-padding AES-CBC helpers) were both fixed rather than added to the
+tolerated baseline.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15732,11 +15825,11 @@ established baselines exactly.
   record, missing text - OCR is out of scope) round out the same
   disclosed-boundary set; annotations and AcroForm field values are not
   surfaced at all. Encryption is decrypted with an empty user password
-  (the Standard Security Handler's classic `/V` 1/2/4 revisions, RC4 and
-  AES-128) - a genuine non-empty user password, or `/V` 5 (AES-256,
-  `/R` 5/6, which needs a second, SHA-256/384/512-based key derivation
-  this project doesn't hand-roll yet), both refuse cleanly rather than
-  guess at a password or attempt an unsupported cipher. A Form XObject's
+  across every Standard Security Handler revision the PDF spec defines -
+  classic `/V` 1/2/4 (RC4 and AES-128) and `/V` 5 (AES-256, `/R` 5's
+  deprecated single-round SHA-256 KDF and `/R` 6's own "hardened hash")
+  alike; only a genuine non-empty user password refuses cleanly, rather
+  than guess at it. A Form XObject's
   own nested content (a `/Do`-invoked form) is recursed into for its own
   text-showing operators; an Image XObject, or a Form/Image resolution
   failure of any kind (an unsupported codec, a bad predictor), is

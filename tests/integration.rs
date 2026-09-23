@@ -13531,23 +13531,24 @@ fn pdf_decrypts_rc4_and_aes128_with_an_empty_user_password() {
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_aes256_encryption_is_a_disclosed_not_yet_supported_gap() {
-    // A real, pikepdf-encrypted R6/AES-256 file (also an empty user
-    // password) - this project's Standard Security Handler support is
-    // deliberately scoped to the classic RC4/AES-128 revisions (2-4)
-    // only, so this must fail with a clear, specific, disclosed message
-    // naming the actual revision, not a generic refusal and never a
-    // silent wrong-key decrypt.
-    let output = Command::new(bin())
-        .args([fixture("edge_pdf_encrypted_aes256.pdf").to_str().unwrap()])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("encryption revision 6 (AES-256, /V 5) - not yet supported"),
-        "got: {stderr}"
-    );
+fn pdf_decrypts_aes256_r5_and_r6_with_an_empty_user_password() {
+    // Both fixtures are real, pikepdf-encrypted PDFs (/V 5, AES-256
+    // "AESV3") protected only by an owner password - no user password
+    // at all, matching the RC4/AES-128 fixtures' own real-world shape.
+    // /R 5 (Adobe's deprecated pre-ISO draft - a single SHA-256 key
+    // derivation round) and /R 6 (the standardized ISO 32000-2 revision
+    // - the full 64-round "hardened hash") use genuinely different key
+    // derivation, so both get their own real fixture rather than
+    // trusting one to stand in for the other.
+    for name in ["edge_pdf_encrypted_r5.pdf", "edge_pdf_encrypted_aes256.pdf"] {
+        let doc = run_json(name, &[]);
+        let table_name = name.trim_end_matches(".pdf");
+        assert_eq!(
+            column(table(&doc, table_name), "text")["sample_values"],
+            serde_json::json!(["This PDF is encrypted but the user password is empty."]),
+            "fixture {name} did not decrypt to the expected plaintext"
+        );
+    }
 }
 
 #[test]
