@@ -58863,6 +58863,15 @@ mod pdf_support {
         let mut lex = PdfLexer::new(data);
         let mut stack: Vec<PdfObj> = Vec::new();
         let mut cur_font: Vec<u8> = Vec::new();
+        // The text font is part of the graphics state (ISO 32000-1 8.4,
+        // 9.3): `q` saves it, `Q` restores it. Without this, a font picked
+        // inside `q ... Q` (a checkbox glyph's dingbat font, say) leaked
+        // into every show after the `Q` and decoded that text in the wrong
+        // font. An unbalanced `Q` is ignored; nesting past
+        // `MAX_GSTATE_DEPTH` stops saving rather than growing without
+        // bound (a later `Q` then restores the deepest state kept).
+        const MAX_GSTATE_DEPTH: usize = 1024;
+        let mut saved_fonts: Vec<Vec<u8>> = Vec::new();
         let mut spans: Vec<CSpan> = Vec::new();
         // Pops a string operand; anything else (or nothing) drops the
         // span, not the page - one malformed text operand is not worth a
@@ -58949,6 +58958,18 @@ mod pdf_support {
                             && let PdfObj::Name(n) = name
                         {
                             cur_font = n;
+                        }
+                        stack.clear();
+                    }
+                    b"q" => {
+                        if saved_fonts.len() < MAX_GSTATE_DEPTH {
+                            saved_fonts.push(cur_font.clone());
+                        }
+                        stack.clear();
+                    }
+                    b"Q" => {
+                        if let Some(font) = saved_fonts.pop() {
+                            cur_font = font;
                         }
                         stack.clear();
                     }
@@ -59085,6 +59106,31 @@ mod pdf_support {
                 }
             }
             out
+        }
+
+        fn shown_fonts(data: &[u8]) -> Vec<String> {
+            content_spans(data)
+                .unwrap()
+                .into_iter()
+                .filter_map(|span| match span {
+                    CSpan::Show { font, .. } => Some(String::from_utf8_lossy(&font).into_owned()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn q_and_capital_q_save_and_restore_the_text_font() {
+            // The font picked inside `q ... Q` must not leak past `Q`;
+            // nested saves unwind in order; an unbalanced `Q` is ignored.
+            assert_eq!(
+                shown_fonts(b"BT /F1 9 Tf (a) Tj ET q BT /F2 9 Tf (b) Tj ET Q BT (c) Tj ET"),
+                vec!["F1", "F2", "F1"]
+            );
+            assert_eq!(
+                shown_fonts(b"/F1 9 Tf q /F2 9 Tf q /F3 9 Tf (a) Tj Q (b) Tj Q (c) Tj Q Q (d) Tj"),
+                vec!["F3", "F2", "F1", "F1"]
+            );
         }
 
         #[test]

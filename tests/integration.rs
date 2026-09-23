@@ -13535,6 +13535,20 @@ fn pdf_reads_a_symbolic_type1_fonts_cleartext_encoding_vector() {
 
 #[test]
 #[cfg(feature = "pdf")]
+fn pdf_restores_the_text_font_when_the_graphics_state_is_restored() {
+    // `q BT /F2 Tf (x) Tj ET Q BT (After) Tj ET`: `After` is shown after
+    // `Q` restored the graphics state, so it's in /F1 again. /F2 maps every
+    // letter of "After" to `Z`; the old reader leaked /F2 past `Q` and
+    // read "ZZZZZ". PDFium reads the same page as "Before ✓ After".
+    let doc = run_json("edge_pdf_font_restored_after_q.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_font_restored_after_q"), "text")["sample_values"],
+        serde_json::json!(["Before\n\u{2713}\nAfter"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
 fn pdf_resolves_full_agl_tex_and_underscore_component_glyph_names() {
     // `/Differences [65 /G_tildecomb /cedilla /angbracketleft
     // /propersubset]`: an AGL-spec underscore ligature (G + U+0303), a

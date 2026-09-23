@@ -15738,6 +15738,26 @@ PFB header; StandardEncoding and unreadable declarations). Clean across
 default/`pdf`/`full` at each build's established clippy baseline (one
 new `needless_range_loop` finding was fixed, not tolerated).
 
+**A follow-up pass fixed a real text-state bug: the font selected inside
+a saved graphics state leaked past its restore.** The text font is part
+of the graphics state (ISO 32000-1 8.4 and 9.3) - `q` saves it and `Q`
+restores it - but the content walker ignored both, so after
+`q ... /F2 Tf ... Q` every later show still decoded through `/F2`. Real
+files do exactly this around a single glyph (a checkbox drawn in a
+dingbat font, then the form's labels in the text font), and the leaked
+font turned those labels into whatever the dingbat font's table said.
+It surfaced while validating a change to Type0 decoding against PDFium
+(Chrome's PDF engine, via `pypdfium2` - newly installed as a verification tool, never
+a dependency): PDFium attributed a label to a completely different font
+than this reader did. The fix is a bounded save stack in
+`content_spans` (`MAX_GSTATE_DEPTH`, 1024; an unbalanced `Q` is
+ignored). Measured on its own against the committed build: exactly two
+real corpus outputs changed, both from partially wrong to matching
+PDFium's text character for character, and nothing else moved.
+`edge_pdf_font_restored_after_q.pdf` locks it in - a font that maps every
+letter of "After" to `Z`, which the old reader leaked into the text after
+`Q` - along with a unit test for nested saves and an unbalanced `Q`.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
