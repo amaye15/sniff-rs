@@ -51229,6 +51229,33 @@ mod pdf_support {
     /// guard in this project already keeps.
     const MAX_PDF_DEPTH: usize = 64;
 
+    /// Cycle/depth guard for Form XObject recursion (`/Do` invoking a
+    /// nested content stream inside another, itself possibly invoking a
+    /// further one) - a document's own Form nesting is shallow by
+    /// construction (an e-signature caption overlay is one level deep,
+    /// most real files are zero), so this is generous headroom against a
+    /// genuinely malformed or adversarially self-referencing XObject,
+    /// not a limit any real file should ever approach.
+    const MAX_XOBJECT_DEPTH: usize = 16;
+
+    /// Which resource scope a cached, already-built `PdfFont` belongs to.
+    /// The same short name (`/F1`) can mean a completely different
+    /// font object depending on which resource dictionary resolved it,
+    /// so the page index alone stops being a safe cache key once a Form
+    /// XObject's own, independent `/Resources` enters the picture (see
+    /// `render_content_text`). Every Form XObject invocation gets its
+    /// own fresh scope from a per-page running counter, rather than
+    /// tracking the XObject's own real object identity - simpler, at the
+    /// honest cost of never sharing a built font across two separate
+    /// invocations of the identical XObject on one page, a real but
+    /// minor performance tradeoff for what's already a rare, small code
+    /// path (a signature stamp's own tiny form, not a whole document).
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum FontScope {
+        Page(usize),
+        XObject(u32),
+    }
+
     /// Hand-rolled MD5 (RFC 1321) and RC4, plus AES-128 decrypt-only (the
     /// straightforward FIPS-197 Inverse Cipher, no key-schedule
     /// optimization needed since this project never encrypts) - the three
@@ -52213,7 +52240,7 @@ mod pdf_support {
         let pages = reader.page_list(path)?;
         let mut num_acc = ColumnAccumulatorState::new();
         let mut text_acc = ColumnAccumulatorState::new();
-        let mut font_cache: HashMap<(usize, Vec<u8>), PdfFont> = HashMap::new();
+        let mut font_cache: HashMap<(FontScope, Vec<u8>), PdfFont> = HashMap::new();
         let mut kept = 0usize;
         for (idx, (page, resources)) in pages.iter().enumerate() {
             if nrows.is_some_and(|limit| kept >= limit) {
@@ -55029,15 +55056,14 @@ mod pdf_support {
         /// across the boundary) walked for text-showing operators, each
         /// span decoded through its `/Tf`-selected font. A page with no
         /// `/Contents` is blank, not broken - empty text, still a record.
-        /// Fonts build once per (page, name) and cache in the caller-held
-        /// map: the same name can mean different fonts on different pages,
-        /// so the page index is part of the key, not just the name.
+        /// The real work is `render_content_text`, called here with the
+        /// page's own top-level resources and a fresh `FontScope::Page`.
         fn page_text(
             &mut self,
             page: &BTreeMap<Vec<u8>, PdfObj>,
             resources: &BTreeMap<Vec<u8>, PdfObj>,
             page_idx: usize,
-            font_cache: &mut HashMap<(usize, Vec<u8>), PdfFont>,
+            font_cache: &mut HashMap<(FontScope, Vec<u8>), PdfFont>,
             path: &Path,
         ) -> Result<String> {
             let page_no = page_idx + 1;
@@ -55066,7 +55092,55 @@ mod pdf_support {
                 }
                 data.extend_from_slice(d);
             }
-            let spans = content_spans(&data)
+            let mut xobject_counter = 0u32;
+            self.render_content_text(
+                &data,
+                resources,
+                FontScope::Page(page_idx),
+                page_no,
+                font_cache,
+                &mut xobject_counter,
+                0,
+                path,
+            )
+        }
+
+        /// Walks one already-decoded content stream's text-showing
+        /// operators (a page's own `/Contents`, or - recursively - a
+        /// Form XObject's own nested content, `/Name Do` naming one
+        /// against `/Resources /XObject`) and renders the real text.
+        /// A Form (as opposed to an Image) XObject is exactly another
+        /// content stream with its own operators and its own optional
+        /// `/Resources` (falling back to the invoking scope's own
+        /// resources when absent, per spec) - the same "run of graphics
+        /// operators with text-showing calls mixed in" shape a page's
+        /// own top-level content already is, so recursing straight back
+        /// into this same function handles it with no separate logic.
+        /// `depth` guards against a cyclic or adversarially deep XObject
+        /// chain (`MAX_XOBJECT_DEPTH`); `xobject_counter` hands every
+        /// Form invocation its own fresh `FontScope`, so a font name
+        /// that means something different inside the Form than it does
+        /// in the invoking scope can never be conflated with it (see
+        /// `FontScope`'s own doc comment).
+        #[allow(clippy::too_many_arguments)]
+        fn render_content_text(
+            &mut self,
+            data: &[u8],
+            resources: &BTreeMap<Vec<u8>, PdfObj>,
+            scope: FontScope,
+            page_no: usize,
+            font_cache: &mut HashMap<(FontScope, Vec<u8>), PdfFont>,
+            xobject_counter: &mut u32,
+            depth: usize,
+            path: &Path,
+        ) -> Result<String> {
+            if depth > MAX_XOBJECT_DEPTH {
+                bail!(
+                    "{path:?} page {page_no} has Form XObjects nested too deep - \
+                     refusing rather than recursing without bound"
+                );
+            }
+            let spans = content_spans(data)
                 .with_context(|| format!("failed reading page {page_no} of {path:?}"))?;
             let fonts: BTreeMap<Vec<u8>, PdfObj> = match resources.get(b"Font".as_slice()) {
                 None => BTreeMap::new(),
@@ -55100,7 +55174,7 @@ mod pdf_support {
                         if font.is_empty() {
                             bail!("{path:?} page {page_no} shows text before any font is selected");
                         }
-                        let key = (page_idx, font.clone());
+                        let key = (scope, font.clone());
                         if !font_cache.contains_key(&key) {
                             let fdict = fonts.get(&font).ok_or_else(|| {
                                 anyhow!(
@@ -55136,6 +55210,77 @@ mod pdf_support {
                     CSpan::NewLine => {
                         if !out.is_empty() && !out.ends_with('\n') {
                             out.push('\n');
+                        }
+                    }
+                    CSpan::XObjectRef(name) => {
+                        // Resolving *any* stream object - Form or Image -
+                        // eagerly runs its own `/Filter` chain (there's no
+                        // "peek at the dict only" mode - see `load_stream`),
+                        // and the overwhelming majority of `/Do` targets in
+                        // a real file are Images using a codec this reader
+                        // was only ever built to decode inside an actual
+                        // page content stream, not speculatively here (a
+                        // JPEG/DCT photo, an LZW-compressed scan, ...). One
+                        // bad or simply-not-a-Form XObject must never cost
+                        // the rest of the page's real, unrelated text - the
+                        // same per-unit isolation this project's own
+                        // Parquet/`.npz` readers already apply - so every
+                        // failure from resolving one is swallowed here,
+                        // not propagated with `?`.
+                        let Some(xobjects_ref) = resources.get(b"XObject".as_slice()) else {
+                            continue;
+                        };
+                        let Ok(PdfObj::Dict(xobjects)) = self.resolve(xobjects_ref, 0, path) else {
+                            continue;
+                        };
+                        let Some(entry) = xobjects.get(&name) else {
+                            continue;
+                        };
+                        let Ok(PdfObj::Stream {
+                            dict: xdict,
+                            data: xdata,
+                        }) = self.resolve(entry, 0, path)
+                        else {
+                            continue;
+                        };
+                        let is_form = matches!(
+                            xdict.get(b"Subtype".as_slice()),
+                            Some(PdfObj::Name(n)) if n == b"Form"
+                        );
+                        if !is_form {
+                            continue;
+                        }
+                        let xres = match xdict.get(b"Resources".as_slice()) {
+                            Some(r) => match self.resolve(r, 0, path) {
+                                Ok(PdfObj::Dict(m)) => m,
+                                _ => resources.clone(),
+                            },
+                            None => resources.clone(),
+                        };
+                        *xobject_counter += 1;
+                        let xscope = FontScope::XObject(*xobject_counter);
+                        // A Form's own content genuinely failing to parse
+                        // (a malformed operand, an undefined font) is the
+                        // same "not worth losing the rest of the page over"
+                        // case as the resolve failures above, not a reason
+                        // to fail the whole page.
+                        let Ok(nested) = self.render_content_text(
+                            &xdata,
+                            &xres,
+                            xscope,
+                            page_no,
+                            font_cache,
+                            xobject_counter,
+                            depth + 1,
+                            path,
+                        ) else {
+                            continue;
+                        };
+                        if !nested.is_empty() {
+                            if !out.is_empty() && !ends_ws(&out) {
+                                out.push(' ');
+                            }
+                            out.push_str(&nested);
                         }
                     }
                 }
@@ -55251,6 +55396,11 @@ mod pdf_support {
         },
         Space,
         NewLine,
+        /// A `/Name Do` invocation - resolved against `/Resources
+        /// /XObject` by the caller (`render_content_text`), since this
+        /// pure syntactic walker has no access to a page's own resources
+        /// or the reader needed to look anything up.
+        XObjectRef(Vec<u8>),
     }
 
     /// Walks a page content stream's operators, returning text-showing
@@ -55422,6 +55572,19 @@ mod pdf_support {
                             anyhow!("unterminated inline image in a content stream")
                         })?;
                     }
+                    b"Do" => {
+                        // `/Name Do` invokes an XObject - a Form (its own
+                        // nested content stream, recursed into by
+                        // `render_content_text`, see that function's own
+                        // doc comment) or an Image (no text of its own,
+                        // silently ignored - which of the two this name
+                        // actually names isn't known until the caller
+                        // resolves it against `/Resources /XObject`).
+                        if let Some(PdfObj::Name(n)) = stack.pop() {
+                            spans.push(CSpan::XObjectRef(n));
+                        }
+                        stack.clear();
+                    }
                     _ => {
                         stack.clear();
                     }
@@ -55507,6 +55670,27 @@ mod pdf_support {
                 show_text(b"BT (A) Tj BI /W 2 /H 1 /BPC 8 ID \x89()\x00] Tj EI (B) Tj ET"),
                 vec!["A", "B"]
             );
+        }
+
+        #[test]
+        fn do_operator_emits_an_xobject_ref_between_direct_shows() {
+            // `content_spans` itself has no reader or `/Resources` to
+            // resolve `/Name Do` against (that's `render_content_text`'s
+            // own job) - it only has to recognize the operator and carry
+            // its operand through, in the right position relative to the
+            // page's own direct text on either side.
+            let spans = content_spans(b"BT (A) Tj ET /Fm0 Do BT (B) Tj ET").unwrap();
+            let kinds: Vec<&str> = spans
+                .iter()
+                .map(|s| match s {
+                    CSpan::Show { .. } => "show",
+                    CSpan::Space => "space",
+                    CSpan::NewLine => "newline",
+                    CSpan::XObjectRef(_) => "xobject",
+                })
+                .collect();
+            assert_eq!(kinds, vec!["show", "newline", "xobject", "show", "newline"]);
+            assert!(matches!(&spans[2], CSpan::XObjectRef(n) if n == b"Fm0"));
         }
 
         #[test]

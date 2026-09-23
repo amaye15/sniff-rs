@@ -15315,6 +15315,103 @@ a `chunks_exact`-on-a-constant-size lint in the new MD5/AES code, and a
 manual modulo-divisibility check clippy prefers as `.is_multiple_of()` -
 were both fixed rather than added to the tolerated baseline).
 
+**A follow-up pass closed the Form XObject gap the encryption pass had
+just found and disclosed - a page's real text living inside a `/Do`-
+invoked nested content stream this reader never recursed into at all -
+rather than leaving it named as future work.** `/Do` was previously an
+unrecognized operator, silently ignored the same as any of the hundreds
+of graphics operators this reader doesn't interpret; `content_spans`
+now recognizes it and emits a new `CSpan::XObjectRef(name)` event (the
+operand it names still has to be resolved against `/Resources /XObject`
+by the caller, since this pure syntactic walker has no access to a
+reader or any resource dictionary at all).
+
+**The real work is `render_content_text`** - `page_text`'s own
+former body, generalized into a function that recurses into itself:
+a Form XObject is exactly another content stream with its own operators
+and its own optional `/Resources` (falling back to the invoking scope's
+own resources when absent, per spec) - the identical "operators, some of
+them text-showing, walked in order" shape a page's own top-level content
+already is, so there's no separate rendering logic needed for it at all,
+only the resolution step that gets there. An Image XObject (or anything
+that isn't a Form) is silently skipped, the same treatment every other
+uninterpreted operator already gets. `MAX_XOBJECT_DEPTH` (16) guards a
+cyclic or adversarially deep XObject chain, the same "bounded, never
+stack-permitting" contract every other recursive structure in this
+reader already keeps.
+
+**A real regression was found and fixed before this ever reached a
+committed state - caught by the same real-world-corpus sweep this whole
+PDF effort has leaned on throughout, not shipped and found later.** A
+first version resolved every `/Do` target with a bare `?`, on the theory
+that a failure there was rare enough to just propagate - but resolving
+*any* stream object, Form or Image alike, eagerly runs its own `/Filter`
+chain (there's no "peek at the dict only" mode anywhere in this reader -
+see `load_stream`), and the overwhelming majority of real `/Do` targets
+are Images using a codec this reader was only ever built to decode
+inside an actual page's own content stream, not spent speculatively just
+to check `/Subtype` here (a JPEG/DCT photo, an LZW-compressed scan, a
+PNG-predictor image with a bit depth this reader doesn't support). Re-
+running the real 666-PDF corpus with that first version produced 432
+failures - a severe regression from the 54 this same corpus already had
+- every one of them a previously-working file whose only new problem was
+referencing an ordinary image through `/Do`. Fixed by isolating every
+XObject-resolution failure per-invocation (`match`/`let-else` in place of
+`?`, skipping silently on any error) rather than propagating it - the
+same "one bad or simply-irrelevant part must never sink the whole file"
+principle this project's own Parquet nested-column and `.npz` per-array
+isolation already established, just applied here to "one page's `/Do`
+reference" as the isolated unit instead of "one column" or "one array."
+A Form XObject's own content genuinely failing to parse gets the
+identical isolation, for the same reason - a bonus text source, not a
+reason to lose a page's own otherwise-good direct text.
+
+**Fonts needed one more real piece to stay correct under recursion**:
+the same short name (`/F1`) can mean a completely different font object
+depending on which resource dictionary resolved it, so the existing
+`(page_idx, font_name)` cache key stopped being safe the moment a Form
+XObject's own independent `/Resources` entered the picture - two
+distinct real font objects sharing the name `/F1` (one on the page, a
+different one inside its own invoked Form) could otherwise collide and
+silently decode with the wrong table. `FontScope` (`Page(usize)` or
+`XObject(u32)`) replaces the bare page index in the cache key; every
+Form invocation gets its own fresh scope from a simple per-page running
+counter rather than tracking the XObject's own real object identity -
+simpler, at the honest, disclosed cost of never sharing a built font
+across two separate invocations of the identical XObject on one page, a
+minor performance tradeoff for what's already a rare, small code path
+(a signature stamp's own tiny form, not a whole document).
+
+Verified with a new unit test (`content_spans` recognizing `/Fm0 Do`
+and carrying its operand through in the right position relative to
+direct text on either side - the parsing half only, since this function
+has no reader to resolve it against) and a new integration test plus a
+hand-built fixture (`edge_pdf_form_xobject.pdf`: direct page text before
+and after a `/Do` call into a real Form XObject with its own nested
+`Tj`, plus a second `/Do` call into a fake Image XObject using
+`/DCTDecode` - a codec this reader doesn't implement - proving that
+resolution failure is swallowed silently rather than losing the page's
+real text) confirming the exact expected splice: `"Direct text
+before.\nText from inside the form. Direct text after."`. Confirmed as a
+pure addition for every already-working file via `diff` against the
+pre-change binary across the entire committed PDF fixture corpus - zero
+byte differences. Re-run against the real 666-PDF corpus after the
+isolation fix: total PDF failures returned to exactly 54 (matching the
+pre-this-pass baseline, confirming the regression was fully closed, not
+just reduced), while 62 real files that previously extracted no text at
+all (or only partial text) now extract real, meaningful content - not
+just the two lease-document files the encryption pass had already found,
+but a much broader real-world shape: PowerPoint-to-PDF slide exports
+(Deakin university lecture slides, spot-checked and confirmed to contain
+genuine slide text - "Emergency Evacuation Information", real lecture
+content), e-signature caption overlays, payslips, and travel documents.
+Clean across default/`pdf`/`full`, matching each build's own established
+clippy baseline exactly - one new finding this pass's own doc comments
+introduced (a `doc_lazy_continuation` lint from a paragraph that
+happened to open with a dash, misread as an unindented markdown list
+continuation, the same lint class this project has hit before) was
+fixed by rewording rather than added to the tolerated baseline.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15631,19 +15728,19 @@ established baselines exactly.
   no pypdf) would break the "no fixture, no trust" rule, and CID codes
   without a CMap are genuinely unmappable (Adobe's public ROS CMaps were
   judged out of scope). Subset-gid (`/g0`) and fragment (`parenlefttp`)
-  glyph names, LZWDecode streams, a Form XObject's own nested content
-  (a `/Do`-invoked form - as opposed to an image - never recursed into
-  at all, so any real page text living only inside one, a common shape
-  for e-signature caption overlays, isn't extracted), and image-only
-  scanned pages (present record, missing text - OCR is out of scope)
-  round out the same disclosed-boundary set; annotations and AcroForm
-  field values are not surfaced at all. Encryption is decrypted with an
-  empty user password (the Standard Security Handler's classic `/V`
-  1/2/4 revisions, RC4 and AES-128) - a genuine non-empty user password,
-  or `/V` 5 (AES-256, `/R` 5/6, which needs a second, SHA-256/384/512-
-  based key derivation this project doesn't hand-roll yet), both refuse
-  cleanly rather than guess at a password or attempt an unsupported
-  cipher. A
+  glyph names, LZWDecode streams, and image-only scanned pages (present
+  record, missing text - OCR is out of scope) round out the same
+  disclosed-boundary set; annotations and AcroForm field values are not
+  surfaced at all. Encryption is decrypted with an empty user password
+  (the Standard Security Handler's classic `/V` 1/2/4 revisions, RC4 and
+  AES-128) - a genuine non-empty user password, or `/V` 5 (AES-256,
+  `/R` 5/6, which needs a second, SHA-256/384/512-based key derivation
+  this project doesn't hand-roll yet), both refuse cleanly rather than
+  guess at a password or attempt an unsupported cipher. A Form XObject's
+  own nested content (a `/Do`-invoked form) is recursed into for its own
+  text-showing operators; an Image XObject, or a Form/Image resolution
+  failure of any kind (an unsupported codec, a bad predictor), is
+  silently skipped rather than costing the rest of the page. A
   content stream's FlateDecode payload that's genuinely truncated
   mid-DEFLATE-block (a real, common corpus shape - an interrupted
   download or write) is no longer an automatic refusal: every complete

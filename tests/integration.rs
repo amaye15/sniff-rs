@@ -13678,3 +13678,22 @@ fn pdf_salvages_page_text_from_a_flate_stream_truncated_partway_through() {
         ])
     );
 }
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_recurses_into_a_form_xobject_but_skips_an_unreadable_image_xobject() {
+    // A real, common shape this project's reader never handled at all
+    // before: a page's own `/Do` operator invoking a Form XObject (its
+    // own nested content stream, e.g. PowerPoint-to-PDF slide exports
+    // and e-signature caption overlays both lean on this) - its text
+    // must be recursed into and spliced in the right position relative
+    // to the page's own direct text before/after it. The same page also
+    // references a second XObject shaped like an Image using a codec
+    // this reader doesn't implement (DCTDecode) - resolving it fails,
+    // and that failure must never cost the rest of the page's real text.
+    let doc = run_json("edge_pdf_form_xobject.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_form_xobject"), "text")["sample_values"],
+        serde_json::json!(["Direct text before.\nText from inside the form. Direct text after."])
+    );
+}
