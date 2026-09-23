@@ -52748,9 +52748,25 @@ mod pdf_support {
         let mut text = text_acc.into_profile("text".to_string(), kept);
         let stats = &reader.text_stats;
         let mut disclosed = Vec::new();
-        if stats.unmapped_codes > 0 {
+        if !stats.undecodable_fonts.is_empty() {
             disclosed.push(format!(
-                "{} character code(s) had no Unicode mapping in their font and read as U+FFFD",
+                "{} font(s) couldn't be decoded at all, so their text reads as U+FFFD ({}: {})",
+                stats.undecodable_fonts.len(),
+                if stats.undecodable_fonts.len() == 1 {
+                    "reason"
+                } else {
+                    "first"
+                },
+                stats.first_font_failure.as_deref().unwrap_or("unknown")
+            ));
+        }
+        if stats.unmapped_codes > 0 {
+            let why = match &stats.first_code_gap {
+                Some(reason) => format!(" (first known reason: {reason})"),
+                None => String::new(),
+            };
+            disclosed.push(format!(
+                "{} character code(s) had no Unicode mapping in their font and read as U+FFFD{why}",
                 stats.unmapped_codes
             ));
         }
@@ -52945,8 +52961,71 @@ mod pdf_support {
     #[derive(Default)]
     struct PdfTextStats {
         unmapped_codes: usize,
+        /// Why the first shown code that read as U+FFFD had no mapping,
+        /// when that's known at font-build time (an unknown glyph name,
+        /// an unassigned code).
+        first_code_gap: Option<String>,
+        /// Fonts that couldn't be built at all, by object (a font used on
+        /// every page counts once), and why the first one failed.
+        undecodable_fonts: HashSet<String>,
+        first_font_failure: Option<String>,
         skipped_forms: usize,
         first_skip_reason: Option<String>,
+    }
+
+    impl PdfTextStats {
+        fn note_code_gap(&mut self, reason: impl FnOnce() -> String) {
+            if self.first_code_gap.is_none() {
+                self.first_code_gap = Some(reason());
+            }
+        }
+    }
+
+    /// The innermost message of an error's cause chain - the actual
+    /// problem, without the "failed reading page N of <path>" context
+    /// wrapped around it on the way up.
+    fn root_cause(e: &Error) -> &str {
+        let mut cur = e;
+        while let Some(next) = cur.source.as_deref() {
+            cur = next;
+        }
+        &cur.message
+    }
+
+    /// An error message without the leading `"<path>" ` every reader error
+    /// carries - the notes it's quoted into already belong to that file.
+    fn without_path_prefix(message: &str, path: &Path) -> String {
+        let prefix = format!("{path:?} ");
+        message.strip_prefix(&prefix).unwrap_or(message).to_string()
+    }
+
+    /// The stand-in for a font `build_font` couldn't build (no usable
+    /// encoding, an empty ToUnicode, a malformed font dictionary, or a
+    /// name missing from the resources): every code reads as U+FFFD -
+    /// counted like any other unmapped code - so one unmappable font (a
+    /// bullet or barcode font, typically) costs only its own text rather
+    /// than the whole document. A composite Identity font keeps its real
+    /// two-byte width, so each of its codes is one U+FFFD, not two.
+    fn undecodable_font(reader: &mut PdfReader, font_obj: Option<&PdfObj>, path: &Path) -> PdfFont {
+        let width = match font_obj.map(|f| reader.resolve(f, 0, path)) {
+            Some(Ok(PdfObj::Dict(d))) if matches!(d.get(b"Subtype".as_slice()), Some(PdfObj::Name(s)) if s == b"Type0") => {
+                match d
+                    .get(b"Encoding".as_slice())
+                    .map(|e| reader.resolve(e, 0, path))
+                {
+                    Some(Ok(PdfObj::Name(n))) if n == b"Identity-H" || n == b"Identity-V" => {
+                        CodeWidth::Two
+                    }
+                    _ => CodeWidth::Variable,
+                }
+            }
+            _ => CodeWidth::One,
+        };
+        PdfFont {
+            cmap: HashMap::new(),
+            table: std::array::from_fn(|_| "\u{FFFD}".to_string()),
+            width,
+        }
     }
 
     impl PdfReader {
@@ -58043,18 +58122,25 @@ mod pdf_support {
                             }
                         }
                     }
+                    // A shown code with no mapping reads as U+FFFD (its
+                    // table slot); only the reason is recorded here, for
+                    // `columns_from_pdf` to disclose.
                     if let Some((code, glyph)) = shown_unknown_glyph(required, &unknown, &cmap) {
-                        bail!(
-                            "{path:?} font {font_desc} maps code {code} to unknown glyph /{}",
-                            String::from_utf8_lossy(glyph)
-                        );
+                        reader.text_stats.note_code_gap(|| {
+                            format!(
+                                "font {font_desc} maps code {code} to unknown glyph /{}",
+                                String::from_utf8_lossy(glyph)
+                            )
+                        });
                     }
                     if needs_coverage_check
                         && let Some(missing) = first_unmapped_code(required, &mapped)
                     {
-                        bail!(
-                            "{path:?} font {font_desc} shows code {missing} with no mapping (no base encoding, no ToUnicode)"
-                        );
+                        reader.text_stats.note_code_gap(|| {
+                            format!(
+                                "font {font_desc} shows code {missing} with no mapping (no base encoding, no ToUnicode)"
+                            )
+                        });
                     }
                 }
                 _ => bail!("{path:?} font {font_desc} has a malformed /Encoding"),
@@ -58075,15 +58161,19 @@ mod pdf_support {
                     let mut unknown = BTreeMap::new();
                     fill_program_table(&mut table, &names, &mut mapped, &mut unknown);
                     if let Some((code, glyph)) = shown_unknown_glyph(required, &unknown, &cmap) {
-                        bail!(
-                            "{path:?} font {font_desc} maps code {code} to unknown glyph /{} (in its embedded font program's built-in encoding)",
-                            String::from_utf8_lossy(glyph)
-                        );
+                        reader.text_stats.note_code_gap(|| {
+                            format!(
+                                "font {font_desc} maps code {code} to unknown glyph /{} (in its embedded font program's built-in encoding)",
+                                String::from_utf8_lossy(glyph)
+                            )
+                        });
                     }
                     if let Some(missing) = first_unmapped_code(required, &mapped) {
-                        bail!(
-                            "{path:?} font {font_desc} shows code {missing}, which its embedded font program's built-in encoding doesn't assign (no /Encoding, no /ToUnicode)"
-                        );
+                        reader.text_stats.note_code_gap(|| {
+                            format!(
+                                "font {font_desc} shows code {missing}, which its embedded font program's built-in encoding doesn't assign"
+                            )
+                        });
                     }
                 }
                 ImplicitBase::Standard => fill_standard_table(&mut table),
@@ -58520,15 +58610,36 @@ mod pdf_support {
                         }
                         let key = (scope, font.clone());
                         if !font_cache.contains_key(&key) {
-                            let fdict = fonts.get(&font).ok_or_else(|| {
-                                anyhow!(
-                                    "{path:?} page {page_no} uses undefined font /{}",
-                                    String::from_utf8_lossy(&font)
-                                )
-                            })?;
                             let desc = format!("/{}/page{page_no}", String::from_utf8_lossy(&font));
                             let req = required.get(&font).unwrap_or(&no_codes);
-                            let built = build_font(self, fdict, &desc, req, path)?;
+                            let fdict = fonts.get(&font);
+                            let built = match fdict {
+                                Some(fdict) => build_font(self, fdict, &desc, req, path),
+                                None => Err(anyhow!(
+                                    "{path:?} page {page_no} uses undefined font /{}",
+                                    String::from_utf8_lossy(&font)
+                                )),
+                            };
+                            // A font that can't be built costs only its own
+                            // text: it reads as U+FFFD, and the failure is
+                            // counted (once per font object) and disclosed on
+                            // the `text` column - never a silent gap, and no
+                            // longer the whole document's refusal.
+                            let built = match built {
+                                Ok(built) => built,
+                                Err(e) => {
+                                    let id = match fdict {
+                                        Some(PdfObj::Ref(n, _)) => format!("obj {n}"),
+                                        _ => desc.clone(),
+                                    };
+                                    self.text_stats.undecodable_fonts.insert(id);
+                                    if self.text_stats.first_font_failure.is_none() {
+                                        self.text_stats.first_font_failure =
+                                            Some(without_path_prefix(&e.to_string(), path));
+                                    }
+                                    undecodable_font(self, fdict, path)
+                                }
+                            };
                             font_cache.insert(key.clone(), built);
                         }
                         let (text, unmapped) = font_cache
@@ -58639,11 +58750,11 @@ mod pdf_support {
                                 ) = before;
                                 self.text_stats.skipped_forms += 1;
                                 if self.text_stats.first_skip_reason.is_none() {
-                                    let reason = e.to_string();
-                                    let prefix = format!("{path:?} ");
-                                    self.text_stats.first_skip_reason = Some(
-                                        reason.strip_prefix(&prefix).unwrap_or(&reason).to_string(),
-                                    );
+                                    self.text_stats.first_skip_reason = Some(format!(
+                                        "Form /{} on page {page_no}: {}",
+                                        String::from_utf8_lossy(&name),
+                                        without_path_prefix(root_cause(&e), path)
+                                    ));
                                 }
                                 continue;
                             }

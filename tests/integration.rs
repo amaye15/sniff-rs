@@ -5439,7 +5439,7 @@ fn bom_prefixed_csv_reads_clean_column_names_not_a_crash() {
 #[test]
 fn ragged_csv_rows_produce_an_actionable_error_not_a_panic() {
     let output = Command::new(bin())
-        .args([fixture("malformed_ragged.csv").to_str().unwrap()])
+        .args([fixture("malformed_ragged.csv").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -5453,7 +5453,7 @@ fn ragged_csv_rows_produce_an_actionable_error_not_a_panic() {
 #[test]
 fn invalid_utf8_csv_produces_an_actionable_error_not_a_panic() {
     let output = Command::new(bin())
-        .args([fixture("malformed_invalid_utf8.csv").to_str().unwrap()])
+        .args([fixture("malformed_invalid_utf8.csv").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -5470,7 +5470,10 @@ fn deeply_nested_json_fails_cleanly_instead_of_a_stack_overflow() {
     // serde_json's own recursion limit protects the recursive flattener in
     // profile_json_path, rather than the process crashing.
     let output = Command::new(bin())
-        .args([fixture("malformed_deeply_nested.json").to_str().unwrap()])
+        .args([
+            fixture("malformed_deeply_nested.json").to_str().unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -5490,7 +5493,10 @@ fn deeply_nested_xml_fails_cleanly_instead_of_a_stack_overflow() {
     // clean error) before xml_nesting_too_deep's pre-parse scan was added.
     // This locks in the fix.
     let output = Command::new(bin())
-        .args([fixture("malformed_deeply_nested.xml").to_str().unwrap()])
+        .args([
+            fixture("malformed_deeply_nested.xml").to_str().unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -6019,7 +6025,10 @@ fn cbor_reads_half_precision_floats() {
 #[test]
 fn deeply_nested_cbor_fails_cleanly_instead_of_a_stack_overflow() {
     let output = Command::new(bin())
-        .args([fixture("malformed_deeply_nested.cbor").to_str().unwrap()])
+        .args([
+            fixture("malformed_deeply_nested.cbor").to_str().unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -6534,7 +6543,7 @@ fn syslog_rfc5424_does_not_force_a_mixed_z_and_offset_timestamp_column_into_one_
 #[allow(dead_code)]
 fn assert_fails_without_panicking(fixture_name: &str) {
     let output = Command::new(bin())
-        .args([fixture(fixture_name).to_str().unwrap()])
+        .args([fixture(fixture_name).to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(
@@ -6626,7 +6635,10 @@ fn msgpack_ascii_garbage_text_decodes_as_a_stream_of_small_integers() {
 #[test]
 fn deeply_nested_msgpack_fails_cleanly_instead_of_a_stack_overflow() {
     let output = Command::new(bin())
-        .args([fixture("malformed_deeply_nested.msgpack").to_str().unwrap()])
+        .args([
+            fixture("malformed_deeply_nested.msgpack").to_str().unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -6659,7 +6671,10 @@ fn deeply_nested_msgpack_fails_cleanly_instead_of_a_stack_overflow() {
 #[test]
 fn deeply_nested_toml_fails_cleanly_instead_of_a_stack_overflow() {
     let output = Command::new(bin())
-        .args([fixture("malformed_deeply_nested.toml").to_str().unwrap()])
+        .args([
+            fixture("malformed_deeply_nested.toml").to_str().unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -7017,7 +7032,7 @@ fn excel_header_only_sheet_and_unicode_content_both_work() {
 #[test]
 fn xml_empty_root_element_is_an_actionable_error_not_a_crash() {
     let output = Command::new(bin())
-        .args([fixture("edge_empty_root.xml").to_str().unwrap()])
+        .args([fixture("edge_empty_root.xml").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -7104,7 +7119,7 @@ fn ini_zero_byte_file_is_an_actionable_error_not_a_crash() {
     // own reader treats zero sections as an error - different from the
     // other two, but still a clean, actionable one rather than a panic.
     let output = Command::new(bin())
-        .args([fixture("edge_empty_doc.ini").to_str().unwrap()])
+        .args([fixture("edge_empty_doc.ini").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -13340,7 +13355,7 @@ fn ipynb_recognizes_semantic_types_through_cells() {
 #[cfg(feature = "ipynb")]
 fn ipynb_without_cells_array_is_an_actionable_error() {
     let output = Command::new(bin())
-        .args([fixture("edge_ipynb_no_cells.ipynb").to_str().unwrap()])
+        .args([fixture("edge_ipynb_no_cells.ipynb").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -13358,7 +13373,10 @@ fn ipynb_non_object_cell_is_an_actionable_error() {
     // Valid JSON, invalid notebook: the error must name the malformed
     // element, not mislabel the file as unparseable.
     let output = Command::new(bin())
-        .args([fixture("edge_ipynb_scalar_cell.ipynb").to_str().unwrap()])
+        .args([
+            fixture("edge_ipynb_scalar_cell.ipynb").to_str().unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -13462,17 +13480,21 @@ fn pdf_differences_without_a_base_apply_to_the_implicit_base_encoding() {
         serde_json::json!(["AB"])
     );
     // A symbolic font with no embedded program has no base to fall back
-    // on: showing a code its differences don't cover still refuses,
-    // naming the code.
-    let output = Command::new(bin())
-        .args([fixture("edge_pdf_differences_unmapped_symbolic.pdf")
-            .to_str()
-            .unwrap()])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("shows code 66"), "got: {stderr}");
+    // on: a shown code its differences don't cover reads as U+FFFD, and
+    // the note names the code.
+    let doc = run_json("edge_pdf_differences_unmapped_symbolic.pdf", &[]);
+    let text = column(
+        table(&doc, "edge_pdf_differences_unmapped_symbolic"),
+        "text",
+    );
+    assert_eq!(text["sample_values"], serde_json::json!(["A\u{FFFD}"]));
+    let notes = text["notes"].as_str().unwrap();
+    assert!(
+        notes.contains(
+            "font /F1/page1 shows code 66 with no mapping (no base encoding, no ToUnicode)"
+        ),
+        "got: {notes}"
+    );
 }
 
 #[test]
@@ -13502,24 +13524,29 @@ fn pdf_reads_a_symbolic_cff_fonts_own_built_in_encoding() {
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_program_encoding_refuses_an_unknown_or_unassigned_shown_code() {
+fn pdf_program_encoding_gaps_read_as_replacement_chars_and_say_why() {
+    // Code 65 is `Gamma` in the CFF program's own encoding; the second
+    // shown code is an unknown glyph (200) or one the program leaves
+    // unassigned (66). Only that code reads as U+FFFD.
     for (name, needle) in [
         (
-            "edge_pdf_cff_builtin_unknown_glyph.pdf",
-            "maps code 200 to unknown glyph /zzzunknownglyph",
+            "edge_pdf_cff_builtin_unknown_glyph",
+            "font /F1/page1 maps code 200 to unknown glyph /zzzunknownglyph",
         ),
         (
-            "edge_pdf_cff_builtin_unassigned_code.pdf",
-            "shows code 66, which its embedded font program's built-in encoding doesn't assign",
+            "edge_pdf_cff_builtin_unassigned_code",
+            "font /F1/page1 shows code 66, which its embedded font program's built-in encoding doesn't assign",
         ),
     ] {
-        let output = Command::new(bin())
-            .args([fixture(name).to_str().unwrap()])
-            .output()
-            .expect("failed to run binary");
-        assert!(!output.status.success(), "{name}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(needle), "{name}: {stderr}");
+        let doc = run_json(&format!("{name}.pdf"), &[]);
+        let text = column(table(&doc, name), "text");
+        assert_eq!(
+            text["sample_values"],
+            serde_json::json!(["\u{0393}\u{FFFD}"]),
+            "{name}"
+        );
+        let notes = text["notes"].as_str().unwrap();
+        assert!(notes.contains(needle), "{name}: {notes}");
     }
 }
 
@@ -13553,33 +13580,35 @@ fn pdf_identity_h_codes_are_two_bytes_and_unmapped_ones_are_disclosed() {
         ),
         "got: {notes}"
     );
-    // A ToUnicode that's present but maps nothing is named as such.
-    let output = Command::new(bin())
-        .args([fixture("edge_pdf_identity_h_empty_tounicode.pdf")
-            .to_str()
-            .unwrap()])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A ToUnicode that's present but maps nothing leaves the whole font
+    // undecodable - each two-byte code is one U+FFFD, not two - and the
+    // note names that shape rather than calling the ToUnicode missing.
+    let doc = run_json("edge_pdf_identity_h_empty_tounicode.pdf", &[]);
+    let text = column(table(&doc, "edge_pdf_identity_h_empty_tounicode"), "text");
+    assert_eq!(
+        text["sample_values"],
+        serde_json::json!(["\u{FFFD}\u{FFFD}"])
+    );
+    let notes = text["notes"].as_str().unwrap();
     assert!(
-        stderr.contains("uses /Identity-H with a /ToUnicode that maps no codes"),
-        "got: {stderr}"
+        notes.contains("uses /Identity-H with a /ToUnicode that maps no codes"),
+        "got: {notes}"
     );
 }
 
 #[test]
 #[cfg(feature = "pdf")]
 fn pdf_a_form_whose_text_cant_be_decoded_is_skipped_and_disclosed() {
-    // The page's own text survives; the Form (whose only font is a bare
-    // symbolic /Symbol) is skipped - and the `text` column now says so,
-    // with the reason, instead of losing it silently.
+    // The page's own text survives; the Form's content stream has a stray
+    // `)` with more content after it - genuinely malformed, not a font
+    // problem - so the Form is skipped, and the `text` column says so,
+    // naming the Form and the root cause, instead of losing it silently.
     let doc = run_json("edge_pdf_form_skipped_is_disclosed.pdf", &[]);
     let text = column(table(&doc, "edge_pdf_form_skipped_is_disclosed"), "text");
     assert_eq!(text["sample_values"], serde_json::json!(["Kept"]));
     let notes = text["notes"].as_str().unwrap();
     assert!(
-        notes.contains("text of 1 Form XObject(s) skipped because it couldn't be decoded (reason: font /F9/page1 has no usable encoding"),
+        notes.contains("text of 1 Form XObject(s) skipped because it couldn't be decoded (reason: Form /Fm0 on page 1: unexpected byte 0x29"),
         "got: {notes}"
     );
 }
@@ -13629,49 +13658,47 @@ fn pdf_resolves_full_agl_tex_and_underscore_component_glyph_names() {
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_unknown_glyph_name_only_refuses_when_a_page_needs_it() {
+fn pdf_an_unknown_glyph_name_costs_only_the_codes_a_page_shows() {
     // `/Differences [65 /A /zzznotaglyph]`: a font may name glyphs a page
-    // never shows - only showing code 66 without a ToUnicode entry for it
-    // is a refusal, and that refusal names the code and the glyph.
+    // never shows, and a ToUnicode entry covers one it does. Only a shown
+    // code with neither reads as U+FFFD - the rest of the font still
+    // decodes - and the note names the code and the glyph.
     let doc = run_json("edge_pdf_unknown_glyph_unshown.pdf", &[]);
-    assert_eq!(
-        column(table(&doc, "edge_pdf_unknown_glyph_unshown"), "text")["sample_values"],
-        serde_json::json!(["A"])
-    );
+    let text = column(table(&doc, "edge_pdf_unknown_glyph_unshown"), "text");
+    assert_eq!(text["sample_values"], serde_json::json!(["A"]));
+    assert!(!text["notes"].as_str().unwrap().contains("U+FFFD"));
     let doc = run_json("edge_pdf_unknown_glyph_tounicode.pdf", &[]);
     assert_eq!(
         column(table(&doc, "edge_pdf_unknown_glyph_tounicode"), "text")["sample_values"],
         serde_json::json!(["A\u{263A}"])
     );
-    let output = Command::new(bin())
-        .args([fixture("edge_pdf_unknown_glyph_shown.pdf")
-            .to_str()
-            .unwrap()])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let doc = run_json("edge_pdf_unknown_glyph_shown.pdf", &[]);
+    let text = column(table(&doc, "edge_pdf_unknown_glyph_shown"), "text");
+    assert_eq!(text["sample_values"], serde_json::json!(["A\u{FFFD}"]));
+    let notes = text["notes"].as_str().unwrap();
     assert!(
-        stderr.contains("maps code 66 to unknown glyph /zzznotaglyph"),
-        "got: {stderr}"
+        notes.contains("1 character code(s) had no Unicode mapping in their font and read as U+FFFD (first known reason: font /F1/page1 maps code 66 to unknown glyph /zzznotaglyph)"),
+        "got: {notes}"
     );
 }
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_differences_running_past_code_255_is_a_clean_refusal_not_a_panic() {
+fn pdf_differences_running_past_code_255_degrades_that_font_not_a_panic() {
     // `/Differences [255 /a /b]`: `/b` would land on code 256. This used
-    // to index past the 256-entry table and panic.
-    let output = Command::new(bin())
-        .args([fixture("edge_pdf_differences_overflow.pdf")
-            .to_str()
-            .unwrap()])
-        .output()
-        .expect("failed to run binary");
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("past code 255"), "got: {stderr}");
-    assert!(!stderr.contains("panicked"), "got: {stderr}");
+    // to index past the 256-entry table and panic; now the malformed font
+    // reads as U+FFFD and the note says why.
+    let doc = run_json("edge_pdf_differences_overflow.pdf", &[]);
+    let text = column(table(&doc, "edge_pdf_differences_overflow"), "text");
+    assert_eq!(
+        text["sample_values"],
+        serde_json::json!(["\u{FFFD}\u{FFFD}"])
+    );
+    let notes = text["notes"].as_str().unwrap();
+    assert!(
+        notes.contains("has a /Differences entry past code 255"),
+        "got: {notes}"
+    );
 }
 
 #[test]
@@ -13707,7 +13734,7 @@ fn pdf_encrypted_is_a_clean_refusal() {
     // to derive a key) still fails cleanly, naming the missing field -
     // never a crash or a silent wrong-key decrypt.
     let output = Command::new(bin())
-        .args([fixture("edge_pdf_encrypted.pdf").to_str().unwrap()])
+        .args([fixture("edge_pdf_encrypted.pdf").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -13790,7 +13817,7 @@ fn pdf_with_a_real_user_password_refuses_distinctly_from_a_malformed_encrypt_dic
 #[cfg(feature = "pdf")]
 fn pdf_lzw_is_a_clean_refusal() {
     let output = Command::new(bin())
-        .args([fixture("edge_pdf_lzw.pdf").to_str().unwrap()])
+        .args([fixture("edge_pdf_lzw.pdf").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
@@ -13816,22 +13843,22 @@ fn pdf_falls_back_to_standard_encoding_for_a_nonsymbolic_font() {
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_symbolic_font_without_tounicode_is_still_a_clean_refusal() {
-    // A *symbolic* font (FontDescriptor /Flags bit 3, or literally
-    // /Symbol/ZapfDingbats with no FontDescriptor at all) has no safe
-    // fixed base encoding to fall back to - its real glyph mapping
-    // lives only inside the embedded font program itself, which this
-    // reader doesn't parse - so this shape must still refuse cleanly,
-    // not silently misdecode through StandardEncoding.
-    let output = Command::new(bin())
-        .args([fixture("edge_pdf_symbolic_no_encoding.pdf")
-            .to_str()
-            .unwrap()])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("no usable encoding"), "got: {stderr}");
+fn pdf_a_symbolic_font_with_no_mapping_reads_as_replacement_chars_and_says_why() {
+    // A bare /Symbol font with no /Encoding, no /ToUnicode, and no program
+    // to read an encoding from can't be mapped - but it costs only its own
+    // text (U+FFFD per code), and the `text` column says which font and
+    // why, instead of refusing the whole document.
+    let doc = run_json("edge_pdf_symbolic_no_encoding.pdf", &[]);
+    let text = column(table(&doc, "edge_pdf_symbolic_no_encoding"), "text");
+    assert_eq!(
+        text["sample_values"],
+        serde_json::json!(["\u{FFFD}\u{FFFD}"])
+    );
+    let notes = text["notes"].as_str().unwrap();
+    assert!(
+        notes.contains("1 font(s) couldn't be decoded at all, so their text reads as U+FFFD (reason: font /F1/page1 has no usable encoding"),
+        "got: {notes}"
+    );
 }
 
 #[test]

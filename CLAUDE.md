@@ -15853,6 +15853,67 @@ ToUnicode mappings - flattening those would be full NFKC, a different
 decision). The one file still below 99% is a TeX practical whose Form
 XObject is skipped - and, as of the previous pass, says so in its notes.
 
+**A follow-up pass turned every font-level refusal into disclosed
+U+FFFD, reversing this reader's earlier "a font it can't map fails the
+whole file" rule.** Measured before deciding: of the 24 files the corpus
+sweep still failed, 18 were PDFs, and all 18 were font-level refusals - a
+symbolic font with no usable mapping, an Identity-H font whose ToUnicode
+maps nothing, a shown code whose glyph name resolves nowhere - in files
+whose other text decoded fine. Two were textbooks with 0.9M and 3.1M
+characters of readable text, lost over under 0.3% of their codes. A
+refusal there discards far more real data than it protects, so the unit
+of failure shrank to the thing that actually failed. A code the font
+can't map (an unknown glyph name a page shows, a code a program's
+encoding leaves unassigned, an Identity-H code a partial ToUnicode
+misses) reads as one U+FFFD, and the first such reason is kept. A font
+that can't be built at all (no usable encoding, an empty ToUnicode, a
+`Tf` naming a font the resources don't define) is replaced by
+`undecodable_font`, which reads every code as U+FFFD at the font's own
+code width - two bytes for Identity-H/V, longest-match for any other
+composite font, one byte otherwise - so a composite font's codes don't
+double into twice as many replacement characters. A Form XObject whose
+content fails to parse is still skipped, but its note now names the
+Form, its page, and the root cause without the file-path prefix. Both
+counts land in the `text` column's notes (`"3 font(s) couldn't be
+decoded at all, so their text reads as U+FFFD (first: ...)"`, `"655
+character code(s) had no Unicode mapping in their font and read as
+U+FFFD (first known reason: ...)"`). U+FFFD rather than dropping the
+code: Unicode designates it for exactly this, it can't be mistaken for
+data, and a dropped code would make "no gap" look the same as "gap".
+Structural failures - a broken xref, LZWDecode, a real user password, a
+malformed page content stream - still refuse the file, since there the
+pages themselves can't be trusted.
+
+Verified against the corpus and PDFium: failures went from 24 to 6
+(every PDF refusal now reads; the 6 left aren't PDFs), with 0 new
+failures and exactly 2 previously-succeeding outputs changed - the TeX
+practical above, whose skipped Form now decodes (PDFium overlap 0.863 to
+0.997), and a tax receipt whose 33 checkbox widget Forms (an unencoded
+ZapfDingbats) now read as 33 disclosed U+FFFD instead of being skipped
+(0.9993 to 0.9991). Of the 18 newly readable files, 10 score at least
+0.939 against PDFium (the two textbooks 0.991 and 0.995). The other
+eight were checked rather than taken at face value. Four score 0.77-0.85
+and lose exactly the text in fonts that carry no Unicode meaning: a Data
+Matrix barcode font and an OCR-B font (symbolic TrueType with no
+`/Encoding`, where ISO 32000-1 9.6.6.4 maps codes to glyphs and never to
+text) in three tax notices, and Wingdings/SymbolMT Identity-H subsets
+with empty ToUnicode in a benefits form - PDFium prints each code as a
+character there. Four read entirely as U+FFFD, and that's the honest
+answer: every font in them is an Identity-H TrueType subset whose
+ToUnicode is empty and whose program has neither a `cmap` nor a `post`
+table (checked with `fontTools`), so no Unicode information exists
+anywhere in the file. PDFium's "text" for them is glyph IDs printed as
+characters, a constant offset from the real letters (the standard
+Macintosh glyph order, GID = code - 29) that only guessing the font's
+glyph order could undo. Seven tests were rewritten from refusal to
+degradation assertions; `edge_pdf_form_skipped_is_disclosed.pdf` was
+rebuilt so its Form fails at content parsing (a stray `)`), since a
+font it can't map no longer skips a Form. The failure-expecting
+integration tests used to run the binary with no output path, so a
+fixture that stopped failing wrote `<name>.dictionary.md` into
+`tests/fixtures` - which this change's own first test run did. Every one
+of them now passes `-`.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -16163,19 +16224,21 @@ established baselines exactly.
 - **PDF text decoding covers WinAnsi/MacRoman/Differences/ToUnicode
   fonts plus each font's implicit built-in encoding** - an embedded Type 1
   or CFF program's own vector, or StandardEncoding for a nonsymbolic font
-  with no such program. A *symbolic* font with no `/Encoding`, no
-  `/ToUnicode`, and no readable Type 1/CFF program - a symbolic TrueType
-  font, a bare standard-14 Symbol/ZapfDingbats, or a program using CFF's
-  predefined Expert encoding - is a clear, disclosed error naming the
-  font. The same goes for a composite/CID font with no usable
-  `/ToUnicode`: CID codes without a CMap are unmappable here (reading an
-  embedded TrueType program's own `cmap`, and Adobe's public ROS CMaps,
-  are not implemented). A *shown* code whose glyph name no list resolves - subset-gid
-  (`/g0`) and subset-renamed (`/H9024`) names, and the delimiter
-  fragments (`parenlefttp`) Adobe maps into the Private Use Area - still
-  refuses unless ToUnicode covers it (an unknown name at a code the page
-  never shows no longer matters). LZWDecode streams, and image-only scanned pages (present
-  record, missing text - OCR is out of scope) round out the same
+  with no such program. What no mapping covers reads as U+FFFD and is
+  disclosed in the `text` column's notes (count plus first reason) -
+  never a whole-file refusal, and never a guessed character. A *symbolic*
+  font with no `/Encoding`, no `/ToUnicode`, and no readable Type 1/CFF
+  program - a symbolic TrueType font, a bare standard-14
+  Symbol/ZapfDingbats, or a program using CFF's predefined Expert
+  encoding - reads entirely as U+FFFD, as does a composite/CID font with
+  no usable `/ToUnicode`: CID codes without a CMap are unmappable here
+  (reading an embedded TrueType program's own `cmap`, and Adobe's public
+  ROS CMaps, are not implemented). A *shown* code whose glyph name no list
+  resolves - subset-gid (`/g0`) and subset-renamed (`/H9024`) names, and
+  the delimiter fragments (`parenlefttp`) Adobe maps into the Private Use
+  Area - reads as U+FFFD unless ToUnicode covers it. LZWDecode streams
+  (a whole-file refusal), and image-only scanned pages (present record,
+  missing text - OCR is out of scope) round out the same
   disclosed-boundary set; annotations and AcroForm field values are not
   surfaced at all. Encryption is decrypted with an empty user password
   across every Standard Security Handler revision the PDF spec defines -
@@ -16187,11 +16250,9 @@ established baselines exactly.
   text-showing operators; an Image XObject, or an XObject that can't
   even be resolved (an unsupported codec, a bad predictor - which of the
   two it was can't be known), is silently skipped rather than costing the
-  rest of the page. A Form whose own text fails to decode is skipped too,
-  but *disclosed*: the `text` column's notes count skipped Forms and give
-  the first reason, and likewise count every character code that read as
-  U+FFFD (a composite font's code its ToUnicode doesn't map, a simple
-  font's code its encoding leaves unassigned). A
+  rest of the page. A Form whose own content fails to parse is skipped
+  too, but *disclosed*: the `text` column's notes count skipped Forms and
+  name the first one, its page, and the root cause. A
   content stream's FlateDecode payload that's genuinely truncated
   mid-DEFLATE-block (a real, common corpus shape - an interrupted
   download or write) is no longer an automatic refusal: every complete

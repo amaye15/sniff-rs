@@ -12,8 +12,8 @@ All notable changes to sniff-rs are documented here. Format follows
   with `/Prev` chains (plus bare-trailer files via index rebuild), object
   streams, FlateDecode (+ASCII85/ASCIIHex/RunLength, stacked),
   WinAnsi/MacRoman/Differences/ToUnicode font decoding, `%PDF-` content
-  sniffing. LZWDecode and fonts with no usable mapping are clean,
-  disclosed refusals, not guesses.
+  sniffing. LZWDecode is a clean refusal; text no font mapping covers
+  reads as U+FFFD, disclosed in the column's notes, never guessed.
 - PDF decryption with an empty user password, across every Standard
   Security Handler revision (RC4, AES-128, AES-256 `/R` 5 and 6);
   a real user password is a clean refusal.
@@ -24,19 +24,23 @@ All notable changes to sniff-rs are documented here. Format follows
   nonsymbolic font - so symbolic embedded fonts decode instead of
   refusing; glyph names resolve through Adobe's full Glyph List plus
   lcdf-typetools' TeX extensions and the AGL spec's `_` ligature rule.
-- PDF `text` column notes disclose lossy decoding: codes that read as
-  U+FFFD, and Form XObjects skipped because their text couldn't be decoded.
+- PDF `text` column notes disclose lossy decoding: fonts and codes that
+  read as U+FFFD (with the first reason), and Form XObjects skipped
+  because their content couldn't be parsed.
 
 ### Fixed
 - PDF: a font selected inside `q ... Q` no longer leaks past `Q`; Form
   XObject fonts no longer collide across pages; Identity-H codes decode at
-  their real two-byte width; `/Differences [255 /a /b]` is a clean
-  refusal instead of a panic; an unknown glyph name only refuses when a
-  page actually shows it; `propersubset`/`propersuperset` map to U+2282/3.
+  their real two-byte width; `/Differences [255 /a /b]` degrades that
+  font instead of panicking; an unknown glyph name only costs the codes a
+  page actually shows; `propersubset`/`propersuperset` map to U+2282/3.
 - PDF text expands `ﬁ`-style presentation-form ligatures to letters
   (Unicode's own NFKC mapping).
 
 ### Changed
+- PDF: a font or code with no Unicode mapping now reads as U+FFFD with a
+  disclosure note instead of failing the whole file (18 real files that
+  used to be refused now read; structural errors still refuse).
 - Default build is now every format plus SIMD (`default = ["full"]`).
   A plain build requires a nightly toolchain; `--no-default-features`
   gives a minimal stable-compatible build (CSV/TSV/JSON/JSONL,
