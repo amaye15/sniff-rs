@@ -51244,16 +51244,20 @@ mod pdf_support {
     /// so the page index alone stops being a safe cache key once a Form
     /// XObject's own, independent `/Resources` enters the picture (see
     /// `render_content_text`). Every Form XObject invocation gets its
-    /// own fresh scope from a per-page running counter, rather than
-    /// tracking the XObject's own real object identity - simpler, at the
-    /// honest cost of never sharing a built font across two separate
-    /// invocations of the identical XObject on one page, a real but
-    /// minor performance tradeoff for what's already a rare, small code
-    /// path (a signature stamp's own tiny form, not a whole document).
+    /// own fresh scope - its page plus a per-page running counter -
+    /// rather than tracking the XObject's own real object identity:
+    /// simpler, at the honest cost of never sharing a built font across
+    /// two invocations of the identical XObject, a minor performance
+    /// tradeoff. The page is part of the key because the font cache
+    /// lives for the whole document while the counter restarts on every
+    /// page: keyed by the counter alone, the first Form on page 14 reused
+    /// fonts built for the first Form on page 3, so a real slide deck's
+    /// later slides decoded their own `/F3` through an earlier slide's
+    /// entirely different `/F3`.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum FontScope {
         Page(usize),
-        XObject(u32),
+        XObject { page: usize, invocation: u32 },
     }
 
     /// Hand-rolled MD5 (RFC 1321) and RC4, plus AES-128 decrypt-only (the
@@ -58472,7 +58476,10 @@ mod pdf_support {
                             None => resources.clone(),
                         };
                         *xobject_counter += 1;
-                        let xscope = FontScope::XObject(*xobject_counter);
+                        let xscope = FontScope::XObject {
+                            page: page_no,
+                            invocation: *xobject_counter,
+                        };
                         // A Form's own content genuinely failing to parse
                         // (a malformed operand, an undefined font) is the
                         // same "not worth losing the rest of the page over"

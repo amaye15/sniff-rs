@@ -15758,6 +15758,24 @@ PDFium's text character for character, and nothing else moved.
 letter of "After" to `Z`, which the old reader leaked into the text after
 `Q` - along with a unit test for nested saves and an unbalanced `Q`.
 
+**A second real text bug from the Form XObject pass: Form fonts were
+cached under a key that collided across pages.** The Form XObject pass
+gave every Form invocation its own `FontScope` from a running counter -
+but the counter restarts on every page while the font cache lives for
+the whole document, so the first Form on page 14 was served the fonts
+built for the first Form on page 3. Slide decks exported with one Form
+per slide, each with its own `/F1`/`/F3` naming different fonts, hit this
+constantly: later slides decoded through earlier slides' fonts, which is
+where most of the NUL-and-Latin-1 garbage in this corpus's lecture PDFs
+came from (a Type0 font's two-byte codes pushed through a simple font's
+single-byte table). `FontScope::XObject` is now keyed by page and
+invocation. Measured on its own against the committed build, scored
+against PDFium's text: exactly 12 real outputs changed, all 12 closer to
+PDFium (three lecture decks went from 67-72% character overlap to
+99.6-100%), nothing worse, nothing else moved.
+`edge_pdf_form_fonts_scoped_per_page.pdf` locks it in - two pages whose
+Forms each name a different `/F1`.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not

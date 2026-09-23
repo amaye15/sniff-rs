@@ -13535,6 +13535,20 @@ fn pdf_reads_a_symbolic_type1_fonts_cleartext_encoding_vector() {
 
 #[test]
 #[cfg(feature = "pdf")]
+fn pdf_form_xobject_fonts_are_scoped_per_page_not_just_per_invocation() {
+    // Each page invokes its own Form, and each Form names a *different*
+    // font `/F1` (page 2's maps every letter of "Plain" to Z). The font
+    // cache used to key a Form's fonts by a counter that restarts on each
+    // page, so page 2 reused page 1's `/F1` and read "Plain" again.
+    let doc = run_json("edge_pdf_form_fonts_scoped_per_page.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_form_fonts_scoped_per_page"), "text")["sample_values"],
+        serde_json::json!(["Plain", "ZZZZZ"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
 fn pdf_restores_the_text_font_when_the_graphics_state_is_restored() {
     // `q BT /F2 Tf (x) Tj ET Q BT (After) Tj ET`: `After` is shown after
     // `Q` restored the graphics state, so it's in /F1 again. /F2 maps every
