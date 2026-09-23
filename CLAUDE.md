@@ -31,8 +31,8 @@ detection" below.
 ## Quick start
 
 ```bash
-cargo build --release                      # CSV/TSV/JSON/JSONL only, ~5-35s
-cargo build --release --features full      # every format, ~7-9 min clean cache
+cargo +nightly build --release                  # the default: every format + SIMD (nightly required)
+cargo build --release --no-default-features     # minimal stable build: CSV/TSV/JSON/JSONL, fixed-width, gzip
 
 ./target/release/sniff-rs data.csv
 ./target/release/sniff-rs events.jsonl out.md --samples 5
@@ -41,20 +41,25 @@ cargo build --release --features full      # every format, ~7-9 min clean cache
 ./target/release/sniff-rs ./data/ --output-dir ./dictionaries/  # batch mode - see below
 ```
 
-`cargo test` covers the default build; `cargo test --features full` covers
-every format. See "Testing" below.
+`cargo +nightly test` covers the default (every-format) build; `cargo test
+--no-default-features` covers the minimal stable one. See "Testing" below.
+A clean build takes seconds, not minutes - there are no dependencies to
+compile (measured: about 9 s for the full build, 5 s for the minimal one,
+on a 10-core machine).
 
-Every build above works on plain stable Rust - this project deliberately
-never depends on unstable/nightly-only APIs for anything a normal build
-needs. The one disclosed exception is entirely opt-in:
-`cargo +nightly build --release --features simd` accelerates the CSV
-reader's own byte-scanning loop, plus the XML/`.xlsx`/`.ods` byte-window
-scanners' own identically-shaped scan, with `std::simd` (portable SIMD,
-still unstable) - a real, consistent win for XML/spreadsheet files
-(never a measured regression), but genuinely worth it for CSV only when
-its fields run long (short-field CSVs measure *slower*) - see the
-Performance section's own write-up for the full, honest numbers before
-reaching for it.
+**The default build requires a nightly toolchain**, by deliberate project
+decision (commit `af7abbe`): `default = ["full"]`, and `full` includes
+`simd`, which uses `std::simd` (portable SIMD, still unstable - stable
+Rust fails with E0554). Every reader is still hand-rolled pure `std` with
+zero runtime dependencies, and `--no-default-features` is the
+stable-compatible escape hatch. Much of this file's history predates
+that decision and describes `simd` as an opt-in extra and `cargo build`
+as a stable CSV/JSON-only build - read those passages with that in mind.
+SIMD accelerates the CSV reader's byte scan and the XML/`.xlsx`/`.ods`/
+JSON/JSON5/plist byte-window scanners - a real, consistent win for XML/
+spreadsheet files, but for CSV only when fields run long (short-field CSVs
+measure *slower*); see the Performance section's own write-up for the
+full, honest numbers.
 
 ## Supported formats
 
@@ -5979,8 +5984,8 @@ Then, regardless of which shape:
 ## Testing
 
 ```bash
-cargo test                    # default build: csv/tsv/json/jsonl only
-cargo test --features full    # everything, including format-gated tests
+cargo +nightly test                       # the default build: every format (nightly required)
+cargo test --no-default-features          # the minimal stable build: csv/tsv/json/jsonl
 ```
 
 `tests/integration.rs` runs the *compiled binary* against fixtures in

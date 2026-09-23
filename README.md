@@ -7,8 +7,9 @@ sample values, and why.
 Reads CSV, TSV, JSON, JSON Lines, Parquet, Arrow IPC/Feather, Avro, Excel,
 SQLite, MessagePack, TOML, YAML, CBOR, INI, XML, fixed-width text, NumPy,
 Common/Combined access logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT,
-SPSS, ORC, BSON, plist, JSON5/JSONC, HAR, GeoJSON, MBOX, vCard, iCalendar —
-any of them gzip- or zstd-compressed — plus Delta Lake and Iceberg tables.
+SPSS, ORC, BSON, plist, JSON5/JSONC, HAR, GeoJSON, MBOX, vCard, iCalendar,
+Jupyter notebooks, and PDF page text — any of them gzip- or
+zstd-compressed — plus Delta Lake and Iceberg tables.
 Writes Markdown, rich JSON, JSON-Schema, or a runnable SQL script.
 `sniff-rs diff` compares two dictionaries and flags schema drift.
 
