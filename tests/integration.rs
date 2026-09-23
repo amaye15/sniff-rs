@@ -13588,13 +13588,33 @@ fn pdf_lzw_is_a_clean_refusal() {
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_standard_encoding_without_tounicode_is_a_clean_refusal() {
-    // A standard-14 font with neither /Encoding nor /ToUnicode has no
-    // machine-checkable table in this environment (no iconv codec, no
-    // pypdf oracle) - refusing loudly rather than shipping a
-    // from-memory StandardEncoding table no test could verify.
+fn pdf_falls_back_to_standard_encoding_for_a_nonsymbolic_font() {
+    // A standard-14 font with neither /Encoding nor /ToUnicode - PDF's
+    // own documented fallback (32000-1 9.6.6.2) for a *nonsymbolic* font
+    // in exactly this shape is Adobe StandardEncoding, cross-checked
+    // against pdfminer's own independent StandardEncoding table before
+    // being hand-rolled here (see `STANDARD_ENCODING`'s own doc
+    // comment) - no longer a disclosed refusal.
+    let doc = run_json("edge_pdf_standard_encoding.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_standard_encoding"), "text")["sample_values"],
+        serde_json::json!(["plain"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_symbolic_font_without_tounicode_is_still_a_clean_refusal() {
+    // A *symbolic* font (FontDescriptor /Flags bit 3, or literally
+    // /Symbol/ZapfDingbats with no FontDescriptor at all) has no safe
+    // fixed base encoding to fall back to - its real glyph mapping
+    // lives only inside the embedded font program itself, which this
+    // reader doesn't parse - so this shape must still refuse cleanly,
+    // not silently misdecode through StandardEncoding.
     let output = Command::new(bin())
-        .args([fixture("edge_pdf_standard_encoding.pdf").to_str().unwrap()])
+        .args([fixture("edge_pdf_symbolic_no_encoding.pdf")
+            .to_str()
+            .unwrap()])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());

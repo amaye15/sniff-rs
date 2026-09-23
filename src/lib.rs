@@ -54423,6 +54423,87 @@ mod pdf_support {
         }
     }
 
+    /// Adobe StandardEncoding (PDF 32000-1 Annex D.2) - a real font's
+    /// own PostScript built-in encoding for a nonsymbolic Type1 program
+    /// with no `/Encoding` entry at all in its PDF font dictionary,
+    /// PDF's own documented fallback (9.6.6.2) rather than a guess: a
+    /// real, embedded LaTeX/dvips font sampled from this project's own
+    /// corpus sweep for this feature (Computer Modern Roman/Italic)
+    /// declares `/Encoding StandardEncoding def` explicitly in its own
+    /// (unencrypted) Type1 header, confirmed by actually decompressing
+    /// and reading one before trusting this table applies at all - not
+    /// assumed from the spec's own fallback rule alone. Every glyph name
+    /// below (and its Unicode resolution, via the existing
+    /// `glyph_to_string` this project's `/Differences`-array decode
+    /// already trusts) was cross-checked against `pdfminer`'s own
+    /// independent `encodingdb.ENCODING` table - a real, separate
+    /// implementation's own StandardEncoding data, not transcribed from
+    /// memory the way this project's own history once declined to (see
+    /// the design philosophy section's own "no fixture, no trust"
+    /// reasoning this closes). Unmapped codes (`None`) - mostly the
+    /// C0/C1 control ranges and a handful of positions StandardEncoding
+    /// itself never assigns - decode to U+FFFD via `fill_standard_table`'s
+    /// own fallback, the same as every other base table here.
+    #[rustfmt::skip]
+    const STANDARD_ENCODING: [Option<&'static [u8]>; 256] = [
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        Some(b"space"), Some(b"exclam"), Some(b"quotedbl"), Some(b"numbersign"),
+        Some(b"dollar"), Some(b"percent"), Some(b"ampersand"), Some(b"quoteright"),
+        Some(b"parenleft"), Some(b"parenright"), Some(b"asterisk"), Some(b"plus"),
+        Some(b"comma"), Some(b"hyphen"), Some(b"period"), Some(b"slash"),
+        Some(b"zero"), Some(b"one"), Some(b"two"), Some(b"three"),
+        Some(b"four"), Some(b"five"), Some(b"six"), Some(b"seven"),
+        Some(b"eight"), Some(b"nine"), Some(b"colon"), Some(b"semicolon"),
+        Some(b"less"), Some(b"equal"), Some(b"greater"), Some(b"question"),
+        Some(b"at"), Some(b"A"), Some(b"B"), Some(b"C"),
+        Some(b"D"), Some(b"E"), Some(b"F"), Some(b"G"),
+        Some(b"H"), Some(b"I"), Some(b"J"), Some(b"K"),
+        Some(b"L"), Some(b"M"), Some(b"N"), Some(b"O"),
+        Some(b"P"), Some(b"Q"), Some(b"R"), Some(b"S"),
+        Some(b"T"), Some(b"U"), Some(b"V"), Some(b"W"),
+        Some(b"X"), Some(b"Y"), Some(b"Z"), Some(b"bracketleft"),
+        Some(b"backslash"), Some(b"bracketright"), Some(b"asciicircum"), Some(b"underscore"),
+        Some(b"quoteleft"), Some(b"a"), Some(b"b"), Some(b"c"),
+        Some(b"d"), Some(b"e"), Some(b"f"), Some(b"g"),
+        Some(b"h"), Some(b"i"), Some(b"j"), Some(b"k"),
+        Some(b"l"), Some(b"m"), Some(b"n"), Some(b"o"),
+        Some(b"p"), Some(b"q"), Some(b"r"), Some(b"s"),
+        Some(b"t"), Some(b"u"), Some(b"v"), Some(b"w"),
+        Some(b"x"), Some(b"y"), Some(b"z"), Some(b"braceleft"),
+        Some(b"bar"), Some(b"braceright"), Some(b"asciitilde"), None,
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        None, Some(b"exclamdown"), Some(b"cent"), Some(b"sterling"),
+        Some(b"fraction"), Some(b"yen"), Some(b"florin"), Some(b"section"),
+        Some(b"currency"), Some(b"quotesingle"), Some(b"quotedblleft"), Some(b"guillemotleft"),
+        Some(b"guilsinglleft"), Some(b"guilsinglright"), Some(b"fi"), Some(b"fl"),
+        None, Some(b"endash"), Some(b"dagger"), Some(b"daggerdbl"),
+        Some(b"periodcentered"), None, Some(b"paragraph"), Some(b"bullet"),
+        Some(b"quotesinglbase"), Some(b"quotedblbase"), Some(b"quotedblright"), Some(b"guillemotright"),
+        Some(b"ellipsis"), Some(b"perthousand"), None, Some(b"questiondown"),
+        None, Some(b"grave"), Some(b"acute"), Some(b"circumflex"),
+        Some(b"tilde"), Some(b"macron"), Some(b"breve"), Some(b"dotaccent"),
+        Some(b"dieresis"), None, Some(b"ring"), Some(b"cedilla"),
+        None, Some(b"hungarumlaut"), Some(b"ogonek"), Some(b"caron"),
+        Some(b"emdash"), None, None, None,
+        None, None, None, None,
+        None, None, None, None,
+        None, None, None, None,
+        None, Some(b"AE"), None, Some(b"ordfeminine"),
+        None, None, None, None,
+        Some(b"Lslash"), Some(b"Oslash"), Some(b"OE"), Some(b"ordmasculine"),
+        None, None, None, None,
+        None, Some(b"ae"), None, None,
+        None, Some(b"dotlessi"), None, None,
+        Some(b"lslash"), Some(b"oslash"), Some(b"oe"), Some(b"germandbls"),
+        None, None, None, None,
+    ];
+
     /// `uni2010` / `u2010` glyph names: literal Unicode codepoints, the
     /// convention subsetted fonts use instead of AGL names (`uni` + 4 hex
     /// digits, or `u` + 4-6 hex). Surrogates and out-of-range values are
@@ -55155,15 +55236,62 @@ mod pdf_support {
         }
     }
 
-    /// Builds a font's decoding state from its font dictionary. ToUnicode
-    /// wins when present; otherwise `/Encoding` must resolve to
-    /// WinAnsi/MacRoman (optionally with `/Differences`). Anything else -
-    /// StandardEncoding, Symbol, a custom base without ToUnicode - is a
-    /// clean error naming the font, not a guessed table: shipping a
-    /// from-memory StandardEncoding table with no machine-checkable
-    /// oracle in this environment (no iconv codec, no pypdf) would break
-    /// the "no fixture, no trust" rule every other hand-roll here holds
-    /// itself to.
+    /// Fills a 256-entry table from Adobe StandardEncoding - kept as its
+    /// own function rather than a third `fill_base_table` branch since
+    /// it's reached from exactly one place (a nonsymbolic font with no
+    /// `/Encoding` entry at all, see `build_font`), not threaded through
+    /// every WinAnsi/MacRoman call site the way that function already is.
+    fn fill_standard_table(table: &mut [String; 256]) {
+        for (i, slot) in table.iter_mut().enumerate() {
+            *slot = STANDARD_ENCODING[i]
+                .and_then(glyph_to_string)
+                .unwrap_or_else(|| "\u{FFFD}".to_string());
+        }
+    }
+
+    /// A font is Symbolic when its `FontDescriptor`'s own `/Flags` bit 3
+    /// (value 4, PDF 32000-1 Table 123) is set - meaning its glyphs
+    /// don't correspond to the standard Latin-text character set at all,
+    /// so no fixed base encoding (StandardEncoding included) can safely
+    /// stand in for its own, only-the-font-program-knows encoding. A
+    /// font with no `FontDescriptor` at all (common for an unembedded
+    /// standard font referenced only by `/BaseFont`) is treated as
+    /// nonsymbolic unless its own base name is literally `Symbol` or
+    /// `ZapfDingbats` - the two genuinely symbolic members of the
+    /// standard 14, both real, fixed, well-known exceptions rather than
+    /// a guess.
+    fn font_is_symbolic(
+        reader: &mut PdfReader,
+        dict: &BTreeMap<Vec<u8>, PdfObj>,
+        path: &Path,
+    ) -> Result<bool> {
+        let Some(desc) = dict.get(b"FontDescriptor".as_slice()) else {
+            return Ok(matches!(
+                dict.get(b"BaseFont".as_slice()),
+                Some(PdfObj::Name(n)) if n == b"Symbol" || n == b"ZapfDingbats"
+            ));
+        };
+        let PdfObj::Dict(desc) = reader.resolve(desc, 0, path)? else {
+            bail!("{path:?} has a /FontDescriptor that is not a dictionary");
+        };
+        let flags = desc
+            .get(b"Flags".as_slice())
+            .and_then(PdfObj::as_int)
+            .unwrap_or(0);
+        Ok(flags & 4 != 0)
+    }
+
+    /// Builds a font's decoding state from its font dictionary.
+    /// ToUnicode wins when present; otherwise `/Encoding` must resolve
+    /// to WinAnsi/MacRoman (optionally with `/Differences`), or - with
+    /// no `/Encoding` entry at all - a nonsymbolic font falls back to
+    /// Adobe StandardEncoding, PDF's own documented default for exactly
+    /// this case (see `font_is_symbolic`/`STANDARD_ENCODING`'s own doc
+    /// comments). Anything else - Symbol/ZapfDingbats, a genuinely
+    /// symbolic embedded font, a custom base without ToUnicode - is
+    /// still a clean error naming the font, not a guessed table: its
+    /// real encoding lives only inside the embedded font program itself,
+    /// which this reader doesn't parse.
     fn build_font(
         reader: &mut PdfReader,
         font_obj: &PdfObj,
@@ -55305,7 +55433,28 @@ mod pdf_support {
                 _ => bail!("{path:?} font {font_desc} has a malformed /Encoding"),
             }
         } else if cmap.is_empty() {
-            bail!("{path:?} font {font_desc} has no usable encoding (no /Encoding, no /ToUnicode)");
+            // No `/Encoding` entry at all, no `/ToUnicode` - per PDF
+            // 32000-1 9.6.6.2, a *nonsymbolic* simple font's own built-in
+            // encoding is used in this case, and Adobe StandardEncoding
+            // is that built-in encoding for the common real-world shape
+            // this actually is: an embedded, non-subsetted-into-a-custom-
+            // vector Type1 program (confirmed directly against a real
+            // LaTeX/dvips-produced font's own unencrypted header, which
+            // states `/Encoding StandardEncoding def` verbatim - see
+            // `STANDARD_ENCODING`'s own doc comment). A *symbolic* font
+            // (FontDescriptor `/Flags` bit 3, or literally `/Symbol`/
+            // `/ZapfDingbats` when there's no FontDescriptor at all to
+            // check) has no such safe default - its real built-in
+            // encoding lives only in the embedded font program's own
+            // internal `/Encoding` array, which this reader doesn't
+            // parse - so that case is still the same disclosed refusal
+            // as before, not a guess.
+            if font_is_symbolic(reader, dict, path)? {
+                bail!(
+                    "{path:?} font {font_desc} has no usable encoding (no /Encoding, no /ToUnicode)"
+                );
+            }
+            fill_standard_table(&mut table);
         } else {
             fill_base_table(&mut table, false);
         }
@@ -55897,6 +56046,34 @@ mod pdf_support {
             assert_eq!(winansi_decode(0x80), '\u{20AC}');
             assert_eq!(winansi_decode(0x93), '\u{201C}');
             assert_eq!(winansi_decode(0x81), '\u{FFFD}');
+        }
+
+        #[test]
+        fn standard_encoding_matches_pdfminers_own_independent_table() {
+            // Every expected value cross-checked against `pdfminer`'s
+            // own `encodingdb.ENCODING` (a real, separate implementation)
+            // before being hardcoded here - including StandardEncoding's
+            // own well-known "gotchas" that a naive ASCII assumption
+            // would get wrong: 0x27/0x60 are curly quotes, not a plain
+            // apostrophe/backtick, and the real apostrophe lives at 0xA9
+            // instead.
+            let decode = |b: u8| {
+                STANDARD_ENCODING[b as usize]
+                    .and_then(glyph_to_string)
+                    .unwrap_or_else(|| "\u{FFFD}".to_string())
+            };
+            assert_eq!(decode(0x41), "A");
+            assert_eq!(decode(0x61), "a");
+            assert_eq!(decode(0x20), " ");
+            assert_eq!(decode(0x27), "\u{2019}"); // quoteright, not '
+            assert_eq!(decode(0x60), "\u{2018}"); // quoteleft, not `
+            assert_eq!(decode(0xA9), "'"); // quotesingle - the real apostrophe
+            assert_eq!(decode(0xAE), "\u{FB01}"); // fi ligature
+            assert_eq!(decode(0xAF), "\u{FB02}"); // fl ligature
+            assert_eq!(decode(0xE1), "\u{00C6}"); // AE
+            assert_eq!(decode(0xF5), "\u{0131}"); // dotlessi
+            assert_eq!(decode(0x00), "\u{FFFD}"); // unmapped control code
+            assert_eq!(decode(0x80), "\u{FFFD}"); // unmapped in this range
         }
 
         #[test]

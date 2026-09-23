@@ -15505,6 +15505,62 @@ marker; two more `chunks_exact`-on-a-constant-size lints in the new
 no-padding AES-CBC helpers) were both fixed rather than added to the
 tolerated baseline.
 
+**A follow-up pass replaced the blanket "no `/Encoding`, no
+`/ToUnicode`" refusal with the PDF spec's own documented fallback - for
+nonsymbolic fonts only.** ISO 32000-1 9.6.6.2: a simple font with no
+`/Encoding` entry uses its font program's built-in encoding, which for a
+*nonsymbolic* font is Adobe StandardEncoding (Annex D.2). This had been a
+disclosed gap purely for lack of a machine-checkable oracle; two things
+closed it. First, the rule was confirmed to apply to real files, not
+just spec prose: decompressing a real LaTeX/dvips-generated Type1 font
+from the corpus (`5740-pdf.pdf`'s embedded Computer Modern Roman/Italic)
+and reading the unencrypted cleartext header of its `/FontFile` (the
+first `/Length1` bytes, before the `eexec` section) shows it literally
+declares `/Encoding StandardEncoding def`. Second, `STANDARD_ENCODING`
+(a 256-entry byte-to-glyph-name table) was generated programmatically
+from `pdfminer.six`'s own independent `encodingdb` table rather than
+typed from memory, and a unit test pins the classic trap positions
+against it (`0x27` is `quoteright`, `0x60` is `quoteleft`, the real
+apostrophe is `quotesingle` at `0xA9`, `fi`/`fl` at `0xAE`/`0xAF`,
+`AE` at `0xE1`, `dotlessi` at `0xF5`, an unassigned code is U+FFFD).
+
+**Symbolic fonts still refuse.** `font_is_symbolic` reads the
+FontDescriptor's `/Flags` bit 3 (Table 123, value 4); a font with no
+FontDescriptor at all (a standard-14 reference) counts as symbolic only
+for `/BaseFont /Symbol`/`/ZapfDingbats`. A symbolic font's real encoding
+lives only inside its own font program, which this reader doesn't
+parse, and guessing StandardEncoding there produces confidently wrong
+text rather than an honest gap - confirmed on a real corpus file (a
+Crédit Mutuel statement's embedded CFF font, `/Flags 14`), where
+`pdfminer.six`'s own StandardEncoding guess renders "Protégé" as
+"ProtØgØ".
+
+**One real bug was caught before this shipped**, by running the
+compiled binary against the fixture rather than trusting a clean
+compile: the first draft resolved each glyph name through `agl_lookup`,
+which only knows *named* AGL entries and has no fallback for a bare
+single-letter name like `a` - so `edge_pdf_standard_encoding.pdf`'s own
+`(plain)` decoded as five U+FFFD characters. `fill_standard_table` now
+goes through `glyph_to_string`, the layer above it that already handles
+single-letter names, ligatures, and subset suffixes.
+
+Verified: `edge_pdf_standard_encoding.pdf` (a bare `/Helvetica` font)
+now decodes to `plain` instead of refusing (its integration test was
+rewritten to assert that), and a new `edge_pdf_symbolic_no_encoding.pdf`
+(`/BaseFont /Symbol`, no `/Encoding`, no `/ToUnicode`) locks the
+symbolic refusal in. `diff` confirmed byte-identical output for every
+other committed PDF fixture. **The real-corpus result is honestly
+zero**: all 53 PDF failures remain, category counts unchanged. A
+per-file comparison against the previous sweep found exactly one file
+whose outcome moved at all - `cerfa_15725-03.pdf`'s page-1 Times-Roman
+font now decodes (its page-1 text, extracted to a standalone file, has
+a character multiset identical to `pdfminer.six`'s; only emission order
+differs, since `pdfminer` reorders by layout), but the same file's
+page-3 standard-14 `/Symbol` font, correctly symbolic, still refuses the
+whole document. Every other "no usable encoding" failure likewise uses
+at least one genuinely symbolic font. Clean across default/`pdf`/`full`
+at each build's established clippy baseline.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15813,14 +15869,15 @@ established baselines exactly.
   the same dependency-weight tradeoff already declined for dBase's own
   ~20-codepage gap and for SPSS/DuckDB entirely (see below).
 - **PDF text decoding is limited to WinAnsi/MacRoman/Differences/ToUnicode
-  fonts.** A font naming StandardEncoding, Symbol, another custom base, or
-  a composite/CID font (including TeX built-ins like CMSY10) with no
-  `/ToUnicode` and no usable `/Differences` coverage is a clear, disclosed
-  error naming the font - shipping a from-memory StandardEncoding table
-  with no machine-checkable oracle in this environment (no `iconv` codec,
-  no pypdf) would break the "no fixture, no trust" rule, and CID codes
-  without a CMap are genuinely unmappable (Adobe's public ROS CMaps were
-  judged out of scope). Subset-gid (`/g0`) and fragment (`parenlefttp`)
+  fonts, plus StandardEncoding for a nonsymbolic font with no `/Encoding`
+  at all.** A *symbolic* font (FontDescriptor `/Flags` bit 3, or a bare
+  standard-14 Symbol/ZapfDingbats) with no `/Encoding` and no
+  `/ToUnicode` - including TeX built-ins like CMSY10 - is a clear,
+  disclosed error naming the font, since its real encoding lives only in
+  its own font program, which this reader doesn't parse. The same goes
+  for a composite/CID font with no `/ToUnicode`: CID codes without a CMap
+  are genuinely unmappable (Adobe's public ROS CMaps were judged out of
+  scope). Subset-gid (`/g0`) and fragment (`parenlefttp`)
   glyph names, LZWDecode streams, and image-only scanned pages (present
   record, missing text - OCR is out of scope) round out the same
   disclosed-boundary set; annotations and AcroForm field values are not
