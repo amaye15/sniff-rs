@@ -13464,6 +13464,68 @@ fn pdf_unmapped_code_without_a_base_names_the_code() {
 
 #[test]
 #[cfg(feature = "pdf")]
+fn pdf_resolves_full_agl_tex_and_underscore_component_glyph_names() {
+    // `/Differences [65 /G_tildecomb /cedilla /angbracketleft
+    // /propersubset]`: an AGL-spec underscore ligature (G + U+0303), a
+    // full-AGL name the old curated table lacked, a TeX-only name from
+    // texglyphlist.txt, and a name the curated table used to map wrong
+    // (U+228A instead of the AGL's U+2282).
+    let doc = run_json("edge_pdf_agl_components.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_agl_components"), "text")["sample_values"],
+        serde_json::json!(["G\u{0303}\u{00B8}\u{27E8}\u{2282}"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_unknown_glyph_name_only_refuses_when_a_page_needs_it() {
+    // `/Differences [65 /A /zzznotaglyph]`: a font may name glyphs a page
+    // never shows - only showing code 66 without a ToUnicode entry for it
+    // is a refusal, and that refusal names the code and the glyph.
+    let doc = run_json("edge_pdf_unknown_glyph_unshown.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_unknown_glyph_unshown"), "text")["sample_values"],
+        serde_json::json!(["A"])
+    );
+    let doc = run_json("edge_pdf_unknown_glyph_tounicode.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_unknown_glyph_tounicode"), "text")["sample_values"],
+        serde_json::json!(["A\u{263A}"])
+    );
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_unknown_glyph_shown.pdf")
+            .to_str()
+            .unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("maps code 66 to unknown glyph /zzznotaglyph"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_differences_running_past_code_255_is_a_clean_refusal_not_a_panic() {
+    // `/Differences [255 /a /b]`: `/b` would land on code 256. This used
+    // to index past the 256-entry table and panic.
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_differences_overflow.pdf")
+            .to_str()
+            .unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("past code 255"), "got: {stderr}");
+    assert!(!stderr.contains("panicked"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
 fn pdf_reads_xref_streams_and_object_streams() {
     // Modern writer shape: no `xref` table at all, object offsets from a
     // compressed xref stream, and the font dictionary itself packed into

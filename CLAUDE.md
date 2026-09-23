@@ -15561,6 +15561,86 @@ whole document. Every other "no usable encoding" failure likewise uses
 at least one genuinely symbolic font. Clean across default/`pdf`/`full`
 at each build's established clippy baseline.
 
+**A follow-up pass made Adobe's own complete glyph list the fallback
+authority behind the hand-built table, fixed three wrong entries that
+cross-check found, and stopped refusing fonts over glyph names a page
+never uses.** Prompted by a StandardEncoding name (`cedilla`, code
+`0xCB`) that the 570-entry hand-built table couldn't resolve, so that
+code quietly decoded as U+FFFD. Rather than patch names one at a time,
+the whole curated table was cross-checked against Adobe's
+`glyphlist.txt` (fetched from adobe-type-tools/agl-aglfn, and
+entry-for-entry identical to `pdfminer.six`'s own independent copy): 411
+entries agree, 133 aren't AGL names at all (control-character names, TeX
+delimiter sizes, `f_f_i`), and 26 disagree. Most disagreements are
+deliberate and stay: real digits for `zerooldstyle`-style names and real
+©/®/™ for the `copyrightsans`-style names where Adobe maps to the Private
+Use Area, Greek letters for `Delta`/`Omega`/`mu`, U+021A for
+`Tcommaaccent`. Four had no defensible source and were removed so the
+AGL answers: `propersubset`/`propersuperset` mapped to ⊊/⊋ (U+228A/B,
+subset *with not-equal*) where Adobe's AGL and AGLFN both say ⊂/⊃
+(U+2282/3), `telephone` to ☎ where the AGL says ℡ (U+2121), and
+`quotedblprime` to U+2033 where the AGL says U+301E.
+
+Behind the curated table (which is still consulted first, so its
+deliberate divergences win) sit two generated tables, sorted for
+`binary_search`: `AGL_GLYPHS`, all 4,089 AGL names that don't map into
+the Private Use Area (the 192 that do - `bracelefttp`-style delimiter
+fragments, `Asmall`-style small caps - stay unknown-glyph refusals, since
+a PUA codepoint is meaningless as data), and `TEX_GLYPHS`, 264 names from
+lcdf-typetools' `texglyphlist.txt` that TeX fonts use and the AGL doesn't
+define (`angbracketleft`, `turnstileleft`, `ceilingleft`, ...) - minus
+its PUA entries and six TeX-internal names the file marks with lone-
+surrogate placeholders rather than characters (the first build of the
+table caught these as compile errors, since Rust rejects a surrogate
+`\u{}` escape). Computer Modern's `summationtext`/`productdisplay`/
+`radicalbig`-style size variants, which neither list defines, map to the
+AGL value of their base symbol in the curated table, the same principle
+as its existing `parenleftbig` family.
+
+Ligature names now follow the AGL specification itself (fetched from
+adobe-type-tools/agl-specification): drop everything from the first
+period, split on `_`, map each component. The old rule accepted only
+exactly-three-byte letter pairs like `T_h`, so `G_tildecomb` (G + U+0303)
+refused a whole real paper. One deliberate divergence from the spec,
+which maps an unknown component to an empty string: here it refuses the
+whole name, since silently dropping part of a glyph is quiet data loss.
+
+**An unknown glyph name in `/Differences` now refuses only when a page
+actually needs it.** The old loop refused the moment it met any
+unresolvable name, including names at codes the page never shows or that
+the font's own ToUnicode already covers - and a font's `/Differences`
+routinely lists glyphs a given page doesn't use. Unknown names are now
+recorded per code, and the refusal fires only for a shown code that no
+ToUnicode entry covers, naming the lowest such code so the message is the
+same on every run (the old "shows code N with no mapping" check picked
+whichever code a `HashSet` yielded first; it's deterministic now too).
+**Writing that change surfaced a real panic**: each `/Differences` name
+advances the code by one, so `[255 /a /b]` put `/b` at code 256 and
+indexed past the 256-entry table - now the same clean refusal an explicit
+out-of-range code already got.
+
+Verified with new unit tests (lookups against values read from the
+source files themselves, strict sortedness of both tables, the spec's own
+worked example, every StandardEncoding name resolving) and five new
+hand-built fixtures (the four glyph shapes above in one font; an unknown
+glyph unshown, shown, and shown-but-ToUnicode-covered; the code-256
+overflow). The real 666-PDF corpus: 4 more files succeed (an Outlook
+e-mail export, a one-page meeting document, a machine-learning paper,
+and a 1,176-page calculus textbook), 0 new failures, and **0 bytes
+changed** across every previously-succeeding file's output. The first
+two files' text matches `pdfminer.six`'s character multiset exactly; the paper matches
+except for four braces `pdfminer.six` couldn't map at all and emitted as
+`(cid:N)` markers. The textbook's 4.6 million characters overlap
+`pdfminer.six`'s at 99.98%; the largest residual is 904 NUL characters
+where its MathTime math fonts name their minus glyph `/NUL` and the
+curated table deliberately maps C0 control-character names to the
+control characters themselves (its own documented "honor the declared
+name" choice, left as is - `--output-format sql` already strips NULs).
+Three more files still fail, but further in (e.g. page
+90 instead of page 18), now on subset-renamed glyphs like `/H9024` that
+no list defines. Clean across default/`pdf`/`full` at each build's
+established clippy baseline.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15877,8 +15957,11 @@ established baselines exactly.
   its own font program, which this reader doesn't parse. The same goes
   for a composite/CID font with no `/ToUnicode`: CID codes without a CMap
   are genuinely unmappable (Adobe's public ROS CMaps were judged out of
-  scope). Subset-gid (`/g0`) and fragment (`parenlefttp`)
-  glyph names, LZWDecode streams, and image-only scanned pages (present
+  scope). A *shown* code whose glyph name no list resolves - subset-gid
+  (`/g0`) and subset-renamed (`/H9024`) names, and the delimiter
+  fragments (`parenlefttp`) Adobe maps into the Private Use Area - still
+  refuses unless ToUnicode covers it (an unknown name at a code the page
+  never shows no longer matters). LZWDecode streams, and image-only scanned pages (present
   record, missing text - OCR is out of scope) round out the same
   disclosed-boundary set; annotations and AcroForm field values are not
   surfaced at all. Encryption is decrypted with an empty user password
