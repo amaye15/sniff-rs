@@ -15641,6 +15641,103 @@ Three more files still fail, but further in (e.g. page
 no list defines. Clean across default/`pdf`/`full` at each build's
 established clippy baseline.
 
+**A follow-up pass reads a symbolic font's real encoding straight out
+of its embedded font program - the largest remaining PDF failure
+category.** After the two passes above, 38 of the corpus's PDF failures
+were "no usable encoding": symbolic simple fonts with no `/Encoding` and
+no `/ToUnicode`. Classifying every font each failing file actually
+selects with `Tf` (Form XObjects included, via `pikepdf`) showed what
+the blocker really was: 21 files used only embedded CFF (`Type1C`)
+programs (bank statements), about 14 used embedded Type 1 programs
+(LaTeX/pdfTeX subsets, whose cleartext declares a custom
+`dup <code> /<name> put` vector), and the rest TrueType or a bare
+standard-14 Symbol. ISO 32000-1 9.6.6.2 and Table 114 say exactly what to
+do: a font with no `/Encoding` - or `/Differences` with no
+`/BaseEncoding` - uses its built-in encoding, which for an embedded
+program is the program's own.
+
+`implicit_base_encoding` now answers that: `Program` (an embedded Type 1
+or CFF program's own code-to-glyph-name vector), `Standard` (no embedded
+program, or TrueType, for a nonsymbolic font - Table 114 and 9.6.6.4), or
+`Unknown` (a symbolic font with no readable program - still the
+disclosed refusal). `type1_builtin_encoding` reads the cleartext before
+`eexec` (`/Length1`, falling back to the `eexec` keyword; a PFB segment
+header is accepted too) through a minimal PostScript tokenizer that skips
+comments, `(...)` strings, and hex strings, so a decoy `/Encoding` in a
+copyright notice is never taken for the real one; it accepts
+`StandardEncoding` or a `dup`/`put` vector. `cff_builtin_encoding`
+implements just enough of Adobe Technical Note #5176 to do the same for
+CFF: the header, Name/Top DICT/String INDEXes, every DICT operand form
+(reals consumed, never read), charset formats 0/1/2 plus predefined
+ISOAdobe, and encoding formats 0/1 plus supplements plus predefined
+Standard; `CFF_STANDARD_STRINGS` (the 391 SID names) is generated from
+fontTools' own table. A CID-keyed program has no vector (`ROS` in its Top
+DICT); the predefined Expert encoding/charsets are refused rather than
+guessed. Every table read is bounds-checked (a unit test feeds every
+truncation of a test program and asserts no panic). Reading the font
+file itself never propagates an error - an unsupported filter or a
+malformed program just means "unreadable" and the old behavior applies,
+the lesson of the Form XObject pass, where eagerly resolving streams
+briefly turned 54 failures into 432. A shown code whose program-assigned
+glyph name doesn't resolve, or that the program leaves unassigned, is a
+clean refusal naming the code.
+
+Table 114 now drives `/Differences` without `/BaseEncoding` too: the
+differences apply on top of the program's own vector for an embedded
+font, and on top of StandardEncoding for an unembedded nonsymbolic one.
+That second case is a deliberate behavior change:
+`edge_pdf_differences_unmapped.pdf` (an unembedded font, `[65 /A]`,
+showing `AB`) used to refuse over the unlisted code 66 and now reads
+`AB`; a new symbolic twin, `edge_pdf_differences_unmapped_symbolic.pdf`,
+keeps the refusal covered.
+
+**Verified at the parser level against two independent implementations,
+across every embedded program in the corpus** - all 670 of them, not just
+the failing files' (extracted with `pikepdf`, parsed by both sides via a
+temporary, uncommitted test harness): Type 1, 214/214 identical to
+`pdfminer.six`'s own `Type1FontHeaderParser`; CFF, 453/456 identical to
+fontTools. The three CFF differences are all at code 0 - fontTools'
+`parseEncoding0` deliberately drops code 0 (`if code != 0`, read from its
+own source), while the CFF specification reserves nothing there; the
+three fonts are the MathTime fonts whose minus glyph is named `/NUL`
+(see the previous pass). The harness itself had a bug on the first run
+(this `pdfminer.six` version's `nextobject` returns the pair directly),
+caught because 171 "mismatches" all looked the same.
+
+**Verified at the text level on the corpus**: 31 more files succeed
+(failures 55 to 24; PDF failures now 18), 0 new failures. All 21 bank
+statements match - character multiset, page by page - a `pdfminer.six`
+patched to take each CFF font's encoding from fontTools (unpatched,
+`pdfminer.six` guesses StandardEncoding for them and renders "Protégé"
+as "ProtØgØ"). The TeX files match `pdfminer.six` exactly except for
+glyphs it can't map at all (⟨ ⟩ ′ ∑ ⊢) and the curated table's Greek
+Ω/µ over the AGL's legacy U+2126/U+00B5. Eight previously-succeeding
+outputs changed, all by *adding* text: Form XObject content that the
+XObject pass's per-form isolation had been dropping *silently* whenever
+a font inside the form couldn't decode. Six of those now match
+`pdfminer.six` 100% (from 45-90%). That exposes a real gap in that
+earlier design - a Form whose content fails is skipped with no
+disclosure - and two TeX practicals' newly-visible form text exposed a
+second, older one (unmapped two-byte codes in a Type0 font falling back
+byte by byte through a single-byte table); both are left to their own
+passes rather than folded into this one. The remaining 18 PDF failures:
+8 embedded TrueType CID fonts whose ToUnicode CMap is present but empty
+(the error calls it "without /ToUnicode" - a misleading message too), 6
+symbolic TrueType fonts or a bare standard-14 Symbol, and 4 glyph names
+no list defines.
+
+Seven new fixtures (a symbolic CFF font read through its own custom
+encoding; the same font showing an unknown glyph and an unassigned code;
+`/Differences` over the program's base; a symbolic Type 1 program whose
+cleartext hides `/Encoding` decoys in a comment and a string; the
+symbolic no-base twin) and six new unit tests (a hand-built CFF with
+encoding supplements - the one shape no corpus font used - validated
+with fontTools' reader; a CID-keyed variant; every truncation; every DICT
+operand form; the Type 1 vector via `/Length1`, via `eexec`, and via a
+PFB header; StandardEncoding and unreadable declarations). Clean across
+default/`pdf`/`full` at each build's established clippy baseline (one
+new `needless_range_loop` finding was fixed, not tolerated).
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -15948,16 +16045,17 @@ established baselines exactly.
   declaring one of them is a clear, disclosed error rather than a guess,
   the same dependency-weight tradeoff already declined for dBase's own
   ~20-codepage gap and for SPSS/DuckDB entirely (see below).
-- **PDF text decoding is limited to WinAnsi/MacRoman/Differences/ToUnicode
-  fonts, plus StandardEncoding for a nonsymbolic font with no `/Encoding`
-  at all.** A *symbolic* font (FontDescriptor `/Flags` bit 3, or a bare
-  standard-14 Symbol/ZapfDingbats) with no `/Encoding` and no
-  `/ToUnicode` - including TeX built-ins like CMSY10 - is a clear,
-  disclosed error naming the font, since its real encoding lives only in
-  its own font program, which this reader doesn't parse. The same goes
-  for a composite/CID font with no `/ToUnicode`: CID codes without a CMap
-  are genuinely unmappable (Adobe's public ROS CMaps were judged out of
-  scope). A *shown* code whose glyph name no list resolves - subset-gid
+- **PDF text decoding covers WinAnsi/MacRoman/Differences/ToUnicode
+  fonts plus each font's implicit built-in encoding** - an embedded Type 1
+  or CFF program's own vector, or StandardEncoding for a nonsymbolic font
+  with no such program. A *symbolic* font with no `/Encoding`, no
+  `/ToUnicode`, and no readable Type 1/CFF program - a symbolic TrueType
+  font, a bare standard-14 Symbol/ZapfDingbats, or a program using CFF's
+  predefined Expert encoding - is a clear, disclosed error naming the
+  font. The same goes for a composite/CID font with no usable
+  `/ToUnicode`: CID codes without a CMap are unmappable here (reading an
+  embedded TrueType program's own `cmap`, and Adobe's public ROS CMaps,
+  are not implemented). A *shown* code whose glyph name no list resolves - subset-gid
   (`/g0`) and subset-renamed (`/H9024`) names, and the delimiter
   fragments (`parenlefttp`) Adobe maps into the Private Use Area - still
   refuses unless ToUnicode covers it (an unknown name at a code the page

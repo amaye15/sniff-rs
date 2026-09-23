@@ -54504,6 +54504,80 @@ mod pdf_support {
         None, None, None, None,
     ];
 
+    /// Adobe's CFF standard strings (Technical Note #5176, Appendix A):
+    /// the 391 glyph and metadata names a CFF font refers to by string ID
+    /// (SID) 0-390 without storing them itself. Generated from fontTools'
+    /// own `cffStandardStrings` (an independent, widely used CFF
+    /// implementation), not typed from memory.
+    #[rustfmt::skip]
+    const CFF_STANDARD_STRINGS: [&[u8]; 391] = [
+        b".notdef", b"space", b"exclam", b"quotedbl", b"numbersign", b"dollar", b"percent",
+        b"ampersand", b"quoteright", b"parenleft", b"parenright", b"asterisk", b"plus",
+        b"comma", b"hyphen", b"period", b"slash", b"zero", b"one", b"two", b"three",
+        b"four", b"five", b"six", b"seven", b"eight", b"nine", b"colon", b"semicolon",
+        b"less", b"equal", b"greater", b"question", b"at", b"A", b"B", b"C", b"D", b"E",
+        b"F", b"G", b"H", b"I", b"J", b"K", b"L", b"M", b"N", b"O", b"P", b"Q", b"R", b"S",
+        b"T", b"U", b"V", b"W", b"X", b"Y", b"Z", b"bracketleft", b"backslash",
+        b"bracketright", b"asciicircum", b"underscore", b"quoteleft", b"a", b"b", b"c",
+        b"d", b"e", b"f", b"g", b"h", b"i", b"j", b"k", b"l", b"m", b"n", b"o", b"p", b"q",
+        b"r", b"s", b"t", b"u", b"v", b"w", b"x", b"y", b"z", b"braceleft", b"bar",
+        b"braceright", b"asciitilde", b"exclamdown", b"cent", b"sterling", b"fraction",
+        b"yen", b"florin", b"section", b"currency", b"quotesingle", b"quotedblleft",
+        b"guillemotleft", b"guilsinglleft", b"guilsinglright", b"fi", b"fl", b"endash",
+        b"dagger", b"daggerdbl", b"periodcentered", b"paragraph", b"bullet",
+        b"quotesinglbase", b"quotedblbase", b"quotedblright", b"guillemotright",
+        b"ellipsis", b"perthousand", b"questiondown", b"grave", b"acute", b"circumflex",
+        b"tilde", b"macron", b"breve", b"dotaccent", b"dieresis", b"ring", b"cedilla",
+        b"hungarumlaut", b"ogonek", b"caron", b"emdash", b"AE", b"ordfeminine", b"Lslash",
+        b"Oslash", b"OE", b"ordmasculine", b"ae", b"dotlessi", b"lslash", b"oslash", b"oe",
+        b"germandbls", b"onesuperior", b"logicalnot", b"mu", b"trademark", b"Eth",
+        b"onehalf", b"plusminus", b"Thorn", b"onequarter", b"divide", b"brokenbar",
+        b"degree", b"thorn", b"threequarters", b"twosuperior", b"registered", b"minus",
+        b"eth", b"multiply", b"threesuperior", b"copyright", b"Aacute", b"Acircumflex",
+        b"Adieresis", b"Agrave", b"Aring", b"Atilde", b"Ccedilla", b"Eacute",
+        b"Ecircumflex", b"Edieresis", b"Egrave", b"Iacute", b"Icircumflex", b"Idieresis",
+        b"Igrave", b"Ntilde", b"Oacute", b"Ocircumflex", b"Odieresis", b"Ograve",
+        b"Otilde", b"Scaron", b"Uacute", b"Ucircumflex", b"Udieresis", b"Ugrave",
+        b"Yacute", b"Ydieresis", b"Zcaron", b"aacute", b"acircumflex", b"adieresis",
+        b"agrave", b"aring", b"atilde", b"ccedilla", b"eacute", b"ecircumflex",
+        b"edieresis", b"egrave", b"iacute", b"icircumflex", b"idieresis", b"igrave",
+        b"ntilde", b"oacute", b"ocircumflex", b"odieresis", b"ograve", b"otilde",
+        b"scaron", b"uacute", b"ucircumflex", b"udieresis", b"ugrave", b"yacute",
+        b"ydieresis", b"zcaron", b"exclamsmall", b"Hungarumlautsmall", b"dollaroldstyle",
+        b"dollarsuperior", b"ampersandsmall", b"Acutesmall", b"parenleftsuperior",
+        b"parenrightsuperior", b"twodotenleader", b"onedotenleader", b"zerooldstyle",
+        b"oneoldstyle", b"twooldstyle", b"threeoldstyle", b"fouroldstyle", b"fiveoldstyle",
+        b"sixoldstyle", b"sevenoldstyle", b"eightoldstyle", b"nineoldstyle",
+        b"commasuperior", b"threequartersemdash", b"periodsuperior", b"questionsmall",
+        b"asuperior", b"bsuperior", b"centsuperior", b"dsuperior", b"esuperior",
+        b"isuperior", b"lsuperior", b"msuperior", b"nsuperior", b"osuperior", b"rsuperior",
+        b"ssuperior", b"tsuperior", b"ff", b"ffi", b"ffl", b"parenleftinferior",
+        b"parenrightinferior", b"Circumflexsmall", b"hyphensuperior", b"Gravesmall",
+        b"Asmall", b"Bsmall", b"Csmall", b"Dsmall", b"Esmall", b"Fsmall", b"Gsmall",
+        b"Hsmall", b"Ismall", b"Jsmall", b"Ksmall", b"Lsmall", b"Msmall", b"Nsmall",
+        b"Osmall", b"Psmall", b"Qsmall", b"Rsmall", b"Ssmall", b"Tsmall", b"Usmall",
+        b"Vsmall", b"Wsmall", b"Xsmall", b"Ysmall", b"Zsmall", b"colonmonetary",
+        b"onefitted", b"rupiah", b"Tildesmall", b"exclamdownsmall", b"centoldstyle",
+        b"Lslashsmall", b"Scaronsmall", b"Zcaronsmall", b"Dieresissmall", b"Brevesmall",
+        b"Caronsmall", b"Dotaccentsmall", b"Macronsmall", b"figuredash", b"hypheninferior",
+        b"Ogoneksmall", b"Ringsmall", b"Cedillasmall", b"questiondownsmall", b"oneeighth",
+        b"threeeighths", b"fiveeighths", b"seveneighths", b"onethird", b"twothirds",
+        b"zerosuperior", b"foursuperior", b"fivesuperior", b"sixsuperior",
+        b"sevensuperior", b"eightsuperior", b"ninesuperior", b"zeroinferior",
+        b"oneinferior", b"twoinferior", b"threeinferior", b"fourinferior", b"fiveinferior",
+        b"sixinferior", b"seveninferior", b"eightinferior", b"nineinferior",
+        b"centinferior", b"dollarinferior", b"periodinferior", b"commainferior",
+        b"Agravesmall", b"Aacutesmall", b"Acircumflexsmall", b"Atildesmall",
+        b"Adieresissmall", b"Aringsmall", b"AEsmall", b"Ccedillasmall", b"Egravesmall",
+        b"Eacutesmall", b"Ecircumflexsmall", b"Edieresissmall", b"Igravesmall",
+        b"Iacutesmall", b"Icircumflexsmall", b"Idieresissmall", b"Ethsmall",
+        b"Ntildesmall", b"Ogravesmall", b"Oacutesmall", b"Ocircumflexsmall",
+        b"Otildesmall", b"Odieresissmall", b"OEsmall", b"Oslashsmall", b"Ugravesmall",
+        b"Uacutesmall", b"Ucircumflexsmall", b"Udieresissmall", b"Yacutesmall",
+        b"Thornsmall", b"Ydieresissmall", b"001.000", b"001.001", b"001.002", b"001.003",
+        b"Black", b"Bold", b"Book", b"Light", b"Medium", b"Regular", b"Roman", b"Semibold",
+    ];
+
     /// `uni2010` / `u2010` glyph names: literal Unicode codepoints, the
     /// convention subsetted fonts use instead of AGL names (`uni` + 4 hex
     /// digits, or `u` + 4-6 hex). Surrogates and out-of-range values are
@@ -57079,6 +57153,544 @@ mod pdf_support {
         }
     }
 
+    /// Where a simple font's base encoding comes from when its
+    /// `/Encoding` names none - see `implicit_base_encoding`.
+    enum ImplicitBase {
+        /// The embedded Type 1 / CFF program's own built-in encoding:
+        /// code to glyph name (`None` for an unassigned code).
+        Program(Vec<Option<Vec<u8>>>),
+        /// Adobe StandardEncoding (`STANDARD_ENCODING`).
+        Standard,
+        /// Nothing this reader can take a base from. The text is appended
+        /// to a refusal message (empty when there's nothing to add).
+        Unknown(String),
+    }
+
+    /// ISO 32000-1's implicit base encoding for a simple font whose
+    /// `/Encoding` names no base (either no `/Encoding` at all, or a
+    /// `/Differences` dictionary without `/BaseEncoding`): an embedded
+    /// Type 1 or CFF (`Type1C`) program's own built-in encoding when there
+    /// is one (9.6.6.2 and Table 114 - the only authority for a symbolic
+    /// font); otherwise StandardEncoding for a nonsymbolic font (Table
+    /// 114's rule for an unembedded font, and 9.6.6.4's for TrueType,
+    /// whose undefined entries fill from StandardEncoding). An embedded
+    /// Type 1/CFF program whose encoding can't be read is `Unknown`, not
+    /// StandardEncoding: its real base exists, it just can't be read.
+    fn implicit_base_encoding(
+        reader: &mut PdfReader,
+        dict: &BTreeMap<Vec<u8>, PdfObj>,
+        path: &Path,
+    ) -> Result<ImplicitBase> {
+        Ok(match embedded_program_encoding(reader, dict, path) {
+            ProgramEncoding::Names(names) => ImplicitBase::Program(names),
+            ProgramEncoding::Unreadable(why) => ImplicitBase::Unknown(format!(
+                " - its embedded font program's built-in encoding couldn't be read: {why}"
+            )),
+            ProgramEncoding::NotEmbedded if font_is_symbolic(reader, dict, path)? => {
+                ImplicitBase::Unknown(String::new())
+            }
+            ProgramEncoding::NotEmbedded => ImplicitBase::Standard,
+        })
+    }
+
+    /// What `embedded_program_encoding` found.
+    enum ProgramEncoding {
+        /// No embedded Type 1 / CFF program: unembedded, or a TrueType,
+        /// OpenType, or CID-keyed program, none of which carries a
+        /// code-to-glyph-name vector.
+        NotEmbedded,
+        /// Code to glyph name, straight from the program.
+        Names(Vec<Option<Vec<u8>>>),
+        /// A program is there, but its encoding couldn't be read.
+        Unreadable(String),
+    }
+
+    /// Reads the built-in encoding of a font's embedded Type 1
+    /// (`/FontFile`) or CFF (`/FontFile3 /Subtype /Type1C`) program.
+    /// Never fails the caller: the font file failing to resolve or decode
+    /// (an unsupported filter, a broken stream) is just one more reason
+    /// the encoding can't be read, so it can never cost a page that
+    /// doesn't need this at all.
+    fn embedded_program_encoding(
+        reader: &mut PdfReader,
+        dict: &BTreeMap<Vec<u8>, PdfObj>,
+        path: &Path,
+    ) -> ProgramEncoding {
+        let Some(desc) = dict.get(b"FontDescriptor".as_slice()) else {
+            return ProgramEncoding::NotEmbedded;
+        };
+        let Ok(PdfObj::Dict(desc)) = reader.resolve(desc, 0, path) else {
+            return ProgramEncoding::NotEmbedded;
+        };
+        let (key, cff): (&[u8], bool) = if desc.contains_key(b"FontFile".as_slice()) {
+            (b"FontFile", false)
+        } else if desc.contains_key(b"FontFile3".as_slice()) {
+            (b"FontFile3", true)
+        } else {
+            return ProgramEncoding::NotEmbedded;
+        };
+        let (sdict, data) = match reader.resolve(&desc[key], 0, path) {
+            Ok(PdfObj::Stream { dict, data }) => (dict, data),
+            Ok(_) => {
+                return ProgramEncoding::Unreadable(format!(
+                    "its /{} is not a stream",
+                    String::from_utf8_lossy(key)
+                ));
+            }
+            Err(e) => return ProgramEncoding::Unreadable(e.to_string()),
+        };
+        let names = if cff {
+            if sdict.get(b"Subtype".as_slice()) != Some(&PdfObj::Name(b"Type1C".to_vec())) {
+                return ProgramEncoding::NotEmbedded;
+            }
+            cff_builtin_encoding(&data)
+        } else {
+            let length1 = sdict
+                .get(b"Length1".as_slice())
+                .and_then(|l| reader.resolve(l, 0, path).ok())
+                .and_then(|l| l.as_int())
+                .and_then(|l| usize::try_from(l).ok());
+            type1_builtin_encoding(&data, length1).map(Some)
+        };
+        match names {
+            Ok(Some(names)) => ProgramEncoding::Names(names),
+            Ok(None) => ProgramEncoding::NotEmbedded,
+            Err(e) => ProgramEncoding::Unreadable(e.to_string()),
+        }
+    }
+
+    /// One token of a Type 1 font program's cleartext PostScript - only
+    /// the shapes `type1_builtin_encoding` needs to tell apart.
+    #[derive(PartialEq)]
+    enum PsToken<'a> {
+        /// `/Name` (without the slash).
+        Name(&'a [u8]),
+        Int(i64),
+        /// Any other executable token, or a single delimiter byte.
+        Word(&'a [u8]),
+    }
+
+    /// Splits PostScript source into tokens, skipping `%` comments,
+    /// `(...)` strings (nested parentheses and backslash escapes
+    /// included), and `<...>` hex strings - so an `/Encoding` that only
+    /// appears inside a copyright notice or a comment is never mistaken
+    /// for the real one.
+    fn ps_tokens(src: &[u8]) -> Vec<PsToken<'_>> {
+        let is_delim = |b: u8| b"()<>[]{}/%".contains(&b) || b.is_ascii_whitespace() || b == 0;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < src.len() {
+            match src[i] {
+                b if b.is_ascii_whitespace() || b == 0 => i += 1,
+                b'%' => {
+                    while i < src.len() && src[i] != b'\n' && src[i] != b'\r' {
+                        i += 1;
+                    }
+                }
+                b'(' => {
+                    let mut depth = 0usize;
+                    while i < src.len() {
+                        match src[i] {
+                            b'\\' => i += 1,
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                b'<' if src.get(i + 1) == Some(&b'<') => {
+                    out.push(PsToken::Word(&src[i..i + 2]));
+                    i += 2;
+                }
+                b'<' => {
+                    while i < src.len() && src[i] != b'>' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'/' => {
+                    let start = i + 1;
+                    i = start;
+                    while i < src.len() && !is_delim(src[i]) {
+                        i += 1;
+                    }
+                    out.push(PsToken::Name(&src[start..i]));
+                }
+                b'[' | b']' | b'{' | b'}' | b')' | b'>' => {
+                    out.push(PsToken::Word(&src[i..i + 1]));
+                    i += 1;
+                }
+                _ => {
+                    let start = i;
+                    while i < src.len() && !is_delim(src[i]) {
+                        i += 1;
+                    }
+                    let word = &src[start..i];
+                    match std::str::from_utf8(word)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
+                        Some(n) => out.push(PsToken::Int(n)),
+                        None => out.push(PsToken::Word(word)),
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The built-in encoding a Type 1 font program declares in its own
+    /// cleartext portion (everything before `eexec`, which a PDF's
+    /// `/FontFile` stream records as `/Length1`): either
+    /// `/Encoding StandardEncoding def`, or a custom 256-entry vector
+    /// filled by `dup <code> /<glyph> put` entries up to the `def` that
+    /// ends it. Only the cleartext is read - the encrypted private
+    /// portion carries glyph outlines, never the encoding.
+    fn type1_builtin_encoding(data: &[u8], length1: Option<usize>) -> Result<Vec<Option<Vec<u8>>>> {
+        let clear: &[u8] = if data.starts_with(&[0x80, 0x01]) && data.len() >= 6 {
+            // A PFB segment header (marker, type 1 = ASCII, u32 length) -
+            // not what the spec calls for inside a PDF, but real.
+            let len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
+            &data[6..data.len().min(6 + len)]
+        } else {
+            let end = length1
+                .filter(|&n| n > 0 && n <= data.len())
+                .or_else(|| data.windows(5).position(|w| w == b"eexec"))
+                .unwrap_or(data.len());
+            &data[..end]
+        };
+        let tokens = ps_tokens(clear);
+        let start = tokens
+            .iter()
+            .position(|t| *t == PsToken::Name(b"Encoding"))
+            .ok_or_else(|| anyhow!("its Type 1 program declares no /Encoding"))?;
+        let rest = &tokens[start + 1..];
+        let mut names: Vec<Option<Vec<u8>>> = vec![None; 256];
+        if rest.first() == Some(&PsToken::Word(b"StandardEncoding")) {
+            for (slot, name) in names.iter_mut().zip(STANDARD_ENCODING.iter()) {
+                *slot = name.map(<[u8]>::to_vec);
+            }
+            return Ok(names);
+        }
+        let mut entries = 0usize;
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i] == PsToken::Word(b"def") {
+                break;
+            }
+            if let [
+                PsToken::Word(b"dup"),
+                PsToken::Int(code),
+                PsToken::Name(glyph),
+                PsToken::Word(b"put"),
+                ..,
+            ] = &rest[i..]
+                && let Ok(code) = u8::try_from(*code)
+            {
+                names[code as usize] = (*glyph != b".notdef").then(|| glyph.to_vec());
+                entries += 1;
+                i += 4;
+                continue;
+            }
+            i += 1;
+        }
+        if entries == 0 {
+            bail!("its Type 1 program's /Encoding isn't StandardEncoding or a dup/put vector");
+        }
+        Ok(names)
+    }
+
+    /// One CFF INDEX (Adobe Technical Note #5176, section 5) at `pos`: the
+    /// byte range of each item, and where the INDEX ends. Every offset is
+    /// bounds-checked, so a truncated or hostile program is an error,
+    /// never a panic or an out-of-range slice.
+    fn cff_index(data: &[u8], pos: usize) -> Result<(Vec<(usize, usize)>, usize)> {
+        let byte = |p: usize| {
+            data.get(p)
+                .copied()
+                .ok_or_else(|| anyhow!("its CFF program ends inside an INDEX"))
+        };
+        let count = usize::from(byte(pos)?) << 8 | usize::from(byte(pos + 1)?);
+        if count == 0 {
+            return Ok((Vec::new(), pos + 2));
+        }
+        let off_size = usize::from(byte(pos + 2)?);
+        if !(1..=4).contains(&off_size) {
+            bail!("its CFF program has an INDEX with offset size {off_size}");
+        }
+        let offsets_at = pos + 3;
+        let offset = |i: usize| -> Result<usize> {
+            let mut v = 0usize;
+            for k in 0..off_size {
+                v = v << 8 | usize::from(byte(offsets_at + i * off_size + k)?);
+            }
+            Ok(v)
+        };
+        // Offsets count from 1, relative to the byte before the data.
+        let base = offsets_at + (count + 1) * off_size - 1;
+        let mut items = Vec::with_capacity(count);
+        let mut prev = offset(0)?;
+        for i in 1..=count {
+            let next = offset(i)?;
+            if prev == 0 || next < prev || base + next > data.len() {
+                bail!("its CFF program has a malformed INDEX");
+            }
+            items.push((base + prev, base + next));
+            prev = next;
+        }
+        Ok((items, base + prev))
+    }
+
+    /// A CFF DICT's operators and their operands (section 4). Only
+    /// integer operands are kept - real numbers (`FontMatrix` and the
+    /// like) are consumed and recorded as 0, since nothing here reads
+    /// them. Two-byte operators are keyed as `1200 + second byte`
+    /// (`12 30`, ROS, is 1230).
+    fn cff_dict(bytes: &[u8]) -> Result<HashMap<u16, Vec<i64>>> {
+        let byte = |p: usize| {
+            bytes
+                .get(p)
+                .copied()
+                .ok_or_else(|| anyhow!("its CFF program ends inside a DICT"))
+        };
+        let mut out = HashMap::new();
+        let mut operands = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b0 = bytes[i];
+            match b0 {
+                0..=21 => {
+                    let op = if b0 == 12 {
+                        i += 1;
+                        1200 + u16::from(byte(i)?)
+                    } else {
+                        u16::from(b0)
+                    };
+                    i += 1;
+                    out.insert(op, std::mem::take(&mut operands));
+                }
+                28 => {
+                    operands.push(i64::from(i16::from_be_bytes([byte(i + 1)?, byte(i + 2)?])));
+                    i += 3;
+                }
+                29 => {
+                    operands.push(i64::from(i32::from_be_bytes([
+                        byte(i + 1)?,
+                        byte(i + 2)?,
+                        byte(i + 3)?,
+                        byte(i + 4)?,
+                    ])));
+                    i += 5;
+                }
+                30 => {
+                    // A real: nibbles up to and including an 0xF nibble.
+                    i += 1;
+                    loop {
+                        let b = byte(i)?;
+                        i += 1;
+                        if b >> 4 == 0xF || b & 0xF == 0xF {
+                            break;
+                        }
+                    }
+                    operands.push(0);
+                }
+                32..=246 => {
+                    operands.push(i64::from(b0) - 139);
+                    i += 1;
+                }
+                247..=250 => {
+                    operands.push((i64::from(b0) - 247) * 256 + i64::from(byte(i + 1)?) + 108);
+                    i += 2;
+                }
+                251..=254 => {
+                    operands.push(-(i64::from(b0) - 251) * 256 - i64::from(byte(i + 1)?) - 108);
+                    i += 2;
+                }
+                _ => bail!("its CFF program has a reserved DICT byte {b0}"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The built-in encoding of a CFF (`/FontFile3 /Subtype /Type1C`)
+    /// program: its Top DICT's `Encoding` table (predefined Standard, or
+    /// a custom format 0/1 table plus optional supplements), mapping
+    /// codes to glyph IDs, and its `charset` table, mapping glyph IDs to
+    /// string IDs (SIDs) - a SID below 391 names one of
+    /// `CFF_STANDARD_STRINGS`, anything above indexes the font's own
+    /// String INDEX. `Ok(None)` for a CID-keyed program (`ROS` in the Top
+    /// DICT), which has no encoding vector at all. The predefined Expert
+    /// encoding and charsets aren't supported - they're errors, never
+    /// guessed at. No charstring (glyph outline) is ever parsed.
+    fn cff_builtin_encoding(data: &[u8]) -> Result<Option<Vec<Option<Vec<u8>>>>> {
+        let byte = |p: usize| {
+            data.get(p)
+                .copied()
+                .ok_or_else(|| anyhow!("its CFF program ends early"))
+        };
+        let card16 = |p: usize| -> Result<usize> {
+            Ok(usize::from(byte(p)?) << 8 | usize::from(byte(p + 1)?))
+        };
+        let (fonts, pos) = cff_index(data, usize::from(byte(2)?))?;
+        if fonts.is_empty() {
+            bail!("its CFF program has no font");
+        }
+        let (top_dicts, pos) = cff_index(data, pos)?;
+        let (strings, _) = cff_index(data, pos)?;
+        let &(top_start, top_end) = top_dicts
+            .first()
+            .ok_or_else(|| anyhow!("its CFF program has no Top DICT"))?;
+        let top = cff_dict(&data[top_start..top_end])?;
+        if top.contains_key(&1230) {
+            return Ok(None);
+        }
+        let offset_of = |op: u16| -> Result<Option<usize>> {
+            match top.get(&op).and_then(|v| v.last()) {
+                None => Ok(None),
+                Some(&v) => usize::try_from(v)
+                    .map(Some)
+                    .map_err(|_| anyhow!("its CFF program has a negative table offset")),
+            }
+        };
+        let charstrings =
+            offset_of(17)?.ok_or_else(|| anyhow!("its CFF program has no CharStrings"))?;
+        let glyph_count = cff_index(data, charstrings)?.0.len();
+        let sid_name = |sid: usize| -> Option<Vec<u8>> {
+            if sid < CFF_STANDARD_STRINGS.len() {
+                Some(CFF_STANDARD_STRINGS[sid].to_vec())
+            } else {
+                strings
+                    .get(sid - CFF_STANDARD_STRINGS.len())
+                    .map(|&(a, b)| data[a..b].to_vec())
+            }
+        };
+        // charset: glyph ID -> SID (glyph 0 is always .notdef).
+        let mut sids = vec![0usize];
+        match offset_of(15)?.unwrap_or(0) {
+            // ISOAdobe: glyph i is SID i, for SIDs 1..=228.
+            0 => sids.extend((1..glyph_count).map(|g| if g <= 228 { g } else { 0 })),
+            1 | 2 => bail!("its CFF program uses a predefined Expert charset"),
+            at => {
+                let format = byte(at)?;
+                let mut p = at + 1;
+                while sids.len() < glyph_count {
+                    match format {
+                        0 => {
+                            sids.push(card16(p)?);
+                            p += 2;
+                        }
+                        1 | 2 => {
+                            let first = card16(p)?;
+                            let left = if format == 1 {
+                                usize::from(byte(p + 2)?)
+                            } else {
+                                card16(p + 2)?
+                            };
+                            p += if format == 1 { 3 } else { 4 };
+                            for k in 0..=left {
+                                if sids.len() >= glyph_count {
+                                    break;
+                                }
+                                sids.push(first + k);
+                            }
+                        }
+                        f => bail!("its CFF program has an unknown charset format {f}"),
+                    }
+                }
+            }
+        }
+        let glyph_name = |gid: usize| sids.get(gid).and_then(|&sid| sid_name(sid));
+        let mut names: Vec<Option<Vec<u8>>> = vec![None; 256];
+        match offset_of(16)?.unwrap_or(0) {
+            0 => {
+                for (slot, name) in names.iter_mut().zip(STANDARD_ENCODING.iter()) {
+                    *slot = name.map(<[u8]>::to_vec);
+                }
+            }
+            1 => bail!("its CFF program uses the predefined Expert encoding"),
+            at => {
+                let format = byte(at)?;
+                let mut p = at + 1;
+                match format & 0x7F {
+                    0 => {
+                        let n = usize::from(byte(p)?);
+                        p += 1;
+                        for gid in 1..=n {
+                            names[usize::from(byte(p)?)] = glyph_name(gid);
+                            p += 1;
+                        }
+                    }
+                    1 => {
+                        let ranges = byte(p)?;
+                        p += 1;
+                        let mut gid = 1;
+                        for _ in 0..ranges {
+                            let first = usize::from(byte(p)?);
+                            let left = usize::from(byte(p + 1)?);
+                            p += 2;
+                            let last = (first + left).min(255);
+                            for slot in &mut names[first..=last] {
+                                *slot = glyph_name(gid);
+                                gid += 1;
+                            }
+                        }
+                    }
+                    f => bail!("its CFF program has an unknown encoding format {f}"),
+                }
+                // Supplements: extra codes for glyphs already encoded,
+                // each naming its glyph's SID directly.
+                if format & 0x80 != 0 {
+                    let count = byte(p)?;
+                    p += 1;
+                    for _ in 0..count {
+                        let code = usize::from(byte(p)?);
+                        names[code] = sid_name(card16(p + 1)?);
+                        p += 3;
+                    }
+                }
+            }
+        }
+        for slot in &mut names {
+            if slot.as_deref() == Some(b".notdef".as_slice()) {
+                *slot = None;
+            }
+        }
+        Ok(Some(names))
+    }
+
+    /// Fills `table` from a program's built-in glyph names. A name that
+    /// resolves goes in (and into `mapped`); one that doesn't is recorded
+    /// in `unknown`, refused only if a page actually shows it - the same
+    /// rule as a `/Differences` name.
+    fn fill_program_table(
+        table: &mut [String; 256],
+        names: &[Option<Vec<u8>>],
+        mapped: &mut HashSet<u8>,
+        unknown: &mut BTreeMap<u8, Vec<u8>>,
+    ) {
+        for (code, name) in names.iter().enumerate() {
+            let (Ok(code), Some(name)) = (u8::try_from(code), name) else {
+                continue;
+            };
+            match difference_glyph_text(name) {
+                Some(text) => {
+                    table[usize::from(code)] = text;
+                    mapped.insert(code);
+                }
+                None => {
+                    unknown.insert(code, name.clone());
+                }
+            }
+        }
+    }
+
     /// A font is Symbolic when its `FontDescriptor`'s own `/Flags` bit 3
     /// (value 4, PDF 32000-1 Table 123) is set - meaning its glyphs
     /// don't correspond to the standard Latin-text character set at all,
@@ -57155,15 +57767,13 @@ mod pdf_support {
 
     /// Builds a font's decoding state from its font dictionary.
     /// ToUnicode wins when present; otherwise `/Encoding` must resolve
-    /// to WinAnsi/MacRoman (optionally with `/Differences`), or - with
-    /// no `/Encoding` entry at all - a nonsymbolic font falls back to
-    /// Adobe StandardEncoding, PDF's own documented default for exactly
-    /// this case (see `font_is_symbolic`/`STANDARD_ENCODING`'s own doc
-    /// comments). Anything else - Symbol/ZapfDingbats, a genuinely
-    /// symbolic embedded font, a custom base without ToUnicode - is
-    /// still a clean error naming the font, not a guessed table: its
-    /// real encoding lives only inside the embedded font program itself,
-    /// which this reader doesn't parse.
+    /// to WinAnsi/MacRoman (optionally with `/Differences`), or - when it
+    /// names no base at all - to the font's implicit base encoding (see
+    /// `implicit_base_encoding`): an embedded Type 1/CFF program's own
+    /// built-in encoding, else StandardEncoding for a nonsymbolic font.
+    /// A symbolic font with no readable program, or a custom base name
+    /// without ToUnicode, is a clean error naming the font, not a guessed
+    /// table.
     fn build_font(
         reader: &mut PdfReader,
         font_obj: &PdfObj,
@@ -57206,15 +57816,27 @@ mod pdf_support {
                     fill_base_table(&mut table, false);
                 }
                 PdfObj::Dict(d) => {
-                    // No usable base and no CMap leaves only Differences-
-                    // mapped codes decodable. Rather than assume a base
-                    // (silently mistranslating unlisted codes) or refuse
-                    // outright (losing real subset-embedded fonts whose
-                    // content stays inside the mapped range), the page's
-                    // actually-shown codes must be covered below - every
-                    // decoded byte then has an explicit mapping, and
-                    // anything outside fails naming the exact code.
+                    // With no /BaseEncoding, the differences apply to the
+                    // font's implicit base (ISO 32000-1 Table 114). When
+                    // that base can't be determined - a symbolic font
+                    // whose program can't be read - only Differences-
+                    // mapped codes are decodable: rather than assume a
+                    // base (silently mistranslating unlisted codes) or
+                    // refuse outright (losing fonts whose content stays
+                    // inside the mapped range), the page's actually-shown
+                    // codes must be covered below, and anything outside
+                    // fails naming the exact code. A program's own
+                    // encoding gets the same shown-codes check, since it
+                    // can leave codes unassigned too.
                     let mut needs_coverage_check = false;
+                    let mut mapped: HashSet<u8> = HashSet::new();
+                    // Glyph names this reader can't resolve, by code. A
+                    // font's /Differences (or its program's encoding)
+                    // routinely names glyphs a given page never shows
+                    // (or that its ToUnicode already covers), so an
+                    // unknown name only refuses the font once it's
+                    // actually needed - see `shown_unknown_glyph`.
+                    let mut unknown: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
                     if let Some(base) = d.get(b"BaseEncoding".as_slice()) {
                         let base_resolved = reader.resolve(base, 0, path)?;
                         match &base_resolved {
@@ -57236,17 +57858,17 @@ mod pdf_support {
                             _ => bail!("{path:?} font {font_desc} has a malformed /BaseEncoding"),
                         }
                     } else if cmap.is_empty() {
-                        needs_coverage_check = true;
+                        match implicit_base_encoding(reader, dict, path)? {
+                            ImplicitBase::Program(names) => {
+                                fill_program_table(&mut table, &names, &mut mapped, &mut unknown);
+                                needs_coverage_check = true;
+                            }
+                            ImplicitBase::Standard => fill_standard_table(&mut table),
+                            ImplicitBase::Unknown(_) => needs_coverage_check = true,
+                        }
                     } else {
                         fill_base_table(&mut table, false);
                     }
-                    let mut mapped: HashSet<u8> = HashSet::new();
-                    // Glyph names this reader can't resolve, by code. A
-                    // font's /Differences routinely names glyphs a given
-                    // page never shows (or that its ToUnicode already
-                    // covers), so an unknown name only refuses the font
-                    // once it's actually needed - see `shown_unknown_glyph`.
-                    let mut unknown: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
                     if let Some(diffs) = d.get(b"Differences".as_slice()) {
                         let diff_resolved = reader.resolve(diffs, 0, path)?;
                         let PdfObj::Array(items) = &diff_resolved else {
@@ -57315,28 +57937,37 @@ mod pdf_support {
                 _ => bail!("{path:?} font {font_desc} has a malformed /Encoding"),
             }
         } else if cmap.is_empty() {
-            // No `/Encoding` entry at all, no `/ToUnicode` - per PDF
-            // 32000-1 9.6.6.2, a *nonsymbolic* simple font's own built-in
-            // encoding is used in this case, and Adobe StandardEncoding
-            // is that built-in encoding for the common real-world shape
-            // this actually is: an embedded, non-subsetted-into-a-custom-
-            // vector Type1 program (confirmed directly against a real
-            // LaTeX/dvips-produced font's own unencrypted header, which
-            // states `/Encoding StandardEncoding def` verbatim - see
-            // `STANDARD_ENCODING`'s own doc comment). A *symbolic* font
-            // (FontDescriptor `/Flags` bit 3, or literally `/Symbol`/
-            // `/ZapfDingbats` when there's no FontDescriptor at all to
-            // check) has no such safe default - its real built-in
-            // encoding lives only in the embedded font program's own
-            // internal `/Encoding` array, which this reader doesn't
-            // parse - so that case is still the same disclosed refusal
-            // as before, not a guess.
-            if font_is_symbolic(reader, dict, path)? {
-                bail!(
-                    "{path:?} font {font_desc} has no usable encoding (no /Encoding, no /ToUnicode)"
-                );
+            // No `/Encoding` entry at all, no `/ToUnicode`: the font's
+            // own built-in encoding applies (PDF 32000-1 9.6.6.2) - read
+            // straight from an embedded Type 1/CFF program when there is
+            // one, since that's the only authority for a symbolic font
+            // (a real LaTeX/dvips Type 1 program states its vector in its
+            // own cleartext), else StandardEncoding for a nonsymbolic
+            // font (see `STANDARD_ENCODING`'s own doc comment). A
+            // symbolic font with no readable program is still the same
+            // disclosed refusal, not a guess.
+            match implicit_base_encoding(reader, dict, path)? {
+                ImplicitBase::Program(names) => {
+                    let mut mapped = HashSet::new();
+                    let mut unknown = BTreeMap::new();
+                    fill_program_table(&mut table, &names, &mut mapped, &mut unknown);
+                    if let Some((code, glyph)) = shown_unknown_glyph(required, &unknown, &cmap) {
+                        bail!(
+                            "{path:?} font {font_desc} maps code {code} to unknown glyph /{} (in its embedded font program's built-in encoding)",
+                            String::from_utf8_lossy(glyph)
+                        );
+                    }
+                    if let Some(missing) = first_unmapped_code(required, &mapped) {
+                        bail!(
+                            "{path:?} font {font_desc} shows code {missing}, which its embedded font program's built-in encoding doesn't assign (no /Encoding, no /ToUnicode)"
+                        );
+                    }
+                }
+                ImplicitBase::Standard => fill_standard_table(&mut table),
+                ImplicitBase::Unknown(why) => bail!(
+                    "{path:?} font {font_desc} has no usable encoding (no /Encoding, no /ToUnicode){why}"
+                ),
             }
-            fill_standard_table(&mut table);
         } else {
             fill_base_table(&mut table, false);
         }
@@ -57998,6 +58629,121 @@ mod pdf_support {
                     );
                 }
             }
+        }
+
+        /// A hand-built 114-byte CFF (two custom strings, a format 0
+        /// charset, a format 0 encoding *with supplements*, 2-byte INDEX
+        /// offsets) - the one encoding shape no real corpus font used.
+        /// fontTools reads it as {65: Gamma, 66: eacute, 67: zzzcustom,
+        /// 97: eacute, 98: Gamma}, the expected value below.
+        const CFF_WITH_SUPPLEMENTS: &str = "01000402000102000100074d696e4346460001020001001e1d0000004e0f1d00000055101d00000061111d000000001d000000721200020200010006000f47616d6d617a7a7a637573746f6d000000018700cf01888003414243026100cf620187000402000100020003000400050e0e0e0e";
+
+        fn hex_bytes(hex: &str) -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        fn assigned(names: &[Option<Vec<u8>>]) -> Vec<(usize, String)> {
+            names
+                .iter()
+                .enumerate()
+                .filter_map(|(c, n)| {
+                    n.as_ref()
+                        .map(|n| (c, String::from_utf8_lossy(n).into_owned()))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn cff_encoding_reads_custom_strings_and_supplements() {
+            let names = cff_builtin_encoding(&hex_bytes(CFF_WITH_SUPPLEMENTS))
+                .unwrap()
+                .unwrap();
+            let expected: Vec<(usize, String)> = [
+                (65, "Gamma"),
+                (66, "eacute"),
+                (67, "zzzcustom"),
+                (97, "eacute"),
+                (98, "Gamma"),
+            ]
+            .iter()
+            .map(|&(c, n)| (c, n.to_string()))
+            .collect();
+            assert_eq!(assigned(&names), expected);
+        }
+
+        #[test]
+        fn cff_encoding_of_a_cid_keyed_program_is_none() {
+            // The same font with `ROS` (12 30) in its Top DICT.
+            let cid = hex_bytes(
+                "01000402000102000100074d696e4346460001020001002f1d000001871d000001881d000000000c1e1d0000005f0f1d00000066101d0000006b111d000000001d0000007c1200020200010006000f47616d6d617a7a7a637573746f6d000000018700cf01880003414243000402000100020003000400050e0e0e0e",
+            );
+            assert!(cff_builtin_encoding(&cid).unwrap().is_none());
+        }
+
+        #[test]
+        fn cff_encoding_errors_cleanly_on_every_truncation() {
+            let full = hex_bytes(CFF_WITH_SUPPLEMENTS);
+            for len in 0..full.len() {
+                // Never a panic; an early cut is an error, a late one
+                // (inside the unused CharStrings data) may still parse.
+                let _ = cff_builtin_encoding(&full[..len]);
+            }
+            assert!(cff_builtin_encoding(&full[..40]).is_err());
+        }
+
+        #[test]
+        fn cff_dict_decodes_every_operand_form() {
+            // 28: i16, 29: i32, 32-246: one byte, 247-250 / 251-254: two
+            // bytes, 30: a real (1.5, consumed and recorded as 0), and a
+            // two-byte `12 7` operator.
+            let dict = cff_dict(&[
+                28, 0x01, 0x00, 15, 29, 0x00, 0x00, 0x01, 0x00, 16, 139, 247, 0x00, 251, 0x00, 17,
+                30, 0x1A, 0x5F, 12, 7,
+            ])
+            .unwrap();
+            assert_eq!(dict[&15], vec![256]);
+            assert_eq!(dict[&16], vec![256]);
+            assert_eq!(dict[&17], vec![0, 108, -108]);
+            assert_eq!(dict[&1207], vec![0]);
+            assert!(cff_dict(&[22]).is_err());
+            assert!(cff_dict(&[28, 0x01]).is_err());
+        }
+
+        #[test]
+        fn type1_encoding_reads_the_vector_and_skips_decoys() {
+            let clear = b"%!PS-AdobeFont-1.0: T\n% /Encoding StandardEncoding def\n/FontInfo 1 dict dup begin /Notice (/Encoding StandardEncoding def \\) (x)) def end\n/Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\ndup 65 /Gamma put\ndup 66 /eacute put\ndup 67 /.notdef put\nreadonly def\ncurrentfile eexec\n";
+            let mut data = clear.to_vec();
+            data.extend_from_slice(&[0xFF, 0x00, 0x13]);
+            let expected = vec![(65, "Gamma".to_string()), (66, "eacute".to_string())];
+            // By /Length1, and by falling back to the `eexec` keyword.
+            assert_eq!(
+                assigned(&type1_builtin_encoding(&data, Some(clear.len())).unwrap()),
+                expected
+            );
+            assert_eq!(
+                assigned(&type1_builtin_encoding(&data, None).unwrap()),
+                expected
+            );
+            // A PFB-wrapped program (segment marker, type 1, u32 length).
+            let mut pfb = vec![0x80, 0x01];
+            pfb.extend_from_slice(&(clear.len() as u32).to_le_bytes());
+            pfb.extend_from_slice(clear);
+            assert_eq!(
+                assigned(&type1_builtin_encoding(&pfb, None).unwrap()),
+                expected
+            );
+        }
+
+        #[test]
+        fn type1_encoding_reads_standard_encoding_and_refuses_the_unreadable() {
+            let names = type1_builtin_encoding(b"/Encoding StandardEncoding def", None).unwrap();
+            assert_eq!(names[0x41].as_deref(), Some(b"A".as_slice()));
+            assert_eq!(names[0xAE].as_deref(), Some(b"fi".as_slice()));
+            assert!(type1_builtin_encoding(b"/FontName /X def", None).is_err());
+            assert!(type1_builtin_encoding(b"/Encoding ISOLatin1Encoding def", None).is_err());
         }
 
         #[test]

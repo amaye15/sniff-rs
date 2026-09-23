@@ -13450,9 +13450,20 @@ fn pdf_accepts_differences_without_a_base_when_content_stays_mapped() {
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_unmapped_code_without_a_base_names_the_code() {
+fn pdf_differences_without_a_base_apply_to_the_implicit_base_encoding() {
+    // ISO 32000-1 Table 114: with no /BaseEncoding, an unembedded
+    // nonsymbolic font's differences apply to StandardEncoding - so the
+    // unlisted code 66 reads as `B`.
+    let doc = run_json("edge_pdf_differences_unmapped.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_differences_unmapped"), "text")["sample_values"],
+        serde_json::json!(["AB"])
+    );
+    // A symbolic font with no embedded program has no base to fall back
+    // on: showing a code its differences don't cover still refuses,
+    // naming the code.
     let output = Command::new(bin())
-        .args([fixture("edge_pdf_differences_unmapped.pdf")
+        .args([fixture("edge_pdf_differences_unmapped_symbolic.pdf")
             .to_str()
             .unwrap()])
         .output()
@@ -13460,6 +13471,66 @@ fn pdf_unmapped_code_without_a_base_names_the_code() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("shows code 66"), "got: {stderr}");
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_reads_a_symbolic_cff_fonts_own_built_in_encoding() {
+    // A symbolic embedded CFF (/FontFile3 /Subtype /Type1C) font with no
+    // /Encoding and no /ToUnicode: its own custom encoding maps 65/70/90/
+    // 120 to Gamma/eacute/fi/angbracketleft (built with fontTools, which
+    // reads the same table back).
+    let doc = run_json("edge_pdf_cff_builtin_encoding.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_cff_builtin_encoding"), "text")["sample_values"],
+        serde_json::json!(["\u{0393}\u{00E9}\u{FB01}\u{27E8}"])
+    );
+    // /Differences without /BaseEncoding apply on top of that same
+    // program encoding: 70 is overridden to `A`, 90 still reads `fi`.
+    let doc = run_json("edge_pdf_differences_over_program_base.pdf", &[]);
+    assert_eq!(
+        column(
+            table(&doc, "edge_pdf_differences_over_program_base"),
+            "text"
+        )["sample_values"],
+        serde_json::json!(["A\u{FB01}"])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_program_encoding_refuses_an_unknown_or_unassigned_shown_code() {
+    for (name, needle) in [
+        (
+            "edge_pdf_cff_builtin_unknown_glyph.pdf",
+            "maps code 200 to unknown glyph /zzzunknownglyph",
+        ),
+        (
+            "edge_pdf_cff_builtin_unassigned_code.pdf",
+            "shows code 66, which its embedded font program's built-in encoding doesn't assign",
+        ),
+    ] {
+        let output = Command::new(bin())
+            .args([fixture(name).to_str().unwrap()])
+            .output()
+            .expect("failed to run binary");
+        assert!(!output.status.success(), "{name}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(needle), "{name}: {stderr}");
+    }
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_reads_a_symbolic_type1_fonts_cleartext_encoding_vector() {
+    // The Type 1 program's cleartext declares `dup 65 /Gamma put` etc.;
+    // a decoy `/Encoding StandardEncoding def` inside a comment and inside
+    // the /Notice string must not be mistaken for the real declaration.
+    let doc = run_json("edge_pdf_type1_builtin_encoding.pdf", &[]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_type1_builtin_encoding"), "text")["sample_values"],
+        serde_json::json!(["\u{0393}\u{00E9}\u{22A2}"])
+    );
 }
 
 #[test]
