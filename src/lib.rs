@@ -52745,9 +52745,36 @@ mod pdf_support {
         if kept == 0 {
             return Ok(Vec::new());
         }
+        let mut text = text_acc.into_profile("text".to_string(), kept);
+        let stats = &reader.text_stats;
+        let mut disclosed = Vec::new();
+        if stats.unmapped_codes > 0 {
+            disclosed.push(format!(
+                "{} character code(s) had no Unicode mapping in their font and read as U+FFFD",
+                stats.unmapped_codes
+            ));
+        }
+        if stats.skipped_forms > 0 {
+            disclosed.push(format!(
+                "text of {} Form XObject(s) skipped because it couldn't be decoded ({}: {})",
+                stats.skipped_forms,
+                if stats.skipped_forms == 1 {
+                    "reason"
+                } else {
+                    "first"
+                },
+                stats.first_skip_reason.as_deref().unwrap_or("unknown")
+            ));
+        }
+        if !disclosed.is_empty() {
+            if !text.notes.is_empty() {
+                text.notes.push_str("; ");
+            }
+            text.notes.push_str(&disclosed.join("; "));
+        }
         Ok(vec![
             num_acc.into_profile("page_number".to_string(), kept),
-            text_acc.into_profile("text".to_string(), kept),
+            text,
         ])
     }
 
@@ -52908,6 +52935,18 @@ mod pdf_support {
         trailer: BTreeMap<Vec<u8>, PdfObj>,
         objstm_cache: HashMap<u32, Vec<PdfObj>>,
         encryption: Option<PdfEncryption>,
+        text_stats: PdfTextStats,
+    }
+
+    /// What page-text extraction couldn't fully decode, for
+    /// `columns_from_pdf` to disclose on the `text` column rather than
+    /// lose silently: codes read as U+FFFD, and Form XObjects whose text
+    /// was skipped because their content failed to decode.
+    #[derive(Default)]
+    struct PdfTextStats {
+        unmapped_codes: usize,
+        skipped_forms: usize,
+        first_skip_reason: Option<String>,
     }
 
     impl PdfReader {
@@ -52927,6 +52966,7 @@ mod pdf_support {
                 trailer: BTreeMap::new(),
                 objstm_cache: HashMap::new(),
                 encryption: None,
+                text_stats: PdfTextStats::default(),
             };
             // The header lives in the first bytes (`%PDF-1.x`); some
             // writers prepend garbage (a BOM, transfer noise), so the
@@ -57091,23 +57131,53 @@ mod pdf_support {
         ("wreathproduct", "\u{2240}"),
     ];
 
+    /// How a font's string bytes split into character codes.
+    #[derive(Clone, Copy, PartialEq)]
+    enum CodeWidth {
+        /// A simple font: one byte per code.
+        One,
+        /// A composite (Type0) font with an `Identity-H`/`Identity-V` CMap,
+        /// which every Type0 font in the real corpus uses: two bytes per
+        /// code.
+        Two,
+        /// A composite font with any other CMap: codes are split by
+        /// longest match against its ToUnicode keys, since this reader
+        /// doesn't carry the predefined CJK CMaps that define them.
+        Variable,
+    }
+
     /// One font's decoding state: a ToUnicode CMap (authoritative whenever
     /// present - it exists precisely because the byte codes are custom)
     /// plus a 256-entry base table (WinAnsi, MacRoman, or either with
-    /// `/Differences` applied) covering codes the CMap doesn't map.
+    /// `/Differences` applied) covering a simple font's codes the CMap
+    /// doesn't map.
     struct PdfFont {
         cmap: HashMap<Vec<u8>, String>,
         table: [String; 256],
+        width: CodeWidth,
     }
 
     impl PdfFont {
-        /// Decodes one content-stream string's raw bytes. CMap lookup is
-        /// longest-match (4 down to 1 byte - CJK fonts use 2-byte codes,
-        /// simple fonts 1); an unmapped byte falls back to the base
-        /// table, which for space/controls (the usual unmapped codes) is
-        /// identical across every encoding anyway.
-        fn decode(&self, bytes: &[u8]) -> String {
+        /// Decodes one content-stream string's raw bytes, returning the
+        /// text and how many codes had no Unicode mapping (each read as
+        /// U+FFFD), for `columns_from_pdf` to disclose. A simple font's
+        /// codes are single bytes: ToUnicode first (longest match, 4 down
+        /// to 1 byte), else the base table. A composite font's codes never
+        /// go through that single-byte table: an Identity code is exactly
+        /// two bytes, and one its ToUnicode doesn't map is a single U+FFFD,
+        /// never the two unrelated single-byte guesses (typically a NUL and
+        /// a Latin-1 letter) this used to produce.
+        fn decode(&self, bytes: &[u8]) -> (String, usize) {
             let mut out = String::new();
+            let mut unmapped = 0;
+            if self.width == CodeWidth::Two {
+                for code in bytes.chunks(2) {
+                    let text = self.cmap.get(code).map_or("\u{FFFD}", String::as_str);
+                    unmapped += usize::from(text == "\u{FFFD}");
+                    out.push_str(text);
+                }
+                return (out, unmapped);
+            }
             let mut i = 0;
             while i < bytes.len() {
                 let mut matched: Option<(&String, usize)> = None;
@@ -57117,18 +57187,16 @@ mod pdf_support {
                         break;
                     }
                 }
-                match matched {
-                    Some((s, len)) => {
-                        out.push_str(s);
-                        i += len;
-                    }
-                    None => {
-                        out.push_str(&self.table[bytes[i] as usize]);
-                        i += 1;
-                    }
-                }
+                let (text, len) = match matched {
+                    Some((s, len)) => (s.as_str(), len),
+                    None if self.width == CodeWidth::Variable => ("\u{FFFD}", 1),
+                    None => (self.table[bytes[i] as usize].as_str(), 1),
+                };
+                unmapped += usize::from(text == "\u{FFFD}");
+                out.push_str(text);
+                i += len;
             }
-            out
+            (out, unmapped)
         }
     }
 
@@ -57797,6 +57865,18 @@ mod pdf_support {
             };
             cmap = parse_tounicode(data, font_desc, path)?;
         }
+        let composite = matches!(
+            dict.get(b"Subtype".as_slice()),
+            Some(PdfObj::Name(s)) if s == b"Type0"
+        );
+        let identity = composite
+            && match dict.get(b"Encoding".as_slice()) {
+                Some(enc) => matches!(
+                    reader.resolve(enc, 0, path)?,
+                    PdfObj::Name(n) if n == b"Identity-H" || n == b"Identity-V"
+                ),
+                None => false,
+            };
         // Base table: WinAnsi unless the font says MacRoman. Unknown
         // base names are fine *with* a CMap (it only backs unmapped
         // codes) but fatal without one.
@@ -57812,8 +57892,17 @@ mod pdf_support {
                 }
                 PdfObj::Name(n) => {
                     if cmap.is_empty() {
+                        // A ToUnicode can be present but map nothing (just
+                        // a codespace range - a real Word/SymbolMT shape);
+                        // saying "without /ToUnicode" there would send
+                        // someone looking for a missing entry.
+                        let what = if dict.contains_key(b"ToUnicode".as_slice()) {
+                            "with a /ToUnicode that maps no codes"
+                        } else {
+                            "without /ToUnicode"
+                        };
                         bail!(
-                            "{path:?} font {font_desc} uses /{} without /ToUnicode - re-save with WinAnsi/MacRoman or an embedded ToUnicode CMap",
+                            "{path:?} font {font_desc} uses /{} {what} - re-save with WinAnsi/MacRoman or an embedded ToUnicode CMap",
                             String::from_utf8_lossy(n)
                         );
                     }
@@ -57975,7 +58064,14 @@ mod pdf_support {
         } else {
             fill_base_table(&mut table, false);
         }
-        Ok(PdfFont { cmap, table })
+        let width = if identity {
+            CodeWidth::Two
+        } else if composite {
+            CodeWidth::Variable
+        } else {
+            CodeWidth::One
+        };
+        Ok(PdfFont { cmap, table, width })
     }
 
     /// UTF-16BE bytes to `String` (ToUnicode destinations). Surrogate
@@ -58405,10 +58501,11 @@ mod pdf_support {
                             let built = build_font(self, fdict, &desc, req, path)?;
                             font_cache.insert(key.clone(), built);
                         }
-                        let text = font_cache
+                        let (text, unmapped) = font_cache
                             .get(&key)
                             .map(|f| f.decode(&bytes))
                             .unwrap_or_default();
+                        self.text_stats.unmapped_codes += unmapped;
                         // An empty show contributes nothing - not even its
                         // word separator (otherwise `() Tj` would spray
                         // double spaces through the text).
@@ -58481,11 +58578,20 @@ mod pdf_support {
                             invocation: *xobject_counter,
                         };
                         // A Form's own content genuinely failing to parse
-                        // (a malformed operand, an undefined font) is the
-                        // same "not worth losing the rest of the page over"
-                        // case as the resolve failures above, not a reason
-                        // to fail the whole page.
-                        let Ok(nested) = self.render_content_text(
+                        // (a malformed operand, a font with no usable
+                        // encoding) is the same "not worth losing the rest
+                        // of the page over" case as the resolve failures
+                        // above, not a reason to fail the whole page - but
+                        // unlike an Image, a Form is known to carry text,
+                        // so skipping it is recorded and disclosed on the
+                        // `text` column (see `PdfTextStats`), never silent.
+                        // Counts from the failed Form's own partial render
+                        // are rolled back so only the skip itself counts.
+                        let before = (
+                            self.text_stats.unmapped_codes,
+                            self.text_stats.skipped_forms,
+                        );
+                        let nested = match self.render_content_text(
                             &xdata,
                             &xres,
                             xscope,
@@ -58494,8 +58600,23 @@ mod pdf_support {
                             xobject_counter,
                             depth + 1,
                             path,
-                        ) else {
-                            continue;
+                        ) {
+                            Ok(nested) => nested,
+                            Err(e) => {
+                                (
+                                    self.text_stats.unmapped_codes,
+                                    self.text_stats.skipped_forms,
+                                ) = before;
+                                self.text_stats.skipped_forms += 1;
+                                if self.text_stats.first_skip_reason.is_none() {
+                                    let reason = e.to_string();
+                                    let prefix = format!("{path:?} ");
+                                    self.text_stats.first_skip_reason = Some(
+                                        reason.strip_prefix(&prefix).unwrap_or(&reason).to_string(),
+                                    );
+                                }
+                                continue;
+                            }
                         };
                         if !nested.is_empty() {
                             if !out.is_empty() && !ends_ws(&out) {
@@ -59105,11 +59226,12 @@ mod pdf_support {
                     }
                     t
                 },
+                width: CodeWidth::One,
             };
             let mut out = Vec::new();
             for span in content_spans(data).expect("test content must parse") {
                 if let CSpan::Show { bytes, .. } = span {
-                    out.push(font.decode(&bytes));
+                    out.push(font.decode(&bytes).0);
                 }
             }
             out
@@ -59138,6 +59260,46 @@ mod pdf_support {
                 shown_fonts(b"/F1 9 Tf q /F2 9 Tf q /F3 9 Tf (a) Tj Q (b) Tj Q (c) Tj Q Q (d) Tj"),
                 vec!["F3", "F2", "F1", "F1"]
             );
+        }
+
+        fn font_with(cmap: &[(&[u8], &str)], width: CodeWidth) -> PdfFont {
+            PdfFont {
+                cmap: cmap
+                    .iter()
+                    .map(|(k, v)| (k.to_vec(), v.to_string()))
+                    .collect(),
+                table: std::array::from_fn(|i| winansi_decode(i as u8).to_string()),
+                width,
+            }
+        }
+
+        #[test]
+        fn identity_codes_are_two_bytes_and_unmapped_ones_read_as_one_replacement_char() {
+            // A partial ToUnicode: only <0041> is mapped. The old decoder
+            // read the unmapped <004C><0056> as NUL, 'L', NUL, 'V'.
+            let font = font_with(&[(b"\x00\x41", "i")], CodeWidth::Two);
+            assert_eq!(
+                font.decode(b"\x00\x41\x00\x4C\x00\x56"),
+                ("i\u{FFFD}\u{FFFD}".to_string(), 2)
+            );
+            // A dangling odd byte is one unmapped code too, never a panic.
+            assert_eq!(font.decode(b"\x00\x41\x00"), ("i\u{FFFD}".to_string(), 1));
+        }
+
+        #[test]
+        fn other_composite_codes_never_fall_back_to_the_single_byte_table() {
+            let font = font_with(&[(b"\x81\x40", "\u{3000}")], CodeWidth::Variable);
+            assert_eq!(
+                font.decode(b"\x81\x40\x41"),
+                ("\u{3000}\u{FFFD}".to_string(), 1)
+            );
+        }
+
+        #[test]
+        fn simple_fonts_count_table_codes_that_read_as_replacement_chars() {
+            // WinAnsi leaves 0x81 unassigned; 0x41 is `A`.
+            let font = font_with(&[], CodeWidth::One);
+            assert_eq!(font.decode(b"A\x81"), ("A\u{FFFD}".to_string(), 1));
         }
 
         #[test]
@@ -59402,6 +59564,7 @@ mod pdf_support {
                 trailer: BTreeMap::new(),
                 objstm_cache: HashMap::new(),
                 encryption: None,
+                text_stats: PdfTextStats::default(),
             };
             reader.read_xref_stream(&map, &data, tpath()).unwrap();
             assert_eq!(reader.xref.get(&0), Some(&XrefEntry::Free));

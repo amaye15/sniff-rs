@@ -13535,6 +13535,54 @@ fn pdf_reads_a_symbolic_type1_fonts_cleartext_encoding_vector() {
 
 #[test]
 #[cfg(feature = "pdf")]
+fn pdf_identity_h_codes_are_two_bytes_and_unmapped_ones_are_disclosed() {
+    // `<0041><0042><004C>` through an Identity-H font whose ToUnicode maps
+    // only the first two: the unmapped code is one U+FFFD (the old decoder
+    // split it into NUL + `L`), and the `text` column says how many codes
+    // read that way.
+    let doc = run_json("edge_pdf_identity_h_partial_tounicode.pdf", &[]);
+    let text = column(table(&doc, "edge_pdf_identity_h_partial_tounicode"), "text");
+    assert_eq!(text["sample_values"], serde_json::json!(["is\u{FFFD}"]));
+    let notes = text["notes"].as_str().unwrap();
+    assert!(
+        notes.contains(
+            "1 character code(s) had no Unicode mapping in their font and read as U+FFFD"
+        ),
+        "got: {notes}"
+    );
+    // A ToUnicode that's present but maps nothing is named as such.
+    let output = Command::new(bin())
+        .args([fixture("edge_pdf_identity_h_empty_tounicode.pdf")
+            .to_str()
+            .unwrap()])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("uses /Identity-H with a /ToUnicode that maps no codes"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_a_form_whose_text_cant_be_decoded_is_skipped_and_disclosed() {
+    // The page's own text survives; the Form (whose only font is a bare
+    // symbolic /Symbol) is skipped - and the `text` column now says so,
+    // with the reason, instead of losing it silently.
+    let doc = run_json("edge_pdf_form_skipped_is_disclosed.pdf", &[]);
+    let text = column(table(&doc, "edge_pdf_form_skipped_is_disclosed"), "text");
+    assert_eq!(text["sample_values"], serde_json::json!(["Kept"]));
+    let notes = text["notes"].as_str().unwrap();
+    assert!(
+        notes.contains("text of 1 Form XObject(s) skipped because it couldn't be decoded (reason: font /F9/page1 has no usable encoding"),
+        "got: {notes}"
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
 fn pdf_form_xobject_fonts_are_scoped_per_page_not_just_per_invocation() {
     // Each page invokes its own Form, and each Form names a *different*
     // font `/F1` (page 2's maps every letter of "Plain" to Z). The font

@@ -15776,6 +15776,52 @@ PDFium (three lecture decks went from 67-72% character overlap to
 `edge_pdf_form_fonts_scoped_per_page.pdf` locks it in - two pages whose
 Forms each name a different `/F1`.
 
+**A follow-up pass made composite-font decoding width-correct and made
+the reader disclose what it couldn't decode.** A composite (Type0) font
+with an `Identity-H`/`Identity-V` CMap - every one of the 1,740 in the
+real corpus - has exactly two-byte codes, but the decoder used to try
+ToUnicode and then fall back *byte by byte* to a single-byte table, so a
+code its ToUnicode didn't map came out as two unrelated characters,
+typically a NUL and a Latin-1 letter. `PdfFont` now carries its
+`CodeWidth`: an Identity code is two bytes, and an unmapped one is one
+U+FFFD; any other composite font keeps longest-match splitting but never
+touches the single-byte table. `decode` also counts every code that read
+as U+FFFD, and a Form XObject whose content fails to decode - which the
+Form XObject pass skipped *silently*, as the embedded-program pass above
+found - is now counted with its first reason (`PdfTextStats`); both are
+appended to the `text` column's notes (`"12 character code(s) had no
+Unicode mapping in their font and read as U+FFFD"`, `"text of 1 Form
+XObject(s) skipped because it couldn't be decoded (reason: ...)"`), so a
+lossy decode is never silent. A ToUnicode that's present but maps nothing
+(only a codespace range - the shape behind all 8 of the corpus's
+Identity-H refusals) is now named as such instead of being reported as
+missing.
+
+**This pass's first version was measured against PDFium and came out
+worse, and that result is what found the two bugs fixed just above.**
+Scored by character-multiset overlap with PDFium's own text (Chrome's PDF
+engine, via `pypdfium2`, newly installed as a verification tool - never a
+dependency), the first version lost ground on 20 real files: the old
+byte-by-byte fallback had been leaking the right letter as the second
+byte of each garbage pair, and plain U+FFFD recovered nothing. Tracing
+why PDFium got those letters led to the `q`/`Q` font leak and then the
+per-page Form font-cache collision - with both fixed (and committed
+separately, each measured on its own), this change is neutral against
+PDFium on every file it touches: 16 real outputs change, 15 only by
+gaining a disclosure note and one by trading garbage for U+FFFD, with 0
+new failures. A TrueType `cmap` fallback (code to glyph ID through
+`/CIDToGIDMap`, then glyph ID to Unicode through the embedded program's
+own `cmap`, PDFium's approach) was implemented alongside and removed
+again: it changed no real file - of roughly 280 embedded CID TrueType
+programs in the affected files, 190 are stripped subsets with neither a
+`cmap` nor a `post` table, and the rest had ToUnicode coverage for
+everything they showed - and its one attempted real effect, reading a
+symbol font's (1,0) subtable as Mac Roman, was wrong (SymbolMT's bullet
+came out as ∑). Unexercised complexity with a demonstrated way to be
+wrong wasn't worth keeping. Three new fixtures (a partial ToUnicode, an
+empty one, and a Form whose only font has no usable encoding) plus three
+unit tests on `decode`'s widths lock it in.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -16107,9 +16153,14 @@ established baselines exactly.
   alike; only a genuine non-empty user password refuses cleanly, rather
   than guess at it. A Form XObject's
   own nested content (a `/Do`-invoked form) is recursed into for its own
-  text-showing operators; an Image XObject, or a Form/Image resolution
-  failure of any kind (an unsupported codec, a bad predictor), is
-  silently skipped rather than costing the rest of the page. A
+  text-showing operators; an Image XObject, or an XObject that can't
+  even be resolved (an unsupported codec, a bad predictor - which of the
+  two it was can't be known), is silently skipped rather than costing the
+  rest of the page. A Form whose own text fails to decode is skipped too,
+  but *disclosed*: the `text` column's notes count skipped Forms and give
+  the first reason, and likewise count every character code that read as
+  U+FFFD (a composite font's code its ToUnicode doesn't map, a simple
+  font's code its encoding leaves unassigned). A
   content stream's FlateDecode payload that's genuinely truncated
   mid-DEFLATE-block (a real, common corpus shape - an interrupted
   download or write) is no longer an automatic refusal: every complete
