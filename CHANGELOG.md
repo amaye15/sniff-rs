@@ -36,6 +36,9 @@ All notable changes to sniff-rs are documented here. Format follows
   page actually shows; `propersubset`/`propersuperset` map to U+2282/3.
 - PDF text expands `ﬁ`-style presentation-form ligatures to letters
   (Unicode's own NFKC mapping).
+- PDF: TeX/Symbol extensible-delimiter pieces (`bracketlefttp`, ...) read
+  as their Unicode 3.2 characters (U+239B-U+23AD and kin) instead of
+  U+FFFD.
 
 ### Changed
 - PDF: a font or code with no Unicode mapping now reads as U+FFFD with a

@@ -13703,6 +13703,20 @@ fn pdf_differences_running_past_code_255_degrades_that_font_not_a_panic() {
 
 #[test]
 #[cfg(feature = "pdf")]
+fn pdf_symbol_delimiter_pieces_read_as_their_unicode_characters() {
+    // The AGL maps TeX/Symbol's extensible-delimiter pieces into the
+    // Private Use Area; Unicode 3.2 gave them real characters.
+    let doc = run_json("edge_pdf_symbol_delimiter_pieces.pdf", &[]);
+    let text = column(table(&doc, "edge_pdf_symbol_delimiter_pieces"), "text");
+    assert_eq!(
+        text["sample_values"],
+        serde_json::json!(["\u{23A1}\u{23A2}\u{23A3}\u{239E}\u{23AE}\u{23D0}"])
+    );
+    assert!(!text["notes"].as_str().unwrap().contains("U+FFFD"));
+}
+
+#[test]
+#[cfg(feature = "pdf")]
 fn pdf_reads_xref_streams_and_object_streams() {
     // Modern writer shape: no `xref` table at all, object offsets from a
     // compressed xref stream, and the font dictionary itself packed into
