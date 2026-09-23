@@ -13407,14 +13407,16 @@ fn pdf_profiles_pages_as_records() {
 #[cfg(feature = "pdf")]
 fn pdf_decodes_winansi_macroman_and_tounicode_faithfully() {
     // Byte 0x80 through WinAnsi is U+20AC; MacRoman 0xDE is the `fi`
-    // ligature and 0xDB is U+20AC (the iconv-oracle fix); the CMap page
-    // maps custom codes to CJK. Any of these coming back wrong means the
-    // font layer mangled real bytes, not a heuristic disagreement.
+    // ligature glyph (U+FB01 - expanded to `fi` in the extracted text,
+    // Unicode's own NFKC mapping) and 0xDB is U+20AC (the iconv-oracle
+    // fix); the CMap page maps custom codes to CJK. Any of these coming
+    // back wrong means the font layer mangled real bytes, not a
+    // heuristic disagreement.
     let doc = run_json("type_detection.pdf", &[]);
     let cols = table(&doc, "type_detection");
     assert_eq!(
         column(cols, "text")["sample_values"],
-        serde_json::json!(["Price: €50, mail a@b.com", "ﬁsh €50", "中文"])
+        serde_json::json!(["Price: €50, mail a@b.com", "fish €50", "中文"])
     );
 }
 
@@ -13479,11 +13481,12 @@ fn pdf_reads_a_symbolic_cff_fonts_own_built_in_encoding() {
     // A symbolic embedded CFF (/FontFile3 /Subtype /Type1C) font with no
     // /Encoding and no /ToUnicode: its own custom encoding maps 65/70/90/
     // 120 to Gamma/eacute/fi/angbracketleft (built with fontTools, which
-    // reads the same table back).
+    // reads the same table back); the `fi` glyph's U+FB01 ligature reads
+    // as the letters `fi` in extracted text.
     let doc = run_json("edge_pdf_cff_builtin_encoding.pdf", &[]);
     assert_eq!(
         column(table(&doc, "edge_pdf_cff_builtin_encoding"), "text")["sample_values"],
-        serde_json::json!(["\u{0393}\u{00E9}\u{FB01}\u{27E8}"])
+        serde_json::json!(["\u{0393}\u{00E9}fi\u{27E8}"])
     );
     // /Differences without /BaseEncoding apply on top of that same
     // program encoding: 70 is overridden to `A`, 90 still reads `fi`.
@@ -13493,7 +13496,7 @@ fn pdf_reads_a_symbolic_cff_fonts_own_built_in_encoding() {
             table(&doc, "edge_pdf_differences_over_program_base"),
             "text"
         )["sample_values"],
-        serde_json::json!(["A\u{FB01}"])
+        serde_json::json!(["Afi"])
     );
 }
 

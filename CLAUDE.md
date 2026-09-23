@@ -15822,6 +15822,32 @@ wrong wasn't worth keeping. Three new fixtures (a partial ToUnicode, an
 empty one, and a Form whose only font has no usable encoding) plus three
 unit tests on `decode`'s widths lock it in.
 
+**A follow-up pass measured the whole reader against PDFium, corpus-wide,
+and fixed the largest systematic difference it found: presentation-form
+ligatures.** With `pypdfium2` in hand, every PDF this reader decodes was
+compared against PDFium's own text by character multiset (whitespace-
+insensitive, pages deduplicated the same way `sample_values` is, and each
+PDFium extraction run in its own subprocess, since PDFium can crash on a
+hostile file). Of 643 decodable PDFs, 498 matched exactly and 143 were
+above 99%. Aggregating what remained showed one pattern dwarfing the
+rest: this reader emitted the ligature code points `ﬁ ﬂ ﬀ ﬃ` (about
+11,000 characters across 24 files) where PDFium emits the letters. The
+AGL does name the `fi` glyph U+FB01, but U+FB00-U+FB06 are Unicode
+compatibility characters - UnicodeData.txt gives each a `<compat>`
+decomposition - and as data `ﬁnance` defeats search, de-duplication, and
+this tool's own type detection. `expand_latin_ligatures` applies exactly
+Unicode's NFKC mapping for those seven code points (checked against
+Python's `unicodedata`) to every decoded string; glyph resolution itself
+still reports U+FB01, so the glyph tables and their tests are untouched.
+Result: 21 files closer to PDFium, none worse, and exact matches up from
+498 to 509. The other residuals were checked and left alone on purpose:
+line-end hyphens (PDFium replaces them with its own markers), TeX's
+`prime` glyph (this reader is right - PDFium reads the raw code as `0`),
+the curated Greek Ω/µ, and Word's math-italic letters (faithful
+ToUnicode mappings - flattening those would be full NFKC, a different
+decision). The one file still below 99% is a TeX practical whose Form
+XObject is skipped - and, as of the previous pass, says so in its notes.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
