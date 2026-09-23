@@ -39,6 +39,9 @@ All notable changes to sniff-rs are documented here. Format follows
 - PDF: TeX/Symbol extensible-delimiter pieces (`bracketlefttp`, ...) read
   as their Unicode 3.2 characters (U+239B-U+23AD and kin) instead of
   U+FFFD.
+- PDF: unembedded standard Symbol and ZapfDingbats fonts use their
+  published built-in encodings (AcroForm checkboxes read as ✔), and
+  ZapfDingbats glyph names (`a20`) resolve in a ZapfDingbats font.
 
 ### Changed
 - PDF: a font or code with no Unicode mapping now reads as U+FFFD with a

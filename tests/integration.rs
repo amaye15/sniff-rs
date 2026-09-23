@@ -13717,6 +13717,38 @@ fn pdf_symbol_delimiter_pieces_read_as_their_unicode_characters() {
 
 #[test]
 #[cfg(feature = "pdf")]
+fn pdf_standard_symbol_and_zapfdingbats_fonts_use_their_built_in_encodings() {
+    // Unembedded `/BaseFont /Symbol` and `/ZapfDingbats` with no usable
+    // `/Encoding`: the standard fonts' published encodings apply (ISO
+    // 32000-1 Annex D.5/D.6). The ZapfDingbats font's `/Differences`
+    // name `a20` resolves through the ITC Zapf Dingbats Glyph List -
+    // the AcroForm checkbox shape (code `4` is a check mark too).
+    for (name, expected) in [
+        (
+            "edge_pdf_standard_symbol_font",
+            "\u{03B1}\u{03B2}\u{03B3}\u{03C0} \u{2192}\u{239B}",
+        ),
+        (
+            "edge_pdf_standard_zapfdingbats_font",
+            "\u{2714}\u{2714}\u{25CF}\u{25A0}",
+        ),
+    ] {
+        let doc = run_json(&format!("{name}.pdf"), &[]);
+        let text = column(table(&doc, name), "text");
+        assert_eq!(
+            text["sample_values"],
+            serde_json::json!([expected]),
+            "{name}"
+        );
+        assert!(
+            !text["notes"].as_str().unwrap().contains("U+FFFD"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "pdf")]
 fn pdf_reads_xref_streams_and_object_streams() {
     // Modern writer shape: no `xref` table at all, object offsets from a
     // compressed xref stream, and the font dictionary itself packed into
@@ -13858,10 +13890,11 @@ fn pdf_falls_back_to_standard_encoding_for_a_nonsymbolic_font() {
 #[test]
 #[cfg(feature = "pdf")]
 fn pdf_a_symbolic_font_with_no_mapping_reads_as_replacement_chars_and_says_why() {
-    // A bare /Symbol font with no /Encoding, no /ToUnicode, and no program
-    // to read an encoding from can't be mapped - but it costs only its own
-    // text (U+FFFD per code), and the `text` column says which font and
-    // why, instead of refusing the whole document.
+    // A symbolic font (FontDescriptor /Flags bit 3) that isn't one of the
+    // standard 14, with no /Encoding, no /ToUnicode, and no program to read
+    // an encoding from, can't be mapped - but it costs only its own text
+    // (U+FFFD per code), and the `text` column says which font and why,
+    // instead of refusing the whole document.
     let doc = run_json("edge_pdf_symbolic_no_encoding.pdf", &[]);
     let text = column(table(&doc, "edge_pdf_symbolic_no_encoding"), "text");
     assert_eq!(

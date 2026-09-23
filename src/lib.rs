@@ -57241,6 +57241,79 @@ mod pdf_support {
         ("parenrighttp", "\u{239E}"),
     ];
 
+    /// Adobe's ITC Zapf Dingbats Glyph List (`zapfdingbats.txt`, from
+    /// adobe-type-tools/agl-aglfn): the `a1`..`a191` glyph names of the
+    /// ZapfDingbats font, to Unicode's dingbats. The AGL specification
+    /// consults it only when the font is ZapfDingbats (a bare `a20` means
+    /// nothing elsewhere), which `difference_glyph_text`'s `zapf` flag
+    /// mirrors. Its fourteen ornamental brackets (`a85`..`a96`, `a205`,
+    /// `a206`) use the Unicode 3.2 characters U+2768-U+2775, where the
+    /// older `zdingbat.txt` still has Private Use points. Generated from
+    /// the file, sorted for `binary_search`.
+    #[rustfmt::skip]
+    static ZAPF_DINGBATS_GLYPHS: [(&str, &str); 201] = [
+        ("a1", "\u{2701}"), ("a10", "\u{2721}"), ("a100", "\u{275E}"), ("a101", "\u{2761}"),
+        ("a102", "\u{2762}"), ("a103", "\u{2763}"), ("a104", "\u{2764}"),
+        ("a105", "\u{2710}"), ("a106", "\u{2765}"), ("a107", "\u{2766}"),
+        ("a108", "\u{2767}"), ("a109", "\u{2660}"), ("a11", "\u{261B}"),
+        ("a110", "\u{2665}"), ("a111", "\u{2666}"), ("a112", "\u{2663}"),
+        ("a117", "\u{2709}"), ("a118", "\u{2708}"), ("a119", "\u{2707}"),
+        ("a12", "\u{261E}"), ("a120", "\u{2460}"), ("a121", "\u{2461}"),
+        ("a122", "\u{2462}"), ("a123", "\u{2463}"), ("a124", "\u{2464}"),
+        ("a125", "\u{2465}"), ("a126", "\u{2466}"), ("a127", "\u{2467}"),
+        ("a128", "\u{2468}"), ("a129", "\u{2469}"), ("a13", "\u{270C}"),
+        ("a130", "\u{2776}"), ("a131", "\u{2777}"), ("a132", "\u{2778}"),
+        ("a133", "\u{2779}"), ("a134", "\u{277A}"), ("a135", "\u{277B}"),
+        ("a136", "\u{277C}"), ("a137", "\u{277D}"), ("a138", "\u{277E}"),
+        ("a139", "\u{277F}"), ("a14", "\u{270D}"), ("a140", "\u{2780}"),
+        ("a141", "\u{2781}"), ("a142", "\u{2782}"), ("a143", "\u{2783}"),
+        ("a144", "\u{2784}"), ("a145", "\u{2785}"), ("a146", "\u{2786}"),
+        ("a147", "\u{2787}"), ("a148", "\u{2788}"), ("a149", "\u{2789}"),
+        ("a15", "\u{270E}"), ("a150", "\u{278A}"), ("a151", "\u{278B}"),
+        ("a152", "\u{278C}"), ("a153", "\u{278D}"), ("a154", "\u{278E}"),
+        ("a155", "\u{278F}"), ("a156", "\u{2790}"), ("a157", "\u{2791}"),
+        ("a158", "\u{2792}"), ("a159", "\u{2793}"), ("a16", "\u{270F}"),
+        ("a160", "\u{2794}"), ("a161", "\u{2192}"), ("a162", "\u{27A3}"),
+        ("a163", "\u{2194}"), ("a164", "\u{2195}"), ("a165", "\u{2799}"),
+        ("a166", "\u{279B}"), ("a167", "\u{279C}"), ("a168", "\u{279D}"),
+        ("a169", "\u{279E}"), ("a17", "\u{2711}"), ("a170", "\u{279F}"),
+        ("a171", "\u{27A0}"), ("a172", "\u{27A1}"), ("a173", "\u{27A2}"),
+        ("a174", "\u{27A4}"), ("a175", "\u{27A5}"), ("a176", "\u{27A6}"),
+        ("a177", "\u{27A7}"), ("a178", "\u{27A8}"), ("a179", "\u{27A9}"),
+        ("a18", "\u{2712}"), ("a180", "\u{27AB}"), ("a181", "\u{27AD}"),
+        ("a182", "\u{27AF}"), ("a183", "\u{27B2}"), ("a184", "\u{27B3}"),
+        ("a185", "\u{27B5}"), ("a186", "\u{27B8}"), ("a187", "\u{27BA}"),
+        ("a188", "\u{27BB}"), ("a189", "\u{27BC}"), ("a19", "\u{2713}"),
+        ("a190", "\u{27BD}"), ("a191", "\u{27BE}"), ("a192", "\u{279A}"),
+        ("a193", "\u{27AA}"), ("a194", "\u{27B6}"), ("a195", "\u{27B9}"),
+        ("a196", "\u{2798}"), ("a197", "\u{27B4}"), ("a198", "\u{27B7}"),
+        ("a199", "\u{27AC}"), ("a2", "\u{2702}"), ("a20", "\u{2714}"), ("a200", "\u{27AE}"),
+        ("a201", "\u{27B1}"), ("a202", "\u{2703}"), ("a203", "\u{2750}"),
+        ("a204", "\u{2752}"), ("a205", "\u{276E}"), ("a206", "\u{2770}"),
+        ("a21", "\u{2715}"), ("a22", "\u{2716}"), ("a23", "\u{2717}"), ("a24", "\u{2718}"),
+        ("a25", "\u{2719}"), ("a26", "\u{271A}"), ("a27", "\u{271B}"), ("a28", "\u{271C}"),
+        ("a29", "\u{2722}"), ("a3", "\u{2704}"), ("a30", "\u{2723}"), ("a31", "\u{2724}"),
+        ("a32", "\u{2725}"), ("a33", "\u{2726}"), ("a34", "\u{2727}"), ("a35", "\u{2605}"),
+        ("a36", "\u{2729}"), ("a37", "\u{272A}"), ("a38", "\u{272B}"), ("a39", "\u{272C}"),
+        ("a4", "\u{260E}"), ("a40", "\u{272D}"), ("a41", "\u{272E}"), ("a42", "\u{272F}"),
+        ("a43", "\u{2730}"), ("a44", "\u{2731}"), ("a45", "\u{2732}"), ("a46", "\u{2733}"),
+        ("a47", "\u{2734}"), ("a48", "\u{2735}"), ("a49", "\u{2736}"), ("a5", "\u{2706}"),
+        ("a50", "\u{2737}"), ("a51", "\u{2738}"), ("a52", "\u{2739}"), ("a53", "\u{273A}"),
+        ("a54", "\u{273B}"), ("a55", "\u{273C}"), ("a56", "\u{273D}"), ("a57", "\u{273E}"),
+        ("a58", "\u{273F}"), ("a59", "\u{2740}"), ("a6", "\u{271D}"), ("a60", "\u{2741}"),
+        ("a61", "\u{2742}"), ("a62", "\u{2743}"), ("a63", "\u{2744}"), ("a64", "\u{2745}"),
+        ("a65", "\u{2746}"), ("a66", "\u{2747}"), ("a67", "\u{2748}"), ("a68", "\u{2749}"),
+        ("a69", "\u{274A}"), ("a7", "\u{271E}"), ("a70", "\u{274B}"), ("a71", "\u{25CF}"),
+        ("a72", "\u{274D}"), ("a73", "\u{25A0}"), ("a74", "\u{274F}"), ("a75", "\u{2751}"),
+        ("a76", "\u{25B2}"), ("a77", "\u{25BC}"), ("a78", "\u{25C6}"), ("a79", "\u{2756}"),
+        ("a8", "\u{271F}"), ("a81", "\u{25D7}"), ("a82", "\u{2758}"), ("a83", "\u{2759}"),
+        ("a84", "\u{275A}"), ("a85", "\u{276F}"), ("a86", "\u{2771}"), ("a87", "\u{2772}"),
+        ("a88", "\u{2773}"), ("a89", "\u{2768}"), ("a9", "\u{2720}"), ("a90", "\u{2769}"),
+        ("a91", "\u{276C}"), ("a92", "\u{276D}"), ("a93", "\u{276A}"), ("a94", "\u{276B}"),
+        ("a95", "\u{2774}"), ("a96", "\u{2775}"), ("a97", "\u{275B}"), ("a98", "\u{275C}"),
+        ("a99", "\u{275D}"),
+    ];
+
     /// How a font's string bytes split into character codes.
     #[derive(Clone, Copy, PartialEq)]
     enum CodeWidth {
@@ -57340,6 +57413,120 @@ mod pdf_support {
         out
     }
 
+    /// The built-in encodings of the two symbolic standard 14 fonts,
+    /// Symbol and ZapfDingbats (ISO 32000-1 Annex D.5 and D.6), code to
+    /// glyph name - the base an unembedded `/BaseFont /Symbol` or
+    /// `/ZapfDingbats` font uses when its `/Encoding` names none (Table
+    /// 114: a symbolic font's own built-in encoding, which for these two
+    /// is fixed and published rather than read from a program). Generated
+    /// from Adobe's Core 14 AFM files (the `C code ; ... N name ;`
+    /// entries of `Symbol.afm` and `ZapfDingbats.afm`) and checked
+    /// identical, code for code, to Unicode's own vendor mappings for the
+    /// same encodings (`MAPPINGS/VENDORS/ADOBE/symbol.txt`,
+    /// `zdingbat.txt`).
+    #[rustfmt::skip]
+    const SYMBOL_ENCODING: [Option<&'static [u8]>; 256] = [
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, Some(b"space"), Some(b"exclam"), Some(b"universal"),
+        Some(b"numbersign"), Some(b"existential"), Some(b"percent"), Some(b"ampersand"),
+        Some(b"suchthat"), Some(b"parenleft"), Some(b"parenright"), Some(b"asteriskmath"),
+        Some(b"plus"), Some(b"comma"), Some(b"minus"), Some(b"period"), Some(b"slash"),
+        Some(b"zero"), Some(b"one"), Some(b"two"), Some(b"three"), Some(b"four"),
+        Some(b"five"), Some(b"six"), Some(b"seven"), Some(b"eight"), Some(b"nine"),
+        Some(b"colon"), Some(b"semicolon"), Some(b"less"), Some(b"equal"), Some(b"greater"),
+        Some(b"question"), Some(b"congruent"), Some(b"Alpha"), Some(b"Beta"), Some(b"Chi"),
+        Some(b"Delta"), Some(b"Epsilon"), Some(b"Phi"), Some(b"Gamma"), Some(b"Eta"),
+        Some(b"Iota"), Some(b"theta1"), Some(b"Kappa"), Some(b"Lambda"), Some(b"Mu"),
+        Some(b"Nu"), Some(b"Omicron"), Some(b"Pi"), Some(b"Theta"), Some(b"Rho"),
+        Some(b"Sigma"), Some(b"Tau"), Some(b"Upsilon"), Some(b"sigma1"), Some(b"Omega"),
+        Some(b"Xi"), Some(b"Psi"), Some(b"Zeta"), Some(b"bracketleft"), Some(b"therefore"),
+        Some(b"bracketright"), Some(b"perpendicular"), Some(b"underscore"),
+        Some(b"radicalex"), Some(b"alpha"), Some(b"beta"), Some(b"chi"), Some(b"delta"),
+        Some(b"epsilon"), Some(b"phi"), Some(b"gamma"), Some(b"eta"), Some(b"iota"),
+        Some(b"phi1"), Some(b"kappa"), Some(b"lambda"), Some(b"mu"), Some(b"nu"),
+        Some(b"omicron"), Some(b"pi"), Some(b"theta"), Some(b"rho"), Some(b"sigma"),
+        Some(b"tau"), Some(b"upsilon"), Some(b"omega1"), Some(b"omega"), Some(b"xi"),
+        Some(b"psi"), Some(b"zeta"), Some(b"braceleft"), Some(b"bar"), Some(b"braceright"),
+        Some(b"similar"), None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, Some(b"Euro"), Some(b"Upsilon1"),
+        Some(b"minute"), Some(b"lessequal"), Some(b"fraction"), Some(b"infinity"),
+        Some(b"florin"), Some(b"club"), Some(b"diamond"), Some(b"heart"), Some(b"spade"),
+        Some(b"arrowboth"), Some(b"arrowleft"), Some(b"arrowup"), Some(b"arrowright"),
+        Some(b"arrowdown"), Some(b"degree"), Some(b"plusminus"), Some(b"second"),
+        Some(b"greaterequal"), Some(b"multiply"), Some(b"proportional"),
+        Some(b"partialdiff"), Some(b"bullet"), Some(b"divide"), Some(b"notequal"),
+        Some(b"equivalence"), Some(b"approxequal"), Some(b"ellipsis"), Some(b"arrowvertex"),
+        Some(b"arrowhorizex"), Some(b"carriagereturn"), Some(b"aleph"), Some(b"Ifraktur"),
+        Some(b"Rfraktur"), Some(b"weierstrass"), Some(b"circlemultiply"),
+        Some(b"circleplus"), Some(b"emptyset"), Some(b"intersection"), Some(b"union"),
+        Some(b"propersuperset"), Some(b"reflexsuperset"), Some(b"notsubset"),
+        Some(b"propersubset"), Some(b"reflexsubset"), Some(b"element"), Some(b"notelement"),
+        Some(b"angle"), Some(b"gradient"), Some(b"registerserif"), Some(b"copyrightserif"),
+        Some(b"trademarkserif"), Some(b"product"), Some(b"radical"), Some(b"dotmath"),
+        Some(b"logicalnot"), Some(b"logicaland"), Some(b"logicalor"), Some(b"arrowdblboth"),
+        Some(b"arrowdblleft"), Some(b"arrowdblup"), Some(b"arrowdblright"),
+        Some(b"arrowdbldown"), Some(b"lozenge"), Some(b"angleleft"), Some(b"registersans"),
+        Some(b"copyrightsans"), Some(b"trademarksans"), Some(b"summation"),
+        Some(b"parenlefttp"), Some(b"parenleftex"), Some(b"parenleftbt"),
+        Some(b"bracketlefttp"), Some(b"bracketleftex"), Some(b"bracketleftbt"),
+        Some(b"bracelefttp"), Some(b"braceleftmid"), Some(b"braceleftbt"), Some(b"braceex"),
+        None, Some(b"angleright"), Some(b"integral"), Some(b"integraltp"),
+        Some(b"integralex"), Some(b"integralbt"), Some(b"parenrighttp"),
+        Some(b"parenrightex"), Some(b"parenrightbt"), Some(b"bracketrighttp"),
+        Some(b"bracketrightex"), Some(b"bracketrightbt"), Some(b"bracerighttp"),
+        Some(b"bracerightmid"), Some(b"bracerightbt"), None,
+    ];
+
+    /// See `SYMBOL_ENCODING`. Its names (`a1`..`a191`) only mean anything
+    /// in a ZapfDingbats font, so they resolve through
+    /// `ZAPF_DINGBATS_GLYPHS`, never the AGL.
+    #[rustfmt::skip]
+    const ZAPF_DINGBATS_ENCODING: [Option<&'static [u8]>; 256] = [
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, Some(b"space"), Some(b"a1"), Some(b"a2"), Some(b"a202"),
+        Some(b"a3"), Some(b"a4"), Some(b"a5"), Some(b"a119"), Some(b"a118"), Some(b"a117"),
+        Some(b"a11"), Some(b"a12"), Some(b"a13"), Some(b"a14"), Some(b"a15"), Some(b"a16"),
+        Some(b"a105"), Some(b"a17"), Some(b"a18"), Some(b"a19"), Some(b"a20"), Some(b"a21"),
+        Some(b"a22"), Some(b"a23"), Some(b"a24"), Some(b"a25"), Some(b"a26"), Some(b"a27"),
+        Some(b"a28"), Some(b"a6"), Some(b"a7"), Some(b"a8"), Some(b"a9"), Some(b"a10"),
+        Some(b"a29"), Some(b"a30"), Some(b"a31"), Some(b"a32"), Some(b"a33"), Some(b"a34"),
+        Some(b"a35"), Some(b"a36"), Some(b"a37"), Some(b"a38"), Some(b"a39"), Some(b"a40"),
+        Some(b"a41"), Some(b"a42"), Some(b"a43"), Some(b"a44"), Some(b"a45"), Some(b"a46"),
+        Some(b"a47"), Some(b"a48"), Some(b"a49"), Some(b"a50"), Some(b"a51"), Some(b"a52"),
+        Some(b"a53"), Some(b"a54"), Some(b"a55"), Some(b"a56"), Some(b"a57"), Some(b"a58"),
+        Some(b"a59"), Some(b"a60"), Some(b"a61"), Some(b"a62"), Some(b"a63"), Some(b"a64"),
+        Some(b"a65"), Some(b"a66"), Some(b"a67"), Some(b"a68"), Some(b"a69"), Some(b"a70"),
+        Some(b"a71"), Some(b"a72"), Some(b"a73"), Some(b"a74"), Some(b"a203"), Some(b"a75"),
+        Some(b"a204"), Some(b"a76"), Some(b"a77"), Some(b"a78"), Some(b"a79"), Some(b"a81"),
+        Some(b"a82"), Some(b"a83"), Some(b"a84"), Some(b"a97"), Some(b"a98"), Some(b"a99"),
+        Some(b"a100"), None, Some(b"a89"), Some(b"a90"), Some(b"a93"), Some(b"a94"),
+        Some(b"a91"), Some(b"a92"), Some(b"a205"), Some(b"a85"), Some(b"a206"),
+        Some(b"a86"), Some(b"a87"), Some(b"a88"), Some(b"a95"), Some(b"a96"), None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, Some(b"a101"), Some(b"a102"), Some(b"a103"), Some(b"a104"),
+        Some(b"a106"), Some(b"a107"), Some(b"a108"), Some(b"a112"), Some(b"a111"),
+        Some(b"a110"), Some(b"a109"), Some(b"a120"), Some(b"a121"), Some(b"a122"),
+        Some(b"a123"), Some(b"a124"), Some(b"a125"), Some(b"a126"), Some(b"a127"),
+        Some(b"a128"), Some(b"a129"), Some(b"a130"), Some(b"a131"), Some(b"a132"),
+        Some(b"a133"), Some(b"a134"), Some(b"a135"), Some(b"a136"), Some(b"a137"),
+        Some(b"a138"), Some(b"a139"), Some(b"a140"), Some(b"a141"), Some(b"a142"),
+        Some(b"a143"), Some(b"a144"), Some(b"a145"), Some(b"a146"), Some(b"a147"),
+        Some(b"a148"), Some(b"a149"), Some(b"a150"), Some(b"a151"), Some(b"a152"),
+        Some(b"a153"), Some(b"a154"), Some(b"a155"), Some(b"a156"), Some(b"a157"),
+        Some(b"a158"), Some(b"a159"), Some(b"a160"), Some(b"a161"), Some(b"a163"),
+        Some(b"a164"), Some(b"a196"), Some(b"a165"), Some(b"a192"), Some(b"a166"),
+        Some(b"a167"), Some(b"a168"), Some(b"a169"), Some(b"a170"), Some(b"a171"),
+        Some(b"a172"), Some(b"a173"), Some(b"a162"), Some(b"a174"), Some(b"a175"),
+        Some(b"a176"), Some(b"a177"), Some(b"a178"), Some(b"a179"), Some(b"a193"),
+        Some(b"a180"), Some(b"a199"), Some(b"a181"), Some(b"a200"), Some(b"a182"), None,
+        Some(b"a201"), Some(b"a183"), Some(b"a184"), Some(b"a197"), Some(b"a185"),
+        Some(b"a194"), Some(b"a198"), Some(b"a186"), Some(b"a195"), Some(b"a187"),
+        Some(b"a188"), Some(b"a189"), Some(b"a190"), Some(b"a191"), None,
+    ];
+
     /// Fills a 256-entry table from a base encoding (the same loop at
     /// every WinAnsi/MacRoman site in `build_font`, factored once).
     fn fill_base_table(table: &mut [String; 256], macroman: bool) {
@@ -57368,9 +57555,11 @@ mod pdf_support {
     /// Where a simple font's base encoding comes from when its
     /// `/Encoding` names none - see `implicit_base_encoding`.
     enum ImplicitBase {
-        /// The embedded Type 1 / CFF program's own built-in encoding:
-        /// code to glyph name (`None` for an unassigned code).
-        Program(Vec<Option<Vec<u8>>>),
+        /// A built-in encoding, code to glyph name (`None` for an
+        /// unassigned code): the embedded Type 1 / CFF program's own, or
+        /// a symbolic standard 14 font's published one. The label names
+        /// which, for the disclosed reason when a shown code misses.
+        Program(Vec<Option<Vec<u8>>>, &'static str),
         /// Adobe StandardEncoding (`STANDARD_ENCODING`).
         Standard,
         /// Nothing this reader can take a base from. The text is appended
@@ -57383,7 +57572,9 @@ mod pdf_support {
     /// `/Differences` dictionary without `/BaseEncoding`): an embedded
     /// Type 1 or CFF (`Type1C`) program's own built-in encoding when there
     /// is one (9.6.6.2 and Table 114 - the only authority for a symbolic
-    /// font); otherwise StandardEncoding for a nonsymbolic font (Table
+    /// font); the published built-in encoding of an unembedded Symbol or
+    /// ZapfDingbats standard font (Annex D.5/D.6); otherwise
+    /// StandardEncoding for a nonsymbolic font (Table
     /// 114's rule for an unembedded font, and 9.6.6.4's for TrueType,
     /// whose undefined entries fill from StandardEncoding). An embedded
     /// Type 1/CFF program whose encoding can't be read is `Unknown`, not
@@ -57394,15 +57585,60 @@ mod pdf_support {
         path: &Path,
     ) -> Result<ImplicitBase> {
         Ok(match embedded_program_encoding(reader, dict, path) {
-            ProgramEncoding::Names(names) => ImplicitBase::Program(names),
+            ProgramEncoding::Names(names) => {
+                ImplicitBase::Program(names, "its embedded font program's built-in encoding")
+            }
             ProgramEncoding::Unreadable(why) => ImplicitBase::Unknown(format!(
                 " - its embedded font program's built-in encoding couldn't be read: {why}"
             )),
-            ProgramEncoding::NotEmbedded if font_is_symbolic(reader, dict, path)? => {
-                ImplicitBase::Unknown(String::new())
-            }
-            ProgramEncoding::NotEmbedded => ImplicitBase::Standard,
+            ProgramEncoding::NotEmbedded => match standard_symbolic_encoding(dict) {
+                Some((names, label)) => ImplicitBase::Program(
+                    names.iter().map(|name| name.map(<[u8]>::to_vec)).collect(),
+                    label,
+                ),
+                None if font_is_symbolic(reader, dict, path)? => {
+                    ImplicitBase::Unknown(String::new())
+                }
+                None => ImplicitBase::Standard,
+            },
         })
+    }
+
+    /// A font dictionary's `/BaseFont` name without its subset tag - the
+    /// six uppercase letters and `+` a subsetted font's name starts with
+    /// (ISO 32000-1 9.6.4).
+    fn base_font_name(dict: &BTreeMap<Vec<u8>, PdfObj>) -> Option<&[u8]> {
+        let Some(PdfObj::Name(name)) = dict.get(b"BaseFont".as_slice()) else {
+            return None;
+        };
+        Some(match name.get(..7) {
+            Some([tag @ .., b'+']) if tag.iter().all(u8::is_ascii_uppercase) => &name[7..],
+            _ => name,
+        })
+    }
+
+    /// The published built-in encoding of an unembedded symbolic
+    /// standard 14 font - a `/Type1` whose `/BaseFont` is exactly
+    /// `Symbol` or `ZapfDingbats` - with the label `build_font` discloses.
+    /// Only reached with no embedded program, so a subset-tagged name
+    /// (which means an embedded one) never gets here.
+    fn standard_symbolic_encoding(
+        dict: &BTreeMap<Vec<u8>, PdfObj>,
+    ) -> Option<(&'static [Option<&'static [u8]>; 256], &'static str)> {
+        if !matches!(dict.get(b"Subtype".as_slice()), Some(PdfObj::Name(s)) if s == b"Type1") {
+            return None;
+        }
+        match dict.get(b"BaseFont".as_slice()) {
+            Some(PdfObj::Name(n)) if n == b"Symbol" => Some((
+                &SYMBOL_ENCODING,
+                "the standard Symbol font's built-in encoding",
+            )),
+            Some(PdfObj::Name(n)) if n == b"ZapfDingbats" => Some((
+                &ZAPF_DINGBATS_ENCODING,
+                "the standard ZapfDingbats font's built-in encoding",
+            )),
+            _ => None,
+        }
     }
 
     /// What `embedded_program_encoding` found.
@@ -57884,6 +58120,7 @@ mod pdf_support {
     fn fill_program_table(
         table: &mut [String; 256],
         names: &[Option<Vec<u8>>],
+        zapf: bool,
         mapped: &mut HashSet<u8>,
         unknown: &mut BTreeMap<u8, Vec<u8>>,
     ) {
@@ -57891,7 +58128,7 @@ mod pdf_support {
             let (Ok(code), Some(name)) = (u8::try_from(code), name) else {
                 continue;
             };
-            match difference_glyph_text(name) {
+            match difference_glyph_text(name, zapf) {
                 Some(text) => {
                     table[usize::from(code)] = text;
                     mapped.insert(code);
@@ -57941,8 +58178,13 @@ mod pdf_support {
     /// lowercase, rendered small, which is what a data tool needs (even
     /// the strict small-capital codepoints would be less useful here);
     /// everything else goes through the shared chain (uni/AGL/TeX/
-    /// ligature/suffix). `None` is an unknown glyph.
-    fn difference_glyph_text(glyph: &[u8]) -> Option<String> {
+    /// ligature/suffix). In a ZapfDingbats font (`zapf`) the ITC Zapf
+    /// Dingbats Glyph List answers first, as the AGL specification says.
+    /// `None` is an unknown glyph.
+    fn difference_glyph_text(glyph: &[u8], zapf: bool) -> Option<String> {
+        if zapf && let Some(text) = generated_glyph_lookup(&ZAPF_DINGBATS_GLYPHS, glyph) {
+            return Some(text.to_string());
+        }
         if let Some(base) = glyph.strip_suffix(b".sc")
             && base.len() == 1
             && base[0].is_ascii_alphabetic()
@@ -58011,6 +58253,7 @@ mod pdf_support {
             dict.get(b"Subtype".as_slice()),
             Some(PdfObj::Name(s)) if s == b"Type0"
         );
+        let zapf = base_font_name(dict) == Some(b"ZapfDingbats".as_slice());
         let identity = composite
             && match dict.get(b"Encoding".as_slice()) {
                 Some(enc) => matches!(
@@ -58093,8 +58336,14 @@ mod pdf_support {
                         }
                     } else if cmap.is_empty() {
                         match implicit_base_encoding(reader, dict, path)? {
-                            ImplicitBase::Program(names) => {
-                                fill_program_table(&mut table, &names, &mut mapped, &mut unknown);
+                            ImplicitBase::Program(names, _) => {
+                                fill_program_table(
+                                    &mut table,
+                                    &names,
+                                    zapf,
+                                    &mut mapped,
+                                    &mut unknown,
+                                );
                                 needs_coverage_check = true;
                             }
                             ImplicitBase::Standard => fill_standard_table(&mut table),
@@ -58134,7 +58383,7 @@ mod pdf_support {
                                             "{path:?} font {font_desc} has a /Differences entry past code 255"
                                         );
                                     };
-                                    match difference_glyph_text(glyph) {
+                                    match difference_glyph_text(glyph, zapf) {
                                         Some(text) => {
                                             table[slot as usize] = text;
                                             mapped.insert(slot);
@@ -58183,28 +58432,27 @@ mod pdf_support {
             // straight from an embedded Type 1/CFF program when there is
             // one, since that's the only authority for a symbolic font
             // (a real LaTeX/dvips Type 1 program states its vector in its
-            // own cleartext), else StandardEncoding for a nonsymbolic
-            // font (see `STANDARD_ENCODING`'s own doc comment). A
-            // symbolic font with no readable program reads as U+FFFD,
-            // disclosed, not a guess.
+            // own cleartext), the published encoding of an unembedded
+            // Symbol/ZapfDingbats standard font, else StandardEncoding for
+            // a nonsymbolic font (see `STANDARD_ENCODING`'s own doc
+            // comment). Any other symbolic font with no readable program
+            // reads as U+FFFD, disclosed, not a guess.
             match implicit_base_encoding(reader, dict, path)? {
-                ImplicitBase::Program(names) => {
+                ImplicitBase::Program(names, source) => {
                     let mut mapped = HashSet::new();
                     let mut unknown = BTreeMap::new();
-                    fill_program_table(&mut table, &names, &mut mapped, &mut unknown);
+                    fill_program_table(&mut table, &names, zapf, &mut mapped, &mut unknown);
                     if let Some((code, glyph)) = shown_unknown_glyph(required, &unknown, &cmap) {
                         reader.text_stats.note_code_gap(|| {
                             format!(
-                                "font {font_desc} maps code {code} to unknown glyph /{} (in its embedded font program's built-in encoding)",
+                                "font {font_desc} maps code {code} to unknown glyph /{} (in {source})",
                                 String::from_utf8_lossy(glyph)
                             )
                         });
                     }
                     if let Some(missing) = first_unmapped_code(required, &mapped) {
                         reader.text_stats.note_code_gap(|| {
-                            format!(
-                                "font {font_desc} shows code {missing}, which its embedded font program's built-in encoding doesn't assign"
-                            )
+                            format!("font {font_desc} shows code {missing}, which {source} doesn't assign")
                         });
                     }
                 }
@@ -58905,6 +59153,62 @@ mod pdf_support {
             assert_eq!(AGL_GLYPHS.len(), 4089);
             assert_eq!(SYMBOL_PIECE_GLYPHS.len(), 22);
             assert_eq!(TEX_GLYPHS.len(), 264);
+        }
+
+        #[test]
+        fn standard_symbolic_encodings_resolve_every_code_they_assign() {
+            assert_eq!(SYMBOL_ENCODING.iter().flatten().count(), 189);
+            assert_eq!(ZAPF_DINGBATS_ENCODING.iter().flatten().count(), 202);
+            assert!(
+                ZAPF_DINGBATS_GLYPHS
+                    .windows(2)
+                    .all(|w| w[0].0.as_bytes() < w[1].0.as_bytes())
+            );
+            // Every Symbol name resolves through the ordinary chain, except
+            // `radicalex`, whose only mapping anywhere is Private Use.
+            for name in SYMBOL_ENCODING.iter().flatten() {
+                assert_eq!(
+                    difference_glyph_text(name, false).is_none(),
+                    *name == b"radicalex".as_slice(),
+                    "{}",
+                    String::from_utf8_lossy(name)
+                );
+            }
+            // ZapfDingbats names resolve only in a ZapfDingbats font.
+            for name in ZAPF_DINGBATS_ENCODING.iter().flatten() {
+                assert!(difference_glyph_text(name, true).is_some());
+                if *name != b"space".as_slice() {
+                    assert!(difference_glyph_text(name, false).is_none());
+                }
+            }
+            assert_eq!(
+                difference_glyph_text(b"a20", true).as_deref(),
+                Some("\u{2714}")
+            );
+            assert_eq!(
+                difference_glyph_text(b"a89", true).as_deref(),
+                Some("\u{2768}")
+            );
+        }
+
+        #[test]
+        fn base_font_name_strips_only_a_real_subset_tag() {
+            let dict =
+                |name: &[u8]| BTreeMap::from([(b"BaseFont".to_vec(), PdfObj::Name(name.to_vec()))]);
+            assert_eq!(
+                base_font_name(&dict(b"ABCDEF+ZapfDingbats")),
+                Some(b"ZapfDingbats".as_slice())
+            );
+            assert_eq!(base_font_name(&dict(b"Symbol")), Some(b"Symbol".as_slice()));
+            // Lowercase letters or the wrong length aren't a subset tag.
+            assert_eq!(
+                base_font_name(&dict(b"abcdef+Symbol")),
+                Some(b"abcdef+Symbol".as_slice())
+            );
+            assert_eq!(
+                base_font_name(&dict(b"ABCDE+Symbol")),
+                Some(b"ABCDE+Symbol".as_slice())
+            );
         }
 
         #[test]

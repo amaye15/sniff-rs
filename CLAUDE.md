@@ -15937,6 +15937,41 @@ committed build: exactly 2 files changed, 645 U+FFFD became the right
 bracket pieces, nothing else moved. `edge_pdf_symbol_delimiter_pieces.pdf`
 locks it in.
 
+**A follow-up pass gave the two symbolic standard 14 fonts, Symbol and
+ZapfDingbats, their built-in encodings.** An unembedded `/BaseFont
+/Symbol` or `/ZapfDingbats` with no usable `/Encoding` was read as
+entirely U+FFFD, since a symbolic font's base is its own built-in
+encoding and there's no program to read it from - but for these two the
+built-in encoding is fixed and published (ISO 32000-1 Annex D.5/D.6), and
+ZapfDingbats is what every AcroForm checkbox is drawn in.
+`SYMBOL_ENCODING`/`ZAPF_DINGBATS_ENCODING` were generated from Adobe's
+Core 14 AFM files (as shipped with matplotlib) and checked identical,
+code for code, to Unicode's own vendor mappings for the same encodings;
+`standard_symbolic_encoding` applies them only to an unembedded `/Type1`
+whose `/BaseFont` is exactly one of the two names. ZapfDingbats' glyph
+names (`a1`..`a191`) resolve through Adobe's ITC Zapf Dingbats Glyph List
+(`ZAPF_DINGBATS_GLYPHS`) only in a ZapfDingbats font, exactly as the AGL
+specification says, so a `/Differences` name like `a20` in such a font
+decodes too (the font check strips a subset tag, `base_font_name`). The
+existing embedded-program path shares all of it: `ImplicitBase::Program`
+now carries a label, so a shown code the encoding doesn't assign is
+disclosed as missing from "the standard Symbol font's built-in encoding"
+rather than an embedded program's. Verified end to end three ways: a
+fixture showing all 188 non-space Symbol codes and all 201 ZapfDingbats
+codes decodes to the vendor mapping's own Unicode for every one (with the
+Apple join's real characters where Adobe's file has Private Use points,
+and U+FFFD, disclosed, only for `radicalex`); PDFium's text for the same
+fixtures matches on all 201 ZapfDingbats codes, and on Symbol differs
+only where PDFium prints a Private Use point or the non-Greek
+compatibility letter (U+2206 INCREMENT for `Delta`, U+2126 OHM for
+`Omega`, U+00B5 MICRO for `mu`), where this reader keeps its curated
+Greek. Full-text corpus comparison against the committed build: exactly
+2 files changed - a tax receipt's 33 checkbox marks (✔) and a form's 5
+bullets - and nothing else moved. The old `edge_pdf_symbolic_no_encoding
+.pdf` was a bare `/Symbol`, which now decodes; it was rebuilt as a
+symbolic TrueType font that isn't one of the standard 14, still the
+disclosed U+FFFD case.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -16246,14 +16281,15 @@ established baselines exactly.
   ~20-codepage gap and for SPSS/DuckDB entirely (see below).
 - **PDF text decoding covers WinAnsi/MacRoman/Differences/ToUnicode
   fonts plus each font's implicit built-in encoding** - an embedded Type 1
-  or CFF program's own vector, or StandardEncoding for a nonsymbolic font
-  with no such program. What no mapping covers reads as U+FFFD and is
-  disclosed in the `text` column's notes (count plus first reason) -
-  never a whole-file refusal, and never a guessed character. A *symbolic*
-  font with no `/Encoding`, no `/ToUnicode`, and no readable Type 1/CFF
-  program - a symbolic TrueType font, a bare standard-14
-  Symbol/ZapfDingbats, or a program using CFF's predefined Expert
-  encoding - reads entirely as U+FFFD, as does a composite/CID font with
+  or CFF program's own vector, the published encoding of an unembedded
+  standard Symbol or ZapfDingbats font, or StandardEncoding for a
+  nonsymbolic font with no such program. What no mapping covers reads as
+  U+FFFD and is disclosed in the `text` column's notes (count plus first
+  reason) - never a whole-file refusal, and never a guessed character. Any
+  other *symbolic* font with no `/Encoding`, no `/ToUnicode`, and no
+  readable Type 1/CFF program - a symbolic TrueType font, or a program
+  using CFF's predefined Expert encoding - reads entirely as U+FFFD, as
+  does a composite/CID font with
   no usable `/ToUnicode`: CID codes without a CMap are unmappable here
   (reading an embedded TrueType program's own `cmap`, and Adobe's public
   ROS CMaps, are not implemented). A *shown* code whose glyph name no list

@@ -10,28 +10,24 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
 endobj
 4 0 obj
-<<  /Length 23 >>
+<<  /Length 25 >>
 stream
-BT /F1 12 Tf (AB) Tj ET
+BT /F1 12 Tf (A4ln) Tj ET
 endstream
 endobj
 5 0 obj
-<< /Type /Font /Subtype /TrueType /BaseFont /Wingdings-Regular /FontDescriptor 6 0 R >>
-endobj
-6 0 obj
-<< /Type /FontDescriptor /FontName /Wingdings-Regular /Flags 4 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 900 /Descent -100 /CapHeight 700 /StemV 80 >>
+<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats /Encoding << /Type /Encoding /Differences [65 /a20] >> >>
 endobj
 xref
-0 7
+0 6
 0000000000 65535 f 
 0000000015 00000 n 
 0000000064 00000 n 
 0000000121 00000 n 
 0000000247 00000 n 
-0000000321 00000 n 
-0000000424 00000 n 
+0000000323 00000 n 
 trailer
-<< /Size 7 /Root 1 0 R >>
+<< /Size 6 /Root 1 0 R >>
 startxref
-597
+451
 %%EOF
