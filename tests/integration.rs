@@ -12200,6 +12200,7 @@ fn find_edge<'a>(
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn relationships_ini_reports_fk_exact_and_inferred_edges() {
     let doc = run_json("edge_relationships.ini", &[]);
     let rels = doc["relationships"].as_array().unwrap();
@@ -12303,6 +12304,7 @@ fn run_graph(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_explain_reports_profile_and_incident_edges() {
     let output = run_graph(&[
         "explain",
@@ -12322,6 +12324,7 @@ fn graph_explain_reports_profile_and_incident_edges() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_explain_json_shape_and_ambiguous_bare_name() {
     let output = run_graph(&[
         "explain",
@@ -12360,6 +12363,7 @@ fn graph_explain_json_shape_and_ambiguous_bare_name() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_explain_rejects_unknown_table_and_column_actionably() {
     let output = run_graph(&[
         "explain",
@@ -12378,6 +12382,7 @@ fn graph_explain_rejects_unknown_table_and_column_actionably() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_explain_isolated_column_reports_no_relationships() {
     let output = run_graph(&[
         "explain",
@@ -12393,6 +12398,7 @@ fn graph_explain_isolated_column_reports_no_relationships() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_path_reports_a_two_hop_chain_in_order() {
     let output = run_graph(&[
         "path",
@@ -12436,6 +12442,7 @@ fn graph_path_reports_a_two_hop_chain_in_order() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_path_lists_parallel_links_as_alternatives() {
     // users <-> orders share three links in edge_relationships.ini; the
     // hop reports the strongest and names the other two.
@@ -12478,6 +12485,7 @@ fn graph_path_lists_parallel_links_as_alternatives() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_path_disconnected_and_same_table_are_errors() {
     let output = run_graph(&[
         "path",
@@ -12502,6 +12510,7 @@ fn graph_path_disconnected_and_same_table_are_errors() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_path_reads_an_already_generated_dictionary() {
     // Every other graph test profiles the raw file; this one proves the
     // dictionary-input half of `load_graph_input` on the same chain.
@@ -12531,6 +12540,7 @@ fn graph_path_reads_an_already_generated_dictionary() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_rank_lists_the_link_table_first_with_communities() {
     let output = run_graph(&["rank", fixture("edge_graph_chain.ini").to_str().unwrap()]);
     assert!(
@@ -12593,6 +12603,7 @@ fn graph_rank_single_table_reports_zero_degree() {
 }
 
 #[test]
+#[cfg(feature = "sqlite")]
 fn graph_samples_deepens_overlap_evidence_on_raw_files() {
     // `label` vs `labels` is a weak name signal either way; the tier is
     // decided by overlap, which only deeper samples can see. agents.label
@@ -12667,6 +12678,7 @@ fn graph_samples_deepens_overlap_evidence_on_raw_files() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn graph_samples_with_a_dictionary_is_disclosed_not_silent() {
     let dir = TempDir::new();
     let dict = dir.path().join("chain.dictionary.json");
@@ -12700,6 +12712,7 @@ fn graph_samples_with_a_dictionary_is_disclosed_not_silent() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
 fn diff_reports_relationship_drift_for_a_broken_join() {
     // users.id <-> orders.user_id links in old (both integers); the new
     // side stores user_id as text, which cannot join an integer. The
@@ -13252,6 +13265,7 @@ fn directory_flags_are_rejected_for_single_file_input() {
 }
 
 #[test]
+#[cfg(feature = "xlsx")]
 fn directory_empty_workbook_skips_with_a_note() {
     let dir = TempDir::new();
     std::fs::copy(
@@ -13286,6 +13300,7 @@ fn directory_empty_workbook_skips_with_a_note() {
 }
 
 #[test]
+#[cfg(feature = "xlsx")]
 fn single_file_empty_workbook_keeps_its_clean_error() {
     let output = Command::new(bin())
         .args([
