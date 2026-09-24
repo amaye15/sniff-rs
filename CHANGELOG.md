@@ -39,11 +39,17 @@ All notable changes to sniff-rs are documented here. Format follows
 - PDF: TeX/Symbol extensible-delimiter pieces (`bracketlefttp`, ...) read
   as their Unicode 3.2 characters (U+239B-U+23AD and kin) instead of
   U+FFFD.
+- PDF: the `"` operator's string is no longer dropped.
 - PDF: unembedded standard Symbol and ZapfDingbats fonts use their
   published built-in encodings (AcroForm checkboxes read as ✔), and
   ZapfDingbats glyph names (`a20`) resolve in a ZapfDingbats font.
 
 ### Changed
+- PDF: word and line breaks come from where glyphs are drawn - text,
+  line and transformation matrices, Form `/Matrix`, `TJ` offsets, and
+  glyph widths (`/Widths`, `/W`, or Core 14 metrics) - instead of which
+  operator drew them. Files matching PDFium word for word: 218 to 446 of
+  607. Runs of space glyphs collapse to one; text is otherwise unchanged.
 - PDF: a font or code with no Unicode mapping now reads as U+FFFD with a
   disclosure note instead of failing the whole file (18 real files that
   used to be refused now read; structural errors still refuse).

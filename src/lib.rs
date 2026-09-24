@@ -52195,6 +52195,16 @@ mod pdf_support {
                 _ => None,
             }
         }
+
+        /// Any number, integer or real - PDF treats the two
+        /// interchangeably wherever a number is expected.
+        fn as_num(&self) -> Option<f64> {
+            match self {
+                PdfObj::Int(n) => Some(*n as f64),
+                PdfObj::Float(f) => Some(*f),
+                _ => None,
+            }
+        }
     }
 
     /// Byte cursor over a slice, with save/restore positions (plain
@@ -53007,8 +53017,13 @@ mod pdf_support {
     /// than the whole document. A composite Identity font keeps its real
     /// two-byte width, so each of its codes is one U+FFFD, not two.
     fn undecodable_font(reader: &mut PdfReader, font_obj: Option<&PdfObj>, path: &Path) -> PdfFont {
-        let width = match font_obj.map(|f| reader.resolve(f, 0, path)) {
-            Some(Ok(PdfObj::Dict(d))) if matches!(d.get(b"Subtype".as_slice()), Some(PdfObj::Name(s)) if s == b"Type0") => {
+        let table: [String; 256] = std::array::from_fn(|_| "\u{FFFD}".to_string());
+        let dict = match font_obj.map(|f| reader.resolve(f, 0, path)) {
+            Some(Ok(PdfObj::Dict(d))) => Some(d),
+            _ => None,
+        };
+        let width = match &dict {
+            Some(d) if matches!(d.get(b"Subtype".as_slice()), Some(PdfObj::Name(s)) if s == b"Type0") => {
                 match d
                     .get(b"Encoding".as_slice())
                     .map(|e| reader.resolve(e, 0, path))
@@ -53021,10 +53036,17 @@ mod pdf_support {
             }
             _ => CodeWidth::One,
         };
+        // Its text is lost, but its glyphs still move the text position,
+        // so the words around it still separate correctly.
+        let advances = match &dict {
+            Some(d) => font_advances(reader, d, &table, path),
+            None => Advances::Simple(Box::new([0.5; 256])),
+        };
         PdfFont {
             cmap: HashMap::new(),
-            table: std::array::from_fn(|_| "\u{FFFD}".to_string()),
+            table,
             width,
+            advances,
         }
     }
 
@@ -57329,15 +57351,476 @@ mod pdf_support {
         Variable,
     }
 
+    /// A font's glyph advances, in text space units per unit of font size
+    /// (a `/Widths` entry divided by 1000, or scaled by a Type 3 font's own
+    /// `/FontMatrix`): what moves the text position after each glyph, and
+    /// so what tells a word gap from the next letter of the same word.
+    enum Advances {
+        /// A simple font's 256 codes.
+        Simple(Box<[f64; 256]>),
+        /// A composite font: `/W` segments (first CID, last CID, advance)
+        /// sorted by first CID, and the `/DW` default. Only an Identity
+        /// CMap says which CID a code is; any other CMap's codes all take
+        /// the default.
+        Cid {
+            default: f64,
+            segments: Vec<(u32, u32, f64)>,
+        },
+    }
+
+    impl Advances {
+        fn width(&self, code: &[u8], width: CodeWidth) -> f64 {
+            match self {
+                Advances::Simple(w) => code.iter().map(|&b| w[b as usize]).sum(),
+                Advances::Cid { default, segments } => {
+                    let [hi, lo] = code else {
+                        return *default;
+                    };
+                    if width != CodeWidth::Two {
+                        return *default;
+                    }
+                    let cid = u32::from(u16::from_be_bytes([*hi, *lo]));
+                    let i = segments.partition_point(|s| s.0 <= cid);
+                    match i.checked_sub(1).map(|i| segments[i]) {
+                        Some((_, last, w)) if cid <= last => w,
+                        _ => *default,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Which Core 14 metrics a standard font name uses (see
+    /// `CORE14_LATIN_CHARS`).
+    enum Core14Metrics {
+        /// Widths by character, in `CORE14_LATIN_CHARS` order.
+        Latin(&'static [u16; 315]),
+        /// Courier: every glyph 600 units.
+        Fixed(u16),
+        /// Symbol and ZapfDingbats: widths by code in their built-in
+        /// encodings.
+        ByCode(&'static [u16; 256]),
+    }
+
+    fn core14_metrics(name: &[u8]) -> Option<Core14Metrics> {
+        Some(match name {
+            b"Helvetica" | b"Helvetica-Oblique" => Core14Metrics::Latin(&HELVETICA_WIDTHS),
+            b"Helvetica-Bold" | b"Helvetica-BoldOblique" => {
+                Core14Metrics::Latin(&HELVETICA_BOLD_WIDTHS)
+            }
+            b"Times-Roman" => Core14Metrics::Latin(&TIMES_ROMAN_WIDTHS),
+            b"Times-Bold" => Core14Metrics::Latin(&TIMES_BOLD_WIDTHS),
+            b"Times-Italic" => Core14Metrics::Latin(&TIMES_ITALIC_WIDTHS),
+            b"Times-BoldItalic" => Core14Metrics::Latin(&TIMES_BOLDITALIC_WIDTHS),
+            b"Courier" | b"Courier-Bold" | b"Courier-Oblique" | b"Courier-BoldOblique" => {
+                Core14Metrics::Fixed(600)
+            }
+            b"Symbol" => Core14Metrics::ByCode(&SYMBOL_WIDTHS),
+            b"ZapfDingbats" => Core14Metrics::ByCode(&ZAPF_DINGBATS_WIDTHS),
+            _ => return None,
+        })
+    }
+
+    fn resolve_num(reader: &mut PdfReader, obj: Option<&PdfObj>, path: &Path) -> Option<f64> {
+        reader.resolve(obj?, 0, path).ok()?.as_num()
+    }
+
+    fn resolve_array(
+        reader: &mut PdfReader,
+        obj: Option<&PdfObj>,
+        path: &Path,
+    ) -> Option<Vec<PdfObj>> {
+        match reader.resolve(obj?, 0, path).ok()? {
+            PdfObj::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Reads a font's glyph advances (see `Advances`): a composite font's
+    /// `/W` and `/DW`; a simple font's `/FirstChar` and `/Widths`, scaled by
+    /// a Type 3 font's `/FontMatrix`; for an unembedded standard 14 font
+    /// with no `/Widths` (legal before PDF 1.5, and what AcroForm fields
+    /// still write), Adobe's Core 14 metrics. Never fails: a malformed or
+    /// missing entry takes the spec's own default (`/MissingWidth`, `/DW`),
+    /// then half an em, so a broken metric can cost spacing accuracy but
+    /// never the text.
+    fn font_advances(
+        reader: &mut PdfReader,
+        dict: &BTreeMap<Vec<u8>, PdfObj>,
+        table: &[String; 256],
+        path: &Path,
+    ) -> Advances {
+        // A `/W` array can't legitimately describe more glyphs than this.
+        const MAX_W_SEGMENTS: usize = 1 << 20;
+        let subtype = dict.get(b"Subtype".as_slice()).and_then(PdfObj::as_name);
+        if subtype == Some(b"Type0".as_slice()) {
+            let descendant = resolve_array(reader, dict.get(b"DescendantFonts".as_slice()), path)
+                .and_then(
+                    |items| match reader.resolve(items.first()?, 0, path).ok()? {
+                        PdfObj::Dict(m) => Some(m),
+                        _ => None,
+                    },
+                );
+            let Some(cid_font) = descendant else {
+                return Advances::Cid {
+                    default: 1.0,
+                    segments: Vec::new(),
+                };
+            };
+            let default = resolve_num(reader, cid_font.get(b"DW".as_slice()), path)
+                .unwrap_or(1000.0)
+                / 1000.0;
+            let mut segments = Vec::new();
+            let items =
+                resolve_array(reader, cid_font.get(b"W".as_slice()), path).unwrap_or_default();
+            let mut i = 0;
+            // `c [w1 w2 ...]` gives consecutive CIDs from `c`; `c_first
+            // c_last w` gives a whole range one width.
+            fn push_run(segments: &mut Vec<(u32, u32, f64)>, first: u32, ws: &[PdfObj]) {
+                for (k, w) in ws.iter().enumerate() {
+                    if segments.len() >= MAX_W_SEGMENTS {
+                        break;
+                    }
+                    let (Some(w), Ok(k)) = (w.as_num(), u32::try_from(k)) else {
+                        continue;
+                    };
+                    let cid = first.saturating_add(k);
+                    segments.push((cid, cid, w / 1000.0));
+                }
+            }
+            while i < items.len() && segments.len() < MAX_W_SEGMENTS {
+                let Some(first) = items[i].as_num().filter(|n| *n >= 0.0) else {
+                    break;
+                };
+                let first = first as u32;
+                match items.get(i + 1) {
+                    Some(PdfObj::Array(ws)) => {
+                        push_run(&mut segments, first, ws);
+                        i += 2;
+                    }
+                    Some(r @ PdfObj::Ref(..)) => {
+                        let Ok(PdfObj::Array(ws)) = reader.resolve(r, 0, path) else {
+                            break;
+                        };
+                        push_run(&mut segments, first, &ws);
+                        i += 2;
+                    }
+                    Some(last) => {
+                        let (Some(last), Some(w)) =
+                            (last.as_num(), items.get(i + 2).and_then(PdfObj::as_num))
+                        else {
+                            break;
+                        };
+                        segments.push((first, last.max(0.0) as u32, w / 1000.0));
+                        i += 3;
+                    }
+                    None => break,
+                }
+            }
+            segments.sort_by_key(|s| s.0);
+            return Advances::Cid { default, segments };
+        }
+        let scale = if subtype == Some(b"Type3".as_slice()) {
+            resolve_array(reader, dict.get(b"FontMatrix".as_slice()), path)
+                .and_then(|m| m.first().and_then(PdfObj::as_num))
+                .filter(|a| a.is_finite() && *a != 0.0)
+                .unwrap_or(0.001)
+        } else {
+            0.001
+        };
+        let missing = match dict
+            .get(b"FontDescriptor".as_slice())
+            .map(|d| reader.resolve(d, 0, path))
+        {
+            Some(Ok(PdfObj::Dict(desc))) => {
+                resolve_num(reader, desc.get(b"MissingWidth".as_slice()), path).map(|m| m * scale)
+            }
+            _ => None,
+        };
+        if let Some(ws) = resolve_array(reader, dict.get(b"Widths".as_slice()), path) {
+            let first = resolve_num(reader, dict.get(b"FirstChar".as_slice()), path)
+                .unwrap_or(0.0)
+                .clamp(0.0, 256.0) as usize;
+            let mut widths = Box::new([missing.unwrap_or(0.0); 256]);
+            for (k, w) in ws.iter().enumerate() {
+                let Some(slot) = widths.get_mut(first + k) else {
+                    break;
+                };
+                if let Some(w) = resolve_num(reader, Some(w), path) {
+                    *slot = w * scale;
+                }
+            }
+            return Advances::Simple(widths);
+        }
+        let mut widths = Box::new([missing.unwrap_or(0.5); 256]);
+        match base_font_name(dict).and_then(core14_metrics) {
+            Some(Core14Metrics::Latin(table_widths)) => {
+                for (slot, text) in widths.iter_mut().zip(table.iter()) {
+                    // A no-break space and a soft hyphen are drawn with
+                    // the space and hyphen glyphs.
+                    let c = text.chars().next().map(|c| match c {
+                        '\u{00A0}' => ' ',
+                        '\u{00AD}' => '-',
+                        c => c,
+                    });
+                    if let Some(c) = c
+                        && let Ok(i) = CORE14_LATIN_CHARS.binary_search(&c)
+                    {
+                        *slot = f64::from(table_widths[i]) / 1000.0;
+                    }
+                }
+            }
+            Some(Core14Metrics::Fixed(w)) => *widths = [f64::from(w) / 1000.0; 256],
+            Some(Core14Metrics::ByCode(by_code)) => {
+                for (slot, w) in widths.iter_mut().zip(by_code.iter()) {
+                    *slot = f64::from(*w) / 1000.0;
+                }
+            }
+            None => {}
+        }
+        Advances::Simple(widths)
+    }
+
+    /// The Core 14 fonts' glyph widths (Adobe's AFM files, as shipped with
+    /// matplotlib), for an unembedded standard font whose dictionary gives
+    /// no `/Widths`. The twelve Latin fonts share one 315-glyph set, keyed
+    /// here by each glyph's AGL character (sorted, for `binary_search`);
+    /// the Oblique faces share their upright widths, and Courier is 600
+    /// throughout. Symbol and ZapfDingbats are keyed by code.
+    #[rustfmt::skip]
+    static CORE14_LATIN_CHARS: [char; 315] = [
+        '\u{0020}', '\u{0021}', '\u{0022}', '\u{0023}', '\u{0024}', '\u{0025}', '\u{0026}',
+        '\u{0027}', '\u{0028}', '\u{0029}', '\u{002A}', '\u{002B}', '\u{002C}', '\u{002D}',
+        '\u{002E}', '\u{002F}', '\u{0030}', '\u{0031}', '\u{0032}', '\u{0033}', '\u{0034}',
+        '\u{0035}', '\u{0036}', '\u{0037}', '\u{0038}', '\u{0039}', '\u{003A}', '\u{003B}',
+        '\u{003C}', '\u{003D}', '\u{003E}', '\u{003F}', '\u{0040}', '\u{0041}', '\u{0042}',
+        '\u{0043}', '\u{0044}', '\u{0045}', '\u{0046}', '\u{0047}', '\u{0048}', '\u{0049}',
+        '\u{004A}', '\u{004B}', '\u{004C}', '\u{004D}', '\u{004E}', '\u{004F}', '\u{0050}',
+        '\u{0051}', '\u{0052}', '\u{0053}', '\u{0054}', '\u{0055}', '\u{0056}', '\u{0057}',
+        '\u{0058}', '\u{0059}', '\u{005A}', '\u{005B}', '\u{005C}', '\u{005D}', '\u{005E}',
+        '\u{005F}', '\u{0060}', '\u{0061}', '\u{0062}', '\u{0063}', '\u{0064}', '\u{0065}',
+        '\u{0066}', '\u{0067}', '\u{0068}', '\u{0069}', '\u{006A}', '\u{006B}', '\u{006C}',
+        '\u{006D}', '\u{006E}', '\u{006F}', '\u{0070}', '\u{0071}', '\u{0072}', '\u{0073}',
+        '\u{0074}', '\u{0075}', '\u{0076}', '\u{0077}', '\u{0078}', '\u{0079}', '\u{007A}',
+        '\u{007B}', '\u{007C}', '\u{007D}', '\u{007E}', '\u{00A1}', '\u{00A2}', '\u{00A3}',
+        '\u{00A4}', '\u{00A5}', '\u{00A6}', '\u{00A7}', '\u{00A8}', '\u{00A9}', '\u{00AA}',
+        '\u{00AB}', '\u{00AC}', '\u{00AE}', '\u{00AF}', '\u{00B0}', '\u{00B1}', '\u{00B2}',
+        '\u{00B3}', '\u{00B4}', '\u{00B5}', '\u{00B6}', '\u{00B7}', '\u{00B8}', '\u{00B9}',
+        '\u{00BA}', '\u{00BB}', '\u{00BC}', '\u{00BD}', '\u{00BE}', '\u{00BF}', '\u{00C0}',
+        '\u{00C1}', '\u{00C2}', '\u{00C3}', '\u{00C4}', '\u{00C5}', '\u{00C6}', '\u{00C7}',
+        '\u{00C8}', '\u{00C9}', '\u{00CA}', '\u{00CB}', '\u{00CC}', '\u{00CD}', '\u{00CE}',
+        '\u{00CF}', '\u{00D0}', '\u{00D1}', '\u{00D2}', '\u{00D3}', '\u{00D4}', '\u{00D5}',
+        '\u{00D6}', '\u{00D7}', '\u{00D8}', '\u{00D9}', '\u{00DA}', '\u{00DB}', '\u{00DC}',
+        '\u{00DD}', '\u{00DE}', '\u{00DF}', '\u{00E0}', '\u{00E1}', '\u{00E2}', '\u{00E3}',
+        '\u{00E4}', '\u{00E5}', '\u{00E6}', '\u{00E7}', '\u{00E8}', '\u{00E9}', '\u{00EA}',
+        '\u{00EB}', '\u{00EC}', '\u{00ED}', '\u{00EE}', '\u{00EF}', '\u{00F0}', '\u{00F1}',
+        '\u{00F2}', '\u{00F3}', '\u{00F4}', '\u{00F5}', '\u{00F6}', '\u{00F7}', '\u{00F8}',
+        '\u{00F9}', '\u{00FA}', '\u{00FB}', '\u{00FC}', '\u{00FD}', '\u{00FE}', '\u{00FF}',
+        '\u{0100}', '\u{0101}', '\u{0102}', '\u{0103}', '\u{0104}', '\u{0105}', '\u{0106}',
+        '\u{0107}', '\u{010C}', '\u{010D}', '\u{010E}', '\u{010F}', '\u{0110}', '\u{0111}',
+        '\u{0112}', '\u{0113}', '\u{0116}', '\u{0117}', '\u{0118}', '\u{0119}', '\u{011A}',
+        '\u{011B}', '\u{011E}', '\u{011F}', '\u{0122}', '\u{0123}', '\u{012A}', '\u{012B}',
+        '\u{012E}', '\u{012F}', '\u{0130}', '\u{0131}', '\u{0136}', '\u{0137}', '\u{0139}',
+        '\u{013A}', '\u{013B}', '\u{013C}', '\u{013D}', '\u{013E}', '\u{0141}', '\u{0142}',
+        '\u{0143}', '\u{0144}', '\u{0145}', '\u{0146}', '\u{0147}', '\u{0148}', '\u{014C}',
+        '\u{014D}', '\u{0150}', '\u{0151}', '\u{0152}', '\u{0153}', '\u{0154}', '\u{0155}',
+        '\u{0156}', '\u{0157}', '\u{0158}', '\u{0159}', '\u{015A}', '\u{015B}', '\u{015E}',
+        '\u{015F}', '\u{0160}', '\u{0161}', '\u{0162}', '\u{0163}', '\u{0164}', '\u{0165}',
+        '\u{016A}', '\u{016B}', '\u{016E}', '\u{016F}', '\u{0170}', '\u{0171}', '\u{0172}',
+        '\u{0173}', '\u{0178}', '\u{0179}', '\u{017A}', '\u{017B}', '\u{017C}', '\u{017D}',
+        '\u{017E}', '\u{0192}', '\u{0218}', '\u{0219}', '\u{02C6}', '\u{02C7}', '\u{02D8}',
+        '\u{02D9}', '\u{02DA}', '\u{02DB}', '\u{02DC}', '\u{02DD}', '\u{2013}', '\u{2014}',
+        '\u{2018}', '\u{2019}', '\u{201A}', '\u{201C}', '\u{201D}', '\u{201E}', '\u{2020}',
+        '\u{2021}', '\u{2022}', '\u{2026}', '\u{2030}', '\u{2039}', '\u{203A}', '\u{2044}',
+        '\u{20AC}', '\u{2122}', '\u{2202}', '\u{2206}', '\u{2211}', '\u{2212}', '\u{221A}',
+        '\u{2260}', '\u{2264}', '\u{2265}', '\u{25CA}', '\u{F6C3}', '\u{FB01}', '\u{FB02}',
+    ];
+
+    #[rustfmt::skip]
+    static HELVETICA_WIDTHS: [u16; 315] = [
+        278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556,
+        556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667,
+        667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722,
+        667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500,
+        556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278,
+        556, 500, 722, 500, 500, 500, 334, 260, 334, 584, 333, 556, 556, 556, 556, 260, 556,
+        333, 737, 370, 556, 584, 737, 333, 400, 584, 333, 333, 333, 556, 537, 278, 333, 333,
+        365, 556, 834, 834, 834, 611, 667, 667, 667, 667, 667, 667, 1000, 722, 667, 667, 667,
+        667, 278, 278, 278, 278, 722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722,
+        722, 667, 667, 611, 556, 556, 556, 556, 556, 556, 889, 500, 556, 556, 556, 556, 278,
+        278, 278, 278, 556, 556, 556, 556, 556, 556, 556, 584, 611, 556, 556, 556, 556, 500,
+        556, 500, 667, 556, 667, 556, 667, 556, 722, 500, 722, 500, 722, 643, 722, 556, 667,
+        556, 667, 556, 667, 556, 667, 556, 778, 556, 778, 556, 278, 278, 278, 222, 278, 278,
+        667, 500, 556, 222, 556, 222, 556, 299, 556, 222, 722, 556, 722, 556, 722, 556, 778,
+        556, 778, 556, 1000, 944, 722, 333, 722, 333, 722, 333, 667, 500, 667, 500, 667, 500,
+        611, 278, 611, 317, 722, 556, 722, 556, 722, 556, 722, 556, 667, 611, 500, 611, 500,
+        611, 500, 556, 667, 500, 333, 333, 333, 333, 333, 333, 333, 333, 556, 1000, 222, 222,
+        222, 333, 333, 333, 556, 556, 350, 1000, 1000, 333, 333, 167, 556, 1000, 476, 612, 600,
+        584, 453, 549, 549, 549, 471, 250, 500, 500,
+    ];
+
+    #[rustfmt::skip]
+    static HELVETICA_BOLD_WIDTHS: [u16; 315] = [
+        278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556,
+        556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975, 722,
+        722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722,
+        667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556,
+        611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611, 611, 611, 389, 556, 333,
+        611, 556, 778, 556, 556, 500, 389, 280, 389, 584, 333, 556, 556, 556, 556, 280, 556,
+        333, 737, 370, 556, 584, 737, 333, 400, 584, 333, 333, 333, 611, 556, 278, 333, 333,
+        365, 556, 834, 834, 834, 611, 722, 722, 722, 722, 722, 722, 1000, 722, 667, 667, 667,
+        667, 278, 278, 278, 278, 722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722,
+        722, 667, 667, 611, 556, 556, 556, 556, 556, 556, 889, 556, 556, 556, 556, 556, 278,
+        278, 278, 278, 611, 611, 611, 611, 611, 611, 611, 584, 611, 611, 611, 611, 611, 556,
+        611, 556, 722, 556, 722, 556, 722, 556, 722, 556, 722, 556, 722, 743, 722, 611, 667,
+        556, 667, 556, 667, 556, 667, 556, 778, 611, 778, 611, 278, 278, 278, 278, 278, 278,
+        722, 556, 611, 278, 611, 278, 611, 400, 611, 278, 722, 611, 722, 611, 722, 611, 778,
+        611, 778, 611, 1000, 944, 722, 389, 722, 389, 722, 389, 667, 556, 667, 556, 667, 556,
+        611, 333, 611, 389, 722, 611, 722, 611, 722, 611, 722, 611, 667, 611, 500, 611, 500,
+        611, 500, 556, 667, 556, 333, 333, 333, 333, 333, 333, 333, 333, 556, 1000, 278, 278,
+        278, 500, 500, 500, 556, 556, 350, 1000, 1000, 333, 333, 167, 556, 1000, 494, 612, 600,
+        584, 549, 549, 549, 549, 494, 250, 611, 611,
+    ];
+
+    #[rustfmt::skip]
+    static TIMES_ROMAN_WIDTHS: [u16; 315] = [
+        250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278, 500,
+        500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444, 921, 722,
+        667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722, 556, 722, 667,
+        556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500, 333, 444, 500, 444,
+        500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500, 500, 500, 333, 389, 278,
+        500, 500, 722, 500, 500, 444, 480, 200, 480, 541, 333, 500, 500, 500, 500, 200, 500,
+        333, 760, 276, 500, 564, 760, 333, 400, 564, 300, 300, 333, 500, 453, 250, 333, 300,
+        310, 500, 750, 750, 750, 444, 722, 722, 722, 722, 722, 722, 889, 667, 611, 611, 611,
+        611, 333, 333, 333, 333, 722, 722, 722, 722, 722, 722, 722, 564, 722, 722, 722, 722,
+        722, 722, 556, 500, 444, 444, 444, 444, 444, 444, 667, 444, 444, 444, 444, 444, 278,
+        278, 278, 278, 500, 500, 500, 500, 500, 500, 500, 564, 500, 500, 500, 500, 500, 500,
+        500, 500, 722, 444, 722, 444, 722, 444, 667, 444, 667, 444, 722, 588, 722, 500, 611,
+        444, 611, 444, 611, 444, 611, 444, 722, 500, 722, 500, 333, 278, 333, 278, 333, 278,
+        722, 500, 611, 278, 611, 278, 611, 344, 611, 278, 722, 500, 722, 500, 722, 500, 722,
+        500, 722, 500, 889, 722, 667, 333, 667, 333, 667, 333, 556, 389, 556, 389, 556, 389,
+        611, 278, 611, 326, 722, 500, 722, 500, 722, 500, 722, 500, 722, 611, 444, 611, 444,
+        611, 444, 500, 556, 389, 333, 333, 333, 333, 333, 333, 333, 333, 500, 1000, 333, 333,
+        333, 444, 444, 444, 500, 500, 350, 1000, 1000, 333, 333, 167, 500, 980, 476, 612, 600,
+        564, 453, 549, 549, 549, 471, 250, 556, 556,
+    ];
+
+    #[rustfmt::skip]
+    static TIMES_BOLD_WIDTHS: [u16; 315] = [
+        250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500,
+        500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 930, 722,
+        667, 722, 722, 667, 611, 778, 778, 389, 500, 778, 667, 944, 722, 778, 611, 778, 722,
+        556, 667, 722, 722, 1000, 722, 722, 667, 333, 278, 333, 581, 500, 333, 500, 556, 444,
+        556, 444, 333, 500, 556, 278, 333, 556, 278, 833, 556, 500, 556, 556, 444, 389, 333,
+        556, 500, 722, 500, 500, 444, 394, 220, 394, 520, 333, 500, 500, 500, 500, 220, 500,
+        333, 747, 300, 500, 570, 747, 333, 400, 570, 300, 300, 333, 556, 540, 250, 333, 300,
+        330, 500, 750, 750, 750, 500, 722, 722, 722, 722, 722, 722, 1000, 722, 667, 667, 667,
+        667, 389, 389, 389, 389, 722, 722, 778, 778, 778, 778, 778, 570, 778, 722, 722, 722,
+        722, 722, 611, 556, 500, 500, 500, 500, 500, 500, 722, 444, 444, 444, 444, 444, 278,
+        278, 278, 278, 500, 556, 500, 500, 500, 500, 500, 570, 500, 556, 556, 556, 556, 500,
+        556, 500, 722, 500, 722, 500, 722, 500, 722, 444, 722, 444, 722, 672, 722, 556, 667,
+        444, 667, 444, 667, 444, 667, 444, 778, 500, 778, 500, 389, 278, 389, 278, 389, 278,
+        778, 556, 667, 278, 667, 278, 667, 394, 667, 278, 722, 556, 722, 556, 722, 556, 778,
+        500, 778, 500, 1000, 722, 722, 444, 722, 444, 722, 444, 556, 389, 556, 389, 556, 389,
+        667, 333, 667, 416, 722, 556, 722, 556, 722, 556, 722, 556, 722, 667, 444, 667, 444,
+        667, 444, 500, 556, 389, 333, 333, 333, 333, 333, 333, 333, 333, 500, 1000, 333, 333,
+        333, 500, 500, 500, 500, 500, 350, 1000, 1000, 333, 333, 167, 500, 1000, 494, 612, 600,
+        570, 549, 549, 549, 549, 494, 250, 556, 556,
+    ];
+
+    #[rustfmt::skip]
+    static TIMES_ITALIC_WIDTHS: [u16; 315] = [
+        250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250, 278, 500,
+        500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675, 675, 500, 920, 611,
+        611, 667, 722, 611, 611, 722, 722, 333, 444, 667, 556, 833, 667, 722, 611, 722, 611,
+        500, 556, 722, 611, 833, 611, 556, 556, 389, 278, 389, 422, 500, 333, 500, 500, 444,
+        500, 444, 278, 500, 500, 278, 278, 444, 278, 722, 500, 500, 500, 500, 389, 389, 278,
+        500, 444, 667, 444, 444, 389, 400, 275, 400, 541, 389, 500, 500, 500, 500, 275, 500,
+        333, 760, 276, 500, 675, 760, 333, 400, 675, 300, 300, 333, 500, 523, 250, 333, 300,
+        310, 500, 750, 750, 750, 500, 611, 611, 611, 611, 611, 611, 889, 667, 611, 611, 611,
+        611, 333, 333, 333, 333, 722, 667, 722, 722, 722, 722, 722, 675, 722, 722, 722, 722,
+        722, 556, 611, 500, 500, 500, 500, 500, 500, 500, 667, 444, 444, 444, 444, 444, 278,
+        278, 278, 278, 500, 500, 500, 500, 500, 500, 500, 675, 500, 500, 500, 500, 500, 444,
+        500, 444, 611, 500, 611, 500, 611, 500, 667, 444, 667, 444, 722, 544, 722, 500, 611,
+        444, 611, 444, 611, 444, 611, 444, 722, 500, 722, 500, 333, 278, 333, 278, 333, 278,
+        667, 444, 556, 278, 556, 278, 611, 300, 556, 278, 667, 500, 667, 500, 667, 500, 722,
+        500, 722, 500, 944, 667, 611, 389, 611, 389, 611, 389, 500, 389, 500, 389, 500, 389,
+        556, 278, 556, 300, 722, 500, 722, 500, 722, 500, 722, 500, 556, 556, 389, 556, 389,
+        556, 389, 500, 500, 389, 333, 333, 333, 333, 333, 333, 333, 333, 500, 889, 333, 333,
+        333, 556, 556, 556, 500, 500, 350, 889, 1000, 333, 333, 167, 500, 980, 476, 612, 600,
+        675, 453, 549, 549, 549, 471, 250, 500, 500,
+    ];
+
+    #[rustfmt::skip]
+    static TIMES_BOLDITALIC_WIDTHS: [u16; 315] = [
+        250, 389, 555, 500, 500, 833, 778, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500,
+        500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 832, 667,
+        667, 667, 722, 667, 667, 722, 778, 389, 500, 667, 611, 889, 722, 722, 611, 722, 667,
+        556, 611, 722, 667, 889, 667, 611, 611, 333, 278, 333, 570, 500, 333, 500, 500, 444,
+        500, 444, 333, 500, 556, 278, 278, 500, 278, 778, 556, 500, 500, 500, 389, 389, 278,
+        556, 444, 667, 500, 444, 389, 348, 220, 348, 570, 389, 500, 500, 500, 500, 220, 500,
+        333, 747, 266, 500, 606, 747, 333, 400, 570, 300, 300, 333, 576, 500, 250, 333, 300,
+        300, 500, 750, 750, 750, 500, 667, 667, 667, 667, 667, 667, 944, 667, 667, 667, 667,
+        667, 389, 389, 389, 389, 722, 722, 722, 722, 722, 722, 722, 570, 722, 722, 722, 722,
+        722, 611, 611, 500, 500, 500, 500, 500, 500, 500, 722, 444, 444, 444, 444, 444, 278,
+        278, 278, 278, 500, 556, 500, 500, 500, 500, 500, 570, 500, 556, 556, 556, 556, 444,
+        500, 444, 667, 500, 667, 500, 667, 500, 667, 444, 667, 444, 722, 608, 722, 500, 667,
+        444, 667, 444, 667, 444, 667, 444, 722, 500, 722, 500, 389, 278, 389, 278, 389, 278,
+        667, 500, 611, 278, 611, 278, 611, 382, 611, 278, 722, 556, 722, 556, 722, 556, 722,
+        500, 722, 500, 944, 722, 667, 389, 667, 389, 667, 389, 556, 389, 556, 389, 556, 389,
+        611, 278, 611, 366, 722, 556, 722, 556, 722, 556, 722, 556, 611, 611, 389, 611, 389,
+        611, 389, 500, 556, 389, 333, 333, 333, 333, 333, 333, 333, 333, 500, 1000, 333, 333,
+        333, 500, 500, 500, 500, 500, 350, 1000, 1000, 333, 333, 167, 500, 1000, 494, 612, 600,
+        606, 549, 549, 549, 549, 494, 250, 556, 556,
+    ];
+
+    #[rustfmt::skip]
+    static SYMBOL_WIDTHS: [u16; 256] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 250, 333, 713, 500, 549, 833, 778, 439, 333, 333, 500, 549, 250, 549, 250, 278,
+        500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 549, 549, 549, 444, 549,
+        722, 667, 722, 612, 611, 763, 603, 722, 333, 631, 722, 686, 889, 722, 722, 768, 741,
+        556, 592, 611, 690, 439, 768, 645, 795, 611, 333, 863, 333, 658, 500, 500, 631, 549,
+        549, 494, 439, 521, 411, 603, 329, 603, 549, 549, 576, 521, 549, 549, 521, 549, 603,
+        439, 576, 713, 686, 493, 686, 494, 480, 200, 480, 549, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 750, 620, 247, 549,
+        167, 713, 500, 753, 753, 753, 753, 1042, 987, 603, 987, 603, 400, 549, 411, 549, 549,
+        713, 494, 460, 549, 549, 549, 549, 1000, 603, 1000, 658, 823, 686, 795, 987, 768, 768,
+        823, 768, 768, 713, 713, 713, 713, 713, 713, 713, 768, 713, 790, 790, 890, 823, 549,
+        250, 713, 603, 603, 1042, 987, 603, 987, 603, 494, 329, 790, 790, 786, 713, 384, 384,
+        384, 384, 384, 384, 494, 494, 494, 494, 0, 329, 274, 686, 686, 686, 384, 384, 384, 384,
+        384, 384, 494, 494, 494, 0,
+    ];
+
+    #[rustfmt::skip]
+    static ZAPF_DINGBATS_WIDTHS: [u16; 256] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 278, 974, 961, 974, 980, 719, 789, 790, 791, 690, 960, 939, 549, 855, 911, 933,
+        911, 945, 974, 755, 846, 762, 761, 571, 677, 763, 760, 759, 754, 494, 552, 537, 577,
+        692, 786, 788, 788, 790, 793, 794, 816, 823, 789, 841, 823, 833, 816, 831, 923, 744,
+        723, 749, 790, 792, 695, 776, 768, 792, 759, 707, 708, 682, 701, 826, 815, 789, 789,
+        707, 687, 696, 689, 786, 787, 713, 791, 785, 791, 873, 761, 762, 762, 759, 759, 892,
+        892, 788, 784, 438, 138, 277, 415, 392, 392, 668, 668, 0, 390, 390, 317, 317, 276, 276,
+        509, 509, 410, 410, 234, 234, 334, 334, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 732, 544, 544, 910, 667, 760, 760, 776, 595, 694, 626, 788, 788, 788, 788, 788,
+        788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788,
+        788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788, 788,
+        788, 894, 838, 1016, 458, 748, 924, 748, 918, 927, 928, 928, 834, 873, 828, 924, 924,
+        917, 930, 931, 463, 883, 836, 836, 867, 867, 696, 696, 874, 0, 874, 760, 946, 771, 865,
+        771, 888, 967, 888, 831, 873, 927, 970, 918, 0,
+    ];
+
     /// One font's decoding state: a ToUnicode CMap (authoritative whenever
     /// present - it exists precisely because the byte codes are custom)
     /// plus a 256-entry base table (WinAnsi, MacRoman, or either with
     /// `/Differences` applied) covering a simple font's codes the CMap
-    /// doesn't map.
+    /// doesn't map, and its glyph advances, which place each string it
+    /// shows (see `TextLayout`).
     struct PdfFont {
         cmap: HashMap<Vec<u8>, String>,
         table: [String; 256],
         width: CodeWidth,
+        advances: Advances,
     }
 
     impl PdfFont {
@@ -57349,41 +57832,79 @@ mod pdf_support {
         /// go through that single-byte table: an Identity code is exactly
         /// two bytes, and one its ToUnicode doesn't map is a single U+FFFD,
         /// never the two unrelated single-byte guesses (typically a NUL and
-        /// a Latin-1 letter) this used to produce.
+        /// a Latin-1 letter) this used to produce. (Page text goes through
+        /// `layout_glyphs`, which splits codes the same way.)
+        #[cfg(test)]
         fn decode(&self, bytes: &[u8]) -> (String, usize) {
             let mut out = String::new();
             let mut unmapped = 0;
+            self.each_code(bytes, |_, text| {
+                unmapped += usize::from(text == "\u{FFFD}");
+                out.push_str(text);
+            });
+            (expand_latin_ligatures(out), unmapped)
+        }
+
+        /// Splits `bytes` into this font's codes (see `decode`), calling
+        /// `f` with each code and its text.
+        fn each_code(&self, bytes: &[u8], mut f: impl FnMut(&[u8], &str)) {
             if self.width == CodeWidth::Two {
                 for code in bytes.chunks(2) {
-                    let text = self.cmap.get(code).map_or("\u{FFFD}", String::as_str);
-                    unmapped += usize::from(text == "\u{FFFD}");
-                    out.push_str(text);
+                    f(code, self.cmap.get(code).map_or("\u{FFFD}", String::as_str));
                 }
-                return (expand_latin_ligatures(out), unmapped);
+                return;
             }
             let mut i = 0;
             while i < bytes.len() {
-                let mut matched: Option<(&String, usize)> = None;
+                let mut matched: Option<(&str, usize)> = None;
                 for len in (1..=4.min(bytes.len() - i)).rev() {
                     if let Some(s) = self.cmap.get(&bytes[i..i + len]) {
-                        matched = Some((s, len));
+                        matched = Some((s.as_str(), len));
                         break;
                     }
                 }
                 let (text, len) = match matched {
-                    Some((s, len)) => (s.as_str(), len),
+                    Some(m) => m,
                     None if self.width == CodeWidth::Variable => ("\u{FFFD}", 1),
                     None => (self.table[bytes[i] as usize].as_str(), 1),
                 };
-                unmapped += usize::from(text == "\u{FFFD}");
-                out.push_str(text);
+                f(&bytes[i..i + len], text);
                 i += len;
             }
-            (expand_latin_ligatures(out), unmapped)
+        }
+
+        /// Walks one shown string glyph by glyph, calling `f` with each
+        /// code's text, where the glyph starts (its offset along the
+        /// baseline from the string's origin) and how far its ink reaches
+        /// (its advance), both in unscaled text space units. Returns how far
+        /// the whole string moves the text position (ISO 32000-1 9.4.4:
+        /// each glyph's advance times the font size, plus character
+        /// spacing, plus word spacing for a single-byte code 32, all times
+        /// horizontal scaling) and how many codes read as U+FFFD.
+        fn layout_glyphs(
+            &self,
+            bytes: &[u8],
+            state: &TextState,
+            mut f: impl FnMut(&str, f64, f64),
+        ) -> (f64, usize) {
+            let mut pen = 0.0;
+            let mut unmapped = 0;
+            self.each_code(bytes, |code, text| {
+                unmapped += usize::from(text == "\u{FFFD}");
+                let ink = self.advances.width(code, self.width) * state.size * state.h_scale;
+                f(text, pen, ink);
+                let word = if code == b" " {
+                    state.word_spacing
+                } else {
+                    0.0
+                };
+                pen += ink + (state.char_spacing + word) * state.h_scale;
+            });
+            (pen, unmapped)
         }
     }
 
-    /// Expands the seven Latin presentation-form ligatures (U+FB00-U+FB06,
+    /// Appends `text` to `out`, expanding the seven Latin presentation-form ligatures (U+FB00-U+FB06,
     /// `ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ`) into their letters - exactly Unicode's own NFKC
     /// mapping for them (UnicodeData.txt marks each a `<compat>`
     /// decomposition; checked against Python's `unicodedata`), and what
@@ -57394,11 +57915,11 @@ mod pdf_support {
     /// address containing U+FB01 is no longer an e-mail address). Against
     /// PDFium this was the single largest systematic difference in the
     /// real corpus - about 11,000 characters across 24 files.
-    fn expand_latin_ligatures(text: String) -> String {
+    fn push_expanding_ligatures(out: &mut String, text: &str) {
         if !text.chars().any(|c| ('\u{FB00}'..='\u{FB06}').contains(&c)) {
-            return text;
+            out.push_str(text);
+            return;
         }
-        let mut out = String::with_capacity(text.len() + 8);
         for c in text.chars() {
             match c {
                 '\u{FB00}' => out.push_str("ff"),
@@ -57410,6 +57931,13 @@ mod pdf_support {
                 c => out.push(c),
             }
         }
+    }
+
+    /// `push_expanding_ligatures` into a fresh string.
+    #[cfg(test)]
+    fn expand_latin_ligatures(text: String) -> String {
+        let mut out = String::with_capacity(text.len() + 8);
+        push_expanding_ligatures(&mut out, &text);
         out
     }
 
@@ -58471,7 +58999,13 @@ mod pdf_support {
         } else {
             CodeWidth::One
         };
-        Ok(PdfFont { cmap, table, width })
+        let advances = font_advances(reader, dict, &table, path);
+        Ok(PdfFont {
+            cmap,
+            table,
+            width,
+            advances,
+        })
     }
 
     /// UTF-16BE bytes to `String` (ToUnicode destinations). Surrogate
@@ -58768,10 +59302,12 @@ mod pdf_support {
         /// Extracts one page's text: every `/Contents` stream (single or
         /// array, concatenated with a newline so no operator can glue
         /// across the boundary) walked for text-showing operators, each
-        /// span decoded through its `/Tf`-selected font. A page with no
-        /// `/Contents` is blank, not broken - empty text, still a record.
-        /// The real work is `render_content_text`, called here with the
-        /// page's own top-level resources and a fresh `FontScope::Page`.
+        /// span decoded through its `/Tf`-selected font and placed by
+        /// where it's drawn (see `TextLayout`). A page with no `/Contents`
+        /// is blank, not broken - empty text, still a record. The real
+        /// work is `render_content_text`, called here with the page's own
+        /// top-level resources, a fresh `FontScope::Page`, and the default
+        /// (identity) transformation matrix.
         fn page_text(
             &mut self,
             page: &BTreeMap<Vec<u8>, PdfObj>,
@@ -58807,47 +59343,60 @@ mod pdf_support {
                 data.extend_from_slice(d);
             }
             let mut xobject_counter = 0u32;
+            let mut layout = TextLayout::default();
             self.render_content_text(
                 &data,
                 resources,
                 FontScope::Page(page_idx),
+                IDENTITY,
                 page_no,
                 font_cache,
                 &mut xobject_counter,
+                &mut layout,
                 0,
                 path,
-            )
+            )?;
+            Ok(layout.out.trim().to_string())
         }
 
         /// Walks one already-decoded content stream's text-showing
         /// operators (a page's own `/Contents`, or - recursively - a
         /// Form XObject's own nested content, `/Name Do` naming one
-        /// against `/Resources /XObject`) and renders the real text.
-        /// A Form (as opposed to an Image) XObject is exactly another
-        /// content stream with its own operators and its own optional
-        /// `/Resources` (falling back to the invoking scope's own
+        /// against `/Resources /XObject`) and lays the real text out in
+        /// `layout`. A Form (as opposed to an Image) XObject is exactly
+        /// another content stream with its own operators and its own
+        /// optional `/Resources` (falling back to the invoking scope's own
         /// resources when absent, per spec) - the same "run of graphics
-        /// operators with text-showing calls mixed in" shape a page's
-        /// own top-level content already is, so recursing straight back
-        /// into this same function handles it with no separate logic.
+        /// operators with text-showing calls mixed in" shape a page's own
+        /// top-level content already is, so recursing straight back into
+        /// this same function handles it, with the Form's `/Matrix`
+        /// concatenated onto the current transformation matrix `ctm`.
         /// `depth` guards against a cyclic or adversarially deep XObject
-        /// chain (`MAX_XOBJECT_DEPTH`); `xobject_counter` hands every
-        /// Form invocation its own fresh `FontScope`, so a font name
-        /// that means something different inside the Form than it does
-        /// in the invoking scope can never be conflated with it (see
+        /// chain (`MAX_XOBJECT_DEPTH`); `xobject_counter` hands every Form
+        /// invocation its own fresh `FontScope`, so a font name that means
+        /// something different inside the Form than it does in the
+        /// invoking scope can never be conflated with it (see
         /// `FontScope`'s own doc comment).
+        ///
+        /// Each string is placed where ISO 32000-1 9.4.4 draws it: the text
+        /// rendering matrix `[size*h_scale 0 0 size 0 rise] x Tm x CTM`
+        /// gives its start and direction, and its glyphs' advances (see
+        /// `PdfFont::advance`) move the text matrix to where the next one
+        /// starts.
         #[allow(clippy::too_many_arguments)]
         fn render_content_text(
             &mut self,
             data: &[u8],
             resources: &BTreeMap<Vec<u8>, PdfObj>,
             scope: FontScope,
+            ctm: Matrix,
             page_no: usize,
             font_cache: &mut HashMap<(FontScope, Vec<u8>), PdfFont>,
             xobject_counter: &mut u32,
+            layout: &mut TextLayout,
             depth: usize,
             path: &Path,
-        ) -> Result<String> {
+        ) -> Result<()> {
             if depth > MAX_XOBJECT_DEPTH {
                 bail!(
                     "{path:?} page {page_no} has Form XObjects nested too deep - \
@@ -58866,7 +59415,6 @@ mod pdf_support {
                     ),
                 },
             };
-            let ends_ws = |s: &str| s.ends_with(' ') || s.ends_with('\n');
             // Codes each font actually shows on this page: a Differences-
             // only font (no base, no CMap) is accepted exactly when every
             // shown code has an explicit mapping - computed up front from
@@ -58881,10 +59429,37 @@ mod pdf_support {
                 }
             }
             let no_codes: HashSet<u8> = HashSet::new();
-            let mut out = String::new();
+            let mut ctm = ctm;
+            let mut saved_ctm: Vec<Matrix> = Vec::new();
+            let mut tm = IDENTITY;
+            let mut tlm = IDENTITY;
             for span in spans {
                 match span {
-                    CSpan::Show { font, bytes, glue } => {
+                    CSpan::BeginText => {
+                        tm = IDENTITY;
+                        tlm = IDENTITY;
+                    }
+                    CSpan::SetMatrix(m) => {
+                        tm = m;
+                        tlm = m;
+                    }
+                    CSpan::MoveLine(tx, ty) => {
+                        tlm = mat_mul(&translate(tx, ty), &tlm);
+                        tm = tlm;
+                    }
+                    CSpan::Adjust(dx) => tm = mat_mul(&translate(dx, 0.0), &tm),
+                    CSpan::Concat(m) => ctm = mat_mul(&m, &ctm),
+                    CSpan::Save => {
+                        if saved_ctm.len() < MAX_GSTATE_DEPTH {
+                            saved_ctm.push(ctm);
+                        }
+                    }
+                    CSpan::Restore => {
+                        if let Some(m) = saved_ctm.pop() {
+                            ctm = m;
+                        }
+                    }
+                    CSpan::Show { font, bytes, state } => {
                         if font.is_empty() {
                             bail!("{path:?} page {page_no} shows text before any font is selected");
                         }
@@ -58922,31 +59497,43 @@ mod pdf_support {
                             };
                             font_cache.insert(key.clone(), built);
                         }
-                        let (text, unmapped) = font_cache
-                            .get(&key)
-                            .map(|f| f.decode(&bytes))
-                            .unwrap_or_default();
-                        self.text_stats.unmapped_codes += unmapped;
-                        // An empty show contributes nothing - not even its
-                        // word separator (otherwise `() Tj` would spray
-                        // double spaces through the text).
-                        if text.is_empty() {
+                        let Some(pdf_font) = font_cache.get(&key) else {
+                            continue;
+                        };
+                        if bytes.is_empty() {
                             continue;
                         }
-                        if !glue && !out.is_empty() && !ends_ws(&out) {
-                            out.push(' ');
-                        }
-                        out.push_str(&text);
-                    }
-                    CSpan::Space => {
-                        if !out.is_empty() && !ends_ws(&out) {
-                            out.push(' ');
-                        }
-                    }
-                    CSpan::NewLine => {
-                        if !out.is_empty() && !out.ends_with('\n') {
-                            out.push('\n');
-                        }
+                        let m = mat_mul(&tm, &ctm);
+                        let trm = mat_mul(
+                            &[
+                                state.size * state.h_scale,
+                                0.0,
+                                0.0,
+                                state.size,
+                                0.0,
+                                state.rise,
+                            ],
+                            &m,
+                        );
+                        let em = trm[2].hypot(trm[3]);
+                        let len = trm[0].hypot(trm[1]);
+                        let dir = if len > 1e-12 {
+                            (trm[0] / len, trm[1] / len)
+                        } else {
+                            (1.0, 0.0)
+                        };
+                        // Moving the text matrix `p` along the baseline moves
+                        // the glyph origin `p * (m[0], m[1])` in device space.
+                        let origin = (trm[4], trm[5]);
+                        let at = |p: f64| (origin.0 + p * m[0], origin.1 + p * m[1]);
+                        layout.begin_string();
+                        let (advance, unmapped) =
+                            pdf_font.layout_glyphs(&bytes, &state, |text, pen, ink| {
+                                let end = at(pen + ink);
+                                layout.push(text, at(pen), LastGlyph { end, dir, em });
+                            });
+                        self.text_stats.unmapped_codes += unmapped;
+                        tm = mat_mul(&translate(advance, 0.0), &tm);
                     }
                     CSpan::XObjectRef(name) => {
                         // Resolving *any* stream object - Form or Image -
@@ -58993,62 +59580,64 @@ mod pdf_support {
                             },
                             None => resources.clone(),
                         };
+                        // A Form's `/Matrix` maps its space into the user
+                        // space it's drawn in (ISO 32000-1 8.10.1).
+                        let matrix = match xdict.get(b"Matrix".as_slice()) {
+                            Some(m) => match self.resolve(m, 0, path) {
+                                Ok(PdfObj::Array(items)) => matrix_from(&items),
+                                _ => None,
+                            },
+                            None => None,
+                        }
+                        .unwrap_or(IDENTITY);
                         *xobject_counter += 1;
                         let xscope = FontScope::XObject {
                             page: page_no,
                             invocation: *xobject_counter,
                         };
                         // A Form's own content genuinely failing to parse
-                        // (a malformed operand, a font with no usable
-                        // encoding) is the same "not worth losing the rest
-                        // of the page over" case as the resolve failures
-                        // above, not a reason to fail the whole page - but
-                        // unlike an Image, a Form is known to carry text,
-                        // so skipping it is recorded and disclosed on the
-                        // `text` column (see `PdfTextStats`), never silent.
-                        // Counts from the failed Form's own partial render
-                        // are rolled back so only the skip itself counts.
+                        // (a malformed operand, text before any font) is the
+                        // same "not worth losing the rest of the page over"
+                        // case as the resolve failures above, not a reason
+                        // to fail the whole page - but unlike an Image, a
+                        // Form is known to carry text, so skipping it is
+                        // recorded and disclosed on the `text` column (see
+                        // `PdfTextStats`), never silent. The failed Form's
+                        // own partial text and counts are rolled back so
+                        // only the skip itself counts.
                         let before = (
                             self.text_stats.unmapped_codes,
                             self.text_stats.skipped_forms,
+                            layout.mark(),
                         );
-                        let nested = match self.render_content_text(
+                        if let Err(e) = self.render_content_text(
                             &xdata,
                             &xres,
                             xscope,
+                            mat_mul(&matrix, &ctm),
                             page_no,
                             font_cache,
                             xobject_counter,
+                            layout,
                             depth + 1,
                             path,
                         ) {
-                            Ok(nested) => nested,
-                            Err(e) => {
-                                (
-                                    self.text_stats.unmapped_codes,
-                                    self.text_stats.skipped_forms,
-                                ) = before;
-                                self.text_stats.skipped_forms += 1;
-                                if self.text_stats.first_skip_reason.is_none() {
-                                    self.text_stats.first_skip_reason = Some(format!(
-                                        "Form /{} on page {page_no}: {}",
-                                        String::from_utf8_lossy(&name),
-                                        without_path_prefix(root_cause(&e), path)
-                                    ));
-                                }
-                                continue;
+                            let (codes, skipped, mark) = before;
+                            self.text_stats.unmapped_codes = codes;
+                            self.text_stats.skipped_forms = skipped + 1;
+                            layout.roll_back(mark);
+                            if self.text_stats.first_skip_reason.is_none() {
+                                self.text_stats.first_skip_reason = Some(format!(
+                                    "Form /{} on page {page_no}: {}",
+                                    String::from_utf8_lossy(&name),
+                                    without_path_prefix(root_cause(&e), path)
+                                ));
                             }
-                        };
-                        if !nested.is_empty() {
-                            if !out.is_empty() && !ends_ws(&out) {
-                                out.push(' ');
-                            }
-                            out.push_str(&nested);
                         }
                     }
                 }
             }
-            Ok(out.trim().to_string())
+            Ok(())
         }
     }
 
@@ -59480,19 +60069,103 @@ mod pdf_support {
         }
     }
 
-    /// One text-showing event from a content stream, in order. `Show.glue`
-    /// marks a `TJ`-array continuation (`[(Hel) 120 (lo)]` must join as
-    /// `Hello`, not `Hel lo`); every other show starts a new unit that
-    /// gets a separating space at join time unless the output already
-    /// ends in whitespace.
+    /// A PDF transformation matrix `[a b c d e f]` (ISO 32000-1 8.3.3):
+    /// a point `(x, y)` maps to `(a*x + c*y + e, b*x + d*y + f)`.
+    type Matrix = [f64; 6];
+
+    const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+    /// `m1 × m2`: apply `m1`, then `m2` - the order the spec writes every
+    /// concatenation in (`cm` is `M × CTM`, `Td` is `T × Tlm`).
+    fn mat_mul(m1: &Matrix, m2: &Matrix) -> Matrix {
+        [
+            m1[0] * m2[0] + m1[1] * m2[2],
+            m1[0] * m2[1] + m1[1] * m2[3],
+            m1[2] * m2[0] + m1[3] * m2[2],
+            m1[2] * m2[1] + m1[3] * m2[3],
+            m1[4] * m2[0] + m1[5] * m2[2] + m2[4],
+            m1[4] * m2[1] + m1[5] * m2[3] + m2[5],
+        ]
+    }
+
+    fn translate(tx: f64, ty: f64) -> Matrix {
+        [1.0, 0.0, 0.0, 1.0, tx, ty]
+    }
+
+    /// Six numeric operands as a matrix (`cm`, `Tm`, a Form's `/Matrix`);
+    /// `None` for anything else, so a malformed matrix is ignored rather
+    /// than guessed at.
+    fn matrix_from(items: &[PdfObj]) -> Option<Matrix> {
+        let [a, b, c, d, e, f] = items else {
+            return None;
+        };
+        let m = [
+            a.as_num()?,
+            b.as_num()?,
+            c.as_num()?,
+            d.as_num()?,
+            e.as_num()?,
+            f.as_num()?,
+        ];
+        m.iter().all(|v| v.is_finite()).then_some(m)
+    }
+
+    /// The text state parameters that move glyphs (ISO 32000-1 9.3): font
+    /// size (`Tf`), character spacing (`Tc`), word spacing (`Tw`),
+    /// horizontal scaling (`Tz`, as a fraction), leading (`TL`), and rise
+    /// (`Ts`). Part of the graphics state, so `q`/`Q` save and restore it
+    /// along with the font.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct TextState {
+        size: f64,
+        char_spacing: f64,
+        word_spacing: f64,
+        h_scale: f64,
+        leading: f64,
+        rise: f64,
+    }
+
+    impl Default for TextState {
+        fn default() -> Self {
+            TextState {
+                size: 1.0,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                h_scale: 1.0,
+                leading: 0.0,
+                rise: 0.0,
+            }
+        }
+    }
+
+    /// One event from a content stream that matters to text, in order:
+    /// what's shown, and everything that moves where it's shown. Where
+    /// words and lines break is decided later, from positions
+    /// (`TextLayout`), not from which operator happened to show a string.
     enum CSpan {
+        /// A string shown by `Tj`, `TJ`, `'`, or `"`, with the font and
+        /// text state current when it was shown.
         Show {
             font: Vec<u8>,
             bytes: Vec<u8>,
-            glue: bool,
+            state: TextState,
         },
-        Space,
-        NewLine,
+        /// A `TJ` number, already a horizontal move in unscaled text space
+        /// (`-n / 1000 * size * h_scale`, ISO 32000-1 9.4.3).
+        Adjust(f64),
+        /// `BT`: the text and line matrices reset to identity.
+        BeginText,
+        /// `Tm`: both matrices set.
+        SetMatrix(Matrix),
+        /// `Td`, `TD`, `T*`, `'`, `"`: the line matrix moves by
+        /// `(tx, ty)` and the text matrix restarts there.
+        MoveLine(f64, f64),
+        /// `cm`: concatenated onto the current transformation matrix.
+        Concat(Matrix),
+        /// `q` / `Q`, for the transformation matrix (the font and text
+        /// state are saved and restored here, in `content_spans`).
+        Save,
+        Restore,
         /// A `/Name Do` invocation - resolved against `/Resources
         /// /XObject` by the caller (`render_content_text`), since this
         /// pure syntactic walker has no access to a page's own resources
@@ -59500,9 +60173,228 @@ mod pdf_support {
         XObjectRef(Vec<u8>),
     }
 
-    /// Walks a page content stream's operators, returning text-showing
-    /// events in order. Operands ride a small stack (`12 /F1 Tf`,
-    /// `(Hello) Tj`); every operator clears it, so memory stays bounded
+    /// How deep `q` nests before saving stops: past this, graphics state
+    /// is no longer saved rather than growing without bound (a later `Q`
+    /// then restores the deepest state kept).
+    const MAX_GSTATE_DEPTH: usize = 1024;
+
+    /// How far past the ink of one glyph the next must start, on the same
+    /// line and in a different string, to begin a new word with no space
+    /// glyph between them: this fraction of the font size. Kerning and `TJ`
+    /// letter adjustments stay under it (TeX's kerns reach about 0.08 em),
+    /// and interword gaps clear it (a justified TeX space shrinks to about
+    /// 0.22 em, a `TJ` word gap is usually 0.25-0.33 em). Calibrated
+    /// against PDFium's word boundaries on the real corpus (see the
+    /// CLAUDE.md entry for this pass); pdf.js uses 0.102.
+    const WORD_GAP: f64 = 0.13;
+
+    /// A gap at most this fraction of the font size is no gap at all,
+    /// even with a space glyph in it: the space is drawn over the letters
+    /// around it (PowerPoint's SmartArt, for one, shows tiny spaces from
+    /// another font on top of a word). pdf.js's `NOT_A_SPACE_FACTOR`.
+    const NOT_A_SPACE: f64 = 0.03;
+
+    /// Where the last visible glyph was drawn, in device space - enough to
+    /// tell what separates it from the next one (`measure_gap`).
+    #[derive(Clone, Copy, Debug)]
+    struct LastGlyph {
+        /// Where its ink ends: its origin plus its advance, without the
+        /// character or word spacing after it (that moves the next glyph,
+        /// not this one).
+        end: (f64, f64),
+        /// The unit vector its text advanced along.
+        dir: (f64, f64),
+        /// Its font size, the unit every gap is measured in.
+        em: f64,
+    }
+
+    /// What goes between two glyphs in the extracted text, weakest first.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+    enum Gap {
+        #[default]
+        None,
+        Space,
+        NewLine,
+    }
+
+    /// How far apart two glyphs are drawn, classified: a different line; a
+    /// gap too wide for kerning (or a jump back of more than half the font
+    /// size); a narrow gap that's a word break only if a space glyph fills
+    /// it; or glyphs that touch or overlap.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Measured {
+        NewLine,
+        Wide,
+        Narrow,
+        Touching,
+    }
+
+    /// Measures the gap between the last visible glyph and one starting at
+    /// `start` (advancing along `dir`, in a font of size `em`), by where
+    /// each is drawn rather than which operator drew it - the way a reader
+    /// sees the page, and what PDFium and pdf.js do. A different direction,
+    /// or a baseline more than half the larger font size away, is a new
+    /// line; along the line, the gap is measured from the last glyph's ink.
+    fn measure_gap(last: &LastGlyph, start: (f64, f64), dir: (f64, f64), em: f64) -> Measured {
+        let em = last.em.max(em);
+        if !(em.is_finite() && em > 1e-9) {
+            // A zero-size font gives no scale to measure by.
+            return Measured::Wide;
+        }
+        if last.dir.0 * dir.0 + last.dir.1 * dir.1 < 0.99 {
+            return Measured::NewLine;
+        }
+        let (dx, dy) = (start.0 - last.end.0, start.1 - last.end.1);
+        let along = (dx * last.dir.0 + dy * last.dir.1) / em;
+        let across = (dy * last.dir.0 - dx * last.dir.1) / em;
+        if across.abs() > 0.5 {
+            Measured::NewLine
+        } else if along > WORD_GAP || along < -0.5 {
+            Measured::Wide
+        } else if along > NOT_A_SPACE {
+            Measured::Narrow
+        } else {
+            Measured::Touching
+        }
+    }
+
+    /// A page's extracted text, built glyph by glyph in content-stream
+    /// order. Space glyphs are held back rather than written: whether a
+    /// word break goes between two visible glyphs is decided when the
+    /// second arrives, from where both are drawn and which space glyphs
+    /// were shown between them. A space glyph shown in the same string as
+    /// either neighbour is the producer's own word separator and always
+    /// counts - OCR text layers draw each word to its scanned box, so a
+    /// word can end past the start of the next, and only its trailing
+    /// space says where one word stops. Otherwise the geometry decides, the
+    /// way pdf.js does: a wide gap is a word break, a narrow one only with
+    /// a space glyph (shown in a string of its own) in it, and glyphs that
+    /// touch are one word even across such a space - PowerPoint's SmartArt
+    /// draws tiny spaces from another font on top of its words. Within one
+    /// string, only a space glyph breaks a word, so letter-spaced text (a
+    /// large `Tc`) is never split into letters. A word break is one
+    /// character however many space glyphs made it, as in PDFium and
+    /// pdf.js. One layout serves a page and every Form XObject it invokes,
+    /// so a Form's text joins the page's by position too.
+    #[derive(Default)]
+    struct TextLayout {
+        out: String,
+        /// The last visible (non-whitespace) glyph.
+        last: Option<LastGlyph>,
+        /// The first space glyph shown since `last`: a word break that
+        /// follows is written as it (a no-break space or a tab stays one),
+        /// or as U+0020 when no space glyph was shown.
+        space: Option<char>,
+        /// Whether a space glyph since `last` was shown in `last`'s own
+        /// string.
+        space_after_last: bool,
+        /// Whether a space glyph was shown in the current string before
+        /// any visible glyph of it.
+        space_in_string: bool,
+        /// Whether the current string has shown a visible glyph, i.e. the
+        /// next one continues `last`'s string.
+        in_string: bool,
+    }
+
+    /// Everything in a `TextLayout` but its text, plus the text's length:
+    /// what a Form XObject that fails partway rolls back to.
+    #[derive(Clone, Copy)]
+    struct LayoutMark {
+        len: usize,
+        last: Option<LastGlyph>,
+        space: Option<char>,
+        space_after_last: bool,
+        space_in_string: bool,
+        in_string: bool,
+    }
+
+    impl TextLayout {
+        fn mark(&self) -> LayoutMark {
+            LayoutMark {
+                len: self.out.len(),
+                last: self.last,
+                space: self.space,
+                space_after_last: self.space_after_last,
+                space_in_string: self.space_in_string,
+                in_string: self.in_string,
+            }
+        }
+
+        fn roll_back(&mut self, mark: LayoutMark) {
+            self.out.truncate(mark.len);
+            self.last = mark.last;
+            self.space = mark.space;
+            self.space_after_last = mark.space_after_last;
+            self.space_in_string = mark.space_in_string;
+            self.in_string = mark.in_string;
+        }
+
+        /// Marks the start of a new shown string (a `Tj`, `'`, `"`, or one
+        /// string of a `TJ` array).
+        fn begin_string(&mut self) {
+            self.in_string = false;
+            self.space_in_string = false;
+        }
+
+        /// Adds one glyph: its `text`, where it `start`s, and where its ink
+        /// ends (`glyph`). A code that decodes to nothing adds nothing.
+        fn push(&mut self, text: &str, start: (f64, f64), glyph: LastGlyph) {
+            if text.is_empty() {
+                return;
+            }
+            if text.chars().all(char::is_whitespace) {
+                self.space = self.space.or(text.chars().next());
+                if self.in_string {
+                    self.space_after_last = true;
+                } else {
+                    self.space_in_string = true;
+                }
+                return;
+            }
+            let spaced = self.space.is_some();
+            let attached = self.space_after_last || self.space_in_string;
+            let gap = match self.last.as_ref() {
+                None => Gap::None,
+                Some(last) => match measure_gap(last, start, glyph.dir, glyph.em) {
+                    Measured::NewLine => Gap::NewLine,
+                    _ if attached => Gap::Space,
+                    _ if self.in_string => Gap::None,
+                    Measured::Wide => Gap::Space,
+                    Measured::Narrow if spaced => Gap::Space,
+                    Measured::Narrow | Measured::Touching => Gap::None,
+                },
+            };
+            match gap {
+                Gap::NewLine => {
+                    let kept = self
+                        .out
+                        .trim_end_matches(|c: char| c != '\n' && c.is_whitespace())
+                        .len();
+                    self.out.truncate(kept);
+                    if !self.out.is_empty() && !self.out.ends_with('\n') {
+                        self.out.push('\n');
+                    }
+                }
+                Gap::Space => {
+                    if !self.out.is_empty() && !self.out.ends_with('\n') {
+                        self.out.push(self.space.unwrap_or(' '));
+                    }
+                }
+                Gap::None => {}
+            }
+            push_expanding_ligatures(&mut self.out, text);
+            self.last = Some(glyph);
+            self.space = None;
+            self.space_after_last = false;
+            self.space_in_string = false;
+            self.in_string = true;
+        }
+    }
+
+    /// Walks a page content stream's operators, returning the events that
+    /// matter to text, in order (see `CSpan`). Operands ride a small stack
+    /// (`12 /F1 Tf`, `(Hello) Tj`); every operator clears it, so memory
+    /// stays bounded
     /// no matter how long the stream is. Only text-relevant operators are
     /// interpreted - the hundreds of graphics/marked-content operators are
     /// ignored, not errors, since the operator vocabulary is genuinely
@@ -59514,15 +60406,16 @@ mod pdf_support {
         let mut lex = PdfLexer::new(data);
         let mut stack: Vec<PdfObj> = Vec::new();
         let mut cur_font: Vec<u8> = Vec::new();
-        // The text font is part of the graphics state (ISO 32000-1 8.4,
-        // 9.3): `q` saves it, `Q` restores it. Without this, a font picked
-        // inside `q ... Q` (a checkbox glyph's dingbat font, say) leaked
-        // into every show after the `Q` and decoded that text in the wrong
-        // font. An unbalanced `Q` is ignored; nesting past
-        // `MAX_GSTATE_DEPTH` stops saving rather than growing without
-        // bound (a later `Q` then restores the deepest state kept).
-        const MAX_GSTATE_DEPTH: usize = 1024;
-        let mut saved_fonts: Vec<Vec<u8>> = Vec::new();
+        let mut state = TextState::default();
+        // The text font and text state are part of the graphics state
+        // (ISO 32000-1 8.4, 9.3): `q` saves them, `Q` restores them.
+        // Without this, a font picked inside `q ... Q` (a checkbox glyph's
+        // dingbat font, say) leaked into every show after the `Q` and
+        // decoded that text in the wrong font. An unbalanced `Q` is
+        // ignored, and saving stops at `MAX_GSTATE_DEPTH`. `Save`/`Restore`
+        // still reach the caller, which keeps the transformation matrix on
+        // the same terms.
+        let mut saved: Vec<(Vec<u8>, TextState)> = Vec::new();
         let mut spans: Vec<CSpan> = Vec::new();
         // Pops a string operand; anything else (or nothing) drops the
         // span, not the page - one malformed text operand is not worth a
@@ -59533,6 +60426,16 @@ mod pdf_support {
                 _ => None,
             }
         }
+        // The last `n` operands as numbers (`None` if there aren't `n`, or
+        // one isn't a number), in the order they were written.
+        fn nums<const N: usize>(stack: &[PdfObj]) -> Option<[f64; N]> {
+            let tail = stack.get(stack.len().checked_sub(N)?..)?;
+            let mut out = [0.0; N];
+            for (slot, obj) in out.iter_mut().zip(tail) {
+                *slot = obj.as_num().filter(|v| v.is_finite())?;
+            }
+            Some(out)
+        }
         loop {
             lex.skip_ws();
             if lex.exhausted() {
@@ -59541,18 +60444,20 @@ mod pdf_support {
             let b = lex.data[lex.pos];
             if b == b'\'' || b == b'"' {
                 lex.pos += 1;
-                // `'` shows with a line move; `"` additionally takes two
-                // ignored spacing operands (word space, char space).
-                if b == b'"' {
-                    stack.pop();
-                    stack.pop();
-                }
+                // `string '` moves to the next line and shows; `aw ac
+                // string "` also sets word and character spacing first.
                 if let Some(s) = pop_str(&mut stack) {
-                    spans.push(CSpan::NewLine);
+                    if b == b'"'
+                        && let Some([aw, ac]) = nums::<2>(&stack)
+                    {
+                        state.word_spacing = aw;
+                        state.char_spacing = ac;
+                    }
+                    spans.push(CSpan::MoveLine(0.0, -state.leading));
                     spans.push(CSpan::Show {
                         font: cur_font.clone(),
                         bytes: s,
-                        glue: false,
+                        state,
                     });
                 }
                 stack.clear();
@@ -59570,34 +60475,46 @@ mod pdf_support {
                 let word = lex.data[lex.pos..e].to_vec();
                 lex.pos = e;
                 match word.as_slice() {
-                    b"true" => stack.push(PdfObj::Bool(true)),
-                    b"false" => stack.push(PdfObj::Bool(false)),
-                    b"null" => stack.push(PdfObj::Null),
+                    b"true" => {
+                        stack.push(PdfObj::Bool(true));
+                        continue;
+                    }
+                    b"false" => {
+                        stack.push(PdfObj::Bool(false));
+                        continue;
+                    }
+                    b"null" => {
+                        stack.push(PdfObj::Null);
+                        continue;
+                    }
                     b"Tj" => {
                         if let Some(s) = pop_str(&mut stack) {
                             spans.push(CSpan::Show {
                                 font: cur_font.clone(),
                                 bytes: s,
-                                glue: false,
+                                state,
                             });
                         }
-                        stack.clear();
                     }
                     b"TJ" => {
                         if let Some(PdfObj::Array(items)) = stack.pop() {
-                            let mut first = true;
                             for item in items {
-                                if let PdfObj::Str(s) = item {
-                                    spans.push(CSpan::Show {
+                                match item {
+                                    PdfObj::Str(s) => spans.push(CSpan::Show {
                                         font: cur_font.clone(),
                                         bytes: s,
-                                        glue: !first,
-                                    });
-                                    first = false;
+                                        state,
+                                    }),
+                                    other => {
+                                        if let Some(n) = other.as_num().filter(|n| n.is_finite()) {
+                                            spans.push(CSpan::Adjust(
+                                                -n / 1000.0 * state.size * state.h_scale,
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
-                        stack.clear();
                     }
                     b"Tf" => {
                         // Operands read `font size Tf`: the size sits on
@@ -59605,32 +60522,75 @@ mod pdf_support {
                         // (an earlier draft had these backwards and no
                         // font was ever selected - caught by the first
                         // real file, whose every page then failed).
-                        if let (Some(_size), Some(name)) = (stack.pop(), stack.pop())
-                            && let PdfObj::Name(n) = name
-                        {
+                        if let (Some(size), Some(PdfObj::Name(n))) = (stack.pop(), stack.pop()) {
                             cur_font = n;
+                            if let Some(size) = size.as_num().filter(|s| s.is_finite()) {
+                                state.size = size;
+                            }
                         }
-                        stack.clear();
+                    }
+                    b"Tc" => {
+                        if let Some([v]) = nums::<1>(&stack) {
+                            state.char_spacing = v;
+                        }
+                    }
+                    b"Tw" => {
+                        if let Some([v]) = nums::<1>(&stack) {
+                            state.word_spacing = v;
+                        }
+                    }
+                    b"Tz" => {
+                        if let Some([v]) = nums::<1>(&stack) {
+                            state.h_scale = v / 100.0;
+                        }
+                    }
+                    b"TL" => {
+                        if let Some([v]) = nums::<1>(&stack) {
+                            state.leading = v;
+                        }
+                    }
+                    b"Ts" => {
+                        if let Some([v]) = nums::<1>(&stack) {
+                            state.rise = v;
+                        }
                     }
                     b"q" => {
-                        if saved_fonts.len() < MAX_GSTATE_DEPTH {
-                            saved_fonts.push(cur_font.clone());
+                        if saved.len() < MAX_GSTATE_DEPTH {
+                            saved.push((cur_font.clone(), state));
                         }
-                        stack.clear();
+                        spans.push(CSpan::Save);
                     }
                     b"Q" => {
-                        if let Some(font) = saved_fonts.pop() {
+                        if let Some((font, st)) = saved.pop() {
                             cur_font = font;
+                            state = st;
                         }
-                        stack.clear();
+                        spans.push(CSpan::Restore);
                     }
-                    b"Td" | b"TD" | b"Tm" => {
-                        spans.push(CSpan::Space);
-                        stack.clear();
+                    b"BT" => spans.push(CSpan::BeginText),
+                    b"Td" => {
+                        if let Some([tx, ty]) = nums::<2>(&stack) {
+                            spans.push(CSpan::MoveLine(tx, ty));
+                        }
                     }
-                    b"T*" | b"ET" => {
-                        spans.push(CSpan::NewLine);
-                        stack.clear();
+                    b"TD" => {
+                        if let Some([tx, ty]) = nums::<2>(&stack) {
+                            state.leading = -ty;
+                            spans.push(CSpan::MoveLine(tx, ty));
+                        }
+                    }
+                    b"T*" => spans.push(CSpan::MoveLine(0.0, -state.leading)),
+                    b"Tm" => {
+                        let tail = &stack[stack.len().saturating_sub(6)..];
+                        if let Some(m) = matrix_from(tail) {
+                            spans.push(CSpan::SetMatrix(m));
+                        }
+                    }
+                    b"cm" => {
+                        let tail = &stack[stack.len().saturating_sub(6)..];
+                        if let Some(m) = matrix_from(tail) {
+                            spans.push(CSpan::Concat(m));
+                        }
                     }
                     b"BI" => {
                         // Inline image: `BI <params> ID <raw bytes> EI`.
@@ -59701,12 +60661,11 @@ mod pdf_support {
                         if let Some(PdfObj::Name(n)) = stack.pop() {
                             spans.push(CSpan::XObjectRef(n));
                         }
-                        stack.clear();
                     }
-                    _ => {
-                        stack.clear();
-                    }
+                    _ => {}
                 }
+                // Every operator consumes its operands, used or not.
+                stack.clear();
                 continue;
             }
             match lex.parse_object(0) {
@@ -59750,6 +60709,7 @@ mod pdf_support {
                     t
                 },
                 width: CodeWidth::One,
+                advances: Advances::Simple(Box::new([0.5; 256])),
             };
             let mut out = Vec::new();
             for span in content_spans(data).expect("test content must parse") {
@@ -59793,6 +60753,7 @@ mod pdf_support {
                     .collect(),
                 table: std::array::from_fn(|i| winansi_decode(i as u8).to_string()),
                 width,
+                advances: Advances::Simple(Box::new([0.5; 256])),
             }
         }
 
@@ -59890,13 +60851,245 @@ mod pdf_support {
                 .iter()
                 .map(|s| match s {
                     CSpan::Show { .. } => "show",
-                    CSpan::Space => "space",
-                    CSpan::NewLine => "newline",
+                    CSpan::BeginText => "bt",
                     CSpan::XObjectRef(_) => "xobject",
+                    _ => "other",
                 })
                 .collect();
-            assert_eq!(kinds, vec!["show", "newline", "xobject", "show", "newline"]);
+            assert_eq!(kinds, vec!["bt", "show", "xobject", "bt", "show"]);
             assert!(matches!(&spans[2], CSpan::XObjectRef(n) if n == b"Fm0"));
+        }
+
+        #[test]
+        fn quote_operators_start_a_new_line_and_double_quote_sets_the_spacing() {
+            // `string '` is `T* string Tj`; `aw ac string "` also sets word
+            // and character spacing first (the old walker never showed the
+            // string of a `"` at all).
+            let spans = content_spans(b"BT 12 TL (a) ' 2 0.5 (b) \" ET").unwrap();
+            let shows: Vec<(String, f64, f64)> = spans
+                .iter()
+                .filter_map(|s| match s {
+                    CSpan::Show { bytes, state, .. } => Some((
+                        String::from_utf8_lossy(bytes).into_owned(),
+                        state.word_spacing,
+                        state.char_spacing,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shows, vec![("a".into(), 0.0, 0.0), ("b".into(), 2.0, 0.5)]);
+            let moves: Vec<(f64, f64)> = spans
+                .iter()
+                .filter_map(|s| match s {
+                    CSpan::MoveLine(x, y) => Some((*x, *y)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(moves, vec![(0.0, -12.0), (0.0, -12.0)]);
+        }
+
+        #[test]
+        fn tj_numbers_become_moves_scaled_by_font_size_and_horizontal_scaling() {
+            // -n / 1000 * size * h_scale: -(-250)/1000 * 10 * 0.5 and
+            // -(120)/1000 * 10 * 0.5.
+            let spans = content_spans(b"BT /F1 10 Tf 50 Tz [(a) -250 (b) 120] TJ ET").unwrap();
+            let moves: Vec<f64> = spans
+                .iter()
+                .filter_map(|s| match s {
+                    CSpan::Adjust(a) => Some(*a),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(moves, vec![1.25, -0.6]);
+        }
+
+        #[test]
+        fn layout_glyphs_places_each_glyph_and_sums_the_advance() {
+            // Every glyph 0.5 em; size 10, Tc 1, Tw 2, Tz 50: ink 2.5 each,
+            // then the spacing after it (Tw only after the space).
+            let font = font_with(&[], CodeWidth::One);
+            let state = TextState {
+                size: 10.0,
+                char_spacing: 1.0,
+                word_spacing: 2.0,
+                h_scale: 0.5,
+                ..TextState::default()
+            };
+            let mut seen = Vec::new();
+            let (advance, unmapped) = font.layout_glyphs(b"a b", &state, |text, pen, ink| {
+                seen.push((text.to_string(), pen, ink));
+            });
+            assert_eq!(
+                seen,
+                vec![
+                    ("a".to_string(), 0.0, 2.5),
+                    (" ".to_string(), 3.0, 2.5),
+                    ("b".to_string(), 7.0, 2.5),
+                ]
+            );
+            assert_eq!((advance, unmapped), (10.0, 0));
+        }
+
+        #[test]
+        fn core14_and_cid_widths_resolve_per_code() {
+            // Adobe's Helvetica AFM: `A` is 667 units, quotesingle 191.
+            let at = |c: char| CORE14_LATIN_CHARS.binary_search(&c).unwrap();
+            assert_eq!(HELVETICA_WIDTHS[at('A')], 667);
+            assert_eq!(HELVETICA_WIDTHS[at('\'')], 191);
+            assert!(CORE14_LATIN_CHARS.windows(2).all(|w| w[0] < w[1]));
+            let cid = Advances::Cid {
+                default: 1.0,
+                segments: vec![(3, 3, 0.25), (10, 20, 0.5)],
+            };
+            assert_eq!(cid.width(b"\x00\x03", CodeWidth::Two), 0.25);
+            assert_eq!(cid.width(b"\x00\x0f", CodeWidth::Two), 0.5);
+            assert_eq!(cid.width(b"\x00\x15", CodeWidth::Two), 1.0);
+            assert_eq!(cid.width(b"\x00\x04", CodeWidth::Two), 1.0);
+            // Only an Identity CMap says which CID a code is.
+            assert_eq!(cid.width(b"\x03", CodeWidth::Variable), 1.0);
+        }
+
+        fn ends_at(x: f64, y: f64, em: f64) -> LastGlyph {
+            LastGlyph {
+                end: (x, y),
+                dir: (1.0, 0.0),
+                em,
+            }
+        }
+
+        #[test]
+        fn measure_gap_classifies_by_where_glyphs_are_drawn() {
+            let last = ends_at(100.0, 700.0, 10.0);
+            let across = (1.0, 0.0);
+            let m = |x: f64, y: f64| measure_gap(&last, (x, y), across, 10.0);
+            assert_eq!(m(100.0, 700.0), Measured::Touching);
+            assert_eq!(m(100.2, 700.0), Measured::Touching); // 0.02 em
+            assert_eq!(m(97.0, 700.0), Measured::Touching); // overlapping by 0.3 em
+            assert_eq!(m(101.0, 700.0), Measured::Narrow); // 0.1 em
+            assert_eq!(m(101.0, 704.0), Measured::Narrow); // raised 0.4 em: same line
+            assert_eq!(m(102.5, 700.0), Measured::Wide); // 0.25 em
+            assert_eq!(m(90.0, 700.0), Measured::Wide); // 1 em back
+            assert_eq!(m(50.0, 688.0), Measured::NewLine);
+            assert_eq!(
+                measure_gap(&last, (101.0, 700.0), (0.0, 1.0), 10.0),
+                Measured::NewLine
+            );
+            // Measured in the larger of the two font sizes.
+            let small = ends_at(100.0, 700.0, 5.0);
+            assert_eq!(
+                measure_gap(&small, (101.0, 700.0), across, 10.0),
+                Measured::Narrow
+            );
+            assert_eq!(
+                measure_gap(&small, (101.0, 700.0), across, 5.0),
+                Measured::Wide
+            );
+            // A zero-size font gives nothing to measure by.
+            let zero = ends_at(100.0, 700.0, 0.0);
+            assert_eq!(
+                measure_gap(&zero, (100.0, 700.0), across, 0.0),
+                Measured::Wide
+            );
+        }
+
+        /// Lays out strings of `(text, x, width)` glyphs on one baseline in
+        /// a 10-unit font.
+        fn lay_out(strings: &[&[(&str, f64, f64)]]) -> String {
+            let mut layout = TextLayout::default();
+            for glyphs in strings {
+                layout.begin_string();
+                for &(text, x, w) in *glyphs {
+                    layout.push(text, (x, 700.0), ends_at(x + w, 700.0, 10.0));
+                }
+            }
+            layout.out
+        }
+
+        #[test]
+        fn a_space_glyph_in_a_words_own_string_always_breaks_it() {
+            // An OCR layer: each word drawn to its scanned box with a
+            // trailing space, and the next word starting before it ends.
+            assert_eq!(
+                lay_out(&[
+                    &[("P", 0.0, 6.0), ("e", 6.0, 5.0), (" ", 11.0, 2.5)],
+                    &[("o", 10.0, 5.0), ("f", 15.0, 3.0)],
+                ]),
+                "Pe of"
+            );
+            // A leading space in the next word's string counts the same.
+            assert_eq!(
+                lay_out(&[&[("a", 0.0, 5.0)], &[(" ", 5.0, 2.5), ("b", 5.0, 5.0)]]),
+                "a b"
+            );
+        }
+
+        #[test]
+        fn a_space_glyph_alone_counts_only_where_the_glyphs_do_not_touch() {
+            // SmartArt: a tiny space shown on its own, over a word.
+            assert_eq!(
+                lay_out(&[&[("i", 0.0, 2.0)], &[(" ", 1.9, 0.8)], &[("n", 1.8, 5.0)]]),
+                "in"
+            );
+            // A narrow gap (0.1 em) is a word break with a space glyph in
+            // it, and kerning without one.
+            assert_eq!(
+                lay_out(&[&[("a", 0.0, 5.0)], &[(" ", 5.0, 0.5)], &[("b", 6.0, 5.0)]]),
+                "a b"
+            );
+            assert_eq!(lay_out(&[&[("a", 0.0, 5.0)], &[("b", 6.0, 5.0)]]), "ab");
+            // A wide gap needs no space glyph at all (TeX never shows one).
+            assert_eq!(lay_out(&[&[("a", 0.0, 5.0)], &[("b", 7.5, 5.0)]]), "a b");
+        }
+
+        #[test]
+        fn one_string_is_never_split_without_a_space_glyph() {
+            // Letter-spaced text (a large `Tc`): wide gaps, but one string.
+            assert_eq!(lay_out(&[&[("H", 0.0, 7.0), ("I", 10.0, 3.0)]]), "HI");
+            // A space glyph in it breaks it, however narrow.
+            assert_eq!(
+                lay_out(&[&[("a", 0.0, 5.0), (" ", 5.0, 0.5), ("b", 5.5, 5.0)]]),
+                "a b"
+            );
+        }
+
+        #[test]
+        fn a_run_of_space_glyphs_is_one_break_written_as_its_first() {
+            assert_eq!(
+                lay_out(&[&[
+                    ("a", 0.0, 5.0),
+                    (" ", 5.0, 2.5),
+                    (" ", 7.5, 2.5),
+                    (" ", 10.0, 2.5),
+                    ("b", 12.5, 5.0),
+                ]]),
+                "a b"
+            );
+            assert_eq!(
+                lay_out(&[&[("a", 0.0, 5.0), ("\u{a0}", 5.0, 2.5), ("b", 7.5, 5.0)]]),
+                "a\u{a0}b"
+            );
+            // Ligatures still expand to letters.
+            assert_eq!(
+                lay_out(&[&[("\u{FB01}", 0.0, 5.0), ("t", 5.0, 3.0)]]),
+                "fit"
+            );
+        }
+
+        #[test]
+        fn a_line_break_drops_the_spaces_around_it_and_roll_back_restores_a_mark() {
+            let mut layout = TextLayout::default();
+            layout.begin_string();
+            layout.push(" ", (0.0, 700.0), ends_at(2.5, 700.0, 10.0));
+            layout.push("a", (2.5, 700.0), ends_at(7.5, 700.0, 10.0));
+            layout.push(" ", (7.5, 700.0), ends_at(10.0, 700.0, 10.0));
+            let mark = layout.mark();
+            layout.begin_string();
+            layout.push("b", (0.0, 686.0), ends_at(5.0, 686.0, 10.0));
+            assert_eq!(layout.out, "a\nb");
+            layout.roll_back(mark);
+            layout.begin_string();
+            layout.push("c", (7.6, 700.0), ends_at(12.6, 700.0, 10.0));
+            assert_eq!(layout.out, "a c");
         }
 
         #[test]

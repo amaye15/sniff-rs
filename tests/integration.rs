@@ -13725,8 +13725,9 @@ fn pdf_standard_symbol_and_zapfdingbats_fonts_use_their_built_in_encodings() {
     // the AcroForm checkbox shape (code `4` is a check mark too).
     for (name, expected) in [
         (
+            // The two strings are drawn back to back, so they join.
             "edge_pdf_standard_symbol_font",
-            "\u{03B1}\u{03B2}\u{03B3}\u{03C0} \u{2192}\u{239B}",
+            "\u{03B1}\u{03B2}\u{03B3}\u{03C0}\u{2192}\u{239B}",
         ),
         (
             "edge_pdf_standard_zapfdingbats_font",
@@ -13977,11 +13978,47 @@ fn pdf_salvages_page_text_from_a_flate_stream_truncated_partway_through() {
     // interrupted download or write leaves behind. The three already-
     // complete text-showing operations before the cut are real, valid
     // text and must survive; only the incomplete fourth line is lost.
+    // Each `0 -14 Td` starts a new line, and the text says so.
     let doc = run_json("edge_pdf_truncated_flate_salvage.pdf", &[]);
     assert_eq!(
         column(table(&doc, "edge_pdf_truncated_flate_salvage"), "text")["sample_values"],
         serde_json::json!([
-            "First recoverable line of real text. Second recoverable line of real text. Third recoverable line of real text."
+            "First recoverable line of real text.\nSecond recoverable line of real text.\nThird recoverable line of real text."
+        ])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_word_and_line_breaks_come_from_where_glyphs_are_drawn() {
+    // One page per case, each checked against PDFium's own text (which
+    // agrees on all eight). The font is an unembedded Helvetica with no
+    // `/Widths`, so every position also depends on its Core 14 metrics.
+    // The build before this change got seven of the eight wrong.
+    let doc = run_json("edge_pdf_glyph_positions.pdf", &["--samples", "20"]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_glyph_positions"), "text")["sample_values"],
+        serde_json::json!([
+            // `TJ`: a -250 gap is a word break, an 80 kern is not; `Td`
+            // down is a new line.
+            "Hello world\nWord",
+            // Every glyph placed by its own `Td`, one space width apart
+            // between the words.
+            "to go",
+            // PowerPoint's negative `Tc` won back by `TJ` gaps: measured
+            // from each glyph's ink, not from where the next would go.
+            "salaries rise",
+            // A Form XObject's `/Matrix` puts its text on the page's line.
+            "Before inside\nafter",
+            // A tiny space glyph drawn over a word doesn't split it...
+            "Graphing",
+            // ...but a word's own trailing space always ends it (OCR
+            // layers draw each word to its scanned box, overlapping).
+            "Place of",
+            // `aw ac string "` shows its string on the next line.
+            "first\nsecond",
+            // Letter spacing (`Tc`) never splits one string into letters.
+            "SPACED",
         ])
     );
 }
@@ -13998,9 +14035,11 @@ fn pdf_recurses_into_a_form_xobject_but_skips_an_unreadable_image_xobject() {
     // references a second XObject shaped like an Image using a codec
     // this reader doesn't implement (DCTDecode) - resolving it fails,
     // and that failure must never cost the rest of the page's real text.
+    // The three are drawn on three different lines (the Form at its own
+    // origin), so the text breaks between them.
     let doc = run_json("edge_pdf_form_xobject.pdf", &[]);
     assert_eq!(
         column(table(&doc, "edge_pdf_form_xobject"), "text")["sample_values"],
-        serde_json::json!(["Direct text before.\nText from inside the form. Direct text after."])
+        serde_json::json!(["Direct text before.\nText from inside the form.\nDirect text after."])
     );
 }

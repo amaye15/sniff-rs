@@ -1,0 +1,117 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R 10 0 R 12 0 R 14 0 R 16 0 R 18 0 R] /Count 8 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<<  /Length 95 >>
+stream
+BT /F1 10 Tf 20 150 Td [(Hello) -250 (world)] TJ ET BT /F1 10 Tf 20 130 Td [(W) 80 (ord)] TJ ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<<  /Length 83 >>
+stream
+BT /F1 10 Tf 20 150 Td (t) Tj 2.78 0 Td (o) Tj 8.34 0 Td (g) Tj 5.56 0 Td (o) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<<  /Length 95 >>
+stream
+BT /F1 1 Tf 10 0 0 10 20 150 Tm -0.15 Tc 0.15 Tw [(sal) -150 (ar) -150 (ies) -400 (rise)] TJ ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> /XObject << /Fm0 20 0 R >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<<  /Length 86 >>
+stream
+BT /F1 10 Tf 20 150 Td (Before) Tj ET q /Fm0 Do Q BT /F1 10 Tf 20 130 Td (after) Tj ET
+endstream
+endobj
+12 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 13 0 R >>
+endobj
+13 0 obj
+<<  /Length 107 >>
+stream
+BT /F1 10 Tf 20 150 Td (Graphi) Tj ET BT /F1 4 Tf 49.9 150 Td ( ) Tj ET BT /F1 10 Tf 49.8 150 Td (ng) Tj ET
+endstream
+endobj
+14 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 15 0 R >>
+endobj
+15 0 obj
+<<  /Length 74 >>
+stream
+BT /F1 10 Tf 20 150 Td (Place ) Tj ET BT /F1 10 Tf 44.5 150 Td (of ) Tj ET
+endstream
+endobj
+16 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 17 0 R >>
+endobj
+17 0 obj
+<<  /Length 57 >>
+stream
+BT /F1 10 Tf 12 TL 20 150 Td (first) Tj 0 0 (second) " ET
+endstream
+endobj
+18 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R >> >> /Contents 19 0 R >>
+endobj
+19 0 obj
+<<  /Length 42 >>
+stream
+BT /F1 10 Tf 3 Tc 20 150 Td (SPACED) Tj ET
+endstream
+endobj
+20 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0 1 60 150] /Resources << /Font << /F1 3 0 R >> >> /Length 34 >>
+stream
+BT /F1 10 Tf 0 0 Td (inside) Tj ET
+endstream
+endobj
+xref
+0 21
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000168 00000 n 
+0000000265 00000 n 
+0000000391 00000 n 
+0000000537 00000 n 
+0000000663 00000 n 
+0000000797 00000 n 
+0000000923 00000 n 
+0000001069 00000 n 
+0000001224 00000 n 
+0000001362 00000 n 
+0000001490 00000 n 
+0000001650 00000 n 
+0000001778 00000 n 
+0000001904 00000 n 
+0000002032 00000 n 
+0000002141 00000 n 
+0000002269 00000 n 
+0000002363 00000 n 
+trailer
+<< /Size 21 /Root 1 0 R >>
+startxref
+2561
+%%EOF

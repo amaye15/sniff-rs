@@ -102,7 +102,7 @@ full, honest numbers.
 | iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
 | MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
 | Jupyter notebooks (.ipynb) | `.ipynb` | `--features ipynb` | standard JSON with a fixed top-level shape (nbformat v4); the top-level `cells` array is the natural records array, one record per object in it; a cell's own `source` line-list pools into a `Vec<String>` column by the existing array convention |
-| PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode) - see the Dependency footprint section |
+| PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode), breaking words and lines where the glyphs are drawn - see the Dependency footprint section |
 | Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
 | Apache Iceberg | *(directory)* | `--features iceberg` | also detected from directory structure (a `metadata/` subdirectory with a real `*.metadata.json` file); resolves the current metadata.json's own snapshot to a manifest-list (Avro) naming manifest files (Avro) naming live Parquet data files, then profiles them the same "one merged table" way - see "Lakehouse table formats" below |
 
@@ -15972,6 +15972,87 @@ bullets - and nothing else moved. The old `edge_pdf_symbolic_no_encoding
 symbolic TrueType font that isn't one of the standard 14, still the
 disclosed U+FFFD case.
 
+**A follow-up pass made word and line breaks come from where glyphs are
+drawn, not from which operator drew them.** The content walker used to
+decide separators by operator: a `Td` became a space or a line break, a
+`TJ` number was ignored, a `"` operator's string was dropped outright,
+and a Form XObject's `/Matrix` never applied. Measured against PDFium's
+word boundaries (whitespace-split word multisets, per file) that cost a
+lot: only 218 of the 607 comparable corpus PDFs matched word for word.
+`TJ` word gaps glued words together (`[(Hello) -250 (world)]` read as
+one word), text placed glyph by glyph with `Td` fell apart into letters,
+and PowerPoint exports did both at once.
+
+`content_spans` now emits every event that moves text - `BT`, `Tm`,
+`Td`/`TD`/`T*`/`'`/`"`, `cm`, `q`/`Q`, `TJ` numbers (as `Adjust`, already
+`-n/1000 * size * Tz`) - with each shown string carrying its text state
+(`Tf` size, `Tc`, `Tw`, `Tz`, `TL`, `Ts`), and `render_content_text`
+replays them (ISO 32000-1 9.4.2-9.4.4): text and line matrices, a
+bounded `q`/`Q` stack for the CTM, and a Form's `/Matrix` concatenated
+onto the CTM it's invoked under (8.10.1). Glyph advances come from the
+font itself (`font_advances`): `/Widths` with `/FirstChar` and
+`/MissingWidth`, a Type0 font's `/W` and `/DW` (CID = code under
+Identity-H/V; any other CMap takes `/DW`), a Type3 font's `/FontMatrix`
+scale, and - for an unembedded standard font with no `/Widths` - Adobe's
+Core 14 AFM widths (the twelve Latin faces keyed by character, Courier a
+flat 600, Symbol and ZapfDingbats by code; tables generated from the AFM
+files as shipped with matplotlib). `PdfFont::layout_glyphs` walks a
+string code by code, reporting each glyph's offset along the baseline
+and its ink (advance times size times `Tz`, without the `Tc`/`Tw` after
+it), and `TextLayout` builds the page text glyph by glyph.
+
+Two decisions carried the result, each found by tracing real files
+rather than reasoned out. **Gaps are measured from the last glyph's ink,
+not from where the next glyph would go:** PowerPoint writes a negative
+`Tc` (-0.15 em on one lecture deck) and wins it back with `TJ` gaps, so
+the pen after a word's last letter sits well before the letter's own
+edge; measured from the pen, every letter gap looked like 0.17 em and
+words split mid-letter, measured from the ink the same gaps are 0.02 em
+(pdf.js measures from the same point). **Space glyphs are evidence, not
+text:** they're held back, and whether a break goes between two visible
+glyphs is decided when the second arrives. A space glyph in the same
+string as either neighbour is the producer's own separator and always
+counts - OCR text layers draw each word to its scanned box, so a word
+can start before the last one's ink ends, and its trailing space is the
+only thing saying where one word stopped. Otherwise the geometry
+decides, pdf.js's rule: along the line a gap over `WORD_GAP` (0.13 em)
+or a jump back over half an em is a break, a narrow gap
+(`NOT_A_SPACE` = 0.03 em up to `WORD_GAP`) is a break only if a space
+glyph (shown in a string of its own) fills it, and touching glyphs are
+one word even across such a space - PowerPoint's SmartArt draws tiny
+spaces from another font on top of its words. Within one string only a
+space glyph breaks a word, so letter-spaced text (a large `Tc`) is never
+split into letters. A baseline more than half the larger font size away,
+or a change of direction, is a new line. A run of space glyphs becomes
+one character - its first, so a no-break space or tab survives - as in
+PDFium and pdf.js; runs of spaces typed inside one string used to come
+through verbatim and no longer do.
+
+The thresholds were calibrated, not picked: `WORD_GAP` swept from 0.08
+to 0.18 em against PDFium's words on a 120-file seeded sample, scored by
+word F1, with 0.12-0.13 best and 0.13 best once the one TeX textbook
+that dominates word-weighted totals is included; `NOT_A_SPACE` at 0.0,
+0.03 (pdf.js's value), and 0.05 scored the same except that 0.0 splits
+SmartArt words drawn with spaces a hair apart. Whole-corpus result
+against PDFium: files matching word for word went from 218 to 446 of
+607, mean per-file word overlap from 0.832 to 0.983, and word F1 over
+all words from 0.648 to 0.955. The text itself didn't change: across
+all 661 corpus PDFs the multiset of non-whitespace characters is
+identical to the committed build's for every file, with 0 new failures.
+Where this reader and PDFium still disagree on a break, the cases looked
+at favour the geometry - a ligature followed by a space glyph kerned
+back under it, which PDFium reads as a break inside a word; a slide's
+genuinely touching words, which both read as one; math, where neither
+has a right answer. `edge_pdf_glyph_positions.pdf` (eight pages, one
+case each, every one matching PDFium's text; the committed build got
+seven wrong) and unit tests on `measure_gap`, `TextLayout`, the `'`/`"`
+operators, `TJ` scaling, `layout_glyphs`, and the width tables lock it
+in; three older integration tests changed expectation where their
+fixtures really do draw lines on different baselines, or two strings
+back to back. Disclosed boundaries: vertical writing (`Identity-V`
+advancing down the page) is laid out as horizontal, and right-to-left
+text keeps content-stream order.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -16321,8 +16402,10 @@ established baselines exactly.
   `flate_decode`/`content_spans` writeup above for the fix. A file with
   *nothing* recoverable before the cut (the truncation lands before even
   the first symbol decodes) still refuses cleanly, the same as before.
-  See the Dependency footprint section's own PDF entry for the full
-  verification trail.
+  Word and line breaks come from glyph positions; vertical writing
+  (`Identity-V`) is laid out as if horizontal, and right-to-left text
+  keeps content-stream order. See the Dependency footprint section's own
+  PDF entry for the full verification trail.
 - **A dotted-quad value valid as IPv4 is always reported as IPv4**, even if
   it's semantically something else - a version string like `"1.2.3.4"` is
   indistinguishable from an address at the string level, and there's no
