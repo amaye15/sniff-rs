@@ -27,6 +27,10 @@ All notable changes to sniff-rs are documented here. Format follows
 - PDF `text` column notes disclose lossy decoding: fonts and codes that
   read as U+FFFD (with the first reason), and Form XObjects skipped
   because their content couldn't be parsed.
+- PDF marked-content `/ActualText` (inline or from `/Resources
+  /Properties`) replaces the text of the glyphs it covers: Chrome's
+  ligatures; InDesign's small caps, soft hyphens, and tabs. ActualText
+  holding U+FFFD is ignored, so the tab-leader dots it covers stay.
 
 ### Fixed
 - PDF: a font selected inside `q ... Q` no longer leaks past `Q`; Form

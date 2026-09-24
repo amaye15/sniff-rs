@@ -59433,8 +59433,48 @@ mod pdf_support {
             let mut saved_ctm: Vec<Matrix> = Vec::new();
             let mut tm = IDENTITY;
             let mut tlm = IDENTITY;
+            // Open marked-content sequences, innermost last: whether each
+            // started a replacement. Only the outermost ActualText counts -
+            // it stands in for everything inside it, nested ActualText
+            // included. Past `MAX_GSTATE_DEPTH`, levels are only counted,
+            // so every `EMC` still closes the sequence it belongs to.
+            let mut marked: Vec<bool> = Vec::new();
+            let mut marked_overflow = 0usize;
+            // ActualText of the named property lists seen so far: a file can
+            // open thousands of sequences on one name (`/OC /MC0 BDC`).
+            let mut named_text: HashMap<Vec<u8>, Option<String>> = HashMap::new();
             for span in spans {
                 match span {
+                    CSpan::BeginMarked(props) => {
+                        if marked.len() >= MAX_GSTATE_DEPTH {
+                            marked_overflow += 1;
+                            continue;
+                        }
+                        let text = match props {
+                            _ if layout.replacing() => None,
+                            Some(PdfObj::Dict(d)) => self.actual_text(&d, path),
+                            Some(PdfObj::Name(n)) => match named_text.get(&n) {
+                                Some(text) => text.clone(),
+                                None => {
+                                    let text = self.named_actual_text(&n, resources, path);
+                                    named_text.insert(n, text.clone());
+                                    text
+                                }
+                            },
+                            _ => None,
+                        };
+                        marked.push(text.is_some());
+                        if let Some(text) = text {
+                            layout.begin_replacement(text);
+                        }
+                    }
+                    CSpan::EndMarked => {
+                        if marked_overflow > 0 {
+                            marked_overflow -= 1;
+                        } else if marked.pop() == Some(true) {
+                            layout.end_replacement();
+                        }
+                    }
                     CSpan::BeginText => {
                         tm = IDENTITY;
                         tlm = IDENTITY;
@@ -59526,13 +59566,18 @@ mod pdf_support {
                         // the glyph origin `p * (m[0], m[1])` in device space.
                         let origin = (trm[4], trm[5]);
                         let at = |p: f64| (origin.0 + p * m[0], origin.1 + p * m[1]);
+                        // Codes ActualText stands in for aren't lost, however
+                        // their font decodes them.
+                        let replaced = layout.replacing();
                         layout.begin_string();
                         let (advance, unmapped) =
                             pdf_font.layout_glyphs(&bytes, &state, |text, pen, ink| {
                                 let end = at(pen + ink);
                                 layout.push(text, at(pen), LastGlyph { end, dir, em });
                             });
-                        self.text_stats.unmapped_codes += unmapped;
+                        if !replaced {
+                            self.text_stats.unmapped_codes += unmapped;
+                        }
                         tm = mat_mul(&translate(advance, 0.0), &tm);
                     }
                     CSpan::XObjectRef(name) => {
@@ -59637,7 +59682,53 @@ mod pdf_support {
                     }
                 }
             }
+            // A sequence still open when its stream ends closes there: a
+            // Form's unbalanced `BDC` must not swallow the page text after
+            // its `Do`.
+            if marked.contains(&true) {
+                layout.end_replacement();
+            }
             Ok(())
+        }
+
+        /// The `/ActualText` of a marked-content property list (ISO 32000-1
+        /// 14.9.4), ready for layout (`actual_text_from_bytes`); `None`
+        /// without a usable one. Nothing here fails the page - a property
+        /// list that doesn't resolve just has no replacement text.
+        fn actual_text(
+            &mut self,
+            props: &BTreeMap<Vec<u8>, PdfObj>,
+            path: &Path,
+        ) -> Option<String> {
+            let value = props.get(b"ActualText".as_slice())?;
+            let Ok(PdfObj::Str(bytes)) = self.resolve(value, 0, path) else {
+                return None;
+            };
+            actual_text_from_bytes(&bytes)
+        }
+
+        /// `actual_text` for a property list named in `/Resources
+        /// /Properties`. An encrypted file's are skipped: their strings are
+        /// still encrypted (this reader decrypts streams, not the strings in
+        /// other objects), unlike inline ActualText, which arrives with its
+        /// content stream already decrypted.
+        fn named_actual_text(
+            &mut self,
+            name: &[u8],
+            resources: &BTreeMap<Vec<u8>, PdfObj>,
+            path: &Path,
+        ) -> Option<String> {
+            if self.encryption.is_some() {
+                return None;
+            }
+            let all = resources.get(b"Properties".as_slice())?;
+            let Ok(PdfObj::Dict(all)) = self.resolve(all, 0, path) else {
+                return None;
+            };
+            let Ok(PdfObj::Dict(props)) = self.resolve(all.get(name)?, 0, path) else {
+                return None;
+            };
+            self.actual_text(&props, path)
         }
     }
 
@@ -60171,6 +60262,13 @@ mod pdf_support {
         /// pure syntactic walker has no access to a page's own resources
         /// or the reader needed to look anything up.
         XObjectRef(Vec<u8>),
+        /// `BMC` / `BDC`: a marked-content sequence opens (ISO 32000-1
+        /// 14.6). A `BDC` property list rides along - an inline
+        /// dictionary, or a name to look up in `/Resources /Properties` -
+        /// for its `/ActualText` (14.9.4); `BMC` has none.
+        BeginMarked(Option<PdfObj>),
+        /// `EMC`: the innermost open marked-content sequence closes.
+        EndMarked,
     }
 
     /// How deep `q` nests before saving stops: past this, graphics state
@@ -60258,6 +60356,147 @@ mod pdf_support {
         }
     }
 
+    /// Decodes a PDF text string (ISO 32000-1 7.9.2.2; ISO 32000-2 adds
+    /// UTF-8): UTF-16BE after a `FE FF` byte order mark, UTF-8 after
+    /// `EF BB BF`, and PDFDocEncoding otherwise. A `FF FE` mark (UTF-16LE)
+    /// is read too, as PDFium and pdf.js both do - writers emit it though
+    /// the spec doesn't allow it. An unpaired surrogate or invalid UTF-8
+    /// reads as U+FFFD, and a dangling odd byte of UTF-16 is dropped. A
+    /// language escape (`ESC` code `ESC`, 7.9.2.2) is dropped - through
+    /// the end of the string if its closing `ESC` is missing, as in pdf.js
+    /// and PDFium. PDFDocEncoding has no escape: its 0x1B is a dot accent.
+    fn decode_text_string(bytes: &[u8]) -> String {
+        fn utf16(units: impl Iterator<Item = u16>) -> String {
+            char::decode_utf16(units)
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .collect()
+        }
+        let unicode = if let Some(rest) = bytes.strip_prefix(b"\xFE\xFF") {
+            utf16(
+                rest.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&p| u16::from_be_bytes(p)),
+            )
+        } else if let Some(rest) = bytes.strip_prefix(b"\xFF\xFE") {
+            utf16(
+                rest.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&p| u16::from_le_bytes(p)),
+            )
+        } else if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
+            String::from_utf8_lossy(rest).into_owned()
+        } else {
+            return bytes.iter().map(|&b| pdfdoc_char(b)).collect();
+        };
+        let mut in_escape = false;
+        unicode
+            .chars()
+            .filter(|&c| {
+                if c == '\u{1B}' {
+                    in_escape = !in_escape;
+                    return false;
+                }
+                !in_escape
+            })
+            .collect()
+    }
+
+    /// One PDFDocEncoding byte (ISO 32000-1 Annex D.2): Latin-1 except the
+    /// spacing accents at 0x18-0x1F, typographic punctuation and a few
+    /// letters at 0x80-0x9E, and the euro sign at 0xA0. The three codes the
+    /// encoding leaves undefined (0x7F, 0x9F, 0xAD) read as U+FFFD.
+    fn pdfdoc_char(b: u8) -> char {
+        const ACCENTS: [char; 8] = [
+            '\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}',
+            '\u{02DC}',
+        ];
+        const HIGH: [char; 32] = [
+            '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{0192}',
+            '\u{2044}', '\u{2039}', '\u{203A}', '\u{2212}', '\u{2030}', '\u{201E}', '\u{201C}',
+            '\u{201D}', '\u{2018}', '\u{2019}', '\u{201A}', '\u{2122}', '\u{FB01}', '\u{FB02}',
+            '\u{0141}', '\u{0152}', '\u{0160}', '\u{0178}', '\u{017D}', '\u{0131}', '\u{0142}',
+            '\u{0153}', '\u{0161}', '\u{017E}', '\u{FFFD}',
+        ];
+        match b {
+            0x18..=0x1F => ACCENTS[usize::from(b - 0x18)],
+            0x80..=0x9F => HIGH[usize::from(b - 0x80)],
+            0xA0 => '\u{20AC}',
+            0x7F | 0xAD => '\u{FFFD}',
+            _ => char::from(b),
+        }
+    }
+
+    /// ActualText as layout uses it: control characters other than tab,
+    /// line feed, and carriage return are dropped, and so are the
+    /// zero-width U+200B and U+FEFF - none of them is text (InDesign writes
+    /// ActualText of U+0007 and U+0003 over space glyphs, for one).
+    fn clean_actual_text(text: &str) -> String {
+        text.chars()
+            .filter(|&c| {
+                !(c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+                    && !matches!(c, '\u{200B}' | '\u{FEFF}')
+            })
+            .collect()
+    }
+
+    /// An ActualText string's bytes as layout uses them: decoded and
+    /// cleaned, or `None` if the result holds U+FFFD. That counts as no
+    /// ActualText, so the glyphs it covers are read instead: the writer is
+    /// saying it doesn't know the text, and the glyphs usually do (one real
+    /// tab leader's ActualText is U+0008 and a U+FFFD per dot).
+    fn actual_text_from_bytes(bytes: &[u8]) -> Option<String> {
+        let text = clean_actual_text(&decode_text_string(bytes));
+        (!text.contains('\u{FFFD}')).then_some(text)
+    }
+
+    /// The character a word break is written as: the first space glyph
+    /// shown in it (a tab or a no-break space stays one), or U+0020 when
+    /// none was. A line-breaking space (a glyph decoding to a newline, say)
+    /// is written as U+0020 too: where lines break is decided by where
+    /// glyphs are drawn, not by what one of them decodes to.
+    fn break_char(space: Option<char>) -> char {
+        match space {
+            Some(c)
+                if !matches!(
+                    c,
+                    '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+                ) =>
+            {
+                c
+            }
+            _ => ' ',
+        }
+    }
+
+    /// `text` split into maximal runs of whitespace and of everything else.
+    fn whitespace_runs(text: &str) -> impl Iterator<Item = &str> {
+        let mut rest = text;
+        std::iter::from_fn(move || {
+            let ws = rest.chars().next()?.is_whitespace();
+            let end = rest
+                .find(|c: char| c.is_whitespace() != ws)
+                .unwrap_or(rest.len());
+            let (run, tail) = rest.split_at(end);
+            rest = tail;
+            Some(run)
+        })
+    }
+
+    /// ActualText standing in for every glyph a marked-content sequence
+    /// draws (ISO 32000-1 14.9.4).
+    #[derive(Clone, Debug)]
+    struct Replacement {
+        /// The text, until it's written at the sequence's first glyph.
+        text: String,
+        placed: bool,
+        /// Whether it wrote a visible character: the sequence's later
+        /// glyphs then move where the last visible glyph ends, so the gap
+        /// to the text after the sequence is measured from its end.
+        extends: bool,
+    }
+
     /// A page's extracted text, built glyph by glyph in content-stream
     /// order. Space glyphs are held back rather than written: whether a
     /// word break goes between two visible glyphs is decided when the
@@ -60276,6 +60515,15 @@ mod pdf_support {
     /// character however many space glyphs made it, as in PDFium and
     /// pdf.js. One layout serves a page and every Form XObject it invokes,
     /// so a Form's text joins the page's by position too.
+    ///
+    /// ActualText (`begin_replacement`) stands in for every glyph of a
+    /// marked-content sequence: it's written once, at the sequence's first
+    /// glyph, the way that glyph would have been; whitespace in it is the
+    /// producer's own separator, so it always breaks the word; and the
+    /// sequence's other glyphs only move where the text after it is
+    /// measured from. Text that's empty once cleaned makes the glyphs
+    /// invisible, as the spec reads, and a sequence that draws no glyph
+    /// contributes nothing.
     #[derive(Default)]
     struct TextLayout {
         out: String,
@@ -60294,11 +60542,13 @@ mod pdf_support {
         /// Whether the current string has shown a visible glyph, i.e. the
         /// next one continues `last`'s string.
         in_string: bool,
+        /// The ActualText standing in for the glyphs being drawn.
+        replacement: Option<Replacement>,
     }
 
     /// Everything in a `TextLayout` but its text, plus the text's length:
     /// what a Form XObject that fails partway rolls back to.
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct LayoutMark {
         len: usize,
         last: Option<LastGlyph>,
@@ -60306,6 +60556,7 @@ mod pdf_support {
         space_after_last: bool,
         space_in_string: bool,
         in_string: bool,
+        replacement: Option<Replacement>,
     }
 
     impl TextLayout {
@@ -60317,6 +60568,7 @@ mod pdf_support {
                 space_after_last: self.space_after_last,
                 space_in_string: self.space_in_string,
                 in_string: self.in_string,
+                replacement: self.replacement.clone(),
             }
         }
 
@@ -60327,6 +60579,25 @@ mod pdf_support {
             self.space_after_last = mark.space_after_last;
             self.space_in_string = mark.space_in_string;
             self.in_string = mark.in_string;
+            self.replacement = mark.replacement;
+        }
+
+        /// Starts replacing the glyphs drawn from here on with `text`.
+        fn begin_replacement(&mut self, text: String) {
+            self.replacement = Some(Replacement {
+                text,
+                placed: false,
+                extends: false,
+            });
+        }
+
+        /// Stops replacing: the next glyph is laid out as itself again.
+        fn end_replacement(&mut self) {
+            self.replacement = None;
+        }
+
+        fn replacing(&self) -> bool {
+            self.replacement.is_some()
         }
 
         /// Marks the start of a new shown string (a `Tj`, `'`, `"`, or one
@@ -60337,8 +60608,41 @@ mod pdf_support {
         }
 
         /// Adds one glyph: its `text`, where it `start`s, and where its ink
-        /// ends (`glyph`). A code that decodes to nothing adds nothing.
+        /// ends (`glyph`) - or, while ActualText replaces the glyphs being
+        /// drawn, the replacement at the first of them and nothing after.
         fn push(&mut self, text: &str, start: (f64, f64), glyph: LastGlyph) {
+            let Some(rep) = self.replacement.as_mut() else {
+                self.push_glyph(text, start, glyph);
+                return;
+            };
+            if rep.placed {
+                if rep.extends
+                    && let Some(last) = self.last.as_mut()
+                {
+                    last.end = glyph.end;
+                }
+                return;
+            }
+            rep.placed = true;
+            let text = std::mem::take(&mut rep.text);
+            let mut extends = false;
+            for run in whitespace_runs(&text) {
+                if run.starts_with(char::is_whitespace) {
+                    self.space = self.space.or(run.chars().next());
+                    self.space_after_last = true;
+                } else {
+                    self.push_glyph(run, start, glyph);
+                    extends = true;
+                }
+            }
+            if let Some(rep) = self.replacement.as_mut() {
+                rep.extends = extends;
+            }
+        }
+
+        /// Lays out one glyph's own text. A code that decodes to nothing
+        /// adds nothing.
+        fn push_glyph(&mut self, text: &str, start: (f64, f64), glyph: LastGlyph) {
             if text.is_empty() {
                 return;
             }
@@ -60377,7 +60681,7 @@ mod pdf_support {
                 }
                 Gap::Space => {
                     if !self.out.is_empty() && !self.out.ends_with('\n') {
-                        self.out.push(self.space.unwrap_or(' '));
+                        self.out.push(break_char(self.space));
                     }
                 }
                 Gap::None => {}
@@ -60662,6 +60966,15 @@ mod pdf_support {
                             spans.push(CSpan::XObjectRef(n));
                         }
                     }
+                    // Every `BMC`/`BDC` is emitted, whatever its operands,
+                    // so each `EMC` still closes the sequence it belongs to.
+                    b"BMC" => spans.push(CSpan::BeginMarked(None)),
+                    b"BDC" => spans.push(CSpan::BeginMarked(
+                        stack
+                            .pop()
+                            .filter(|p| matches!(p, PdfObj::Dict(_) | PdfObj::Name(_))),
+                    )),
+                    b"EMC" => spans.push(CSpan::EndMarked),
                     _ => {}
                 }
                 // Every operator consumes its operands, used or not.
@@ -61116,6 +61429,231 @@ mod pdf_support {
             // in the middle of the stream, distinct from the stream simply
             // running out of bytes.
             assert!(content_spans(b"BT (First) Tj ) (Second) Tj ET").is_err());
+        }
+
+        #[test]
+        fn marked_content_operators_carry_their_property_lists() {
+            let spans = content_spans(
+                b"/Span <</ActualText (fi)>> BDC (a) Tj EMC /OC /MC0 BDC /Artifact BMC EMC EMC \
+                  /X 5 BDC EMC",
+            )
+            .unwrap();
+            let kinds: Vec<String> = spans
+                .iter()
+                .map(|s| match s {
+                    CSpan::BeginMarked(None) => "begin".to_string(),
+                    CSpan::BeginMarked(Some(PdfObj::Dict(d))) => {
+                        format!("begin {:?}", d.get(b"ActualText".as_slice()))
+                    }
+                    CSpan::BeginMarked(Some(PdfObj::Name(n))) => {
+                        format!("begin /{}", String::from_utf8_lossy(n))
+                    }
+                    CSpan::EndMarked => "end".to_string(),
+                    CSpan::Show { .. } => "show".to_string(),
+                    _ => "other".to_string(),
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    "begin Some(Str([102, 105]))",
+                    "show",
+                    "end",
+                    "begin /MC0",
+                    "begin",
+                    "end",
+                    "end",
+                    // A property list that's neither a dictionary nor a
+                    // name still opens a sequence, so its `EMC` pairs up.
+                    "begin",
+                    "end",
+                ]
+            );
+        }
+
+        #[test]
+        fn text_strings_decode_by_their_byte_order_mark() {
+            // UTF-16BE, with a surrogate pair and an unpaired surrogate.
+            assert_eq!(decode_text_string(b"\xFE\xFF\x00f\x00i"), "fi");
+            assert_eq!(
+                decode_text_string(b"\xFE\xFF\xD8\x35\xDC\x00\xD8\x00\x00a"),
+                "\u{1D400}\u{FFFD}a"
+            );
+            assert_eq!(decode_text_string(b"\xFE\xFF\x00a\x00"), "a");
+            assert_eq!(decode_text_string(b"\xFE\xFF"), "");
+            // UTF-16LE and UTF-8 marks.
+            assert_eq!(decode_text_string(b"\xFF\xFEf\x00i\x00"), "fi");
+            assert_eq!(decode_text_string(b"\xEF\xBB\xBFcaf\xC3\xA9"), "café");
+            // A language escape is dropped, through the end when unclosed.
+            assert_eq!(
+                decode_text_string(b"\xFE\xFF\x00\x1Bja\x00\x1B\x30\x42"),
+                "\u{3042}"
+            );
+            assert_eq!(decode_text_string(b"\xFE\xFF\x00a\x00\x1Ben"), "a");
+        }
+
+        #[test]
+        fn pdfdoc_encoding_follows_annex_d() {
+            // Expected values from pdfminer.six's own PDFDocEncoding table,
+            // which marks the three undefined codes U+0000 (U+FFFD here).
+            assert_eq!(decode_text_string(b"(fi) caf\xE9"), "(fi) café");
+            assert_eq!(
+                decode_text_string(b"\x18\x1B\x1F"),
+                "\u{02D8}\u{02D9}\u{02DC}"
+            );
+            assert_eq!(
+                decode_text_string(b"\x80\x8A\x93\x9E\xA0"),
+                "\u{2022}\u{2212}\u{FB01}\u{017E}\u{20AC}"
+            );
+            assert_eq!(
+                decode_text_string(b"\x7F\x9F\xAD"),
+                "\u{FFFD}\u{FFFD}\u{FFFD}"
+            );
+        }
+
+        #[test]
+        fn actual_text_drops_control_and_zero_width_characters() {
+            assert_eq!(clean_actual_text("\t\u{3}"), "\t");
+            assert_eq!(clean_actual_text("\u{7}"), "");
+            assert_eq!(clean_actual_text("\u{200B}\u{FEFF}"), "");
+            // Text, whitespace, and a soft hyphen all stay.
+            assert_eq!(
+                clean_actual_text("in\u{AD}\u{2002}x\r\n"),
+                "in\u{AD}\u{2002}x\r\n"
+            );
+        }
+
+        #[test]
+        fn actual_text_holding_u_fffd_is_no_actual_text() {
+            // A real tab leader's shape: U+0008, then a U+FFFD per dot.
+            assert_eq!(
+                actual_text_from_bytes(b"\xFE\xFF\x00\x08\xFF\xFD\xFF\xFD"),
+                None
+            );
+            // So is text that only decodes to U+FFFD (a lone surrogate).
+            assert_eq!(actual_text_from_bytes(b"\xFE\xFF\x00a\xD8\x00"), None);
+            // Cleaned-to-empty ActualText is still ActualText: the content
+            // it covers has no text.
+            assert_eq!(
+                actual_text_from_bytes(b"\xFE\xFF\x00\x07"),
+                Some(String::new())
+            );
+            assert_eq!(
+                actual_text_from_bytes(b"\xFE\xFF\x00f\x00i"),
+                Some("fi".to_string())
+            );
+        }
+
+        /// One shown string's glyphs, as `(text, x, width)`, and the
+        /// ActualText covering it, if any.
+        type ReplacedString<'a> = (Option<&'a str>, &'a [(&'a str, f64, f64)]);
+
+        /// `lay_out`, with ActualText: a string paired with `Some(text)` is
+        /// covered by that replacement.
+        fn lay_out_replaced(strings: &[ReplacedString]) -> String {
+            let mut layout = TextLayout::default();
+            for (replacement, glyphs) in strings {
+                if let Some(text) = replacement {
+                    layout.begin_replacement(text.to_string());
+                }
+                layout.begin_string();
+                for &(text, x, w) in *glyphs {
+                    layout.push(text, (x, 700.0), ends_at(x + w, 700.0, 10.0));
+                }
+                if replacement.is_some() {
+                    layout.end_replacement();
+                }
+            }
+            layout.out
+        }
+
+        #[test]
+        fn actual_text_stands_in_for_the_glyphs_it_covers() {
+            // Chrome's print-to-PDF: a ligature glyph whose own text is
+            // U+0000, covered by ActualText "fi".
+            assert_eq!(
+                lay_out_replaced(&[
+                    (None, &[("d", 0.0, 5.0), ("e", 5.0, 5.0)]),
+                    (Some("fi"), &[("\0", 10.0, 5.0)]),
+                    (None, &[("n", 15.0, 5.0), ("e", 20.0, 5.0)]),
+                ]),
+                "define"
+            );
+            // Two glyphs covered: the text after is measured from where the
+            // second ends (18), not the first (15, a 0.3 em gap).
+            assert_eq!(
+                lay_out_replaced(&[
+                    (None, &[("d", 0.0, 5.0), ("e", 5.0, 5.0)]),
+                    (Some("fi"), &[("f", 10.0, 5.0), ("i", 15.0, 3.0)]),
+                    (None, &[("n", 18.0, 5.0)]),
+                ]),
+                "defin"
+            );
+            // Text that's empty once cleaned hides what it covers.
+            assert_eq!(
+                lay_out_replaced(&[
+                    (None, &[("a", 0.0, 5.0)]),
+                    (Some(""), &[("x", 5.0, 0.5)]),
+                    (None, &[("b", 5.5, 5.0)]),
+                ]),
+                "ab"
+            );
+        }
+
+        #[test]
+        fn whitespace_in_actual_text_always_breaks_the_word() {
+            // A tab's ActualText between words that touch: the producer
+            // said there's a break, and it's written as the tab.
+            assert_eq!(
+                lay_out_replaced(&[
+                    (None, &[("a", 0.0, 5.0)]),
+                    (Some("\t"), &[(" ", 5.0, 0.1)]),
+                    (None, &[("b", 5.1, 5.0)]),
+                ]),
+                "a\tb"
+            );
+            // Leading whitespace in visible ActualText is its separator: a
+            // contents line's leader dots and page number.
+            assert_eq!(
+                lay_out_replaced(&[
+                    (None, &[("Intro", 0.0, 25.0)]),
+                    (
+                        Some("\t3"),
+                        &[(".", 25.0, 3.0), (".", 28.0, 3.0), ("3", 31.0, 5.0)]
+                    ),
+                ]),
+                "Intro\t3"
+            );
+        }
+
+        #[test]
+        fn a_replacement_is_written_once_and_rolls_back_with_its_mark() {
+            let mut layout = TextLayout::default();
+            layout.begin_replacement("fi".to_string());
+            let mark = layout.mark();
+            for x in [0.0, 5.0] {
+                layout.begin_string();
+                layout.push("\0", (x, 700.0), ends_at(x + 5.0, 700.0, 10.0));
+            }
+            assert_eq!(layout.out, "fi");
+            // A Form that failed after writing it: rolled back, the
+            // replacement waits for its first glyph again.
+            layout.roll_back(mark);
+            assert_eq!(layout.out, "");
+            layout.begin_string();
+            layout.push("\0", (0.0, 700.0), ends_at(5.0, 700.0, 10.0));
+            layout.end_replacement();
+            layout.begin_string();
+            layout.push("x", (5.0, 700.0), ends_at(10.0, 700.0, 10.0));
+            assert_eq!(layout.out, "fix");
+        }
+
+        #[test]
+        fn a_space_glyph_decoding_to_a_newline_breaks_the_word_not_the_line() {
+            assert_eq!(
+                lay_out(&[&[("a", 0.0, 5.0), ("\n", 5.0, 2.5), ("b", 7.5, 5.0)]]),
+                "a b"
+            );
         }
     }
 

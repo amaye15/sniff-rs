@@ -14041,6 +14041,43 @@ fn pdf_word_and_line_breaks_come_from_where_glyphs_are_drawn() {
 
 #[test]
 #[cfg(feature = "pdf")]
+fn pdf_actual_text_stands_in_for_the_glyphs_it_covers() {
+    // One page per case, each shaped like a real producer's output. ISO
+    // 32000-1 14.9.4 is the reference, not PDFium: PDFium applies
+    // ActualText only when the covered font can encode one of its
+    // characters, and never across a `Do`, so it agrees on just the
+    // second and fifth pages. The build before this change got every
+    // page but the seventh wrong.
+    let doc = run_json("edge_pdf_actual_text.pdf", &["--samples", "20"]);
+    assert_eq!(
+        column(table(&doc, "edge_pdf_actual_text"), "text")["sample_values"],
+        serde_json::json!([
+            // Skia: a ligature glyph whose ToUnicode is U+0000.
+            "define",
+            // A named property list, from `/Resources /Properties`.
+            "AéB",
+            // InDesign: a tab over a space glyph is the break itself, and
+            // U+0007 is no text at all (the gap still breaks the word).
+            "a\tb c",
+            // Nested: the outer ActualText wins; a `BMC` inside it and a
+            // stray `EMC` after it change nothing.
+            "X e",
+            // A Form's unclosed `BDC` ends with the Form.
+            "Before Form\nafter",
+            // ActualText around a `Do` replaces the Form's text.
+            "Before Swap",
+            // A tab leader: ActualText of U+0008 and U+FFFDs is no
+            // ActualText, so the dots it covers stay.
+            "Name ..",
+            // InDesign: an unused hyphenation point drawn as a space glyph
+            // is a soft hyphen inside the word, not a word break.
+            "communi\u{AD}cations",
+        ])
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf")]
 fn pdf_recurses_into_a_form_xobject_but_skips_an_unreadable_image_xobject() {
     // A real, common shape this project's reader never handled at all
     // before: a page's own `/Do` operator invoking a Form XObject (its

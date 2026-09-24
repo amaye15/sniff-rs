@@ -1,0 +1,148 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [8 0 R 10 0 R 12 0 R 14 0 R 16 0 R 18 0 R 20 0 R 22 0 R] /Count 8 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 1 /LastChar 1 /Widths [556] /ToUnicode 5 0 R >>
+endobj
+5 0 obj
+<<  /Length 228 >>
+stream
+/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CMapName /Test def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+1 beginbfchar
+<01> <0000>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+endstream
+endobj
+6 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0 1 60 150] /Resources << /Font << /F1 3 0 R >> >> /Length 69 >>
+stream
+/Span << /ActualText (Form) >> BDC BT /F1 10 Tf 0 0 Td (inside) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0 1 60 150] /Resources << /Font << /F1 3 0 R >> >> /Length 34 >>
+stream
+BT /F1 10 Tf 0 0 Td (inside) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<<  /Length 106 >>
+stream
+BT /F1 10 Tf 20 150 Td (de) Tj /F2 10 Tf /Span << /ActualText (fi) >> BDC <01> Tj EMC /F1 10 Tf (ne) Tj ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<<  /Length 64 >>
+stream
+BT /F1 10 Tf 20 150 Td (A) Tj /Span /P1 BDC (e) Tj EMC (B) Tj ET
+endstream
+endobj
+12 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 13 0 R >>
+endobj
+13 0 obj
+<<  /Length 146 >>
+stream
+BT /F1 10 Tf 20 150 Td (a) Tj /Span << /ActualText <FEFF0009> >> BDC ( ) Tj EMC (b) Tj /Span << /ActualText <FEFF0007> >> BDC ( ) Tj EMC (c) Tj ET
+endstream
+endobj
+14 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 15 0 R >>
+endobj
+15 0 obj
+<<  /Length 149 >>
+stream
+BT /F1 10 Tf 20 150 Td /Span << /ActualText (X) >> BDC /Span << /ActualText (Y) >> BDC (a) Tj EMC /Artifact BMC (b) Tj EMC (cd) Tj EMC EMC ( e) Tj ET
+endstream
+endobj
+16 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 17 0 R >>
+endobj
+17 0 obj
+<<  /Length 86 >>
+stream
+BT /F1 10 Tf 20 150 Td (Before) Tj ET q /Fm0 Do Q BT /F1 10 Tf 20 130 Td (after) Tj ET
+endstream
+endobj
+18 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 19 0 R >>
+endobj
+19 0 obj
+<<  /Length 88 >>
+stream
+BT /F1 10 Tf 20 150 Td (Before) Tj ET /Span << /ActualText (Swap) >> BDC q /Fm1 Do Q EMC
+endstream
+endobj
+20 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 21 0 R >>
+endobj
+21 0 obj
+<<  /Length 95 >>
+stream
+BT /F1 10 Tf 20 150 Td (Name) Tj /Span << /ActualText <FEFF0008FFFDFFFD> >> BDC ( ..) Tj EMC ET
+endstream
+endobj
+22 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << /Fm0 6 0 R /Fm1 7 0 R >> /Properties << /P1 << /ActualText <FEFF00E9> >> >> >> /Contents 23 0 R >>
+endobj
+23 0 obj
+<<  /Length 101 >>
+stream
+BT /F1 10 Tf 20 150 Td (communi) Tj /Span << /ActualText <FEFF00AD> >> BDC ( ) Tj EMC (cations) Tj ET
+endstream
+endobj
+xref
+0 24
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000170 00000 n 
+0000000267 00000 n 
+0000000393 00000 n 
+0000000673 00000 n 
+0000000905 00000 n 
+0000001102 00000 n 
+0000001326 00000 n 
+0000001484 00000 n 
+0000001710 00000 n 
+0000001826 00000 n 
+0000002052 00000 n 
+0000002251 00000 n 
+0000002477 00000 n 
+0000002679 00000 n 
+0000002905 00000 n 
+0000003043 00000 n 
+0000003269 00000 n 
+0000003409 00000 n 
+0000003635 00000 n 
+0000003782 00000 n 
+0000004008 00000 n 
+trailer
+<< /Size 24 /Root 1 0 R >>
+startxref
+4162
+%%EOF

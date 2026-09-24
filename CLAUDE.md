@@ -102,7 +102,7 @@ full, honest numbers.
 | iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
 | MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
 | Jupyter notebooks (.ipynb) | `.ipynb` | `--features ipynb` | standard JSON with a fixed top-level shape (nbformat v4); the top-level `cells` array is the natural records array, one record per object in it; a cell's own `source` line-list pools into a `Vec<String>` column by the existing array convention |
-| PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode), breaking words and lines where the glyphs are drawn - see the Dependency footprint section |
+| PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode), breaking words and lines where the glyphs are drawn and letting marked-content `/ActualText` stand in for the glyphs it covers - see the Dependency footprint section |
 | Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
 | Apache Iceberg | *(directory)* | `--features iceberg` | also detected from directory structure (a `metadata/` subdirectory with a real `*.metadata.json` file); resolves the current metadata.json's own snapshot to a manifest-list (Avro) naming manifest files (Avro) naming live Parquet data files, then profiles them the same "one merged table" way - see "Lakehouse table formats" below |
 
@@ -16053,6 +16053,81 @@ back to back. Disclosed boundaries: vertical writing (`Identity-V`
 advancing down the page) is laid out as horizontal, and right-to-left
 text keeps content-stream order.
 
+**A follow-up pass made marked-content `/ActualText` stand in for the
+glyphs it covers (ISO 32000-1 14.9.4).** A tagged PDF can say what a
+marked-content sequence's text really is (`BDC ... EMC`, 14.6), and
+producers use it wherever a glyph's own Unicode is wrong or missing:
+Chrome's print-to-PDF (Skia) draws a ligature glyph whose ToUnicode is
+U+0000 under ActualText "fi", InDesign writes the typed text over small
+caps whose glyphs decode to the wrong case and a soft hyphen over the
+space glyph at an unused hyphenation point, and marks tabs, en and em
+spaces, and control characters the same way (tallied by producer,
+InDesign wrote over 98% of the corpus's ActualText). The reader ignored
+all of it, so those spans read as NUL characters, wrong-case letters,
+and words split in two.
+`content_spans` now emits every `BMC`/`BDC`/`EMC`, whatever its
+operands, so each `EMC` closes the sequence it belongs to, and
+`render_content_text` keeps a bounded stack of open sequences: a `BDC`
+whose property list - inline, or a name looked up in `/Resources
+/Properties` - carries `/ActualText` starts a replacement, and every
+glyph until its `EMC` is laid out as that text instead of its own. The
+text is written once, at the first covered glyph's position, and the
+covered glyphs' extent is kept, so the gap to what follows is still
+measured from where their ink ends; whitespace in it is a word break
+written as that character (a tab stays a tab), never part of a word.
+The outermost ActualText wins (a nested one, or a `BMC` inside it,
+changes nothing), a replacement reaches through a `Do` into a Form's
+content, and a Form's unclosed `BDC` ends with the Form instead of
+swallowing the page text after its `Do`. Codes that no font maps but a
+replacement covers aren't counted in the U+FFFD disclosure: they aren't
+in the text. A word break is also now written as a space whenever the
+space glyph (or ActualText) that supplied it is a line-break character:
+where lines break is decided by position, not by what a glyph decodes
+to.
+
+The string decodes as a PDF text string (7.9.2.2): UTF-16BE after
+`FE FF`, UTF-16LE after `FF FE` (outside the spec, but PDFium and pdf.js
+accept it), UTF-8 after `EF BB BF` (PDF 2.0), and PDFDocEncoding
+otherwise, with a language escape (`ESC` code `ESC`) dropped. The
+PDFDocEncoding table (Annex D.2) matches pdfminer.six's everywhere but
+0x16, where pdfminer's has a typo (U+0017) and this one follows the
+spec. Control characters other than tab, LF, and CR are dropped, and so
+are the zero-width U+200B and U+FEFF - InDesign writes ActualText of
+U+0007 and U+0003 over space glyphs - and ActualText that cleans to nothing
+still stands in for what it covers: that content has no text.
+**ActualText holding U+FFFD counts as absent, found by the corpus
+comparison, not assumed:** this change's first version replaced 189 real
+tab-leader dots in one file with U+FFFD, because its writer put U+0008
+and one U+FFFD per dot over each leader - the writer saying it doesn't
+know the text - so the glyphs are read there instead. Named property lists
+are skipped in an encrypted file, since this reader decrypts streams and
+not the strings in other objects (inline ActualText arrives inside its
+already-decrypted content stream).
+
+Verified against the corpus and PDFium: 25 of the 661 PDFs' text
+changed (15 beyond whitespace), with 0 failures before or after and no
+notes changed. Three research papers printed from Chrome went from
+0.998-0.999 to 1.0000 on PDFium's characters, a one-page meeting
+document to 1.0000 on characters and words, and a 1,176-page textbook
+from 0.9951 to 0.9961 on characters and 0.9180 to 0.9251 on words (4,124
+control characters and hundreds of wrong-case small caps replaced by
+the typed text). Six maths lecture and tutorial files are essentially
+unchanged against PDFium, which prints the same equation ActualText.
+Three InDesign fill-in forms move slightly away from PDFium (at most
+0.0007 on characters): InDesign writes ActualText "." over the space
+glyph that opens each field's dot leader, which this reader keeps and
+PDFium drops, since PDFium applies ActualText only when the covered font
+can encode one of its characters - a heuristic that would also discard
+Chrome's ligature text in a font with no plain `f` - and never across a
+`Do`. Several files now carry the tabs their ActualText says are
+there. `edge_pdf_actual_text.pdf` (eight pages, one real producer's
+shape each; the committed build got seven wrong, and PDFium agrees on
+two) and unit tests on the operators, text-string decoding,
+PDFDocEncoding, cleaning, the U+FFFD rule, and replacement layout lock
+it in. Disclosed boundaries: ActualText over a sequence that draws no
+glyph (an image) has nowhere to be placed and is dropped, and named
+property lists in an encrypted file are skipped.
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -16404,8 +16479,11 @@ established baselines exactly.
   the first symbol decodes) still refuses cleanly, the same as before.
   Word and line breaks come from glyph positions; vertical writing
   (`Identity-V`) is laid out as if horizontal, and right-to-left text
-  keeps content-stream order. See the Dependency footprint section's own
-  PDF entry for the full verification trail.
+  keeps content-stream order. Marked-content `/ActualText` stands in for
+  the glyphs it covers unless it holds U+FFFD; ActualText over a
+  sequence that draws no glyph (an image) is dropped, and named property
+  lists in an encrypted file are skipped. See the Dependency footprint
+  section's own PDF entry for the full verification trail.
 - **A dotted-quad value valid as IPv4 is always reported as IPv4**, even if
   it's semantically something else - a version string like `"1.2.3.4"` is
   indistinguishable from an address at the string level, and there's no
