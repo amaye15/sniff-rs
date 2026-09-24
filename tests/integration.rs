@@ -12186,6 +12186,7 @@ fn stdin_input_survives_sql_inline_modes_second_pass_reread() {
 /// Finds the edge touching `column` in `table` (either endpoint), or panics
 /// naming what was missing - the integration-level twin of the
 /// `rel_edge` unit-test helper.
+#[cfg(feature = "ini")]
 fn find_edge<'a>(
     rels: &'a [serde_json::Value],
     table: &str,
