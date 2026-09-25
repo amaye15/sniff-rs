@@ -14096,3 +14096,352 @@ fn pdf_recurses_into_a_form_xobject_but_skips_an_unreadable_image_xobject() {
         serde_json::json!(["Direct text before.\nText from inside the form.\nDirect text after."])
     );
 }
+
+// --- Knowledge graph (`sniff-rs graph`) ---
+
+#[cfg(all(feature = "ipynb", feature = "pdf"))]
+fn kg_link<'a>(
+    doc: &'a serde_json::Value,
+    relation: &str,
+    source: &str,
+    target: &str,
+) -> Option<&'a serde_json::Value> {
+    doc["links"].as_array().unwrap().iter().find(|l| {
+        l["relation"] == relation
+            && ((l["source"] == source && l["target"] == target)
+                || (l["source"] == target && l["target"] == source))
+    })
+}
+
+#[test]
+#[cfg(all(feature = "ipynb", feature = "pdf"))]
+fn knowledge_graph_links_every_data_type_in_a_folder() {
+    let tmp = TempDir::new();
+    let out = tmp.path().join("kg");
+    let output = run_graph(&[
+        "graph",
+        fixture("edge_knowledge_graph").to_str().unwrap(),
+        out.to_str().unwrap(),
+        "--obsidian",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("graph.json")).unwrap()).unwrap();
+    assert!(
+        doc["graph"]["generator"]
+            .as_str()
+            .unwrap()
+            .starts_with("sniff-rs")
+    );
+    assert_eq!(doc["directed"], false);
+    let ids: Vec<&str> = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    for file in [
+        "analysis/analysis.ipynb",
+        "analysis/plot.png",
+        "crm/customers.csv",
+        "crm/orders.json",
+        "docs/notes.md",
+        "docs/report.docx",
+        "docs/report.pdf",
+        "lectures/lecture1.txt",
+        "lectures/lecture2.txt",
+        "lectures/recipes.txt",
+        "sales/sales_2024.csv",
+        "sales/sales_2025.csv",
+    ] {
+        assert!(ids.contains(&file), "missing node {file}: {ids:?}");
+    }
+    assert!(
+        !ids.iter().any(|id| id.contains(".DS_Store")
+            || id.contains("__pycache__")
+            || id.contains(".ipynb_checkpoints")),
+        "clutter must be skipped: {ids:?}"
+    );
+
+    let join = kg_link(&doc, "joins", "crm/customers.csv", "crm/orders.json").expect("join");
+    assert_eq!(join["confidence"], "EXTRACTED");
+    assert!(
+        join["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("foreign-key naming"))
+    );
+
+    for (from, to) in [
+        ("analysis/analysis.ipynb", "crm/customers.csv"),
+        ("analysis/analysis.ipynb", "analysis/plot.png"),
+        ("docs/notes.md", "docs/report.pdf"),
+    ] {
+        let link =
+            kg_link(&doc, "references", from, to).unwrap_or_else(|| panic!("{from} -> {to}"));
+        assert_eq!(
+            link["source"], from,
+            "a reference points from the naming file"
+        );
+        assert_eq!(link["confidence"], "EXTRACTED");
+    }
+
+    for (entity, files) in [
+        (
+            "email:alice@acme-corp.com",
+            &["crm/customers.csv", "crm/orders.json", "docs/report.pdf"][..],
+        ),
+        (
+            "doi:10.1000/xyz123",
+            &["analysis/analysis.ipynb", "docs/report.pdf"][..],
+        ),
+        (
+            "isbn:9780306406157",
+            &["docs/notes.md", "docs/report.pdf"][..],
+        ),
+        ("code:SIT720", &["docs/notes.md", "docs/report.pdf"][..]),
+    ] {
+        for file in files {
+            assert!(
+                kg_link(&doc, "mentions", file, entity).is_some(),
+                "{file} should mention {entity}"
+            );
+        }
+    }
+    assert_eq!(
+        kg_link(&doc, "mentions", "docs/report.pdf", "code:SIT720").unwrap()["confidence"],
+        "INFERRED",
+        "a course code is a shape heuristic"
+    );
+
+    let schemas: Vec<&serde_json::Value> = doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["relation"] == "has_schema")
+        .collect();
+    assert_eq!(schemas.len(), 2);
+    assert_eq!(schemas[0]["target"], schemas[1]["target"]);
+    assert!(
+        kg_link(
+            &doc,
+            "similar_to",
+            "lectures/lecture1.txt",
+            "lectures/lecture2.txt"
+        )
+        .is_some()
+    );
+    assert!(kg_link(&doc, "same_name", "docs/report.docx", "docs/report.pdf").is_some());
+    assert!(
+        !doc["links"].as_array().unwrap().iter().any(|l| l["source"]
+            == "lectures/recipes.txt"
+            || l["target"] == "lectures/recipes.txt"),
+        "an unrelated file links to nothing"
+    );
+
+    let report = std::fs::read_to_string(out.join("GRAPH_REPORT.md")).unwrap();
+    assert!(report.contains("## Connections across data types"));
+    assert!(
+        report.contains("`lectures/recipes.txt` (txt)"),
+        "isolated file listed: {report}"
+    );
+
+    let vault = out.join("obsidian");
+    let note = std::fs::read_to_string(vault.join("files/docs/report.pdf.md")).unwrap();
+    assert!(note.starts_with("---\ntype: file\n"), "{note}");
+    assert!(
+        note.contains("[[entities/email/alice@acme-corp.com|alice@acme-corp.com]]"),
+        "{note}"
+    );
+    assert!(
+        note.contains("referenced by [[files/docs/notes.md|notes.md]]"),
+        "{note}"
+    );
+    assert!(vault.join("entities/doi/10.1000_xyz123.md").exists());
+    assert!(vault.join("index.md").exists());
+    assert!(vault.join(".obsidian/graph.json").exists());
+
+    // A re-run replaces the graph in place; a folder this tool didn't
+    // write is refused rather than written into.
+    let again = run_graph(&[
+        "graph",
+        fixture("edge_knowledge_graph").to_str().unwrap(),
+        out.to_str().unwrap(),
+    ]);
+    assert!(again.status.success());
+    let foreign = tmp.path().join("mine");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(foreign.join("keep.txt"), "mine").unwrap();
+    let refused = run_graph(&[
+        "graph",
+        fixture("edge_knowledge_graph").to_str().unwrap(),
+        foreign.to_str().unwrap(),
+    ]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("wasn't written by sniff-rs graph"));
+    assert_eq!(
+        std::fs::read_to_string(foreign.join("keep.txt")).unwrap(),
+        "mine"
+    );
+}
+
+#[test]
+#[cfg(all(feature = "ipynb", feature = "pdf"))]
+fn graph_queries_accept_graph_json_and_directories() {
+    let tmp = TempDir::new();
+    let out = tmp.path().join("kg");
+    let dir = fixture("edge_knowledge_graph");
+    assert!(
+        run_graph(&["graph", dir.to_str().unwrap(), out.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let graph_json = out.join("graph.json");
+
+    let explained = run_graph(&["explain", graph_json.to_str().unwrap(), "customers.csv"]);
+    assert!(
+        explained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+    let text = String::from_utf8_lossy(&explained.stdout);
+    assert!(text.starts_with("# customers.csv"), "{text}");
+    assert!(text.contains("### joins (1)"), "{text}");
+    assert!(
+        text.contains("referenced by `analysis/analysis.ipynb`"),
+        "{text}"
+    );
+
+    let path = run_graph(&[
+        "path",
+        graph_json.to_str().unwrap(),
+        "notes.md",
+        "customers.csv",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        path.status.success(),
+        "{}",
+        String::from_utf8_lossy(&path.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&path.stdout).unwrap();
+    assert_eq!(doc["from"], "docs/notes.md");
+    assert_eq!(doc["to"], "crm/customers.csv");
+    let hops = doc["hops"].as_array().unwrap();
+    assert_eq!(hops.len(), 3, "{doc}");
+    assert_eq!(hops[0]["relation"], "references");
+
+    // A directory is graphed in memory, with the same answer.
+    let from_dir = run_graph(&[
+        "path",
+        dir.to_str().unwrap(),
+        "notes.md",
+        "customers.csv",
+        "--output-format",
+        "json",
+    ]);
+    assert!(from_dir.status.success());
+    let doc2: serde_json::Value = serde_json::from_slice(&from_dir.stdout).unwrap();
+    assert_eq!(doc, doc2);
+
+    let none = run_graph(&[
+        "path",
+        graph_json.to_str().unwrap(),
+        "lecture1.txt",
+        "recipes.txt",
+    ]);
+    assert!(!none.status.success());
+    assert!(String::from_utf8_lossy(&none.stderr).contains("no path between"));
+
+    let rank = run_graph(&[
+        "rank",
+        graph_json.to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert!(rank.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&rank.stdout).unwrap();
+    assert_eq!(doc["nodes"][0]["id"], "crm/customers.csv");
+    assert!(!doc["communities"].as_array().unwrap().is_empty());
+
+    let ambiguous = run_graph(&["explain", graph_json.to_str().unwrap(), "report"]);
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("matches several nodes"));
+}
+
+#[test]
+fn graph_writes_to_stdout_and_generated_folders_are_never_reprofiled() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(
+        data.join("a.csv"),
+        "id,email\n1,x@example.org\n2,y@example.org\n",
+    )
+    .unwrap();
+    std::fs::write(data.join("b.txt"), "Contact x@example.org about a.csv\n").unwrap();
+
+    let json = run_graph(&["graph", data.to_str().unwrap(), "-"]);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(kg_link_any(&doc, "references", "b.txt", "a.csv"));
+    let md = run_graph(&[
+        "graph",
+        data.to_str().unwrap(),
+        "-",
+        "--output-format",
+        "md",
+    ]);
+    assert!(String::from_utf8_lossy(&md.stdout).starts_with("# Knowledge graph: data"));
+
+    // A graph written inside the folder it describes is skipped by later
+    // walks - neither the graph nor directory mode profiles graph.json.
+    let inside = data.join("graph");
+    assert!(
+        run_graph(&["graph", data.to_str().unwrap(), inside.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let again = run_graph(&["graph", data.to_str().unwrap(), "-"]);
+    let doc: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert!(
+        !doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"].as_str().unwrap().starts_with("graph/"))
+    );
+    let dict = tmp.path().join("dict");
+    let batch = Command::new(bin())
+        .args([
+            data.to_str().unwrap(),
+            "--output-dir",
+            dict.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        batch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&batch.stderr)
+    );
+    assert!(!dict.join("graph").exists());
+}
+
+fn kg_link_any(doc: &serde_json::Value, relation: &str, source: &str, target: &str) -> bool {
+    doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l["relation"] == relation && l["source"] == source && l["target"] == target)
+}

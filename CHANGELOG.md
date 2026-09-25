@@ -32,7 +32,23 @@ All notable changes to sniff-rs are documented here. Format follows
   ligatures; InDesign's small caps, soft hyphens, and tabs. ActualText
   holding U+FFFD is ignored, so the tab-leader dots it covers stay.
 
+- `sniff-rs graph <DIR>`: a knowledge graph across every file and data
+  type. Files (and tables, and identifiers two or more files share) are
+  nodes; links are joins measured by value overlap, shared schemas,
+  shared identifiers (emails, domains, URLs, DOIs, ISBNs, UUIDs, IPs,
+  VINs, IBANs, course codes, reference numbers, masked card numbers),
+  file references, TF-IDF-similar wording, and shared name stems - each
+  EXTRACTED / INFERRED / AMBIGUOUS with evidence. Louvain communities.
+  Writes graphify-style `graph.json` and `GRAPH_REPORT.md`, and with
+  `--obsidian` an Obsidian vault. Word and PowerPoint text, plain text,
+  HTML, and source files are read for links; images and other binaries
+  are nodes too.
+- `explain`/`path`/`rank` accept a directory or a `graph.json` and then
+  query the knowledge graph's nodes.
+
 ### Fixed
+- Directory walks skip folders `sniff-rs graph` generated, so a graph
+  or vault inside its own input is never profiled as data.
 - PDF: a font selected inside `q ... Q` no longer leaks past `Q`; Form
   XObject fonts no longer collide across pages; Identity-H codes decode at
   their real two-byte width; `/Differences [255 /a /b]` degrades that

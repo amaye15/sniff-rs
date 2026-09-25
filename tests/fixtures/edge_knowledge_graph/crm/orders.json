@@ -1,0 +1,242 @@
+[
+ {
+  "order_id": "ORD-1000",
+  "customer_id": 1,
+  "amount": 10.0,
+  "email": "alice@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1001",
+  "customer_id": 8,
+  "amount": 13.25,
+  "email": "heidi@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1002",
+  "customer_id": 15,
+  "amount": 16.5,
+  "email": "rupert@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1003",
+  "customer_id": 22,
+  "amount": 19.75,
+  "email": "xena@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1004",
+  "customer_id": 5,
+  "amount": 23.0,
+  "email": "erin@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1005",
+  "customer_id": 12,
+  "amount": 26.25,
+  "email": "niaj@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1006",
+  "customer_id": 19,
+  "amount": 29.5,
+  "email": "walter@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1007",
+  "customer_id": 2,
+  "amount": 32.75,
+  "email": "bob@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1008",
+  "customer_id": 9,
+  "amount": 36.0,
+  "email": "ivan@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1009",
+  "customer_id": 16,
+  "amount": 39.25,
+  "email": "sybil@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1010",
+  "customer_id": 23,
+  "amount": 42.5,
+  "email": "uma@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1011",
+  "customer_id": 6,
+  "amount": 45.75,
+  "email": "frank@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1012",
+  "customer_id": 13,
+  "amount": 49.0,
+  "email": "olivia@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1013",
+  "customer_id": 20,
+  "amount": 52.25,
+  "email": "zoe@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1014",
+  "customer_id": 3,
+  "amount": 55.5,
+  "email": "carol@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1015",
+  "customer_id": 10,
+  "amount": 58.75,
+  "email": "judy@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1016",
+  "customer_id": 17,
+  "amount": 62.0,
+  "email": "trent@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1017",
+  "customer_id": 24,
+  "amount": 65.25,
+  "email": "quinn@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1018",
+  "customer_id": 7,
+  "amount": 68.5,
+  "email": "grace@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1019",
+  "customer_id": 14,
+  "amount": 71.75,
+  "email": "peggy@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1020",
+  "customer_id": 21,
+  "amount": 75.0,
+  "email": "yusuf@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1021",
+  "customer_id": 4,
+  "amount": 78.25,
+  "email": "dave@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1022",
+  "customer_id": 11,
+  "amount": 81.5,
+  "email": "mallory@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1023",
+  "customer_id": 18,
+  "amount": 84.75,
+  "email": "victor@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1024",
+  "customer_id": 1,
+  "amount": 88.0,
+  "email": "alice@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1025",
+  "customer_id": 8,
+  "amount": 91.25,
+  "email": "heidi@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1026",
+  "customer_id": 15,
+  "amount": 94.5,
+  "email": "rupert@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1027",
+  "customer_id": 22,
+  "amount": 97.75,
+  "email": "xena@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1028",
+  "customer_id": 5,
+  "amount": 101.0,
+  "email": "erin@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1029",
+  "customer_id": 12,
+  "amount": 104.25,
+  "email": "niaj@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1030",
+  "customer_id": 19,
+  "amount": 107.5,
+  "email": "walter@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1031",
+  "customer_id": 2,
+  "amount": 110.75,
+  "email": "bob@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1032",
+  "customer_id": 9,
+  "amount": 114.0,
+  "email": "ivan@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1033",
+  "customer_id": 16,
+  "amount": 117.25,
+  "email": "sybil@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1034",
+  "customer_id": 23,
+  "amount": 120.5,
+  "email": "uma@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1035",
+  "customer_id": 6,
+  "amount": 123.75,
+  "email": "frank@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1036",
+  "customer_id": 13,
+  "amount": 127.0,
+  "email": "olivia@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1037",
+  "customer_id": 20,
+  "amount": 130.25,
+  "email": "zoe@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1038",
+  "customer_id": 3,
+  "amount": 133.5,
+  "email": "carol@acme-corp.com"
+ },
+ {
+  "order_id": "ORD-1039",
+  "customer_id": 10,
+  "amount": 136.75,
+  "email": "judy@acme-corp.com"
+ }
+]

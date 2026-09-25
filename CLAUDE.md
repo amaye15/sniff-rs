@@ -21,12 +21,19 @@ type, not the format's own type inference. It re-derives what's actually
 there from the values themselves. See "Design philosophy" below; it's the
 reason most of the code is shaped the way it is.
 
-`sniff-rs diff <OLD> <NEW>` — this tool's one subcommand — compares two
-already-generated `--output-format json` dictionaries and flags schema
-drift (added/removed/renamed columns, type changes, missing-% shifts),
+`sniff-rs diff <OLD> <NEW>` compares two already-generated
+`--output-format json` dictionaries and flags schema drift
+(added/removed/renamed columns, type changes, missing-% shifts),
 classifying each change safe or breaking and, on request, generating a
 review-first SQL script for the safe ones. See "Schema diff / drift
 detection" below.
+
+`sniff-rs graph <DIR>` builds a graphify-style knowledge graph across
+every file in a folder, of every data type - joins, shared identifiers
+(emails, DOIs, IBANs, ...), file references, similar wording, shared
+schemas and names - and writes `graph.json`, `GRAPH_REPORT.md`, and
+(with `--obsidian`) an Obsidian vault; `explain`/`path`/`rank` query it.
+See "Knowledge graph" below.
 
 ## Quick start
 
@@ -39,6 +46,7 @@ cargo build --release --no-default-features     # minimal stable build: CSV/TSV/
 ./target/release/sniff-rs warehouse.db - --output-format json | jq .
 ./target/release/sniff-rs data.csv.gz                       # gzip decompressed transparently
 ./target/release/sniff-rs ./data/ --output-dir ./dictionaries/  # batch mode - see below
+./target/release/sniff-rs graph ./data/ --obsidian            # knowledge graph + Obsidian vault
 ```
 
 `cargo +nightly test` covers the default (every-format) build; `cargo test
@@ -3551,6 +3559,190 @@ picked as the pre-fix "hub") went from `Degree: 1204` to `Degree: 0,
 Duplicates: 1204`, and its community's label changed from that same
 arbitrary PDF's own filename to `"duplicate schema: page_number, text"` -
 the real-world improvement this fix set out to make.
+
+Since the knowledge graph (next section), `explain`/`path`/`rank` also
+take a directory or a `graph.json`; with a dictionary or a raw data file
+they behave exactly as described here.
+
+## Knowledge graph (`sniff-rs graph`)
+
+Prompted directly by the user asking that everything this tool extracts
+"feed into the graph/network correctly, similar to graphify or
+Obsidian", and then that "everything should connect all files and data
+types". Checked against the existing graph first rather than assumed
+broken: `sniff-rs <dir> --combine --output-format json` over the user's
+real 1,400-file test folder (666 PDFs, 207 notebooks, 129 Word files,
+CSV/Excel/JSON/SQLite, images, HTML, code) produced a 1.07 GB dictionary
+whose `relationships` array held 807,380 edges - 406,406 of them PDF to
+PDF over the `page_number`/`text` columns every profiled PDF has, and
+another ~228,000 notebook to notebook over `cell_type` and
+`execution_count`. Not one edge came from what a file actually *says*:
+`detect_relationships` sees column metadata and three sample values,
+never content, so for documents the "graph" was a schema-coincidence
+hairball. `sniff-rs graph` is the content-level half.
+
+**Nodes and links.** Every file under the input is a node - files
+sniff-rs profiles, other text files (txt, md, html, source code, scanned
+as text for links only), `.docx`/`.pptx` (their text extracted for the
+graph), and binary files (images, video, archives: nodes with no
+content, linked when something names them). A multi-table file's tables
+(SQLite, Excel sheets) are nodes too (`contains`), and so is every
+identifier two or more files share. Links, each with graphify's
+EXTRACTED / INFERRED / AMBIGUOUS confidence, a score, a weight, and its
+evidence:
+
+- `joins` - two tables whose columns line up. The naming signals
+  `join_candidate` already weighs (same name, `users.id <- orders.
+  user_id`, a shared identifier domain) are now checked against how much
+  the two columns' *full* value sets overlap, from a 64-hash bottom-k
+  sketch of each column (so containment is measured over every value,
+  not three samples); string-like columns whose values line up join
+  with no naming signal at all. What never joins, each rule found by
+  auditing real false positives rather than guessed: an empty column (a
+  name-only join between two empty SQLite tables produced 1,685 links),
+  a column with fewer than five distinct values (chat-export `role`
+  and safety-`category` columns produced ~6,900), a pair where neither
+  side is at least 90% distinct, a counter running from 0 or 1, and an
+  integer column with an ordinary name (`token_count` overlaps by
+  coincidence).
+- `has_schema` - tables sharing at least 80% of their column names
+  (versioned exports, monthly sheets), grouped transitively into one
+  schema node rather than O(n^2) pairwise edges. Only for formats whose
+  columns someone authored: PDF, notebook, MBOX, vCard, iCalendar, HAR,
+  and the log formats have format-fixed columns, so two PDFs sharing
+  `page_number`/`text` says nothing and they connect through content
+  instead (`has_fixed_schema`).
+- `mentions` - a file to a shared identifier found anywhere in its
+  content: emails (and their organization's domain, never a webmail
+  provider's), URL domains and URLs, DOIs (bare, `doi:`, or via
+  doi.org), ISBNs (only with an `ISBN` label or printed hyphenated,
+  normalized to 13 digits so both printings link), UUIDs, IPv4 (not
+  loopback), VINs, IBANs (whole or printed in groups of four),
+  course/product codes (`SIT720`), long reference numbers (8-20 digits
+  that aren't a date, or uppercase references like `INV-2024-00123`),
+  and Luhn-valid card numbers - keyed by a hash and labelled by their
+  last four digits only, so a full card number never reaches the graph.
+  Every kind but codes and reference numbers is recognized by the same
+  grammar/checksum validators type detection uses (EXTRACTED); those
+  two are shape heuristics (INFERRED). XML-namespace hosts (`w3.org`,
+  `schemas.openxmlformats.org`, ...) are skipped - they appear in every
+  file of a format. When two to four files share more than twelve
+  identifiers (the same customer list saved as CSV and as Excel shares
+  every email), the twelve most specific become nodes and the rest one
+  `shares_identifiers` link per pair, counted by kind - on the real
+  corpus one CSV/XLSX pair had produced 327 entity nodes alone.
+- `references` - a file naming another file: a notebook's
+  `read_csv('../crm/customers.csv')`, a page's `<img src="plot.png">`,
+  a `.docx` hyperlink. Only names of files that really exist in the
+  input are collected (the scanner is handed the input's file names), a
+  multi-word name (`Lecture 1.pdf`) is matched by its last word plus the
+  text right before it, and a name several files share resolves by path
+  or same directory before falling back to AMBIGUOUS links (at most
+  five candidates; more is left unresolved and counted).
+- `similar_to` - TF-IDF cosine over each file's words (idf `ln(1 +
+  N/df)`, words in over half the files dropped once there are 20+,
+  64-term vectors), each file linked to its five closest at cosine 0.3+
+  sharing at least three words; 0.95+ is flagged "near-identical
+  wording". Words come only from chunks that read as prose - a chunk
+  holding an email, URL, DOI, or letters mixed with digits is an
+  identifier and never splits into fake words (`acme`, `corp`), a
+  256-byte whitespace-free blob (base64 notebook images) is skipped,
+  and English stop words are dropped.
+- `same_name` - files sharing a name stem after dropping a browser's
+  ` (1)` and a trailing ` copy`: one document saved as `.docx` and
+  `.pdf`, a download saved twice. Generic stems (`untitled`, `image`,
+  ...) and groups over eight are skipped.
+
+**How content reaches it.** `content_scan` rides the same three choke
+points `numeric_stats` already does - `ColumnAccumulatorState::push`,
+`JsonPathAccumulator::absorb_scalar`, and `profile_column` - so every
+reader (PDF page text and notebook cells included) feeds it with no
+per-format code. It is off unless a `ScanGuard` is alive on the thread
+(only the graph creates one), so ordinary profiling pays one `Option`
+check per value; the summary rides on `ColumnProfile.content` and never
+reaches `to_json`, leaving every existing output byte-identical.
+Everything it keeps is bounded per column: 1,024 identifiers (a node
+attribute discloses truncation), 256 file references, a lossy-counted
+word map of 4,096 kept to its top 256, and the 64-hash sketch. Word
+documents' and presentations' text comes from their OOXML parts - body,
+headers, footers, footnotes, endnotes, comments, math, slides and
+speaker notes - plus external relationship targets (hyperlinks); verified
+against an independent lxml extraction on all 134 real `.docx`/`.pptx`
+files in the corpus, character multiset exact on 134/134. That check is
+what found the one real bug: Word writes every text box twice (a
+DrawingML `mc:Choice` and a VML `mc:Fallback`), and reading both doubled
+their text in 9 files; the Markup Compatibility rule (process the
+Choice, skip the Fallback) fixed it.
+
+**Communities** come from Louvain modularity (Blondel et al. 2008) over
+every link weighted by relation (a mention of an identifier many files
+share weighs `2/ln(1+df)`), made deterministic (index-order passes,
+strict gains only, ties to the lowest community) - the same input
+always produces byte-identical `graph.json` and report, confirmed by two
+full-corpus runs. Each is labelled LLM-free by the words its files share
+most, or by its best-connected member when it has no text.
+
+**Outputs.** `graph.json` is networkx node-link JSON, the shape
+graphify writes (`directed`, `multigraph`, `graph`, `nodes`, `links`;
+node `id`/`label`/`type`/`file_type`/`source_file`/`community`/`degree`;
+link `source`/`target`/`relation`/`confidence`/`confidence_score`/
+`weight`/`evidence`). `GRAPH_REPORT.md` covers link counts by relation
+and confidence, files by type (linked vs isolated), god nodes (distinct
+neighbors over every link but a file's own tables) and the most shared
+identifiers, communities with their composition, the strongest links
+*across* data types, text that didn't decode (files with 1%+ U+FFFD -
+where an OCR or model pass recovers words the graph can't see), documents
+with no text layer at all, isolated files, and failures. `--obsidian`
+writes a vault: a note per file (mirroring the input's folders under
+`files/`), per shared identifier (`entities/<kind>/`), per schema and
+community, YAML frontmatter with `type/<data type>`, `node/<kind>`, and
+`community/<id>` tags, every link as a `[[wikilink]]` grouped by
+relation with its evidence and confidence, a home note, and an
+`.obsidian/graph.json` that colors the graph view by data type. The
+output directory (and vault) must be new, empty, or one this tool wrote
+- marked with a `.sniff-rs-graph` file, which every directory walk
+(directory mode, `--combine`, the graph itself) now skips, so a graph
+written inside its own input is never profiled as data. A re-run
+replaces a marked vault's generated folders; an unmarked non-empty
+folder is refused rather than written into.
+
+**Queries.** `explain`/`path`/`rank` accept a `graph.json` or a
+directory (graphed in memory) as well as a dictionary or raw file.
+Over a knowledge graph they address nodes - a relative file path,
+`file#table`, `kind:value`, or any unique label - instead of columns:
+`explain` lists every link grouped by relation, `rank` the god nodes,
+most shared identifiers, and communities, and `path` a Dijkstra route
+where every hop costs the same plus a little for INFERRED/AMBIGUOUS
+links and for passing through a widely shared identifier, so equally
+short routes prefer specific, extracted links. A dictionary or raw file
+keeps the table-join behavior unchanged.
+
+**Verified** with 26 new unit tests (every entity kind and its
+near-misses, file-reference resolution, sketch overlap estimates, OOXML
+parsing, join rules, Louvain, graph.json round-trip, identifier
+grouping) and three integration tests over a committed mixed-type
+fixture folder (`tests/fixtures/edge_knowledge_graph`: CSV, JSON, a
+notebook, a PDF, markdown, a PNG, a fake `.docx`, text files, and a
+`.DS_Store`, `__pycache__`, and notebook checkpoint to skip) asserting every relation, the Obsidian notes and wikilinks,
+the query commands over both `graph.json` and the directory, the
+refusal to write into a foreign folder, and that a generated graph is
+never re-profiled. On the real corpus: 1,340 files, 2,229 nodes, 5,948
+links, 297 communities in 66 s. After the audit fixes above, links went
+from a first draft's 16,450 to 5,948 (joins 6,306 to 376, reference-
+number entities 1,754 to 118) while isolated files dropped (Word files
+70 to 32, once `.docx` text was read); 88 `.docx`/`.pdf` pairs link as
+the same document exported twice.
+
+**Disclosed boundaries.** The vault and `graph.json` contain the
+identifiers found in the files (emails, IBANs, reference numbers - card
+numbers only as their last four digits), so they're as private as the
+input. Text that didn't decode (U+FFFD) and image-only pages can't link:
+the report lists both so an OCR or model pass can target them. `.docx`
+and `.pptx` are read for the graph only - not formats `sniff-rs <file>`
+profiles. Similarity is word overlap, not meaning: two documents on one
+topic in different vocabulary won't link. Peak memory on the corpus is
+1.6 GB, almost all of it the existing PDF reader on two large PDFs, not
+the graph.
 
 ## Numeric/statistical column summaries
 

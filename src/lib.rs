@@ -3440,6 +3440,9 @@ USAGE:
     sniff-rs path <INPUT> <FROM_TABLE> <TO_TABLE> [OUTPUT_PATH]
                                                     (see `sniff-rs path --help`)
     sniff-rs rank <INPUT> [OUTPUT_PATH]             (see `sniff-rs rank --help`)
+    sniff-rs graph <INPUT> [OUTPUT_DIR]             (see `sniff-rs graph --help`):
+                                                    a knowledge graph across every file
+                                                    and data type, with an Obsidian vault
 
     If INPUT_PATH is a directory, every file under it (recursively) that
     sniff-rs can identify on its own is profiled, one output per input
@@ -4782,6 +4785,12 @@ struct ColumnProfile {
     // the same "one engine at a time" rollout this project's own inline-
     // SQL and streaming-reads campaigns already established).
     numeric_stats: Option<NumericStats>,
+    // What a content scan found in this column (shared identifiers, file
+    // references, words, a value sketch) - `Some` only while scanning is
+    // on (`sniff-rs graph`, and `explain`/`path`/`rank` over a directory),
+    // `None` for every ordinary profiling run. Never part of `to_json`:
+    // the knowledge graph consumes it directly. See `content_scan`.
+    content: Option<Box<content_scan::ColumnContent>>,
 }
 
 // This project used to have a hand-rolled `impl serde::Serialize for
@@ -4870,6 +4879,7 @@ mod column_profile_to_json_tests {
             notes: "leading zeros".to_string(),
             row_count: 2,
             numeric_stats: None,
+            content: None,
         };
         let json_support::Value::Object(obj) = p.to_json() else {
             panic!("expected an Object");
@@ -4912,6 +4922,7 @@ mod column_profile_to_json_tests {
             notes: "".to_string(),
             row_count: 5,
             numeric_stats: None,
+            content: None,
         };
         // `to_json()` rendered through the hand-rolled pretty-printer,
         // then parsed by a genuinely independent reference implementation
@@ -5142,6 +5153,7 @@ mod numeric_stats_tests {
                     ("p99".to_string(), 2.5),
                 ],
             }),
+            content: None,
         };
         let text = json_support::to_pretty_string(&p.to_json());
         let via_real: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -7327,6 +7339,8 @@ struct ColumnAccumulatorState {
     naive_acc: NaiveTypeAccumulator,
     numeric_acc: NumericStatsAccumulator,
     samples: Vec<String>,
+    /// `Some` only while content scanning is on - see `content_scan`.
+    content: Option<Box<content_scan::ContentAccumulator>>,
 }
 
 impl ColumnAccumulatorState {
@@ -7337,6 +7351,7 @@ impl ColumnAccumulatorState {
             naive_acc: NaiveTypeAccumulator::new(),
             numeric_acc: NumericStatsAccumulator::new(),
             samples: Vec::new(),
+            content: content_scan::ContentAccumulator::maybe_new(),
         }
     }
 
@@ -7362,6 +7377,9 @@ impl ColumnAccumulatorState {
         // consults this accumulator's own result once `ideal_type` has
         // already been decided to be `"i64"`/`"f64"`.
         self.numeric_acc.push(&field);
+        if let Some(content) = self.content.as_mut() {
+            content.push(&field);
+        }
         self.total_non_null += 1;
     }
 
@@ -7408,6 +7426,7 @@ impl ColumnAccumulatorState {
             naive_acc: _,
             numeric_acc,
             samples,
+            content,
         } = self;
         let missing = total.saturating_sub(total_non_null);
         let missing_pct = round1(if total > 0 {
@@ -7440,6 +7459,7 @@ impl ColumnAccumulatorState {
         } else {
             None
         };
+        let content = content.map(|c| Box::new(c.finish(&ideal_type)));
         ColumnProfile {
             name,
             current_type,
@@ -7450,6 +7470,7 @@ impl ColumnAccumulatorState {
             notes,
             row_count: total,
             numeric_stats,
+            content,
         }
     }
 }
@@ -15182,6 +15203,7 @@ mod orc_support {
                     notes: note,
                     row_count: total,
                     numeric_stats: None,
+                    content: None,
                 });
                 continue;
             }
@@ -15800,6 +15822,8 @@ struct JsonPathAccumulator {
     child_order: Vec<String>,
     child_index: HashMap<String, usize, FxBuildHasher>,
     children: Vec<JsonPathAccumulator>,
+    /// `Some` only while content scanning is on - see `content_scan`.
+    content: Option<Box<content_scan::ContentAccumulator>>,
 }
 
 impl JsonPathAccumulator {
@@ -15818,6 +15842,7 @@ impl JsonPathAccumulator {
             child_order: Vec::new(),
             child_index: HashMap::default(),
             children: Vec::new(),
+            content: content_scan::ContentAccumulator::maybe_new(),
         }
     }
 
@@ -15897,6 +15922,9 @@ impl JsonPathAccumulator {
         self.scalar_count += 1;
         self.ideal_acc.push(s);
         self.numeric_acc.push(s);
+        if let Some(content) = self.content.as_mut() {
+            content.push(s);
+        }
         if self.scalar_samples.len() < self.n_samples && !self.scalar_samples.iter().any(|x| x == s)
         {
             self.scalar_samples.push(s.to_string());
@@ -15922,6 +15950,7 @@ impl JsonPathAccumulator {
                 notes: "column is empty/all null".to_string(),
                 row_count: total,
                 numeric_stats: None,
+                content: None,
             }];
         }
 
@@ -15991,6 +16020,7 @@ impl JsonPathAccumulator {
             self.object_samples
         };
 
+        let content = self.content.map(|c| Box::new(c.finish(&ideal_type)));
         let mut result = vec![ColumnProfile {
             name: name.clone(),
             current_type,
@@ -16001,6 +16031,7 @@ impl JsonPathAccumulator {
             notes,
             row_count: total,
             numeric_stats,
+            content,
         }];
 
         if self.object_count > 0 {
@@ -64696,6 +64727,7 @@ mod npy_support {
                     notes: format!("array '{array_name}' could not be profiled: {e}"),
                     row_count: 0, // unreadable - no real row count is knowable
                     numeric_stats: None,
+                    content: None,
                 }],
             };
             out.push((array_name, profiles));
@@ -66314,6 +66346,7 @@ mod sqlite_support {
                     notes: format!("table '{}' could not be profiled: {e}", entry.name),
                     row_count: 0, // unreadable - no real row count is knowable
                     numeric_stats: None,
+                    content: None,
                 }],
             };
             out.push((entry.name, profiles));
@@ -67503,6 +67536,13 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         None
     };
 
+    let content = content_scan::ContentAccumulator::maybe_new().map(|mut acc| {
+        for v in non_null {
+            acc.push(v);
+        }
+        Box::new(acc.finish(&ideal_type))
+    });
+
     ColumnProfile {
         name: col.name,
         current_type: col.current_type,
@@ -67513,6 +67553,7 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         notes,
         row_count: col.total,
         numeric_stats,
+        content,
     }
 }
 
@@ -78503,6 +78544,8 @@ pub fn run() -> Result<()> {
         run_path(&raw[1..])
     } else if raw.first().map(String::as_str) == Some("rank") {
         run_rank(&raw[1..])
+    } else if raw.first().map(String::as_str) == Some("graph") {
+        run_graph(&raw[1..])
     } else {
         run_main(&raw)
     };
@@ -79152,6 +79195,12 @@ fn collect_files_sorted(
             // broken symlink resolves to an Err above - either way,
             // there's nothing more to do with it than skip it.
         } else if file_type.is_dir() {
+            // A folder `sniff-rs graph` generated (a graph or an Obsidian
+            // vault) is output, not input - never walked, so a later run
+            // doesn't profile its own `graph.json`.
+            if path.join(knowledge_graph::MARKER_FILE).exists() {
+                continue;
+            }
             // Prune excluded directories without descending: `--exclude
             // "target/**"` (or a bare `"target"`) never even walks the
             // tree, which matters more than correctness alone on a
@@ -82329,8 +82378,14 @@ USAGE:
     <INPUT> may be an already-generated --output-format json dictionary
     (this tool's own rich JSON shape, or the --combine directory shape)
     OR a raw data file (csv, parquet, sqlite, ... - anything sniff-rs
-    already reads), profiled fresh with default settings. Directories are
-    rejected - query a --combine dictionary instead (see below).
+    already reads), profiled fresh with default settings.
+
+    <INPUT> may also be a directory or a graph.json from `sniff-rs graph`:
+    then the query runs over the knowledge graph (every file and data
+    type, linked by joins, shared identifiers, references, and similar
+    wording - see `sniff-rs graph --help`), and <COLUMN> names a node
+    instead: a file path relative to the input, file#table, an identifier
+    as kind:value (email:alice@example.com), or any unique label.
 
     <COLUMN> is `table.column` (required when several tables share the
     name), or a bare column name when it is unique across every table -
@@ -82344,8 +82399,10 @@ USAGE:
     beyond it - --output-format json always carries the full list.
 
 ARGS:
-    <INPUT>                 Dictionary or raw data file to query
+    <INPUT>                 Dictionary, raw data file, directory, or
+                            graph.json to query
     <COLUMN>                table.column, or a unique bare column name
+                            (a node, over a knowledge graph)
     [OUTPUT_PATH]           Where the report is written (default:
                             stdout). Pass "-" to write to stdout explicitly.
 
@@ -82371,12 +82428,15 @@ USAGE:
     has no inter-table paths by construction, and disjoint table groups
     are reported as "no join path found" (exit 1), never guessed across.
 
-    <INPUT> follows the same dictionary-or-raw-file rule as
-    `sniff-rs explain` (see `sniff-rs explain --help`); directories are
-    rejected - query a --combine dictionary instead.
+    <INPUT> follows the same rules as `sniff-rs explain` (see
+    `sniff-rs explain --help`). Over a directory or a graph.json the path
+    runs between any two nodes of the knowledge graph (files, tables,
+    shared identifiers), preferring EXTRACTED links and specific
+    identifiers when two routes are equally short.
 
 ARGS:
-    <INPUT>                 Dictionary or raw data file to query
+    <INPUT>                 Dictionary, raw data file, directory, or
+                            graph.json to query
     <FROM_TABLE>            Table to start from (exact name)
     <TO_TABLE>              Table to reach (exact name)
     [OUTPUT_PATH]           Where the report is written (default:
@@ -82410,12 +82470,14 @@ USAGE:
     an arbitrary member "the hub". Isolated tables rank with degree zero
     in single-member communities rather than vanishing.
 
-    <INPUT> follows the same dictionary-or-raw-file rule as
-    `sniff-rs explain` (see `sniff-rs explain --help`); directories are
-    rejected - query a --combine dictionary instead.
+    <INPUT> follows the same rules as `sniff-rs explain` (see
+    `sniff-rs explain --help`). Over a directory or a graph.json it ranks
+    every file and table of the knowledge graph by distinct neighbors,
+    lists the most shared identifiers, and names its Louvain communities.
 
 ARGS:
-    <INPUT>                 Dictionary or raw data file to query
+    <INPUT>                 Dictionary, raw data file, directory, or
+                            graph.json to query
     [OUTPUT_PATH]           Where the report is written (default:
                             stdout). Pass "-" to write to stdout explicitly.
 
@@ -82859,6 +82921,15 @@ fn run_explain(raw: &[String]) -> Result<()> {
     let (positionals, output) = split_graph_rest(&args.rest, 1, "<INPUT> <COLUMN> [OUTPUT_PATH]")?;
     args.output = output;
     let column_spec = positionals[0].clone();
+    if let Some(kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+        let node = knowledge_graph::resolve_node(&kg, &column_spec)?;
+        let rendered = knowledge_graph::render_explain(&kg, node, &args.format)?;
+        return emit_graph_output(
+            &rendered,
+            &args.output,
+            &format!("{} explained", kg.nodes[node].id),
+        );
+    }
     let tables = load_graph_input(&args.input, args.samples)?;
     let graph = build_table_graph(&tables);
     let (table, idx) = resolve_graph_column(&tables, &column_spec)?;
@@ -82999,6 +83070,30 @@ fn run_path(raw: &[String]) -> Result<()> {
     )?;
     args.output = output;
     let (from, to) = (positionals[0].clone(), positionals[1].clone());
+    if let Some(kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+        let (a, b) = (
+            knowledge_graph::resolve_node(&kg, &from)?,
+            knowledge_graph::resolve_node(&kg, &to)?,
+        );
+        if a == b {
+            bail!("{from:?} and {to:?} are the same node - a path needs two different ones");
+        }
+        let hops = knowledge_graph::shortest_path(&kg, a, b).ok_or_else(|| {
+            anyhow!(
+                "no path between {:?} and {:?} ({} nodes, {} links) - they sit in parts of the graph nothing connects",
+                kg.nodes[a].id,
+                kg.nodes[b].id,
+                kg.nodes.len(),
+                kg.edges.len()
+            )
+        })?;
+        let rendered = knowledge_graph::render_path(&kg, a, b, &hops, &args.format)?;
+        return emit_graph_output(
+            &rendered,
+            &args.output,
+            &format!("path {} → {}", kg.nodes[a].id, kg.nodes[b].id),
+        );
+    }
     if from == to {
         bail!("{from:?} and {to:?} are the same table - a join path needs two different tables");
     }
@@ -83245,6 +83340,18 @@ fn run_rank(raw: &[String]) -> Result<()> {
     let (positionals, output) = split_graph_rest(&args.rest, 0, "<INPUT> [OUTPUT_PATH]")?;
     debug_assert!(positionals.is_empty());
     args.output = output;
+    if let Some(kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+        let rendered = knowledge_graph::render_rank(&kg, &args.format, &args.input)?;
+        return emit_graph_output(
+            &rendered,
+            &args.output,
+            &format!(
+                "{} nodes, {} communities",
+                kg.nodes.len(),
+                kg.communities.len()
+            ),
+        );
+    }
     let tables = load_graph_input(&args.input, args.samples)?;
     let graph = build_table_graph(&tables);
     let components = connected_components(&graph);
@@ -83262,6 +83369,5740 @@ fn run_rank(raw: &[String]) -> Result<()> {
             components.len()
         ),
     )
+}
+
+// --- Content scanning (knowledge-graph input) ---
+//
+// The table-join graph above (`detect_relationships` and the `explain`/
+// `path`/`rank` subcommands) only ever sees column *metadata*: names,
+// types, and a handful of sample values. That is the right signal for
+// structured data, and no signal at all for documents - every profiled
+// PDF has the same two columns (`page_number`, `text`), so on a folder of
+// documents the join graph links every PDF to every other PDF by schema
+// alone and never by what they say. `content_scan` is the missing half:
+// while a file is being profiled anyway, every value each column sees is
+// also scanned for what connects files to each other - the identifiers
+// they share (emails, domains, DOIs, ISBNs, IBANs, ...), the other files
+// they name, the words they use, and (for short scalar values) a bounded
+// sketch of the value set itself, so two columns can be compared by
+// overlap instead of by name.
+//
+// It rides the same choke points `numeric_stats` already does -
+// `ColumnAccumulatorState::push` (every flat reader),
+// `JsonPathAccumulator::absorb_scalar` (every nested/JSON-bridge reader,
+// PDF and notebooks included), and `profile_column` - so every format
+// feeds it with no per-reader code. It is off unless a `ScanGuard` is
+// alive on the current thread (only `sniff-rs graph` and the graph
+// queries create one), so ordinary profiling pays one `Option` check per
+// value and nothing else. Everything it keeps is bounded per column:
+// entities, file references, and terms are capped, and the value sketch
+// is a fixed 64 hashes.
+mod content_scan {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static KNOWN_FILES: RefCell<Option<Arc<KnownFiles>>> = const { RefCell::new(None) };
+    }
+
+    /// Whether content scanning is on for this thread.
+    pub(crate) fn enabled() -> bool {
+        ENABLED.with(Cell::get)
+    }
+
+    /// The file names a scan may report as references: only names of
+    /// files that really exist in the input are ever collected, so a
+    /// scanned value never fills its bounded reference list with
+    /// `np.array`-style dotted tokens that name nothing. Names are
+    /// lowercased. A name containing whitespace (`lecture 1.pdf`) can't be
+    /// found by splitting text on whitespace, so it is also indexed by its
+    /// last whitespace-separated word, and a match on that word checks the
+    /// text right before it for the rest of the name.
+    #[derive(Default)]
+    pub(crate) struct KnownFiles {
+        names: HashSet<String>,
+        by_last_word: HashMap<String, Vec<String>>,
+    }
+
+    impl KnownFiles {
+        pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+            let mut known = KnownFiles::default();
+            for name in names {
+                let lower = name.to_lowercase();
+                if lower.chars().count() < 3 || !lower.contains('.') {
+                    continue;
+                }
+                if lower.contains(char::is_whitespace) {
+                    if let Some(last) = lower.split_whitespace().last()
+                        && last.contains('.')
+                    {
+                        let entry = known.by_last_word.entry(last.to_string()).or_default();
+                        if !entry.contains(&lower) {
+                            entry.push(lower);
+                        }
+                    }
+                } else {
+                    known.names.insert(lower);
+                }
+            }
+            known
+        }
+    }
+
+    /// Turns content scanning on for the current thread until dropped,
+    /// restoring whatever was there before (so guards nest).
+    pub(crate) struct ScanGuard {
+        was: bool,
+        known_was: Option<Arc<KnownFiles>>,
+    }
+
+    impl ScanGuard {
+        pub(crate) fn new(known: Option<Arc<KnownFiles>>) -> Self {
+            let was = ENABLED.with(|e| e.replace(true));
+            let known_was = KNOWN_FILES.with(|k| k.replace(known));
+            ScanGuard { was, known_was }
+        }
+    }
+
+    impl Drop for ScanGuard {
+        fn drop(&mut self) {
+            ENABLED.with(|e| e.set(self.was));
+            let previous = self.known_was.take();
+            KNOWN_FILES.with(|k| *k.borrow_mut() = previous);
+        }
+    }
+
+    /// What kind of shared identifier a scan found. Everything but `Code`
+    /// and `Id` is recognized by a fixed grammar or a checksum (the same
+    /// validators type detection uses); `Code` (course/product codes like
+    /// `SIT720`) and `Id` (long reference/account-number-shaped tokens) are
+    /// shape heuristics, reported as inferred rather than extracted.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+    pub(crate) enum EntityKind {
+        Email,
+        Domain,
+        Url,
+        Doi,
+        Isbn,
+        Uuid,
+        Ip,
+        Vin,
+        Iban,
+        Card,
+        Code,
+        Id,
+    }
+
+    impl EntityKind {
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                EntityKind::Email => "email",
+                EntityKind::Domain => "domain",
+                EntityKind::Url => "url",
+                EntityKind::Doi => "doi",
+                EntityKind::Isbn => "isbn",
+                EntityKind::Uuid => "uuid",
+                EntityKind::Ip => "ip",
+                EntityKind::Vin => "vin",
+                EntityKind::Iban => "iban",
+                EntityKind::Card => "card",
+                EntityKind::Code => "code",
+                EntityKind::Id => "id",
+            }
+        }
+
+        /// Recognized by a grammar or checksum, not a shape guess.
+        pub(crate) fn is_validated(self) -> bool {
+            !matches!(self, EntityKind::Code | EntityKind::Id)
+        }
+    }
+
+    const MAX_ENTITIES: usize = 1024;
+    const MAX_REFS: usize = 256;
+    const TERM_CAP: usize = 4096;
+    pub(crate) const TERMS_KEPT: usize = 256;
+    pub(crate) const SKETCH_K: usize = 64;
+    const SKETCH_MAX_VALUE_LEN: usize = 128;
+    const MAX_TERM_CHARS: usize = 24;
+    /// A value this long with no whitespace in it is a blob (base64 image
+    /// data in a notebook's outputs, a hex dump), not text: it can't hold
+    /// words, and scanning it for them only fills the term counter with
+    /// noise.
+    const BLOB_LEN: usize = 256;
+
+    /// Word-frequency counting with a bounded map: when it fills, every
+    /// term at or below a rising floor count is dropped (lossy counting),
+    /// so frequent terms survive a long document while one-offs cycle
+    /// through. Deterministic for a given input order.
+    #[derive(Default)]
+    struct TermCounter {
+        counts: HashMap<String, u32, FxBuildHasher>,
+        floor: u32,
+    }
+
+    impl TermCounter {
+        fn add(&mut self, term: &str) {
+            if let Some(c) = self.counts.get_mut(term) {
+                *c += 1;
+                return;
+            }
+            if self.counts.len() >= TERM_CAP {
+                self.prune();
+            }
+            self.counts.insert(term.to_string(), 1);
+        }
+
+        fn prune(&mut self) {
+            loop {
+                self.floor += 1;
+                let floor = self.floor;
+                self.counts.retain(|_, c| *c > floor);
+                if self.counts.len() <= TERM_CAP * 3 / 4 {
+                    break;
+                }
+            }
+        }
+
+        fn finish(self) -> Vec<(String, u32)> {
+            let mut terms: Vec<(String, u32)> = self.counts.into_iter().collect();
+            terms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            terms.truncate(TERMS_KEPT);
+            terms
+        }
+    }
+
+    /// Everything one column's scan produced, bounded.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct ColumnContent {
+        /// `(kind, normalized value, occurrences)`, sorted by kind and value.
+        pub(crate) entities: Vec<(EntityKind, String, u32)>,
+        pub(crate) entities_truncated: bool,
+        /// Most frequent words, most frequent first.
+        pub(crate) terms: Vec<(String, u32)>,
+        /// Lowercased references to real input files, as written
+        /// (`data/sales.csv` or `sales.csv`), in first-seen order.
+        pub(crate) refs: Vec<String>,
+        /// The `SKETCH_K` smallest distinct value hashes, ascending.
+        pub(crate) sketch: Vec<u64>,
+        pub(crate) sketch_values: u64,
+        pub(crate) text_chars: u64,
+        pub(crate) unmapped_chars: u64,
+    }
+
+    impl ColumnContent {
+        /// Distinct values seen (exact below `SKETCH_K`, the standard
+        /// k-minimum-values estimate above it).
+        pub(crate) fn distinct_estimate(&self) -> f64 {
+            if self.sketch.len() < SKETCH_K {
+                return self.sketch.len() as f64;
+            }
+            let kth = *self.sketch.last().expect("sketch is full") as f64 / u64::MAX as f64;
+            if kth <= 0.0 {
+                return self.sketch.len() as f64;
+            }
+            (SKETCH_K as f64 - 1.0) / kth
+        }
+    }
+
+    /// Jaccard similarity of two value sets from their bottom-k sketches:
+    /// of the k smallest hashes in the union, the share present in both.
+    /// Exact when both sketches hold every distinct value.
+    pub(crate) fn jaccard_estimate(a: &[u64], b: &[u64]) -> f64 {
+        if a.is_empty() || b.is_empty() {
+            return 0.0;
+        }
+        let (mut i, mut j, mut taken, mut both) = (0, 0, 0usize, 0usize);
+        while taken < SKETCH_K && (i < a.len() || j < b.len()) {
+            if j >= b.len() || (i < a.len() && a[i] < b[j]) {
+                i += 1;
+            } else if i >= a.len() || b[j] < a[i] {
+                j += 1;
+            } else {
+                both += 1;
+                i += 1;
+                j += 1;
+            }
+            taken += 1;
+        }
+        both as f64 / taken as f64
+    }
+
+    /// How much of `a`'s value set appears in `b` (and vice versa), from
+    /// the Jaccard estimate and each side's distinct-count estimate:
+    /// `|A∩B| = J/(1+J) * (|A|+|B|)`.
+    pub(crate) fn containment_estimates(a: &ColumnContent, b: &ColumnContent) -> (f64, f64) {
+        let j = jaccard_estimate(&a.sketch, &b.sketch);
+        let (na, nb) = (a.distinct_estimate(), b.distinct_estimate());
+        if j <= 0.0 || na <= 0.0 || nb <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let inter = j / (1.0 + j) * (na + nb);
+        ((inter / na).min(1.0), (inter / nb).min(1.0))
+    }
+
+    /// FNV-1a, then MurmurHash3's 64-bit finalizer, so the low and high
+    /// bits are both well mixed - a bottom-k sketch reads the hash as a
+    /// uniform fraction of `u64::MAX`, which plain FNV isn't.
+    pub(crate) fn value_hash(value: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in value.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^= h >> 33;
+        h
+    }
+
+    /// `1.0` and `1` are the same value to a join; `007` and `7` are not,
+    /// so only a value with a decimal point is canonicalized.
+    fn sketch_key(value: &str) -> std::borrow::Cow<'_, str> {
+        if value.contains('.')
+            && let Ok(f) = value.parse::<f64>()
+            && f.is_finite()
+            && f.fract() == 0.0
+            && f.abs() < 1e15
+        {
+            return std::borrow::Cow::Owned((f as i64).to_string());
+        }
+        std::borrow::Cow::Borrowed(value)
+    }
+
+    /// Per-column scanning state. See the module comment.
+    pub(crate) struct ContentAccumulator {
+        entities: HashMap<(EntityKind, String), u32, FxBuildHasher>,
+        entities_truncated: bool,
+        terms: Option<TermCounter>,
+        refs: Vec<String>,
+        refs_seen: HashSet<String, FxBuildHasher>,
+        sketch: Vec<u64>,
+        sketch_values: u64,
+        text_chars: u64,
+        unmapped_chars: u64,
+        known: Option<Arc<KnownFiles>>,
+        with_sketch: bool,
+    }
+
+    impl ContentAccumulator {
+        /// A new accumulator when scanning is on for this thread.
+        pub(crate) fn maybe_new() -> Option<Box<ContentAccumulator>> {
+            enabled().then(|| Box::new(ContentAccumulator::new(true)))
+        }
+
+        pub(crate) fn new(with_sketch: bool) -> Self {
+            ContentAccumulator {
+                entities: HashMap::default(),
+                entities_truncated: false,
+                terms: None,
+                refs: Vec::new(),
+                refs_seen: HashSet::default(),
+                sketch: Vec::new(),
+                sketch_values: 0,
+                text_chars: 0,
+                unmapped_chars: 0,
+                known: KNOWN_FILES.with(|k| k.borrow().clone()),
+                with_sketch,
+            }
+        }
+
+        /// One value, as the column saw it.
+        pub(crate) fn push(&mut self, value: &str) {
+            let v = value.trim();
+            if v.is_empty() {
+                return;
+            }
+            if self.with_sketch && v.len() <= SKETCH_MAX_VALUE_LEN {
+                self.sketch_insert(value_hash(&sketch_key(v)));
+                self.sketch_values += 1;
+            }
+            if v.len() >= BLOB_LEN && !v.contains(char::is_whitespace) && !v.starts_with("http") {
+                return;
+            }
+            self.scan(v, v);
+        }
+
+        /// Scan `raw` for entities and file references and `words` for
+        /// terms - the same text for a data value, but markup files pass
+        /// their raw text (where `src="app.js"` lives) and their
+        /// tag-stripped text (where the words live) separately.
+        pub(crate) fn scan(&mut self, raw: &str, words: &str) {
+            self.scan_entities(raw);
+            self.scan_refs(raw);
+            self.scan_terms(words);
+        }
+
+        fn sketch_insert(&mut self, h: u64) {
+            if let Err(pos) = self.sketch.binary_search(&h) {
+                if self.sketch.len() < SKETCH_K {
+                    self.sketch.insert(pos, h);
+                } else if pos < SKETCH_K {
+                    self.sketch.insert(pos, h);
+                    self.sketch.pop();
+                }
+            }
+        }
+
+        fn emit(&mut self, kind: EntityKind, value: String) {
+            let len = self.entities.len();
+            match self.entities.entry((kind, value)) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    *o.get_mut() = o.get().saturating_add(1);
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    if len < MAX_ENTITIES {
+                        v.insert(1);
+                    } else {
+                        self.entities_truncated = true;
+                    }
+                }
+            }
+        }
+
+        /// Words, from each whitespace-separated chunk that reads as
+        /// prose: a chunk holding an email, a URL, a DOI, or letters mixed
+        /// with digits (`SIT720`, `ORD-1001`) is an identifier - scanned as
+        /// an entity, never split into fake words like `acme` and `corp`.
+        fn scan_terms(&mut self, text: &str) {
+            for chunk in text.split(char::is_whitespace) {
+                if chunk.is_empty() {
+                    self.text_chars += 1;
+                    continue;
+                }
+                if is_identifier_chunk(chunk) {
+                    let chars = chunk.chars().count() as u64;
+                    self.text_chars += chars + 1;
+                    self.unmapped_chars +=
+                        chunk.chars().filter(|c| *c == '\u{FFFD}').count() as u64;
+                    continue;
+                }
+                self.scan_chunk_terms(chunk);
+                self.text_chars += 1;
+            }
+            // The loop counted one separator per chunk; a text has one fewer.
+            self.text_chars = self.text_chars.saturating_sub(1);
+        }
+
+        fn scan_chunk_terms(&mut self, text: &str) {
+            let mut word = String::new();
+            let mut chars = 0usize;
+            let mut vowel = false;
+            let mut non_ascii = false;
+            for c in text.chars() {
+                self.text_chars += 1;
+                if c == '\u{FFFD}' {
+                    self.unmapped_chars += 1;
+                }
+                if c.is_alphabetic() {
+                    if chars < MAX_TERM_CHARS {
+                        for lc in c.to_lowercase() {
+                            word.push(lc);
+                        }
+                    }
+                    chars += 1;
+                    if !c.is_ascii() {
+                        non_ascii = true;
+                    } else if matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
+                        vowel = true;
+                    }
+                } else if chars > 0 {
+                    self.flush_word(&word, chars, vowel || non_ascii);
+                    word.clear();
+                    chars = 0;
+                    vowel = false;
+                    non_ascii = false;
+                }
+            }
+            if chars > 0 {
+                self.flush_word(&word, chars, vowel || non_ascii);
+            }
+        }
+
+        fn flush_word(&mut self, word: &str, chars: usize, pronounceable: bool) {
+            if !(3..=MAX_TERM_CHARS).contains(&chars) || !pronounceable || is_stopword(word) {
+                return;
+            }
+            self.terms
+                .get_or_insert_with(TermCounter::default)
+                .add(word);
+        }
+
+        fn scan_refs(&mut self, text: &str) {
+            let Some(known) = self.known.clone() else {
+                return;
+            };
+            if !text.contains('.') {
+                return;
+            }
+            let mut start = None;
+            for (i, c) in text
+                .char_indices()
+                .chain(std::iter::once((text.len(), ' ')))
+            {
+                if is_ref_delim(c) {
+                    if let Some(s) = start.take() {
+                        self.ref_token(&known, text, s, i);
+                    }
+                } else if start.is_none() {
+                    start = Some(i);
+                }
+            }
+        }
+
+        /// One delimited token, `text[s..e]`: a reference if its last path
+        /// component names a known file, or if it is the last word of a
+        /// known multi-word name whose other words sit right before it.
+        fn ref_token(&mut self, known: &KnownFiles, text: &str, s: usize, e: usize) {
+            let raw = &text[s..e];
+            if raw.len() < 3 || raw.len() > 512 || !raw.contains('.') {
+                return;
+            }
+            let trimmed = raw.trim_end_matches(['.', ':', ',', ';', '!', '?']);
+            let lead = trimmed.len() - trimmed.trim_start_matches(['.', '/']).len();
+            let tok = &trimmed[lead..];
+            let tok_start = s + lead;
+            let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+            if base.len() < 3 {
+                return;
+            }
+            let base_lower = base.to_lowercase();
+            if known.names.contains(&base_lower) {
+                self.add_ref(tok.replace('\\', "/").to_lowercase());
+            }
+            if base.len() != tok.len() {
+                return;
+            }
+            if let Some(candidates) = known.by_last_word.get(&base_lower) {
+                for full in candidates {
+                    let prefix_len = full.len() - base_lower.len();
+                    if let Some(begin) = tok_start.checked_sub(prefix_len)
+                        && text.is_char_boundary(begin)
+                        && text[begin..tok_start].to_lowercase() == full[..prefix_len]
+                    {
+                        let full = full.clone();
+                        self.add_ref(full);
+                    }
+                }
+            }
+        }
+
+        fn add_ref(&mut self, reference: String) {
+            if self.refs.len() < MAX_REFS && self.refs_seen.insert(reference.clone()) {
+                self.refs.push(reference);
+            }
+        }
+
+        fn scan_entities(&mut self, text: &str) {
+            if text.len() < 4 {
+                return;
+            }
+            let chunks: Vec<&str> = text
+                .split(is_entity_delim)
+                .filter(|c| !c.is_empty())
+                .collect();
+            let mut i = 0;
+            while i < chunks.len() {
+                i += self.entity_at(&chunks, i).max(1);
+            }
+        }
+
+        /// The entity (if any) starting at chunk `i`, returning how many
+        /// chunks it spans (an IBAN written in groups spans several).
+        fn entity_at(&mut self, chunks: &[&str], i: usize) -> usize {
+            let tok = trim_token(chunks[i]);
+            let b = tok.as_bytes();
+            if b.len() < 4 {
+                return 1;
+            }
+            if tok.contains('@') {
+                self.try_email(tok);
+                return 1;
+            }
+            if starts_with_ignore_case(tok, "http://")
+                || starts_with_ignore_case(tok, "https://")
+                || starts_with_ignore_case(tok, "ftp://")
+                || starts_with_ignore_case(tok, "www.")
+            {
+                self.try_url(tok);
+                return 1;
+            }
+            if let Some(doi) = doi_candidate(tok) {
+                self.emit(EntityKind::Doi, doi);
+                return 1;
+            }
+            if b.len() == 36 && is_uuid(tok) {
+                self.emit(EntityKind::Uuid, tok.to_ascii_lowercase());
+                return 1;
+            }
+            if (7..=15).contains(&b.len())
+                && b.iter().all(|c| c.is_ascii_digit() || *c == b'.')
+                && b.iter().filter(|c| **c == b'.').count() == 3
+            {
+                if is_ipv4(tok) && !reserved_ipv4(tok) {
+                    self.emit(EntityKind::Ip, tok.to_string());
+                }
+                return 1;
+            }
+            if let Some(isbn) = isbn_candidate(chunks, i, tok) {
+                self.emit(EntityKind::Isbn, isbn);
+                return 1;
+            }
+            if b.len() == 17 && b.iter().all(u8::is_ascii_alphanumeric) {
+                let upper = tok.to_ascii_uppercase();
+                if is_vin(&upper)
+                    && b.iter().any(u8::is_ascii_digit)
+                    && b.iter().any(u8::is_ascii_alphabetic)
+                {
+                    self.emit(EntityKind::Vin, upper);
+                    return 1;
+                }
+            }
+            if b[0].is_ascii_uppercase()
+                && b[1].is_ascii_uppercase()
+                && b[2].is_ascii_digit()
+                && b[3].is_ascii_digit()
+                && let Some((iban, spanned)) = iban_at(chunks, i, tok)
+            {
+                self.emit(EntityKind::Iban, iban);
+                return spanned;
+            }
+            if is_course_code(tok) {
+                self.emit(EntityKind::Code, tok.to_string());
+                return 1;
+            }
+            if let Some((kind, value)) = identifier(tok) {
+                self.emit(kind, value);
+            }
+            1
+        }
+
+        fn try_email(&mut self, tok: &str) {
+            let tok = strip_prefix_ignore_case(tok, "mailto:").unwrap_or(tok);
+            if tok.matches('@').count() != 1 || !is_email(tok) {
+                return;
+            }
+            let email = tok.to_lowercase();
+            let domain = email.rsplit_once('@').map(|(_, d)| d.to_string());
+            self.emit(EntityKind::Email, email);
+            if let Some(domain) = domain
+                && valid_host(&domain)
+                && !WEBMAIL_DOMAINS.contains(&domain.as_str())
+            {
+                self.emit(EntityKind::Domain, domain);
+            }
+        }
+
+        fn try_url(&mut self, tok: &str) {
+            // ASCII lowercasing keeps byte offsets, so positions found in
+            // `lower` index the original too.
+            let lower = tok.to_ascii_lowercase();
+            let scheme_len = ["https://", "http://", "ftp://"]
+                .iter()
+                .find(|p| lower.starts_with(**p))
+                .map_or(0, |p| p.len());
+            let rest = &lower[scheme_len..];
+            let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let mut host = &rest[..host_end];
+            if let Some(at) = host.rfind('@') {
+                host = &host[at + 1..];
+            }
+            if let Some(colon) = host.find(':') {
+                host = &host[..colon];
+            }
+            let host = host.strip_prefix("www.").unwrap_or(host);
+            if !valid_host(host) || NAMESPACE_HOSTS.contains(&host) {
+                return;
+            }
+            let host = host.to_string();
+            let path = &tok[scheme_len + host_end..];
+            let path = path.split('#').next().unwrap_or("").trim_end_matches('/');
+            if (host == "doi.org" || host == "dx.doi.org")
+                && let Some(doi) = doi_candidate(path.trim_start_matches('/'))
+            {
+                self.emit(EntityKind::Doi, doi);
+            }
+            let url = format!("{host}{path}");
+            if url.len() <= 200 && !path.is_empty() {
+                self.emit(EntityKind::Url, url);
+            }
+            self.emit(EntityKind::Domain, host);
+        }
+
+        /// The finished summary. `ideal_type` is the column's resolved
+        /// type: an `Id`/`Card` found in a numeric, date, or boolean
+        /// column is a measurement, not an identifier, and is dropped.
+        pub(crate) fn finish(self, ideal_type: &str) -> ColumnContent {
+            let base = ideal_type
+                .strip_prefix("Vec<")
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or(ideal_type);
+            let measured = matches!(
+                base,
+                "i64" | "f64" | "bool" | "NaiveDate / DateTime" | "NaiveTime"
+            );
+            let mut entities: Vec<(EntityKind, String, u32)> = self
+                .entities
+                .into_iter()
+                .filter(|((k, _), _)| !(measured && matches!(k, EntityKind::Id | EntityKind::Card)))
+                .map(|((k, v), c)| (k, v, c))
+                .collect();
+            entities.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            ColumnContent {
+                entities,
+                entities_truncated: self.entities_truncated,
+                terms: self.terms.map(TermCounter::finish).unwrap_or_default(),
+                refs: self.refs,
+                sketch: self.sketch,
+                sketch_values: self.sketch_values,
+                text_chars: self.text_chars,
+                unmapped_chars: self.unmapped_chars,
+            }
+        }
+    }
+
+    /// Generic webmail providers: an address there says nothing about an
+    /// organization, so it links as an email but not as a domain.
+    const WEBMAIL_DOMAINS: [&str; 24] = [
+        "126.com",
+        "163.com",
+        "aol.com",
+        "bigpond.com",
+        "gmail.com",
+        "gmx.com",
+        "gmx.de",
+        "googlemail.com",
+        "hotmail.co.uk",
+        "hotmail.com",
+        "icloud.com",
+        "live.com",
+        "mac.com",
+        "mail.com",
+        "me.com",
+        "msn.com",
+        "optusnet.com.au",
+        "outlook.com",
+        "proton.me",
+        "protonmail.com",
+        "qq.com",
+        "yahoo.com",
+        "yahoo.com.au",
+        "yandex.com",
+    ];
+
+    /// Hosts that appear in XML namespace and schema declarations
+    /// (`xmlns="http://www.w3.org/2000/svg"`), in every file of a format
+    /// rather than because of what any file says.
+    const NAMESPACE_HOSTS: [&str; 8] = [
+        "ns.adobe.com",
+        "openxmlformats.org",
+        "purl.org",
+        "schema.org",
+        "schemas.microsoft.com",
+        "schemas.openxmlformats.org",
+        "w3.org",
+        "xmlns.com",
+    ];
+
+    /// English function words, plus URL fragments that tokenize as words.
+    /// Sorted, for `binary_search`.
+    const STOPWORDS: &[&str] = &[
+        "about",
+        "above",
+        "after",
+        "again",
+        "against",
+        "all",
+        "also",
+        "although",
+        "always",
+        "among",
+        "and",
+        "another",
+        "any",
+        "are",
+        "around",
+        "because",
+        "been",
+        "before",
+        "being",
+        "below",
+        "between",
+        "both",
+        "but",
+        "can",
+        "cannot",
+        "com",
+        "could",
+        "did",
+        "does",
+        "doing",
+        "done",
+        "down",
+        "during",
+        "each",
+        "either",
+        "else",
+        "even",
+        "ever",
+        "every",
+        "few",
+        "for",
+        "from",
+        "further",
+        "get",
+        "gets",
+        "got",
+        "had",
+        "has",
+        "have",
+        "having",
+        "her",
+        "here",
+        "hers",
+        "herself",
+        "him",
+        "himself",
+        "his",
+        "how",
+        "however",
+        "html",
+        "http",
+        "https",
+        "into",
+        "its",
+        "itself",
+        "just",
+        "least",
+        "less",
+        "let",
+        "like",
+        "made",
+        "make",
+        "many",
+        "may",
+        "might",
+        "more",
+        "most",
+        "much",
+        "must",
+        "near",
+        "neither",
+        "net",
+        "never",
+        "nor",
+        "not",
+        "now",
+        "off",
+        "often",
+        "once",
+        "one",
+        "only",
+        "onto",
+        "org",
+        "other",
+        "others",
+        "our",
+        "ours",
+        "ourselves",
+        "out",
+        "over",
+        "own",
+        "per",
+        "perhaps",
+        "quite",
+        "rather",
+        "said",
+        "same",
+        "see",
+        "seen",
+        "several",
+        "she",
+        "should",
+        "since",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "themselves",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "though",
+        "through",
+        "thus",
+        "too",
+        "toward",
+        "towards",
+        "two",
+        "under",
+        "unless",
+        "until",
+        "upon",
+        "use",
+        "used",
+        "uses",
+        "using",
+        "very",
+        "via",
+        "was",
+        "way",
+        "well",
+        "were",
+        "what",
+        "when",
+        "whenever",
+        "where",
+        "whether",
+        "which",
+        "while",
+        "who",
+        "whom",
+        "whose",
+        "why",
+        "will",
+        "with",
+        "within",
+        "without",
+        "would",
+        "www",
+        "yet",
+        "you",
+        "your",
+        "yours",
+        "yourself",
+        "yourselves",
+    ];
+
+    fn is_identifier_chunk(chunk: &str) -> bool {
+        let b = chunk.as_bytes();
+        chunk.contains('@')
+            || chunk.contains("://")
+            || starts_with_ignore_case(chunk, "www.")
+            || starts_with_ignore_case(chunk, "doi:")
+            || (b.iter().any(u8::is_ascii_digit) && b.iter().any(u8::is_ascii_alphabetic))
+    }
+
+    fn is_stopword(word: &str) -> bool {
+        STOPWORDS.binary_search(&word).is_ok()
+    }
+
+    fn is_entity_delim(c: char) -> bool {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ',' | ';'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '|'
+                    | '\\'
+            )
+    }
+
+    fn is_ref_delim(c: char) -> bool {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\''
+                    | '`'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | '='
+                    | '|'
+                    | '!'
+                    | '?'
+                    | '*'
+            )
+    }
+
+    fn trim_token(tok: &str) -> &str {
+        tok.trim_start_matches([':', '*', '#', '~', '!', '?'])
+            .trim_end_matches(['.', ':', '!', '?', '*', '#', '~', ','])
+    }
+
+    fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+        s.len() >= prefix.len()
+            && s.is_char_boundary(prefix.len())
+            && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
+    fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        starts_with_ignore_case(s, prefix).then(|| &s[prefix.len()..])
+    }
+
+    /// A DNS host name with an alphabetic top-level label - not an IP
+    /// address, not a bare word.
+    fn valid_host(host: &str) -> bool {
+        if !(4..=253).contains(&host.len()) || !host.contains('.') {
+            return false;
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        let tld = labels.last().copied().unwrap_or("");
+        tld.len() >= 2
+            && tld.bytes().all(|c| c.is_ascii_alphabetic())
+            && labels.iter().all(|l| {
+                !l.is_empty()
+                    && !l.starts_with('-')
+                    && !l.ends_with('-')
+                    && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+    }
+
+    /// `10.<4-9 digits>/<suffix>`, optionally prefixed `doi:`.
+    fn doi_candidate(tok: &str) -> Option<String> {
+        let t = strip_prefix_ignore_case(tok, "doi:").unwrap_or(tok);
+        let rest = t.strip_prefix("10.")?;
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if !(4..=9).contains(&digits) || rest.as_bytes().get(digits) != Some(&b'/') {
+            return None;
+        }
+        if rest.len() <= digits + 1 {
+            return None;
+        }
+        Some(t.to_lowercase())
+    }
+
+    fn reserved_ipv4(ip: &str) -> bool {
+        ip == "0.0.0.0" || ip == "255.255.255.255" || ip.starts_with("127.")
+    }
+
+    /// An ISBN, normalized to its 13 digits. Accepted only with an `ISBN`
+    /// label right before it (or glued to it), or written hyphenated the
+    /// way ISBNs are printed - a bare 10- or 13-digit number passes the
+    /// checksum by chance too often to trust on its own.
+    fn isbn_candidate(chunks: &[&str], i: usize, tok: &str) -> Option<String> {
+        let label = |s: &str| {
+            let s = s.trim_end_matches(':').to_ascii_lowercase();
+            matches!(
+                s.as_str(),
+                "isbn" | "isbn-10" | "isbn-13" | "isbn10" | "isbn13"
+            )
+        };
+        let mut body = tok;
+        let mut context = false;
+        if let Some(rest) = strip_prefix_ignore_case(tok, "isbn") {
+            let rest = rest
+                .strip_prefix("-13")
+                .or_else(|| rest.strip_prefix("-10"))
+                .or_else(|| rest.strip_prefix("13"))
+                .or_else(|| rest.strip_prefix("10"))
+                .filter(|r| r.starts_with(':'))
+                .unwrap_or(rest);
+            body = rest.trim_start_matches([':', '-']);
+            context = true;
+        }
+        if !body.bytes().next().is_some_and(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        if i > 0 && label(trim_token(chunks[i - 1])) {
+            context = true;
+        }
+        if i > 1 {
+            let prev = trim_token(chunks[i - 1]).trim_end_matches(':');
+            if (prev == "10" || prev == "13") && label(trim_token(chunks[i - 2])) {
+                context = true;
+            }
+        }
+        let hyphenated = body.matches('-').count() >= 3;
+        if !(context || hyphenated) {
+            return None;
+        }
+        let cleaned: String = body.chars().filter(|c| *c != '-').collect();
+        if cleaned.len() == 13 && is_isbn13(&cleaned) {
+            return Some(cleaned);
+        }
+        if cleaned.len() == 10 && is_isbn10(&cleaned) {
+            return Some(isbn10_to_13(&cleaned));
+        }
+        None
+    }
+
+    /// The ISBN-13 form of a valid ISBN-10: `978`, the first nine digits,
+    /// and a recomputed EAN check digit, so both printings of the same
+    /// book link.
+    pub(crate) fn isbn10_to_13(isbn10: &str) -> String {
+        let mut digits: Vec<u32> = vec![9, 7, 8];
+        digits.extend(isbn10.chars().take(9).filter_map(|c| c.to_digit(10)));
+        let sum: u32 = digits
+            .iter()
+            .enumerate()
+            .map(|(i, d)| if i % 2 == 0 { *d } else { d * 3 })
+            .sum();
+        digits.push((10 - sum % 10) % 10);
+        digits.iter().map(|d| char::from(b'0' + *d as u8)).collect()
+    }
+
+    /// An IBAN at chunk `i`, whole or printed in groups of up to four
+    /// (`GB82 WEST 1234 5698 7654 32`), as its compact uppercase form plus
+    /// the number of chunks it spans. The longest valid run wins.
+    fn iban_at(chunks: &[&str], i: usize, tok: &str) -> Option<(String, usize)> {
+        let upper = tok.to_ascii_uppercase();
+        if upper.len() >= 15 {
+            return (upper.len() <= 34 && is_iban(&upper)).then_some((upper, 1));
+        }
+        if !upper.bytes().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let mut compact = upper;
+        let mut best = None;
+        let mut j = i + 1;
+        while j < chunks.len() && j <= i + 9 {
+            let next = trim_token(chunks[j]);
+            if next.is_empty() || next.len() > 4 || !next.bytes().all(|c| c.is_ascii_alphanumeric())
+            {
+                break;
+            }
+            compact.push_str(&next.to_ascii_uppercase());
+            if compact.len() > 34 {
+                break;
+            }
+            if compact.len() >= 15 && is_iban(&compact) {
+                best = Some((compact.clone(), j - i + 1));
+            }
+            j += 1;
+        }
+        best
+    }
+
+    /// `SIT720`, `COMP1511`, `MATH1131A`: two to five capital letters and
+    /// three to five digits, the shape of course and product codes.
+    fn is_course_code(tok: &str) -> bool {
+        let b = tok.as_bytes();
+        let letters = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
+        let digits = b[letters..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let tail = b.len() - letters - digits;
+        (2..=5).contains(&letters)
+            && (3..=5).contains(&digits)
+            && (tail == 0 || (tail == 1 && b[b.len() - 1].is_ascii_uppercase()))
+    }
+
+    /// A reference-number-shaped token: 8-20 digits (optionally grouped
+    /// with `-`/`_`) that isn't a date, or an uppercase reference like
+    /// `INV-2024-00123` (a capital letter first, no lowercase, at least
+    /// five digits). Lowercase or hex-like mixes (`9a7f3e...`, CSS and
+    /// minified-code fragments) are not identifiers. A Luhn-valid 13-19
+    /// digit number is kept as a `Card`, keyed by a hash and labelled by
+    /// its last four digits so the full number never leaves the scan.
+    fn identifier(tok: &str) -> Option<(EntityKind, String)> {
+        let b = tok.as_bytes();
+        if !(8..=40).contains(&b.len())
+            || !b
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+            || !b[0].is_ascii_alphanumeric()
+        {
+            return None;
+        }
+        let digits = b.iter().filter(|c| c.is_ascii_digit()).count();
+        let letters = b.iter().filter(|c| c.is_ascii_alphabetic()).count();
+        if letters == 0 {
+            if date_shaped(tok) {
+                return None;
+            }
+            let d: String = tok.chars().filter(char::is_ascii_digit).collect();
+            let first = d.as_bytes().first().copied()?;
+            if !(8..=20).contains(&d.len()) || d.bytes().all(|c| c == first) {
+                return None;
+            }
+            if d.len() == 8 && yyyymmdd(&d) {
+                return None;
+            }
+            if (13..=19).contains(&d.len()) {
+                let ds: Vec<u32> = d.chars().filter_map(|c| c.to_digit(10)).collect();
+                if luhn_checksum_valid(&ds) {
+                    let last4 = &d[d.len() - 4..];
+                    return Some((
+                        EntityKind::Card,
+                        format!("…{last4}#{:08x}", value_hash(&d) >> 32),
+                    ));
+                }
+            }
+            return Some((EntityKind::Id, d));
+        }
+        if digits < 5
+            || letters > 8
+            || !b[0].is_ascii_uppercase()
+            || b.iter().any(u8::is_ascii_lowercase)
+        {
+            return None;
+        }
+        Some((EntityKind::Id, tok.to_string()))
+    }
+
+    /// `2024-01-15`, `15-01-2024`, `2019-2020`: digit groups shaped like a
+    /// date or a year range.
+    fn date_shaped(tok: &str) -> bool {
+        let groups: Vec<usize> = tok.split(['-', '_']).map(str::len).collect();
+        matches!(
+            groups.as_slice(),
+            [4, 2, 2] | [2, 2, 4] | [4, 4] | [4, 1, 1] | [1, 1, 4]
+        )
+    }
+
+    fn yyyymmdd(d: &str) -> bool {
+        let n = |r: std::ops::Range<usize>| d[r].parse::<u32>().unwrap_or(0);
+        (1900..=2100).contains(&n(0..4))
+            && (1..=12).contains(&n(4..6))
+            && (1..=31).contains(&n(6..8))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scan(text: &str) -> ColumnContent {
+            let mut acc = ContentAccumulator::new(true);
+            acc.push(text);
+            acc.finish("String")
+        }
+
+        fn entities(text: &str) -> Vec<(EntityKind, String)> {
+            scan(text)
+                .entities
+                .into_iter()
+                .map(|(k, v, _)| (k, v))
+                .collect()
+        }
+
+        #[test]
+        fn stopwords_are_sorted_for_binary_search() {
+            assert!(STOPWORDS.windows(2).all(|w| w[0] < w[1]));
+            assert!(WEBMAIL_DOMAINS.windows(2).all(|w| w[0] < w[1]));
+            assert!(NAMESPACE_HOSTS.windows(2).all(|w| w[0] < w[1]));
+        }
+
+        #[test]
+        fn emails_link_their_organization_domain_but_not_webmail() {
+            let found = entities("Contact Alice.Smith@Example.edu.au or bob@gmail.com.");
+            assert!(found.contains(&(EntityKind::Email, "alice.smith@example.edu.au".into())));
+            assert!(found.contains(&(EntityKind::Domain, "example.edu.au".into())));
+            assert!(found.contains(&(EntityKind::Email, "bob@gmail.com".into())));
+            assert!(!found.contains(&(EntityKind::Domain, "gmail.com".into())));
+        }
+
+        #[test]
+        fn urls_yield_domain_url_and_doi() {
+            let found = entities(
+                "See (https://www.Example.com/data/x.csv). Paper: https://doi.org/10.1000/XYZ123.",
+            );
+            assert!(found.contains(&(EntityKind::Domain, "example.com".into())));
+            assert!(found.contains(&(EntityKind::Url, "example.com/data/x.csv".into())));
+            assert!(found.contains(&(EntityKind::Doi, "10.1000/xyz123".into())));
+            assert!(found.contains(&(EntityKind::Domain, "doi.org".into())));
+        }
+
+        #[test]
+        fn bare_and_prefixed_dois() {
+            assert_eq!(
+                entities("doi:10.1038/nphys1170 and 10.1145/3292500.3330701"),
+                vec![
+                    (EntityKind::Doi, "10.1038/nphys1170".into()),
+                    (EntityKind::Doi, "10.1145/3292500.3330701".into()),
+                ]
+            );
+            assert!(entities("version 10.5 and 10.12/ab").is_empty());
+        }
+
+        #[test]
+        fn isbns_need_a_label_or_hyphens_and_normalize_to_13_digits() {
+            // 0306406152 is the ISBN-10 of 9780306406157.
+            assert_eq!(
+                entities("ISBN 0-306-40615-2"),
+                vec![(EntityKind::Isbn, "9780306406157".into())]
+            );
+            assert_eq!(
+                entities("isbn: 9780306406157"),
+                vec![(EntityKind::Isbn, "9780306406157".into())]
+            );
+            assert_eq!(
+                entities("ISBN-13: 978-0-306-40615-7"),
+                vec![(EntityKind::Isbn, "9780306406157".into())]
+            );
+            // Unlabelled and unhyphenated: a checksum-valid number alone is
+            // not trusted as an ISBN (it falls through to a plain id).
+            assert_eq!(
+                entities("ref 9780306406157"),
+                vec![(EntityKind::Id, "9780306406157".into())]
+            );
+        }
+
+        #[test]
+        fn ibans_are_found_whole_and_in_printed_groups() {
+            assert_eq!(
+                entities("IBAN: GB82 WEST 1234 5698 7654 32."),
+                vec![(EntityKind::Iban, "GB82WEST12345698765432".into())]
+            );
+            assert_eq!(
+                entities("pay DE89370400440532013000 now"),
+                vec![(EntityKind::Iban, "DE89370400440532013000".into())]
+            );
+            // A tampered check digit is not an IBAN.
+            assert!(
+                !entities("GB83 WEST 1234 5698 7654 32")
+                    .iter()
+                    .any(|(k, _)| *k == EntityKind::Iban)
+            );
+        }
+
+        #[test]
+        fn uuid_ip_vin_and_codes() {
+            let found = entities(
+                "id 123E4567-E89B-12D3-A456-426614174000 host 10.1.2.3 loop 127.0.0.1 car 1HGCM82633A004352 unit SIT720",
+            );
+            assert!(found.contains(&(
+                EntityKind::Uuid,
+                "123e4567-e89b-12d3-a456-426614174000".into()
+            )));
+            assert!(found.contains(&(EntityKind::Ip, "10.1.2.3".into())));
+            assert!(!found.iter().any(|(_, v)| v == "127.0.0.1"));
+            assert!(found.contains(&(EntityKind::Vin, "1HGCM82633A004352".into())));
+            assert!(found.contains(&(EntityKind::Code, "SIT720".into())));
+        }
+
+        #[test]
+        fn identifiers_skip_dates_and_mask_card_numbers() {
+            let found = entities(
+                "ref 00412345678 on 2024-01-15 or 20240115, acct 12345678, card 4111111111111111",
+            );
+            assert!(found.contains(&(EntityKind::Id, "00412345678".into())));
+            assert!(found.contains(&(EntityKind::Id, "12345678".into())));
+            assert!(!found.iter().any(|(_, v)| v.contains("2024")));
+            let card = found
+                .iter()
+                .find(|(k, _)| *k == EntityKind::Card)
+                .expect("card found");
+            assert!(card.1.starts_with("…1111#"));
+            assert!(!found.iter().any(|(_, v)| v.contains("4111111111111111")));
+        }
+
+        #[test]
+        fn identifiers_in_a_numeric_column_are_measurements() {
+            let mut acc = ContentAccumulator::new(true);
+            acc.push("12345678");
+            acc.push("87654321");
+            assert!(acc.finish("i64").entities.is_empty());
+        }
+
+        #[test]
+        fn terms_skip_stopwords_short_words_and_blobs() {
+            let content = scan("The neural network and THE network's weights: a b cd");
+            let terms: Vec<&str> = content.terms.iter().map(|(t, _)| t.as_str()).collect();
+            assert_eq!(terms, vec!["network", "neural", "weights"]);
+            assert_eq!(content.terms[0].1, 2);
+            let blob = "iVBORw0KGgoAAAANSUhEUgAA".repeat(20);
+            assert!(scan(&blob).terms.is_empty());
+        }
+
+        #[test]
+        fn unmapped_characters_are_counted() {
+            let content = scan("ab\u{FFFD}\u{FFFD} cd");
+            assert_eq!(content.unmapped_chars, 2);
+            assert_eq!(content.text_chars, 7);
+        }
+
+        #[test]
+        fn file_references_resolve_only_to_known_names() {
+            let known = Arc::new(KnownFiles::new(["sales.csv", "Lecture 1.pdf", "notes.txt"]));
+            let _guard = ScanGuard::new(Some(known));
+            let mut acc = ContentAccumulator::new(false);
+            acc.push("df = pd.read_csv('data/Sales.csv'); np.array(x)");
+            acc.push("see lecture 1.pdf, and notes.txt.");
+            acc.push("unknown.csv");
+            let refs = acc.finish("String").refs;
+            assert_eq!(refs, vec!["data/sales.csv", "lecture 1.pdf", "notes.txt"]);
+        }
+
+        #[test]
+        fn scanning_is_off_without_a_guard() {
+            assert!(!enabled());
+            assert!(ContentAccumulator::maybe_new().is_none());
+            {
+                let _guard = ScanGuard::new(None);
+                assert!(enabled());
+                assert!(ContentAccumulator::maybe_new().is_some());
+            }
+            assert!(!enabled());
+        }
+
+        #[test]
+        fn sketches_estimate_overlap() {
+            let mut a = ContentAccumulator::new(true);
+            let mut b = ContentAccumulator::new(true);
+            for i in 0..1000 {
+                a.push(&format!("K{i}"));
+            }
+            for i in 500..1500 {
+                b.push(&format!("K{i}"));
+            }
+            let (a, b) = (a.finish("String"), b.finish("String"));
+            let j = jaccard_estimate(&a.sketch, &b.sketch);
+            // True Jaccard: 500 / 1500.
+            assert!((j - 1.0 / 3.0).abs() < 0.15, "jaccard {j}");
+            let est = a.distinct_estimate();
+            assert!((est - 1000.0).abs() < 400.0, "distinct {est}");
+            let (ca, cb) = containment_estimates(&a, &b);
+            assert!(
+                (ca - 0.5).abs() < 0.2 && (cb - 0.5).abs() < 0.2,
+                "{ca} {cb}"
+            );
+            // Small sets are exact.
+            let mut c = ContentAccumulator::new(true);
+            let mut d = ContentAccumulator::new(true);
+            for v in ["a", "b", "c", "d"] {
+                c.push(v);
+            }
+            for v in ["c", "d", "1.0"] {
+                d.push(v);
+            }
+            d.push("1");
+            let (c, d) = (c.finish("String"), d.finish("String"));
+            assert_eq!(d.sketch.len(), 3, "1.0 and 1 are one value");
+            assert_eq!(jaccard_estimate(&c.sketch, &d.sketch), 2.0 / 5.0);
+        }
+
+        #[test]
+        fn isbn10_converts_to_isbn13() {
+            assert_eq!(isbn10_to_13("0306406152"), "9780306406157");
+            assert_eq!(isbn10_to_13("097522980X"), "9780975229804");
+        }
+    }
+}
+
+// --- Knowledge graph (`sniff-rs graph`) ---
+//
+// A graphify-style knowledge graph over every file in a folder, of every
+// data type: files (and the tables inside multi-table files) are nodes,
+// and so are the identifiers two or more files share. Links say what
+// connects them and how sure that is (graphify's own EXTRACTED /
+// INFERRED / AMBIGUOUS vocabulary), each with its evidence:
+//
+//   contains    a multi-table file to each of its tables
+//   has_schema  a table to the schema it shares with other tables
+//               (versioned exports, monthly sheets)
+//   joins       two tables whose columns line up by name and/or values
+//   mentions    a file to a shared identifier found in its content
+//   references  a file naming another file (`read_csv("sales.csv")`)
+//   similar_to  two files whose wording overlaps (TF-IDF cosine)
+//   same_name   two files sharing a name stem (`report.pdf`/`report.docx`)
+//
+// Schema links only connect formats whose columns someone authored (CSV,
+// Excel, SQLite, JSON, ...): a PDF's `page_number`/`text` or a notebook's
+// cell structure is fixed by the format, so two PDFs sharing it say
+// nothing about each other - they connect through what they contain
+// instead. Communities come from Louvain modularity (deterministic node
+// order and tie-breaks), labelled by the words their files share.
+mod knowledge_graph {
+    use super::content_scan::{self, ColumnContent, EntityKind, KnownFiles, ScanGuard};
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    /// Written into every directory this tool generates a graph or vault
+    /// into: directory walks skip a directory holding it (so a later run
+    /// never profiles its own `graph.json`), and a re-run may clear it.
+    pub(crate) const MARKER_FILE: &str = ".sniff-rs-graph";
+
+    /// Directories that are never user content: version-control
+    /// internals, caches, and editor state.
+    const SKIP_DIRS: [&str; 7] = [
+        ".git",
+        ".hg",
+        ".ipynb_checkpoints",
+        ".obsidian",
+        ".svn",
+        "__pycache__",
+        "node_modules",
+    ];
+
+    /// Operating-system clutter files.
+    const SKIP_FILES: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
+
+    /// Largest text file scanned for content; anything past this is left
+    /// unread (and the file's node says so).
+    const MAX_TEXT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// Sample values longer than this are cut when a file is kept for the
+    /// graph: a long sample (a page of text, a base64 image) is never a
+    /// join key, and hundreds of files' worth of them is real memory.
+    const MAX_KEPT_SAMPLE_BYTES: usize = 256;
+
+    /// How one input file was read.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FileKind {
+        /// Profiled by one of this tool's readers.
+        Data,
+        /// Not a profiled format, but text: scanned for links only.
+        Text,
+        /// Neither (an image, a video, an archive): a node with no content.
+        Binary,
+        /// A recognized format whose reader failed.
+        Failed,
+    }
+
+    impl FileKind {
+        fn as_str(self) -> &'static str {
+            match self {
+                FileKind::Data => "data",
+                FileKind::Text => "text",
+                FileKind::Binary => "binary",
+                FileKind::Failed => "failed",
+            }
+        }
+    }
+
+    /// One input file, read.
+    pub(crate) struct KgFile {
+        pub(crate) rel: String,
+        pub(crate) name: String,
+        pub(crate) file_type: String,
+        pub(crate) kind: FileKind,
+        pub(crate) size: u64,
+        pub(crate) tables: Vec<(String, Vec<ColumnProfile>)>,
+        pub(crate) text: Option<ColumnContent>,
+        pub(crate) error: Option<String>,
+        /// Columns fixed by the format, not authored: never schema-linked.
+        pub(crate) fixed_schema: bool,
+        pub(crate) truncated_scan: bool,
+    }
+
+    pub(crate) struct CollectOptions {
+        pub(crate) samples: usize,
+        pub(crate) include: Vec<String>,
+        pub(crate) exclude: Vec<String>,
+        pub(crate) progress: bool,
+    }
+
+    /// Formats whose columns are fixed by the format itself rather than
+    /// authored - linking two files through them would mean "both are
+    /// PDFs", not that they are related.
+    fn has_fixed_schema(format: &InputFormat) -> bool {
+        matches!(
+            format,
+            InputFormat::Pdf
+                | InputFormat::Ipynb
+                | InputFormat::Mbox
+                | InputFormat::Vcard
+                | InputFormat::Ical
+                | InputFormat::Har
+                | InputFormat::Syslog
+                | InputFormat::Syslog5424
+                | InputFormat::CommonLog
+                | InputFormat::CombinedLog
+        )
+    }
+
+    fn root_cause(e: &Error) -> String {
+        let mut cur = e;
+        while let Some(next) = cur.source.as_deref() {
+            cur = next;
+        }
+        cur.message.clone()
+    }
+
+    fn skipped_by_name(root: &Path, path: &Path) -> bool {
+        if path
+            .file_name()
+            .is_some_and(|n| SKIP_FILES.iter().any(|s| n == *s))
+        {
+            return true;
+        }
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        rel.components().any(|c| {
+            let c = c.as_os_str();
+            SKIP_DIRS.iter().any(|s| c == *s)
+        })
+    }
+
+    /// Every file under `input` (or `input` itself), read for the graph.
+    /// Returns the input's display name and one `KgFile` per file, in
+    /// sorted path order.
+    pub(crate) fn collect(input: &Path, opts: &CollectOptions) -> Result<(String, Vec<KgFile>)> {
+        let (root, paths): (PathBuf, Vec<PathBuf>) = if input.is_dir() {
+            let mut files = Vec::new();
+            collect_files_sorted(input, input, &mut files, &opts.exclude)?;
+            let files = files
+                .into_iter()
+                .filter(|p| {
+                    file_selected(input, p, &opts.include, &opts.exclude)
+                        && !skipped_by_name(input, p)
+                        && !looks_like_own_output(p)
+                })
+                .collect();
+            (input.to_path_buf(), files)
+        } else if input.is_file() {
+            (
+                input.parent().map(Path::to_path_buf).unwrap_or_default(),
+                vec![input.to_path_buf()],
+            )
+        } else {
+            bail!("{input:?} doesn't exist");
+        };
+        let known = Arc::new(KnownFiles::new(
+            paths
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str())),
+        ));
+        let mut out = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let file = read_one(&root, path, opts, &known);
+            if opts.progress {
+                let status = match file.kind {
+                    FileKind::Data => format!("profiled ({})", file.file_type),
+                    FileKind::Text => format!("scanned as text ({})", file.file_type),
+                    FileKind::Binary => "no readable content (node only)".to_string(),
+                    FileKind::Failed => format!(
+                        "failed ({})",
+                        file.error.as_deref().unwrap_or("unknown error")
+                    ),
+                };
+                eprintln!("{}: {status}", path.display());
+            }
+            out.push(file);
+        }
+        let name = input
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| input.display().to_string());
+        Ok((name, out))
+    }
+
+    fn extension_of(name: &str) -> String {
+        match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => ext.to_lowercase(),
+            _ => String::new(),
+        }
+    }
+
+    fn graph_args(path: &Path, samples: usize) -> Args {
+        Args {
+            input_path: path.to_path_buf(),
+            output_path: None,
+            output_dir: None,
+            samples,
+            nrows: None,
+            format: None,
+            delimiter: None,
+            skip_rows: None,
+            widths: None,
+            output_format: "json".to_string(),
+            sql_mode: None,
+            load_into: None,
+            combine: false,
+            continue_on_error: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            list_formats: false,
+        }
+    }
+
+    fn cut_sample(s: &mut String) {
+        if s.len() > MAX_KEPT_SAMPLE_BYTES {
+            let mut end = MAX_KEPT_SAMPLE_BYTES;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            s.push('…');
+        }
+    }
+
+    fn read_one(
+        root: &Path,
+        path: &Path,
+        opts: &CollectOptions,
+        known: &Arc<KnownFiles>,
+    ) -> KgFile {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ext = extension_of(&name);
+        let mut file = KgFile {
+            rel: if root.as_os_str().is_empty() {
+                name.clone()
+            } else {
+                relative_display_path(root, path)
+            },
+            file_type: if ext.is_empty() {
+                "file".to_string()
+            } else {
+                ext.clone()
+            },
+            name,
+            kind: FileKind::Binary,
+            size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            tables: Vec::new(),
+            text: None,
+            error: None,
+            fixed_schema: false,
+            truncated_scan: false,
+        };
+        let (read_path, logical_path, _decompressed) = match decompress_if_needed(path) {
+            Ok(paths) => paths,
+            Err(e) => {
+                file.kind = FileKind::Failed;
+                file.error = Some(root_cause(&e));
+                return file;
+            }
+        };
+        if let Ok(format) = detect_format(&read_path, &logical_path, &None) {
+            file.file_type = format.as_str().to_string();
+            file.fixed_schema = has_fixed_schema(&format);
+            let args = graph_args(path, opts.samples);
+            let _scan = ScanGuard::new(Some(known.clone()));
+            match dispatch_reader(&read_path, &logical_path, format, &args) {
+                Ok((tables, _)) => {
+                    file.kind = FileKind::Data;
+                    file.tables = tables
+                        .into_iter()
+                        .map(|(t, mut cols)| {
+                            for c in &mut cols {
+                                for s in &mut c.sample_values {
+                                    cut_sample(s);
+                                }
+                            }
+                            (t, cols)
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    file.kind = FileKind::Failed;
+                    file.error = Some(root_cause(&e));
+                }
+            }
+            return file;
+        }
+        if let Some(lines) = office_text(&read_path, &ext) {
+            let _scan = ScanGuard::new(Some(known.clone()));
+            let mut acc = content_scan::ContentAccumulator::new(false);
+            for line in &lines {
+                acc.push(line);
+            }
+            file.kind = FileKind::Text;
+            file.text = Some(acc.finish("String"));
+            return file;
+        }
+        if let Some((content, truncated)) = scan_text_file(&read_path, &ext, known) {
+            file.kind = FileKind::Text;
+            file.text = Some(content);
+            file.truncated_scan = truncated;
+        }
+        file
+    }
+
+    /// The text of an Office Open XML document or presentation (`.docx`,
+    /// `.pptx`, and their macro-enabled and template variants), one
+    /// string per paragraph, plus the targets of its external
+    /// relationships (hyperlinks, linked files) - read for the graph
+    /// only; these aren't formats sniff-rs profiles as data. Word:
+    /// the body, headers, footers, footnotes, endnotes, and comments.
+    /// PowerPoint: every slide and its speaker notes, in slide order.
+    /// `None` for anything else, or a file that isn't a readable zip.
+    #[cfg(any(feature = "xlsx", feature = "npy"))]
+    fn office_text(path: &Path, ext: &str) -> Option<Vec<String>> {
+        let word = matches!(ext, "docx" | "docm" | "dotx" | "dotm");
+        let slides = matches!(ext, "pptx" | "pptm" | "potx" | "potm" | "ppsx");
+        if !word && !slides {
+            return None;
+        }
+        let mut zip = zip_support::ZipArchive::open(path).ok()?;
+        let part_number = |name: &str| -> u64 {
+            name.rsplit('/')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(".xml")
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                .parse()
+                .unwrap_or(0)
+        };
+        let mut parts: Vec<String> = zip
+            .names()
+            .filter(|n| {
+                if word {
+                    n.starts_with("word/")
+                        && n.ends_with(".xml")
+                        && !n[5..].contains('/')
+                        && [
+                            "document",
+                            "header",
+                            "footer",
+                            "footnotes",
+                            "endnotes",
+                            "comments",
+                        ]
+                        .iter()
+                        .any(|p| n[5..].starts_with(p))
+                } else {
+                    (n.starts_with("ppt/slides/slide")
+                        || n.starts_with("ppt/notesSlides/notesSlide"))
+                        && n.ends_with(".xml")
+                }
+            })
+            .map(str::to_string)
+            .collect();
+        parts.sort_by(|a, b| {
+            let body = |n: &str| {
+                !(n.contains("/header") || n.contains("/footer") || n.contains("notesSlide"))
+            };
+            body(b)
+                .cmp(&body(a))
+                .then_with(|| part_number(a).cmp(&part_number(b)))
+                .then_with(|| a.cmp(b))
+        });
+        let rels: Vec<String> = zip
+            .names()
+            .filter(|n| {
+                n.ends_with(".rels")
+                    && (n.starts_with("word/_rels/") || n.starts_with("ppt/slides/_rels/"))
+            })
+            .map(str::to_string)
+            .collect();
+        let mut lines = Vec::new();
+        for part in parts {
+            let bytes = zip.read(&part).ok()?;
+            lines.extend(ooxml_paragraphs(&String::from_utf8_lossy(&bytes)));
+        }
+        for rel in rels {
+            if let Ok(bytes) = zip.read(&rel) {
+                lines.extend(external_targets(&String::from_utf8_lossy(&bytes)));
+            }
+        }
+        Some(lines)
+    }
+
+    #[cfg(not(any(feature = "xlsx", feature = "npy")))]
+    fn office_text(_path: &Path, _ext: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    #[cfg(any(feature = "xlsx", feature = "npy"))]
+    /// Paragraph texts of a WordprocessingML or DrawingML part: the
+    /// characters inside `<w:t>`/`<a:t>`/`<m:t>` runs, a `<w:tab/>` as a
+    /// tab and a break as a space, one string per `</w:p>`/`</a:p>`.
+    /// Markup-compatibility alternatives (ECMA-376 Part 3) are read the
+    /// way Word reads them: the `mc:Choice`, never the `mc:Fallback` -
+    /// Word writes every text box twice (a DrawingML shape and a VML
+    /// fallback), and reading both doubled its text.
+    fn ooxml_paragraphs(xml: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut para = String::new();
+        let mut in_text = false;
+        let mut fallback_depth = 0usize;
+        let mut i = 0;
+        while i < xml.len() {
+            if xml.as_bytes()[i] == b'<' {
+                let Some(len) = xml[i..].find('>') else {
+                    break;
+                };
+                let tag = &xml[i + 1..i + len];
+                let closing = tag.starts_with('/');
+                let self_closing = tag.ends_with('/');
+                let name = tag
+                    .trim_start_matches('/')
+                    .split(|c: char| c.is_whitespace() || c == '/')
+                    .next()
+                    .unwrap_or("");
+                let local = name.rsplit(':').next().unwrap_or(name);
+                if local == "Fallback" && !self_closing {
+                    if closing {
+                        fallback_depth = fallback_depth.saturating_sub(1);
+                    } else {
+                        fallback_depth += 1;
+                    }
+                    i += len + 1;
+                    continue;
+                }
+                if fallback_depth > 0 {
+                    i += len + 1;
+                    continue;
+                }
+                match (local, closing, self_closing) {
+                    ("t", false, false) => in_text = true,
+                    ("t", true, _) => in_text = false,
+                    ("tab", _, _) => para.push('\t'),
+                    ("br" | "cr", _, _) => para.push(' '),
+                    ("p", true, _) => {
+                        if !para.trim().is_empty() {
+                            out.push(std::mem::take(&mut para));
+                        }
+                        para.clear();
+                    }
+                    _ => {}
+                }
+                i += len + 1;
+            } else {
+                let next = xml[i..].find('<').map_or(xml.len(), |p| i + p);
+                if in_text && fallback_depth == 0 {
+                    para.push_str(&xml_unescape_text(&xml[i..next]));
+                }
+                i = next;
+            }
+        }
+        if !para.trim().is_empty() {
+            out.push(para);
+        }
+        out
+    }
+
+    #[cfg(any(feature = "xlsx", feature = "npy"))]
+    /// `Target` values of the `TargetMode="External"` relationships in a
+    /// `.rels` part: hyperlinks and linked files.
+    fn external_targets(xml: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for element in xml.split('<').filter(|e| e.starts_with("Relationship ")) {
+            if !element.contains("TargetMode=\"External\"") {
+                continue;
+            }
+            if let Some(start) = element.find("Target=\"") {
+                let rest = &element[start + 8..];
+                if let Some(end) = rest.find('"') {
+                    out.push(xml_unescape_text(&rest[..end]));
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(any(feature = "xlsx", feature = "npy"))]
+    /// XML character references and the five predefined entities.
+    fn xml_unescape_text(s: &str) -> String {
+        if !s.contains('&') {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(amp) = rest.find('&') {
+            out.push_str(&rest[..amp]);
+            rest = &rest[amp..];
+            let Some(semi) = rest.find(';').filter(|p| *p <= 10) else {
+                out.push('&');
+                rest = &rest[1..];
+                continue;
+            };
+            let entity = &rest[1..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| entity.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            };
+            match decoded {
+                Some(c) => {
+                    out.push(c);
+                    rest = &rest[semi + 1..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Markup whose tags are stripped before counting words (the tags'
+    /// own attributes still get scanned for identifiers and file names).
+    fn is_markup(ext: &str) -> bool {
+        matches!(ext, "html" | "htm" | "xhtml" | "xml" | "svg")
+    }
+
+    /// A file this tool doesn't profile, read as text if it is text: no
+    /// NUL byte and valid UTF-8 in its first 8 KiB. Returns `None` for
+    /// anything binary. Lines past `MAX_TEXT_SCAN_BYTES`, or past the
+    /// first invalid UTF-8 line, are left unread (`true` in the result).
+    fn scan_text_file(
+        path: &Path,
+        ext: &str,
+        known: &Arc<KnownFiles>,
+    ) -> Option<(ColumnContent, bool)> {
+        use std::io::{BufRead, Read};
+        let mut f = fs::File::open(path).ok()?;
+        let mut head = vec![0u8; 8192];
+        let mut filled = 0;
+        while filled < head.len() {
+            match f.read(&mut head[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        head.truncate(filled);
+        if head.is_empty() || head.contains(&0) {
+            return None;
+        }
+        match std::str::from_utf8(&head) {
+            Ok(_) => {}
+            // A multi-byte character cut by the 8 KiB boundary is fine;
+            // anything else is not text.
+            Err(e) if e.error_len().is_none() && filled == head.capacity() => {}
+            Err(_) => return None,
+        }
+        let f = fs::File::open(path).ok()?;
+        let _scan = ScanGuard::new(Some(known.clone()));
+        let mut acc = content_scan::ContentAccumulator::new(false);
+        let markup = is_markup(ext);
+        let mut in_tag = false;
+        let mut read: u64 = 0;
+        let mut truncated = false;
+        let mut reader = std::io::BufReader::new(f);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(n) => read += n as u64,
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
+            }
+            if markup {
+                let words = strip_tags(&line, &mut in_tag);
+                acc.scan(line.trim(), &words);
+            } else {
+                acc.push(&line);
+            }
+            if read >= MAX_TEXT_SCAN_BYTES {
+                truncated = true;
+                break;
+            }
+        }
+        Some((acc.finish("String"), truncated))
+    }
+
+    /// Text outside `<...>` tags, a tag becoming a space; `in_tag` carries
+    /// an open tag across lines.
+    fn strip_tags(line: &str, in_tag: &mut bool) -> String {
+        let mut out = String::with_capacity(line.len());
+        for c in line.chars() {
+            match c {
+                '<' => *in_tag = true,
+                '>' if *in_tag => {
+                    *in_tag = false;
+                    out.push(' ');
+                }
+                _ if !*in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    // ---- The graph ----
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum NodeType {
+        File,
+        Table,
+        Entity,
+        Schema,
+    }
+
+    impl NodeType {
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                NodeType::File => "file",
+                NodeType::Table => "table",
+                NodeType::Entity => "entity",
+                NodeType::Schema => "schema",
+            }
+        }
+
+        pub(crate) fn parse(s: &str) -> Option<NodeType> {
+            match s {
+                "file" => Some(NodeType::File),
+                "table" => Some(NodeType::Table),
+                "entity" => Some(NodeType::Entity),
+                "schema" => Some(NodeType::Schema),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(crate) enum Relation {
+        Contains,
+        HasSchema,
+        Joins,
+        References,
+        Mentions,
+        SharesIds,
+        SimilarTo,
+        SameName,
+    }
+
+    impl Relation {
+        pub(crate) const ALL: [Relation; 8] = [
+            Relation::Contains,
+            Relation::HasSchema,
+            Relation::Joins,
+            Relation::References,
+            Relation::Mentions,
+            Relation::SharesIds,
+            Relation::SimilarTo,
+            Relation::SameName,
+        ];
+
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                Relation::Contains => "contains",
+                Relation::HasSchema => "has_schema",
+                Relation::Joins => "joins",
+                Relation::References => "references",
+                Relation::Mentions => "mentions",
+                Relation::SharesIds => "shares_identifiers",
+                Relation::SimilarTo => "similar_to",
+                Relation::SameName => "same_name",
+            }
+        }
+
+        pub(crate) fn parse(s: &str) -> Option<Relation> {
+            Relation::ALL.into_iter().find(|r| r.as_str() == s)
+        }
+
+        /// A file holding its own tables: structure, not a relationship
+        /// to anything else. Degree rankings ("god nodes") and the
+        /// isolated-file check leave it out.
+        pub(crate) fn structural(self) -> bool {
+            matches!(self, Relation::Contains)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub(crate) enum Conf {
+        Extracted,
+        Inferred,
+        Ambiguous,
+    }
+
+    impl Conf {
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                Conf::Extracted => "EXTRACTED",
+                Conf::Inferred => "INFERRED",
+                Conf::Ambiguous => "AMBIGUOUS",
+            }
+        }
+
+        pub(crate) fn parse(s: &str) -> Option<Conf> {
+            match s.to_ascii_uppercase().as_str() {
+                "EXTRACTED" => Some(Conf::Extracted),
+                "INFERRED" => Some(Conf::Inferred),
+                "AMBIGUOUS" => Some(Conf::Ambiguous),
+                _ => None,
+            }
+        }
+    }
+
+    pub(crate) struct KgNode {
+        pub(crate) id: String,
+        pub(crate) label: String,
+        pub(crate) node_type: NodeType,
+        /// File/table: the data type (`csv`, `pdf`, `txt`, `png`, ...).
+        /// Entity: its kind (`email`, `doi`, ...). Schema: `schema`.
+        pub(crate) file_type: String,
+        pub(crate) source_file: Option<String>,
+        /// Everything else graph.json carries for this node.
+        pub(crate) attrs: json_support::Map,
+        pub(crate) community: usize,
+    }
+
+    pub(crate) struct KgEdge {
+        pub(crate) source: usize,
+        pub(crate) target: usize,
+        pub(crate) relation: Relation,
+        pub(crate) confidence: Conf,
+        pub(crate) score: f64,
+        pub(crate) weight: f64,
+        pub(crate) evidence: Vec<String>,
+    }
+
+    pub(crate) struct Community {
+        pub(crate) label: String,
+        pub(crate) members: Vec<usize>,
+    }
+
+    pub(crate) struct KnowledgeGraph {
+        pub(crate) input: String,
+        pub(crate) nodes: Vec<KgNode>,
+        pub(crate) edges: Vec<KgEdge>,
+        pub(crate) communities: Vec<Community>,
+        /// File references that named no input file (or too many).
+        pub(crate) unresolved_references: usize,
+    }
+
+    impl KnowledgeGraph {
+        /// Distinct neighbors of every node, over non-structural links.
+        pub(crate) fn content_degrees(&self) -> Vec<usize> {
+            let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); self.nodes.len()];
+            for e in &self.edges {
+                if e.relation.structural() || e.source == e.target {
+                    continue;
+                }
+                neighbors[e.source].insert(e.target);
+                neighbors[e.target].insert(e.source);
+            }
+            neighbors.iter().map(HashSet::len).collect()
+        }
+
+        /// Distinct neighbors of every node, over every link.
+        pub(crate) fn degrees(&self) -> Vec<usize> {
+            let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); self.nodes.len()];
+            for e in &self.edges {
+                if e.source == e.target {
+                    continue;
+                }
+                neighbors[e.source].insert(e.target);
+                neighbors[e.target].insert(e.source);
+            }
+            neighbors.iter().map(HashSet::len).collect()
+        }
+
+        /// Incident edge indices per node.
+        pub(crate) fn incidence(&self) -> Vec<Vec<usize>> {
+            let mut inc = vec![Vec::new(); self.nodes.len()];
+            for (i, e) in self.edges.iter().enumerate() {
+                inc[e.source].push(i);
+                if e.target != e.source {
+                    inc[e.target].push(i);
+                }
+            }
+            inc
+        }
+    }
+
+    /// Everything one file's content scan found, merged across its
+    /// columns.
+    #[derive(Default)]
+    struct FileContent {
+        /// entity -> (occurrences, the first column it was found in)
+        entities: BTreeMap<(EntityKind, String), (u64, String)>,
+        terms: HashMap<String, u64>,
+        refs: Vec<String>,
+        text_chars: u64,
+        unmapped_chars: u64,
+        entities_truncated: bool,
+    }
+
+    impl FileContent {
+        fn absorb(&mut self, column: &str, content: &ColumnContent) {
+            for (kind, value, count) in &content.entities {
+                let slot = self
+                    .entities
+                    .entry((*kind, value.clone()))
+                    .or_insert((0, column.to_string()));
+                slot.0 += u64::from(*count);
+            }
+            for (term, count) in &content.terms {
+                *self.terms.entry(term.clone()).or_insert(0) += u64::from(*count);
+            }
+            for r in &content.refs {
+                if !self.refs.contains(r) {
+                    self.refs.push(r.clone());
+                }
+            }
+            self.text_chars += content.text_chars;
+            self.unmapped_chars += content.unmapped_chars;
+            self.entities_truncated |= content.entities_truncated;
+        }
+    }
+
+    fn file_content(file: &KgFile) -> FileContent {
+        let mut fc = FileContent::default();
+        for (_, cols) in &file.tables {
+            for col in cols {
+                if let Some(content) = &col.content {
+                    fc.absorb(&col.name, content);
+                }
+            }
+        }
+        if let Some(text) = &file.text {
+            fc.absorb("(text)", text);
+        }
+        fc
+    }
+
+    /// Entity node ids are `<kind>:<value>`.
+    pub(crate) fn entity_id(kind: EntityKind, value: &str) -> String {
+        format!("{}:{value}", kind.as_str())
+    }
+
+    fn entity_label(kind: EntityKind, value: &str) -> String {
+        match kind {
+            EntityKind::Card => format!("card {}", value.split('#').next().unwrap_or(value)),
+            _ => value.to_string(),
+        }
+    }
+
+    struct Builder {
+        nodes: Vec<KgNode>,
+        edges: Vec<KgEdge>,
+        node_index: HashMap<String, usize>,
+    }
+
+    impl Builder {
+        fn add_node(
+            &mut self,
+            id: String,
+            label: String,
+            node_type: NodeType,
+            file_type: String,
+            source_file: Option<String>,
+            attrs: json_support::Map,
+        ) -> usize {
+            if let Some(&i) = self.node_index.get(&id) {
+                return i;
+            }
+            let i = self.nodes.len();
+            self.node_index.insert(id.clone(), i);
+            self.nodes.push(KgNode {
+                id,
+                label,
+                node_type,
+                file_type,
+                source_file,
+                attrs,
+                community: 0,
+            });
+            i
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn add_edge(
+            &mut self,
+            source: usize,
+            target: usize,
+            relation: Relation,
+            confidence: Conf,
+            score: f64,
+            weight: f64,
+            evidence: Vec<String>,
+        ) {
+            self.edges.push(KgEdge {
+                source,
+                target,
+                relation,
+                confidence,
+                score,
+                weight,
+                evidence,
+            });
+        }
+    }
+
+    fn table_rows(cols: &[ColumnProfile]) -> usize {
+        cols.first().map(|c| c.row_count).unwrap_or(0)
+    }
+
+    /// Column names and ideal types on a table-bearing node (the first 60).
+    fn insert_column_attrs(attrs: &mut json_support::Map, cols: &[ColumnProfile]) {
+        attrs.insert(
+            "column_names".to_string(),
+            JsonValue::Array(
+                cols.iter()
+                    .take(60)
+                    .map(|c| JsonValue::from(c.name.clone()))
+                    .collect(),
+            ),
+        );
+        attrs.insert(
+            "column_types".to_string(),
+            JsonValue::Array(
+                cols.iter()
+                    .take(60)
+                    .map(|c| JsonValue::from(c.ideal_type.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    /// Build the graph from read files. Deterministic: the same files in
+    /// the same order always produce the same nodes, links, and
+    /// communities.
+    pub(crate) fn build(input: String, files: Vec<KgFile>) -> KnowledgeGraph {
+        let mut b = Builder {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            node_index: HashMap::new(),
+        };
+        let contents: Vec<FileContent> = files.iter().map(file_content).collect();
+
+        // Files, and the tables inside multi-table files.
+        let mut file_node = Vec::with_capacity(files.len());
+        // (node, file index, table index) for every table of every
+        // readable file: the node is the table's own node in a multi-table
+        // file, the file's node otherwise.
+        let mut table_nodes: Vec<(usize, usize, usize)> = Vec::new();
+        for (fi, file) in files.iter().enumerate() {
+            let mut attrs = json_support::Map::new();
+            attrs.insert("kind".to_string(), JsonValue::from(file.kind.as_str()));
+            attrs.insert(
+                "readable".to_string(),
+                JsonValue::from(matches!(file.kind, FileKind::Data | FileKind::Text)),
+            );
+            attrs.insert("size_bytes".to_string(), JsonValue::from(file.size));
+            if !file.tables.is_empty() {
+                attrs.insert("tables".to_string(), JsonValue::from(file.tables.len()));
+                let rows: usize = file.tables.iter().map(|(_, c)| table_rows(c)).sum();
+                attrs.insert("rows".to_string(), JsonValue::from(rows));
+                let columns: usize = file.tables.iter().map(|(_, c)| c.len()).sum();
+                attrs.insert("columns".to_string(), JsonValue::from(columns));
+            }
+            let fc = &contents[fi];
+            if matches!(file.kind, FileKind::Data | FileKind::Text) {
+                attrs.insert("text_chars".to_string(), JsonValue::from(fc.text_chars));
+            }
+            if fc.text_chars >= 200 && fc.unmapped_chars > 0 {
+                let pct = (fc.unmapped_chars as f64 / fc.text_chars as f64 * 1000.0).round() / 10.0;
+                attrs.insert("unmapped_char_pct".to_string(), JsonValue::from(pct));
+            }
+            if file.truncated_scan {
+                attrs.insert("scan_truncated".to_string(), JsonValue::from(true));
+            }
+            if fc.entities_truncated {
+                // A column held more distinct identifiers than the scan
+                // keeps (1,024 per column): some went unlinked.
+                attrs.insert("identifiers_truncated".to_string(), JsonValue::from(true));
+            }
+            if let Some(err) = &file.error {
+                attrs.insert("error".to_string(), JsonValue::from(err.clone()));
+            }
+            if let [(_, cols)] = file.tables.as_slice() {
+                insert_column_attrs(&mut attrs, cols);
+            }
+            let node = b.add_node(
+                file.rel.clone(),
+                file.name.clone(),
+                NodeType::File,
+                file.file_type.clone(),
+                Some(file.rel.clone()),
+                attrs,
+            );
+            file_node.push(node);
+            if file.tables.len() == 1 {
+                table_nodes.push((node, fi, 0));
+            } else {
+                for (ti, (table, cols)) in file.tables.iter().enumerate() {
+                    let mut attrs = json_support::Map::new();
+                    attrs.insert("rows".to_string(), JsonValue::from(table_rows(cols)));
+                    attrs.insert("columns".to_string(), JsonValue::from(cols.len()));
+                    insert_column_attrs(&mut attrs, cols);
+                    let tnode = b.add_node(
+                        format!("{}#{table}", file.rel),
+                        table.clone(),
+                        NodeType::Table,
+                        file.file_type.clone(),
+                        Some(file.rel.clone()),
+                        attrs,
+                    );
+                    b.add_edge(
+                        node,
+                        tnode,
+                        Relation::Contains,
+                        Conf::Extracted,
+                        1.0,
+                        1.0,
+                        vec![format!("table {table:?} of {}", file.name)],
+                    );
+                    table_nodes.push((tnode, fi, ti));
+                }
+            }
+        }
+
+        link_entities(&mut b, &files, &contents, &file_node);
+        let unresolved = link_references(&mut b, &files, &contents, &file_node);
+        link_same_names(&mut b, &files, &file_node);
+        let doc_terms = link_similar(&mut b, &files, &contents, &file_node);
+        link_schemas_and_joins(&mut b, &files, &table_nodes);
+
+        // Top terms on each file node, for labels and notes.
+        for (fi, terms) in doc_terms.iter().enumerate() {
+            if !terms.is_empty() {
+                b.nodes[file_node[fi]].attrs.insert(
+                    "top_terms".to_string(),
+                    JsonValue::Array(
+                        terms
+                            .iter()
+                            .take(8)
+                            .map(|(t, _)| JsonValue::from(t.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+        }
+
+        let membership = louvain(
+            b.nodes.len(),
+            &b.edges
+                .iter()
+                .map(|e| (e.source, e.target, e.weight))
+                .collect::<Vec<_>>(),
+        );
+        let communities =
+            communities_from(&mut b.nodes, &membership, &doc_terms, &file_node, &b.edges);
+
+        let mut graph = KnowledgeGraph {
+            input,
+            nodes: b.nodes,
+            edges: b.edges,
+            communities,
+            unresolved_references: unresolved,
+        };
+        let degrees = graph.degrees();
+        for (node, d) in graph.nodes.iter_mut().zip(degrees) {
+            node.attrs.insert("degree".to_string(), JsonValue::from(d));
+        }
+        graph
+    }
+
+    /// One file's mention of an identifier: (file index, occurrences, the
+    /// first column it appeared in).
+    type Mention = (usize, u64, String);
+
+    /// Shared identifiers kept as their own nodes per exact set of files
+    /// sharing them; see `link_entities`.
+    const ENTITY_NODES_PER_FILE_SET: usize = 12;
+
+    /// Which shared identifiers become nodes first when a set of files
+    /// shares more than `ENTITY_NODES_PER_FILE_SET`: the most specific
+    /// kinds first.
+    fn kind_priority(kind: EntityKind) -> u8 {
+        match kind {
+            EntityKind::Email => 0,
+            EntityKind::Iban => 1,
+            EntityKind::Doi => 2,
+            EntityKind::Isbn => 3,
+            EntityKind::Vin => 4,
+            EntityKind::Uuid => 5,
+            EntityKind::Url => 6,
+            EntityKind::Card => 7,
+            EntityKind::Code => 8,
+            EntityKind::Domain => 9,
+            EntityKind::Ip => 10,
+            EntityKind::Id => 11,
+        }
+    }
+
+    /// `mentions`: every identifier two or more files share becomes an
+    /// entity node linked from each of them. An identifier only one file
+    /// mentions links nothing and is left out. A link to an entity many
+    /// files mention weighs less (it says less about any one pair).
+    ///
+    /// Two to four files sharing a large set of identifiers (the same
+    /// customer list saved as CSV and as Excel shares every email in it)
+    /// keep the first `ENTITY_NODES_PER_FILE_SET` as nodes, most specific
+    /// kinds first, and the rest become one `shares_identifiers` link per
+    /// pair of those files, counted by kind - hundreds of nodes that each
+    /// connect the same two files say nothing one link doesn't.
+    fn link_entities(
+        b: &mut Builder,
+        files: &[KgFile],
+        contents: &[FileContent],
+        file_node: &[usize],
+    ) {
+        let mut by_entity: BTreeMap<(EntityKind, String), Vec<Mention>> = BTreeMap::new();
+        for (fi, fc) in contents.iter().enumerate() {
+            for ((kind, value), (count, column)) in &fc.entities {
+                by_entity.entry((*kind, value.clone())).or_default().push((
+                    fi,
+                    *count,
+                    column.clone(),
+                ));
+            }
+        }
+        let mut by_set: BTreeMap<Vec<usize>, Vec<(EntityKind, String)>> = BTreeMap::new();
+        for ((kind, value), mentions) in &by_entity {
+            if mentions.len() >= 2 {
+                let set: Vec<usize> = mentions.iter().map(|m| m.0).collect();
+                by_set.entry(set).or_default().push((*kind, value.clone()));
+            }
+        }
+        let mut summarized: HashSet<(EntityKind, String)> = HashSet::new();
+        for (set, mut shared) in by_set {
+            if shared.len() <= ENTITY_NODES_PER_FILE_SET || set.len() > 4 {
+                continue;
+            }
+            shared.sort_by(|x, y| (kind_priority(x.0), &x.1).cmp(&(kind_priority(y.0), &y.1)));
+            let rest = &shared[ENTITY_NODES_PER_FILE_SET..];
+            let mut kinds: BTreeMap<u8, (EntityKind, usize)> = BTreeMap::new();
+            for (k, _) in rest {
+                kinds.entry(kind_priority(*k)).or_insert((*k, 0)).1 += 1;
+            }
+            let breakdown = kinds
+                .values()
+                .map(|(k, n)| format!("{} {n}", k.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let examples = rest
+                .iter()
+                .take(3)
+                .map(|(k, v)| entity_label(*k, v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let confidence = if rest.iter().any(|(k, _)| k.is_validated()) {
+                Conf::Extracted
+            } else {
+                Conf::Inferred
+            };
+            for (i, &x) in set.iter().enumerate() {
+                for &y in &set[i + 1..] {
+                    b.add_edge(
+                        file_node[x],
+                        file_node[y],
+                        Relation::SharesIds,
+                        confidence,
+                        1.0,
+                        3.0,
+                        vec![
+                            format!(
+                                "{} more identifiers only these {} files share ({breakdown})",
+                                rest.len(),
+                                set.len()
+                            ),
+                            format!("e.g. {examples}"),
+                        ],
+                    );
+                }
+            }
+            summarized.extend(rest.iter().cloned());
+        }
+        for ((kind, value), mentions) in by_entity {
+            if mentions.len() < 2 || summarized.contains(&(kind, value.clone())) {
+                continue;
+            }
+            let mut attrs = json_support::Map::new();
+            attrs.insert("entity_kind".to_string(), JsonValue::from(kind.as_str()));
+            attrs.insert("files".to_string(), JsonValue::from(mentions.len()));
+            let node = b.add_node(
+                entity_id(kind, &value),
+                entity_label(kind, &value),
+                NodeType::Entity,
+                kind.as_str().to_string(),
+                None,
+                attrs,
+            );
+            let weight = 2.0 / (1.0 + mentions.len() as f64).ln();
+            let confidence = if kind.is_validated() {
+                Conf::Extracted
+            } else {
+                Conf::Inferred
+            };
+            for (fi, count, column) in mentions {
+                let where_ = if files[fi].kind == FileKind::Text {
+                    String::new()
+                } else {
+                    format!(" (column {column:?})")
+                };
+                let times = if count == 1 {
+                    "once".to_string()
+                } else {
+                    format!("{count}×")
+                };
+                b.add_edge(
+                    file_node[fi],
+                    node,
+                    Relation::Mentions,
+                    confidence,
+                    if confidence == Conf::Extracted {
+                        1.0
+                    } else {
+                        0.6
+                    },
+                    weight,
+                    vec![format!("mentioned {times}{where_}")],
+                );
+            }
+        }
+    }
+
+    /// `references`: a file naming another file. Resolved by file name; a
+    /// name several files share resolves by path (`data/x.csv`) or by
+    /// sitting in the same directory, and otherwise links to each
+    /// candidate as AMBIGUOUS (up to five - a name shared more widely than
+    /// that is left unresolved rather than guessed across). Returns how
+    /// many references stayed unresolved.
+    fn link_references(
+        b: &mut Builder,
+        files: &[KgFile],
+        contents: &[FileContent],
+        file_node: &[usize],
+    ) -> usize {
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            by_name.entry(f.name.to_lowercase()).or_default().push(fi);
+        }
+        let dir_of = |rel: &str| rel.rsplit_once('/').map_or("", |(d, _)| d).to_lowercase();
+        let mut unresolved = 0;
+        for (fi, fc) in contents.iter().enumerate() {
+            let mut linked: BTreeSet<usize> = BTreeSet::new();
+            for reference in &fc.refs {
+                let base = reference.rsplit('/').next().unwrap_or(reference);
+                let candidates: Vec<usize> = by_name
+                    .get(base)
+                    .map(|v| v.iter().copied().filter(|c| *c != fi).collect())
+                    .unwrap_or_default();
+                if candidates.is_empty() {
+                    continue;
+                }
+                let (targets, conf): (Vec<usize>, Conf) = if candidates.len() == 1 {
+                    (candidates, Conf::Extracted)
+                } else {
+                    let by_path: Vec<usize> = if reference.contains('/') {
+                        candidates
+                            .iter()
+                            .copied()
+                            .filter(|c| {
+                                let rel = files[*c].rel.to_lowercase();
+                                rel == *reference || rel.ends_with(&format!("/{reference}"))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let here = dir_of(&files[fi].rel);
+                    let same_dir: Vec<usize> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|c| dir_of(&files[*c].rel) == here)
+                        .collect();
+                    if by_path.len() == 1 {
+                        (by_path, Conf::Extracted)
+                    } else if same_dir.len() == 1 {
+                        (same_dir, Conf::Extracted)
+                    } else if candidates.len() <= 5 {
+                        (candidates, Conf::Ambiguous)
+                    } else {
+                        unresolved += 1;
+                        continue;
+                    }
+                };
+                let n = targets.len();
+                for t in targets {
+                    if !linked.insert(t) {
+                        continue;
+                    }
+                    let mut evidence = vec![format!("names {reference:?}")];
+                    if conf == Conf::Ambiguous {
+                        evidence.push(format!("{n} files share that name"));
+                    }
+                    b.add_edge(
+                        file_node[fi],
+                        file_node[t],
+                        Relation::References,
+                        conf,
+                        if conf == Conf::Ambiguous {
+                            1.0 / n as f64
+                        } else {
+                            1.0
+                        },
+                        if conf == Conf::Ambiguous { 1.0 } else { 3.0 },
+                        evidence,
+                    );
+                }
+            }
+        }
+        unresolved
+    }
+
+    /// Generic stems that say nothing when two files share them.
+    const GENERIC_STEMS: [&str; 14] = [
+        "copy", "data", "document", "download", "file", "image", "img", "index", "main", "new",
+        "readme", "temp", "tmp", "untitled",
+    ];
+
+    /// A file's name without its extension and without a browser's
+    /// `" (1)"` duplicate suffix or a trailing `" copy"`.
+    fn name_stem(name: &str) -> String {
+        let lower = name.to_lowercase();
+        let mut stem = match lower.rsplit_once('.') {
+            Some((s, _)) if !s.is_empty() => s.to_string(),
+            _ => lower,
+        };
+        loop {
+            let trimmed = stem.trim_end();
+            let before = trimmed.len();
+            let mut s = trimmed.to_string();
+            if s.ends_with(')')
+                && let Some(open) = s.rfind(" (")
+                && s[open + 2..s.len() - 1].bytes().all(|c| c.is_ascii_digit())
+                && s.len() > open + 3
+            {
+                s.truncate(open);
+            }
+            for suffix in [" copy", "_copy", "-copy"] {
+                if let Some(t) = s.strip_suffix(suffix) {
+                    s = t.to_string();
+                }
+            }
+            stem = s;
+            if stem.len() == before {
+                break;
+            }
+        }
+        stem
+    }
+
+    /// `same_name`: files sharing a name stem - one document saved as
+    /// several formats, a download saved twice, the same dataset in two
+    /// folders. Groups larger than eight, and generic stems, are skipped.
+    fn link_same_names(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            let stem = name_stem(&f.name);
+            if stem.chars().count() < 3 || GENERIC_STEMS.contains(&stem.as_str()) {
+                continue;
+            }
+            groups.entry(stem).or_default().push(fi);
+        }
+        for (stem, members) in groups {
+            if !(2..=8).contains(&members.len()) {
+                continue;
+            }
+            for (i, &a) in members.iter().enumerate() {
+                for &c in &members[i + 1..] {
+                    b.add_edge(
+                        file_node[a],
+                        file_node[c],
+                        Relation::SameName,
+                        Conf::Inferred,
+                        0.7,
+                        2.0,
+                        vec![format!(
+                            "same name {stem:?} ({} and {})",
+                            files[a].file_type, files[c].file_type
+                        )],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Minimum cosine for a `similar_to` link.
+    pub(crate) const SIMILARITY_THRESHOLD: f64 = 0.3;
+    /// Each file links to at most this many of its most similar files
+    /// (plus any that picked it among theirs).
+    const SIMILAR_NEIGHBORS: usize = 5;
+    /// Terms per file kept in its TF-IDF vector.
+    const VECTOR_TERMS: usize = 64;
+    /// Distinct words two files must share for a `similar_to` link.
+    const MIN_SHARED_TERMS: usize = 3;
+
+    /// `similar_to`: TF-IDF cosine over each file's words, linking every
+    /// file to its closest few above `SIMILARITY_THRESHOLD`. Returns each
+    /// file's weighted terms (most distinctive first), which also label
+    /// communities.
+    fn link_similar(
+        b: &mut Builder,
+        files: &[KgFile],
+        contents: &[FileContent],
+        file_node: &[usize],
+    ) -> Vec<Vec<(String, f64)>> {
+        let n_files = files.len();
+        let mut df: HashMap<&str, usize> = HashMap::new();
+        let mut kept: Vec<Vec<(&str, u64)>> = Vec::with_capacity(n_files);
+        for fc in contents {
+            let mut terms: Vec<(&str, u64)> =
+                fc.terms.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+            terms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            terms.truncate(content_scan::TERMS_KEPT);
+            for (t, _) in &terms {
+                *df.entry(t).or_insert(0) += 1;
+            }
+            kept.push(terms);
+        }
+        let docs = kept.iter().filter(|t| !t.is_empty()).count();
+        let mut vectors: Vec<Vec<(String, f64)>> = vec![Vec::new(); n_files];
+        if docs == 0 {
+            return vectors;
+        }
+        let n = docs as f64;
+        for (fi, terms) in kept.iter().enumerate() {
+            let mut weighted: Vec<(String, f64)> = terms
+                .iter()
+                .filter_map(|(t, c)| {
+                    let d = *df.get(t).unwrap_or(&1) as f64;
+                    // Words in over half the files, once there are enough
+                    // files for that to mean anything, are effectively
+                    // stop words here.
+                    if docs >= 20 && d > n * 0.5 {
+                        return None;
+                    }
+                    let idf = (1.0 + n / d).ln();
+                    Some((t.to_string(), (1.0 + (*c as f64).ln()) * idf))
+                })
+                .collect();
+            weighted.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            weighted.truncate(VECTOR_TERMS);
+            vectors[fi] = weighted;
+        }
+        // Inverted index over terms at least two files share.
+        let mut postings: HashMap<&str, Vec<(usize, f64)>> = HashMap::new();
+        for (fi, v) in vectors.iter().enumerate() {
+            for (t, w) in v {
+                postings.entry(t.as_str()).or_default().push((fi, *w));
+            }
+        }
+        let norms: Vec<f64> = vectors
+            .iter()
+            .map(|v| v.iter().map(|(_, w)| w * w).sum::<f64>().sqrt())
+            .collect();
+        let mut scores = vec![0.0f64; n_files];
+        let mut touched: Vec<usize> = Vec::new();
+        let mut candidates: Vec<(usize, usize, f64)> = Vec::new();
+        for a in 0..n_files {
+            if norms[a] == 0.0 {
+                continue;
+            }
+            for (t, wa) in &vectors[a] {
+                let Some(list) = postings.get(t.as_str()) else {
+                    continue;
+                };
+                if list.len() < 2 {
+                    continue;
+                }
+                for (bi, wb) in list {
+                    if *bi <= a {
+                        continue;
+                    }
+                    if scores[*bi] == 0.0 {
+                        touched.push(*bi);
+                    }
+                    scores[*bi] += wa * wb;
+                }
+            }
+            for &bi in &touched {
+                let cos = scores[bi] / (norms[a] * norms[bi]);
+                if cos >= SIMILARITY_THRESHOLD {
+                    candidates.push((a, bi, cos.min(1.0)));
+                }
+                scores[bi] = 0.0;
+            }
+            touched.clear();
+        }
+        // Each file's closest few; a pair is linked if either side picked it.
+        let mut best: Vec<Vec<(f64, usize)>> = vec![Vec::new(); n_files];
+        for (i, (a, c, cos)) in candidates.iter().enumerate() {
+            best[*a].push((*cos, i));
+            best[*c].push((*cos, i));
+        }
+        let mut chosen: BTreeSet<usize> = BTreeSet::new();
+        for list in &mut best {
+            list.sort_by(|x, y| {
+                y.0.partial_cmp(&x.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| x.1.cmp(&y.1))
+            });
+            for (_, i) in list.iter().take(SIMILAR_NEIGHBORS) {
+                chosen.insert(*i);
+            }
+        }
+        for i in chosen {
+            let (a, c, cos) = candidates[i];
+            let wc: HashMap<&str, f64> = vectors[c].iter().map(|(t, w)| (t.as_str(), *w)).collect();
+            let mut shared: Vec<(&str, f64)> = vectors[a]
+                .iter()
+                .filter_map(|(t, w)| wc.get(t.as_str()).map(|w2| (t.as_str(), w * w2)))
+                .collect();
+            shared.sort_by(|x, y| {
+                y.1.partial_cmp(&x.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| x.0.cmp(y.0))
+            });
+            // One or two shared words can make short texts look alike;
+            // a link needs at least three.
+            if shared.len() < MIN_SHARED_TERMS {
+                continue;
+            }
+            let words: Vec<&str> = shared.iter().take(6).map(|(t, _)| *t).collect();
+            let mut evidence = vec![format!("cosine {cos:.2} over their words")];
+            if cos >= 0.95 {
+                evidence.push("near-identical wording".to_string());
+            }
+            if !words.is_empty() {
+                evidence.push(format!("shared terms: {}", words.join(", ")));
+            }
+            b.add_edge(
+                file_node[a],
+                file_node[c],
+                Relation::SimilarTo,
+                Conf::Inferred,
+                (cos * 1000.0).round() / 1000.0,
+                3.0 * cos,
+                evidence,
+            );
+        }
+        vectors
+    }
+
+    fn is_key_like_name(canon: &str) -> bool {
+        canon == "id"
+            || [
+                "_id", "_key", "_code", "_uuid", "_guid", "_no", "_num", "_number", "_ref",
+            ]
+            .iter()
+            .any(|s| canon.ends_with(s))
+            || [
+                "uuid", "guid", "email", "sku", "isbn", "iban", "vin", "code",
+            ]
+            .contains(&canon)
+    }
+
+    /// A small-integer column counting up from 0 or 1 (a row number, an
+    /// autoincrement key, a notebook's execution count): its values
+    /// overlap any other such column's by construction, so overlap alone
+    /// proves nothing.
+    fn sequential_ints(col: &ColumnProfile) -> bool {
+        if col.ideal_type != "i64" {
+            return false;
+        }
+        let (Some(stats), Some(content)) = (&col.numeric_stats, &col.content) else {
+            return false;
+        };
+        let distinct = content.distinct_estimate().max(1.0);
+        stats.min >= 0.0 && stats.min <= 1.0 && (stats.max - stats.min + 1.0) <= distinct * 1.25
+    }
+
+    fn pct(x: f64) -> String {
+        format!("~{:.0}%", x * 100.0)
+    }
+
+    /// `has_schema` and `joins`, over tables whose schema was authored.
+    fn link_schemas_and_joins(
+        b: &mut Builder,
+        files: &[KgFile],
+        table_nodes: &[(usize, usize, usize)],
+    ) {
+        let tables: Vec<(usize, usize, &str, &Vec<ColumnProfile>)> = table_nodes
+            .iter()
+            .filter(|(_, fi, _)| !files[*fi].fixed_schema && files[*fi].kind == FileKind::Data)
+            .map(|(node, fi, ti)| {
+                let (name, cols) = &files[*fi].tables[*ti];
+                (*node, *fi, name.as_str(), cols)
+            })
+            .filter(|(_, _, _, cols)| !cols.is_empty())
+            .collect();
+        // Schema groups: tables sharing at least 80% of their column
+        // names, grouped transitively.
+        let canon: Vec<BTreeSet<String>> = tables
+            .iter()
+            .map(|(_, _, _, cols)| {
+                cols.iter()
+                    .map(|c| canon_name(&c.name))
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .collect();
+        let mut parent: Vec<usize> = (0..tables.len()).collect();
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            let mut r = x;
+            while parent[r] != r {
+                r = parent[r];
+            }
+            let mut c = x;
+            while parent[c] != r {
+                let next = parent[c];
+                parent[c] = r;
+                c = next;
+            }
+            r
+        }
+        let mut best_similarity = vec![0.0f64; tables.len()];
+        for i in 0..tables.len() {
+            for j in i + 1..tables.len() {
+                let (a, c) = (&canon[i], &canon[j]);
+                if a.is_empty() || c.is_empty() {
+                    continue;
+                }
+                let (small, large) = if a.len() <= c.len() {
+                    (a.len(), c.len())
+                } else {
+                    (c.len(), a.len())
+                };
+                if (small as f64) < DUPLICATE_SCHEMA_SIMILARITY * large as f64 {
+                    continue;
+                }
+                let shared = a.intersection(c).count() as f64;
+                let jac = shared / (a.len() as f64 + c.len() as f64 - shared);
+                if jac >= DUPLICATE_SCHEMA_SIMILARITY {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri.max(rj)] = ri.min(rj);
+                    }
+                    best_similarity[i] = best_similarity[i].max(jac);
+                    best_similarity[j] = best_similarity[j].max(jac);
+                }
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in 0..tables.len() {
+            let r = find(&mut parent, i);
+            groups.entry(r).or_default().push(i);
+        }
+        let mut group_of = vec![usize::MAX; tables.len()];
+        for (gid, members) in &groups {
+            if members.len() < 2 {
+                continue;
+            }
+            // The schema's columns: those every member shares, in the
+            // first member's column order.
+            let first = tables[members[0]].3;
+            let common: Vec<String> = first
+                .iter()
+                .map(|c| c.name.clone())
+                .filter(|n| {
+                    let cn = canon_name(n);
+                    members.iter().all(|m| canon[*m].contains(&cn))
+                })
+                .collect();
+            let shown: Vec<&str> = common.iter().take(6).map(String::as_str).collect();
+            let mut label = format!("schema: {}", shown.join(", "));
+            if common.len() > shown.len() {
+                label.push_str(", …");
+            }
+            let key: Vec<&str> = canon[members[0]].iter().map(String::as_str).collect();
+            let mut id = format!("schema:{}", key.join(","));
+            if id.len() > 160 {
+                let mut end = 150;
+                while !id.is_char_boundary(end) {
+                    end -= 1;
+                }
+                id = format!(
+                    "{}…{:08x}",
+                    &id[..end],
+                    content_scan::value_hash(&key.join(",")) >> 32
+                );
+            }
+            let mut attrs = json_support::Map::new();
+            attrs.insert(
+                "columns".to_string(),
+                JsonValue::Array(common.iter().map(|c| JsonValue::from(c.clone())).collect()),
+            );
+            attrs.insert("tables".to_string(), JsonValue::from(members.len()));
+            let snode = b.add_node(
+                id,
+                label,
+                NodeType::Schema,
+                "schema".to_string(),
+                None,
+                attrs,
+            );
+            for m in members {
+                group_of[*m] = *gid;
+                let others = members.len() - 1;
+                b.add_edge(
+                    tables[*m].0,
+                    snode,
+                    Relation::HasSchema,
+                    Conf::Inferred,
+                    (best_similarity[*m] * 1000.0).round() / 1000.0,
+                    1.0,
+                    vec![format!(
+                        "shares {:.0}% or more of its column names with {others} other table{}",
+                        best_similarity[*m] * 100.0,
+                        if others == 1 { "" } else { "s" }
+                    )],
+                );
+            }
+        }
+
+        // Joins between tables that are not copies of each other.
+        for i in 0..tables.len() {
+            for j in i + 1..tables.len() {
+                if group_of[i] != usize::MAX && group_of[i] == group_of[j] {
+                    continue;
+                }
+                let (na, _, ta, cols_a) = tables[i];
+                let (nb, _, tb, cols_b) = tables[j];
+                if na == nb {
+                    continue;
+                }
+                let mut found: Vec<(Conf, f64, String)> = Vec::new();
+                for ca in cols_a {
+                    for cb in cols_b {
+                        if let Some(link) = column_join(ta, ca, tb, cb) {
+                            found.push(link);
+                        }
+                    }
+                }
+                if found.is_empty() {
+                    continue;
+                }
+                found.sort_by(|x, y| {
+                    x.0.cmp(&y.0)
+                        .then_with(|| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| x.2.cmp(&y.2))
+                });
+                let confidence = found[0].0;
+                let score = found.iter().map(|f| f.1).fold(0.0, f64::max);
+                let mut evidence: Vec<String> = found.iter().take(5).map(|f| f.2.clone()).collect();
+                if found.len() > 5 {
+                    evidence.push(format!("+{} more column pairs", found.len() - 5));
+                }
+                b.add_edge(
+                    na,
+                    nb,
+                    Relation::Joins,
+                    confidence,
+                    (score * 1000.0).round() / 1000.0,
+                    if confidence == Conf::Extracted {
+                        3.0
+                    } else {
+                        1.0
+                    },
+                    evidence,
+                );
+            }
+        }
+    }
+
+    /// One column pair's join, if the evidence supports it. The naming
+    /// signals `join_candidate` already weighs (same name, the
+    /// `users.id <- orders.user_id` pattern, a shared identifier domain)
+    /// are checked against how much the two columns' full value sets
+    /// actually overlap, from their sketches; string-like columns whose
+    /// values line up can also join with no naming signal at all. What
+    /// never joins: an empty column, a low-cardinality one (fewer than 5
+    /// distinct values - a role, a category), a pair where neither side
+    /// is key-like by its values (at least 90% distinct), a counter
+    /// running from 0 or 1, and an integer column with an ordinary name
+    /// (a count or a measurement overlaps others by coincidence).
+    fn column_join(
+        ta: &str,
+        ca: &ColumnProfile,
+        tb: &str,
+        cb: &ColumnProfile,
+    ) -> Option<(Conf, f64, String)> {
+        for c in [ca, cb] {
+            if matches!(c.ideal_type.as_str(), "enum / category" | "bool") {
+                return None;
+            }
+        }
+        let (ba, bb) = (join_base(&ca.ideal_type)?, join_base(&cb.ideal_type)?);
+        if !join_compatible(&ba, &bb) {
+            return None;
+        }
+        let stats = |c: &ColumnProfile| {
+            c.content
+                .as_ref()
+                .map(|x| (x.sketch_values, x.distinct_estimate()))
+        };
+        let (sa, sb) = (stats(ca), stats(cb));
+        if matches!(sa, Some((0, _))) || matches!(sb, Some((0, _))) {
+            return None;
+        }
+        let measured = match (&ca.content, &cb.content) {
+            (Some(x), Some(y)) => {
+                let (xa, xb) = content_scan::containment_estimates(x, y);
+                Some(xa.max(xb))
+            }
+            _ => None,
+        };
+        let uniqueness =
+            |s: Option<(u64, f64)>| s.map_or(0.0, |(n, d)| (d / n.max(1) as f64).min(1.0));
+        let key_by_values = uniqueness(sa).max(uniqueness(sb)) >= 0.9;
+        let distinct = |s: Option<(u64, f64)>, min: f64| s.is_some_and(|(_, d)| d >= min);
+        let sequential = sequential_ints(ca) || sequential_ints(cb);
+        let (canon_a, canon_b) = (canon_name(&ca.name), canon_name(&cb.name));
+        let key_named = is_key_like_name(&canon_a)
+            || is_key_like_name(&canon_b)
+            || ba.is_identifier_domain()
+            || bb.is_identifier_domain();
+        let pair = format!("{ta}.{} ↔ {tb}.{}", ca.name, cb.name);
+        if let Some(rel) = join_candidate(ta, ca, tb, cb) {
+            let fk = rel.reference.is_some();
+            if matches!(ba, JoinBase::Date | JoinBase::Time) && !fk {
+                return None;
+            }
+            if fk {
+                return Some(match measured {
+                    Some(m) if m > 0.0 => (
+                        Conf::Extracted,
+                        m,
+                        format!("{pair}: foreign-key naming, {} of values shared", pct(m)),
+                    ),
+                    Some(_) => (
+                        Conf::Inferred,
+                        0.5,
+                        format!("{pair}: foreign-key naming, but no values in common"),
+                    ),
+                    None => (Conf::Inferred, 0.7, format!("{pair}: foreign-key naming")),
+                });
+            }
+            let naming = if canon_a == canon_b {
+                "same name".to_string()
+            } else if singular(strip_id_suffix(&canon_a)) == singular(strip_id_suffix(&canon_b)) {
+                "similar names".to_string()
+            } else {
+                format!("both {}", ba.label())
+            };
+            if let Some(m) = measured {
+                let int_ok = !matches!(ba, JoinBase::Int) || key_named;
+                if m >= 0.3
+                    && distinct(sa, 5.0)
+                    && distinct(sb, 5.0)
+                    && key_by_values
+                    && !sequential
+                    && int_ok
+                {
+                    return Some((
+                        Conf::Extracted,
+                        m,
+                        format!("{pair}: {naming}, {} of values shared", pct(m)),
+                    ));
+                }
+                return None;
+            }
+            // No scan data (a dictionary input): a same-named key-like
+            // column is a guess, labelled as one.
+            if key_named && canon_a == canon_b {
+                return Some((Conf::Inferred, 0.6, format!("{pair}: same key-like name")));
+            }
+            return None;
+        }
+        let m = measured?;
+        let string_like = |b: &JoinBase| {
+            matches!(
+                b,
+                JoinBase::PlainString
+                    | JoinBase::Uuid
+                    | JoinBase::Ulid
+                    | JoinBase::Email
+                    | JoinBase::OtherSemantic(_)
+            )
+        };
+        if m >= 0.6
+            && string_like(&ba)
+            && string_like(&bb)
+            && key_by_values
+            && distinct(sa, 20.0)
+            && distinct(sb, 20.0)
+        {
+            return Some((
+                Conf::Extracted,
+                m,
+                format!("{pair}: {} of values shared (names differ)", pct(m)),
+            ));
+        }
+        None
+    }
+
+    // ---- Communities ----
+
+    /// Louvain modularity communities (Blondel et al. 2008), made
+    /// deterministic: nodes are visited in index order every pass, a node
+    /// only moves for a strictly better gain, and ties go to the lowest
+    /// community index. Returns each node's community.
+    pub(crate) fn louvain(n: usize, edges: &[(usize, usize, f64)]) -> Vec<usize> {
+        struct G {
+            n: usize,
+            adj: Vec<Vec<(usize, f64)>>,
+            self_w: Vec<f64>,
+        }
+        fn from_edges(n: usize, edges: &[(usize, usize, f64)]) -> G {
+            let mut maps: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); n];
+            let mut self_w = vec![0.0; n];
+            for &(a, c, w) in edges {
+                if w <= 0.0 || !w.is_finite() {
+                    continue;
+                }
+                if a == c {
+                    self_w[a] += w;
+                } else {
+                    *maps[a].entry(c).or_insert(0.0) += w;
+                    *maps[c].entry(a).or_insert(0.0) += w;
+                }
+            }
+            G {
+                n,
+                adj: maps.into_iter().map(|m| m.into_iter().collect()).collect(),
+                self_w,
+            }
+        }
+        fn one_level(g: &G) -> (Vec<usize>, bool) {
+            let k: Vec<f64> = (0..g.n)
+                .map(|i| g.adj[i].iter().map(|(_, w)| w).sum::<f64>() + 2.0 * g.self_w[i])
+                .collect();
+            let m2: f64 = k.iter().sum();
+            let mut comm: Vec<usize> = (0..g.n).collect();
+            if m2 <= 0.0 {
+                return (comm, false);
+            }
+            let mut tot = k.clone();
+            let mut neigh = vec![0.0f64; g.n];
+            let mut touched: Vec<usize> = Vec::new();
+            let mut improved = false;
+            for _pass in 0..100 {
+                let mut moves = 0;
+                for i in 0..g.n {
+                    let ci = comm[i];
+                    for &(j, w) in &g.adj[i] {
+                        let cj = comm[j];
+                        if neigh[cj] == 0.0 {
+                            touched.push(cj);
+                        }
+                        neigh[cj] += w;
+                    }
+                    tot[ci] -= k[i];
+                    let mut best = ci;
+                    let mut best_gain = neigh[ci] - tot[ci] * k[i] / m2;
+                    touched.sort_unstable();
+                    for &c in &touched {
+                        let gain = neigh[c] - tot[c] * k[i] / m2;
+                        if gain > best_gain + 1e-12 {
+                            best = c;
+                            best_gain = gain;
+                        }
+                    }
+                    tot[best] += k[i];
+                    comm[i] = best;
+                    if best != ci {
+                        moves += 1;
+                    }
+                    for &c in &touched {
+                        neigh[c] = 0.0;
+                    }
+                    touched.clear();
+                }
+                if moves == 0 {
+                    break;
+                }
+                improved = true;
+            }
+            // Renumber by first appearance.
+            let mut map: HashMap<usize, usize> = HashMap::new();
+            let renum: Vec<usize> = comm
+                .iter()
+                .map(|c| {
+                    let next = map.len();
+                    *map.entry(*c).or_insert(next)
+                })
+                .collect();
+            (renum, improved)
+        }
+        fn aggregate(g: &G, comm: &[usize], c: usize) -> G {
+            let mut maps: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); c];
+            let mut self_w = vec![0.0; c];
+            for i in 0..g.n {
+                self_w[comm[i]] += g.self_w[i];
+                for &(j, w) in &g.adj[i] {
+                    let (a, b) = (comm[i], comm[j]);
+                    if a == b {
+                        // Each internal edge is seen from both ends.
+                        self_w[a] += w / 2.0;
+                    } else {
+                        *maps[a].entry(b).or_insert(0.0) += w;
+                    }
+                }
+            }
+            G {
+                n: c,
+                adj: maps.into_iter().map(|m| m.into_iter().collect()).collect(),
+                self_w,
+            }
+        }
+        let mut membership: Vec<usize> = (0..n).collect();
+        let mut g = from_edges(n, edges);
+        for _level in 0..32 {
+            let (comm, improved) = one_level(&g);
+            for m in membership.iter_mut() {
+                *m = comm[*m];
+            }
+            let c = comm.iter().max().map_or(0, |m| m + 1);
+            if !improved || c == g.n {
+                break;
+            }
+            g = aggregate(&g, &comm, c);
+        }
+        membership
+    }
+
+    /// Communities numbered by size (largest first, ties by first member),
+    /// each labelled by the words its files share most - or, for a
+    /// community with no text, by its best-connected member.
+    fn communities_from(
+        nodes: &mut [KgNode],
+        membership: &[usize],
+        doc_terms: &[Vec<(String, f64)>],
+        file_node: &[usize],
+        edges: &[KgEdge],
+    ) -> Vec<Community> {
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (node, c) in membership.iter().enumerate() {
+            groups.entry(*c).or_default().push(node);
+        }
+        let mut list: Vec<Vec<usize>> = groups.into_values().collect();
+        list.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
+        let mut terms_of_node: HashMap<usize, &Vec<(String, f64)>> = HashMap::new();
+        for (fi, node) in file_node.iter().enumerate() {
+            terms_of_node.insert(*node, &doc_terms[fi]);
+        }
+        let mut degree = vec![0usize; nodes.len()];
+        for e in edges {
+            if !e.relation.structural() && e.source != e.target {
+                degree[e.source] += 1;
+                degree[e.target] += 1;
+            }
+        }
+        let mut out = Vec::with_capacity(list.len());
+        for (id, members) in list.into_iter().enumerate() {
+            for m in &members {
+                nodes[*m].community = id;
+            }
+            let label = community_label(nodes, &members, &terms_of_node, &degree);
+            out.push(Community { label, members });
+        }
+        out
+    }
+
+    fn community_label(
+        nodes: &[KgNode],
+        members: &[usize],
+        terms_of_node: &HashMap<usize, &Vec<(String, f64)>>,
+        degree: &[usize],
+    ) -> String {
+        let mut sum: HashMap<&str, (f64, usize)> = HashMap::new();
+        let mut docs = 0;
+        for m in members {
+            if let Some(terms) = terms_of_node.get(m)
+                && !terms.is_empty()
+            {
+                docs += 1;
+                for (t, w) in terms.iter().take(20) {
+                    let slot = sum.entry(t.as_str()).or_insert((0.0, 0));
+                    slot.0 += w;
+                    slot.1 += 1;
+                }
+            }
+        }
+        let min_docs = if docs >= 2 { 2 } else { 1 };
+        let mut ranked: Vec<(&str, f64)> = sum
+            .into_iter()
+            .filter(|(_, (_, c))| *c >= min_docs)
+            .map(|(t, (w, _))| (t, w))
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(b.0))
+        });
+        if !ranked.is_empty() {
+            return ranked
+                .iter()
+                .take(3)
+                .map(|(t, _)| *t)
+                .collect::<Vec<_>>()
+                .join(" · ");
+        }
+        let hub = members
+            .iter()
+            .copied()
+            .max_by(|a, b| degree[*a].cmp(&degree[*b]).then_with(|| b.cmp(a)))
+            .expect("a community has members");
+        if members.len() == 1 {
+            nodes[hub].label.clone()
+        } else {
+            format!("{}-centered", nodes[hub].label)
+        }
+    }
+
+    // ---- graph.json (networkx node-link shape, as graphify writes) ----
+
+    fn round3(x: f64) -> f64 {
+        (x * 1000.0).round() / 1000.0
+    }
+
+    fn count_map<'a>(items: impl Iterator<Item = &'a str>) -> Vec<(String, usize)> {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for i in items {
+            *counts.entry(i).or_insert(0) += 1;
+        }
+        let mut v: Vec<(String, usize)> = counts
+            .into_iter()
+            .map(|(k, c)| (k.to_string(), c))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    fn counts_json(counts: &[(String, usize)]) -> JsonValue {
+        let mut m = json_support::Map::with_capacity(counts.len());
+        for (k, c) in counts {
+            m.push_unique(k.clone(), JsonValue::from(*c));
+        }
+        JsonValue::Object(m)
+    }
+
+    /// A community's composition: file nodes by data type, then tables,
+    /// entities, and schemas.
+    fn composition(kg: &KnowledgeGraph, members: &[usize]) -> Vec<(String, usize)> {
+        count_map(members.iter().map(|m| {
+            let n = &kg.nodes[*m];
+            match n.node_type {
+                NodeType::File => n.file_type.as_str(),
+                NodeType::Table => "table",
+                NodeType::Entity => "entity",
+                NodeType::Schema => "schema",
+            }
+        }))
+    }
+
+    pub(crate) fn to_json(kg: &KnowledgeGraph) -> JsonValue {
+        let mut graph = json_support::Map::new();
+        graph.insert(
+            "generator".to_string(),
+            JsonValue::from(format!("sniff-rs {}", env!("CARGO_PKG_VERSION"))),
+        );
+        graph.insert("input".to_string(), JsonValue::from(kg.input.clone()));
+        let files: Vec<&KgNode> = kg
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == NodeType::File)
+            .collect();
+        graph.insert("files".to_string(), JsonValue::from(files.len()));
+        graph.insert(
+            "file_types".to_string(),
+            counts_json(&count_map(files.iter().map(|n| n.file_type.as_str()))),
+        );
+        graph.insert(
+            "relations".to_string(),
+            counts_json(&count_map(kg.edges.iter().map(|e| e.relation.as_str()))),
+        );
+        graph.insert(
+            "unresolved_references".to_string(),
+            JsonValue::from(kg.unresolved_references),
+        );
+        graph.insert(
+            "communities".to_string(),
+            JsonValue::Array(
+                kg.communities
+                    .iter()
+                    .enumerate()
+                    .map(|(id, c)| {
+                        let mut m = json_support::Map::new();
+                        m.insert("id".to_string(), JsonValue::from(id));
+                        m.insert("label".to_string(), JsonValue::from(c.label.clone()));
+                        m.insert("size".to_string(), JsonValue::from(c.members.len()));
+                        m.insert(
+                            "composition".to_string(),
+                            counts_json(&composition(kg, &c.members)),
+                        );
+                        JsonValue::Object(m)
+                    })
+                    .collect(),
+            ),
+        );
+        let nodes: Vec<JsonValue> = kg
+            .nodes
+            .iter()
+            .map(|n| {
+                let mut m = json_support::Map::with_capacity(6 + n.attrs.len());
+                m.insert("id".to_string(), JsonValue::from(n.id.clone()));
+                m.insert("label".to_string(), JsonValue::from(n.label.clone()));
+                m.insert("type".to_string(), JsonValue::from(n.node_type.as_str()));
+                m.insert(
+                    "file_type".to_string(),
+                    JsonValue::from(n.file_type.clone()),
+                );
+                if let Some(s) = &n.source_file {
+                    m.insert("source_file".to_string(), JsonValue::from(s.clone()));
+                }
+                m.insert("community".to_string(), JsonValue::from(n.community));
+                for (k, v) in n.attrs.iter() {
+                    m.insert(k.clone(), v.clone());
+                }
+                JsonValue::Object(m)
+            })
+            .collect();
+        let links: Vec<JsonValue> = kg
+            .edges
+            .iter()
+            .map(|e| {
+                let mut m = json_support::Map::with_capacity(7);
+                m.insert(
+                    "source".to_string(),
+                    JsonValue::from(kg.nodes[e.source].id.clone()),
+                );
+                m.insert(
+                    "target".to_string(),
+                    JsonValue::from(kg.nodes[e.target].id.clone()),
+                );
+                m.insert("relation".to_string(), JsonValue::from(e.relation.as_str()));
+                m.insert(
+                    "confidence".to_string(),
+                    JsonValue::from(e.confidence.as_str()),
+                );
+                m.insert(
+                    "confidence_score".to_string(),
+                    JsonValue::from(round3(e.score)),
+                );
+                m.insert("weight".to_string(), JsonValue::from(round3(e.weight)));
+                m.insert(
+                    "evidence".to_string(),
+                    JsonValue::Array(e.evidence.iter().cloned().map(JsonValue::from).collect()),
+                );
+                JsonValue::Object(m)
+            })
+            .collect();
+        let mut doc = json_support::Map::with_capacity(5);
+        doc.insert("directed".to_string(), JsonValue::from(false));
+        doc.insert("multigraph".to_string(), JsonValue::from(true));
+        doc.insert("graph".to_string(), JsonValue::Object(graph));
+        doc.insert("nodes".to_string(), JsonValue::Array(nodes));
+        doc.insert("links".to_string(), JsonValue::Array(links));
+        JsonValue::Object(doc)
+    }
+
+    /// Whether a file looks like a `graph.json` this tool wrote: a
+    /// node-link document (`"directed"` and `"links"` near its start) whose
+    /// generator is sniff-rs.
+    pub(crate) fn looks_like_graph_json(path: &Path) -> bool {
+        use std::io::Read;
+        let Ok(mut f) = fs::File::open(path) else {
+            return false;
+        };
+        let mut head = vec![0u8; 4096];
+        let n = f.read(&mut head).unwrap_or(0);
+        let head = String::from_utf8_lossy(&head[..n]);
+        head.trim_start().starts_with('{')
+            && head.contains("\"directed\"")
+            && head.contains("\"generator\": \"sniff-rs")
+    }
+
+    /// Read a `graph.json` back (for `explain`/`path`/`rank`).
+    pub(crate) fn from_json(path: &Path) -> Result<KnowledgeGraph> {
+        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
+        let doc =
+            json_support::from_str(&text).with_context(|| format!("{path:?} is not valid JSON"))?;
+        drop(text);
+        let JsonValue::Object(doc) = doc else {
+            bail!("{path:?} is not a graph.json object");
+        };
+        let mut input = String::new();
+        let mut labels: Vec<String> = Vec::new();
+        let mut unresolved = 0;
+        let mut nodes_json = Vec::new();
+        let mut links_json = Vec::new();
+        for (k, v) in doc {
+            match (k.as_str(), v) {
+                ("graph", JsonValue::Object(g)) => {
+                    for (gk, gv) in g {
+                        match (gk.as_str(), gv) {
+                            ("input", JsonValue::String(s)) => input = s,
+                            ("unresolved_references", n) => {
+                                unresolved = n.as_u64().unwrap_or(0) as usize;
+                            }
+                            ("communities", JsonValue::Array(cs)) => {
+                                for c in cs {
+                                    labels.push(
+                                        c.get("label")
+                                            .and_then(|l| l.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ("nodes", JsonValue::Array(a)) => nodes_json = a,
+                ("links", JsonValue::Array(a)) => links_json = a,
+                _ => {}
+            }
+        }
+        let mut nodes = Vec::with_capacity(nodes_json.len());
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for v in nodes_json {
+            let JsonValue::Object(obj) = v else {
+                bail!("{path:?}: a node isn't a JSON object");
+            };
+            let mut id = None;
+            let mut label = String::new();
+            let mut node_type = NodeType::File;
+            let mut file_type = String::new();
+            let mut source_file = None;
+            let mut community = 0usize;
+            let mut attrs = json_support::Map::new();
+            for (k, v) in obj {
+                match k.as_str() {
+                    "id" => id = v.as_str().map(str::to_string),
+                    "label" => label = v.as_str().unwrap_or("").to_string(),
+                    "type" => {
+                        node_type = v
+                            .as_str()
+                            .and_then(NodeType::parse)
+                            .unwrap_or(NodeType::File)
+                    }
+                    "file_type" => file_type = v.as_str().unwrap_or("").to_string(),
+                    "source_file" => source_file = v.as_str().map(str::to_string),
+                    "community" => community = v.as_u64().unwrap_or(0) as usize,
+                    _ => {
+                        attrs.insert(k, v);
+                    }
+                }
+            }
+            let id = id.ok_or_else(|| anyhow!("{path:?}: a node has no \"id\""))?;
+            index.insert(id.clone(), nodes.len());
+            nodes.push(KgNode {
+                id,
+                label,
+                node_type,
+                file_type,
+                source_file,
+                attrs,
+                community,
+            });
+        }
+        let mut edges = Vec::with_capacity(links_json.len());
+        for v in links_json {
+            let node_of = |key: &str| -> Result<usize> {
+                let id = v
+                    .get(key)
+                    .and_then(|s| s.as_str())
+                    .ok_or_else(|| anyhow!("{path:?}: a link has no {key:?}"))?;
+                index
+                    .get(id)
+                    .copied()
+                    .ok_or_else(|| anyhow!("{path:?}: a link names unknown node {id:?}"))
+            };
+            let source = node_of("source")?;
+            let target = node_of("target")?;
+            let relation = v
+                .get("relation")
+                .and_then(|s| s.as_str())
+                .and_then(Relation::parse)
+                .unwrap_or(Relation::Mentions);
+            let confidence = v
+                .get("confidence")
+                .and_then(|s| s.as_str())
+                .and_then(Conf::parse)
+                .unwrap_or(Conf::Inferred);
+            let score = v
+                .get("confidence_score")
+                .and_then(|s| s.as_f64())
+                .unwrap_or(0.0);
+            let weight = v.get("weight").and_then(|s| s.as_f64()).unwrap_or(1.0);
+            let evidence = v
+                .get("evidence")
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            edges.push(KgEdge {
+                source,
+                target,
+                relation,
+                confidence,
+                score,
+                weight,
+                evidence,
+            });
+        }
+        let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            members.entry(n.community).or_default().push(i);
+        }
+        let count = members
+            .keys()
+            .next_back()
+            .map_or(0, |m| m + 1)
+            .max(labels.len());
+        let communities = (0..count)
+            .map(|id| Community {
+                label: labels.get(id).cloned().unwrap_or_default(),
+                members: members.remove(&id).unwrap_or_default(),
+            })
+            .collect();
+        Ok(KnowledgeGraph {
+            input,
+            nodes,
+            edges,
+            communities,
+            unresolved_references: unresolved,
+        })
+    }
+
+    // ---- GRAPH_REPORT.md ----
+
+    fn md(text: &str) -> String {
+        text.replace('|', "\\|").replace('\n', " ")
+    }
+
+    fn node_ref(n: &KgNode) -> String {
+        match n.node_type {
+            NodeType::File | NodeType::Table => format!("`{}` ({})", md(&n.id), n.file_type),
+            NodeType::Entity => format!("`{}` ({})", md(&n.label), n.file_type),
+            NodeType::Schema => format!("`{}`", md(&n.label)),
+        }
+    }
+
+    fn attr_f64(n: &KgNode, key: &str) -> Option<f64> {
+        n.attrs.get(key).and_then(JsonValue::as_f64)
+    }
+
+    fn attr_str<'a>(n: &'a KgNode, key: &str) -> Option<&'a str> {
+        n.attrs.get(key).and_then(JsonValue::as_str)
+    }
+
+    /// Pairs of files of different data types the graph links, strongest
+    /// first: direct links between them, and specific shared entities
+    /// (mentioned by at most five files).
+    pub(crate) fn cross_type_connections(kg: &KnowledgeGraph) -> Vec<(usize, usize, Conf, String)> {
+        let mut out: Vec<(u8, Conf, i64, usize, usize, String)> = Vec::new();
+        let is_data_node =
+            |i: usize| matches!(kg.nodes[i].node_type, NodeType::File | NodeType::Table);
+        let file_of = |i: usize| {
+            kg.nodes[i]
+                .source_file
+                .clone()
+                .unwrap_or_else(|| kg.nodes[i].id.clone())
+        };
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        for e in &kg.edges {
+            if e.relation.structural() || e.relation == Relation::Mentions {
+                continue;
+            }
+            if !(is_data_node(e.source) && is_data_node(e.target)) {
+                continue;
+            }
+            let (a, c) = (&kg.nodes[e.source], &kg.nodes[e.target]);
+            if a.file_type == c.file_type || file_of(e.source) == file_of(e.target) {
+                continue;
+            }
+            let rank = match e.relation {
+                Relation::References => 0,
+                Relation::Joins | Relation::SharesIds => 1,
+                Relation::SimilarTo => 3,
+                _ => 4,
+            };
+            let key = (e.source.min(e.target), e.source.max(e.target));
+            if seen.insert(key) {
+                let why = format!(
+                    "{} — {}",
+                    e.relation.as_str(),
+                    e.evidence.first().cloned().unwrap_or_default()
+                );
+                out.push((
+                    rank,
+                    e.confidence,
+                    -((e.score * 1000.0) as i64),
+                    e.source,
+                    e.target,
+                    why,
+                ));
+            }
+        }
+        let inc = kg.incidence();
+        for (ei, n) in kg.nodes.iter().enumerate() {
+            if n.node_type != NodeType::Entity {
+                continue;
+            }
+            let files: Vec<usize> = inc[ei]
+                .iter()
+                .map(|x| {
+                    let e = &kg.edges[*x];
+                    if e.source == ei { e.target } else { e.source }
+                })
+                .filter(|x| is_data_node(*x))
+                .collect();
+            if files.len() > 5 {
+                continue;
+            }
+            let conf = inc[ei]
+                .first()
+                .map_or(Conf::Inferred, |x| kg.edges[*x].confidence);
+            for (i, &a) in files.iter().enumerate() {
+                for &c in &files[i + 1..] {
+                    if kg.nodes[a].file_type == kg.nodes[c].file_type {
+                        continue;
+                    }
+                    let key = (a.min(c), a.max(c));
+                    if seen.insert(key) {
+                        let why = format!("both mention {} `{}`", n.file_type, md(&n.label));
+                        out.push((2, conf, 0, a, c, why));
+                    }
+                }
+            }
+        }
+        out.sort_by(|x, y| {
+            x.1.cmp(&y.1)
+                .then_with(|| x.0.cmp(&y.0))
+                .then_with(|| x.2.cmp(&y.2))
+                .then_with(|| kg.nodes[x.3].id.cmp(&kg.nodes[y.3].id))
+                .then_with(|| kg.nodes[x.4].id.cmp(&kg.nodes[y.4].id))
+        });
+        out.into_iter()
+            .map(|(_, conf, _, a, c, why)| (a, c, conf, why))
+            .collect()
+    }
+
+    pub(crate) fn render_report(kg: &KnowledgeGraph) -> String {
+        let mut out = String::new();
+        let files: Vec<usize> = (0..kg.nodes.len())
+            .filter(|i| kg.nodes[*i].node_type == NodeType::File)
+            .collect();
+        let kinds = count_map(
+            files
+                .iter()
+                .map(|i| attr_str(&kg.nodes[*i], "kind").unwrap_or("data")),
+        );
+        let kind_count = |k: &str| kinds.iter().find(|(x, _)| x == k).map_or(0, |(_, c)| *c);
+        out.push_str(&format!("# Knowledge graph: {}\n\n", md(&kg.input)));
+        out.push_str(&format!(
+            "**{} files** ({} profiled, {} scanned as text, {} with no readable content, {} failed) · {} nodes · {} links · {} communities\n\n",
+            files.len(),
+            kind_count("data"),
+            kind_count("text"),
+            kind_count("binary"),
+            kind_count("failed"),
+            kg.nodes.len(),
+            kg.edges.len(),
+            kg.communities.len()
+        ));
+        out.push_str("Links carry graphify's confidence tags: EXTRACTED (read directly from the data), INFERRED (a heuristic's judgment), AMBIGUOUS (several candidates).\n\n");
+
+        out.push_str("## Links\n\n| Relation | Links | EXTRACTED | INFERRED | AMBIGUOUS |\n|---|---|---|---|---|\n");
+        for r in Relation::ALL {
+            let of: Vec<&KgEdge> = kg.edges.iter().filter(|e| e.relation == r).collect();
+            if of.is_empty() {
+                continue;
+            }
+            let c = |conf: Conf| of.iter().filter(|e| e.confidence == conf).count();
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                r.as_str(),
+                of.len(),
+                c(Conf::Extracted),
+                c(Conf::Inferred),
+                c(Conf::Ambiguous)
+            ));
+        }
+        if kg.unresolved_references > 0 {
+            out.push_str(&format!(
+                "\n{} file reference(s) matched more than five files of that name and were left unlinked.\n",
+                kg.unresolved_references
+            ));
+        }
+
+        let content_degree = kg.content_degrees();
+        out.push_str(
+            "\n## Files by type\n\n| Type | Files | Linked | Isolated |\n|---|---|---|---|\n",
+        );
+        for (t, count) in count_map(files.iter().map(|i| kg.nodes[*i].file_type.as_str())) {
+            let linked = files
+                .iter()
+                .filter(|i| kg.nodes[**i].file_type == t && content_degree[**i] > 0)
+                .count();
+            out.push_str(&format!(
+                "| {} | {count} | {linked} | {} |\n",
+                md(&t),
+                count - linked
+            ));
+        }
+
+        out.push_str("\n## God nodes\n\nThe most-connected files and tables (distinct neighbors over every link but a file's own tables):\n\n| Node | Type | Degree | Community |\n|---|---|---|---|\n");
+        let mut ranked: Vec<usize> = (0..kg.nodes.len())
+            .filter(|i| {
+                matches!(kg.nodes[*i].node_type, NodeType::File | NodeType::Table)
+                    && content_degree[*i] > 0
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            content_degree[*b]
+                .cmp(&content_degree[*a])
+                .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+        });
+        for i in ranked.iter().take(15) {
+            let n = &kg.nodes[*i];
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} |\n",
+                md(&n.id),
+                n.file_type,
+                content_degree[*i],
+                n.community
+            ));
+        }
+        let mut entities: Vec<usize> = (0..kg.nodes.len())
+            .filter(|i| kg.nodes[*i].node_type == NodeType::Entity)
+            .collect();
+        entities.sort_by(|a, b| {
+            content_degree[*b]
+                .cmp(&content_degree[*a])
+                .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+        });
+        if !entities.is_empty() {
+            out.push_str(&format!(
+                "\nThe most widely shared identifiers ({} shared in total):\n\n| Entity | Kind | Files |\n|---|---|---|\n",
+                entities.len()
+            ));
+            for i in entities.iter().take(15) {
+                let n = &kg.nodes[*i];
+                out.push_str(&format!(
+                    "| `{}` | {} | {} |\n",
+                    md(&n.label),
+                    n.file_type,
+                    content_degree[*i]
+                ));
+            }
+        }
+
+        out.push_str("\n## Communities\n\nLouvain modularity over every link, labelled by the words their files share most.\n\n");
+        let shown = kg
+            .communities
+            .iter()
+            .filter(|c| c.members.len() > 1)
+            .take(40);
+        for (id, c) in shown.enumerate() {
+            let comp = composition(kg, &c.members)
+                .iter()
+                .map(|(t, n)| format!("{t} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "### {id} · {} ({} nodes: {comp})\n\n",
+                md(&c.label),
+                c.members.len()
+            ));
+            let mut members: Vec<usize> = c
+                .members
+                .iter()
+                .copied()
+                .filter(|m| matches!(kg.nodes[*m].node_type, NodeType::File | NodeType::Table))
+                .collect();
+            members.sort_by(|a, b| {
+                content_degree[*b]
+                    .cmp(&content_degree[*a])
+                    .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+            });
+            let names: Vec<String> = members
+                .iter()
+                .take(12)
+                .map(|m| format!("`{}`", md(&kg.nodes[*m].id)))
+                .collect();
+            if !names.is_empty() {
+                out.push_str(&names.join(", "));
+                if members.len() > 12 {
+                    out.push_str(&format!(", …and {} more", members.len() - 12));
+                }
+                out.push_str("\n\n");
+            }
+        }
+        let singletons = kg
+            .communities
+            .iter()
+            .filter(|c| c.members.len() == 1)
+            .count();
+        if singletons > 0 {
+            out.push_str(&format!(
+                "{singletons} node(s) link to nothing and form communities of their own.\n"
+            ));
+        }
+
+        let cross = cross_type_connections(kg);
+        out.push_str(&format!(
+            "\n## Connections across data types\n\n{} pairs of files of different types are linked directly or through a specific shared identifier. The strongest:\n\n",
+            cross.len()
+        ));
+        for (a, c, conf, why) in cross.iter().take(30) {
+            out.push_str(&format!(
+                "- {} ↔ {} — {why} [{}]\n",
+                node_ref(&kg.nodes[*a]),
+                node_ref(&kg.nodes[*c]),
+                conf.as_str()
+            ));
+        }
+
+        let mut unmapped: Vec<(usize, f64)> = files
+            .iter()
+            .filter_map(|i| attr_f64(&kg.nodes[*i], "unmapped_char_pct").map(|p| (*i, p)))
+            .filter(|(_, p)| *p >= 1.0)
+            .collect();
+        unmapped.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| kg.nodes[a.0].id.cmp(&kg.nodes[b.0].id))
+        });
+        if !unmapped.is_empty() {
+            out.push_str(&format!(
+                "\n## Text that didn't decode\n\n{} file(s) have at least 1% of their characters as U+FFFD (a font or encoding with no Unicode mapping): their words are missing from the similarity links. An OCR or model pass over these recovers them.\n\n",
+                unmapped.len()
+            ));
+            for (i, p) in unmapped.iter().take(25) {
+                out.push_str(&format!("- `{}` — {p:.1}%\n", md(&kg.nodes[*i].id)));
+            }
+            if unmapped.len() > 25 {
+                out.push_str(&format!("- …and {} more\n", unmapped.len() - 25));
+            }
+        }
+
+        // Documents that should hold text but gave none: scanned pages,
+        // image-only exports.
+        let textless: Vec<usize> = files
+            .iter()
+            .copied()
+            .filter(|i| {
+                let n = &kg.nodes[*i];
+                matches!(n.file_type.as_str(), "pdf" | "docx" | "pptx")
+                    && n.attrs.get("text_chars").and_then(JsonValue::as_u64) == Some(0)
+            })
+            .collect();
+        if !textless.is_empty() {
+            out.push_str(&format!(
+                "\n## Documents with no extractable text\n\n{} document(s) hold no text layer at all (scanned or image-only pages), so nothing in them can link: OCR would recover them.\n\n",
+                textless.len()
+            ));
+            for i in textless.iter().take(25) {
+                out.push_str(&format!("- `{}`\n", md(&kg.nodes[*i].id)));
+            }
+            if textless.len() > 25 {
+                out.push_str(&format!("- …and {} more\n", textless.len() - 25));
+            }
+        }
+
+        let isolated: Vec<usize> = files
+            .iter()
+            .copied()
+            .filter(|i| content_degree[*i] == 0)
+            .collect();
+        if !isolated.is_empty() {
+            out.push_str(&format!("\n## Isolated files\n\n{} file(s) share nothing detectable with any other file:\n\n", isolated.len()));
+            for i in isolated.iter().take(40) {
+                out.push_str(&format!("- {}\n", node_ref(&kg.nodes[*i])));
+            }
+            if isolated.len() > 40 {
+                out.push_str(&format!("- …and {} more\n", isolated.len() - 40));
+            }
+        }
+
+        let failed: Vec<usize> = files
+            .iter()
+            .copied()
+            .filter(|i| attr_str(&kg.nodes[*i], "kind") == Some("failed"))
+            .collect();
+        if !failed.is_empty() {
+            out.push_str(&format!(
+                "\n## Failed\n\n{} file(s) couldn't be read:\n\n",
+                failed.len()
+            ));
+            for i in failed.iter().take(25) {
+                let n = &kg.nodes[*i];
+                out.push_str(&format!(
+                    "- `{}` — {}\n",
+                    md(&n.id),
+                    md(attr_str(n, "error").unwrap_or(""))
+                ));
+            }
+        }
+        out
+    }
+
+    // ---- Obsidian vault ----
+
+    fn sanitize_component(s: &str) -> String {
+        let mut out: String = s
+            .chars()
+            .map(|c| {
+                if c.is_control() || "\\/:*?\"<>|#^[]".contains(c) {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let trimmed = out.trim_end_matches(['.', ' ']).trim_start().to_string();
+        out = trimmed;
+        if out.starts_with('.') {
+            out.insert(0, '_');
+        }
+        if out.is_empty() {
+            out.push('_');
+        }
+        if out.len() > 120 {
+            let hash = content_scan::value_hash(s) >> 40;
+            let mut end = 110;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+            out.push_str(&format!("…{hash:06x}"));
+        }
+        out
+    }
+
+    fn tag_part(s: &str) -> String {
+        let t: String = s
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if t.chars().all(|c| c.is_ascii_digit()) {
+            format!("_{t}")
+        } else {
+            t
+        }
+    }
+
+    fn yaml_str(s: &str) -> String {
+        format!(
+            "\"{}\"",
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        )
+    }
+
+    fn alias(s: &str) -> String {
+        s.replace('|', "/")
+            .replace('[', "(")
+            .replace(']', ")")
+            .replace('\n', " ")
+    }
+
+    fn wikilink(path: &str, label: &str) -> String {
+        format!("[[{path}|{}]]", alias(label))
+    }
+
+    /// Vault-relative note paths (without `.md`), unique case-insensitively.
+    fn note_paths(kg: &KnowledgeGraph) -> Vec<String> {
+        let mut used: HashSet<String> = HashSet::new();
+        let mut out = Vec::with_capacity(kg.nodes.len());
+        for n in &kg.nodes {
+            let base = match n.node_type {
+                NodeType::File => {
+                    let parts: Vec<String> = n.id.split('/').map(sanitize_component).collect();
+                    format!("files/{}", parts.join("/"))
+                }
+                NodeType::Table => {
+                    let file = n.source_file.clone().unwrap_or_default();
+                    let parts: Vec<String> = file.split('/').map(sanitize_component).collect();
+                    format!("files/{}/{}", parts.join("/"), sanitize_component(&n.label))
+                }
+                NodeType::Entity => format!(
+                    "entities/{}/{}",
+                    sanitize_component(&n.file_type),
+                    sanitize_component(&n.label)
+                ),
+                NodeType::Schema => format!(
+                    "schemas/{}",
+                    sanitize_component(n.label.strip_prefix("schema: ").unwrap_or(&n.label))
+                ),
+            };
+            let mut path = base.clone();
+            let mut k = 2;
+            while !used.insert(path.to_lowercase()) {
+                path = format!("{base} ({k})");
+                k += 1;
+            }
+            out.push(path);
+        }
+        out
+    }
+
+    fn community_note(id: usize, c: &Community) -> String {
+        format!("communities/{id:02} {}", sanitize_component(&c.label))
+    }
+
+    /// Make `dir` ready to hold generated output: create it if missing;
+    /// accept it empty or already marked as this tool's; otherwise refuse,
+    /// so a real folder is never written into (or cleared) by mistake.
+    pub(crate) fn prepare_generated_dir(dir: &Path) -> Result<()> {
+        if dir.exists() {
+            if !dir.is_dir() {
+                bail!("{dir:?} exists and isn't a directory");
+            }
+            let marked = dir.join(MARKER_FILE).exists();
+            let empty = fs::read_dir(dir)
+                .with_context(|| format!("failed to read {dir:?}"))?
+                .next()
+                .is_none();
+            if !marked && !empty {
+                bail!(
+                    "{dir:?} already exists and wasn't written by sniff-rs graph - pass a new or empty directory"
+                );
+            }
+        }
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {dir:?}"))?;
+        fs::write(
+            dir.join(MARKER_FILE),
+            "Generated by sniff-rs graph. Directory walks skip this folder, and re-running the graph may replace its contents.\n",
+        )
+        .with_context(|| format!("failed to write into {dir:?}"))?;
+        Ok(())
+    }
+
+    /// Write an Obsidian vault: one note per node, linked with
+    /// `[[wikilinks]]` grouped by relation, plus a note per community, a
+    /// home note, and a graph-view color scheme by data type. Returns the
+    /// number of notes written.
+    pub(crate) fn write_obsidian(kg: &KnowledgeGraph, dir: &Path) -> Result<usize> {
+        prepare_generated_dir(dir)?;
+        for sub in ["files", "entities", "schemas", "communities"] {
+            let p = dir.join(sub);
+            if p.exists() {
+                fs::remove_dir_all(&p).with_context(|| format!("failed to clear {p:?}"))?;
+            }
+        }
+        let paths = note_paths(kg);
+        let inc = kg.incidence();
+        let content_degree = kg.content_degrees();
+        let write_note = |rel: &str, body: &str| -> Result<()> {
+            let path = dir.join(format!("{rel}.md"));
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {parent:?}"))?;
+            }
+            fs::write(&path, body).with_context(|| format!("failed to write {path:?}"))
+        };
+        let mut written = 0;
+        for (i, n) in kg.nodes.iter().enumerate() {
+            let c = &kg.communities[n.community];
+            let mut note = String::new();
+            note.push_str("---\n");
+            note.push_str(&format!("type: {}\n", n.node_type.as_str()));
+            match n.node_type {
+                NodeType::Entity => {
+                    note.push_str(&format!("entity_kind: {}\n", yaml_str(&n.file_type)))
+                }
+                _ => note.push_str(&format!("file_type: {}\n", yaml_str(&n.file_type))),
+            }
+            if let Some(s) = &n.source_file {
+                note.push_str(&format!("source_file: {}\n", yaml_str(s)));
+            }
+            note.push_str(&format!("community: {}\n", n.community));
+            note.push_str(&format!("community_label: {}\n", yaml_str(&c.label)));
+            note.push_str(&format!("degree: {}\n", content_degree[i]));
+            note.push_str("tags:\n");
+            match n.node_type {
+                NodeType::File | NodeType::Table => {
+                    note.push_str(&format!("  - type/{}\n", tag_part(&n.file_type)));
+                }
+                NodeType::Entity => {
+                    note.push_str(&format!("  - entity/{}\n", tag_part(&n.file_type)))
+                }
+                NodeType::Schema => note.push_str("  - schema\n"),
+            }
+            note.push_str(&format!("  - node/{}\n", n.node_type.as_str()));
+            note.push_str(&format!("  - community/{}\n", n.community));
+            note.push_str("---\n");
+            note.push_str(&format!("# {}\n\n", n.label));
+            let mut facts: Vec<String> = Vec::new();
+            match n.node_type {
+                NodeType::File | NodeType::Table => {
+                    if let Some(s) = &n.source_file {
+                        facts.push(format!("`{s}`"));
+                    }
+                    facts.push(format!("**{}**", n.file_type));
+                    let plural =
+                        |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+                    if let Some(r) = n.attrs.get("rows").and_then(JsonValue::as_u64) {
+                        facts.push(plural(r, "row"));
+                    }
+                    if let Some(k) = n.attrs.get("columns").and_then(JsonValue::as_u64) {
+                        facts.push(plural(k, "column"));
+                    }
+                    if let Some(k) = attr_str(n, "kind")
+                        && k != "data"
+                    {
+                        facts.push(k.to_string());
+                    }
+                }
+                NodeType::Entity => {
+                    facts.push(format!("**{}**", n.file_type));
+                    facts.push(format!("mentioned by {} files", content_degree[i]));
+                }
+                NodeType::Schema => {
+                    if let Some(t) = n.attrs.get("tables").and_then(JsonValue::as_u64) {
+                        facts.push(format!("shared by {t} tables"));
+                    }
+                }
+            }
+            facts.push(format!(
+                "community {}",
+                wikilink(
+                    &community_note(n.community, c),
+                    &format!("{}: {}", n.community, c.label)
+                )
+            ));
+            note.push_str(&facts.join(" · "));
+            note.push_str("\n\n");
+            if let Some(terms) = n.attrs.get("top_terms").and_then(JsonValue::as_array) {
+                let words: Vec<&str> = terms.iter().filter_map(JsonValue::as_str).collect();
+                if !words.is_empty() {
+                    note.push_str(&format!("**Top terms:** {}\n\n", words.join(", ")));
+                }
+            }
+            if let Some(err) = attr_str(n, "error") {
+                note.push_str(&format!("**Couldn't be read:** {err}\n\n"));
+            }
+            if let Some(p) = attr_f64(n, "unmapped_char_pct") {
+                note.push_str(&format!(
+                    "**{p:.1}% of characters didn't decode** (U+FFFD).\n\n"
+                ));
+            }
+            // Connections, grouped by relation.
+            let mut by_rel: BTreeMap<Relation, Vec<(Conf, String, String)>> = BTreeMap::new();
+            for &ei in &inc[i] {
+                let e = &kg.edges[ei];
+                let other = if e.source == i { e.target } else { e.source };
+                let dir_mark = match (e.relation, e.source == i) {
+                    (Relation::References, false) => "referenced by ",
+                    (Relation::Contains, false) => "part of ",
+                    _ => "",
+                };
+                let line = format!(
+                    "{dir_mark}{} — {} · {}",
+                    wikilink(&paths[other], &kg.nodes[other].label),
+                    e.evidence.join("; "),
+                    e.confidence.as_str()
+                );
+                by_rel.entry(e.relation).or_default().push((
+                    e.confidence,
+                    kg.nodes[other].label.to_lowercase(),
+                    line,
+                ));
+            }
+            if !by_rel.is_empty() {
+                note.push_str("## Connections\n\n");
+                for (rel, mut lines) in by_rel {
+                    lines.sort();
+                    note.push_str(&format!(
+                        "### {} ({})\n\n",
+                        rel.as_str().replace('_', " "),
+                        lines.len()
+                    ));
+                    for (_, _, line) in lines {
+                        note.push_str(&format!("- {line}\n"));
+                    }
+                    note.push('\n');
+                }
+            }
+            if let (Some(names), Some(types)) = (
+                n.attrs.get("column_names").and_then(JsonValue::as_array),
+                n.attrs.get("column_types").and_then(JsonValue::as_array),
+            ) {
+                note.push_str("## Columns\n\n| Column | Type |\n|---|---|\n");
+                for (name, ty) in names.iter().zip(types) {
+                    note.push_str(&format!(
+                        "| {} | {} |\n",
+                        md(name.as_str().unwrap_or("")),
+                        md(ty.as_str().unwrap_or(""))
+                    ));
+                }
+                note.push('\n');
+            }
+            write_note(&paths[i], &note)?;
+            written += 1;
+        }
+        // Community notes.
+        for (id, c) in kg.communities.iter().enumerate() {
+            if c.members.len() < 2 {
+                continue;
+            }
+            let mut note = format!(
+                "---\ntype: community\ncommunity: {id}\nmembers: {}\ntags:\n  - community/{id}\n---\n# Community {id} · {}\n\n",
+                c.members.len(),
+                c.label
+            );
+            let comp = composition(kg, &c.members)
+                .iter()
+                .map(|(t, n)| format!("{t} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            note.push_str(&format!(
+                "{} nodes: {comp}\n\n## Members\n\n",
+                c.members.len()
+            ));
+            let mut members = c.members.clone();
+            members.sort_by(|a, b| {
+                content_degree[*b]
+                    .cmp(&content_degree[*a])
+                    .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+            });
+            for m in members {
+                let n = &kg.nodes[m];
+                note.push_str(&format!(
+                    "- {} ({}, degree {})\n",
+                    wikilink(&paths[m], &n.label),
+                    n.file_type,
+                    content_degree[m]
+                ));
+            }
+            let mut across: BTreeMap<usize, usize> = BTreeMap::new();
+            for e in &kg.edges {
+                let (ca, cb) = (kg.nodes[e.source].community, kg.nodes[e.target].community);
+                if ca != cb && (ca == id || cb == id) {
+                    *across.entry(if ca == id { cb } else { ca }).or_insert(0) += 1;
+                }
+            }
+            if !across.is_empty() {
+                note.push_str("\n## Links to other communities\n\n");
+                for (other, count) in across {
+                    let oc = &kg.communities[other];
+                    note.push_str(&format!(
+                        "- {} — {count} link(s)\n",
+                        wikilink(
+                            &community_note(other, oc),
+                            &format!("{other}: {}", oc.label)
+                        )
+                    ));
+                }
+            }
+            write_note(&community_note(id, c), &note)?;
+            written += 1;
+        }
+        // Home note.
+        let mut home = format!(
+            "# {} knowledge graph\n\nGenerated by sniff-rs: {} nodes, {} links. Every file is a note under `files/`; identifiers two or more files share are notes under `entities/`; links carry EXTRACTED / INFERRED / AMBIGUOUS confidence and their evidence. Open the graph view to see the network, colored by data type.\n\n## Communities\n\n",
+            kg.input,
+            kg.nodes.len(),
+            kg.edges.len()
+        );
+        for (id, c) in kg
+            .communities
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.members.len() > 1)
+        {
+            home.push_str(&format!(
+                "- {} ({} nodes)\n",
+                wikilink(&community_note(id, c), &format!("{id}: {}", c.label)),
+                c.members.len()
+            ));
+        }
+        home.push_str("\n## Most connected\n\n");
+        let mut ranked: Vec<usize> = (0..kg.nodes.len())
+            .filter(|i| content_degree[*i] > 0)
+            .collect();
+        ranked.sort_by(|a, b| {
+            content_degree[*b]
+                .cmp(&content_degree[*a])
+                .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+        });
+        for i in ranked.iter().take(25) {
+            home.push_str(&format!(
+                "- {} ({}, degree {})\n",
+                wikilink(&paths[*i], &kg.nodes[*i].label),
+                kg.nodes[*i].file_type,
+                content_degree[*i]
+            ));
+        }
+        write_note("index", &home)?;
+        written += 1;
+        // Graph view: color by data type.
+        const PALETTE: [u32; 12] = [
+            0xE74C3C, 0x3498DB, 0x2ECC71, 0xF39C12, 0x9B59B6, 0x1ABC9C, 0xE67E22, 0xF1C40F,
+            0x16A085, 0xD35400, 0x8E44AD, 0x2980B9,
+        ];
+        let types = count_map(
+            kg.nodes
+                .iter()
+                .filter(|n| matches!(n.node_type, NodeType::File | NodeType::Table))
+                .map(|n| n.file_type.as_str()),
+        );
+        let mut groups: Vec<JsonValue> = types
+            .iter()
+            .take(PALETTE.len())
+            .enumerate()
+            .map(|(i, (t, _))| {
+                json!({
+                    "query": format!("tag:#type/{}", tag_part(t)),
+                    "color": {"a": 1, "rgb": PALETTE[i]}
+                })
+            })
+            .collect();
+        groups.push(json!({"query": "tag:#node/entity", "color": {"a": 1, "rgb": 0x95A5A6u32}}));
+        groups.push(json!({"query": "tag:#node/schema", "color": {"a": 1, "rgb": 0x7F8C8Du32}}));
+        let config = json!({
+            "collapse-filter": false,
+            "search": "",
+            "showTags": false,
+            "showAttachments": false,
+            "hideUnresolved": false,
+            "showOrphans": true,
+            "collapse-color-groups": false,
+            "colorGroups": JsonValue::Array(groups)
+        });
+        let obsidian = dir.join(".obsidian");
+        fs::create_dir_all(&obsidian).with_context(|| format!("failed to create {obsidian:?}"))?;
+        fs::write(
+            obsidian.join("graph.json"),
+            json_support::to_pretty_string(&config),
+        )
+        .with_context(|| format!("failed to write {obsidian:?}"))?;
+        Ok(written)
+    }
+
+    // ---- Queries: explain / path / rank over a knowledge graph ----
+
+    /// A node by id (a file's path relative to the input, `file#table`, or
+    /// `kind:value`), else by unique label, else case-insensitively, else
+    /// by a unique substring of its id.
+    pub(crate) fn resolve_node(kg: &KnowledgeGraph, spec: &str) -> Result<usize> {
+        if let Some(i) = kg.nodes.iter().position(|n| n.id == spec) {
+            return Ok(i);
+        }
+        let by_label: Vec<usize> = (0..kg.nodes.len())
+            .filter(|i| kg.nodes[*i].label == spec)
+            .collect();
+        if by_label.len() == 1 {
+            return Ok(by_label[0]);
+        }
+        let lower = spec.to_lowercase();
+        let ci: Vec<usize> = (0..kg.nodes.len())
+            .filter(|i| {
+                kg.nodes[*i].id.to_lowercase() == lower
+                    || kg.nodes[*i].label.to_lowercase() == lower
+            })
+            .collect();
+        if ci.len() == 1 {
+            return Ok(ci[0]);
+        }
+        let sub: Vec<usize> = (0..kg.nodes.len())
+            .filter(|i| kg.nodes[*i].id.to_lowercase().contains(&lower))
+            .collect();
+        if sub.len() == 1 {
+            return Ok(sub[0]);
+        }
+        let candidates = if !by_label.is_empty() {
+            by_label
+        } else if !ci.is_empty() {
+            ci
+        } else {
+            sub
+        };
+        if candidates.is_empty() {
+            bail!(
+                "no node matches {spec:?} - pass a file path relative to the input, a table as file#table, or an identifier as kind:value (e.g. email:alice@example.com)"
+            );
+        }
+        bail!(
+            "{spec:?} matches several nodes - pass one of: {}",
+            capped_name_list(
+                candidates
+                    .iter()
+                    .map(|i| kg.nodes[*i].id.as_str())
+                    .collect()
+            )
+        )
+    }
+
+    fn node_json(kg: &KnowledgeGraph, i: usize, degree: usize) -> JsonValue {
+        let n = &kg.nodes[i];
+        let mut m = json_support::Map::new();
+        m.insert("id".to_string(), JsonValue::from(n.id.clone()));
+        m.insert("label".to_string(), JsonValue::from(n.label.clone()));
+        m.insert("type".to_string(), JsonValue::from(n.node_type.as_str()));
+        m.insert(
+            "file_type".to_string(),
+            JsonValue::from(n.file_type.clone()),
+        );
+        if let Some(s) = &n.source_file {
+            m.insert("source_file".to_string(), JsonValue::from(s.clone()));
+        }
+        m.insert("community".to_string(), JsonValue::from(n.community));
+        if let Some(c) = kg.communities.get(n.community) {
+            m.insert(
+                "community_label".to_string(),
+                JsonValue::from(c.label.clone()),
+            );
+        }
+        m.insert("degree".to_string(), JsonValue::from(degree));
+        JsonValue::Object(m)
+    }
+
+    /// `explain` over a knowledge graph: the node, then every link it
+    /// has, grouped by relation, strongest first.
+    pub(crate) fn render_explain(
+        kg: &KnowledgeGraph,
+        i: usize,
+        format: &GraphFormat,
+    ) -> Result<String> {
+        let degrees = kg.content_degrees();
+        let inc = kg.incidence();
+        let mut links: Vec<(Relation, Conf, i64, String, usize, &'static str, usize)> = inc[i]
+            .iter()
+            .map(|ei| {
+                let e = &kg.edges[*ei];
+                let (other, direction) = if e.source == e.target {
+                    (i, "self")
+                } else if e.source == i {
+                    (e.target, "out")
+                } else {
+                    (e.source, "in")
+                };
+                (
+                    e.relation,
+                    e.confidence,
+                    -((e.score * 1000.0) as i64),
+                    kg.nodes[other].label.to_lowercase(),
+                    other,
+                    direction,
+                    *ei,
+                )
+            })
+            .collect();
+        links.sort();
+        let n = &kg.nodes[i];
+        match format {
+            GraphFormat::Json => {
+                let mut doc = json_support::Map::new();
+                let mut node = node_json(kg, i, degrees[i]);
+                if let JsonValue::Object(m) = &mut node {
+                    for (k, v) in n.attrs.iter() {
+                        if k != "degree" {
+                            m.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                doc.insert("node".to_string(), node);
+                doc.insert(
+                    "connections".to_string(),
+                    JsonValue::Array(
+                        links
+                            .iter()
+                            .map(|(rel, conf, _, _, other, direction, ei)| {
+                                let e = &kg.edges[*ei];
+                                let mut m = json_support::Map::new();
+                                m.insert(
+                                    "node".to_string(),
+                                    JsonValue::from(kg.nodes[*other].id.clone()),
+                                );
+                                m.insert(
+                                    "label".to_string(),
+                                    JsonValue::from(kg.nodes[*other].label.clone()),
+                                );
+                                m.insert(
+                                    "type".to_string(),
+                                    JsonValue::from(kg.nodes[*other].node_type.as_str()),
+                                );
+                                m.insert(
+                                    "file_type".to_string(),
+                                    JsonValue::from(kg.nodes[*other].file_type.clone()),
+                                );
+                                m.insert("relation".to_string(), JsonValue::from(rel.as_str()));
+                                m.insert("direction".to_string(), JsonValue::from(*direction));
+                                m.insert("confidence".to_string(), JsonValue::from(conf.as_str()));
+                                m.insert(
+                                    "confidence_score".to_string(),
+                                    JsonValue::from(round3(e.score)),
+                                );
+                                m.insert(
+                                    "evidence".to_string(),
+                                    JsonValue::Array(
+                                        e.evidence.iter().cloned().map(JsonValue::from).collect(),
+                                    ),
+                                );
+                                JsonValue::Object(m)
+                            })
+                            .collect(),
+                    ),
+                );
+                Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+            }
+            GraphFormat::Md => {
+                let mut out = format!("# {}\n\n", md(&n.label));
+                out.push_str(&format!("- **Id:** `{}`\n", md(&n.id)));
+                out.push_str(&format!(
+                    "- **Type:** {} ({})\n",
+                    n.node_type.as_str(),
+                    n.file_type
+                ));
+                if let Some(s) = &n.source_file {
+                    out.push_str(&format!("- **Source file:** `{}`\n", md(s)));
+                }
+                let label = kg
+                    .communities
+                    .get(n.community)
+                    .map_or("", |c| c.label.as_str());
+                out.push_str(&format!(
+                    "- **Community:** {} ({})\n",
+                    n.community,
+                    md(label)
+                ));
+                out.push_str(&format!(
+                    "- **Degree:** {} (distinct neighbors, not counting a file's own tables)\n",
+                    degrees[i]
+                ));
+                for key in [
+                    "rows",
+                    "columns",
+                    "tables",
+                    "files",
+                    "size_bytes",
+                    "unmapped_char_pct",
+                ] {
+                    if let Some(v) = n.attrs.get(key)
+                        && !v.is_null()
+                    {
+                        out.push_str(&format!("- **{}:** {v}\n", key.replace('_', " ")));
+                    }
+                }
+                if let Some(terms) = n.attrs.get("top_terms").and_then(JsonValue::as_array) {
+                    let words: Vec<&str> = terms.iter().filter_map(JsonValue::as_str).collect();
+                    out.push_str(&format!("- **Top terms:** {}\n", words.join(", ")));
+                }
+                if let Some(err) = attr_str(n, "error") {
+                    out.push_str(&format!("- **Error:** {}\n", md(err)));
+                }
+                out.push_str(&format!("\n## Connections ({})\n", links.len()));
+                let mut rel_start = 0;
+                while rel_start < links.len() {
+                    let rel = links[rel_start].0;
+                    let rel_end = links[rel_start..]
+                        .iter()
+                        .position(|l| l.0 != rel)
+                        .map_or(links.len(), |p| rel_start + p);
+                    let group = &links[rel_start..rel_end];
+                    out.push_str(&format!(
+                        "\n### {} ({})\n\n| Node | Type | Confidence | Evidence |\n|---|---|---|---|\n",
+                        rel.as_str(),
+                        group.len()
+                    ));
+                    for (_, conf, _, _, other, direction, ei) in group.iter().take(MAX_TOC_ENTRIES)
+                    {
+                        let arrow = match (*direction, rel) {
+                            ("in", Relation::References) => "referenced by ",
+                            ("in", Relation::Contains) => "part of ",
+                            _ => "",
+                        };
+                        let o = &kg.nodes[*other];
+                        out.push_str(&format!(
+                            "| {arrow}`{}` | {} | {} | {} |\n",
+                            md(&o.id),
+                            o.file_type,
+                            conf.as_str(),
+                            md(&kg.edges[*ei].evidence.join("; "))
+                        ));
+                    }
+                    if group.len() > MAX_TOC_ENTRIES {
+                        out.push_str(&format!(
+                            "| …and {} more (--output-format json lists them all) | | | |\n",
+                            group.len() - MAX_TOC_ENTRIES
+                        ));
+                    }
+                    rel_start = rel_end;
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Cheapest path between two nodes: every hop costs the same, plus a
+    /// little more for an INFERRED or AMBIGUOUS link and for passing
+    /// through an identifier many files share - so the path prefers
+    /// specific, extracted links when two paths are otherwise equally
+    /// short. Ties break by node order, so the answer is stable.
+    pub(crate) fn shortest_path(kg: &KnowledgeGraph, from: usize, to: usize) -> Option<Vec<usize>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let inc = kg.incidence();
+        let degrees = kg.content_degrees();
+        let mut dist = vec![u64::MAX; kg.nodes.len()];
+        let mut prev: Vec<Option<usize>> = vec![None; kg.nodes.len()];
+        let mut heap = BinaryHeap::new();
+        dist[from] = 0;
+        heap.push(Reverse((0u64, from)));
+        while let Some(Reverse((d, node))) = heap.pop() {
+            if d > dist[node] {
+                continue;
+            }
+            if node == to {
+                break;
+            }
+            for &ei in &inc[node] {
+                let e = &kg.edges[ei];
+                let next = if e.source == node { e.target } else { e.source };
+                if next == node {
+                    continue;
+                }
+                let mut cost = 1000u64
+                    + match e.confidence {
+                        Conf::Extracted => 0,
+                        Conf::Inferred => 250,
+                        Conf::Ambiguous => 500,
+                    };
+                if next != to && kg.nodes[next].node_type == NodeType::Entity {
+                    cost += 20 * degrees[next].min(50) as u64;
+                }
+                let nd = d + cost;
+                if nd < dist[next] {
+                    dist[next] = nd;
+                    prev[next] = Some(ei);
+                    heap.push(Reverse((nd, next)));
+                }
+            }
+        }
+        if from != to && prev[to].is_none() {
+            return None;
+        }
+        let mut hops = Vec::new();
+        let mut cur = to;
+        while cur != from {
+            let ei = prev[cur]?;
+            hops.push(ei);
+            let e = &kg.edges[ei];
+            cur = if e.source == cur { e.target } else { e.source };
+        }
+        hops.reverse();
+        Some(hops)
+    }
+
+    pub(crate) fn render_path(
+        kg: &KnowledgeGraph,
+        from: usize,
+        to: usize,
+        hops: &[usize],
+        format: &GraphFormat,
+    ) -> Result<String> {
+        let mut steps = Vec::with_capacity(hops.len());
+        let mut cur = from;
+        for &ei in hops {
+            let e = &kg.edges[ei];
+            let next = if e.source == cur { e.target } else { e.source };
+            steps.push((cur, next, ei));
+            cur = next;
+        }
+        match format {
+            GraphFormat::Json => {
+                let mut doc = json_support::Map::new();
+                doc.insert(
+                    "from".to_string(),
+                    JsonValue::from(kg.nodes[from].id.clone()),
+                );
+                doc.insert("to".to_string(), JsonValue::from(kg.nodes[to].id.clone()));
+                doc.insert("length".to_string(), JsonValue::from(hops.len()));
+                doc.insert(
+                    "hops".to_string(),
+                    JsonValue::Array(
+                        steps
+                            .iter()
+                            .map(|(a, c, ei)| {
+                                let e = &kg.edges[*ei];
+                                let mut m = json_support::Map::new();
+                                m.insert(
+                                    "from".to_string(),
+                                    JsonValue::from(kg.nodes[*a].id.clone()),
+                                );
+                                m.insert(
+                                    "to".to_string(),
+                                    JsonValue::from(kg.nodes[*c].id.clone()),
+                                );
+                                m.insert(
+                                    "relation".to_string(),
+                                    JsonValue::from(e.relation.as_str()),
+                                );
+                                m.insert(
+                                    "confidence".to_string(),
+                                    JsonValue::from(e.confidence.as_str()),
+                                );
+                                m.insert(
+                                    "evidence".to_string(),
+                                    JsonValue::Array(
+                                        e.evidence.iter().cloned().map(JsonValue::from).collect(),
+                                    ),
+                                );
+                                JsonValue::Object(m)
+                            })
+                            .collect(),
+                    ),
+                );
+                Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+            }
+            GraphFormat::Md => {
+                let mut out = format!(
+                    "# Path: {} → {} ({} hop{})\n\n",
+                    md(&kg.nodes[from].label),
+                    md(&kg.nodes[to].label),
+                    hops.len(),
+                    if hops.len() == 1 { "" } else { "s" }
+                );
+                for (step, (a, c, ei)) in steps.iter().enumerate() {
+                    let e = &kg.edges[*ei];
+                    out.push_str(&format!(
+                        "{}. {} —{} [{}]→ {}\n   - {}\n",
+                        step + 1,
+                        node_ref(&kg.nodes[*a]),
+                        e.relation.as_str(),
+                        e.confidence.as_str(),
+                        node_ref(&kg.nodes[*c]),
+                        md(&e.evidence.join("; "))
+                    ));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    pub(crate) fn render_rank(
+        kg: &KnowledgeGraph,
+        format: &GraphFormat,
+        input: &Path,
+    ) -> Result<String> {
+        let degrees = kg.content_degrees();
+        let mut order: Vec<usize> = (0..kg.nodes.len()).collect();
+        order.sort_by(|a, b| {
+            degrees[*b]
+                .cmp(&degrees[*a])
+                .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+        });
+        match format {
+            GraphFormat::Json => {
+                let mut doc = json_support::Map::new();
+                doc.insert(
+                    "input".to_string(),
+                    JsonValue::from(input.display().to_string()),
+                );
+                doc.insert(
+                    "nodes".to_string(),
+                    JsonValue::Array(
+                        order
+                            .iter()
+                            .map(|i| node_json(kg, *i, degrees[*i]))
+                            .collect(),
+                    ),
+                );
+                doc.insert(
+                    "communities".to_string(),
+                    JsonValue::Array(
+                        kg.communities
+                            .iter()
+                            .enumerate()
+                            .map(|(id, c)| {
+                                let mut m = json_support::Map::new();
+                                m.insert("id".to_string(), JsonValue::from(id));
+                                m.insert("label".to_string(), JsonValue::from(c.label.clone()));
+                                m.insert("size".to_string(), JsonValue::from(c.members.len()));
+                                m.insert(
+                                    "composition".to_string(),
+                                    counts_json(&composition(kg, &c.members)),
+                                );
+                                m.insert(
+                                    "members".to_string(),
+                                    JsonValue::Array(
+                                        c.members
+                                            .iter()
+                                            .map(|x| JsonValue::from(kg.nodes[*x].id.clone()))
+                                            .collect(),
+                                    ),
+                                );
+                                JsonValue::Object(m)
+                            })
+                            .collect(),
+                    ),
+                );
+                Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+            }
+            GraphFormat::Md => {
+                let mut out = String::from(
+                    "# Most connected nodes\n\nDegree counts distinct neighbors over every link but a file's own tables (joins, shared schemas, references, mentions, similarity, names).\n\n| Node | Type | Degree | Community |\n|---|---|---|---|\n",
+                );
+                let data: Vec<usize> = order
+                    .iter()
+                    .copied()
+                    .filter(|i| matches!(kg.nodes[*i].node_type, NodeType::File | NodeType::Table))
+                    .collect();
+                for i in data.iter().take(MAX_TOC_ENTRIES) {
+                    let n = &kg.nodes[*i];
+                    out.push_str(&format!(
+                        "| `{}` | {} | {} | {} |\n",
+                        md(&n.id),
+                        n.file_type,
+                        degrees[*i],
+                        n.community
+                    ));
+                }
+                if data.len() > MAX_TOC_ENTRIES {
+                    out.push_str(&format!(
+                        "| …and {} more | | | |\n",
+                        data.len() - MAX_TOC_ENTRIES
+                    ));
+                }
+                let entities: Vec<usize> = order
+                    .iter()
+                    .copied()
+                    .filter(|i| kg.nodes[*i].node_type == NodeType::Entity)
+                    .collect();
+                if !entities.is_empty() {
+                    out.push_str("\n## Most shared identifiers\n\n| Identifier | Kind | Files |\n|---|---|---|\n");
+                    for i in entities.iter().take(25) {
+                        let n = &kg.nodes[*i];
+                        out.push_str(&format!(
+                            "| `{}` | {} | {} |\n",
+                            md(&n.label),
+                            n.file_type,
+                            degrees[*i]
+                        ));
+                    }
+                }
+                out.push_str("\n## Communities\n\n");
+                for (id, c) in kg.communities.iter().enumerate() {
+                    let comp = composition(kg, &c.members)
+                        .iter()
+                        .map(|(t, n)| format!("{t} {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
+                        "- Community {id} ({}, {} nodes: {comp})\n",
+                        md(&c.label),
+                        c.members.len()
+                    ));
+                    if id + 1 >= MAX_TOC_ENTRIES && kg.communities.len() > MAX_TOC_ENTRIES {
+                        out.push_str(&format!(
+                            "- …and {} more communities\n",
+                            kg.communities.len() - MAX_TOC_ENTRIES
+                        ));
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn profile(name: &str, ideal: &str, values: &[&str]) -> ColumnProfile {
+            let mut acc = content_scan::ContentAccumulator::new(true);
+            for v in values {
+                acc.push(v);
+            }
+            ColumnProfile {
+                name: name.to_string(),
+                current_type: ideal.to_string(),
+                ideal_type: ideal.to_string(),
+                row_count: values.len(),
+                content: Some(Box::new(acc.finish(ideal))),
+                ..Default::default()
+            }
+        }
+
+        fn strings(prefix: &str, n: usize) -> Vec<String> {
+            (0..n).map(|i| format!("{prefix}{i}")).collect()
+        }
+
+        #[test]
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
+        fn ooxml_paragraphs_read_runs_tabs_entities_and_skip_fallbacks() {
+            let xml = r#"<w:document><w:body><w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:tab/><w:t xml:space="preserve"> world &amp; co</w:t></w:r></w:p><w:p><mc:AlternateContent><mc:Choice Requires="wps"><w:t>box</w:t></mc:Choice><mc:Fallback><w:pict><w:t>box</w:t></w:pict></mc:Fallback></mc:AlternateContent></w:p><w:p><m:oMath><m:r><m:t>x=1</m:t></m:r></m:oMath></w:p><w:p></w:p></w:body></w:document>"#;
+            assert_eq!(
+                ooxml_paragraphs(xml),
+                vec!["Hello\t world & co", "box", "x=1"]
+            );
+            let slide = r#"<p:sld><a:p><a:r><a:t>Title</a:t></a:r><a:br/><a:r><a:t>line</a:t></a:r></a:p></p:sld>"#;
+            assert_eq!(ooxml_paragraphs(slide), vec!["Title line"]);
+        }
+
+        #[test]
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
+        fn only_external_relationship_targets_are_read() {
+            let rels = r#"<Relationships><Relationship Id="rId1" Type="x/image" Target="media/image1.png"/><Relationship Id="rId2" Type="x/hyperlink" Target="https://example.com/a?b=1&amp;c=2" TargetMode="External"/></Relationships>"#;
+            assert_eq!(
+                external_targets(rels),
+                vec!["https://example.com/a?b=1&c=2"]
+            );
+        }
+
+        #[test]
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
+        fn xml_entities_unescape_and_bad_ones_stay_literal() {
+            assert_eq!(
+                xml_unescape_text("&lt;a&gt; &#65;&#x42; &bogus; &"),
+                "<a> AB &bogus; &"
+            );
+        }
+
+        #[test]
+        fn name_stems_drop_extension_and_copy_suffixes() {
+            assert_eq!(name_stem("Report (1).pdf"), "report");
+            assert_eq!(name_stem("report copy.docx"), "report");
+            assert_eq!(name_stem("a.b.c.txt"), "a.b.c");
+            assert_eq!(name_stem(".bashrc"), ".bashrc");
+            assert_eq!(name_stem("version (2a).pdf"), "version (2a)");
+        }
+
+        #[test]
+        fn louvain_separates_two_loosely_linked_cliques_deterministically() {
+            let mut edges = Vec::new();
+            for (a, b) in [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5)] {
+                edges.push((a, b, 1.0));
+            }
+            edges.push((2, 3, 0.1));
+            let first = louvain(7, &edges);
+            assert_eq!(first, louvain(7, &edges));
+            assert_eq!(first[0], first[1]);
+            assert_eq!(first[1], first[2]);
+            assert_eq!(first[3], first[4]);
+            assert_eq!(first[4], first[5]);
+            assert_ne!(first[0], first[3]);
+            // Node 6 has no links: a community of its own.
+            assert!(first[..6].iter().all(|c| *c != first[6]));
+        }
+
+        #[test]
+        fn foreign_keys_join_when_their_values_overlap() {
+            let ids: Vec<String> = (1..=30).map(|i| i.to_string()).collect();
+            let refs: Vec<String> = (1..=30).map(|i| ((i % 10) + 1).to_string()).collect();
+            let id = profile(
+                "id",
+                "i64",
+                &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let customer_id = profile(
+                "customer_id",
+                "i64",
+                &refs.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let (conf, _, evidence) =
+                column_join("customers", &id, "orders", &customer_id).expect("joins");
+            assert_eq!(conf, Conf::Extracted);
+            assert!(evidence.contains("foreign-key naming"));
+        }
+
+        #[test]
+        fn low_cardinality_empty_and_measurement_columns_never_join() {
+            let roles_a = profile("role", "String", &["user", "model", "user", "model"]);
+            let roles_b = profile("role", "String", &["model", "user"]);
+            assert!(column_join("a", &roles_a, "b", &roles_b).is_none());
+            let empty_a = profile("user_id", "i64", &[]);
+            let empty_b = profile("user_id", "i64", &[]);
+            assert!(column_join("a", &empty_a, "b", &empty_b).is_none());
+            let counts: Vec<String> = (100..160).map(|i| i.to_string()).collect();
+            let c: Vec<&str> = counts.iter().map(String::as_str).collect();
+            let tokens_a = profile("token_count", "i64", &c);
+            let tokens_b = profile("token_count", "i64", &c);
+            assert!(column_join("a", &tokens_a, "b", &tokens_b).is_none());
+        }
+
+        #[test]
+        fn string_values_join_even_when_names_differ() {
+            let skus = strings("SKU-", 40);
+            let s: Vec<&str> = skus.iter().map(String::as_str).collect();
+            let a = profile("product", "String", &s);
+            let b = profile("item_code_text", "String", &s[..30]);
+            let (conf, score, evidence) = column_join("catalog", &a, "sales", &b).expect("joins");
+            assert_eq!(conf, Conf::Extracted);
+            assert!(score > 0.9, "{score}");
+            assert!(evidence.contains("names differ"));
+        }
+
+        fn kg_file(rel: &str, text: &str, known: &Arc<KnownFiles>) -> KgFile {
+            let _scan = ScanGuard::new(Some(known.clone()));
+            let mut acc = content_scan::ContentAccumulator::new(false);
+            acc.push(text);
+            KgFile {
+                rel: rel.to_string(),
+                name: rel.rsplit('/').next().unwrap().to_string(),
+                file_type: "txt".to_string(),
+                kind: FileKind::Text,
+                size: text.len() as u64,
+                tables: Vec::new(),
+                text: Some(acc.finish("String")),
+                error: None,
+                fixed_schema: false,
+                truncated_scan: false,
+            }
+        }
+
+        #[test]
+        fn references_resolve_by_path_and_directory_before_ambiguity() {
+            let known = Arc::new(KnownFiles::new(["data.csv", "a.txt", "b.txt", "c.txt"]));
+            let files = vec![
+                kg_file("x/data.csv", "", &known),
+                kg_file("y/data.csv", "", &known),
+                kg_file("x/a.txt", "load data.csv", &known),
+                kg_file("z/b.txt", "load y/data.csv", &known),
+                kg_file("z/c.txt", "load data.csv", &known),
+            ];
+            let kg = build("t".to_string(), files);
+            let refs: Vec<(String, String, Conf)> = kg
+                .edges
+                .iter()
+                .filter(|e| e.relation == Relation::References)
+                .map(|e| {
+                    (
+                        kg.nodes[e.source].id.clone(),
+                        kg.nodes[e.target].id.clone(),
+                        e.confidence,
+                    )
+                })
+                .collect();
+            assert!(refs.contains(&("x/a.txt".into(), "x/data.csv".into(), Conf::Extracted)));
+            assert!(refs.contains(&("z/b.txt".into(), "y/data.csv".into(), Conf::Extracted)));
+            assert!(refs.contains(&("z/c.txt".into(), "x/data.csv".into(), Conf::Ambiguous)));
+            assert!(refs.contains(&("z/c.txt".into(), "y/data.csv".into(), Conf::Ambiguous)));
+            assert_eq!(refs.len(), 4);
+        }
+
+        #[test]
+        fn many_identifiers_shared_by_two_files_collapse_into_one_link() {
+            let known = Arc::new(KnownFiles::new(Vec::<&str>::new()));
+            let emails: String = (0..40).map(|i| format!("user{i}@example.org ")).collect();
+            let files = vec![
+                kg_file("a.txt", &emails, &known),
+                kg_file("b.txt", &emails, &known),
+            ];
+            let kg = build("t".to_string(), files);
+            let entities = kg
+                .nodes
+                .iter()
+                .filter(|n| n.node_type == NodeType::Entity)
+                .count();
+            assert_eq!(entities, ENTITY_NODES_PER_FILE_SET);
+            let shares: Vec<&KgEdge> = kg
+                .edges
+                .iter()
+                .filter(|e| e.relation == Relation::SharesIds)
+                .collect();
+            assert_eq!(shares.len(), 1);
+            // 40 emails plus the domain they share; 12 are nodes.
+            assert!(
+                shares[0].evidence[0].starts_with("29 more identifiers"),
+                "{:?}",
+                shares[0].evidence
+            );
+        }
+
+        #[test]
+        fn the_graph_round_trips_through_graph_json() {
+            let known = Arc::new(KnownFiles::new(["b.txt"]));
+            let files = vec![
+                kg_file("a.txt", "see b.txt and ops@example.org", &known),
+                kg_file("b.txt", "mail ops@example.org", &known),
+            ];
+            let kg = build("t".to_string(), files);
+            let dir = std::env::temp_dir().join(format!("sniff-kg-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("graph.json");
+            fs::write(&path, json_support::to_pretty_string(&to_json(&kg))).unwrap();
+            assert!(looks_like_graph_json(&path));
+            let back = from_json(&path).unwrap();
+            assert_eq!(back.nodes.len(), kg.nodes.len());
+            assert_eq!(back.edges.len(), kg.edges.len());
+            assert_eq!(back.communities.len(), kg.communities.len());
+            for (x, y) in kg.edges.iter().zip(&back.edges) {
+                assert_eq!(
+                    (x.source, x.target, x.relation, x.confidence),
+                    (y.source, y.target, y.relation, y.confidence)
+                );
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+}
+
+const GRAPH_HELP_TEXT: &str = r#"sniff-rs graph - a knowledge graph across every file and data type
+
+USAGE:
+    sniff-rs graph <INPUT> [OUTPUT_DIR] [OPTIONS]
+
+    Reads every file under <INPUT> (a directory, walked recursively, or one
+    file) and links files by what they share, not just by schema:
+
+      joins        tables whose columns line up by name and/or by values
+                   (EXTRACTED when the value sets measurably overlap)
+      has_schema   tables sharing (nearly) the same columns - versioned
+                   exports, monthly sheets (never PDFs or notebooks, whose
+                   columns are fixed by the format)
+      mentions     identifiers found anywhere in a file's content - emails
+                   and their organization's domain, URLs, DOIs, ISBNs,
+                   UUIDs, IPs, VINs, IBANs, card numbers (shown by their
+                   last four digits only), course/product codes, long
+                   reference numbers - linked when two or more files share
+                   one
+      references   a file naming another file (a notebook's
+                   read_csv("sales.csv"), a page's <img src="plot.png">)
+      similar_to   files whose wording overlaps (TF-IDF cosine, INFERRED)
+      same_name    files sharing a name stem (report.pdf / report.docx)
+
+    Every data format sniff-rs reads is profiled; any other text file (txt,
+    md, html, source code) is scanned for the same links; binary files
+    (images, video, archives) are nodes too, linked when something names
+    them. Version-control and cache folders (.git, __pycache__,
+    .ipynb_checkpoints, node_modules) and OS clutter (.DS_Store) are skipped.
+    Every link carries graphify's EXTRACTED / INFERRED / AMBIGUOUS
+    confidence and its evidence; communities come from Louvain modularity.
+
+    Writes to OUTPUT_DIR (default: <INPUT>.graph beside the input):
+      graph.json        nodes and links (networkx node-link JSON, the
+                        shape graphify writes)
+      GRAPH_REPORT.md   god nodes, communities, links across data types,
+                        text that didn't decode, isolated files
+      obsidian/         with --obsidian: an Obsidian vault - a note per
+                        file and shared identifier, [[wikilinks]] for
+                        every link, graph view colored by data type
+
+    Query it afterwards: sniff-rs explain|path|rank <OUTPUT_DIR>/graph.json
+    (they also accept a directory directly).
+
+ARGS:
+    <INPUT>                 Directory or file to graph
+    [OUTPUT_DIR]            Where the graph is written; "-" prints
+                            graph.json (or, with --output-format md, the
+                            report) to stdout instead
+
+OPTIONS:
+        --obsidian              Also write an Obsidian vault to
+                                OUTPUT_DIR/obsidian
+        --obsidian-dir <DIR>    Write the vault to DIR (implies --obsidian)
+        --samples <N>           Sample values per column (default: 3)
+        --include <GLOB>        Only files matching GLOB (repeatable)
+        --exclude <GLOB>        Skip files matching GLOB (repeatable)
+        --output-format <FMT>   With OUTPUT_DIR "-": json (default) or md
+    -h, --help                  Print this help
+"#;
+
+fn run_graph(raw: &[String]) -> Result<()> {
+    let mut obsidian = false;
+    let mut obsidian_dir: Option<PathBuf> = None;
+    let mut samples: usize = 3;
+    let mut include: Vec<String> = Vec::new();
+    let mut exclude: Vec<String> = Vec::new();
+    let mut output_format: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = raw[i].as_str();
+        if arg == "-h" || arg == "--help" {
+            print!("{GRAPH_HELP_TEXT}");
+            std::process::exit(0);
+        }
+        if let Some(rest) = arg.strip_prefix("--") {
+            let (name, inline_value) = match rest.split_once('=') {
+                Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                None => (rest.to_string(), None),
+            };
+            let value = |i: &mut usize| -> Result<String> {
+                if let Some(v) = inline_value.clone() {
+                    return Ok(v);
+                }
+                *i += 1;
+                raw.get(*i)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("--{name} requires a value"))
+            };
+            match name.as_str() {
+                "obsidian" => {
+                    if inline_value.is_some() {
+                        bail!(
+                            "--obsidian takes no value (use --obsidian-dir <DIR> to choose where the vault goes)"
+                        );
+                    }
+                    obsidian = true;
+                }
+                "obsidian-dir" => obsidian_dir = Some(PathBuf::from(value(&mut i)?)),
+                "samples" => {
+                    let raw_value = value(&mut i)?;
+                    samples = raw_value
+                        .parse()
+                        .ok()
+                        .filter(|n: &usize| *n > 0)
+                        .ok_or_else(|| {
+                            anyhow!("--samples must be a positive integer, got {raw_value:?}")
+                        })?;
+                }
+                "include" => include.push(value(&mut i)?),
+                "exclude" => exclude.push(value(&mut i)?),
+                "output-format" => output_format = Some(value(&mut i)?),
+                other => bail!("unrecognized flag --{other}"),
+            }
+        } else {
+            positionals.push(arg.to_string());
+        }
+        i += 1;
+    }
+    if positionals.is_empty() || positionals.len() > 2 {
+        bail!("expected <INPUT> [OUTPUT_DIR] (see sniff-rs graph --help)");
+    }
+    let input = PathBuf::from(&positionals[0]);
+    let output = positionals.get(1).map(PathBuf::from);
+    let to_stdout = output.as_deref() == Some(Path::new("-"));
+    if !to_stdout && output_format.is_some() {
+        bail!(
+            "--output-format only applies with OUTPUT_DIR \"-\" - a graph directory always gets both graph.json and GRAPH_REPORT.md"
+        );
+    }
+    if to_stdout && obsidian && obsidian_dir.is_none() {
+        bail!(
+            "--obsidian with OUTPUT_DIR \"-\" has nowhere to put the vault - pass --obsidian-dir <DIR>"
+        );
+    }
+    let stdout_format = match output_format.as_deref().map(str::to_lowercase).as_deref() {
+        None | Some("json") => GraphFormat::Json,
+        Some("md") | Some("markdown") => GraphFormat::Md,
+        Some(other) => bail!("unrecognized --output-format '{other}' (expected json or md)"),
+    };
+
+    let (name, files) = knowledge_graph::collect(
+        &input,
+        &knowledge_graph::CollectOptions {
+            samples,
+            include,
+            exclude,
+            progress: true,
+        },
+    )?;
+    if files.is_empty() {
+        bail!("no files found under {input:?}");
+    }
+    let kg = knowledge_graph::build(name, files);
+    let summary = format!(
+        "{} files, {} nodes, {} links, {} communities",
+        kg.nodes
+            .iter()
+            .filter(|n| n.node_type == knowledge_graph::NodeType::File)
+            .count(),
+        kg.nodes.len(),
+        kg.edges.len(),
+        kg.communities.len()
+    );
+
+    if to_stdout {
+        let rendered = match stdout_format {
+            GraphFormat::Json => json_support::to_pretty_string(&knowledge_graph::to_json(&kg)),
+            GraphFormat::Md => knowledge_graph::render_report(&kg),
+        };
+        print!("{rendered}");
+        if !rendered.ends_with('\n') {
+            println!();
+        }
+        if let Some(dir) = obsidian_dir {
+            let notes = knowledge_graph::write_obsidian(&kg, &dir)?;
+            eprintln!(
+                "{summary} -> obsidian vault {} ({notes} notes)",
+                dir.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let dir = match output {
+        Some(d) => d,
+        None => default_graph_dir(&input)?,
+    };
+    knowledge_graph::prepare_generated_dir(&dir)?;
+    let graph_path = dir.join("graph.json");
+    fs::write(
+        &graph_path,
+        json_support::to_pretty_string(&knowledge_graph::to_json(&kg)),
+    )
+    .with_context(|| format!("failed to write {graph_path:?}"))?;
+    let report_path = dir.join("GRAPH_REPORT.md");
+    fs::write(&report_path, knowledge_graph::render_report(&kg))
+        .with_context(|| format!("failed to write {report_path:?}"))?;
+    let mut status = format!("{summary} -> {}", dir.display());
+    if obsidian || obsidian_dir.is_some() {
+        let vault = obsidian_dir.unwrap_or_else(|| dir.join("obsidian"));
+        let notes = knowledge_graph::write_obsidian(&kg, &vault)?;
+        status.push_str(&format!(
+            " (obsidian vault: {}, {notes} notes)",
+            vault.display()
+        ));
+    }
+    eprintln!("{status}");
+    Ok(())
+}
+
+/// `<INPUT>.graph` beside the input: `data/` -> `data.graph/`,
+/// `sales.csv` -> `sales.csv.graph/`.
+fn default_graph_dir(input: &Path) -> Result<PathBuf> {
+    let full = fs::canonicalize(input).with_context(|| format!("failed to resolve {input:?}"))?;
+    let name = full
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "input".to_string());
+    Ok(full
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join(format!("{name}.graph")))
+}
+
+/// The graph subcommands' knowledge-graph inputs: a directory (graphed
+/// in memory, the same way `sniff-rs graph` would) or a `graph.json`
+/// that `sniff-rs graph` wrote. `None` for anything else, which keeps the
+/// table-join behavior (a dictionary or a raw data file).
+fn load_knowledge_graph_input(
+    input: &Path,
+    samples: Option<usize>,
+) -> Result<Option<knowledge_graph::KnowledgeGraph>> {
+    if input.is_dir() {
+        let (name, files) = knowledge_graph::collect(
+            input,
+            &knowledge_graph::CollectOptions {
+                samples: samples.unwrap_or(3),
+                include: Vec::new(),
+                exclude: Vec::new(),
+                progress: false,
+            },
+        )?;
+        if files.is_empty() {
+            bail!("no files found under {input:?}");
+        }
+        eprintln!("graphed {} files under {}", files.len(), input.display());
+        return Ok(Some(knowledge_graph::build(name, files)));
+    }
+    if input.is_file() && knowledge_graph::looks_like_graph_json(input) {
+        if let Some(n) = samples {
+            eprintln!(
+                "note: --samples {n} applies to raw inputs only - {} is an already-built graph",
+                input.display()
+            );
+        }
+        return Ok(Some(knowledge_graph::from_json(input)?));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -90649,6 +96490,7 @@ mod tests {
             notes: String::new(),
             row_count: 10,
             numeric_stats: None,
+            content: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = std::iter::once((
             "t".to_string(),
@@ -90724,6 +96566,7 @@ mod tests {
             notes: String::new(),
             row_count: 42,
             numeric_stats: None,
+            content: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> =
             std::iter::once(("t".to_string(), vec![profile])).collect();
@@ -90743,6 +96586,7 @@ mod tests {
             notes: String::new(),
             row_count,
             numeric_stats: None,
+            content: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = [
             ("events".to_string(), vec![profile_with_rows(3)]),
@@ -91142,6 +96986,7 @@ mod tests {
                 notes: String::new(),
                 row_count: 1,
                 numeric_stats: None,
+                content: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -91153,6 +96998,7 @@ mod tests {
                 notes: "matches email address format".to_string(),
                 row_count: 1,
                 numeric_stats: None,
+                content: None,
             },
         ];
         let mut tables = BTreeMap::new();
@@ -91229,6 +97075,7 @@ mod tests {
                     notes: String::new(),
                     row_count: 1,
                     numeric_stats: None,
+                    content: None,
                 })
                 .collect()
         };
@@ -91308,6 +97155,7 @@ mod tests {
                 notes: String::new(),
                 row_count: 2,
                 numeric_stats: None,
+                content: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -91319,6 +97167,7 @@ mod tests {
                 notes: "matches email address format".to_string(),
                 row_count: 2,
                 numeric_stats: None,
+                content: None,
             },
         ];
         let dir = std::env::temp_dir().join(format!(
@@ -91377,6 +97226,7 @@ mod tests {
             notes: String::new(),
             row_count: 1,
             numeric_stats: None,
+            content: None,
         }];
         let dir = std::env::temp_dir().join(format!(
             "sniff-rs-sql-inline-trailing-newline-test-{}",
