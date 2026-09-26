@@ -12845,11 +12845,22 @@ fn graph_blank_headers_neither_link_nor_break_queries() {
 fn graph_rank_reports_similar_tables_and_edge_context() {
     // v1/v2 are column-identical (similarity 1.0): their shared edges
     // read duplicate_schema. w shares one column with each (0.33) - below
-    // the reporting bar entirely - and those edges stay bridges.
+    // the reporting bar entirely - and those edges stay bridges. The
+    // shared column is `account_id`, a real reference key: a bare `id`
+    // in each would be three tables' own surrogate keys, which never
+    // bridge (see `graph_surrogate_ids_do_not_bridge_unrelated_tables`).
     let dir = TempDir::new();
-    std::fs::write(dir.path().join("v1.csv"), "id,name\n1,Alice\n2,Bob\n").unwrap();
-    std::fs::write(dir.path().join("v2.csv"), "id,name\n1,Alice\n2,Bob\n").unwrap();
-    std::fs::write(dir.path().join("w.csv"), "id,city\n1,Paris\n").unwrap();
+    std::fs::write(
+        dir.path().join("v1.csv"),
+        "account_id,name\n1,Alice\n2,Bob\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("v2.csv"),
+        "account_id,name\n1,Alice\n2,Bob\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("w.csv"), "account_id,city\n1,Paris\n").unwrap();
     let out = TempDir::new();
     let output = Command::new(bin())
         .args([
@@ -12938,19 +12949,19 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     // The real-world shape this locks in: many near-identical tables
     // (hundreds of profiled PDFs, all sharing one fixed page_number/text
     // schema, is the motivating case) plus one genuinely different table
-    // that bridges them all via a shared id. Explaining one duplicate's
-    // own id column should surface the one real bridge first, cap the
-    // wall of duplicate-schema copies at 50 rows, and disclose exactly
-    // how many more of each kind exist beyond the cap.
+    // that bridges them all via a shared doc_id. Explaining one
+    // duplicate's own doc_id column should surface the one real bridge
+    // first, cap the wall of duplicate-schema copies at 50 rows, and
+    // disclose exactly how many more of each kind exist beyond the cap.
     let dir = TempDir::new();
     for i in 0..55 {
         std::fs::write(
             dir.path().join(format!("t{i}.csv")),
-            "id,text\n1,hello\n2,world\n",
+            "doc_id,text\n1,hello\n2,world\n",
         )
         .unwrap();
     }
-    std::fs::write(dir.path().join("hub.csv"), "id\n1\n2\n").unwrap();
+    std::fs::write(dir.path().join("hub.csv"), "doc_id\n1\n2\n").unwrap();
     let out = TempDir::new();
     let output = Command::new(bin())
         .args([
@@ -12971,9 +12982,9 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
     let dict = out.path().join(format!("{dir_name}.dictionary.json"));
 
-    // `t0`'s own `id` column: 1 real bridge (to hub) + 54 duplicate-schema
+    // `t0`'s own `doc_id` column: 1 real bridge (to hub) + 54 duplicate-schema
     // links (to every other t*) = 55 edges, past the 50-row md cap.
-    let output = run_graph(&["explain", dict.to_str().unwrap(), "t0__t0.id"]);
+    let output = run_graph(&["explain", dict.to_str().unwrap(), "t0__t0.doc_id"]);
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -13002,7 +13013,7 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     // (one header separator line plus 50 data rows).
     assert_eq!(
         stdout.matches("[duplicate-schema link]").count()
-            + stdout.matches("hub__hub | id | extracted").count(),
+            + stdout.matches("hub__hub | doc_id | extracted").count(),
         50,
         "got: {stdout}"
     );
@@ -13013,7 +13024,7 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     let output = run_graph(&[
         "explain",
         dict.to_str().unwrap(),
-        "t0__t0.id",
+        "t0__t0.doc_id",
         "--output-format",
         "json",
     ]);
@@ -13028,6 +13039,127 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     // The community as a whole has a real bridge (hub) - its label should
     // name that hub, not an arbitrary near-duplicate.
     assert_eq!(doc["community_label"], "hub__hub-centered");
+}
+
+/// Profiles `files` as one `--combine` directory and returns the combined
+/// dictionary's path (kept alive by the returned `TempDir`s).
+fn combine_dictionary(files: &[(&str, &str)]) -> (TempDir, TempDir, std::path::PathBuf) {
+    let dir = TempDir::new();
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let dict = out.path().join(format!("{dir_name}.dictionary.json"));
+    (dir, out, dict)
+}
+
+#[test]
+fn graph_surrogate_ids_do_not_bridge_unrelated_tables() {
+    // Every file has its own integer `id` (values 1, 2 in each) plus
+    // shared attributes (`amount`, `active`): none of that is a join.
+    // Only the real reference key, `vendors.id <- products.vendor_id`,
+    // connects anything.
+    let (_d, _o, dict) = combine_dictionary(&[
+        (
+            "vendors.csv",
+            "id,name,active\n1,Acme,true\n2,Globex,false\n",
+        ),
+        (
+            "products.csv",
+            "id,vendor_id,amount,active\n1,1,9.5,true\n2,2,3.25,false\n",
+        ),
+        ("audits.csv", "id,amount,note\n1,9.5,ok\n2,3.25,late\n"),
+    ]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dict).unwrap()).unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    assert_eq!(rels.len(), 1, "got: {rels:?}");
+    assert_eq!(rels[0]["reference"]["referencing_column"], "vendor_id");
+    assert_eq!(rels[0]["reference"]["referenced_table"], "vendors__vendors");
+    let output = run_graph(&["rank", dict.to_str().unwrap(), "--output-format", "json"]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let communities = doc["communities"].as_array().unwrap();
+    assert_eq!(
+        communities.len(),
+        2,
+        "audits stays on its own: {communities:?}"
+    );
+    assert_eq!(
+        communities[1]["members"],
+        serde_json::json!(["audits__audits"])
+    );
+}
+
+#[test]
+fn graph_star_schema_ranks_the_hub_and_marks_sibling_links() {
+    // customers owns `customer_id`; three fact tables carry it. The graph
+    // should read as a star around customers, with the fact tables' direct
+    // links to each other kept but labelled shared_reference.
+    let (_d, _o, dict) = combine_dictionary(&[
+        ("customers.csv", "customer_id,name\nC-1,Alice\nC-2,Bob\n"),
+        ("orders.csv", "order_no,customer_id\n1,C-1\n2,C-2\n"),
+        ("invoices.csv", "invoice_no,customer_id\n10,C-1\n11,C-2\n"),
+        ("tickets.csv", "ticket_no,customer_id\n100,C-2\n101,C-1\n"),
+    ]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dict).unwrap()).unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    assert_eq!(rels.len(), 6);
+    let spokes: Vec<_> = rels.iter().filter(|e| e["context"] == "bridge").collect();
+    let siblings: Vec<_> = rels
+        .iter()
+        .filter(|e| e["context"] == "shared_reference")
+        .collect();
+    assert_eq!(spokes.len(), 3);
+    assert_eq!(siblings.len(), 3);
+    assert!(
+        spokes
+            .iter()
+            .all(|e| e["reference"]["referenced_table"] == "customers__customers")
+    );
+
+    let output = run_graph(&["rank", dict.to_str().unwrap(), "--output-format", "json"]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tables = doc["tables"].as_array().unwrap();
+    assert_eq!(tables[0]["table"], "customers__customers");
+    assert_eq!(tables[0]["degree"], 3);
+    assert_eq!(tables[1]["degree"], 1);
+    assert_eq!(tables[1]["shared_reference_degree"], 2);
+    assert_eq!(
+        doc["communities"][0]["label"],
+        "customers__customers-centered"
+    );
+
+    let output = run_graph(&[
+        "explain",
+        dict.to_str().unwrap(),
+        "orders__orders.customer_id",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("- Degree: 3 (1 bridge, 2 shared-reference, 0 duplicate-schema)"),
+        "got: {stdout}"
+    );
+    let hub = stdout.find("customers__customers").expect("hub row");
+    let sibling = stdout.find("[shared-reference link]").expect("sibling row");
+    assert!(hub < sibling, "the spoke must lead: {stdout}");
 }
 
 #[test]

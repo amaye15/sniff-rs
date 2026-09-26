@@ -3552,6 +3552,70 @@ Duplicates: 1204`, and its community's label changed from that same
 arbitrary PDF's own filename to `"duplicate schema: page_number, text"` -
 the real-world improvement this fix set out to make.
 
+**Auto-connect precision pass: a bridge edge now has to look like a join
+key, and star schemas read as stars.** Checked against what the edge list
+actually looked like on realistic multi-table inputs rather than on the
+two small committed fixtures, the auto-connect rules had three systematic
+noise sources, each making the graph a hairball rather than the data's
+real shape:
+
+- **Surrogate-key collisions.** `users.id` and `orders.id` matched as an
+  exact-name `extracted` edge - and for integers their samples (1, 2, 3)
+  always overlap too. Every ORM-style schema, where each table has its own
+  `id`, became a complete graph. `is_surrogate_key_name` (`id`, `uuid`,
+  `pk`, `key`, `rowid`, pandas' `Unnamed: 0`/`index`, ...) now blocks an
+  exact-name match between two different schemas, with one exception
+  where coincidence is implausible: both sides an identifier domain
+  (UUID/ULID/Email) *and* sharing observed values - a 1:1 extension table
+  keyed by its parent's UUID, reported as "a shared primary key".
+- **Attribute columns.** `amount` (f64), `active` (bool), `created_at`
+  (date) exist in almost every table and linked all of them. Joins live in
+  key domains (`JoinBase::is_key_domain`: integers, text, UUID/ULID/Email,
+  and identifier semantics like IBAN/VIN/ISBN); floats, booleans, dates,
+  times, coordinates, geometry, cron, colors, and SemVer never bridge two
+  different schemas. Star-schema date joins go through an integer/text
+  `date_key`, which still links.
+- **Star schemas as cliques.** Ten fact tables carrying `customer_id`
+  produced 45 mutual "bridges", burying the real hub. A third
+  `EdgeContext`, `SharedReference`, now labels a link between two columns
+  that each reference the same owning table (`mark_shared_references`,
+  run after every edge is known): the join is real and `path` can still
+  take it, but `rank`'s Degree, `community_label`'s hub selection, and
+  `explain`'s leading rows count spokes only. Nothing is hidden - each
+  relabelled edge gains an evidence line naming the hub, the JSON carries
+  `"context": "shared_reference"`, and `explain`/`rank` JSON gain an
+  appended `shared_reference_degree`.
+
+Two recall improvements make the owner/referrer structure visible in the
+first place. Every edge whose names say which side owns the key now
+carries a `reference`: the foreign-key pattern as before, and also an
+exact match on a key-suffixed name where exactly one table is named for
+its stem (`customers.customer_id` owns it; `orders.customer_id`
+references it) - never guessed when both or neither side is. And table
+stems match the way real schemas are named: `singular_forms`/`same_noun`
+compare every plausible singular (`categories`/`category`,
+`boxes`/`box`, `caches`/`cache`, `people`/`person`) instead of one
+strip-an-`s` rule that missed `-ies`/`-es` plurals, `table_stems` strips
+warehouse decoration (`dim_`, `fact_`, `stg_`, `_dim`, ...) as whole
+segments, and the FK id side accepts `id`/`uuid`/`guid`/`pk`/`key` with
+any key suffix on the referencing side (`_id`, `_uuid`, `_key`, `_no`,
+...). Duplicate-schema pairs are unchanged throughout: two copies of one
+schema still link on every shared column, since there the whole row lines
+up.
+
+Verified with nine new unit tests (plural forms; surrogate ids in both
+integer and UUID form plus pandas' index column; the shared-UUID-PK
+exception; attributes not bridging but still linking duplicate schemas;
+FK matching through `-ies`/`-es`/irregular plurals and `dim_`/`fact_`
+prefixes; owner orientation and its "neither side owns it" refusal; a
+four-table star with three sibling links relabelled, the hub ranked first
+and named in the community label, and the direct sibling hop still
+available to `path`) and two end-to-end `--combine` integration tests.
+Three existing tests used `id`<->`id` as their example of a bridge - the
+exact false positive removed here - and now use a real reference key
+(`account_id`, `doc_id`, `batch`) with their intent unchanged. Clippy is
+identical to the pre-change baseline.
+
 ## Numeric/statistical column summaries
 
 `ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,
