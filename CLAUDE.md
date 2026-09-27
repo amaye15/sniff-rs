@@ -3832,6 +3832,46 @@ integration tests against `edge_graph_declared_keys.sqlite` (the
 composite key through a saved dictionary; the self-reference from both
 ends and absent on an unrelated column).
 
+**The 0.4-0.5 band was a labelling artifact; the weights are refitted.**
+The tiers pass disclosed one uncalibrated band - 22 Spider bridges scored
+0.4-0.5, 14 of them real, all dropped. Every one of the 22 was the same
+comparison: an exact key name owned by a table named for it, outside that
+table's first column, in three or more tables (`yelp`'s
+`review.business_id -> business.business_id`, `baseball_1`'s
+`team_id -> team`). Their level (`exact_owned`) had been fitted at -1.56
+from 15 real against 13 not - and 8 of the 13 were `baseball_1`'s
+`team_id`s, which Spider declares for five tables and leaves undeclared
+for eight more. Relabelling by eye would be circular (the same intuition
+the heuristic encodes), so one whole schema was adjudicated against an
+outside authority instead: `baseball_1` is the Lahman database, whose
+documentation makes every `team_id` a reference to `team`, the managers'
+and pitchers' `player_id` a reference to `player` (Lahman keeps managers
+in the same person table), and `team.franchise_id` a reference to
+`team_franchise` - 15 keys added; its other four candidates stay false
+(`team.park` holds park names, there is no division table for `div_id`).
+No other schema was touched. The refit on that ground truth moves
+`exact_owned` to -0.36 and the band's edges to about 0.81, with the other
+weights close to where they were (`FS_PRIOR` 0.8686, `FS_SCALE` 1.01).
+Two checks that this corrects the labels rather than fitting baseball:
+the new weights score better even against Spider's uncorrected labels
+(bridge F1 0.811 -> 0.815; 0.813 -> 0.828 with baseball corrected), and a
+fit with `baseball_1` left out entirely still puts `exact_owned` at -1.17
+but lifts the band's `yelp` keys over 0.5 (0.63) - the drop came mostly
+from baseball's missing keys. The three real databases are unchanged
+(precision 1.000, recall 0.955 with declared keys stripped; the same
+edges with them). Several unit tests and one integration test used
+`customer` beside `customer_id` - an unmarked weak name - as a
+mid-strength link; with disjoint samples it now scores 0.44 and is
+dropped, so the tests that measure evidence or score compare unthresholded
+edges, and the drift and `--samples` tests use `ref_code` leading two
+tables (0.62 without the shared sample, 0.83 with it).
+
+`Customer.SupportRepId -> Employee.EmployeeId` stays out of reach, and now
+for a measured reason: its values (3, 4, 5) sit inside the keys of ten of
+Chinook's eleven tables, the tightest being `MediaType` (1..5) - no rule
+over values can pick `Employee`, and the name carries nothing that
+matches it.
+
 ## Numeric/statistical column summaries
 
 `ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,

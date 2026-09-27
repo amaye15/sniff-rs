@@ -62,6 +62,13 @@ All notable changes to sniff-rs are documented here. Format follows
   ZapfDingbats glyph names (`a20`) resolve in a ZapfDingbats font.
 
 ### Changed
+- Relationship probabilities refitted after correcting the benchmark:
+  Spider leaves 15 of its `baseball_1` (Lahman) keys undeclared, which had
+  pushed an exact key name owned by a table named for it, outside that
+  table's first column (`category.business_id -> business.business_id`),
+  down to 0.46 - under the threshold. Those links now score about 0.81
+  and are kept (Spider F1 0.811 -> 0.815 on its own labels, 0.813 ->
+  0.828 with baseball corrected; the three real databases unchanged).
 - Relationship `confidence` is now `declared`/`discovered`/`probable`,
   replacing `extracted`/`inferred`. Column JSON gains `references` and
   `value_sketch` (appended last).

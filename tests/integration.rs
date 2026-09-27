@@ -12390,12 +12390,7 @@ fn relationships_declared_sqlite_keys_are_declared_edges() {
         assert_eq!(e["confidence"], "declared");
         assert_eq!(e["probability"], 1.0);
         assert_eq!(e["context"], "bridge");
-        assert!(
-            e["evidence"][0]
-                .as_str()
-                .unwrap()
-                .starts_with("declared ")
-        );
+        assert!(e["evidence"][0].as_str().unwrap().starts_with("declared "));
     }
     let owner = rels.iter().find(|e| e["to_column"] == "owner").unwrap();
     assert_eq!(owner["reference"]["referenced_column"], "client ref");
@@ -12925,18 +12920,19 @@ fn graph_rank_single_table_reports_zero_degree() {
 #[test]
 #[cfg(feature = "sqlite")]
 fn graph_samples_deepens_overlap_evidence_on_raw_files() {
-    // `label` vs `labels` is a weak name signal either way; its probability
-    // rises with overlap, which only deeper samples can see. agents.label
-    // holds v1..v10, jobs.labels holds w1,w2,w3,v7,v8: the first three
-    // samples are disjoint, the full columns share v7 and v8.
+    // `ref_code` leading two tables that don't own it is a mid-strength
+    // name signal either way; its probability rises with overlap, which
+    // only deeper samples can see. agents.ref_code holds v1..v10,
+    // jobs.ref_code holds w1,w2,w3,v7,v8: the first three samples are
+    // disjoint, the full columns share v7 and v8.
     let dir = TempDir::new();
     let db = dir.path().join("overlap.sqlite");
     let setup = format!(
         "import sqlite3; con = sqlite3.connect(r'{}'); \
-         con.execute('CREATE TABLE agents (label TEXT)'); \
-         con.executemany('INSERT INTO agents VALUES (?)', [(f'v{{i}}',) for i in range(1, 11)]); \
-         con.execute('CREATE TABLE jobs (labels TEXT)'); \
-         con.executemany('INSERT INTO jobs VALUES (?)', [(f'w{{i}}',) for i in range(1, 4)] + [('v7',), ('v8',)]); \
+         con.execute('CREATE TABLE agents (ref_code TEXT, name TEXT)'); \
+         con.executemany('INSERT INTO agents VALUES (?, ?)', [(f'v{{i}}', f'n{{i}}') for i in range(1, 11)]); \
+         con.execute('CREATE TABLE jobs (ref_code TEXT, title TEXT)'); \
+         con.executemany('INSERT INTO jobs VALUES (?, ?)', [(f'w{{i}}', 't') for i in range(1, 4)] + [('v7', 't'), ('v8', 't')]); \
          con.commit(); con.close()",
         db.to_str().unwrap()
     );
@@ -12953,7 +12949,7 @@ fn graph_samples_deepens_overlap_evidence_on_raw_files() {
     let output = run_graph(&[
         "explain",
         db.to_str().unwrap(),
-        "label",
+        "agents.ref_code",
         "--output-format",
         "json",
         "--samples",
@@ -12973,7 +12969,7 @@ fn graph_samples_deepens_overlap_evidence_on_raw_files() {
     let output = run_graph(&[
         "explain",
         db.to_str().unwrap(),
-        "label",
+        "agents.ref_code",
         "--output-format",
         "json",
         "--samples",

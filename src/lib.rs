@@ -70141,7 +70141,8 @@ impl EdgeFeatures {
 /// m = P(outcome | the edge is a real join) and u = P(outcome | it is not),
 /// estimated over the bridge candidates this module proposes. Fitted once
 /// against 834 declared foreign keys (Spider's 166 schemas plus Chinook,
-/// Northwind and Sakila) and committed as constants - see CLAUDE.md's graph
+/// Northwind and Sakila), with the 15 keys Spider leaves undeclared in its
+/// `baseball_1` (Lahman) schema added, and committed as constants - see CLAUDE.md's graph
 /// section for the fit and its numbers; nothing is learned at run time.
 ///
 /// The name comparison is multi-level, as Fellegi-Sunter allows: which kind
@@ -70154,13 +70155,13 @@ impl EdgeFeatures {
 /// prior either way (the identifier-domain and value-only levels, the
 /// abbreviation test).
 const FS_NAME_LEVELS: [(&str, f64); 9] = [
-    ("fk", 0.4359),
-    ("exact_owned_lead", 0.6719),
-    ("exact_owned", -1.5575),
-    ("exact_lead", -0.7894),
-    ("exact_plain", -3.1545),
-    ("weak_lead", -0.2081),
-    ("weak_plain", -7.5178),
+    ("fk", 0.2646),
+    ("exact_owned_lead", 0.6777),
+    ("exact_owned", -0.3573),
+    ("exact_lead", -0.9607),
+    ("exact_plain", -3.3257),
+    ("weak_lead", -0.3793),
+    ("weak_plain", -7.6890),
     ("identifier", 0.0),
     ("value", 0.0),
 ];
@@ -70169,12 +70170,12 @@ const FS_NAME_LEVELS: [(&str, f64); 9] = [
 /// test that can't be run (`None` - no sample values, no value sketch)
 /// contributes nothing.
 const FS_TESTS: [(&str, f64, f64); 6] = [
-    ("key_marker", 0.0843, -1.0498),
+    ("key_marker", 0.1069, -1.2211),
     ("same_type", 0.0, 0.0),
-    ("common_name", -0.3415, 0.2778),
+    ("common_name", -0.1749, 0.1286),
     ("abbrev_name", 0.0, 0.0),
     ("shared_values", 0.4357, -0.6555),
-    ("contained", 0.4395, 0.0),
+    ("contained", 0.4384, 0.0),
 ];
 
 /// See `FS_NAME_LEVELS`: the fewest observations an outcome needs before
@@ -70186,13 +70187,13 @@ const FS_MIN_SUPPORT: usize = 5;
 /// at - high, because a candidate already passed the name and type rules in
 /// `join_candidate`/`value_candidate`; the comparisons then sort out the
 /// 15% that are not joins.
-const FS_PRIOR: f64 = 0.8475;
+const FS_PRIOR: f64 = 0.8686;
 
 /// Multiplies the summed weight before it becomes a probability. The
 /// comparisons are not independent (an exact name and a key marker travel
 /// together), which makes a raw Fellegi-Sunter sum overconfident; one scale
 /// factor, fitted with the weights by maximum likelihood, calibrates it.
-const FS_SCALE: f64 = 0.96;
+const FS_SCALE: f64 = 1.01;
 
 /// Bridges below this probability are dropped. 0.5 is "more likely a join
 /// than not".
@@ -85409,14 +85410,41 @@ mod diff_tests {
         // Names and types stand still; only the samples move (overlap lost),
         // so there are no column entries at all - yet the measured link
         // degrades to a guess. This is the one drift shape with an empty
-        // `entries` list, and it still counts as breaking.
+        // `entries` list, and it still counts as breaking. `ref_code`
+        // leading two tables that don't own it is a mid-strength name: the
+        // lost overlap moves it by more than the drift bar (0.83 to 0.62)
+        // without dropping it.
         let old = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["acme"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let new = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["globex"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["globex"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let report = diff_dictionaries(&old, &new);
         assert!(report.entries.is_empty());
@@ -85428,12 +85456,36 @@ mod diff_tests {
     #[test]
     fn drift_reports_strengthened_confidence_from_new_overlap() {
         let old = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["globex"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["globex"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let new = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["acme"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let report = diff_dictionaries(&old, &new);
         assert_eq!(report.relationship_drift.len(), 1);
@@ -94586,7 +94638,9 @@ mod tests {
             ("a", vec![rel_col("customer", "String", &["acme"])]),
             ("b", vec![rel_col("customer_id", "String", &["globex"])]),
         ]);
-        let without = detect_relationships(&tables);
+        // Without the overlap this unmarked weak name falls under the
+        // threshold (0.44), so compare against the unthresholded edge.
+        let without = detect_relationships_scored(&tables, true);
         assert_eq!(without.len(), 1);
         assert!(edges[0].probability > without[0].probability + 0.1);
     }
@@ -95110,7 +95164,8 @@ mod tests {
     #[test]
     fn relationships_common_values_promote_nothing_and_score_lower() {
         // `1` sits in most columns with samples: sharing it measures
-        // nothing, so `customer` beside `customer_id` stays inferred.
+        // nothing, so `customer` beside `customer_id` stays inferred (and, with no
+        // key marker on `customer`, under the threshold: compared unthresholded).
         // A value only these two columns hold does promote.
         let filler = |name: &str| vec![rel_col(name, "i64", &["1"])];
         let tables = rel_tables(&[
@@ -95120,7 +95175,7 @@ mod tests {
             ("d", filler("y_qty")),
             ("e", filler("z_qty")),
         ]);
-        let edges = detect_relationships(&tables);
+        let edges = detect_relationships_scored(&tables, true);
         let e = rel_edge(&edges, "a", "customer");
         assert_eq!(e.confidence, Confidence::Probable);
         assert!(e.evidence.iter().any(|x| x.contains("weak evidence")));
@@ -95131,7 +95186,7 @@ mod tests {
             ("d", filler("y_qty")),
             ("e", filler("z_qty")),
         ]);
-        let rare = detect_relationships(&tables);
+        let rare = detect_relationships_scored(&tables, true);
         let r = rel_edge(&rare, "a", "customer");
         assert_eq!(r.confidence, Confidence::Probable);
         // The rarer shared value scores higher on the same names.
