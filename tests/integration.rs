@@ -12903,6 +12903,51 @@ fn graph_rank_lists_the_link_table_first_with_communities() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
+fn graph_rank_reports_reference_rank_areas_and_cut_tables() {
+    let output = run_graph(&[
+        "rank",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    let row = |name: &str| {
+        doc["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["table"] == name)
+            .unwrap()
+            .clone()
+    };
+    // orders references both dimensions, so they outrank it; every join
+    // between customers and products runs through orders.
+    let rank = |name: &str| row(name)["reference_rank"].as_f64().unwrap();
+    assert!(rank("customers") > rank("orders"));
+    assert_eq!(rank("customers"), rank("products"));
+    assert_eq!(row("orders")["articulation"], true);
+    assert_eq!(row("customers")["articulation"], false);
+    assert_eq!(row("orders")["area"], row("customers")["area"]);
+    assert_ne!(row("audit")["area"], row("orders")["area"]);
+    let areas = doc["areas"].as_array().unwrap();
+    assert_eq!(areas.len(), 2);
+    assert_eq!(areas[0]["size"], 3);
+    assert_eq!(areas[0]["lead"], "orders");
+
+    let output = run_graph(&["rank", fixture("edge_graph_chain.ini").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("| Ref. rank | Area | Cut |"),
+        "got: {stdout}"
+    );
+    // One community, one area: nothing to split, no section.
+    assert!(!stdout.contains("## Subject areas"), "got: {stdout}");
+}
+
+#[test]
 fn graph_rank_single_table_reports_zero_degree() {
     let output = run_graph(&["rank", fixture("sample.csv").to_str().unwrap()]);
     assert!(

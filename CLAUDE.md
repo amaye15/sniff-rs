@@ -3872,6 +3872,56 @@ Chinook's eleven tables, the tightest being `MediaType` (1..5) - no rule
 over values can pick `Employee`, and the name carries nothing that
 matches it.
 
+**Graph measures: reference rank, subject areas, cut tables - and a
+triangle rule.** Asked which graph techniques help, each was tried
+against the real databases and the Spider benchmark rather than added
+by default. Connected components said little on real schemas (Sakila,
+Chinook and Northwind are each one component) and degree ties heavily,
+so `rank` gains three measures, all over `Bridge` edges only
+(`bridge_arcs`, weight = probability; duplicate-schema and
+shared-reference links are repetition, not structure):
+
+- **`reference_rank`** (`table_importance`): weighted PageRank along
+  `referencing -> referenced` (an undirected edge sends half each way),
+  damping 0.85, dangling mass spread uniformly, scaled so the average
+  table is 1.0. It measures what the schema ultimately points at, not
+  "importance": Sakila's top is `country`/`city`/`address`, Chinook's
+  `Employee`, Northwind's `Regions`. Named for what it is, and `rank`
+  still sorts by bridge degree - the fact tables a reader expects first.
+- **`area`** (`subject_areas`): Louvain modularity (local moving plus
+  aggregation, deterministic: index order, strictly positive gain). It
+  splits a component where links are dense inside and sparse between;
+  on the real databases the split reads the way the schemas are
+  designed - Sakila into catalog (`film`, `actor`, `category`,
+  `language`, `inventory`), transactions (`staff`, `store`, `customer`,
+  `rental`, `payment`, `address`) and locations (`city`, `country`);
+  Chinook into sales, tracks, albums and playlists; Northwind into
+  products, employees/territories, customers and orders. An area is
+  named for its internal hub (most bridge weight inside it): naming it
+  for its top reference rank called Sakila's catalog "language". There
+  is no ground truth for subject areas, so this was checked by reading
+  these three and a few Spider schemas (baseball splits into team and
+  player areas), and is disclosed as such.
+- **`articulation`** (`articulation_tables`): Tarjan's cut vertices over
+  the full adjacency `path` walks, iterative so a long chain can't
+  overflow the stack.
+
+The triangle rule is the one technique that moves the benchmark. A
+column with bridges to two targets where one target itself references
+the other (`trip.start_station_id` to `station.id` and to
+`status.station_id`, which references `station`) has one real target;
+the hop to `status` is derived through the hub, so `mark_hub_references`
+now relabels it `SharedReference` (declared edges excepted). On Spider
+with declared keys stripped it changed exactly 3 edges, all false
+(bike_1's two station ids, station_weather's `route` to
+`weekly_weather`): bridge precision 0.906 -> 0.910, recall unchanged;
+the real databases are unchanged. Only 3 columns in the whole benchmark
+had two oriented targets, so a general "one target per column" rule
+had nothing else to fix. `rank` also computes components once instead
+of per row. At 3,000 synthetic tables `rank` takes ~25 s, almost all of
+it relationship detection itself (`explain` alone ~21 s) - a
+pre-existing scaling cost, not these measures.
+
 ## Numeric/statistical column summaries
 
 `ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,

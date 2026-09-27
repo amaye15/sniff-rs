@@ -70464,7 +70464,32 @@ fn mark_hub_references(edges: &mut [Relationship]) {
         return;
     }
     for rel in edges.iter_mut() {
-        if rel.context != EdgeContext::Bridge || rel.reference.is_some() {
+        if rel.context != EdgeContext::Bridge {
+            continue;
+        }
+        if let Some(r) = &rel.reference {
+            // A triangle: `trip.start_station_id` references both `station`
+            // and `status.station_id`, and `status.station_id` itself
+            // references `station`. The hop to `status` is the one derived
+            // through the hub, not a second target of the same column.
+            if rel.confidence == Confidence::Declared {
+                continue;
+            }
+            let hub = owners
+                .get(&(r.referencing_table.clone(), r.referencing_column.clone()))
+                .zip(owners.get(&(r.referenced_table.clone(), r.referenced_column.clone())))
+                .and_then(|(from, to)| {
+                    from.intersection(to)
+                        .find(|hub| **hub != r.referenced_table && **hub != r.referencing_table)
+                        .cloned()
+                });
+            if let Some(hub) = hub {
+                rel.evidence.push(format!(
+                    "\"{}.{}\" also references \"{hub}\", which \"{}.{}\" references too - a link derived through that hub, not a second target",
+                    r.referencing_table, r.referencing_column, r.referenced_table, r.referenced_column
+                ));
+                rel.context = EdgeContext::SharedReference;
+            }
             continue;
         }
         let from = owners.get(&(rel.from_table.clone(), rel.from_column.clone()));
@@ -70705,6 +70730,258 @@ fn shared_reference_degree(graph: &TableGraph, table: &str) -> usize {
         .into_iter()
         .filter(|&idx| graph.relationships[idx].context == EdgeContext::SharedReference)
         .count()
+}
+
+/// Bridge edges as weighted table-index pairs `(u, v, weight)`, weight the
+/// edge's probability. Directed `referencing -> referenced` when the names
+/// say which side owns the key; an undirected edge contributes half its
+/// weight each way. Only `Bridge` edges: duplicate-schema copies and
+/// hub-derived shared references are repetition, not structure (see
+/// `EdgeContext`).
+fn bridge_arcs(graph: &TableGraph) -> Vec<(usize, usize, f64)> {
+    let index: HashMap<&str, usize> = graph
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let mut arcs = Vec::new();
+    for rel in &graph.relationships {
+        if rel.context != EdgeContext::Bridge {
+            continue;
+        }
+        let w = rel.probability;
+        match &rel.reference {
+            Some(r) => arcs.push((
+                index[r.referencing_table.as_str()],
+                index[r.referenced_table.as_str()],
+                w,
+            )),
+            None => {
+                let (a, b) = (index[rel.from_table.as_str()], index[rel.to_table.as_str()]);
+                arcs.push((a, b, w / 2.0));
+                arcs.push((b, a, w / 2.0));
+            }
+        }
+    }
+    arcs
+}
+
+const PAGERANK_DAMPING: f64 = 0.85;
+
+/// Weighted PageRank over bridge edges pointing from the referencing table
+/// to the referenced one, scaled so the average table scores 1.0. A table
+/// scores high when many tables - or important ones - reference it: in a
+/// snowflake, `country` sits above `city` sits above `address`, even though
+/// each has one reference. Degree counts a table's links; this follows them.
+/// A table with no outgoing references spreads its score uniformly (the
+/// standard dangling-node rule), so isolated tables score just under 1.0.
+/// Deterministic: fixed iteration order, stopping on an L1 change below
+/// 1e-12 or after 1000 rounds.
+fn table_importance(graph: &TableGraph) -> Vec<f64> {
+    let n = graph.tables.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let arcs = bridge_arcs(graph);
+    let mut out_weight = vec![0.0; n];
+    for &(u, _, w) in &arcs {
+        out_weight[u] += w;
+    }
+    let nf = n as f64;
+    let mut rank = vec![1.0 / nf; n];
+    for _ in 0..1000 {
+        let dangling: f64 = (0..n)
+            .filter(|&u| out_weight[u] == 0.0)
+            .map(|u| rank[u])
+            .sum();
+        let base = (1.0 - PAGERANK_DAMPING) / nf + PAGERANK_DAMPING * dangling / nf;
+        let mut next = vec![base; n];
+        for &(u, v, w) in &arcs {
+            next[v] += PAGERANK_DAMPING * rank[u] * w / out_weight[u];
+        }
+        let change: f64 = next.iter().zip(&rank).map(|(a, b)| (a - b).abs()).sum();
+        rank = next;
+        if change < 1e-12 {
+            break;
+        }
+    }
+    rank.into_iter().map(|r| r * nf).collect()
+}
+
+/// Subject areas: a modularity partition (Louvain: local moving, then
+/// aggregation, repeated until nothing moves) of the undirected bridge
+/// graph, weights summed per table pair. A connected component is often
+/// the whole schema; this splits it where links are dense inside and
+/// sparse between - Sakila's catalog (`film`, `actor`, `category`), its
+/// locations (`address`, `city`, `country`), its transactions. Modularity
+/// never groups tables with no path between them, so an area always sits
+/// inside one component. Returns an area id per table in `graph.tables`
+/// order, numbered by (size descending, first member). Deterministic:
+/// nodes visit in index order and a move needs a strictly positive gain.
+fn subject_areas(graph: &TableGraph) -> Vec<usize> {
+    let n = graph.tables.len();
+    let mut pair: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for (u, v, w) in bridge_arcs(graph) {
+        *pair.entry((u.min(v), u.max(v))).or_default() += w;
+    }
+    // Current level: node -> neighbor weights, and each original table's
+    // node at this level.
+    let mut adj: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); n];
+    for (&(u, v), &w) in &pair {
+        *adj[u].entry(v).or_default() += w;
+        *adj[v].entry(u).or_default() += w;
+    }
+    let mut member_of: Vec<usize> = (0..n).collect();
+    let two_m: f64 = adj.iter().flat_map(|a| a.values()).sum();
+    if two_m > 0.0 {
+        loop {
+            let size = adj.len();
+            let strength: Vec<f64> = adj.iter().map(|a| a.values().sum()).collect();
+            let mut comm: Vec<usize> = (0..size).collect();
+            let mut total: Vec<f64> = strength.clone();
+            let mut moved_any = false;
+            loop {
+                let mut moved = false;
+                for i in 0..size {
+                    let own = comm[i];
+                    let mut links: BTreeMap<usize, f64> = BTreeMap::new();
+                    for (&j, &w) in &adj[i] {
+                        if j != i {
+                            *links.entry(comm[j]).or_default() += w;
+                        }
+                    }
+                    total[own] -= strength[i];
+                    let gain = |c: usize, links: &BTreeMap<usize, f64>| {
+                        links.get(&c).copied().unwrap_or(0.0) - total[c] * strength[i] / two_m
+                    };
+                    let mut best = own;
+                    let mut best_gain = gain(own, &links);
+                    for &c in links.keys() {
+                        let g = gain(c, &links);
+                        if g > best_gain + 1e-12 {
+                            best = c;
+                            best_gain = g;
+                        }
+                    }
+                    total[best] += strength[i];
+                    if best != own {
+                        comm[i] = best;
+                        moved = true;
+                        moved_any = true;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+            if !moved_any {
+                break;
+            }
+            // Aggregate: renumber communities densely, fold edges.
+            let mut renumber: BTreeMap<usize, usize> = BTreeMap::new();
+            for &c in &comm {
+                let next = renumber.len();
+                renumber.entry(c).or_insert(next);
+            }
+            let mut folded: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); renumber.len()];
+            for (i, a) in adj.iter().enumerate() {
+                for (&j, &w) in a {
+                    *folded[renumber[&comm[i]]]
+                        .entry(renumber[&comm[j]])
+                        .or_default() += w;
+                }
+            }
+            for m in member_of.iter_mut() {
+                *m = renumber[&comm[*m]];
+            }
+            adj = folded;
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (table, &node) in member_of.iter().enumerate() {
+        groups.entry(node).or_default().push(table);
+    }
+    let mut ordered: Vec<Vec<usize>> = groups.into_values().collect();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
+    let mut area = vec![0; n];
+    for (id, members) in ordered.iter().enumerate() {
+        for &t in members {
+            area[t] = id;
+        }
+    }
+    area
+}
+
+/// Tables whose removal disconnects the rest of their community: every
+/// join path between some pair of other tables runs through them.
+/// Articulation points of the undirected table graph (all edge contexts,
+/// the same adjacency `path` walks), by Tarjan's low-link DFS, iterative
+/// so a long chain of tables cannot overflow the stack.
+fn articulation_tables(graph: &TableGraph) -> std::collections::BTreeSet<String> {
+    let names = &graph.tables;
+    let index: HashMap<&str, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let adj: Vec<Vec<usize>> = names
+        .iter()
+        .map(|t| graph.adj[t].keys().map(|k| index[k.as_str()]).collect())
+        .collect();
+    let n = names.len();
+    let mut disc = vec![usize::MAX; n];
+    let mut low = vec![0; n];
+    let mut cut = vec![false; n];
+    let mut timer = 0;
+    for root in 0..n {
+        if disc[root] != usize::MAX {
+            continue;
+        }
+        disc[root] = timer;
+        low[root] = timer;
+        timer += 1;
+        let mut root_children = 0;
+        // (node, parent, next neighbor position)
+        let mut stack: Vec<(usize, usize, usize)> = vec![(root, usize::MAX, 0)];
+        while let Some(&(u, parent, pos)) = stack.last() {
+            if pos < adj[u].len() {
+                let v = adj[u][pos];
+                if let Some(top) = stack.last_mut() {
+                    top.2 += 1;
+                }
+                if v == parent {
+                    continue;
+                }
+                if disc[v] == usize::MAX {
+                    disc[v] = timer;
+                    low[v] = timer;
+                    timer += 1;
+                    if u == root {
+                        root_children += 1;
+                    }
+                    stack.push((v, u, 0));
+                } else {
+                    low[u] = low[u].min(disc[v]);
+                }
+            } else {
+                stack.pop();
+                if parent != usize::MAX {
+                    low[parent] = low[parent].min(low[u]);
+                    if parent != root && low[u] >= disc[parent] {
+                        cut[parent] = true;
+                    }
+                }
+            }
+        }
+        if root_children > 1 {
+            cut[root] = true;
+        }
+    }
+    (0..n)
+        .filter(|&i| cut[i])
+        .map(|i| names[i].clone())
+        .collect()
 }
 
 /// Human label for one table's community: its highest-*bridge*-degree
@@ -84386,6 +84663,14 @@ USAGE:
     an arbitrary member "the hub". Isolated tables rank with degree zero
     in single-member communities rather than vanishing.
 
+    Three more measures per table: Ref. rank (weighted PageRank along
+    references, 1.00 = average - high for the tables everything
+    ultimately points at, like a snowflake's country dimension), Area
+    (a modularity subject area splitting a community where links are
+    dense inside and sparse between; listed under "Subject areas" when
+    a community splits), and Cut (every join path between some other
+    pair of tables runs through this one).
+
     <INPUT> follows the same dictionary-or-raw-file rule as
     `sniff-rs explain` (see `sniff-rs explain --help`); directories are
     rejected - query a --combine dictionary instead.
@@ -85096,6 +85381,9 @@ fn render_rank_md(
 ) -> String {
     let mut out = String::new();
     out.push_str("# Tables by connectivity\n\n");
+    out.push_str(
+        "Degree counts bridge links. Ref. rank follows references transitively (weighted PageRank; 1.00 is average): high for the tables everything ultimately points at. Area is the table's subject area within its community. Cut marks a table every join path between some other pair runs through.\n\n",
+    );
     // Degree counts `Bridge` edges only - the real, distinct-schema
     // connectivity a "god table" ranking exists to surface. Duplicates
     // is the `DuplicateSchema` count reported alongside it, never folded
@@ -85104,36 +85392,34 @@ fn render_rank_md(
     // otherwise rank as if it were hundreds of times more central than a
     // table that genuinely bridges two different schemas once. See
     // `EdgeContext`'s own doc comment for the full reasoning.
-    out.push_str("| Table | Rows | Degree | Duplicates | Neighbors | Community |\n");
-    out.push_str("|---|---|---|---|---|---|\n");
-    let mut rows: Vec<(&String, usize, usize, usize, usize)> = graph
-        .tables
-        .iter()
-        .map(|t| {
-            let bridge = bridge_degree(graph, t);
-            let duplicate = duplicate_degree(graph, t);
-            let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
-            (t, bridge, duplicate, neighbors, community_of(graph, t))
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.0.cmp(b.0))
-    });
-    for (table, bridge, duplicate, neighbors, community) in rows {
-        let rows_text = match table_rows(tables, table) {
+    // Ref. rank is weighted PageRank along references (average table =
+    // 1.00), Area the modularity subject area inside a community, and a
+    // Cut table one every path between some other pair goes through.
+    out.push_str(
+        "| Table | Rows | Degree | Duplicates | Neighbors | Community | Ref. rank | Area | Cut |\n",
+    );
+    out.push_str("|---|---|---|---|---|---|---|---|---|\n");
+    let metrics = GraphMetrics::compute(graph);
+    for row in rank_rows(graph) {
+        let rows_text = match table_rows(tables, row.table) {
             Some(n) => n.to_string(),
             None => "(unknown)".to_string(),
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
-            escape_graph_md(table),
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {} | {} |\n",
+            escape_graph_md(row.table),
             rows_text,
-            bridge,
-            duplicate,
-            neighbors,
-            community
+            row.bridge,
+            row.duplicate,
+            row.neighbors,
+            row.community,
+            metrics.importance[row.index],
+            metrics.area[row.index],
+            if metrics.cut.contains(row.table) {
+                "yes"
+            } else {
+                ""
+            }
         ));
     }
     out.push_str("\n## Communities\n\n");
@@ -85150,6 +85436,35 @@ fn render_rank_md(
             let label = community_label(graph, &members[0], tables);
             out.push_str(&format!(
                 "- Community {id} ({label}, {} tables): {}\n",
+                members.len(),
+                members
+                    .iter()
+                    .map(|m| escape_graph_md(m))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    // Subject areas only say something when a community splits into
+    // more than one multi-table area; otherwise they repeat the list above.
+    let splits = components.iter().any(|members| {
+        let areas: std::collections::BTreeSet<usize> = members
+            .iter()
+            .filter_map(|m| graph.tables.binary_search(m).ok())
+            .map(|i| metrics.area[i])
+            .filter(|a| metrics.area_size(*a) > 1)
+            .collect();
+        areas.len() > 1
+    });
+    if splits {
+        out.push_str("\n## Subject areas\n\n");
+        for (id, members) in metrics.areas(graph).iter().enumerate() {
+            if members.len() < 2 {
+                continue;
+            }
+            out.push_str(&format!(
+                "- Area {id} ({} area, {} tables): {}\n",
+                escape_graph_md(&metrics.area_lead(graph, id)),
                 members.len(),
                 members
                     .iter()
@@ -85201,26 +85516,20 @@ fn render_rank_json(
         "input".to_string(),
         JsonValue::from(input.display().to_string()),
     );
-    let mut rows: Vec<(&String, usize, usize, usize, usize)> = graph
-        .tables
-        .iter()
-        .map(|t| {
-            let bridge = bridge_degree(graph, t);
-            let duplicate = duplicate_degree(graph, t);
-            let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
-            (t, bridge, duplicate, neighbors, community_of(graph, t))
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.0.cmp(b.0))
-    });
+    let metrics = GraphMetrics::compute(graph);
     doc.insert(
         "tables".to_string(),
         JsonValue::Array(
-            rows.iter()
-                .map(|(table, bridge, duplicate, neighbors, community)| {
+            rank_rows(graph)
+                .iter()
+                .map(|row| {
+                    let (table, bridge, duplicate, neighbors, community) = (
+                        row.table,
+                        &row.bridge,
+                        &row.duplicate,
+                        &row.neighbors,
+                        &row.community,
+                    );
                     let mut obj = json_support::Map::with_capacity(6);
                     obj.insert("table".to_string(), JsonValue::from(table.to_string()));
                     obj.insert(
@@ -85248,6 +85557,18 @@ fn render_rank_json(
                     obj.insert(
                         "shared_reference_degree".to_string(),
                         JsonValue::from(shared_reference_degree(graph, table) as i64),
+                    );
+                    obj.insert(
+                        "reference_rank".to_string(),
+                        JsonValue::from((metrics.importance[row.index] * 1e4).round() / 1e4),
+                    );
+                    obj.insert(
+                        "area".to_string(),
+                        JsonValue::from(metrics.area[row.index] as i64),
+                    );
+                    obj.insert(
+                        "articulation".to_string(),
+                        JsonValue::from(metrics.cut.contains(table)),
                     );
                     JsonValue::Object(obj)
                 })
@@ -85305,7 +85626,137 @@ fn render_rank_json(
                 .collect(),
         ),
     );
+    // Appended last: the modularity partition, every area listed (a
+    // single-table area included) so a consumer can join on `area`.
+    doc.insert(
+        "areas".to_string(),
+        JsonValue::Array(
+            metrics
+                .areas(graph)
+                .iter()
+                .enumerate()
+                .map(|(id, members)| {
+                    let mut obj = json_support::Map::with_capacity(4);
+                    obj.insert("id".to_string(), JsonValue::from(id as i64));
+                    obj.insert("size".to_string(), JsonValue::from(members.len() as i64));
+                    obj.insert(
+                        "lead".to_string(),
+                        JsonValue::from(metrics.area_lead(graph, id)),
+                    );
+                    obj.insert(
+                        "members".to_string(),
+                        JsonValue::Array(members.iter().cloned().map(JsonValue::from).collect()),
+                    );
+                    JsonValue::Object(obj)
+                })
+                .collect(),
+        ),
+    );
     Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+}
+
+/// One `rank` row, in the order both renderers list them: bridge degree
+/// descending, then duplicate degree descending, then name.
+struct RankRow<'a> {
+    table: &'a String,
+    index: usize,
+    bridge: usize,
+    duplicate: usize,
+    neighbors: usize,
+    community: usize,
+}
+
+fn rank_rows(graph: &TableGraph) -> Vec<RankRow<'_>> {
+    // Components once, not per row (`community_of` recomputes them).
+    let mut community: HashMap<String, usize> = HashMap::new();
+    for (id, members) in connected_components(graph).into_iter().enumerate() {
+        for m in members {
+            community.insert(m, id);
+        }
+    }
+    let mut rows: Vec<RankRow> = graph
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(index, t)| RankRow {
+            table: t,
+            index,
+            bridge: bridge_degree(graph, t),
+            duplicate: duplicate_degree(graph, t),
+            neighbors: graph.adj.get(t).map(BTreeMap::len).unwrap_or(0),
+            community: community[t],
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.bridge
+            .cmp(&a.bridge)
+            .then_with(|| b.duplicate.cmp(&a.duplicate))
+            .then_with(|| a.table.cmp(b.table))
+    });
+    rows
+}
+
+/// The whole-graph measures `rank` reports, computed once: importance
+/// (`table_importance`), subject area (`subject_areas`), and articulation
+/// tables (`articulation_tables`), the first two indexed like
+/// `graph.tables`.
+struct GraphMetrics {
+    importance: Vec<f64>,
+    area: Vec<usize>,
+    cut: std::collections::BTreeSet<String>,
+}
+
+impl GraphMetrics {
+    fn compute(graph: &TableGraph) -> Self {
+        GraphMetrics {
+            importance: table_importance(graph),
+            area: subject_areas(graph),
+            cut: articulation_tables(graph),
+        }
+    }
+
+    fn area_size(&self, area: usize) -> usize {
+        self.area.iter().filter(|a| **a == area).count()
+    }
+
+    /// Members of each area, sorted, indexed by area id.
+    fn areas(&self, graph: &TableGraph) -> Vec<Vec<String>> {
+        let count = self.area.iter().max().map_or(0, |m| m + 1);
+        let mut out = vec![Vec::new(); count];
+        for (i, &a) in self.area.iter().enumerate() {
+            out[a].push(graph.tables[i].clone());
+        }
+        out
+    }
+
+    /// The area's hub: the member with the most bridge weight to other
+    /// members, ties to the higher reference rank, then the first name.
+    /// Reference rank alone would name an area after the lookup table
+    /// everything points at (`language` for Sakila's film catalog).
+    fn area_lead(&self, graph: &TableGraph, area: usize) -> String {
+        let mut inner = vec![0.0; graph.tables.len()];
+        for (u, v, w) in bridge_arcs(graph) {
+            if self.area[u] == area && self.area[v] == area {
+                inner[u] += w;
+                inner[v] += w;
+            }
+        }
+        let mut best: Option<usize> = None;
+        for (i, &a) in self.area.iter().enumerate() {
+            if a != area {
+                continue;
+            }
+            let better = best.is_none_or(|b| {
+                inner[i] > inner[b] + 1e-9
+                    || ((inner[i] - inner[b]).abs() <= 1e-9
+                        && self.importance[i] > self.importance[b] + 1e-9)
+            });
+            if better {
+                best = Some(i);
+            }
+        }
+        best.map(|i| graph.tables[i].clone()).unwrap_or_default()
+    }
 }
 
 fn run_rank(raw: &[String]) -> Result<()> {
@@ -93934,6 +94385,192 @@ mod tests {
         );
         assert!(parse_graph_args(&graph_raw_args(&["--samples", "0"]), EXPLAIN_HELP_TEXT).is_err());
         assert!(parse_graph_args(&graph_raw_args(&["--samples"]), EXPLAIN_HELP_TEXT).is_err());
+    }
+
+    /// A graph from bare edges `(a, b, oriented)`: an oriented edge reads
+    /// `a` references `b`. Every edge is a probability-1 bridge on `id`.
+    fn synth_graph(tables: &[&str], edges: &[(&str, &str, bool)]) -> TableGraph {
+        let relationships: Vec<Relationship> = edges
+            .iter()
+            .map(|&(a, b, oriented)| Relationship {
+                from_table: a.to_string(),
+                from_column: format!("{b}_id"),
+                to_table: b.to_string(),
+                to_column: "id".to_string(),
+                confidence: Confidence::Probable,
+                reference: oriented.then(|| Reference {
+                    referencing_table: a.to_string(),
+                    referencing_column: format!("{b}_id"),
+                    referenced_table: b.to_string(),
+                    referenced_column: "id".to_string(),
+                }),
+                context: EdgeContext::Bridge,
+                evidence: Vec::new(),
+                reason: String::new(),
+                score: 0.0,
+                probability: 1.0,
+                features: EdgeFeatures::default(),
+            })
+            .collect();
+        let mut adj: BTreeMap<String, BTreeMap<String, Vec<usize>>> = tables
+            .iter()
+            .map(|t| (t.to_string(), BTreeMap::new()))
+            .collect();
+        for (i, rel) in relationships.iter().enumerate() {
+            adj.get_mut(&rel.from_table)
+                .unwrap()
+                .entry(rel.to_table.clone())
+                .or_default()
+                .push(i);
+            adj.get_mut(&rel.to_table)
+                .unwrap()
+                .entry(rel.from_table.clone())
+                .or_default()
+                .push(i);
+        }
+        let mut names: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+        names.sort();
+        TableGraph {
+            tables: names,
+            adj,
+            relationships,
+        }
+    }
+
+    fn metric<'a>(graph: &'a TableGraph, values: &'a [f64], table: &str) -> f64 {
+        values[graph.tables.iter().position(|t| t == table).unwrap()]
+    }
+
+    #[test]
+    fn graph_reference_rank_follows_references_transitively() {
+        // A snowflake: two facts reference customer, customer references
+        // address, address references country. Each dimension has the
+        // same single inbound link from below it, but rank accumulates.
+        let graph = synth_graph(
+            &["orders", "invoices", "customer", "address", "country"],
+            &[
+                ("orders", "customer", true),
+                ("invoices", "customer", true),
+                ("customer", "address", true),
+                ("address", "country", true),
+            ],
+        );
+        let rank = table_importance(&graph);
+        let r = |t| metric(&graph, &rank, t);
+        assert!(r("country") > r("address"));
+        assert!(r("address") > r("customer"));
+        assert!(r("customer") > r("orders"));
+        assert!((r("orders") - r("invoices")).abs() < 1e-9);
+        // Scaled so the average is 1.0.
+        assert!((rank.iter().sum::<f64>() - 5.0).abs() < 1e-6);
+        // No bridges at all: every table scores exactly average.
+        let flat = table_importance(&synth_graph(&["a", "b"], &[]));
+        assert!(flat.iter().all(|v| (v - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn graph_subject_areas_split_two_dense_clusters_joined_by_one_link() {
+        // Two triangles joined by a single edge c-d: one component, two
+        // areas; a disconnected pair is its own area.
+        let graph = synth_graph(
+            &["a", "b", "c", "d", "e", "f", "x", "y"],
+            &[
+                ("a", "b", false),
+                ("b", "c", false),
+                ("a", "c", false),
+                ("d", "e", false),
+                ("e", "f", false),
+                ("d", "f", false),
+                ("c", "d", false),
+                ("x", "y", false),
+            ],
+        );
+        let area = subject_areas(&graph);
+        let at = |t: &str| area[graph.tables.iter().position(|n| n == t).unwrap()];
+        assert_eq!(at("a"), at("b"));
+        assert_eq!(at("a"), at("c"));
+        assert_eq!(at("d"), at("e"));
+        assert_eq!(at("d"), at("f"));
+        assert_ne!(at("a"), at("d"));
+        assert_eq!(at("x"), at("y"));
+        assert_ne!(at("x"), at("a"));
+        assert_ne!(at("x"), at("d"));
+        // Numbered largest first; the pair comes last.
+        assert_eq!(at("x"), 2);
+        // Hub naming: the member with the most links inside its area.
+        let metrics = GraphMetrics::compute(&graph);
+        assert!(["a", "b", "c"].contains(&metrics.area_lead(&graph, at("a")).as_str()));
+    }
+
+    #[test]
+    fn graph_articulation_tables_are_the_cut_points() {
+        // A chain a-b-c plus a triangle c-d-e: b and c are cut points; a
+        // triangle member other than c is not, nor is an isolated table.
+        let graph = synth_graph(
+            &["a", "b", "c", "d", "e", "z"],
+            &[
+                ("a", "b", true),
+                ("b", "c", true),
+                ("c", "d", false),
+                ("d", "e", false),
+                ("c", "e", false),
+            ],
+        );
+        let cut = articulation_tables(&graph);
+        assert_eq!(
+            cut.into_iter().collect::<Vec<_>>(),
+            vec!["b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn graph_triangle_through_a_hub_is_relabelled_shared_reference() {
+        // trip.station_id references station and status.station_id; status
+        // references station too. The trip -> status hop is derived.
+        let entries = [
+            (
+                "station",
+                vec![
+                    rel_col("id", "i64", &["1", "2", "3"]),
+                    rel_col("name", "String", &["x", "y", "z"]),
+                ],
+            ),
+            (
+                "status",
+                vec![
+                    rel_col("station_id", "i64", &["1", "2"]),
+                    rel_col("bikes", "i64", &["4", "5"]),
+                ],
+            ),
+            (
+                "trip",
+                vec![
+                    rel_col("id", "i64", &["7", "8"]),
+                    rel_col("station_id", "i64", &["1", "3"]),
+                ],
+            ),
+        ];
+        let tables = rel_tables(&entries);
+        let rels = detect_relationships(&tables);
+        let find = |a: &str, b: &str| {
+            rels.iter()
+                .find(|r| {
+                    (r.from_table == a && r.to_table == b) || (r.from_table == b && r.to_table == a)
+                })
+                .unwrap_or_else(|| panic!("no {a}-{b} edge"))
+        };
+        assert_eq!(find("station", "trip").context, EdgeContext::Bridge);
+        assert_eq!(find("station", "status").context, EdgeContext::Bridge);
+        let derived = find("status", "trip");
+        assert_eq!(derived.context, EdgeContext::SharedReference);
+        assert!(
+            derived
+                .evidence
+                .iter()
+                .any(|e| e.contains("derived through that hub")),
+            "{:?}",
+            derived.evidence
+        );
     }
 
     #[test]

@@ -7,6 +7,16 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `rank` gains three graph measures per table: `reference_rank`
+  (weighted PageRank along references, 1.0 = average - high for the
+  tables everything ultimately points at), `area` (a Louvain modularity
+  subject area inside a community, with a new top-level `areas` array
+  and a "Subject areas" Markdown section when a community splits), and
+  `articulation` (every join path between some other pair of tables runs
+  through it). `rank` also computes components once instead of per row.
+- A reference that runs to both a hub and a table that itself references
+  that hub (`trip.station_id` to `station` and to `status.station_id`)
+  now reads `shared_reference` for the derived hop.
 - Relationship tiers: `declared` (SQLite `REFERENCES`/`FOREIGN KEY`
   constraints, surfaced per column as `references` and turned into edges
   with probability 1), `discovered` (inclusion dependencies measured on a
