@@ -14,6 +14,12 @@ All notable changes to sniff-rs are documented here. Format follows
   Fellegi-Sunter model over name, type and value comparisons, fitted on
   834 declared foreign keys). Edges gain a `probability` field; bridges
   below 0.5 are dropped.
+- Composite foreign keys stay whole: each column of a multi-column
+  `FOREIGN KEY` carries the full key in its `references` entry
+  (`"composite": [["o", "order_id"], ["l", "line_no"]]`), and its edge's
+  evidence says to join on every pair. `explain` also lists a column's
+  declared self-references (`staff.manager -> staff.id`), which have no
+  edge since the graph links tables; its JSON gains `self_references`.
 - PDF page-text reader (`--features pdf`, in `full`): one record per page
   (`page_number`, `text`). Hand-rolled, pure `std` - xref tables/streams
   with `/Prev` chains (plus bare-trailer files via index rebuild), object

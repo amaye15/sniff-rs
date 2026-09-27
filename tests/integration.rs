@@ -12394,7 +12394,7 @@ fn relationships_declared_sqlite_keys_are_declared_edges() {
             e["evidence"][0]
                 .as_str()
                 .unwrap()
-                .starts_with("declared foreign key")
+                .starts_with("declared ")
         );
     }
     let owner = rels.iter().find(|e| e["to_column"] == "owner").unwrap();
@@ -12557,6 +12557,89 @@ fn graph_explain_reports_profile_and_incident_edges() {
     assert!(stdout.contains("customers"));
     assert!(stdout.contains("probable"));
     assert!(stdout.contains("Community: 0 (orders-centered)"));
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn graph_composite_foreign_keys_carry_the_whole_key_through_a_saved_dictionary() {
+    // FOREIGN KEY (o, l) REFERENCES order_lines: each pair's reference names
+    // the whole key, one-column keys keep their two-field shape, and the
+    // edge built from a saved dictionary says to join on every pair.
+    let doc = run_json("edge_graph_declared_keys.sqlite", &[]);
+    let refs = |table: &str, column: &str| {
+        doc["tables"][table]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == column)
+            .unwrap()["references"]
+            .clone()
+    };
+    let key = serde_json::json!([["o", "order_id"], ["l", "line_no"]]);
+    assert_eq!(refs("shipments", "o")[0]["composite"], key);
+    assert_eq!(refs("shipments", "l")[0]["composite"], key);
+    assert_eq!(
+        refs("tickets", "opened_by"),
+        serde_json::json!([{"table": "staff", "column": "id"}])
+    );
+
+    let dir = TempDir::new();
+    let saved = dir.path().join("dict.json");
+    std::fs::write(&saved, serde_json::to_string(&doc).unwrap()).unwrap();
+    let out = run_graph(&[
+        "explain",
+        saved.to_str().unwrap(),
+        "shipments.l",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let explained: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rel = &explained["relationships"][0];
+    assert_eq!(rel["confidence"], "declared");
+    assert!(
+        rel["evidence"][0]
+            .as_str()
+            .unwrap()
+            .contains("composite foreign key: \"shipments\" (\"o\", \"l\") references \"order_lines\" (\"order_id\", \"line_no\")"),
+        "{rel}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn graph_explain_lists_declared_self_references_from_both_ends() {
+    // staff.manager REFERENCES staff(id): no edge (the graph links tables),
+    // but explain names the hierarchy on both columns and nowhere else.
+    let path = fixture("edge_graph_declared_keys.sqlite");
+    let md = |col: &str| {
+        let out = run_graph(&["explain", path.to_str().unwrap(), col]);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    assert!(md("staff.manager").contains("declared foreign key to `id` in this same table"));
+    assert!(md("staff.id").contains("`manager` in this same table declares a foreign key"));
+    assert!(!md("staff.name").contains("Self-reference"));
+    let out = run_graph(&[
+        "explain",
+        path.to_str().unwrap(),
+        "staff.id",
+        "--output-format",
+        "json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc["self_references"],
+        serde_json::json!([{"column": "manager", "references": "id"}])
+    );
 }
 
 #[test]

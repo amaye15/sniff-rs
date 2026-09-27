@@ -3809,6 +3809,29 @@ three whose fixtures relied on exact names nobody owns or leads with
 (dropped now, as the benchmark says they should be) were given a leading
 key or assert the drop.
 
+**Composite keys stay whole; self-references are named.** Two declared
+shapes the tiers above kept only partly. A composite `FOREIGN KEY (o, l)
+REFERENCES order_lines` became two independent edges, each reading like
+a complete join - and joining `shipments` to `order_lines` on `o` alone
+is wrong. `parse_create_table` now numbers each foreign-key clause, and
+`resolve_foreign_keys` gives every pair of a clause that resolved to two
+or more pairs the whole key as `ColumnRef::composite` - serialized as
+`"composite": [["o", "order_id"], ["l", "line_no"]]` on each column's
+`references` entry, written only for a composite so one-column keys keep
+their two-field shape, and read back from a saved dictionary. Each
+pair's edge stays (`path` still takes the hop), but its evidence reads
+"declared composite foreign key: ... - join on every pair, not this one
+alone" and its reason calls it one column pair of one. A self-reference
+(`staff.manager -> staff.id`) still has no edge - the graph links tables
+- but `explain` now lists it on both columns ("Self-reference: ... (a
+hierarchy)") and its JSON appends `self_references: [{column,
+references}]`. Declared only: the benchmark corpora hold three
+self-joins in Spider's 166 schemas (one of them mislabelled) and two in
+the real databases, too few to fit or check a heuristic. Verified by two
+integration tests against `edge_graph_declared_keys.sqlite` (the
+composite key through a saved dictionary; the self-reference from both
+ends and absent on an unrelated column).
+
 ## Numeric/statistical column summaries
 
 `ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,

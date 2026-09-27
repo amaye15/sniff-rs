@@ -4740,6 +4740,11 @@ impl NumericStats {
 struct ColumnRef {
     table: String,
     column: String,
+    /// The whole key when this pair is one column of a composite foreign
+    /// key, as (referencing column, referenced column) pairs in declared
+    /// order - `shipments.(o, l) -> order_lines.(order_id, line_no)` - and
+    /// empty for a one-column key. A join on one pair alone is wrong.
+    composite: Vec<(String, String)>,
 }
 
 /// How many of a column's smallest distinct value hashes a `ValueSketch`
@@ -5038,9 +5043,27 @@ impl ColumnProfile {
                 self.references
                     .iter()
                     .map(|r| {
-                        let mut m = Map::with_capacity(2);
+                        let mut m = Map::with_capacity(3);
                         m.insert("table".to_string(), Value::from(r.table.clone()));
                         m.insert("column".to_string(), Value::from(r.column.clone()));
+                        // Only written for a composite key, so a one-column
+                        // reference keeps its original two-field shape.
+                        if !r.composite.is_empty() {
+                            m.insert(
+                                "composite".to_string(),
+                                Value::Array(
+                                    r.composite
+                                        .iter()
+                                        .map(|(l, t)| {
+                                            Value::Array(vec![
+                                                Value::from(l.clone()),
+                                                Value::from(t.clone()),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
                         Value::Object(m)
                     })
                     .collect(),
@@ -65902,8 +65925,9 @@ mod sqlite_support {
         /// Declared foreign keys, one entry per referencing column:
         /// (local column, referenced table, referenced column). A composite
         /// `FOREIGN KEY (a, b) REFERENCES t (x, y)` becomes the two pairs
-        /// `a -> x` and `b -> y`.
-        foreign_keys: Vec<(String, String, FkTarget)>,
+        /// `a -> x` and `b -> y`; the fourth element numbers the clause each
+        /// pair came from, so the pairs of one composite key stay together.
+        foreign_keys: Vec<(String, String, FkTarget, usize)>,
     }
 
     /// The referenced column of one declared foreign-key pair: named in the
@@ -66372,7 +66396,8 @@ mod sqlite_support {
         let mut inline_rowid_alias = None;
         let mut pk_constraint_text: Option<String> = None;
         let mut primary_key: Vec<String> = Vec::new();
-        let mut foreign_keys: Vec<(String, String, FkTarget)> = Vec::new();
+        let mut foreign_keys: Vec<(String, String, FkTarget, usize)> = Vec::new();
+        let mut fk_clauses = 0usize;
 
         for (item_start, item_end) in items {
             let text: String = chars[item_start..item_end].iter().collect();
@@ -66405,8 +66430,9 @@ mod sqlite_support {
                                     None => continue,
                                 }
                             };
-                            foreign_keys.push((local, table.clone(), target));
+                            foreign_keys.push((local, table.clone(), target, fk_clauses));
                         }
+                        fk_clauses += 1;
                     }
                 } else if contains_word(&lower, "primary") && contains_word(&lower, "key") {
                     let pk_kw = find_keyword_outside_quotes(&chars, item_start, item_end, "key");
@@ -66463,7 +66489,8 @@ mod sqlite_support {
                     Some(t) => FkTarget::Named(t),
                     None => FkTarget::PrimaryKey(0),
                 };
-                foreign_keys.push((name.clone(), table, target));
+                foreign_keys.push((name.clone(), table, target, fk_clauses));
+                fk_clauses += 1;
             }
             col_types_are_integer.push(type_is_integer);
             columns.push(name);
@@ -66685,8 +66712,8 @@ mod sqlite_support {
         entries: &[SchemaEntry],
         parsed_all: &[Option<ParsedTable>],
     ) -> Vec<(String, ColumnRef)> {
-        let mut out = Vec::new();
-        for (local, table, target) in &parsed.foreign_keys {
+        let mut out: Vec<(String, ColumnRef, usize)> = Vec::new();
+        for (local, table, target, clause) in &parsed.foreign_keys {
             let Some(local) = parsed
                 .columns
                 .iter()
@@ -66722,10 +66749,30 @@ mod sqlite_support {
                 ColumnRef {
                     table: entries[t_idx].name.clone(),
                     column: column.clone(),
+                    composite: Vec::new(),
                 },
+                *clause,
             ));
         }
-        out
+        // A clause that resolved to two or more pairs is one composite key:
+        // every pair carries the whole key, so no single column of it ever
+        // reads as a complete join on its own.
+        let key_of = |clause: usize| -> Vec<(String, String)> {
+            out.iter()
+                .filter(|(_, _, c)| *c == clause)
+                .map(|(l, r, _)| (l.clone(), r.column.clone()))
+                .collect()
+        };
+        let keys: Vec<Vec<(String, String)>> = out.iter().map(|(_, _, c)| key_of(*c)).collect();
+        out.into_iter()
+            .zip(keys)
+            .map(|((local, mut r, _), key)| {
+                if key.len() > 1 {
+                    r.composite = key;
+                }
+                (local, r)
+            })
+            .collect()
     }
 
     pub(crate) fn columns_from_sqlite(
@@ -66825,15 +66872,16 @@ mod sqlite_support {
             assert_eq!(
                 t.foreign_keys,
                 vec![
-                    ("a".into(), "users".into(), FkTarget::Named("uid".into())),
+                    ("a".into(), "users".into(), FkTarget::Named("uid".into()), 0),
                     (
                         "b col".into(),
                         "Groups".into(),
-                        FkTarget::Named("gid".into())
+                        FkTarget::Named("gid".into()),
+                        1
                     ),
-                    ("c".into(), "staff".into(), FkTarget::PrimaryKey(0)),
-                    ("d".into(), "pairs".into(), FkTarget::Named("p".into())),
-                    ("e".into(), "pairs".into(), FkTarget::Named("q".into())),
+                    ("c".into(), "staff".into(), FkTarget::PrimaryKey(0), 2),
+                    ("d".into(), "pairs".into(), FkTarget::Named("p".into()), 3),
+                    ("e".into(), "pairs".into(), FkTarget::Named("q".into()), 3),
                 ]
             );
         }
@@ -66847,8 +66895,8 @@ mod sqlite_support {
             assert_eq!(
                 t.foreign_keys,
                 vec![
-                    ("o".into(), "lines".into(), FkTarget::PrimaryKey(0)),
-                    ("l".into(), "lines".into(), FkTarget::PrimaryKey(1)),
+                    ("o".into(), "lines".into(), FkTarget::PrimaryKey(0), 0),
+                    ("l".into(), "lines".into(), FkTarget::PrimaryKey(1), 0),
                 ]
             );
             let lines = parse_create_table(
@@ -66894,7 +66942,8 @@ mod sqlite_support {
                     "a".to_string(),
                     ColumnRef {
                         table: "Staff".into(),
-                        column: "Id".into()
+                        column: "Id".into(),
+                        composite: Vec::new(),
                     }
                 )]
             );
@@ -70266,10 +70315,32 @@ fn apply_declared_keys(
                 {
                     continue;
                 }
-                let declared = format!(
-                    "declared foreign key: \"{}\".\"{}\" references \"{}\".\"{}\"",
-                    table, col.name, r.table, r.column
-                );
+                let declared = if r.composite.is_empty() {
+                    format!(
+                        "declared foreign key: \"{}\".\"{}\" references \"{}\".\"{}\"",
+                        table, col.name, r.table, r.column
+                    )
+                } else {
+                    let list = |pick: fn(&(String, String)) -> &String| {
+                        r.composite
+                            .iter()
+                            .map(|p| format!("\"{}\"", pick(p)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    format!(
+                        "declared composite foreign key: \"{}\" ({}) references \"{}\" ({}) - join on every pair, not this one alone",
+                        table,
+                        list(|p| &p.0),
+                        r.table,
+                        list(|p| &p.1)
+                    )
+                };
+                let joined_by = if r.composite.is_empty() {
+                    "a declared foreign key"
+                } else {
+                    "one column pair of a declared composite foreign key"
+                };
                 let reference = Reference {
                     referencing_table: table.clone(),
                     referencing_column: col.name.clone(),
@@ -70305,12 +70376,12 @@ fn apply_declared_keys(
                         e.reference = Some(reference);
                         e.context = EdgeContext::Bridge;
                         e.reason = format!(
-                            "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) are joined by a declared foreign key"
+                            "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) are joined by {joined_by}"
                         );
                     }
                     None => edges.push(Relationship {
                         reason: format!(
-                            "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) are joined by a declared foreign key"
+                            "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) are joined by {joined_by}"
                         ),
                         from_table,
                         from_column,
@@ -70767,9 +70838,25 @@ fn graph_column_from_json_owned(v: JsonValue) -> Result<ColumnProfile> {
                         else {
                             continue;
                         };
+                        let composite = match item.get("composite") {
+                            Some(JsonValue::Array(pairs)) => pairs
+                                .iter()
+                                .filter_map(|p| match p {
+                                    JsonValue::Array(v) => match v.as_slice() {
+                                        [JsonValue::String(l), JsonValue::String(r)] => {
+                                            Some((l.clone(), r.clone()))
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
                         profile.references.push(ColumnRef {
                             table: t.clone(),
                             column: c.clone(),
+                            composite,
                         });
                     }
                 }
@@ -84516,6 +84603,38 @@ fn escape_graph_md(text: &str) -> String {
     text.replace('|', "\\|")
 }
 
+/// Declared foreign keys from one table to itself that involve `column`,
+/// as (referencing column, referenced column) pairs: `staff.manager ->
+/// staff.id` is a hierarchy. The graph links tables, so a loop has no
+/// edge there (see `apply_declared_keys`); `explain` lists these
+/// separately instead of dropping them. Declared keys only - self-joins
+/// are too rare in the benchmark corpora (three in Spider's 166 schemas,
+/// one of them mislabelled) to fit or check a heuristic against.
+fn self_references(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    table: &str,
+    column: &str,
+) -> Vec<(String, String)> {
+    let Some(cols) = tables.get(table) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in cols {
+        for r in &c.references {
+            if r.table == table
+                && (c.name == column || r.column == column)
+                && cols.iter().any(|x| x.name == r.column)
+            {
+                let pair = (c.name.clone(), r.column.clone());
+                if !out.contains(&pair) {
+                    out.push(pair);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn render_explain_md(
     input: &Path,
     table: &str,
@@ -84601,6 +84720,19 @@ fn render_explain_md(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    }
+    for (from, to) in self_references(tables, table, &profile.name) {
+        if from == profile.name {
+            out.push_str(&format!(
+                "- Self-reference: declared foreign key to `{}` in this same table (a hierarchy)\n",
+                escape_graph_md(&to)
+            ));
+        } else {
+            out.push_str(&format!(
+                "- Self-reference: `{}` in this same table declares a foreign key to this column (a hierarchy)\n",
+                escape_graph_md(&from)
+            ));
+        }
     }
     out.push('\n');
     if edge_indices.is_empty() {
@@ -84774,6 +84906,16 @@ fn render_explain_json(
     doc.insert(
         "shared_reference_degree".to_string(),
         JsonValue::from(shared_count as i64),
+    );
+    // Appended last too: declared keys from this table to itself.
+    doc.insert(
+        "self_references".to_string(),
+        JsonValue::Array(
+            self_references(tables, table, &profile.name)
+                .into_iter()
+                .map(|(from, to)| json!({"column": from, "references": to}))
+                .collect(),
+        ),
     );
     Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
 }
@@ -94251,16 +94393,19 @@ mod tests {
         opened_by.references.push(ColumnRef {
             table: "staff".into(),
             column: "id".into(),
+            composite: Vec::new(),
         });
         let mut manager = rel_col("manager", "i64", &["1"]);
         manager.references.push(ColumnRef {
             table: "staff".into(),
             column: "id".into(),
+            composite: Vec::new(),
         });
         let mut dangling = rel_col("legacy", "i64", &["1"]);
         dangling.references.push(ColumnRef {
             table: "gone".into(),
             column: "id".into(),
+            composite: Vec::new(),
         });
         let tables = rel_tables(&[
             ("staff", vec![rel_col("id", "i64", &["1", "2"]), manager]),
