@@ -19,10 +19,12 @@ Zero runtime dependencies: every reader is hand-rolled pure `std`.
 
 Rich JSON output carries a top-level `relationships` array: join
 candidates detected across tables (SQLite, Excel, INI, multi-table
-formats, or `--combine` directories), each tagged `extracted` (measured
-in the data: matching names, a `users.id` ← `orders.user_id` shape, or
-shared samples) or `inferred` (similar names, or a shared UUID/Email
-domain), with per-edge evidence. Three subcommands query the graph
+formats, or `--combine` directories), each in one of three tiers:
+`declared` (the schema states it - SQLite `REFERENCES`/`FOREIGN KEY`),
+`discovered` (the values show it: one column's values sit inside
+another's unique values), or `probable` (names and types make it more
+likely than not). Every edge carries a calibrated `probability` and its
+evidence; weaker candidates are dropped. Three subcommands query the graph
 without re-reading any file - each takes a dictionary or a raw file:
 
 ```bash
@@ -32,7 +34,7 @@ sniff-rs rank warehouse.db                 # god tables + communities
 ```
 
 `diff` additionally reports relationship drift: joins that appeared,
-vanished, or changed confidence between snapshots (a lost join is
+vanished, or changed tier or probability between snapshots (a lost join is
 breaking, like a removed column).
 
 ## Install

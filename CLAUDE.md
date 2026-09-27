@@ -283,12 +283,20 @@ everything else's implicit single one:
         "sample_values": ["02134", "90210"],
         "notes": "leading zeros in raw values (likely an ID/code)",
         "row_count": 100,
-        "numeric_stats": null
+        "numeric_stats": null,
+        "references": [],
+        "value_sketch": {"count": 100, "distinct": 97, "hashes": "0004a1f2..."}
       }
     ]
   }
 }
 ```
+
+`references` (declared foreign keys, `[{"table", "column"}]`, only ever
+non-empty for SQLite today) and `value_sketch` (a bounded KMV sketch of
+the column's distinct values, `null` outside key domains) feed the
+relationship graph's `declared` and `discovered` tiers - see "Linking
+tiers" in the relationship-graph section.
 
 `row_count` is how many rows/records this column was profiled against (the
 same total every `missing_pct` above is already derived from) — added after
@@ -3703,6 +3711,103 @@ gating, role prefixes both ways, own-key exclusion, first-column owners,
 unowned shared keys, value IDF, score ordering) and an INI fixture
 (`edge_graph_key_evidence.ini`) run through the binary. Clippy matches the
 baseline.
+
+**Linking tiers: declared, discovered, probable.** The BM25 pass left
+every edge on one footing - a rule said "join", and nothing said how sure.
+Record linkage and inclusion-dependency discovery both separate three
+kinds of evidence, and the graph now does too. `confidence` is one of:
+
+- **`declared`**: the schema says so. The SQLite reader now parses
+  `REFERENCES`/`FOREIGN KEY` clauses (`parse_create_table`: inline column
+  constraints, named `CONSTRAINT ... FOREIGN KEY`, composite keys paired
+  positionally, a bare `REFERENCES t` resolved onto `t`'s primary key once
+  every table is parsed - `resolve_foreign_keys`, case-insensitive like
+  SQLite). Keyword search skips quoted text (`find_keyword_outside_quotes`
+  - a `DEFAULT 'references x(y)'` read as a key until a unit test caught
+  it). Each column carries its keys as `references`; `--combine` rewrites
+  them to the qualified table names; a saved dictionary carries them back
+  into `explain`/`path`/`rank`. `apply_declared_keys` turns each into an
+  edge with probability 1, upgrading a heuristic edge on the same columns
+  in place. A key to a missing table or column is dropped; a
+  self-reference (`Employee.ReportsTo`) stays on the column but isn't an
+  edge, since the graph links tables. Checked against SQLite's own
+  `pragma foreign_key_list` on Chinook, Northwind and Sakila: 46 of 46
+  identical.
+- **`discovered`**: the values show it. Every key-domain column now
+  carries a `ValueSketch` - a KMV sketch of its 128 smallest 32-bit value
+  hashes (FNV-1a finished with splitmix64), built in the same streaming
+  pass by `ColumnAccumulatorState`, `profile_column` and
+  `JsonPathAccumulator`. It estimates distinct count (exact below 128) and
+  containment: a hash of `A` at or below `B`'s largest kept hash is a
+  value `B` would have kept, so the share found in `B` estimates the share
+  of `A` inside `B`. `inclusion_between` calls `A -> B` an inclusion
+  dependency when `B` looks unique, `A` has two or more distinct values,
+  and 95%+ of `A` sits in `B`. Every candidate edge records that as a
+  comparison; one that holds labels the edge `discovered`, adds a
+  "values match" evidence line, and orients an edge the names left
+  undirected - unless some table owns the name, where the two are hub
+  siblings (`film_category.film_id` is unique and contains
+  `film_actor.film_id`, but both reference `film`). `value_candidate`
+  proposes edges from values alone (`Orders.ShipVia` in
+  `Shippers.ShipperID`), with two restrictions the benchmark forced: the
+  referenced side must be its table's own key (first column, or named for
+  the table - `customer.address_id` is unique and `_id`-named but
+  references `address`), and an integer pair also needs the name to
+  abbreviate the table (`ship_via` -> `shippers`). Without the latter,
+  every small integer range sits inside every `1..N` id: 120 value-only
+  candidates on Sakila, none real. With both, the three real databases
+  yield exactly one value-only candidate, and it is right.
+- **`probable`**: names and types make it more likely than not.
+  `edge_probability` is a Fellegi-Sunter posterior: prior log-odds plus a
+  weight per comparison - a multi-level name agreement (`fk`,
+  `exact_owned_lead`, `exact_owned`, `exact_lead`, `exact_plain`,
+  `weak_lead`, `weak_plain`, `identifier`, `value`), and yes/no tests
+  (key marker, same type, name in 3+ tables, abbreviation, shared
+  informative samples, containment), each `None` when it can't be run.
+  The name comparison is one categorical level rather than separate tests
+  because the parts interact: a same-noun match is 82% real beside a
+  table's first column and 0% elsewhere, which independent tests scored
+  at 0.17. Weights are `ln(m/u)`, shrunk towards the pooled rate, and an
+  outcome seen fewer than 5 times gets 0 - an early fit gave an unseen
+  test -1.7 from smoothing alone. One scale factor (0.96, maximum
+  likelihood) calibrates the sum. Bridges below 0.5 are dropped;
+  declared, duplicate-schema and shared-reference edges never are (their
+  labels already say they aren't independent joins, and `path` needs the
+  hop). Every edge's JSON gains `probability` after `score`; Markdown
+  shows `probable 0.93`; `path` breaks ties by tier, then probability.
+  Relationship drift in `diff` fires on a tier change or a probability
+  move of 0.2 or more.
+
+The weights were fitted on the benchmark's bridge candidates (712 across
+Spider's 166 schemas and the three real databases, declared keys
+stripped so they had to be found), with a small offline harness that
+dumps each edge's comparisons; they are committed as `FS_NAME_LEVELS`/
+`FS_TESTS`/`FS_PRIOR`/`FS_SCALE`. Value comparisons rest on the three real
+databases only (Spider has no data), so their weights are the thinnest.
+Results, bridges only, declared keys stripped: Spider precision 0.839 ->
+0.898, recall 0.766 -> 0.739 (F1 0.801 -> 0.811); real databases 0.977 ->
+1.000 at recall 0.955 - the same when the model is fitted on Spider
+alone, so the real-database number is held out. With declared keys, all
+44 cross-table keys in the real databases are found and every bridge is
+right. On Spider, predicted probability tracks the observed rate (edges
+scored 0.9+ are 94% real, 0.7-0.8 are 79%, 0.1-0.2 are 10%). The one
+band that isn't calibrated is 0.4-0.5 (14 of 22 real, dropped): a
+threshold tuned for F1 would keep them, but 0.5 keeps its plain meaning.
+Two real keys stay out of reach: `Customer.SupportRepId -> EmployeeId`
+(integers, no abbreviation) and `film.original_language_id` (all NULL).
+Sketching costs nothing measurable (a 1M-row CSV and a 500k-record JSONL
+file both ran in the same time and memory as before) and grows JSON by
+about 1 KB per key-domain column (25-70% on the files tried). Verified
+with unit tests on the parser, resolution, sketch (exactness, estimate
+bounds, containment, JSON round trip and malformed rejection), the
+model, the discovered tier (a text code, Sakila's range coincidence, the
+ShipVia case, hub siblings) and declared edges, a committed fixture
+(`edge_graph_declared_keys.sqlite`) through the binary, `--combine`
+qualification, and a discovered code reference across two CSVs. Tests
+that asserted `extracted`/`inferred` now assert tiers and probabilities;
+three whose fixtures relied on exact names nobody owns or leads with
+(dropped now, as the benchmark says they should be) were given a leading
+key or assert the drop.
 
 ## Numeric/statistical column summaries
 

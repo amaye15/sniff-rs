@@ -7,6 +7,13 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- Relationship tiers: `declared` (SQLite `REFERENCES`/`FOREIGN KEY`
+  constraints, surfaced per column as `references` and turned into edges
+  with probability 1), `discovered` (inclusion dependencies measured on a
+  new bounded per-column `value_sketch`), and `probable` (a
+  Fellegi-Sunter model over name, type and value comparisons, fitted on
+  834 declared foreign keys). Edges gain a `probability` field; bridges
+  below 0.5 are dropped.
 - PDF page-text reader (`--features pdf`, in `full`): one record per page
   (`page_number`, `text`). Hand-rolled, pure `std` - xref tables/streams
   with `/Prev` chains (plus bare-trailer files via index rebuild), object
@@ -49,6 +56,9 @@ All notable changes to sniff-rs are documented here. Format follows
   ZapfDingbats glyph names (`a20`) resolve in a ZapfDingbats font.
 
 ### Changed
+- Relationship `confidence` is now `declared`/`discovered`/`probable`,
+  replacing `extracted`/`inferred`. Column JSON gains `references` and
+  `value_sketch` (appended last).
 - PDF: word and line breaks come from where glyphs are drawn - text,
   line and transformation matrices, Form `/Matrix`, `TJ` offsets, and
   glyph widths (`/Widths`, `/W`, or Core 14 metrics) - instead of which
