@@ -12206,7 +12206,8 @@ fn relationships_ini_reports_fk_exact_and_inferred_edges() {
     let doc = run_json("edge_relationships.ini", &[]);
     let rels = doc["relationships"].as_array().unwrap();
     // users.id <-> orders.user_id: foreign-key naming + UUID + a shared
-    // sample - extracted. region <-> region: identical names - extracted.
+    // sample - extracted. region_code <-> region_code: identical key
+    // names - extracted.
     // email <-> contact: shared Email domain, different names - inferred.
     // orders.order_id (i64) matches nothing and correctly yields no edge.
     assert_eq!(rels.len(), 3);
@@ -12217,7 +12218,7 @@ fn relationships_ini_reports_fk_exact_and_inferred_edges() {
     assert_eq!(fk["reference"]["referencing_column"], "user_id");
     assert_eq!(fk["reference"]["referenced_table"], "users");
     assert_eq!(fk["reference"]["referenced_column"], "id");
-    let exact = find_edge(rels, "users", "region");
+    let exact = find_edge(rels, "users", "region_code");
     assert_eq!(exact["confidence"], "extracted");
     let inferred = find_edge(rels, "users", "email");
     assert_eq!(inferred["confidence"], "inferred");
@@ -12228,12 +12229,48 @@ fn relationships_ini_reports_fk_exact_and_inferred_edges() {
         assert!(!e["reason"].as_str().unwrap().is_empty());
     }
     // Edges sorted by (from-table, from-column): all three run orders ->
-    // users here, contact < region < user_id.
+    // users here, contact < region_code < user_id.
     let cols: Vec<&str> = rels
         .iter()
         .map(|e| e["from_column"].as_str().unwrap())
         .collect();
-    assert_eq!(cols, vec!["contact", "region", "user_id"]);
+    assert_eq!(cols, vec!["contact", "region_code", "user_id"]);
+}
+
+#[test]
+#[cfg(feature = "ini")]
+fn relationships_need_key_evidence_and_resolve_roles_and_natural_keys() {
+    let doc = run_json("edge_graph_key_evidence.ini", &[]);
+    let rels = doc["relationships"].as_array().unwrap();
+    // customer/staff share city and phone: attributes, never a bridge.
+    for attr in ["city", "phone"] {
+        assert!(
+            rels.iter().all(|e| e["from_column"] != attr),
+            "{attr} must not link: {rels:#?}"
+        );
+    }
+    // store.manager_staff_id is a role-prefixed copy of staff's own key.
+    let role = find_edge(rels, "store", "manager_staff_id");
+    assert_eq!(role["reference"]["referenced_table"], "staff");
+    assert_eq!(role["reference"]["referenced_column"], "staff_id");
+    assert_eq!(role["context"], "bridge");
+    // state owns state_name, so customer.state_name references it.
+    let natural = find_edge(rels, "customer", "state_name");
+    assert_eq!(natural["reference"]["referenced_table"], "state");
+    // league_code sits in three tables and none owns it: shared, not a
+    // clique of bridges.
+    let league: Vec<&serde_json::Value> = rels
+        .iter()
+        .filter(|e| e["from_column"] == "league_code")
+        .collect();
+    assert_eq!(league.len(), 3);
+    assert!(league.iter().all(|e| e["context"] == "shared_reference"));
+    // Every edge carries its BM25-style score as the last field.
+    for e in rels {
+        let obj = e.as_object().unwrap();
+        assert_eq!(obj.keys().next_back().map(String::as_str), Some("score"));
+        assert!(e["score"].as_f64().unwrap() >= 0.0);
+    }
 }
 
 #[test]
@@ -12471,7 +12508,7 @@ fn graph_path_lists_parallel_links_as_alternatives() {
         .iter()
         .map(|e| e["from_column"].as_str().unwrap())
         .collect();
-    // The hop itself is region->region (first extracted edge); the two
+    // The hop itself is region_code->region_code (first extracted edge); the two
     // unchosen parallel links are named here, in edge order.
     assert_eq!(cols, vec!["contact", "user_id"]);
 
@@ -12852,14 +12889,16 @@ fn graph_rank_reports_similar_tables_and_edge_context() {
     let dir = TempDir::new();
     std::fs::write(
         dir.path().join("v1.csv"),
-        "account_id,name\n1,Alice\n2,Bob\n",
+        "name,account_id\nAlice,1\nBob,2\n",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("v2.csv"),
-        "account_id,name\n1,Alice\n2,Bob\n",
+        "name,account_id\nAlice,1\nBob,2\n",
     )
     .unwrap();
+    // `w` is the only table leading with `account_id`, so it owns the key:
+    // its two links are references into it, not a shared key.
     std::fs::write(dir.path().join("w.csv"), "account_id,city\n1,Paris\n").unwrap();
     let out = TempDir::new();
     let output = Command::new(bin())
@@ -12957,10 +12996,12 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     for i in 0..55 {
         std::fs::write(
             dir.path().join(format!("t{i}.csv")),
-            "doc_id,text\n1,hello\n2,world\n",
+            "text,doc_id\nhello,1\nworld,2\n",
         )
         .unwrap();
     }
+    // `hub` is the only table leading with `doc_id`: it owns the key, so
+    // its links are references into it rather than one more shared copy.
     std::fs::write(dir.path().join("hub.csv"), "doc_id\n1\n2\n").unwrap();
     let out = TempDir::new();
     let output = Command::new(bin())

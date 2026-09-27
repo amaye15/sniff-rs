@@ -3616,6 +3616,94 @@ exact false positive removed here - and now use a real reference key
 (`account_id`, `doc_id`, `batch`) with their intent unchanged. Clippy is
 identical to the pre-change baseline.
 
+**BM25-style linking: key evidence, measured against 834 declared foreign
+keys.** Researched before building, then built against a benchmark rather
+than intuition. The literature on join and foreign-key discovery (Aurum's
+TF-IDF/MinHash profiles, Rostin et al.'s ten FK features, Zhang et al.'s
+randomness test, HoPF) agrees on the useful signals: a name that says
+"key", a referenced side that is its table's own key, and value evidence
+weighted by how rare the values are - BM25's inverse document frequency
+applied to schemas. Two ground-truth corpora, neither committed (they are
+external and large): the declared `FOREIGN KEY`s of three real SQLite
+sample databases with data (Chinook, Northwind, Sakila - 44 cross-table
+keys) and the declared keys of all 166 schemas in the Spider text-to-SQL
+benchmark's `tables.json` (790 cross-table keys, names and types only, no
+values). Each schema became a dictionary, `detect_relationships` ran over
+it, and every bridge was scored against the declared keys.
+
+The baseline was precise about what it got wrong: bridge precision 0.34
+on Spider and 0.42 on the real databases, with recall 0.78 / 0.91. Of
+Spider's 1,201 wrong bridges, 1,150 were exact-name matches on attribute
+columns - `name`, `city`, `phone`, `homepage`, `address` in two unrelated
+entities. Token IDF alone does not separate those from keys (in a
+normalized schema `city` and `customer` each appear in about two tables),
+so the fix is the key-evidence the literature calls for, with IDF used
+where it actually discriminates:
+
+- **An exact-name bridge between different schemas needs key evidence**:
+  a key-marker last token (`KEY_MARKERS`: `id`, `code`, `key`, `no`,
+  `num`, `sku`, ...; also compact `aid`/`pid`), a table that owns the name
+  (`owns_key`, below), a unique leading column (below), or an identifier
+  domain with shared values. Unowned, unmarked exact matches were wrong
+  876 times for every 29 right on Spider, and 52 to 0 on the real data.
+  Duplicate-schema pairs are unchanged.
+- **Natural-key owners**: `owner_stems` now reads a column as naming its
+  table through the whole name (`grapes.grape`), a key suffix
+  (`customer_id`), a natural-key head (`state.state_name`,
+  `invoices.invoice_number`), or an unseparated `id` (`Dorm.dormid`; the
+  stem must be three letters or more, so `paid` stays `paid`).
+- **A unique leading column owns its key**: schemas put their primary key
+  first. When exactly one table in the input leads with a name, that table
+  owns it - key-marked names always, unmarked names only when they occur
+  in exactly two tables (tested: allowing any unmarked leading column
+  brought back `homepage`/`Year`/`name` false links for the same F1).
+- **Role-prefixed keys**: `store.manager_staff_id -> staff.staff_id`,
+  `farm_competition.host_city_id -> city.city_id` - the long name ends
+  with another table's own key (`LinkIndex::key_tables`), and only one
+  table claims that key; a column that is itself its table's key
+  (`people_addresses.person_address_id`) is never read as a reference.
+  The bare-id pattern gained the same reading (`parent_user_id ->
+  users.id`). Recovered 24 declared Spider keys the old linker missed.
+- **An unowned key in three or more tables is a shared key**
+  (`mark_unowned_shared_keys`): `league_id` across fifteen baseball
+  tables with no `league` table used to be a clique of bridges; it now
+  reads `SharedReference` with evidence saying no table owns it. Kept for
+  `path`, out of bridge degree. Two tables sharing an unowned key stay a
+  bridge.
+- **Sample-value IDF** (`LinkIndex`, `value_is_informative`): each column
+  with samples is a document. A shared value only promotes a weak or
+  domain-only name match to `extracted` when it sits in at most half of
+  the other columns - the Robertson/Sparck Jones sign rule, judged against
+  the columns other than the two compared (which hold it by definition,
+  and which would otherwise make every value "common" in a two-table
+  input). Shared `1`/`true` values now say `(common to most columns here,
+  so weak evidence)` instead of promoting.
+- **An edge `score`** (`edge_score`, appended last in the JSON): the BM25
+  idf (Lucene's non-negative form) of the matched name's non-marker tokens,
+  tables as documents, plus the idf of every shared sample value. It
+  orders `explain`'s rows within each context, most specific first; it
+  never gates an edge.
+
+Result on the same benchmarks: bridge precision 0.34 -> 0.84 on Spider
+and 0.42 -> 0.98 on the real databases; recall (any context) 0.78 -> 0.77
+and 0.91 -> 0.93; correctly oriented true bridges 423 -> 523 and 39 -> 41.
+The declared keys still missed are mostly out of reach for names alone:
+composite keys (`section.year`/`semester`), self-references
+(`Employee.ReportsTo`), role names with no entity (`Orders.ShipVia ->
+Shippers.ShipperID`), abbreviations (`dept_name` for `department`), and a
+few Spider schemas whose declared types disagree (`text` vs `number` for
+one key). Spider's declared keys are also incomplete (baseball's
+`team_id`s point at `team` but are undeclared), so its precision is a
+floor. Everything else in the relationship graph is unchanged. Three
+existing tests used attribute names (`batch`, `region`, `a`) as bridge
+examples and now use key names; two `--combine` tests put the shared key
+second in the copied tables so the hub table is the one leading with it.
+Verified with nine new unit tests (idf, markers and owner stems, attribute
+gating, role prefixes both ways, own-key exclusion, first-column owners,
+unowned shared keys, value IDF, score ordering) and an INI fixture
+(`edge_graph_key_evidence.ini`) run through the binary. Clippy matches the
+baseline.
+
 ## Numeric/statistical column summaries
 
 `ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,
