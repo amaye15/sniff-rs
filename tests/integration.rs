@@ -8527,7 +8527,7 @@ fn ini_duplicate_sections_and_keys_pooled() {
     let name = column(owner, "name");
     // Depending on impl, duplicate keys become Vec<String> with pooled values or last-wins;
     // this project's ini_support pools duplicates into an array value, so ideal_type should be String or Vec<String>.
-    assert!(name["sample_values"].as_array().unwrap().len() >= 1);
+    assert!(!name["sample_values"].as_array().unwrap().is_empty());
     // Re-opened [owner] must have appended its new key "role" rather than creating a second table.
     assert!(
         owner.iter().any(|c| c["name"] == "role"),
@@ -14960,4 +14960,92 @@ fn kg_link_any(doc: &serde_json::Value, relation: &str, source: &str, target: &s
         .unwrap()
         .iter()
         .any(|l| l["relation"] == relation && l["source"] == source && l["target"] == target)
+}
+
+// --- Compressed input recognized by content, and `diff` reading stdin ---
+
+/// A gzip-compressed CSV with no extension at all is decompressed from
+/// its own magic bytes; CSV itself still can't be sniffed, so `--format`
+/// is still required for the decompressed content.
+#[test]
+fn extensionless_gzip_csv_is_decompressed_by_its_magic_bytes() {
+    let doc = run_json("edge_gzip_no_extension", &["--format", "csv"]);
+    assert_eq!(doc["format"], "csv");
+    let cols = doc["tables"]["edge_gzip_no_extension"].as_array().unwrap();
+    assert_eq!(cols[0]["name"], "user_id");
+}
+
+/// Extensionless gzip whose decompressed content is sniffable (JSON Lines)
+/// needs no flags at all.
+#[test]
+fn extensionless_gzip_json_is_decompressed_then_sniffed() {
+    let doc = run_json("edge_gzip_json_no_extension", &[]);
+    assert_eq!(doc["format"], "json");
+    let cols = doc["tables"]["edge_gzip_json_no_extension"]
+        .as_array()
+        .unwrap();
+    assert_eq!(cols[0]["name"], "id");
+}
+
+/// Piped gzip on stdin used to reach the readers still compressed.
+#[test]
+fn stdin_gzip_input_is_decompressed() {
+    let gz = std::fs::read(fixture("edge_gzip_no_extension")).unwrap();
+    let output = run_with_stdin(
+        &gz,
+        &["-", "-", "--format", "csv", "--output-format", "json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["tables"]["stdin"][0]["name"], "user_id");
+}
+
+/// `diff` accepts `-` for one side; identical data reports no changes.
+#[test]
+fn diff_reads_one_side_from_stdin() {
+    let csv = std::fs::read(fixture("sample.csv")).unwrap();
+    let old = fixture("sample.csv");
+    let output = run_with_stdin(
+        &csv,
+        &[
+            "diff",
+            old.to_str().unwrap(),
+            "-",
+            "--format",
+            "csv",
+            "--output-format",
+            "json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["changes"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn diff_rejects_stdin_for_both_sides_and_a_stray_format_flag() {
+    let both = run_with_stdin(b"", &["diff", "-", "-"]);
+    assert!(!both.status.success());
+    assert!(String::from_utf8_lossy(&both.stderr).contains("only one of"));
+    let a = fixture("sample.csv");
+    let stray = Command::new(bin())
+        .args([
+            "diff",
+            a.to_str().unwrap(),
+            a.to_str().unwrap(),
+            "--format",
+            "csv",
+        ])
+        .output()
+        .unwrap();
+    assert!(!stray.status.success());
+    assert!(String::from_utf8_lossy(&stray.stderr).contains("applies only to"));
 }

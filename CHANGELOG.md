@@ -13,6 +13,13 @@ All notable changes to sniff-rs are documented here. Format follows
   grew quadratically (81 s at 4,000 tables, now under half a second).
 - ZIP-based inputs (`.xlsx`, `.ods`, `.xlsb`, `.npz`) read Zip64
   archives, e.g. an `.npz` with more than 65,535 arrays.
+- gzip/zstd input with no telling extension (an extensionless file, or
+  data piped to `-`) is recognized by its magic bytes and decompressed,
+  instead of reaching the readers still compressed.
+
+### Added (compressed input)
+- `sniff-rs diff` accepts `-` for one side (stdin), with `--format` for
+  that side when its format can't be sniffed.
 
 ### Added
 - `rank` gains three graph measures per table: `reference_rank`

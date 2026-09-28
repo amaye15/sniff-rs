@@ -68044,54 +68044,60 @@ fn detect_format(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    match ext.as_str() {
-        "csv" => Ok(InputFormat::Csv),
-        "tsv" => Ok(InputFormat::Tsv),
-        "json" | "jsonl" | "ndjson" => Ok(InputFormat::Json),
-        "parquet" | "pqt" => Ok(InputFormat::Parquet),
-        "arrow" | "feather" => Ok(InputFormat::ArrowIpc),
-        "avro" => Ok(InputFormat::Avro),
-        "xlsx" | "xls" | "xlsb" | "ods" => Ok(InputFormat::Xlsx),
-        "db" | "sqlite" | "sqlite3" => Ok(InputFormat::Sqlite),
-        "msgpack" | "mp" => Ok(InputFormat::MsgPack),
-        "toml" => Ok(InputFormat::Toml),
-        "yaml" | "yml" => Ok(InputFormat::Yaml),
-        "cbor" => Ok(InputFormat::Cbor),
-        "ini" => Ok(InputFormat::Ini),
-        "xml" => Ok(InputFormat::Xml),
-        "npy" => Ok(InputFormat::Npy),
-        "npz" => Ok(InputFormat::Npz),
-        "dbf" => Ok(InputFormat::Dbase),
-        "dta" => Ok(InputFormat::Stata),
-        "sas7bdat" => Ok(InputFormat::Sas7bdat),
-        "sav" | "zsav" => Ok(InputFormat::Spss),
-        "orc" => Ok(InputFormat::Orc),
-        "bson" => Ok(InputFormat::Bson),
-        "plist" => Ok(InputFormat::Plist),
-        "json5" | "jsonc" => Ok(InputFormat::Json5),
-        "har" => Ok(InputFormat::Har),
-        "geojson" => Ok(InputFormat::GeoJson),
-        "mbox" => Ok(InputFormat::Mbox),
-        "vcf" => Ok(InputFormat::Vcard),
-        "ics" => Ok(InputFormat::Ical),
-        "ipynb" => Ok(InputFormat::Ipynb),
-        "pdf" => Ok(InputFormat::Pdf),
-        // The extension alone doesn't tell us - either there isn't one, or
-        // it's not one of the above. Before giving up, try the file's own
-        // bytes: fixed-width text and the four log formats have no magic
-        // number or delimiter to sniff either (that's exactly why they're
-        // --format-only above too), so a real hit here can only be one of
-        // sniff_format's magic-backed formats.
-        other => {
-            if let Some(format) = sniff_format(read_path) {
-                return Ok(format);
-            }
-            bail!(
-                "can't infer format from extension '.{other}' - pass --format {} explicitly (run `sniff-rs --list-formats` for the full, per-build list)",
-                format_names_piped()
-            )
-        }
+    if let Some(format) = format_from_extension(&ext) {
+        return Ok(format);
     }
+    // The extension alone doesn't tell us - either there isn't one, or
+    // it's not a recognized one. Before giving up, try the file's own
+    // bytes: fixed-width text and the four log formats have no magic
+    // number or delimiter to sniff either (that's exactly why they're
+    // --format-only above too), so a real hit here can only be one of
+    // sniff_format's magic-backed formats.
+    if let Some(format) = sniff_format(read_path) {
+        return Ok(format);
+    }
+    bail!(
+        "can't infer format from extension '.{ext}' - pass --format {} explicitly (run `sniff-rs --list-formats` for the full, per-build list)",
+        format_names_piped()
+    )
+}
+
+/// The data format a (lowercased, dot-less) file extension names, if any.
+fn format_from_extension(ext: &str) -> Option<InputFormat> {
+    Some(match ext {
+        "csv" => InputFormat::Csv,
+        "tsv" => InputFormat::Tsv,
+        "json" | "jsonl" | "ndjson" => InputFormat::Json,
+        "parquet" | "pqt" => InputFormat::Parquet,
+        "arrow" | "feather" => InputFormat::ArrowIpc,
+        "avro" => InputFormat::Avro,
+        "xlsx" | "xls" | "xlsb" | "ods" => InputFormat::Xlsx,
+        "db" | "sqlite" | "sqlite3" => InputFormat::Sqlite,
+        "msgpack" | "mp" => InputFormat::MsgPack,
+        "toml" => InputFormat::Toml,
+        "yaml" | "yml" => InputFormat::Yaml,
+        "cbor" => InputFormat::Cbor,
+        "ini" => InputFormat::Ini,
+        "xml" => InputFormat::Xml,
+        "npy" => InputFormat::Npy,
+        "npz" => InputFormat::Npz,
+        "dbf" => InputFormat::Dbase,
+        "dta" => InputFormat::Stata,
+        "sas7bdat" => InputFormat::Sas7bdat,
+        "sav" | "zsav" => InputFormat::Spss,
+        "orc" => InputFormat::Orc,
+        "bson" => InputFormat::Bson,
+        "plist" => InputFormat::Plist,
+        "json5" | "jsonc" => InputFormat::Json5,
+        "har" => InputFormat::Har,
+        "geojson" => InputFormat::GeoJson,
+        "mbox" => InputFormat::Mbox,
+        "vcf" => InputFormat::Vcard,
+        "ics" => InputFormat::Ical,
+        "ipynb" => InputFormat::Ipynb,
+        "pdf" => InputFormat::Pdf,
+        _ => return None,
+    })
 }
 
 // --- Shared profiling step (format-agnostic) ---
@@ -80373,6 +80379,42 @@ fn compression_from_extension(path: &Path) -> Option<Compression> {
     }
 }
 
+/// Compression recognized from a file's own leading bytes, for input whose
+/// name says nothing (no extension, an unrecognized one, or piped stdin).
+/// A recognized *data-format* extension is never second-guessed - MessagePack
+/// and CBOR streams can legally start with these same bytes - so this only
+/// runs when `format_from_extension` has no answer either. gzip needs its
+/// full 3-byte ID1/ID2/CM=deflate header (RFC 1952 2.3.1); zstd its 4-byte
+/// frame magic (RFC 8878 3.1.1). Skippable zstd frames aren't sniffed.
+fn compression_from_magic(path: &Path) -> Option<Compression> {
+    use std::io::Read;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if format_from_extension(&ext).is_some() {
+        return None;
+    }
+    let mut head = [0u8; 4];
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut n = 0;
+    while n < head.len() {
+        match file.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(_) => return None,
+        }
+    }
+    if n >= 3 && head[..3] == [0x1F, 0x8B, 0x08] {
+        Some(Compression::Gzip)
+    } else if n == 4 && head == [0x28, 0xB5, 0x2F, 0xFD] {
+        Some(Compression::Zstd)
+    } else {
+        None
+    }
+}
+
 #[cfg(feature = "zstd")]
 fn decompress_zstd(input: std::fs::File, out: &mut dyn std::io::Write, path: &Path) -> Result<()> {
     zstd_support::zstd_decompress_to(input, out)
@@ -80481,15 +80523,11 @@ impl Drop for TempFile {
 /// through unchanged, with no guard and no stdin read at all - the
 /// overwhelmingly common (real file) case pays nothing.
 ///
-/// A real, disclosed scope boundary: unlike a real file path, a literal
-/// `-` carries no extension for `compression_from_extension` to key off,
-/// so a gzip/zstd-compressed stream piped this way is *not* auto-
-/// decompressed - the same `gunzip -c foo.csv.gz | sniff-rs -` shell-
-/// pipeline workaround this tool already needs for any other
-/// extensionless compressed input. `sniff-rs diff`'s own two-input
-/// grammar doesn't get this treatment either (its own separate
-/// `load_diff_input`) - out of scope for now, disclosed rather than
-/// silently unsupported.
+/// A gzip/zstd-compressed stream piped this way is still decompressed:
+/// the buffered temp file has no compression extension, so
+/// `decompress_if_needed` recognizes it by its own magic bytes
+/// (`compression_from_magic`). `sniff-rs diff` accepts `-` for one of its
+/// two inputs through this same function.
 fn resolve_stdin_input(input_path: &Path) -> Result<(PathBuf, Option<TempFile>)> {
     if input_path != Path::new("-") {
         return Ok((input_path.to_path_buf(), None));
@@ -80521,7 +80559,8 @@ mod stdin_input_tests {
     }
 }
 
-/// If `path` ends in `.gz`/`.gzip` or `.zst`/`.zstd`, decompresses it into a
+/// If `path` ends in `.gz`/`.gzip` or `.zst`/`.zstd` - or has no recognized
+/// extension but starts with a gzip/zstd magic number - decompresses it into a
 /// real temporary file and returns (the path to actually read bytes from,
 /// the compression-stripped logical path used for format detection and
 /// default output naming, a guard that deletes the temp file on drop).
@@ -80529,8 +80568,16 @@ mod stdin_input_tests {
 fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFile>)> {
     use std::fs::File;
 
-    let Some(compression) = compression_from_extension(path) else {
-        return Ok((path.to_path_buf(), path.to_path_buf(), None));
+    let (compression, logical_path) = match compression_from_extension(path) {
+        Some(c) => (c, path.with_extension("")),
+        None => match compression_from_magic(path) {
+            // A sniffed stream keeps its own name: it had no compression
+            // extension to strip, and format detection then sniffs the
+            // decompressed bytes the same way it would an extensionless
+            // plain file.
+            Some(c) => (c, path.to_path_buf()),
+            None => return Ok((path.to_path_buf(), path.to_path_buf(), None)),
+        },
     };
 
     let input = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
@@ -80558,7 +80605,6 @@ fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFil
         }
     }
 
-    let logical_path = path.with_extension("");
     Ok((tmp.path().to_path_buf(), logical_path, Some(tmp)))
 }
 
@@ -83232,7 +83278,15 @@ fn profile_raw_file_as_diff_columns(
 /// was a real bug caught before this shipped, not a hypothetical one:
 /// a `.json.gz` dictionary would otherwise fail to parse as JSON at all,
 /// since its own raw bytes are still gzip-compressed binary.
-fn load_diff_input(path: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
+///
+/// `-` reads that side from stdin (buffered to a temporary file, like a
+/// single-file run's own `-`); `stdin_format` is `diff --format`, which
+/// applies to that side only, since stdin has no name to detect from.
+fn load_diff_input(
+    path: &Path,
+    stdin_format: &Option<String>,
+) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
+    let is_stdin = path == Path::new("-");
     if path.is_dir() {
         bail!(
             "{path:?} is a directory - `sniff-rs diff` compares two files. To compare two \
@@ -83240,8 +83294,13 @@ fn load_diff_input(path: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
              <out.json>` on each one first, then diff the two resulting files"
         );
     }
-    let (read_path, logical_path, _decompressed_tmp) = decompress_if_needed(path)?;
-    let format = detect_format(&read_path, &logical_path, &None)?;
+    let (stdin_path, _stdin_tmp) = resolve_stdin_input(path)?;
+    let (read_path, mut logical_path, _decompressed_tmp) = decompress_if_needed(&stdin_path)?;
+    let override_fmt = if is_stdin { stdin_format.clone() } else { None };
+    if is_stdin {
+        logical_path = PathBuf::from("stdin");
+    }
+    let format = detect_format(&read_path, &logical_path, &override_fmt)?;
     if matches!(format, InputFormat::Json)
         && let Some(tables) = try_load_dictionary_tables(path, &read_path)?
     {
@@ -84660,6 +84719,8 @@ USAGE:
     live data file - works too. A raw file needing --nrows/--delimiter/
     --format control should be pre-profiled explicitly with those flags
     first; hand the resulting --output-format json file to diff instead.
+    One side may be "-" to read it from stdin (gzip/zstd recognized by
+    content); pass --format if its format can't be sniffed (e.g. CSV).
 
 ARGS:
     <OLD>                   The earlier dictionary or data file
@@ -84680,6 +84741,9 @@ OPTIONS:
                                 is named in a leading comment instead,
                                 never guessed at. Nothing here is ever
                                 applied automatically.
+        --format <FMT>          Format of the "-" (stdin) input, when its
+                                content can't be sniffed (csv, tsv, toml,
+                                yaml, ini, ...)
     -h, --help                  Print this help
 "#;
 
@@ -84696,6 +84760,7 @@ struct DiffArgs {
     output_format: String,
     fail_on_breaking: bool,
     resolution_sql: Option<PathBuf>,
+    format: Option<String>,
 }
 
 enum DiffOutputFormat {
@@ -84720,6 +84785,7 @@ impl DiffArgs {
         let mut output_format = "md".to_string();
         let mut fail_on_breaking = false;
         let mut resolution_sql: Option<PathBuf> = None;
+        let mut format: Option<String> = None;
         let mut positionals: Vec<String> = Vec::new();
 
         let mut i = 0;
@@ -84747,12 +84813,16 @@ impl DiffArgs {
                     "output-format" => output_format = value(&mut i)?,
                     "fail-on-breaking" => fail_on_breaking = true,
                     "resolution-sql" => resolution_sql = Some(PathBuf::from(value(&mut i)?)),
+                    "format" => format = Some(value(&mut i)?),
                     other => bail!("unrecognized flag --{other}"),
                 }
             } else {
                 positionals.push(arg.to_string());
             }
             i += 1;
+        }
+        if positionals.iter().take(2).filter(|p| *p == "-").count() > 1 {
+            bail!("only one of <OLD>/<NEW> can be \"-\" (stdin)");
         }
 
         let mut positionals = positionals.into_iter();
@@ -84774,6 +84844,7 @@ impl DiffArgs {
             output_format,
             fail_on_breaking,
             resolution_sql,
+            format,
         })
     }
 }
@@ -84782,8 +84853,11 @@ fn run_diff(raw: &[String]) -> Result<()> {
     let args = DiffArgs::parse_from(raw)?;
     let output_format = DiffOutputFormat::parse(&args.output_format)?;
 
-    let old_tables = load_diff_input(&args.old_path)?;
-    let new_tables = load_diff_input(&args.new_path)?;
+    if args.format.is_some() && args.old_path != Path::new("-") && args.new_path != Path::new("-") {
+        bail!("`diff --format` applies only to a \"-\" (stdin) input, and neither side is one");
+    }
+    let old_tables = load_diff_input(&args.old_path, &args.format)?;
+    let new_tables = load_diff_input(&args.new_path, &args.format)?;
     let report = diff_dictionaries(&old_tables, &new_tables);
 
     let rendered = match output_format {

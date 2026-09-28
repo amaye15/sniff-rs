@@ -243,16 +243,24 @@ already stated above: no delimiter or magic number distinguishes them from
 generic text at all, which is exactly why they're `--format`-only in the
 first place, not a gap specific to sniffing.
 
-One further, explicitly out-of-scope case: an extensionless file that's
-*also* gzip- or zstd-compressed. `compression_from_extension` (feeding
-`decompress_if_needed`) is still purely extension-based (`.gz`/`.gzip`/
-`.zst`/`.zstd`) and runs *before* format detection, so a compressed file
-with no extension at all skips decompression entirely and `sniff_format`
-sees raw compressed bytes it has no signature for — a clear `--format`-
-demanding error, not a silent misdetection, but not an automatic pass
-either. Extending sniffing to compression itself was considered and set
-aside as a separate concern from identifying the *inner* data format, the
-thing this feature was actually asked to solve.
+Compression is sniffed too, for input whose name doesn't settle it: when
+a file has neither a compression extension nor a recognized data-format
+extension (no extension, an unknown one, or piped stdin),
+`compression_from_magic` checks its first bytes for gzip's `1F 8B 08`
+(ID1/ID2/CM=deflate) or zstd's `28 B5 2F FD` frame magic and
+`decompress_if_needed` decompresses it before format detection runs, so
+the inner format is then sniffed (or taken from `--format`) as usual. The
+logical name is left unchanged, since there's no extension to strip. A
+recognized data-format extension is never second-guessed - a MessagePack
+or CBOR stream can legally begin with these same bytes. This used to be a
+disclosed gap (extensionless or piped compressed input reached the
+readers still compressed); `gunzip -c ... | sniff-rs -` is no longer
+needed. `sniff-rs diff` accepts `-` for one of its two inputs through the
+same path, with `diff --format` naming that side's format when it can't
+be sniffed (it's rejected when neither side is `-`, and both sides can't
+be `-`). Tested by `edge_gzip_no_extension` (needs `--format csv`),
+`edge_gzip_json_no_extension` (no flags), piped gzip on stdin, and
+`diff` with one stdin side.
 
 Tested at two levels, the same split this project uses for every other
 heuristic: `sniff_format` itself has direct unit tests in `lib.rs`'s
