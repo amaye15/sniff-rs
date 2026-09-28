@@ -17,11 +17,9 @@ All notable changes to sniff-rs are documented here. Format follows
   data piped to `-`) is recognized by its magic bytes and decompressed,
   instead of reaching the readers still compressed.
 
-### Added (compressed input)
+### Added
 - `sniff-rs diff` accepts `-` for one side (stdin), with `--format` for
   that side when its format can't be sniffed.
-
-### Added
 - `rank` gains three graph measures per table: `reference_rank`
   (weighted PageRank along references, 1.0 = average - high for the
   tables everything ultimately points at), `area` (a Louvain modularity
