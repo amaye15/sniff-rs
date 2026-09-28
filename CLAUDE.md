@@ -103,7 +103,7 @@ full, honest numbers.
 | ORC | `.orc` | `--features orc` | one section per top-level column; a nested Struct/List/Map/Union column is a disclosed placeholder (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
 | BSON | `.bson` | `--features bson` | stream of concatenated top-level documents (MongoDB's own on-disk/dump convention); always object-at-top-level, so there's no scalar/array top-level fallback the way MessagePack/CBOR need |
 | Property List (plist) | `.plist` | `--features plist` | both the XML and binary (`bplist00`) variants; a top-level `<dict>`/binary-plist root dict = one row, a top-level `<array>`/binary-plist root array = array-of-records, same dual-mode convention as YAML/TOML |
-| JSON5 / JSONC | `.json5`, `.jsonc` | `--features json5` | a deliberately independent, more narrowly-scoped relaxed-JSON parser (comments, trailing commas, unquoted object keys, single-quoted strings only - not the full JSON5 grammar); a whole document, same dual-mode convention as plain JSON |
+| JSON5 / JSONC | `.json5`, `.jsonc` | `--features json5` | a deliberately independent relaxed-JSON parser implementing the full JSON5 1.0.0 grammar; a whole document, same dual-mode convention as plain JSON |
 | HAR (HTTP Archive) | `.har` | `--features har` | plain JSON with a fixed top-level shape (HAR 1.2); `log.entries` is the natural records array, each entry's own nested `request`/`response`/`timings` objects flatten like any other nested JSON object |
 | GeoJSON | `.geojson` | `--features geojson` | plain JSON with a fixed top-level shape (RFC 7946); a `FeatureCollection`'s `features` array is the natural records array, one `Feature` or a bare `Geometry` profiles as a single record; each feature's own geometry renders as WKT text, which this tool's own coordinate/WKT heuristics then recognize automatically |
 | vCard | `.vcf` | `--features vcard` | one record per `BEGIN:VCARD`/`END:VCARD` block (RFC 6350); a repeated property (multiple `EMAIL`/`TEL` lines) pools into an array column, the same convention this tool's INI reader already uses for a repeated key |
@@ -5396,13 +5396,20 @@ flattener**, rather than reimplementing recursion per format:
   below); loosening its grammar in place to accept comments/trailing
   commas/unquoted keys would risk every one of its other callers
   silently accepting input they were never meant to, for a relaxation
-  only this one format ever asked for. `json5_support` is deliberately
-  scoped to exactly four relaxations - comments (`//` and `/* */`),
-  trailing commas, unquoted object keys, and single-quoted strings - not
-  the complete JSON5 grammar (real JSON5 also permits leading `+`/bare
-  leading-or-trailing `.`/hex integers/`Infinity`/`NaN`, none of which
-  are implemented here), the same "confident common case, disclosed gap"
-  tradeoff `is_email`/`is_url` already make elsewhere in this project.
+  only this one format ever asked for. `json5_support` started scoped to
+  four relaxations - comments, trailing commas, unquoted keys, and
+  single-quoted strings - and a later pass completed the JSON5 1.0.0
+  grammar: signed/hex/leading-dot/trailing-dot numbers, `Infinity`/`NaN`
+  (kept as their literal text, the YAML `.inf` fallback, since a JSON
+  number can't hold them; a hex literal past `u64` errors rather than
+  rounding), `\x`/`\v`/`\0`/surrogate-pair `\u` escapes, any other
+  escaped character standing for itself, line continuations over
+  LF/CR/CRLF/LS/PS, ECMAScript identifier keys (Unicode letters and
+  `\uXXXX` escapes), and Unicode whitespace. Leading zeros (`01`) and
+  `\1`-`\9` escapes are rejected, as the spec says.
+  `edge_json5_full_grammar.json5` is cross-checked against the `json5`
+  crate (which itself can't parse a negative hex literal, so that case
+  is a unit test instead).
   `.jsonc` shares this exact same relaxed grammar rather than a second,
   narrower parser of its own - VS Code's own "JSON with comments"
   definition (comments and trailing commas, but not unquoted keys or

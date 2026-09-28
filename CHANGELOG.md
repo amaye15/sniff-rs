@@ -18,6 +18,9 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- JSON5 reads the full 1.0.0 grammar: hex, signed, and leading/trailing-dot
+  numbers, `Infinity`/`NaN`, `\x`/`\v`/`\0` escapes, Unicode identifier
+  keys, and Unicode whitespace.
 - YAML aliases (`*name`) and merge keys (`<<`) resolve, with an
   expansion cap against alias bombs; they used to be a parse error.
 - `sniff-rs diff` accepts `-` for one side (stdin), with `--format` for

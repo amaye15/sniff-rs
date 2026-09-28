@@ -1,0 +1,6 @@
+// Every JSON5 1.0.0 extension beyond comments/trailing commas/quoting.
+[
+  {id: 0x1F, ratio: .5, whole: 3., signed: +7, note: 'line one \
+continues', esc: "\x41é😀\v", café: 'unicode key', $ok: true,},
+  {id: 0x0A, ratio: 1.25e2, whole: 4., signed: -2, note: "tab\tend", esc: "plain", café: "x", $ok: false},
+]

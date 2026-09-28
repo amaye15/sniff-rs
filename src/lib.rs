@@ -49423,15 +49423,14 @@ fn columns_from_plist(
 // they're not supposed to, for a relaxation only this one format ever
 // wants. A second, separately-scoped parser has no such blast radius.
 //
-// Deliberately scoped to exactly the four relaxations this format was
-// actually asked for - comments, trailing commas, unquoted object keys,
-// and single-quoted strings - not the complete JSON5 grammar. Real
-// JSON5 also permits leading `+`/bare leading-or-trailing `.`/hex
-// integer literals/`Infinity`/`NaN` as numbers, more Unicode escape
-// forms in unquoted keys, and additional Unicode whitespace/line-
-// terminator characters; none of that is implemented here, the same
-// "confident common case, disclosed gap" tradeoff `is_email`/`is_url`
-// already make elsewhere in this project. `.jsonc` (VS Code's own
+// Implements the JSON5 1.0.0 grammar: comments, trailing commas,
+// ECMAScript identifier keys (Unicode letters, `\uXXXX` escapes),
+// single-quoted strings with the full escape set (`\x`, `\v`, `\0`,
+// line continuations over LF/CR/CRLF/LS/PS, surrogate-pair `\u`, any
+// other character escaping to itself), and numbers with a sign, hex,
+// a leading or trailing `.`, `Infinity`, and `NaN` (the last two kept
+// as their literal text, since a JSON number can't hold them), plus
+// Unicode whitespace. `.jsonc` (VS Code's own
 // "JSON with comments" convention - comments and trailing commas, but
 // not unquoted keys or single-quoted strings in its own stricter
 // definition) shares this exact same relaxed grammar rather than a
@@ -49471,6 +49470,21 @@ mod json5_support {
             self.bytes.get(self.pos).copied()
         }
 
+        fn peek_char(&self) -> Option<char> {
+            let end = (self.pos + 4).min(self.bytes.len());
+            (self.pos + 1..=end)
+                .find_map(|e| std::str::from_utf8(&self.bytes[self.pos..e]).ok())
+                .and_then(|s| s.chars().next())
+        }
+
+        /// U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR.
+        fn at_line_separator(&self) -> bool {
+            matches!(
+                self.bytes.get(self.pos..self.pos + 3),
+                Some([0xE2, 0x80, 0xA8 | 0xA9])
+            )
+        }
+
         fn error(&self, msg: &str) -> Error {
             anyhow!("{msg} at byte offset {}", self.pos)
         }
@@ -49483,11 +49497,25 @@ mod json5_support {
         fn skip_ws_and_comments(&mut self) -> Result<()> {
             loop {
                 match self.peek() {
-                    Some(b' ' | b'\t' | b'\n' | b'\r') => self.pos += 1,
+                    Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) => self.pos += 1,
+                    Some(0x80..) => {
+                        // JSON5's WhiteSpace also takes NBSP, the BOM,
+                        // the line/paragraph separators, and any other
+                        // Unicode Space_Separator (spec 1.0.0 §6).
+                        match self.peek_char() {
+                            Some(c) if c.is_whitespace() || c == '\u{FEFF}' => {
+                                self.pos += c.len_utf8()
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
                     Some(b'/') if self.bytes.get(self.pos + 1) == Some(&b'/') => {
                         self.pos += 2;
+                        // A comment ends at any LineTerminator (LF, CR,
+                        // LS, PS); stopping at LF alone was enough while
+                        // CR is plain whitespace, and LS/PS end it too.
                         while let Some(b) = self.peek() {
-                            if b == b'\n' {
+                            if b == b'\n' || b == b'\r' || self.at_line_separator() {
                                 break;
                             }
                             self.pos += 1;
@@ -49532,7 +49560,7 @@ mod json5_support {
                 Some(b't') => self.parse_literal("true", JsonValue::from(true)),
                 Some(b'f') => self.parse_literal("false", JsonValue::from(false)),
                 Some(b'n') => self.parse_literal("null", JsonValue::Null),
-                Some(b'-' | b'0'..=b'9') => self.parse_number(),
+                Some(b'-' | b'+' | b'.' | b'0'..=b'9' | b'I' | b'N') => self.parse_number(),
                 _ => Err(self.error("expected a value")),
             }
         }
@@ -49546,23 +49574,63 @@ mod json5_support {
             }
         }
 
-        /// Standard JSON number grammar only - deliberately not the
-        /// wider JSON5 grammar (no leading `+`, no hex, no bare leading/
-        /// trailing `.`, no `Infinity`/`NaN`), per this module's own
-        /// doc comment.
+        /// The full JSON5 number grammar (spec 1.0.0 §6): an optional `+`
+        /// or `-`; `Infinity`/`NaN`; hex (`0x1F`); and decimals with a
+        /// leading or trailing `.` (`.5`, `5.`). `Infinity`/`NaN` can't be a
+        /// JSON number, so they stay the literal text - the same fallback
+        /// the YAML reader uses for `.inf`/`.nan`. A hex literal too large
+        /// for `u64` is an error rather than a rounded float.
         fn parse_number(&mut self) -> Result<JsonValue> {
             let start = self.pos;
-            if self.peek() == Some(b'-') {
+            let negative = self.peek() == Some(b'-');
+            if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
-            let digits_start = self.pos;
+            for (lit, text) in [("Infinity", "Infinity"), ("NaN", "NaN")] {
+                if self.bytes[self.pos..].starts_with(lit.as_bytes()) {
+                    self.pos += lit.len();
+                    let text = if negative && text == "Infinity" {
+                        "-Infinity"
+                    } else {
+                        text
+                    };
+                    return Ok(JsonValue::String(text.to_string()));
+                }
+            }
+            if self.peek() == Some(b'0')
+                && matches!(self.bytes.get(self.pos + 1), Some(b'x' | b'X'))
+            {
+                self.pos += 2;
+                let hex_start = self.pos;
+                while matches!(self.peek(), Some(b) if b.is_ascii_hexdigit()) {
+                    self.pos += 1;
+                }
+                if self.pos == hex_start {
+                    return Err(self.error("expected a hex digit after 0x"));
+                }
+                let hex = std::str::from_utf8(&self.bytes[hex_start..self.pos]).unwrap();
+                let magnitude = u64::from_str_radix(hex, 16)
+                    .map_err(|_| self.error("hex literal too large"))?;
+                if !negative {
+                    return Ok(JsonValue::from(magnitude));
+                }
+                return i64::try_from(magnitude)
+                    .ok()
+                    .and_then(i64::checked_neg)
+                    .or((magnitude == 1u64 << 63).then_some(i64::MIN))
+                    .map(JsonValue::from)
+                    .ok_or_else(|| self.error("hex literal too large"));
+            }
+            let int_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
             }
-            if self.pos == digits_start {
-                return Err(self.error("expected a digit"));
+            let int_digits = self.pos - int_start;
+            if int_digits > 1 && self.bytes[int_start] == b'0' {
+                return Err(self.error("leading zeros aren't allowed"));
             }
             let mut is_float = false;
+            let mut frac_digits = 0;
             if self.peek() == Some(b'.') {
                 is_float = true;
                 self.pos += 1;
@@ -49570,9 +49638,10 @@ mod json5_support {
                 while matches!(self.peek(), Some(b'0'..=b'9')) {
                     self.pos += 1;
                 }
-                if self.pos == frac_start {
-                    return Err(self.error("expected a digit after '.'"));
-                }
+                frac_digits = self.pos - frac_start;
+            }
+            if int_digits == 0 && frac_digits == 0 {
+                return Err(self.error("expected a digit"));
             }
             if matches!(self.peek(), Some(b'e' | b'E')) {
                 is_float = true;
@@ -49588,7 +49657,12 @@ mod json5_support {
                     return Err(self.error("expected a digit in exponent"));
                 }
             }
-            let text = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap();
+            // Rust's parsers take neither a leading `+` nor a bare
+            // trailing `.`, so both are normalized away first.
+            let raw = std::str::from_utf8(&self.bytes[start..self.pos]).unwrap();
+            let unsigned = raw.strip_prefix('+').unwrap_or(raw);
+            let text = unsigned.replace(".e", ".0e").replace(".E", ".0E");
+            let text = text.strip_suffix('.').unwrap_or(&text);
             if !is_float {
                 if let Ok(i) = text.parse::<i64>() {
                     return Ok(JsonValue::from(i));
@@ -49658,28 +49732,51 @@ mod json5_support {
                                 out.push('\t');
                                 self.pos += 1;
                             }
+                            Some(b'v') => {
+                                out.push('\u{b}');
+                                self.pos += 1;
+                            }
+                            Some(b'0')
+                                if !matches!(self.bytes.get(self.pos + 1), Some(b'0'..=b'9')) =>
+                            {
+                                out.push('\0');
+                                self.pos += 1;
+                            }
+                            Some(b'1'..=b'9' | b'0') => {
+                                return Err(self
+                                    .error("a digit can't follow a backslash in a JSON5 string"));
+                            }
                             Some(b'\n') => {
                                 // Line continuation - the backslash and
                                 // the newline it escapes both vanish.
                                 self.pos += 1;
                             }
+                            Some(b'\r') => {
+                                self.pos += 1;
+                                if self.peek() == Some(b'\n') {
+                                    self.pos += 1;
+                                }
+                            }
+                            _ if self.at_line_separator() => self.pos += 3,
+                            Some(b'x') => {
+                                self.pos += 1;
+                                let cp = self.read_hex(2)?;
+                                out.push(char::from_u32(cp).unwrap());
+                            }
                             Some(b'u') => {
                                 self.pos += 1;
-                                let hex = self
-                                    .bytes
-                                    .get(self.pos..self.pos + 4)
-                                    .and_then(|b| std::str::from_utf8(b).ok())
-                                    .ok_or_else(|| self.error("truncated \\u escape"))?;
-                                let cp = u32::from_str_radix(hex, 16)
-                                    .map_err(|_| self.error("invalid \\u escape"))?;
-                                out.push(
-                                    char::from_u32(cp).ok_or_else(|| {
-                                        self.error("invalid \\u escape codepoint")
-                                    })?,
-                                );
-                                self.pos += 4;
+                                out.push(self.read_unicode_escape()?);
                             }
-                            _ => return Err(self.error("unrecognized escape sequence")),
+                            None => return Err(self.error("unterminated string")),
+                            Some(_) => {
+                                // Any other escaped character stands for
+                                // itself (JSON5's NonEscapeCharacter).
+                                let c = self
+                                    .peek_char()
+                                    .ok_or_else(|| self.error("invalid UTF-8"))?;
+                                out.push(c);
+                                self.pos += c.len_utf8();
+                            }
                         }
                     }
                     Some(_) => {
@@ -49704,24 +49801,82 @@ mod json5_support {
             }
         }
 
-        /// A bare identifier key - `[A-Za-z_$][A-Za-z0-9_$]*`, the
-        /// common-case subset of JSON5's real (Unicode-aware,
-        /// escape-supporting) `IdentifierName` grammar. A key outside
-        /// this subset still works fine quoted, the normal fallback for
-        /// every scoped-down heuristic in this project.
+        fn read_hex(&mut self, n: usize) -> Result<u32> {
+            let hex = self
+                .bytes
+                .get(self.pos..self.pos + n)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| self.error("invalid hex escape"))?;
+            self.pos += n;
+            Ok(u32::from_str_radix(hex, 16).unwrap())
+        }
+
+        /// The four hex digits after `\u`, joining a UTF-16 surrogate pair
+        /// (`\uD83D\uDE00`) into one character. A lone surrogate is an
+        /// error rather than a silent U+FFFD.
+        fn read_unicode_escape(&mut self) -> Result<char> {
+            let hi = self.read_hex(4)?;
+            if (0xD800..0xDC00).contains(&hi) {
+                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                    return Err(self.error("unpaired \\u surrogate"));
+                }
+                self.pos += 2;
+                let lo = self.read_hex(4)?;
+                if !(0xDC00..0xE000).contains(&lo) {
+                    return Err(self.error("unpaired \\u surrogate"));
+                }
+                let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                return Ok(char::from_u32(cp).unwrap());
+            }
+            char::from_u32(hi).ok_or_else(|| self.error("unpaired \\u surrogate"))
+        }
+
+        /// A bare identifier key - ECMAScript 5.1's IdentifierName, as
+        /// JSON5 specifies: a Unicode letter, `$`, `_`, or a `\uXXXX`
+        /// escape to start, then also digits, combining marks, and
+        /// ZWNJ/ZWJ. `char::is_alphabetic`/`is_alphanumeric` stand in for
+        /// the ID_Start/ID_Continue categories.
         fn parse_unquoted_key(&mut self) -> Result<String> {
-            let start = self.pos;
-            match self.peek() {
-                Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b'$' => self.pos += 1,
-                _ => return Err(self.error("expected an object key")),
+            let mut out = String::new();
+            loop {
+                let c = if self.peek() == Some(b'\\') {
+                    if self.bytes.get(self.pos + 1) != Some(&b'u') {
+                        return Err(self.error("expected \\u in an identifier escape"));
+                    }
+                    self.pos += 2;
+                    let c = self.read_unicode_escape()?;
+                    if !(c.is_alphanumeric() || c == '_' || c == '$') {
+                        return Err(self.error("escaped character isn't valid in an identifier"));
+                    }
+                    out.push(c);
+                    continue;
+                } else {
+                    match self.peek_char() {
+                        Some(c) => c,
+                        None => break,
+                    }
+                };
+                let ok = if out.is_empty() {
+                    c.is_alphabetic() || c == '_' || c == '$'
+                } else {
+                    c.is_alphanumeric()
+                        || c == '_'
+                        || c == '$'
+                        || c == '\u{200C}'
+                        || c == '\u{200D}'
+                        || is_combining_mark(c)
+                };
+                if !ok {
+                    break;
+                }
+                out.push(c);
+                self.pos += c.len_utf8();
             }
-            while matches!(self.peek(), Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
-            {
-                self.pos += 1;
+            if out.is_empty() {
+                return Err(self.error("expected an object key"));
             }
-            Ok(std::str::from_utf8(&self.bytes[start..self.pos])
-                .unwrap()
-                .to_string())
+            Ok(out)
         }
 
         fn parse_object(&mut self) -> Result<JsonValue> {
@@ -49806,6 +49961,13 @@ mod json5_support {
             self.depth -= 1;
             Ok(JsonValue::Array(items))
         }
+    }
+
+    /// Combining marks (Mn/Mc) commonly used in identifiers - the
+    /// general-purpose diacritic blocks; a rarer script-specific mark
+    /// outside them still works in a quoted key.
+    fn is_combining_mark(c: char) -> bool {
+        matches!(c as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
     }
 
     pub(crate) fn parse(s: &str) -> Result<JsonValue> {
@@ -49909,7 +50071,7 @@ mod json5_support {
         fn skip_ws_and_comments(&mut self) -> Result<()> {
             loop {
                 match self.peek()? {
-                    Some(b' ' | b'\t' | b'\n' | b'\r') => self.pos += 1,
+                    Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) => self.pos += 1,
                     Some(b'/') if self.peek_at(1)? == Some(b'/') => {
                         self.pos += 2;
                         while !matches!(self.peek()?, None | Some(b'\n')) {
@@ -50240,6 +50402,41 @@ mod json5_support {
                 Ok(())
             })?;
             Ok(out)
+        }
+
+        #[test]
+        fn parse_accepts_the_full_json5_number_and_string_grammar() {
+            let v = parse(
+                "{a: 0xFF, b: -0x10, c: .5, d: 5., e: +3, f: Infinity, g: -Infinity, h: NaN, \
+                 i: +.5e1, s: '\\x41\\v\\0\\q\\uD83D\\uDE00', t: 'a\\\r\nb', \u{2003}u\u{fb}: 1}",
+            )
+            .unwrap();
+            assert_eq!(v["a"], 255);
+            assert_eq!(v["b"], -16);
+            assert_eq!(v["c"], 0.5);
+            assert_eq!(v["d"], 5.0);
+            assert_eq!(v["e"], 3);
+            assert_eq!(v["f"], "Infinity");
+            assert_eq!(v["g"], "-Infinity");
+            assert_eq!(v["h"], "NaN");
+            assert_eq!(v["i"], 5.0);
+            assert_eq!(v["s"], "A\u{b}\0q\u{1F600}");
+            assert_eq!(v["t"], "ab");
+            assert_eq!(v["u\u{fb}"], 1);
+        }
+
+        #[test]
+        fn parse_rejects_what_json5_still_forbids() {
+            for bad in [
+                "{a: 01}",
+                "{a: .}",
+                "{a: 0x}",
+                "{a: '\\1'}",
+                "{a: '\\uD800'}",
+                "{1a: 1}",
+            ] {
+                assert!(parse(bad).is_err(), "{bad} should be rejected");
+            }
         }
 
         #[test]
@@ -97488,6 +97685,7 @@ mod tests {
             "tests/fixtures/sample.json5",
             "tests/fixtures/type_detection.json5",
             "tests/fixtures/sample.jsonc",
+            "tests/fixtures/edge_json5_full_grammar.json5",
         ] {
             let path = Path::new(f);
             let mine = json5_support::columns_from_json5(path, None, 100)
