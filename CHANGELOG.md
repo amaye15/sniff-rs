@@ -6,6 +6,14 @@ All notable changes to sniff-rs are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- Near-identical tables (same column names) now link as a star on the
+  first copy instead of every copy to every other: 1,000 same-schema
+  tables wrote 499,500 `duplicate_schema` relationships and JSON output
+  grew quadratically (81 s at 4,000 tables, now under half a second).
+- ZIP-based inputs (`.xlsx`, `.ods`, `.xlsb`, `.npz`) read Zip64
+  archives, e.g. an `.npz` with more than 65,535 arrays.
+
 ### Added
 - `rank` gains three graph measures per table: `reference_rank`
   (weighted PageRank along references, 1.0 = average - high for the

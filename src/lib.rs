@@ -69839,6 +69839,7 @@ fn join_candidate(
 /// names over the union. Both empty is defined as 0.0 (no columns, nothing
 /// in common), not 1.0 - vacuous similarity would flag every pair of
 /// zero-column tables as duplicates of each other.
+#[cfg(test)]
 fn table_name_similarity(a: &[ColumnProfile], b: &[ColumnProfile]) -> f64 {
     use std::collections::HashSet;
     let set_a: HashSet<String> = a.iter().map(|c| canon_name(&c.name)).collect();
@@ -69861,26 +69862,113 @@ const DUPLICATE_SCHEMA_SIMILARITY: f64 = 0.8;
 /// same domain, genuinely different tables.
 const OVERLAP_REPORT_SIMILARITY: f64 = 0.5;
 
+/// One `similar_tables` row: table A, table B, their column-name Jaccard
+/// similarity, and whether it clears the duplicate bar.
+type SimilarPair = (String, String, f64, bool);
+
 /// Every table pair at or above `OVERLAP_REPORT_SIMILARITY`, sorted by
 /// similarity descending (ties by table names): the raw material for
 /// rank's own "similar tables" section. Each entry also says whether the
 /// pair clears the duplicate bar, so callers never recompute it.
+///
+/// Near-copies are reported as a star, not a clique: tables with the same
+/// column-name set are one schema class, each copy is paired only with
+/// its class's first table, and two classes are compared once, through
+/// their first tables. A folder of 1,000 same-schema files yields 999
+/// pairs rather than 499,500.
 fn similar_tables(
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
 ) -> Vec<(String, String, f64, bool)> {
+    schema_similarity(tables).0
+}
+
+/// `similar_tables` plus the duplicate-schema groups behind it: each
+/// table in a group of two or more near-copies (similarity at or above
+/// `DUPLICATE_SCHEMA_SIMILARITY`, joined transitively) maps to its
+/// group's anchor, the group's first table by name. Relationship
+/// detection links each copy to the anchor only.
+fn schema_similarity(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+) -> (Vec<SimilarPair>, HashMap<String, String>) {
     let names: Vec<&String> = tables.keys().collect();
+    // One class per distinct column-name set, members in name order.
+    let mut class_of: BTreeMap<std::collections::BTreeSet<String>, Vec<usize>> = BTreeMap::new();
+    for (i, name) in names.iter().enumerate() {
+        let set: std::collections::BTreeSet<String> =
+            tables[*name].iter().map(|c| canon_name(&c.name)).collect();
+        class_of.entry(set).or_default().push(i);
+    }
+    let mut classes: Vec<(std::collections::BTreeSet<String>, Vec<usize>)> =
+        class_of.into_iter().collect();
+    classes.sort_by_key(|(_, members)| members[0]);
     let mut pairs = Vec::new();
-    for (i, t1) in names.iter().enumerate() {
-        for t2 in &names[i + 1..] {
-            let sim = table_name_similarity(&tables[*t1], &tables[*t2]);
-            if sim >= OVERLAP_REPORT_SIMILARITY {
-                pairs.push((
-                    (*t1).clone(),
-                    (*t2).clone(),
-                    (sim * 1000.0).round() / 1000.0,
-                    sim >= DUPLICATE_SCHEMA_SIMILARITY,
-                ));
+    // Union-find over classes, for the transitive duplicate groups.
+    let mut parent: Vec<usize> = (0..classes.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for (ci, (set, members)) in classes.iter().enumerate() {
+        // An empty column set is never a duplicate of anything
+        // (`table_name_similarity` scores it 0.0).
+        if set.is_empty() {
+            continue;
+        }
+        for &m in &members[1..] {
+            pairs.push((names[members[0]].clone(), names[m].clone(), 1.0, true));
+        }
+        for (cj, (other, other_members)) in classes.iter().enumerate().skip(ci + 1) {
+            if other.is_empty() {
+                continue;
             }
+            let (small, large) = if set.len() <= other.len() {
+                (set.len(), other.len())
+            } else {
+                (other.len(), set.len())
+            };
+            // Jaccard can't reach the reporting bar when one set is less
+            // than half the other.
+            if (small as f64) < OVERLAP_REPORT_SIMILARITY * large as f64 {
+                continue;
+            }
+            let shared = set.intersection(other).count() as f64;
+            let sim = shared / (set.len() as f64 + other.len() as f64 - shared);
+            if sim >= OVERLAP_REPORT_SIMILARITY {
+                let duplicate = sim >= DUPLICATE_SCHEMA_SIMILARITY;
+                pairs.push((
+                    names[members[0]].clone(),
+                    names[other_members[0]].clone(),
+                    (sim * 1000.0).round() / 1000.0,
+                    duplicate,
+                ));
+                if duplicate {
+                    let (a, b) = (find(&mut parent, ci), find(&mut parent, cj));
+                    if a != b {
+                        parent[a.max(b)] = a.min(b);
+                    }
+                }
+            }
+        }
+    }
+    let mut group_members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (ci, (set, members)) in classes.iter().enumerate() {
+        if set.is_empty() {
+            continue;
+        }
+        let root = find(&mut parent, ci);
+        group_members.entry(root).or_default().extend(members);
+    }
+    let mut anchors = HashMap::new();
+    for members in group_members.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let anchor = names[*members.iter().min().expect("non-empty")].clone();
+        for &m in members {
+            anchors.insert(names[m].clone(), anchor.clone());
         }
     }
     pairs.sort_by(|a, b| {
@@ -69889,7 +69977,7 @@ fn similar_tables(
             .then_with(|| a.0.cmp(&b.0))
             .then_with(|| a.1.cmp(&b.1))
     });
-    pairs
+    (pairs, anchors)
 }
 
 /// The minimum estimated share of a column's distinct values that must be
@@ -70275,33 +70363,66 @@ fn detect_relationships_scored(
     keep_all: bool,
 ) -> Vec<Relationship> {
     let tables_vec: Vec<(&String, &Vec<ColumnProfile>)> = tables.iter().collect();
-    // Table pairs at the duplicate bar, resolved once up front: every edge
-    // between them is tagged `DuplicateSchema` below, so a ranking over
-    // incident edges can tell repetition apart from importance.
-    let mut duplicate_pairs: HashSet<(String, String)> = HashSet::new();
-    for (t1, t2, _, duplicate) in similar_tables(tables) {
-        if duplicate {
-            duplicate_pairs.insert((t1, t2));
+    // Duplicate-schema groups, resolved once up front: every edge inside a
+    // group is tagged `DuplicateSchema` below, so a ranking over incident
+    // edges can tell repetition apart from importance. Inside a group only
+    // the anchor links to each copy - a star, not a clique - so N copies of
+    // one schema cost N-1 table pairs of edges instead of N(N-1)/2.
+    let (_, anchors) = schema_similarity(tables);
+    let idx = LinkIndex::build(tables);
+    // Tables grouped by anchor (a table outside every group is its own
+    // group of one), in name order. Pairs are then enumerated per group
+    // pair, so a group's copies are never even visited against each other.
+    let position: HashMap<&String, usize> = tables_vec
+        .iter()
+        .enumerate()
+        .map(|(i, (t, _))| (*t, i))
+        .collect();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of_anchor: HashMap<usize, usize> = HashMap::new();
+    for (i, (t, _)) in tables_vec.iter().enumerate() {
+        match anchors.get(*t) {
+            Some(anchor) => {
+                let a = position[anchor];
+                let g = *group_of_anchor.entry(a).or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+                groups[g].push(i);
+            }
+            None => groups.push(vec![i]),
         }
     }
-    let idx = LinkIndex::build(tables);
     let mut out = Vec::new();
-    for (i, (t1, cols1)) in tables_vec.iter().enumerate() {
-        for (t2, cols2) in &tables_vec[i + 1..] {
-            let duplicate = duplicate_pairs.contains(&((*t1).clone(), (*t2).clone()));
-            for c1 in cols1.iter() {
-                for c2 in cols2.iter() {
-                    let found = join_candidate(t1, c1, t2, c2, duplicate, &idx).or_else(|| {
-                        (!duplicate)
-                            .then(|| value_candidate(t1, c1, t2, c2, &idx))
-                            .flatten()
-                    });
-                    if let Some(mut rel) = found {
-                        if duplicate {
-                            rel.context = EdgeContext::DuplicateSchema;
-                        }
-                        out.push(rel);
+    let link = |i: usize, j: usize, duplicate: bool, out: &mut Vec<Relationship>| {
+        let (i, j) = if i < j { (i, j) } else { (j, i) };
+        let (t1, cols1) = tables_vec[i];
+        let (t2, cols2) = tables_vec[j];
+        for c1 in cols1.iter() {
+            for c2 in cols2.iter() {
+                let found = join_candidate(t1, c1, t2, c2, duplicate, &idx).or_else(|| {
+                    (!duplicate)
+                        .then(|| value_candidate(t1, c1, t2, c2, &idx))
+                        .flatten()
+                });
+                if let Some(mut rel) = found {
+                    if duplicate {
+                        rel.context = EdgeContext::DuplicateSchema;
                     }
+                    out.push(rel);
+                }
+            }
+        }
+    };
+    for (gi, group) in groups.iter().enumerate() {
+        // Inside a group: the anchor (its first table) to each copy.
+        for &m in &group[1..] {
+            link(group[0], m, true, &mut out);
+        }
+        for other in &groups[gi + 1..] {
+            for &a in group {
+                for &b in other {
+                    link(a, b, false, &mut out);
                 }
             }
         }
@@ -74335,9 +74456,7 @@ mod zip_support {
         compressed: &mut u64,
         offset: &mut u64,
     ) -> Result<()> {
-        let needs = [*uncompressed, *compressed, *offset]
-            .iter()
-            .any(|v| *v == 0xFFFF_FFFF);
+        let needs = [*uncompressed, *compressed, *offset].contains(&0xFFFF_FFFF);
         if !needs {
             return Ok(());
         }
@@ -100671,14 +100790,16 @@ mod tests {
             ),
         ]);
         let pairs = similar_tables(&tables);
-        // v1/v2 identical (1.0, duplicate); each shares 2 of 3 names with
-        // other (0.667, overlapping); sorted by similarity.
-        assert_eq!(pairs.len(), 3);
+        // v1/v2 identical (1.0, duplicate); their schema shares 2 of 3
+        // names with other (0.667, overlapping) - reported once, through
+        // v1, the schema's first table. Sorted by similarity.
+        assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "v1");
         assert_eq!(pairs[0].1, "v2");
         assert_eq!(pairs[0].2, 1.0);
         assert!(pairs[0].3);
-        assert!(!pairs[1].3 && !pairs[2].3);
+        assert_eq!((pairs[1].0.as_str(), pairs[1].1.as_str()), ("other", "v1"));
+        assert!(!pairs[1].3);
     }
 
     #[test]
@@ -101295,6 +101416,38 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_schema_copies_link_as_a_star_not_a_clique() {
+        // 200 copies of one two-column schema: every copy links to the
+        // first by name only. A clique would be 19,900 table pairs.
+        let owned: Vec<(String, Vec<ColumnProfile>)> = (0..200)
+            .map(|i| {
+                (
+                    format!("t{i:03}"),
+                    vec![
+                        rel_col("doc_id", "i64", &["1", "2"]),
+                        rel_col("text", "String", &["x"]),
+                    ],
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, Vec<ColumnProfile>)> =
+            owned.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+        let tables = rel_tables(&refs);
+        let edges = detect_relationships(&tables);
+        assert!(!edges.is_empty());
+        assert!(edges.iter().all(|e| e.from_table == "t000"));
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.context == EdgeContext::DuplicateSchema)
+        );
+        let partners: std::collections::BTreeSet<&str> =
+            edges.iter().map(|e| e.to_table.as_str()).collect();
+        assert_eq!(partners.len(), 199);
+        assert_eq!(similar_tables(&tables).len(), 199);
+    }
+
+    #[test]
     fn relationships_output_order_is_deterministic() {
         // From/to assignment follows (table, column) sort order, and the
         // edge list itself is sorted, so profiling order cannot leak into
@@ -101305,7 +101458,10 @@ mod tests {
             ("mid", vec![rel_col("id", "i64", &["1"])]),
         ]);
         let edges = detect_relationships(&tables);
-        assert_eq!(edges.len(), 3);
+        // Three copies of one schema form a star on the first by name:
+        // alpha-mid and alpha-zeta, never mid-zeta.
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.from_table == "alpha"));
         let keys: Vec<(&str, &str, &str, &str)> = edges
             .iter()
             .map(|e| {

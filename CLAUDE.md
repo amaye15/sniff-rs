@@ -3930,6 +3930,36 @@ of per row. At 3,000 synthetic tables `rank` takes ~25 s, almost all of
 it relationship detection itself (`explain` alone ~21 s) - a
 pre-existing scaling cost, not these measures.
 
+**Near-copies link as a star, not a clique.** Duplicate-schema detection
+used to compare every table pair and link every pair of copies, so N
+copies of one schema cost N(N-1)/2 table pairs of edges: an `.npz` with
+1,000 same-shape arrays wrote 499,500 `duplicate_schema` relationships,
+and JSON output took 3.8 s at 1,000 tables, 15 s at 2,000, and 81 s at
+4,000 while Markdown (no relationships) stayed under half a second.
+`schema_similarity` now groups tables by their exact canonical
+column-name set first, compares distinct schemas once through each
+class's first table (with the same size prefilter the knowledge graph's
+schema grouping uses), and joins duplicate classes transitively into
+groups whose anchor is the group's first table by name. Relationship
+detection enumerates pairs per group: the anchor links to each copy,
+copies are never compared with each other, and every other pair is
+visited as before. `similar_tables` reports the same star (one row per
+copy, one row per pair of distinct schemas). The anchor keeps every
+duplicate-schema link, so `explain`/`rank` read exactly as before for
+it; a non-anchor copy now shows one duplicate-schema neighbor (the
+anchor) instead of every other copy, and `path` between two copies
+takes two hops through the anchor. Measured: 4,000 same-schema tables
+81 s -> 0.48 s; 80,000 (an 80,000-array `.npz`, which also needed
+Zip64) 1.4 s of CPU. All 484 fixtures produce byte-identical JSON
+against the previous build; a `--combine` over
+`tests/fixtures/edge_batch_directory` goes from 63 relationships to 36,
+the difference being copy-to-copy links. Two unit tests that asserted
+the clique now assert the star, and
+`duplicate_schema_copies_link_as_a_star_not_a_clique` (200 copies, 199
+partners, all from `t000`) locks it in. A folder of genuinely distinct
+schemas is still compared pairwise - that cost is real work, not
+repetition.
+
 Since the knowledge graph (next section), `explain`/`path`/`rank` also
 take a directory or a `graph.json`; with a dictionary or a raw data file
 they behave exactly as described here.
