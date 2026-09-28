@@ -1,9 +1,9 @@
 # Draft Homebrew formula for sniff-rs.
 #
-# This file is NOT used from this repo directly. Copy it to your tap repo
-# (e.g. amaye15/homebrew-sniff-rs/Formula/sniff-rs.rb), then for each
-# release update `version` and the four `sha256` values below from that
-# release's SHA256SUMS.txt asset. Asset names come from
+# A template, not used from this repo directly: the release workflow's
+# `homebrew` job renders it (render.py fills in the version and the four
+# sha256 values from that release's archives) and pushes the result to
+# amaye15/homebrew-sniff-rs/Formula/sniff-rs.rb. Asset names come from
 # .github/workflows/release.yml - the two must stay in sync.
 class SniffRs < Formula
   desc "Profile a data file and produce a data dictionary"

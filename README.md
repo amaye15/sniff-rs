@@ -11,7 +11,9 @@ SPSS, ORC, BSON, plist, JSON5/JSONC, HAR, GeoJSON, MBOX, vCard, iCalendar,
 Jupyter notebooks, and PDF page text — any of them gzip- or
 zstd-compressed — plus Delta Lake and Iceberg tables.
 Writes Markdown, rich JSON, JSON-Schema, or a runnable SQL script.
-`sniff-rs diff` compares two dictionaries and flags schema drift.
+`sniff-rs diff` compares two dictionaries (or two raw files) and flags
+schema drift. `sniff-rs graph` builds a knowledge graph across every file
+in a folder.
 
 Zero runtime dependencies: every reader is hand-rolled pure `std`.
 
@@ -25,7 +27,8 @@ formats, or `--combine` directories), each in one of three tiers:
 another's unique values), or `probable` (names and types make it more
 likely than not). Every edge carries a calibrated `probability` and its
 evidence; weaker candidates are dropped. Three subcommands query the graph
-without re-reading any file - each takes a dictionary or a raw file:
+without re-reading any file - each takes a dictionary, a raw file, a
+directory, or a `graph.json` (see below):
 
 ```bash
 sniff-rs explain warehouse.db users.id     # one column: profile + edges
@@ -36,6 +39,27 @@ sniff-rs rank warehouse.db                 # god tables + communities
 `diff` additionally reports relationship drift: joins that appeared,
 vanished, or changed tier or probability between snapshots (a lost join is
 breaking, like a removed column).
+
+## Knowledge graph
+
+`sniff-rs graph <DIR>` links every file in a folder, of every data type:
+table joins, shared identifiers found in content (emails, DOIs, ISBNs,
+IBANs, UUIDs, reference numbers, ...), one file naming another, similar
+wording, shared schemas, and the same document saved twice. Each link
+carries a confidence (extracted / inferred / ambiguous) and its evidence;
+Louvain communities group what belongs together.
+
+```bash
+sniff-rs graph ./data/                    # ./data.graph/graph.json + GRAPH_REPORT.md
+sniff-rs graph ./data/ --obsidian         # plus an Obsidian vault
+sniff-rs explain data.graph/graph.json crm/customers.csv
+sniff-rs path data.graph/graph.json crm/customers.csv crm/orders.json
+sniff-rs rank ./data/                     # graph the folder in memory
+```
+
+`graph.json` is networkx node-link JSON (the shape graphify writes). The
+graph and vault contain the identifiers found in your files, so keep them
+as private as the input. `sniff-rs graph --help` lists every option.
 
 ## Install
 
