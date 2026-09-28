@@ -6877,27 +6877,45 @@ fn dbase_reads_utf8_code_page_content_correctly() {
     assert_eq!(name["sample_values"], serde_json::json!(["café日本語"]));
 }
 
-// A dBase file marked with one of the ~20 *named* legacy single-byte code
-// pages (here CP1252, header byte 0x03) is a disclosed, clear error rather
-// than a silent misdecode - this project's hand-rolled reader only
-// supports UTF-8 or undefined/unmarked-codepage dBase files, exactly
-// matching a real, pre-existing limitation of the `dbase` crate's own
-// default build (no `yore`/`encoding_rs` feature enabled) that this
-// hand-roll replaces - see CLAUDE.md's Dependency footprint section.
+// A dBase file's header code page mark selects a legacy single-byte code
+// page (see `resolve_text_mode`); text decodes through it rather than as
+// UTF-8. Fixtures written by the `dbf` Python package in each code page.
 #[cfg(feature = "dbase")]
 #[test]
-fn dbase_named_code_page_is_a_clear_disclosed_error() {
+fn dbase_decodes_text_through_its_marked_code_page() {
+    for (file, expected) in [
+        ("edge_dbase_cp1252.dbf", vec!["café €5", "Straße", "naïve"]),
+        ("edge_dbase_cp866.dbf", vec!["Привет", "Москва", "ёлка"]),
+        ("edge_dbase_cp437.dbf", vec!["Müller", "Æble ½", "Ñandú"]),
+    ] {
+        let doc = run_json(file, &["--samples", "5"]);
+        let stem = file.trim_end_matches(".dbf");
+        let name = column(table(&doc, stem), "NAME");
+        assert_eq!(name["sample_values"], serde_json::json!(expected), "{file}");
+    }
+    // Marked CP1252 but pure ASCII content: reads normally.
+    let doc = run_json("edge_dbase_cp1252_marked_ascii.dbf", &[]);
+    assert!(!table(&doc, "edge_dbase_cp1252_marked_ascii").is_empty());
+}
+
+// The double-byte East Asian code pages stay a disclosed error.
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_double_byte_code_page_is_a_clear_disclosed_error() {
     let output = Command::new(bin())
-        .args([fixture("malformed_dbase_unsupported_codepage.dbf")
-            .to_str()
-            .unwrap()])
+        .args([
+            fixture("malformed_dbase_double_byte_codepage.dbf")
+                .to_str()
+                .unwrap(),
+            "-",
+        ])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("code page") && stderr.contains("0x03"),
-        "expected a code-page error naming the byte, got: {stderr}"
+        stderr.contains("0x7b") && stderr.contains("double-byte"),
+        "got: {stderr}"
     );
 }
 
@@ -15041,4 +15059,14 @@ fn diff_rejects_stdin_for_both_sides_and_a_stray_format_flag() {
         .unwrap();
     assert!(!stray.status.success());
     assert!(String::from_utf8_lossy(&stray.stderr).contains("applies only to"));
+}
+
+/// A SAS7BDAT file declaring WINDOWS-1251 (pandas' own datetime fixture)
+/// used to be refused over its encoding; it now reads.
+#[cfg(feature = "sas7bdat")]
+#[test]
+fn sas7bdat_reads_a_windows_1251_file() {
+    let doc = run_json("sas7bdat_pandas_windows1251.sas7bdat", &[]);
+    let cols = table(&doc, "sas7bdat_pandas_windows1251");
+    assert_eq!(column(cols, "Date1")["ideal_type"], "NaiveDate / DateTime");
 }

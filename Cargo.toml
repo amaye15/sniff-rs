@@ -325,6 +325,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # `sas7bdat_reader_matches_the_sas7bdat_crate_output_exactly`
 # (`#[cfg(all(test, feature = "sas7bdat"))]` in src/lib.rs).
 sas7bdat = "0.8.0"
+# Oracle for the single-byte code page tables (codepage_support); already
+# in the dev graph via sas7bdat.
+encoding_rs = "0.8"
 # Unlike every other dev-dependency in this list, `ambers` was never a real
 # runtime dependency of this project's own `spss` feature to begin with -
 # SPSS support went straight to a hand-rolled reader (`spss_support` in

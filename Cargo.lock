@@ -2992,6 +2992,7 @@ dependencies = [
  "criterion",
  "dbase",
  "dta",
+ "encoding_rs",
  "geojson",
  "ical",
  "json5",

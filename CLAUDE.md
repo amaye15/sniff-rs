@@ -12755,7 +12755,12 @@ this project could just implement directly rather than depend on:
        boundary rather than "fixing" it into a bigger hand-roll than
        verification could support - a real, disclosed limitation
        inherited faithfully, not silently narrowed further or quietly
-       widened without the codepage tables to back it up.
+       widened without the codepage tables to back it up. **A later pass
+       added those tables** (`codepage_support`, below): every
+       single-byte code page a dBase mark names now decodes, and only the
+       double-byte East Asian pages (932/936/949/950) and the two DOS
+       pages with no public table (895 Kamenicky, 620 Mazovia) still
+       refuse.
     4. **Memo fields (external `.dbt`/`.fpt` files) are a disclosed,
        clear error** rather than an attempt at a second binary format
        this project has no committed fixture to verify against - the same
@@ -12789,9 +12794,38 @@ this project could just implement directly rather than depend on:
   multi-byte UTF-8 field content, a named-code-page file (a disclosed
   error), and a Memo-field file (also a disclosed error) - are now
   permanent fixtures/tests (`edge_dbase_deleted_records.dbf`,
-  `edge_dbase_unicode.dbf`, `malformed_dbase_unsupported_codepage.dbf`,
+  `edge_dbase_unicode.dbf`, `malformed_dbase_unsupported_codepage.dbf`
+  (since renamed `edge_dbase_cp1252_marked_ascii.dbf`, when named code
+  pages started decoding),
   `malformed_dbase_memo_field.dbf`), the first two additionally verified
   against the real `dbase` crate via the same oracle before being trusted.
+
+- **Single-byte code pages (`codepage_support`), shared by dBase and
+  SAS7BDAT.** 50 tables of 256 entries - the DOS pages (437, 737, 775,
+  850, 852, 855, 857, 858, 860-866, 869, 720), windows-874/1250-1258,
+  ISO-8859-2..16, KOI8-R/U, and the Mac pages - generated from Python's
+  own codec tables and checked byte for byte against encoding_rs for the
+  27 it implements (`tables_match_encoding_rs_where_it_has_the_encoding`;
+  `encoding_rs` is a dev-only oracle, already in the dev graph through
+  `sas7bdat`). That check found three places Python's tables and the
+  WHATWG standard encoding_rs follows differ, and the tables follow
+  WHATWG: windows-* pages map an undefined byte in 0x80-0x9F to the C1
+  control of the same value but U+FFFD above it, windows-1255 assigns
+  0xCA (U+05BA), and WHATWG's koi8-u is KOI8-RU (0xAE/0xBE are ў/Ў). The
+  dBase mark-to-page table is the `dbase` crate's own, extended with the
+  rest of the Visual FoxPro list the `dbf` Python package records (0x26
+  Russian OEM, 0xCC Baltic, the Mac marks); fixtures in CP1252, CP866,
+  and CP437 were written with that package. SAS resolves its encoding
+  names the way encoding_rs does where encoding_rs knows them (ISO-8859-9
+  is windows-1254, ISO-8859-11 and CP874 are windows-874, MACUKRAINE is
+  x-mac-cyrillic); for the DOS and other Mac pages the reference crate
+  falls back to UTF-8, while this reader uses the real page. All 29
+  readable files in pandas' own SAS test corpus now read (the 4 that used
+  to refuse declare ISO-8859-15 or WINDOWS-1251), and every string sample
+  matches pandas' own decode except `test16.sas7bdat`, which declares
+  ISO-8859-1 over UTF-8 bytes - the same mojibake the reference crate
+  produces. `sas7bdat_pandas_windows1251.sas7bdat` (pandas' `datetime`
+  fixture, BSD-3) is vendored as a regression test.
 
 - **`dta` → a hand-rolled reader (`stata_support`).** The largest hand-roll
   in this whole effort by scope, not by algorithmic complexity - Stata's
@@ -17063,15 +17097,13 @@ established baselines exactly.
   `Variable::label()` in the `dta` crate, `ColumnMeta::label` in the
   `sas7bdat` crate, and `SpssMetadata::variable_labels`/
   `variable_value_labels` in `ambers` already expose it.
-- **SAS7BDAT text decoding is limited to UTF-8/US-ASCII and Windows-1252**
-  (which, per the WHATWG Encoding Standard `encoding_rs` implements, also
-  covers files declaring "ISO-8859-1" - see the Dependency footprint
-  section for why that's not genuine Latin-1). SAS can declare roughly 70
-  more legacy codepages, several genuinely complex multi-byte/stateful
-  schemes (Shift-JIS, EUC-JP/KR, Big5, GB18030, ISO-2022-\*); a file
-  declaring one of them is a clear, disclosed error rather than a guess,
-  the same dependency-weight tradeoff already declined for dBase's own
-  ~20-codepage gap and for SPSS/DuckDB entirely (see below).
+- **SAS7BDAT and dBase don't decode multi-byte East Asian encodings**
+  (Shift-JIS, EUC-JP/KR, Big5, GB18030, ISO-2022-\*, and dBase's code
+  pages 932/936/949/950), nor a few rare single-byte ones with no
+  available table (SAS's CP921/CP922/CP1129/MACHEBREW/MACTHAI, dBase's
+  895/620). A file declaring one is a clear, disclosed error. Every other
+  single-byte code page decodes through `codepage_support` - see the
+  Dependency footprint section.
 - **PDF text decoding covers WinAnsi/MacRoman/Differences/ToUnicode
   fonts plus each font's implicit built-in encoding** - an embedded Type 1
   or CFF program's own vector, the published encoding of an unembedded

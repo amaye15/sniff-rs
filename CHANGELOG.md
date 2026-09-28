@@ -18,6 +18,9 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- dBase and SAS7BDAT decode legacy single-byte code pages (DOS, Windows,
+  ISO-8859, KOI8, Mac) instead of refusing them; double-byte East Asian
+  encodings still refuse.
 - JSON5 reads the full 1.0.0 grammar: hex, signed, and leading/trailing-dot
   numbers, `Infinity`/`NaN`, `\x`/`\v`/`\0` escapes, Unicode identifier
   keys, and Unicode whitespace.

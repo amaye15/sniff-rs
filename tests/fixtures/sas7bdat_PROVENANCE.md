@@ -19,3 +19,9 @@ committed non-malformed fixture at all, only `malformed_garbage.sas7bdat`
 non-ASCII text content, the same "vendor a real file when self-generation
 is genuinely impossible" call already made for the POI `.xlsb` fixtures
 (see `poi_xlsb_PROVENANCE.md`).
+
+`sas7bdat_pandas_windows1251.sas7bdat` is `datetime.sas7bdat` copied
+verbatim from pandas' own test data (`pandas/tests/io/sas/data/`,
+https://github.com/pandas-dev/pandas, BSD-3-Clause). It declares the
+WINDOWS-1251 text encoding, which this reader used to refuse; it now
+reads through the shared single-byte code page tables.
