@@ -10661,6 +10661,7 @@ mod dbase_support {
     }
 
     struct Header {
+        version: u8,
         num_records: u32,
         offset_to_first_record: u16,
         is_visual_foxpro: bool,
@@ -10691,6 +10692,7 @@ mod dbase_support {
         let code_page_mark = buf[29];
         let is_visual_foxpro = matches!(version, 0x30..=0x32);
         Ok(Header {
+            version,
             num_records,
             offset_to_first_record,
             is_visual_foxpro,
@@ -10719,7 +10721,12 @@ mod dbase_support {
         })
     }
 
-    fn read_field_value(f: &FieldInfo, bytes: &[u8], text_mode: TextMode) -> Result<Value> {
+    fn read_field_value(
+        f: &FieldInfo,
+        bytes: &[u8],
+        text_mode: TextMode,
+        memo: Option<&mut MemoFile>,
+    ) -> Result<Value> {
         Ok(match f.field_type {
             FieldType::Logical => {
                 let c = bytes.first().copied().unwrap_or(b' ');
@@ -10820,14 +10827,240 @@ mod dbase_support {
                 validate_date(u32::try_from(y).unwrap_or(u32::MAX), m, d)?;
                 Value::DateTime((y as u32, m, d), (h, mi, s))
             }
-            FieldType::Memo => unreachable!("memo fields are rejected before any record is read"),
+            FieldType::Memo => {
+                let memo = memo.ok_or_else(|| anyhow!("dBase memo field without a memo file"))?;
+                match memo.read(memo_block_index(bytes)?)? {
+                    None => Value::Character(None),
+                    Some(data) => {
+                        let text = decode_text(text_mode, &data)?;
+                        let text = text.trim_end_matches(['\0', '\r', '\n']);
+                        Value::Character((!text.is_empty()).then(|| text.to_string()))
+                    }
+                }
+            }
         })
+    }
+
+    /// Which memo-file layout a `.dbf`'s `M` fields point into. Read from
+    /// the header's version byte the way the `dbase` crate's own
+    /// `Version::supported_memo_type` does: FoxBase (0x02), FoxPro 2 with
+    /// memo (0xF5) and Visual FoxPro (0x30-0x32) use `.fpt`; dBase III
+    /// with memo (0x83) a `.dbt`; dBase IV with memo (0x8B) a `.dbt` whose
+    /// blocks carry a length header. Any other version with an `M` field
+    /// falls back on whichever sibling file exists.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MemoKind {
+        Dbase3,
+        Dbase4,
+        Fox,
+    }
+
+    /// Cap on one memo value, so a corrupt length or a missing terminator
+    /// can't make a single read allocate without bound.
+    const MAX_MEMO_BYTES: usize = 64 * 1024 * 1024;
+
+    pub(super) struct MemoFile {
+        kind: MemoKind,
+        file: File,
+        block_size: u64,
+    }
+
+    impl MemoFile {
+        /// Finds the memo file next to `dbf_path` (same stem, `.dbt` or
+        /// `.fpt` in either case) and reads its header.
+        fn open(dbf_path: &Path, version: u8) -> Result<Self> {
+            let kind_from_version = match version {
+                0x02 | 0xF5 | 0x30..=0x32 | 0xFB => Some(MemoKind::Fox),
+                0x83 => Some(MemoKind::Dbase3),
+                0x8B | 0xCB => Some(MemoKind::Dbase4),
+                _ => None,
+            };
+            let find = |exts: &[&str]| {
+                exts.iter()
+                    .map(|e| dbf_path.with_extension(e))
+                    .find(|p| p.is_file())
+            };
+            let (kind, memo_path) = match kind_from_version {
+                Some(MemoKind::Fox) => (MemoKind::Fox, find(&["fpt", "FPT"])),
+                Some(k) => (k, find(&["dbt", "DBT"])),
+                None => match find(&["fpt", "FPT"]) {
+                    Some(p) => (MemoKind::Fox, Some(p)),
+                    None => (MemoKind::Dbase3, find(&["dbt", "DBT"])),
+                },
+            };
+            let memo_path = memo_path.ok_or_else(|| {
+                let ext = if kind == MemoKind::Fox { "fpt" } else { "dbt" };
+                anyhow!(
+                    "{dbf_path:?} has memo fields but its memo file ({:?}) isn't there",
+                    dbf_path.with_extension(ext)
+                )
+            })?;
+            let mut file = File::open(&memo_path)
+                .with_context(|| format!("failed to open memo file {memo_path:?}"))?;
+            let mut head = [0u8; 32];
+            let n = read_up_to(&mut file, &mut head)
+                .with_context(|| format!("failed reading memo file {memo_path:?}"))?;
+            if n < 8 {
+                bail!("memo file {memo_path:?} is too short for a header");
+            }
+            let block_size = match kind {
+                // FoxPro: big-endian block size at offset 6.
+                MemoKind::Fox => u64::from(u16::from_be_bytes([head[6], head[7]])),
+                // dBase III blocks are always 512 bytes.
+                MemoKind::Dbase3 => 512,
+                // dBase IV: block length at offset 20, per the dBase IV
+                // file layout; the `dbase` crate reads offset 4 instead,
+                // so either is accepted, falling back to 512.
+                MemoKind::Dbase4 => {
+                    let at20 = if n >= 22 {
+                        u16::from_le_bytes([head[20], head[21]])
+                    } else {
+                        0
+                    };
+                    let at4 = u16::from_le_bytes([head[4], head[5]]);
+                    u64::from(if at20 != 0 {
+                        at20
+                    } else if at4 != 0 {
+                        at4
+                    } else {
+                        512
+                    })
+                }
+            };
+            if block_size == 0 {
+                bail!("memo file {memo_path:?} declares a zero block size");
+            }
+            Ok(MemoFile {
+                kind,
+                file,
+                block_size,
+            })
+        }
+
+        /// The raw bytes of the memo starting at block `index`, or `None`
+        /// when the index is 0 (no memo).
+        fn read(&mut self, index: u32) -> Result<Option<Vec<u8>>> {
+            if index == 0 {
+                return Ok(None);
+            }
+            let offset = u64::from(index) * self.block_size;
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .context("failed seeking in memo file")?;
+            match self.kind {
+                MemoKind::Fox => {
+                    let mut head = [0u8; 8];
+                    self.file
+                        .read_exact(&mut head)
+                        .context("memo block header runs past the end of the memo file")?;
+                    let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+                    if len > MAX_MEMO_BYTES {
+                        bail!(
+                            "memo block declares {len} bytes, past the {MAX_MEMO_BYTES}-byte cap"
+                        );
+                    }
+                    let mut data = vec![0u8; len];
+                    self.file
+                        .read_exact(&mut data)
+                        .context("memo data runs past the end of the memo file")?;
+                    Ok(Some(data))
+                }
+                MemoKind::Dbase4 => {
+                    let mut head = [0u8; 8];
+                    self.file
+                        .read_exact(&mut head)
+                        .context("memo block header runs past the end of the memo file")?;
+                    // The length counts the 8-byte block header itself.
+                    let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+                    let len = len.saturating_sub(8);
+                    if len > MAX_MEMO_BYTES {
+                        bail!(
+                            "memo block declares {len} bytes, past the {MAX_MEMO_BYTES}-byte cap"
+                        );
+                    }
+                    let mut data = vec![0u8; len];
+                    let got = read_up_to(&mut self.file, &mut data)?;
+                    data.truncate(got);
+                    if let Some(end) = data.iter().position(|&b| b == 0x1A || b == 0x1F) {
+                        data.truncate(end);
+                    }
+                    Ok(Some(data))
+                }
+                MemoKind::Dbase3 => {
+                    // Text runs block after block until a 0x1A terminator
+                    // (or end of file) - not just one block, which is where
+                    // the `dbase` crate stops, truncating a longer memo.
+                    let mut data = Vec::new();
+                    let mut block = vec![0u8; self.block_size as usize];
+                    loop {
+                        let got = read_up_to(&mut self.file, &mut block)?;
+                        if let Some(end) = block[..got].iter().position(|&b| b == 0x1A) {
+                            data.extend_from_slice(&block[..end]);
+                            break;
+                        }
+                        data.extend_from_slice(&block[..got]);
+                        if got < block.len() {
+                            break;
+                        }
+                        if data.len() > MAX_MEMO_BYTES {
+                            bail!(
+                                "memo value runs past the {MAX_MEMO_BYTES}-byte cap without a terminator"
+                            );
+                        }
+                    }
+                    Ok(Some(data))
+                }
+            }
+        }
+    }
+
+    /// Reads until `buf` is full or the reader is exhausted.
+    fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<usize> {
+        let mut n = 0;
+        while n < buf.len() {
+            match r.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(n)
+    }
+
+    /// A memo field's block number: ten ASCII digits in dBase III/FoxPro,
+    /// or a 4-byte little-endian integer in Visual FoxPro (field length 4).
+    fn memo_block_index(bytes: &[u8]) -> Result<u32> {
+        if bytes.len() == 4 {
+            return Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let t = trim_both(bytes);
+        if t.is_empty() {
+            return Ok(0);
+        }
+        if !t.iter().all(u8::is_ascii_digit) {
+            bail!(
+                "dBase memo field holds {:?}, not a block number",
+                String::from_utf8_lossy(t)
+            );
+        }
+        std::str::from_utf8(t)
+            .unwrap()
+            .parse()
+            .context("dBase memo block number is out of range")
     }
 
     /// `(reader, header, text_mode, fields, record_data_len)` - named
     /// here purely to keep `open_dbase_for_records`'s signature readable
     /// (`clippy::type_complexity`).
-    type DbaseRecordSource = (BufReader<File>, Header, TextMode, Vec<FieldInfo>, usize);
+    type DbaseRecordSource = (
+        BufReader<File>,
+        Header,
+        TextMode,
+        Vec<FieldInfo>,
+        usize,
+        Option<MemoFile>,
+    );
 
     /// Opens `path`, reads its header and field-descriptor table, and
     /// seeks the returned reader to the first record - every step
@@ -10867,13 +11100,24 @@ mod dbase_support {
                 anyhow!("dBase file's offset to first record is before the end of its header")
             })?;
 
+        // Descriptors end at the 0x0D terminator. The count derived from
+        // the header offset is only an upper bound: FoxPro 2 files (and
+        // other writers) also put a 263-byte backlink after the
+        // terminator without being Visual FoxPro, which the arithmetic
+        // alone would misread as eight more descriptors.
         let mut fields = Vec::with_capacity(num_fields);
         for _ in 0..num_fields {
+            use std::io::BufRead;
+            if r.fill_buf()?.first() == Some(&0x0D) {
+                break;
+            }
             fields.push(read_field_info(&mut r, text_mode)?);
         }
-        if fields.iter().any(|f| f.field_type == FieldType::Memo) {
-            bail!("dBase memo fields (external .dbt/.fpt files) aren't supported by this reader");
-        }
+        let memo = if fields.iter().any(|f| f.field_type == FieldType::Memo) {
+            Some(MemoFile::open(path, header.version)?)
+        } else {
+            None
+        };
 
         // The field-table terminator byte is read but - matching the
         // `dbase` crate's own explicit choice - never checked against its
@@ -10893,7 +11137,7 @@ mod dbase_support {
         // `open_dbase`'s own `record_size` recomputation exactly.
         let record_data_len: usize = fields.iter().map(|f| f.field_length as usize).sum();
 
-        Ok((r, header, text_mode, fields, record_data_len))
+        Ok((r, header, text_mode, fields, record_data_len, memo))
     }
 
     pub(crate) fn columns_from_dbase(
@@ -10901,7 +11145,8 @@ mod dbase_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let (mut r, header, text_mode, fields, record_data_len) = open_dbase_for_records(path)?;
+        let (mut r, header, text_mode, fields, record_data_len, mut memo) =
+            open_dbase_for_records(path)?;
 
         // One `Vec<Option<String>>` accumulator per field, filled
         // positionally as each record is decoded - not one `HashMap<String,
@@ -10956,7 +11201,7 @@ mod dbase_support {
             for (col_idx, f) in fields.iter().enumerate() {
                 let field_bytes = &record_buf[pos..pos + f.field_length as usize];
                 pos += f.field_length as usize;
-                let value = read_field_value(f, field_bytes, text_mode)?;
+                let value = read_field_value(f, field_bytes, text_mode, memo.as_mut())?;
                 if keep_this_row && let Some(s) = value_to_string(&value) {
                     col_states[col_idx].push(s, n_samples);
                 }
@@ -11002,7 +11247,8 @@ mod dbase_support {
         path: &Path,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
-        let (mut r, header, text_mode, fields, record_data_len) = open_dbase_for_records(path)?;
+        let (mut r, header, text_mode, fields, record_data_len, mut memo) =
+            open_dbase_for_records(path)?;
 
         let mut deletion_flag = [0u8; 1];
         let mut record_buf = vec![0u8; record_data_len];
@@ -11022,7 +11268,7 @@ mod dbase_support {
             for f in &fields {
                 let field_bytes = &record_buf[pos..pos + f.field_length as usize];
                 pos += f.field_length as usize;
-                let value = read_field_value(f, field_bytes, text_mode)?;
+                let value = read_field_value(f, field_bytes, text_mode, memo.as_mut())?;
                 row.push(value_to_string(&value));
             }
             sink.accept(row)?;

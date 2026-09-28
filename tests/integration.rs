@@ -6919,13 +6919,53 @@ fn dbase_double_byte_code_page_is_a_clear_disclosed_error() {
     );
 }
 
-// A dBase file with a Memo field (whose content lives in an external
-// .dbt/.fpt file this reader doesn't implement - see CLAUDE.md's Known
-// limitations) is a disclosed, clear error, not a silent drop or a panic.
+// A memo field whose .dbt/.fpt file is missing is a clear error naming
+// the file it looked for, not a silent drop or a panic.
 #[cfg(feature = "dbase")]
 #[test]
-fn dbase_memo_field_is_a_clear_disclosed_error() {
-    assert_fails_without_panicking("malformed_dbase_memo_field.dbf");
+fn dbase_memo_field_without_its_memo_file_is_a_clear_error() {
+    let output = Command::new(bin())
+        .args([
+            fixture("malformed_dbase_memo_field.dbf").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("malformed_dbase_memo_field.dbt"),
+        "{stderr}"
+    );
+}
+
+// Memo text read from each memo-file layout: dBase III (.dbt, text runs
+// across 512-byte blocks to a 0x1A terminator), dBase IV (.dbt, a length
+// header per block; hand-built from the published layout), FoxPro 2 and
+// Visual FoxPro (.fpt, big-endian block header). The FoxPro 2 file also
+// carries a 263-byte backlink without being Visual FoxPro. All but the
+// dBase IV file were written by the `dbf` Python package.
+#[cfg(feature = "dbase")]
+#[test]
+fn dbase_reads_memo_fields_from_every_memo_layout() {
+    let long = "Lorem ipsum dolor sit amet. ".repeat(40);
+    let long = long.trim_end();
+    for stem in [
+        "edge_dbase_memo_db3",
+        "edge_dbase_memo_db4",
+        "edge_dbase_memo_foxpro",
+        "edge_dbase_memo_vfp",
+    ] {
+        let doc = run_json(&format!("{stem}.dbf"), &[]);
+        let notes = column(table(&doc, stem), "NOTES");
+        assert_eq!(
+            notes["sample_values"],
+            serde_json::json!(["Short note with café", long]),
+            "{stem}"
+        );
+        assert_eq!(notes["missing_pct"], 33.3, "{stem}");
+        assert_eq!(notes["current_type"], "String", "{stem}");
+    }
 }
 
 #[cfg(feature = "stata")]

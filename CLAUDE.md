@@ -12761,11 +12761,32 @@ this project could just implement directly rather than depend on:
        double-byte East Asian pages (932/936/949/950) and the two DOS
        pages with no public table (895 Kamenicky, 620 Mazovia) still
        refuse.
-    4. **Memo fields (external `.dbt`/`.fpt` files) are a disclosed,
-       clear error** rather than an attempt at a second binary format
-       this project has no committed fixture to verify against - the same
-       "no fixture, no trust" boundary already drawn for SAS7BDAT and
-       old-style BIFF2-5 `.xls`.
+    4. **Memo fields (external `.dbt`/`.fpt` files) started as a
+       disclosed error** for want of a fixture, and a later pass reads
+       them (`MemoFile`). The layout comes from the header version byte,
+       as in the crate's `Version::supported_memo_type` (FoxBase/FoxPro
+       2/Visual FoxPro use `.fpt`, dBase III/IV `.dbt`; any other version
+       with an `M` field uses whichever sibling exists), and the memo file
+       is found next to the `.dbf` in either case. A record's block number
+       is ten ASCII digits, or a 4-byte little-endian integer in a 4-byte
+       Visual FoxPro field; block 0 or blanks mean no memo. `.fpt` blocks
+       carry a big-endian type/length header (block size is big-endian at
+       offset 6); dBase IV blocks carry `FF FF 08 00` plus a length that
+       counts its own 8 bytes; dBase III text runs block after block to a
+       0x1A terminator - the crate reads only one 512-byte block there,
+       truncating any longer memo, which is why the fixtures aren't in its
+       oracle comparison. Memo text decodes through the file's code page
+       and is capped at 64 MiB per value. Verified against files the
+       `dbf` Python package wrote (dBase III, FoxPro 2, Visual FoxPro,
+       each with a 1,119-byte memo spanning blocks, a short non-ASCII
+       memo, and an empty one); the dBase IV file is hand-built from the
+       published layout, since no available tool writes one. The FoxPro 2
+       file surfaced a second real gap: FoxPro 2 writers also put the
+       263-byte Visual FoxPro backlink after the field descriptors, so the
+       descriptor count computed from the header offset read eight
+       phantom fields and failed on the first; descriptors are now read
+       until their 0x0D terminator, with the offset only an upper bound.
+       A missing memo file is a clear error naming the path it looked for.
     5. **`trim_field_data`'s one real quirk was worth preserving exactly,
        not smoothing over**: its leading/trailing-space scan stops dead at
        the *first* NUL byte encountered anywhere in a field (not just a

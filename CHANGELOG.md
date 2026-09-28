@@ -7,6 +7,8 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Fixed
+- dBase files with a backlink after the field descriptors but not marked
+  Visual FoxPro (FoxPro 2 writes these) no longer fail on phantom fields.
 - Near-identical tables (same column names) now link as a star on the
   first copy instead of every copy to every other: 1,000 same-schema
   tables wrote 499,500 `duplicate_schema` relationships and JSON output
@@ -18,6 +20,8 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- dBase memo fields read from their `.dbt`/`.fpt` file (dBase III/IV,
+  FoxPro, Visual FoxPro) instead of refusing the file.
 - dBase and SAS7BDAT decode legacy single-byte code pages (DOS, Windows,
   ISO-8859, KOI8, Mac) instead of refusing them; double-byte East Asian
   encodings still refuse.
