@@ -291,12 +291,20 @@ everything else's implicit single one:
         "sample_values": ["02134", "90210"],
         "notes": "leading zeros in raw values (likely an ID/code)",
         "row_count": 100,
-        "numeric_stats": null
+        "numeric_stats": null,
+        "references": [],
+        "value_sketch": {"count": 100, "distinct": 97, "hashes": "0004a1f2..."}
       }
     ]
   }
 }
 ```
+
+`references` (declared foreign keys, `[{"table", "column"}]`, only ever
+non-empty for SQLite today) and `value_sketch` (a bounded KMV sketch of
+the column's distinct values, `null` outside key domains) feed the
+relationship graph's `declared` and `discovered` tiers - see "Linking
+tiers" in the relationship-graph section.
 
 `row_count` is how many rows/records this column was profiled against (the
 same total every `missing_pct` above is already derived from) — added after
@@ -3559,6 +3567,368 @@ picked as the pre-fix "hub") went from `Degree: 1204` to `Degree: 0,
 Duplicates: 1204`, and its community's label changed from that same
 arbitrary PDF's own filename to `"duplicate schema: page_number, text"` -
 the real-world improvement this fix set out to make.
+
+**Auto-connect precision pass: a bridge edge now has to look like a join
+key, and star schemas read as stars.** Checked against what the edge list
+actually looked like on realistic multi-table inputs rather than on the
+two small committed fixtures, the auto-connect rules had three systematic
+noise sources, each making the graph a hairball rather than the data's
+real shape:
+
+- **Surrogate-key collisions.** `users.id` and `orders.id` matched as an
+  exact-name `extracted` edge - and for integers their samples (1, 2, 3)
+  always overlap too. Every ORM-style schema, where each table has its own
+  `id`, became a complete graph. `is_surrogate_key_name` (`id`, `uuid`,
+  `pk`, `key`, `rowid`, pandas' `Unnamed: 0`/`index`, ...) now blocks an
+  exact-name match between two different schemas, with one exception
+  where coincidence is implausible: both sides an identifier domain
+  (UUID/ULID/Email) *and* sharing observed values - a 1:1 extension table
+  keyed by its parent's UUID, reported as "a shared primary key".
+- **Attribute columns.** `amount` (f64), `active` (bool), `created_at`
+  (date) exist in almost every table and linked all of them. Joins live in
+  key domains (`JoinBase::is_key_domain`: integers, text, UUID/ULID/Email,
+  and identifier semantics like IBAN/VIN/ISBN); floats, booleans, dates,
+  times, coordinates, geometry, cron, colors, and SemVer never bridge two
+  different schemas. Star-schema date joins go through an integer/text
+  `date_key`, which still links.
+- **Star schemas as cliques.** Ten fact tables carrying `customer_id`
+  produced 45 mutual "bridges", burying the real hub. A third
+  `EdgeContext`, `SharedReference`, now labels a link between two columns
+  that each reference the same owning table (`mark_shared_references`,
+  run after every edge is known): the join is real and `path` can still
+  take it, but `rank`'s Degree, `community_label`'s hub selection, and
+  `explain`'s leading rows count spokes only. Nothing is hidden - each
+  relabelled edge gains an evidence line naming the hub, the JSON carries
+  `"context": "shared_reference"`, and `explain`/`rank` JSON gain an
+  appended `shared_reference_degree`.
+
+Two recall improvements make the owner/referrer structure visible in the
+first place. Every edge whose names say which side owns the key now
+carries a `reference`: the foreign-key pattern as before, and also an
+exact match on a key-suffixed name where exactly one table is named for
+its stem (`customers.customer_id` owns it; `orders.customer_id`
+references it) - never guessed when both or neither side is. And table
+stems match the way real schemas are named: `singular_forms`/`same_noun`
+compare every plausible singular (`categories`/`category`,
+`boxes`/`box`, `caches`/`cache`, `people`/`person`) instead of one
+strip-an-`s` rule that missed `-ies`/`-es` plurals, `table_stems` strips
+warehouse decoration (`dim_`, `fact_`, `stg_`, `_dim`, ...) as whole
+segments, and the FK id side accepts `id`/`uuid`/`guid`/`pk`/`key` with
+any key suffix on the referencing side (`_id`, `_uuid`, `_key`, `_no`,
+...). Duplicate-schema pairs are unchanged throughout: two copies of one
+schema still link on every shared column, since there the whole row lines
+up.
+
+Verified with nine new unit tests (plural forms; surrogate ids in both
+integer and UUID form plus pandas' index column; the shared-UUID-PK
+exception; attributes not bridging but still linking duplicate schemas;
+FK matching through `-ies`/`-es`/irregular plurals and `dim_`/`fact_`
+prefixes; owner orientation and its "neither side owns it" refusal; a
+four-table star with three sibling links relabelled, the hub ranked first
+and named in the community label, and the direct sibling hop still
+available to `path`) and two end-to-end `--combine` integration tests.
+Three existing tests used `id`<->`id` as their example of a bridge - the
+exact false positive removed here - and now use a real reference key
+(`account_id`, `doc_id`, `batch`) with their intent unchanged. Clippy is
+identical to the pre-change baseline.
+
+**BM25-style linking: key evidence, measured against 834 declared foreign
+keys.** Researched before building, then built against a benchmark rather
+than intuition. The literature on join and foreign-key discovery (Aurum's
+TF-IDF/MinHash profiles, Rostin et al.'s ten FK features, Zhang et al.'s
+randomness test, HoPF) agrees on the useful signals: a name that says
+"key", a referenced side that is its table's own key, and value evidence
+weighted by how rare the values are - BM25's inverse document frequency
+applied to schemas. Two ground-truth corpora, neither committed (they are
+external and large): the declared `FOREIGN KEY`s of three real SQLite
+sample databases with data (Chinook, Northwind, Sakila - 44 cross-table
+keys) and the declared keys of all 166 schemas in the Spider text-to-SQL
+benchmark's `tables.json` (790 cross-table keys, names and types only, no
+values). Each schema became a dictionary, `detect_relationships` ran over
+it, and every bridge was scored against the declared keys.
+
+The baseline was precise about what it got wrong: bridge precision 0.34
+on Spider and 0.42 on the real databases, with recall 0.78 / 0.91. Of
+Spider's 1,201 wrong bridges, 1,150 were exact-name matches on attribute
+columns - `name`, `city`, `phone`, `homepage`, `address` in two unrelated
+entities. Token IDF alone does not separate those from keys (in a
+normalized schema `city` and `customer` each appear in about two tables),
+so the fix is the key-evidence the literature calls for, with IDF used
+where it actually discriminates:
+
+- **An exact-name bridge between different schemas needs key evidence**:
+  a key-marker last token (`KEY_MARKERS`: `id`, `code`, `key`, `no`,
+  `num`, `sku`, ...; also compact `aid`/`pid`), a table that owns the name
+  (`owns_key`, below), a unique leading column (below), or an identifier
+  domain with shared values. Unowned, unmarked exact matches were wrong
+  876 times for every 29 right on Spider, and 52 to 0 on the real data.
+  Duplicate-schema pairs are unchanged.
+- **Natural-key owners**: `owner_stems` now reads a column as naming its
+  table through the whole name (`grapes.grape`), a key suffix
+  (`customer_id`), a natural-key head (`state.state_name`,
+  `invoices.invoice_number`), or an unseparated `id` (`Dorm.dormid`; the
+  stem must be three letters or more, so `paid` stays `paid`).
+- **A unique leading column owns its key**: schemas put their primary key
+  first. When exactly one table in the input leads with a name, that table
+  owns it - key-marked names always, unmarked names only when they occur
+  in exactly two tables (tested: allowing any unmarked leading column
+  brought back `homepage`/`Year`/`name` false links for the same F1).
+- **Role-prefixed keys**: `store.manager_staff_id -> staff.staff_id`,
+  `farm_competition.host_city_id -> city.city_id` - the long name ends
+  with another table's own key (`LinkIndex::key_tables`), and only one
+  table claims that key; a column that is itself its table's key
+  (`people_addresses.person_address_id`) is never read as a reference.
+  The bare-id pattern gained the same reading (`parent_user_id ->
+  users.id`). Recovered 24 declared Spider keys the old linker missed.
+- **An unowned key in three or more tables is a shared key**
+  (`mark_unowned_shared_keys`): `league_id` across fifteen baseball
+  tables with no `league` table used to be a clique of bridges; it now
+  reads `SharedReference` with evidence saying no table owns it. Kept for
+  `path`, out of bridge degree. Two tables sharing an unowned key stay a
+  bridge.
+- **Sample-value IDF** (`LinkIndex`, `value_is_informative`): each column
+  with samples is a document. A shared value only promotes a weak or
+  domain-only name match to `extracted` when it sits in at most half of
+  the other columns - the Robertson/Sparck Jones sign rule, judged against
+  the columns other than the two compared (which hold it by definition,
+  and which would otherwise make every value "common" in a two-table
+  input). Shared `1`/`true` values now say `(common to most columns here,
+  so weak evidence)` instead of promoting.
+- **An edge `score`** (`edge_score`, appended last in the JSON): the BM25
+  idf (Lucene's non-negative form) of the matched name's non-marker tokens,
+  tables as documents, plus the idf of every shared sample value. It
+  orders `explain`'s rows within each context, most specific first; it
+  never gates an edge.
+
+Result on the same benchmarks: bridge precision 0.34 -> 0.84 on Spider
+and 0.42 -> 0.98 on the real databases; recall (any context) 0.78 -> 0.77
+and 0.91 -> 0.93; correctly oriented true bridges 423 -> 523 and 39 -> 41.
+The declared keys still missed are mostly out of reach for names alone:
+composite keys (`section.year`/`semester`), self-references
+(`Employee.ReportsTo`), role names with no entity (`Orders.ShipVia ->
+Shippers.ShipperID`), abbreviations (`dept_name` for `department`), and a
+few Spider schemas whose declared types disagree (`text` vs `number` for
+one key). Spider's declared keys are also incomplete (baseball's
+`team_id`s point at `team` but are undeclared), so its precision is a
+floor. Everything else in the relationship graph is unchanged. Three
+existing tests used attribute names (`batch`, `region`, `a`) as bridge
+examples and now use key names; two `--combine` tests put the shared key
+second in the copied tables so the hub table is the one leading with it.
+Verified with nine new unit tests (idf, markers and owner stems, attribute
+gating, role prefixes both ways, own-key exclusion, first-column owners,
+unowned shared keys, value IDF, score ordering) and an INI fixture
+(`edge_graph_key_evidence.ini`) run through the binary. Clippy matches the
+baseline.
+
+**Linking tiers: declared, discovered, probable.** The BM25 pass left
+every edge on one footing - a rule said "join", and nothing said how sure.
+Record linkage and inclusion-dependency discovery both separate three
+kinds of evidence, and the graph now does too. `confidence` is one of:
+
+- **`declared`**: the schema says so. The SQLite reader now parses
+  `REFERENCES`/`FOREIGN KEY` clauses (`parse_create_table`: inline column
+  constraints, named `CONSTRAINT ... FOREIGN KEY`, composite keys paired
+  positionally, a bare `REFERENCES t` resolved onto `t`'s primary key once
+  every table is parsed - `resolve_foreign_keys`, case-insensitive like
+  SQLite). Keyword search skips quoted text (`find_keyword_outside_quotes`
+  - a `DEFAULT 'references x(y)'` read as a key until a unit test caught
+  it). Each column carries its keys as `references`; `--combine` rewrites
+  them to the qualified table names; a saved dictionary carries them back
+  into `explain`/`path`/`rank`. `apply_declared_keys` turns each into an
+  edge with probability 1, upgrading a heuristic edge on the same columns
+  in place. A key to a missing table or column is dropped; a
+  self-reference (`Employee.ReportsTo`) stays on the column but isn't an
+  edge, since the graph links tables. Checked against SQLite's own
+  `pragma foreign_key_list` on Chinook, Northwind and Sakila: 46 of 46
+  identical.
+- **`discovered`**: the values show it. Every key-domain column now
+  carries a `ValueSketch` - a KMV sketch of its 128 smallest 32-bit value
+  hashes (FNV-1a finished with splitmix64), built in the same streaming
+  pass by `ColumnAccumulatorState`, `profile_column` and
+  `JsonPathAccumulator`. It estimates distinct count (exact below 128) and
+  containment: a hash of `A` at or below `B`'s largest kept hash is a
+  value `B` would have kept, so the share found in `B` estimates the share
+  of `A` inside `B`. `inclusion_between` calls `A -> B` an inclusion
+  dependency when `B` looks unique, `A` has two or more distinct values,
+  and 95%+ of `A` sits in `B`. Every candidate edge records that as a
+  comparison; one that holds labels the edge `discovered`, adds a
+  "values match" evidence line, and orients an edge the names left
+  undirected - unless some table owns the name, where the two are hub
+  siblings (`film_category.film_id` is unique and contains
+  `film_actor.film_id`, but both reference `film`). `value_candidate`
+  proposes edges from values alone (`Orders.ShipVia` in
+  `Shippers.ShipperID`), with two restrictions the benchmark forced: the
+  referenced side must be its table's own key (first column, or named for
+  the table - `customer.address_id` is unique and `_id`-named but
+  references `address`), and an integer pair also needs the name to
+  abbreviate the table (`ship_via` -> `shippers`). Without the latter,
+  every small integer range sits inside every `1..N` id: 120 value-only
+  candidates on Sakila, none real. With both, the three real databases
+  yield exactly one value-only candidate, and it is right.
+- **`probable`**: names and types make it more likely than not.
+  `edge_probability` is a Fellegi-Sunter posterior: prior log-odds plus a
+  weight per comparison - a multi-level name agreement (`fk`,
+  `exact_owned_lead`, `exact_owned`, `exact_lead`, `exact_plain`,
+  `weak_lead`, `weak_plain`, `identifier`, `value`), and yes/no tests
+  (key marker, same type, name in 3+ tables, abbreviation, shared
+  informative samples, containment), each `None` when it can't be run.
+  The name comparison is one categorical level rather than separate tests
+  because the parts interact: a same-noun match is 82% real beside a
+  table's first column and 0% elsewhere, which independent tests scored
+  at 0.17. Weights are `ln(m/u)`, shrunk towards the pooled rate, and an
+  outcome seen fewer than 5 times gets 0 - an early fit gave an unseen
+  test -1.7 from smoothing alone. One scale factor (0.96, maximum
+  likelihood) calibrates the sum. Bridges below 0.5 are dropped;
+  declared, duplicate-schema and shared-reference edges never are (their
+  labels already say they aren't independent joins, and `path` needs the
+  hop). Every edge's JSON gains `probability` after `score`; Markdown
+  shows `probable 0.93`; `path` breaks ties by tier, then probability.
+  Relationship drift in `diff` fires on a tier change or a probability
+  move of 0.2 or more.
+
+The weights were fitted on the benchmark's bridge candidates (712 across
+Spider's 166 schemas and the three real databases, declared keys
+stripped so they had to be found), with a small offline harness that
+dumps each edge's comparisons; they are committed as `FS_NAME_LEVELS`/
+`FS_TESTS`/`FS_PRIOR`/`FS_SCALE`. Value comparisons rest on the three real
+databases only (Spider has no data), so their weights are the thinnest.
+Results, bridges only, declared keys stripped: Spider precision 0.839 ->
+0.898, recall 0.766 -> 0.739 (F1 0.801 -> 0.811); real databases 0.977 ->
+1.000 at recall 0.955 - the same when the model is fitted on Spider
+alone, so the real-database number is held out. With declared keys, all
+44 cross-table keys in the real databases are found and every bridge is
+right. On Spider, predicted probability tracks the observed rate (edges
+scored 0.9+ are 94% real, 0.7-0.8 are 79%, 0.1-0.2 are 10%). The one
+band that isn't calibrated is 0.4-0.5 (14 of 22 real, dropped): a
+threshold tuned for F1 would keep them, but 0.5 keeps its plain meaning.
+Two real keys stay out of reach: `Customer.SupportRepId -> EmployeeId`
+(integers, no abbreviation) and `film.original_language_id` (all NULL).
+Sketching costs nothing measurable (a 1M-row CSV and a 500k-record JSONL
+file both ran in the same time and memory as before) and grows JSON by
+about 1 KB per key-domain column (25-70% on the files tried). Verified
+with unit tests on the parser, resolution, sketch (exactness, estimate
+bounds, containment, JSON round trip and malformed rejection), the
+model, the discovered tier (a text code, Sakila's range coincidence, the
+ShipVia case, hub siblings) and declared edges, a committed fixture
+(`edge_graph_declared_keys.sqlite`) through the binary, `--combine`
+qualification, and a discovered code reference across two CSVs. Tests
+that asserted `extracted`/`inferred` now assert tiers and probabilities;
+three whose fixtures relied on exact names nobody owns or leads with
+(dropped now, as the benchmark says they should be) were given a leading
+key or assert the drop.
+
+**Composite keys stay whole; self-references are named.** Two declared
+shapes the tiers above kept only partly. A composite `FOREIGN KEY (o, l)
+REFERENCES order_lines` became two independent edges, each reading like
+a complete join - and joining `shipments` to `order_lines` on `o` alone
+is wrong. `parse_create_table` now numbers each foreign-key clause, and
+`resolve_foreign_keys` gives every pair of a clause that resolved to two
+or more pairs the whole key as `ColumnRef::composite` - serialized as
+`"composite": [["o", "order_id"], ["l", "line_no"]]` on each column's
+`references` entry, written only for a composite so one-column keys keep
+their two-field shape, and read back from a saved dictionary. Each
+pair's edge stays (`path` still takes the hop), but its evidence reads
+"declared composite foreign key: ... - join on every pair, not this one
+alone" and its reason calls it one column pair of one. A self-reference
+(`staff.manager -> staff.id`) still has no edge - the graph links tables
+- but `explain` now lists it on both columns ("Self-reference: ... (a
+hierarchy)") and its JSON appends `self_references: [{column,
+references}]`. Declared only: the benchmark corpora hold three
+self-joins in Spider's 166 schemas (one of them mislabelled) and two in
+the real databases, too few to fit or check a heuristic. Verified by two
+integration tests against `edge_graph_declared_keys.sqlite` (the
+composite key through a saved dictionary; the self-reference from both
+ends and absent on an unrelated column).
+
+**The 0.4-0.5 band was a labelling artifact; the weights are refitted.**
+The tiers pass disclosed one uncalibrated band - 22 Spider bridges scored
+0.4-0.5, 14 of them real, all dropped. Every one of the 22 was the same
+comparison: an exact key name owned by a table named for it, outside that
+table's first column, in three or more tables (`yelp`'s
+`review.business_id -> business.business_id`, `baseball_1`'s
+`team_id -> team`). Their level (`exact_owned`) had been fitted at -1.56
+from 15 real against 13 not - and 8 of the 13 were `baseball_1`'s
+`team_id`s, which Spider declares for five tables and leaves undeclared
+for eight more. Relabelling by eye would be circular (the same intuition
+the heuristic encodes), so one whole schema was adjudicated against an
+outside authority instead: `baseball_1` is the Lahman database, whose
+documentation makes every `team_id` a reference to `team`, the managers'
+and pitchers' `player_id` a reference to `player` (Lahman keeps managers
+in the same person table), and `team.franchise_id` a reference to
+`team_franchise` - 15 keys added; its other four candidates stay false
+(`team.park` holds park names, there is no division table for `div_id`).
+No other schema was touched. The refit on that ground truth moves
+`exact_owned` to -0.36 and the band's edges to about 0.81, with the other
+weights close to where they were (`FS_PRIOR` 0.8686, `FS_SCALE` 1.01).
+Two checks that this corrects the labels rather than fitting baseball:
+the new weights score better even against Spider's uncorrected labels
+(bridge F1 0.811 -> 0.815; 0.813 -> 0.828 with baseball corrected), and a
+fit with `baseball_1` left out entirely still puts `exact_owned` at -1.17
+but lifts the band's `yelp` keys over 0.5 (0.63) - the drop came mostly
+from baseball's missing keys. The three real databases are unchanged
+(precision 1.000, recall 0.955 with declared keys stripped; the same
+edges with them). Several unit tests and one integration test used
+`customer` beside `customer_id` - an unmarked weak name - as a
+mid-strength link; with disjoint samples it now scores 0.44 and is
+dropped, so the tests that measure evidence or score compare unthresholded
+edges, and the drift and `--samples` tests use `ref_code` leading two
+tables (0.62 without the shared sample, 0.83 with it).
+
+`Customer.SupportRepId -> Employee.EmployeeId` stays out of reach, and now
+for a measured reason: its values (3, 4, 5) sit inside the keys of ten of
+Chinook's eleven tables, the tightest being `MediaType` (1..5) - no rule
+over values can pick `Employee`, and the name carries nothing that
+matches it.
+
+**Graph measures: reference rank, subject areas, cut tables - and a
+triangle rule.** Asked which graph techniques help, each was tried
+against the real databases and the Spider benchmark rather than added
+by default. Connected components said little on real schemas (Sakila,
+Chinook and Northwind are each one component) and degree ties heavily,
+so `rank` gains three measures, all over `Bridge` edges only
+(`bridge_arcs`, weight = probability; duplicate-schema and
+shared-reference links are repetition, not structure):
+
+- **`reference_rank`** (`table_importance`): weighted PageRank along
+  `referencing -> referenced` (an undirected edge sends half each way),
+  damping 0.85, dangling mass spread uniformly, scaled so the average
+  table is 1.0. It measures what the schema ultimately points at, not
+  "importance": Sakila's top is `country`/`city`/`address`, Chinook's
+  `Employee`, Northwind's `Regions`. Named for what it is, and `rank`
+  still sorts by bridge degree - the fact tables a reader expects first.
+- **`area`** (`subject_areas`): Louvain modularity (local moving plus
+  aggregation, deterministic: index order, strictly positive gain). It
+  splits a component where links are dense inside and sparse between;
+  on the real databases the split reads the way the schemas are
+  designed - Sakila into catalog (`film`, `actor`, `category`,
+  `language`, `inventory`), transactions (`staff`, `store`, `customer`,
+  `rental`, `payment`, `address`) and locations (`city`, `country`);
+  Chinook into sales, tracks, albums and playlists; Northwind into
+  products, employees/territories, customers and orders. An area is
+  named for its internal hub (most bridge weight inside it): naming it
+  for its top reference rank called Sakila's catalog "language". There
+  is no ground truth for subject areas, so this was checked by reading
+  these three and a few Spider schemas (baseball splits into team and
+  player areas), and is disclosed as such.
+- **`articulation`** (`articulation_tables`): Tarjan's cut vertices over
+  the full adjacency `path` walks, iterative so a long chain can't
+  overflow the stack.
+
+The triangle rule is the one technique that moves the benchmark. A
+column with bridges to two targets where one target itself references
+the other (`trip.start_station_id` to `station.id` and to
+`status.station_id`, which references `station`) has one real target;
+the hop to `status` is derived through the hub, so `mark_hub_references`
+now relabels it `SharedReference` (declared edges excepted). On Spider
+with declared keys stripped it changed exactly 3 edges, all false
+(bike_1's two station ids, station_weather's `route` to
+`weekly_weather`): bridge precision 0.906 -> 0.910, recall unchanged;
+the real databases are unchanged. Only 3 columns in the whole benchmark
+had two oriented targets, so a general "one target per column" rule
+had nothing else to fix. `rank` also computes components once instead
+of per row. At 3,000 synthetic tables `rank` takes ~25 s, almost all of
+it relationship detection itself (`explain` alone ~21 s) - a
+pre-existing scaling cost, not these measures.
 
 Since the knowledge graph (next section), `explain`/`path`/`rank` also
 take a directory or a `graph.json`; with a dictionary or a raw data file

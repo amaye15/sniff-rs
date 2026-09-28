@@ -7,6 +7,29 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `rank` gains three graph measures per table: `reference_rank`
+  (weighted PageRank along references, 1.0 = average - high for the
+  tables everything ultimately points at), `area` (a Louvain modularity
+  subject area inside a community, with a new top-level `areas` array
+  and a "Subject areas" Markdown section when a community splits), and
+  `articulation` (every join path between some other pair of tables runs
+  through it). `rank` also computes components once instead of per row.
+- A reference that runs to both a hub and a table that itself references
+  that hub (`trip.station_id` to `station` and to `status.station_id`)
+  now reads `shared_reference` for the derived hop.
+- Relationship tiers: `declared` (SQLite `REFERENCES`/`FOREIGN KEY`
+  constraints, surfaced per column as `references` and turned into edges
+  with probability 1), `discovered` (inclusion dependencies measured on a
+  new bounded per-column `value_sketch`), and `probable` (a
+  Fellegi-Sunter model over name, type and value comparisons, fitted on
+  834 declared foreign keys). Edges gain a `probability` field; bridges
+  below 0.5 are dropped.
+- Composite foreign keys stay whole: each column of a multi-column
+  `FOREIGN KEY` carries the full key in its `references` entry
+  (`"composite": [["o", "order_id"], ["l", "line_no"]]`), and its edge's
+  evidence says to join on every pair. `explain` also lists a column's
+  declared self-references (`staff.manager -> staff.id`), which have no
+  edge since the graph links tables; its JSON gains `self_references`.
 - PDF page-text reader (`--features pdf`, in `full`): one record per page
   (`page_number`, `text`). Hand-rolled, pure `std` - xref tables/streams
   with `/Prev` chains (plus bare-trailer files via index rebuild), object
@@ -65,6 +88,16 @@ All notable changes to sniff-rs are documented here. Format follows
   ZapfDingbats glyph names (`a20`) resolve in a ZapfDingbats font.
 
 ### Changed
+- Relationship probabilities refitted after correcting the benchmark:
+  Spider leaves 15 of its `baseball_1` (Lahman) keys undeclared, which had
+  pushed an exact key name owned by a table named for it, outside that
+  table's first column (`category.business_id -> business.business_id`),
+  down to 0.46 - under the threshold. Those links now score about 0.81
+  and are kept (Spider F1 0.811 -> 0.815 on its own labels, 0.813 ->
+  0.828 with baseball corrected; the three real databases unchanged).
+- Relationship `confidence` is now `declared`/`discovered`/`probable`,
+  replacing `extracted`/`inferred`. Column JSON gains `references` and
+  `value_sketch` (appended last).
 - PDF: word and line breaks come from where glyphs are drawn - text,
   line and transformation matrices, Form `/Matrix`, `TJ` offsets, and
   glyph widths (`/Widths`, `/W`, or Core 14 metrics) - instead of which
