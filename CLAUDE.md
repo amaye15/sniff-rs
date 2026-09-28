@@ -4617,21 +4617,24 @@ rather than a specific table that needed one of them:
   automatically (the field simply isn't present), so this closes the gap
   with zero behavior change for the overwhelmingly common case.
 
-- **Deletion vectors are now detected and refused loudly, not silently
-  ignored.** Real bitmap decoding (the actual roaring-bitmap-like format
-  a deletion vector's own side file/inline blob uses) was judged out of
-  reasonable scope for this pass - but silently treating every row of a
-  file with one attached as still present was the real, disclosed
-  correctness risk this gap always carried, so closing it doesn't require
-  decoding the bitmap at all: an `add` action's own `deletionVector`
-  field being present (non-null) is enough to know rows have been
-  deleted from that file. `DeltaFileEntry::has_deletion_vector` tracks
-  this per live file; `resolve_delta_table_profiles` refuses to profile
-  the table at all if any live file has one, with a clear, actionable
-  error naming the file - turning a silent-wrongness risk (deleted rows
-  counted as present) into a safe, loud refusal instead, the same
-  "confident common case, disclosed gap" trade this project already
-  makes for LZO compression or old-style BIFF2-5 `.xls`.
+- **Deletion vectors started as a loud refusal and are now applied.**
+  `deletion_vector_rows` decodes an `add` action's `deletionVector`: an
+  inline one (`storageType` `i`, Z85 text) or a file-backed one (`u`: a
+  prefix plus a Z85-encoded UUID naming `<prefix>/deletion_vector_<uuid>
+  .bin`; `p`: a path), whose record at `offset` is a big-endian size, the
+  bitmap, and a big-endian CRC-32 that's checked. The bitmap is a
+  `RoaringBitmapArray` (magic 1681511377, a u64 count, then a u32 key and
+  a portable 32-bit Roaring bitmap per bucket - array, bitmap, and run
+  containers all read), and its members are row positions skipped as the
+  file streams; `--nrows` counts rows left after deletion. No available
+  tool writes deletion vectors (delta-rs rewrites files instead), so
+  `edge_delta_deletion_vectors` is hand-built to the protocol with
+  pyroaring bitmaps - two vectors in one file under a prefix directory
+  and one inline - and checked against delta-rs's own
+  `DeltaTable.deletion_vectors()`, which reads the same rows as deleted.
+  Z85 is checked against ZeroMQ RFC 32's own test vector, and a Roaring
+  unit test covers run and bitmap containers. A corrupt vector fails its
+  CRC check with an error naming the data file.
 
 Verified against real, `deltalake`-generated tables throughout, not just
 reasoned about: a real 6-commit table with a real checkpoint created at

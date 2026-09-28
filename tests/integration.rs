@@ -11416,42 +11416,67 @@ fn delta_table_resolves_column_mapped_physical_names() {
     assert_eq!(samples, vec!["a", "b", "c"]);
 }
 
-/// A live `add` entry carrying a `deletionVector` field marks individual
-/// *rows* within its own data file as logically deleted via a separate
-/// bitmap this reader doesn't decode - refusing the whole table outright
-/// (rather than silently counting every one of that file's rows as still
-/// present) is the correct, disclosed behavior; see the Delta Lake
-/// section of CLAUDE.md.
+/// Deletion vectors are applied: `edge_delta_deletion_vectors` (hand-built
+/// to the Delta protocol with pyroaring bitmaps) has two vectors stored in
+/// one `deletion_vector_<uuid>.bin` file under a prefix directory and one
+/// stored inline. delta-rs's own `deletion_vectors()` reads the same rows
+/// as deleted: 3 and 7 of the first file, 5 and 9 of the second, 0, 2, 3
+/// and 4 of the third - 17 of 25 rows left.
 #[cfg(feature = "delta")]
 #[test]
-fn delta_table_rejects_a_live_file_carrying_a_deletion_vector() {
+fn delta_table_applies_file_backed_and_inline_deletion_vectors() {
+    let doc = run_json("edge_delta_deletion_vectors", &["--samples", "20"]);
+    let id = column(table(&doc, "edge_delta_deletion_vectors"), "id");
+    assert_eq!(id["row_count"], 17);
+    assert_eq!(
+        id["sample_values"],
+        serde_json::json!([
+            "0", "1", "2", "4", "5", "6", "8", "9", "10", "11", "12", "13", "14", "16", "17", "18",
+            "21"
+        ])
+    );
+    // --nrows counts rows left after deletion.
+    let doc = run_json(
+        "edge_delta_deletion_vectors",
+        &["--nrows", "4", "--samples", "20"],
+    );
+    let id = column(table(&doc, "edge_delta_deletion_vectors"), "id");
+    assert_eq!(id["sample_values"], serde_json::json!(["0", "1", "2", "4"]));
+}
+
+/// A corrupt deletion vector file fails its CRC-32 check with an error
+/// naming the data file, rather than deleting the wrong rows.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_rejects_a_corrupt_deletion_vector() {
     let dir = TempDir::new();
-    std::fs::create_dir_all(dir.path().join("_delta_log")).unwrap();
-    let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}"#;
-    std::fs::write(
-        dir.path().join("_delta_log/00000000000000000000.json"),
-        format!(
-            "{{\"metaData\":{{\"schemaString\":\"{schema}\"}}}}\n\
-             {{\"add\":{{\"path\":\"part-0.parquet\",\"partitionValues\":{{}},\
-             \"deletionVector\":{{\"storageType\":\"u\",\"pathOrInlineDv\":\"abc\",\
-             \"offset\":1,\"sizeInBytes\":10,\"cardinality\":1}}}}}}\n"
-        ),
-    )
-    .unwrap();
+    let src = fixture("edge_delta_deletion_vectors");
+    let dest = dir.path().join("t");
+    copy_dir_recursive(&src, &dest);
+    let dv_dir = dest.join("ab");
+    let dv_file = std::fs::read_dir(&dv_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&dv_file).unwrap();
+    bytes[10] ^= 0xFF;
+    std::fs::write(&dv_file, bytes).unwrap();
     let output = Command::new(bin())
-        .args([dir.path().to_str().unwrap(), "-", "--output-format", "json"])
+        .args([dest.to_str().unwrap(), "-", "--output-format", "json"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("deletion vector"));
+    assert!(
+        stderr.contains("deletion vector") && stderr.contains("part-a.parquet"),
+        "{stderr}"
+    );
 }
 
-/// tests/fixtures/edge_delta_deletion_vector_among_multiple_files has two
-/// live files, only one of which carries a `deletionVector` - proving the
-/// refusal correctly names the *actual* offending file
-/// (`part-dv.parquet`), not just the first live file it happens to walk,
-/// and that a clean sibling file existing alongside it changes nothing.
+/// A malformed deletion vector reference (`"abc"`, too short for a UUID)
+/// is an error naming the file that carries it, not its clean sibling.
 #[cfg(feature = "delta")]
 #[test]
 fn delta_table_names_the_correct_file_among_several_when_only_one_carries_a_deletion_vector() {
@@ -15204,4 +15229,17 @@ fn delta_table_flattens_nested_columns() {
         serde_json::json!(["Paris", "Oslo"])
     );
     assert_eq!(column(cols, "tags")["ideal_type"], "Vec<String>");
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) {
+    std::fs::create_dir_all(dest).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dest.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_recursive(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), to).unwrap();
+        }
+    }
 }

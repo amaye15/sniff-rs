@@ -39730,15 +39730,258 @@ mod delta_support {
     /// partition value as a string, `None` meaning a genuinely null
     /// partition value, regardless of that column's own logical type,
     /// since the value never round-trips through a typed Parquet cell at
-    /// all) and whether it carries a deletion vector (a real Delta
-    /// feature marking individual *rows* within the file as logically
-    /// deleted via a separate small bitmap file/inline blob - see
-    /// `resolve_delta_table_profiles`'s own doc comment for why a file
-    /// with one attached is refused outright rather than silently read
-    /// as if every one of its rows were still present).
+    /// all) and its deletion vector, if any (a Delta feature marking
+    /// individual *rows* within the file as logically deleted via a
+    /// separate bitmap - see `deletion_vector_rows`).
     struct DeltaFileEntry {
         partition_values: BTreeMap<String, Option<String>>,
-        has_deletion_vector: bool,
+        deletion_vector: Option<DeletionVector>,
+    }
+
+    /// An `add` action's `deletionVector` descriptor (Delta protocol,
+    /// "Deletion Vectors"): where the bitmap lives and how long it is.
+    struct DeletionVector {
+        /// `u` (a file named by a UUID), `i` (inline), or `p` (a path).
+        storage_type: String,
+        path_or_inline: String,
+        offset: Option<u64>,
+        size: usize,
+    }
+
+    impl DeletionVector {
+        fn from_json(v: &JsonValue) -> Result<Self> {
+            Ok(DeletionVector {
+                storage_type: v
+                    .get("storageType")
+                    .and_then(JsonValue::as_str)
+                    .context("deletionVector has no storageType")?
+                    .to_string(),
+                path_or_inline: v
+                    .get("pathOrInlineDv")
+                    .and_then(JsonValue::as_str)
+                    .context("deletionVector has no pathOrInlineDv")?
+                    .to_string(),
+                offset: v
+                    .get("offset")
+                    .and_then(JsonValue::as_i64)
+                    .and_then(|o| u64::try_from(o).ok()),
+                size: v
+                    .get("sizeInBytes")
+                    .and_then(JsonValue::as_i64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .context("deletionVector has no sizeInBytes")?,
+            })
+        }
+    }
+
+    const Z85_ALPHABET: &[u8; 85] =
+        b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+
+    /// Z85 (ZeroMQ RFC 32): five characters per big-endian 4-byte group -
+    /// the encoding Delta uses for a deletion vector's UUID and inline data.
+    fn z85_decode(s: &str) -> Result<Vec<u8>> {
+        let b = s.as_bytes();
+        if !b.len().is_multiple_of(5) {
+            bail!("Z85 text length {} isn't a multiple of 5", b.len());
+        }
+        let mut out = Vec::with_capacity(b.len() / 5 * 4);
+        for chunk in b.chunks(5) {
+            let mut v: u64 = 0;
+            for &c in chunk {
+                let d = Z85_ALPHABET
+                    .iter()
+                    .position(|&a| a == c)
+                    .with_context(|| format!("{:?} isn't a Z85 character", c as char))?;
+                v = v * 85 + d as u64;
+            }
+            let v = u32::try_from(v).context("Z85 group overflows 32 bits")?;
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        Ok(out)
+    }
+
+    /// Cap on one deletion vector's serialized size.
+    const MAX_DV_BYTES: usize = 256 * 1024 * 1024;
+
+    /// The row positions a deletion vector marks deleted. The bitmap is a
+    /// `RoaringBitmapArray`: magic 1681511377, a u64 count, then per
+    /// 32-bit bucket a u32 key and a standard portable-format Roaring
+    /// bitmap. A file-backed vector sits at `offset` in its file as a
+    /// big-endian u32 size, the bitmap, and a big-endian CRC-32, which is
+    /// checked. Verified against delta-rs, whose `deletion_vectors()`
+    /// reads the same hand-built vectors to the same rows.
+    fn deletion_vector_rows(
+        dv: &DeletionVector,
+        table_dir: &Path,
+    ) -> Result<HashSet<u64, FxBuildHasher>> {
+        if dv.size > MAX_DV_BYTES {
+            bail!(
+                "deletion vector of {} bytes is out of a sane range",
+                dv.size
+            );
+        }
+        let bytes = match dv.storage_type.as_str() {
+            "i" => {
+                let mut b = z85_decode(&dv.path_or_inline)?;
+                if b.len() < dv.size {
+                    bail!("inline deletion vector is shorter than its sizeInBytes");
+                }
+                b.truncate(dv.size);
+                b
+            }
+            "u" | "p" => {
+                let path = if dv.storage_type == "u" {
+                    let s = &dv.path_or_inline;
+                    if s.len() < 20 {
+                        bail!("deletion vector reference {s:?} is too short for a UUID");
+                    }
+                    let (prefix, encoded) = s.split_at(s.len() - 20);
+                    let u = z85_decode(encoded)?;
+                    let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
+                    let uuid = format!(
+                        "{}-{}-{}-{}-{}",
+                        &hex[0..8],
+                        &hex[8..12],
+                        &hex[12..16],
+                        &hex[16..20],
+                        &hex[20..32]
+                    );
+                    table_dir
+                        .join(prefix)
+                        .join(format!("deletion_vector_{uuid}.bin"))
+                } else {
+                    let raw = &dv.path_or_inline;
+                    match raw.strip_prefix("file://") {
+                        Some(rest) => PathBuf::from(percent_decode(rest)),
+                        None if raw.contains("://") => bail!(
+                            "deletion vector at {raw:?} is on remote storage - this tool only reads local files"
+                        ),
+                        None => PathBuf::from(raw),
+                    }
+                };
+                read_dv_file(&path, dv.offset.unwrap_or(1), dv.size)
+                    .with_context(|| format!("failed to read deletion vector {path:?}"))?
+            }
+            other => bail!("unknown deletion vector storage type {other:?}"),
+        };
+        parse_roaring_bitmap_array(&bytes)
+    }
+
+    fn read_dv_file(path: &Path, offset: u64, size: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = fs::File::open(path)?;
+        f.seek(SeekFrom::Start(offset))?;
+        let mut word = [0u8; 4];
+        f.read_exact(&mut word)?;
+        let stored = u32::from_be_bytes(word) as usize;
+        if stored != size {
+            bail!("the file records {stored} bytes where the log says {size}");
+        }
+        let mut data = vec![0u8; size];
+        f.read_exact(&mut data)?;
+        f.read_exact(&mut word)?;
+        if u32::from_be_bytes(word) != crc32(&data) {
+            bail!("CRC-32 mismatch - the deletion vector is corrupt");
+        }
+        Ok(data)
+    }
+
+    fn parse_roaring_bitmap_array(b: &[u8]) -> Result<HashSet<u64, FxBuildHasher>> {
+        let mut pos = 0usize;
+        let take = |pos: &mut usize, n: usize| -> Result<&[u8]> {
+            let s = b
+                .get(*pos..*pos + n)
+                .context("deletion vector bitmap is truncated")?;
+            *pos += n;
+            Ok(s)
+        };
+        let u32_le = |s: &[u8]| u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+        if u32_le(take(&mut pos, 4)?) != 1_681_511_377 {
+            bail!("deletion vector doesn't start with the RoaringBitmapArray magic number");
+        }
+        let count = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        let mut rows: HashSet<u64, FxBuildHasher> = HashSet::default();
+        for _ in 0..count {
+            let key = u64::from(u32_le(take(&mut pos, 4)?));
+            let rest = &b[pos..];
+            let used = parse_roaring32(rest, |low| {
+                rows.insert(key << 32 | u64::from(low));
+            })?;
+            pos += used;
+        }
+        Ok(rows)
+    }
+
+    /// One portable-format 32-bit Roaring bitmap (the RoaringFormatSpec):
+    /// calls `on_value` for each member and returns the bytes consumed.
+    fn parse_roaring32(b: &[u8], mut on_value: impl FnMut(u32)) -> Result<usize> {
+        let mut pos = 0usize;
+        let take = |pos: &mut usize, n: usize| -> Result<&[u8]> {
+            let s = b
+                .get(*pos..*pos + n)
+                .context("Roaring bitmap is truncated")?;
+            *pos += n;
+            Ok(s)
+        };
+        let u16_le = |s: &[u8]| u16::from_le_bytes([s[0], s[1]]);
+        let cookie = {
+            let s = take(&mut pos, 4)?;
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        };
+        let (n, run_flags) = if cookie & 0xFFFF == 12347 {
+            let n = (cookie >> 16) as usize + 1;
+            let flags = take(&mut pos, n.div_ceil(8))?.to_vec();
+            (n, Some(flags))
+        } else if cookie == 12346 {
+            let s = take(&mut pos, 4)?;
+            (u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize, None)
+        } else {
+            bail!("not a portable Roaring bitmap (cookie {cookie:#x})");
+        };
+        if n > 65_536 {
+            bail!("Roaring bitmap claims {n} containers");
+        }
+        let mut headers = Vec::with_capacity(n);
+        for _ in 0..n {
+            let s = take(&mut pos, 4)?;
+            headers.push((u16_le(&s[0..2]), usize::from(u16_le(&s[2..4])) + 1));
+        }
+        if run_flags.is_none() || n >= 4 {
+            take(&mut pos, 4 * n)?; // container offsets, not needed read in order
+        }
+        for (i, &(key, card)) in headers.iter().enumerate() {
+            let high = u32::from(key) << 16;
+            let is_run = run_flags
+                .as_ref()
+                .is_some_and(|f| f[i / 8] & (1 << (i % 8)) != 0);
+            if is_run {
+                let runs = usize::from(u16_le(take(&mut pos, 2)?));
+                for _ in 0..runs {
+                    let s = take(&mut pos, 4)?;
+                    let start = u32::from(u16_le(&s[0..2]));
+                    let len = u32::from(u16_le(&s[2..4]));
+                    for v in start..=start + len {
+                        on_value(high | v);
+                    }
+                }
+            } else if card > 4096 {
+                let bits = take(&mut pos, 8192)?;
+                for (w, word) in bits.chunks(8).enumerate() {
+                    let mut x = u64::from_le_bytes(word.try_into().unwrap());
+                    while x != 0 {
+                        let t = x.trailing_zeros();
+                        on_value(high | (w as u32 * 64 + t));
+                        x &= x - 1;
+                    }
+                }
+            } else {
+                let vals = take(&mut pos, 2 * card)?;
+                for v in vals.chunks(2) {
+                    on_value(high | u32::from(u16_le(v)));
+                }
+            }
+        }
+        Ok(pos)
     }
 
     /// The result of replaying every commit in `_delta_log/` in order -
@@ -39944,14 +40187,15 @@ mod delta_support {
                     .get("partitionValues")
                     .map(normalize_string_map)
                     .unwrap_or_default();
-                let has_deletion_vector = action_value
-                    .get("deletionVector")
-                    .is_some_and(|v| !v.is_null());
+                let deletion_vector = match action_value.get("deletionVector") {
+                    Some(v) if !v.is_null() => Some(DeletionVector::from_json(v)?),
+                    _ => None,
+                };
                 acc.live_files.insert(
                     path,
                     DeltaFileEntry {
                         partition_values,
-                        has_deletion_vector,
+                        deletion_vector,
                     },
                 );
             }
@@ -40176,14 +40420,6 @@ mod delta_support {
     ) -> Result<Vec<ColumnProfile>> {
         let state = resolve_delta_log(table_dir)?;
 
-        for (rel_path, entry) in &state.live_files {
-            if entry.has_deletion_vector {
-                bail!(
-                    "{rel_path:?} in this Delta table carries a deletion vector (a row-level soft-delete marker naming individual rows within the file as logically deleted, via a separate bitmap this reader doesn't decode) - refusing to profile this table rather than silently counting its deleted rows as still present; see the Delta Lake section of CLAUDE.md for this disclosed gap"
-                );
-            }
-        }
-
         let mut states: Vec<LakehouseColumn> = state
             .schema
             .iter()
@@ -40234,9 +40470,31 @@ mod delta_support {
                     )
                 })
                 .collect();
+            // Rows this file's deletion vector marks deleted are skipped,
+            // exactly as if they weren't in the table.
+            let deleted_rows = match &entry.deletion_vector {
+                Some(dv) => Some(deletion_vector_rows(dv, table_dir).with_context(|| {
+                    format!("failed to read the deletion vector for {rel_path:?}")
+                })?),
+                None => None,
+            };
+            let mut row_pos: u64 = 0;
             let remaining = nrows.map(|limit| limit - total_rows);
             let mut file_rows = 0usize;
-            parquet_support::stream_parquet_rows(&file_path, remaining, |row| {
+            let read_limit = if deleted_rows.is_some() {
+                None
+            } else {
+                remaining
+            };
+            parquet_support::stream_parquet_rows(&file_path, read_limit, |row| {
+                let this_pos = row_pos;
+                row_pos += 1;
+                if deleted_rows.as_ref().is_some_and(|d| d.contains(&this_pos)) {
+                    return Ok(());
+                }
+                if remaining.is_some_and(|r| file_rows >= r) {
+                    return Ok(());
+                }
                 let JsonValue::Object(map) = row else {
                     bail!("{file_path:?}: expected each Parquet row to decode to an object");
                 };
@@ -40308,6 +40566,53 @@ mod delta_support {
             assert!(!is_delta_commit_filename("00000000000000000000.crc"));
             assert!(!is_delta_commit_filename("_last_checkpoint"));
             assert!(!is_delta_commit_filename("0.json")); // wrong width
+        }
+
+        #[test]
+        fn z85_round_trips_the_spec_example() {
+            // ZeroMQ RFC 32's own test vector.
+            assert_eq!(
+                z85_decode("HelloWorld").unwrap(),
+                vec![0x86, 0x4F, 0xD2, 0x6F, 0xB5, 0x59, 0xF7, 0x5B]
+            );
+            assert!(z85_decode("abc").is_err());
+        }
+
+        #[test]
+        fn roaring_parses_run_array_and_bitmap_containers() {
+            // pyroaring: BitMap(range(100, 200)) | {70000, 70001}, run-optimized.
+            let hex = "3b30010001000063000100010001006400630070117111";
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut got = Vec::new();
+            let used = parse_roaring32(&bytes, |v| got.push(v)).unwrap();
+            assert_eq!(used, bytes.len());
+            let mut want: Vec<u32> = (100..200).collect();
+            want.extend([70000, 70001]);
+            assert_eq!(got, want);
+
+            // A hand-built bitmap container (cardinality 5000 > 4096).
+            let mut b = Vec::new();
+            b.extend_from_slice(&12346u32.to_le_bytes());
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(&4999u16.to_le_bytes());
+            b.extend_from_slice(&16u32.to_le_bytes());
+            let mut bits = vec![0u8; 8192];
+            for v in 0..5000usize {
+                bits[v / 8] |= 1 << (v % 8);
+            }
+            b.extend_from_slice(&bits);
+            let mut count = 0u32;
+            let mut max = 0u32;
+            parse_roaring32(&b, |v| {
+                count += 1;
+                max = max.max(v);
+            })
+            .unwrap();
+            assert_eq!((count, max), (5000, 4999));
         }
 
         #[test]

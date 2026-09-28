@@ -20,6 +20,8 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- Delta deletion vectors (inline and file-backed) are applied instead of
+  refusing the table.
 - Delta and Iceberg flatten nested struct/list/map columns into
   sub-columns; Iceberg applies equality deletes and follows renamed
   columns by field id.
