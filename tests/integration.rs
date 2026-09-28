@@ -15136,3 +15136,31 @@ fn stata_strl_values_resolve_to_their_text() {
         assert_eq!(note["missing_pct"], 25.0, "{release}");
     }
 }
+
+/// MIME decoding, checked against Python's `email` package on the same
+/// file: RFC 2047 header words, quoted-printable/base64/8-bit bodies in
+/// UTF-8 and ISO-8859-1, and a multipart/mixed message whose text comes
+/// from its plain part while its PDF lands in `attachments`.
+#[cfg(feature = "mbox")]
+#[test]
+fn mbox_decodes_mime_headers_bodies_and_attachments() {
+    let doc = run_json("edge_mbox_mime.mbox", &["--samples", "5"]);
+    let cols = table(&doc, "edge_mbox_mime");
+    assert_eq!(
+        column(cols, "Subject")["sample_values"][0],
+        "Réunion café ☕"
+    );
+    assert_eq!(
+        column(cols, "body")["sample_values"],
+        serde_json::json!([
+            "Bonjour, à demain.\n",
+            "Plain text part: see attachment.\n",
+            "Straße naïve\n",
+            "Base64 bodied ✓\n"
+        ])
+    );
+    assert_eq!(
+        column(cols, "attachments")["sample_values"],
+        serde_json::json!(["résumé.pdf"])
+    );
+}

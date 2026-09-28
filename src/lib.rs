@@ -8979,7 +8979,7 @@ fn columns_from_syslog(
 // SAS reference crate decodes through) maps them to the C1 control
 // character with the same value. Multi-byte encodings (Shift-JIS, GBK,
 // Big5, EUC-*, ISO-2022-*) aren't here and stay disclosed errors.
-#[cfg(any(feature = "dbase", feature = "sas7bdat"))]
+#[cfg(any(feature = "dbase", feature = "sas7bdat", feature = "mbox"))]
 mod codepage_support {
     // Generated from Python's own codec tables (scratchpad gen_cp.py); every
     // entry is checked against encoding_rs where encoding_rs has the encoding.
@@ -64535,12 +64535,14 @@ mod mbox_support {
     /// a time as `columns_from_mbox` streams the file - never a whole
     /// message string held in memory at once, matching the "one record
     /// at a time" shape every other streaming reader in this project
-    /// already uses.
+    /// already uses. Body lines are kept as bytes: a MIME part declares
+    /// its own charset and transfer encoding, which `finish` applies.
     struct MessageBuilder {
         envelope_sender: String,
         envelope_date: String,
         headers: Vec<(String, String)>,
-        body_lines: Vec<String>,
+        body: Vec<u8>,
+        body_has_line: bool,
         in_headers: bool,
     }
 
@@ -64555,26 +64557,26 @@ mod mbox_support {
                 envelope_sender: parts.next().unwrap_or("").to_string(),
                 envelope_date: parts.next().unwrap_or("").trim().to_string(),
                 headers: Vec::new(),
-                body_lines: Vec::new(),
+                body: Vec::new(),
+                body_has_line: false,
                 in_headers: true,
             }
         }
 
-        /// RFC 822 headers only - deliberately no MIME multipart
-        /// decoding (a `multipart/*` body's own boundary-delimited
-        /// parts are kept as one opaque `body` blob, not recursed into),
-        /// the same "isolate what's out of scope" boundary the
-        /// iCalendar/vCard readers above draw for their own unsupported
-        /// nested components.
-        fn add_line(&mut self, line: &str) -> Result<()> {
+        fn add_line(&mut self, line: &[u8]) -> Result<()> {
             if !self.in_headers {
-                self.body_lines.push(line.to_string());
+                if self.body_has_line {
+                    self.body.push(b'\n');
+                }
+                self.body.extend_from_slice(line);
+                self.body_has_line = true;
                 return Ok(());
             }
             if line.is_empty() {
                 self.in_headers = false;
                 return Ok(());
             }
+            let line = String::from_utf8_lossy(line);
             if (line.starts_with(' ') || line.starts_with('\t')) && !self.headers.is_empty() {
                 // RFC 822 §3.1.1 header folding.
                 let last = self.headers.last_mut().unwrap();
@@ -64591,8 +64593,15 @@ mod mbox_support {
             Ok(())
         }
 
+        /// Headers become columns, each with RFC 2047 encoded words
+        /// decoded (`=?UTF-8?B?...?=` in a Subject). The body is decoded
+        /// as MIME (RFC 2045/2046): the transfer encoding (base64,
+        /// quoted-printable) and charset are applied, and a multipart
+        /// message's text comes from its first `text/plain` part (else its
+        /// first `text/html` part). Attachment file names go in an
+        /// `attachments` column.
         fn finish(self) -> json_support::Map {
-            let mut map = json_support::Map::with_capacity(self.headers.len() + 3);
+            let mut map = json_support::Map::with_capacity(self.headers.len() + 4);
             map.insert(
                 "envelope_sender".to_string(),
                 JsonValue::from(self.envelope_sender),
@@ -64601,6 +64610,7 @@ mod mbox_support {
                 "envelope_date".to_string(),
                 JsonValue::from(self.envelope_date),
             );
+            let (text, attachments) = mime::message_text(&self.headers, &self.body);
             // Exact-name pooling, matching this project's own INI
             // reader - real header names are conventionally written
             // consistently within one message even though RFC 822
@@ -64609,6 +64619,7 @@ mod mbox_support {
             // `is_email`/`is_url` already make elsewhere in this
             // project.
             for (name, value) in self.headers {
+                let value = mime::decode_encoded_words(&value);
                 match map.get_mut(&name) {
                     Some(JsonValue::Array(arr)) => arr.push(JsonValue::from(value)),
                     Some(existing) => {
@@ -64620,11 +64631,530 @@ mod mbox_support {
                     }
                 }
             }
-            map.insert(
-                "body".to_string(),
-                JsonValue::from(self.body_lines.join("\n")),
-            );
+            map.insert("body".to_string(), JsonValue::from(text));
+            if !attachments.is_empty() {
+                map.insert(
+                    "attachments".to_string(),
+                    JsonValue::Array(attachments.into_iter().map(JsonValue::from).collect()),
+                );
+            }
             map
+        }
+    }
+
+    /// Lines as raw bytes (a trailing `\r` stripped), since a message body
+    /// may be in any charset - `BufRead::lines` would reject non-UTF-8.
+    struct ByteLines<R> {
+        reader: R,
+        buf: Vec<u8>,
+    }
+
+    impl<R: BufRead> ByteLines<R> {
+        fn new(reader: R) -> Self {
+            ByteLines {
+                reader,
+                buf: Vec::new(),
+            }
+        }
+
+        fn next_line(&mut self, path: &Path) -> Result<Option<&[u8]>> {
+            self.buf.clear();
+            let n = self
+                .reader
+                .read_until(b'\n', &mut self.buf)
+                .with_context(|| format!("I/O error while reading {path:?}"))?;
+            if n == 0 {
+                return Ok(None);
+            }
+            if self.buf.last() == Some(&b'\n') {
+                self.buf.pop();
+            }
+            if self.buf.last() == Some(&b'\r') {
+                self.buf.pop();
+            }
+            Ok(Some(&self.buf))
+        }
+    }
+
+    /// Just enough MIME (RFC 2045-2047, 2231) to turn a message into text.
+    mod mime {
+        use super::*;
+
+        /// Multipart nesting beyond this is read as opaque text.
+        const MAX_DEPTH: usize = 16;
+
+        fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+            headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// `type/subtype; key=value; key="quoted value"` -> the lowercased
+        /// type and its parameters (keys lowercased).
+        pub(super) fn parse_content_type(value: &str) -> (String, Vec<(String, String)>) {
+            let mut parts = split_params(value).into_iter();
+            let mime = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+            let params = parts
+                .filter_map(|p| {
+                    let (k, v) = p.split_once('=')?;
+                    let v = v.trim();
+                    let v = v
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"'))
+                        .map(|v| v.replace("\\\"", "\"").replace("\\\\", "\\"))
+                        .unwrap_or_else(|| v.to_string());
+                    Some((k.trim().to_ascii_lowercase(), v))
+                })
+                .collect();
+            (mime, params)
+        }
+
+        /// Splits on `;` outside double quotes.
+        fn split_params(s: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut cur = String::new();
+            let mut quoted = false;
+            let mut escaped = false;
+            for c in s.chars() {
+                if escaped {
+                    cur.push(c);
+                    escaped = false;
+                    continue;
+                }
+                match c {
+                    '\\' if quoted => {
+                        cur.push(c);
+                        escaped = true;
+                    }
+                    '"' => {
+                        quoted = !quoted;
+                        cur.push(c);
+                    }
+                    ';' if !quoted => out.push(std::mem::take(&mut cur)),
+                    _ => cur.push(c),
+                }
+            }
+            out.push(cur);
+            out
+        }
+
+        fn param<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// A file name from `filename`/`name`, including the RFC 2231
+        /// `filename*=utf-8''caf%C3%A9.pdf` form.
+        fn file_name(params: &[(String, String)]) -> Option<String> {
+            for key in ["filename*", "name*"] {
+                if let Some(v) = param(params, key) {
+                    let mut it = v.splitn(3, '\'');
+                    let (charset, _lang, text) = (it.next(), it.next(), it.next());
+                    if let Some(text) = text {
+                        let bytes = percent_decode(text);
+                        return Some(decode_charset(charset.unwrap_or("utf-8"), &bytes));
+                    }
+                    return Some(v.to_string());
+                }
+            }
+            ["filename", "name"]
+                .iter()
+                .find_map(|k| param(params, k))
+                .map(decode_encoded_words)
+        }
+
+        fn percent_decode(s: &str) -> Vec<u8> {
+            let b = s.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%'
+                    && i + 2 < b.len()
+                    && let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2]))
+                {
+                    out.push(h << 4 | l);
+                    i += 3;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        fn hex_val(b: u8) -> Option<u8> {
+            (b as char).to_digit(16).map(|d| d as u8)
+        }
+
+        /// Base64 with whitespace and anything outside the alphabet
+        /// skipped, the lenient reading mail readers apply.
+        pub(super) fn base64_decode(input: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(input.len() / 4 * 3);
+            let mut acc = 0u32;
+            let mut bits = 0;
+            for &c in input {
+                let v = match c {
+                    b'A'..=b'Z' => c - b'A',
+                    b'a'..=b'z' => c - b'a' + 26,
+                    b'0'..=b'9' => c - b'0' + 52,
+                    b'+' => 62,
+                    b'/' => 63,
+                    b'=' => break,
+                    _ => continue,
+                };
+                acc = acc << 6 | u32::from(v);
+                bits += 6;
+                if bits >= 8 {
+                    bits -= 8;
+                    out.push((acc >> bits) as u8);
+                }
+            }
+            out
+        }
+
+        /// Quoted-printable (RFC 2045 §6.7): `=XX` bytes and `=` soft line
+        /// breaks. With `underscore_is_space` it's RFC 2047's "Q" form.
+        pub(super) fn qp_decode(input: &[u8], underscore_is_space: bool) -> Vec<u8> {
+            let mut out = Vec::with_capacity(input.len());
+            let mut i = 0;
+            while i < input.len() {
+                match input[i] {
+                    b'=' => {
+                        let rest = &input[i + 1..];
+                        if let (Some(&h), Some(&l)) = (rest.first(), rest.get(1))
+                            && let (Some(h), Some(l)) = (hex_val(h), hex_val(l))
+                        {
+                            out.push(h << 4 | l);
+                            i += 3;
+                        } else if rest.first() == Some(&b'\n') {
+                            i += 2;
+                        } else if rest.starts_with(b"\r\n") {
+                            i += 3;
+                        } else {
+                            // A soft break with trailing whitespace before
+                            // the newline, or a stray `=`.
+                            let ws = rest
+                                .iter()
+                                .take_while(|&&b| b == b' ' || b == b'\t')
+                                .count();
+                            if rest.get(ws) == Some(&b'\n') {
+                                i += 2 + ws;
+                            } else {
+                                out.push(b'=');
+                                i += 1;
+                            }
+                        }
+                    }
+                    b'_' if underscore_is_space => {
+                        out.push(b' ');
+                        i += 1;
+                    }
+                    b => {
+                        out.push(b);
+                        i += 1;
+                    }
+                }
+            }
+            out
+        }
+
+        /// Bytes in a named charset to text: UTF-8 and ASCII directly,
+        /// ISO-8859-1/Latin-1 as Windows-1252 (the WHATWG reading every
+        /// mail client applies), any other single-byte charset through
+        /// `codepage_support`, and an unknown one as lossy UTF-8.
+        pub(super) fn decode_charset(charset: &str, bytes: &[u8]) -> String {
+            let cs = charset
+                .trim()
+                .trim_matches('"')
+                .to_ascii_uppercase()
+                .replace('_', "-");
+            let key = match cs.as_str() {
+                "" | "UTF-8" | "UTF8" | "US-ASCII" | "ASCII" => {
+                    return String::from_utf8_lossy(bytes).into_owned();
+                }
+                "ISO-8859-1" | "LATIN1" | "LATIN-1" | "CP1252" | "WINDOWS-1252" => "WINDOWS-1252",
+                "ISO-8859-9" => "WINDOWS-1254",
+                "ISO-8859-11" | "TIS-620" => "WINDOWS-874",
+                "KOI8R" => "KOI8-R",
+                "KOI8U" => "KOI8-U",
+                other => other,
+            };
+            let key = if let Some(n) = key.strip_prefix("CP")
+                && n.starts_with("125")
+            {
+                format!("WINDOWS-{n}")
+            } else {
+                key.to_string()
+            };
+            match codepage_support::table(&key) {
+                Some(t) => codepage_support::decode(t, bytes),
+                None => String::from_utf8_lossy(bytes).into_owned(),
+            }
+        }
+
+        /// RFC 2047 `=?charset?B|Q?text?=` words decoded in place;
+        /// whitespace between two adjacent encoded words is dropped, as
+        /// the RFC says. Malformed words are left as written.
+        pub(super) fn decode_encoded_words(value: &str) -> String {
+            if !value.contains("=?") {
+                return value.to_string();
+            }
+            let mut out = String::with_capacity(value.len());
+            let mut rest = value;
+            let mut last_was_word = false;
+            while let Some(start) = rest.find("=?") {
+                let (before, from) = rest.split_at(start);
+                let decoded = decode_one_word(from);
+                match decoded {
+                    Some((text, used)) => {
+                        if !(last_was_word && before.trim().is_empty()) {
+                            out.push_str(before);
+                        }
+                        out.push_str(&text);
+                        rest = &from[used..];
+                        last_was_word = true;
+                    }
+                    None => {
+                        out.push_str(before);
+                        out.push_str("=?");
+                        rest = &from[2..];
+                        last_was_word = false;
+                    }
+                }
+            }
+            out.push_str(rest);
+            out
+        }
+
+        /// One encoded word at the start of `s`: its text and byte length.
+        fn decode_one_word(s: &str) -> Option<(String, usize)> {
+            let body = s.strip_prefix("=?")?;
+            let (charset_raw, body) = body.split_once('?')?;
+            let (enc, body) = body.split_once('?')?;
+            let end = body.find("?=")?;
+            let text = &body[..end];
+            if charset_raw.is_empty() || text.contains(' ') {
+                return None;
+            }
+            // `charset*language` (RFC 2231 §5).
+            let charset = charset_raw.split('*').next().unwrap_or(charset_raw);
+            let bytes = match enc {
+                "B" | "b" => base64_decode(text.as_bytes()),
+                "Q" | "q" => qp_decode(text.as_bytes(), true),
+                _ => return None,
+            };
+            let used = 2 + charset_raw.len() + 1 + enc.len() + 1 + end + 2;
+            Some((decode_charset(charset, &bytes), used))
+        }
+
+        fn transfer_decode(encoding: Option<&str>, body: &[u8]) -> Vec<u8> {
+            match encoding.map(|e| e.trim().to_ascii_lowercase()).as_deref() {
+                Some("base64") => base64_decode(body),
+                Some("quoted-printable") => qp_decode(body, false),
+                _ => body.to_vec(),
+            }
+        }
+
+        /// Splits a part's raw bytes into its headers and body.
+        fn split_part(raw: &[u8]) -> (Vec<(String, String)>, &[u8]) {
+            let mut headers: Vec<(String, String)> = Vec::new();
+            let mut pos = 0;
+            while pos < raw.len() {
+                let end = raw[pos..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(raw.len(), |e| pos + e);
+                let line = &raw[pos..end];
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                pos = (end + 1).min(raw.len());
+                if line.is_empty() {
+                    return (headers, &raw[pos..]);
+                }
+                let line = String::from_utf8_lossy(line);
+                if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
+                    let last = headers.last_mut().unwrap();
+                    last.1.push(' ');
+                    last.1.push_str(line.trim_start());
+                } else if let Some((n, v)) = line.split_once(':') {
+                    headers.push((n.trim().to_string(), v.trim().to_string()));
+                } else {
+                    // Not a header block after all: all body.
+                    return (Vec::new(), raw);
+                }
+            }
+            (headers, &raw[raw.len()..])
+        }
+
+        /// The parts of a multipart body, between `--boundary` lines up to
+        /// the closing `--boundary--` (the preamble and epilogue dropped).
+        fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
+            let delim = format!("--{boundary}");
+            let mut parts = Vec::new();
+            let mut start: Option<usize> = None;
+            let mut pos = 0;
+            while pos <= body.len() {
+                let end = body[pos..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(body.len(), |e| pos + e);
+                let line = &body[pos..end];
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                let trimmed = line.trim_ascii_end();
+                if trimmed.starts_with(delim.as_bytes()) {
+                    let tail = &trimmed[delim.len()..];
+                    if tail.is_empty() || tail == b"--" {
+                        if let Some(s) = start {
+                            // The newline before a delimiter belongs to it.
+                            let mut e = pos.saturating_sub(1).max(s);
+                            if e > s && body[e - 1] == b'\r' {
+                                e -= 1;
+                            }
+                            parts.push(&body[s..e]);
+                        }
+                        if tail == b"--" {
+                            return parts;
+                        }
+                        start = Some((end + 1).min(body.len()));
+                    }
+                }
+                if end >= body.len() {
+                    break;
+                }
+                pos = end + 1;
+            }
+            // No closing delimiter: keep the last open part.
+            if let Some(s) = start
+                && s < body.len()
+            {
+                parts.push(&body[s..]);
+            }
+            parts
+        }
+
+        #[derive(Default)]
+        struct Found {
+            plain: Option<String>,
+            html: Option<String>,
+            attachments: Vec<String>,
+        }
+
+        fn walk(headers: &[(String, String)], body: &[u8], depth: usize, found: &mut Found) {
+            let (mime, params) = header(headers, "Content-Type")
+                .map(parse_content_type)
+                .unwrap_or_else(|| ("text/plain".to_string(), Vec::new()));
+            let disposition = header(headers, "Content-Disposition").map(parse_content_type);
+            if mime.starts_with("multipart/")
+                && depth < MAX_DEPTH
+                && let Some(boundary) = param(&params, "boundary")
+            {
+                for part in split_multipart(body, boundary) {
+                    let (h, b) = split_part(part);
+                    walk(&h, b, depth + 1, found);
+                }
+                return;
+            }
+            let attachment_name = disposition
+                .as_ref()
+                .and_then(|(_, p)| file_name(p))
+                .or_else(|| file_name(&params));
+            let is_attachment = disposition.as_ref().is_some_and(|(d, _)| d == "attachment")
+                || (attachment_name.is_some() && !mime.starts_with("text/"));
+            if is_attachment {
+                found
+                    .attachments
+                    .push(attachment_name.unwrap_or_else(|| format!("({mime})")));
+                return;
+            }
+            if mime == "message/rfc822" && depth < MAX_DEPTH {
+                let raw = transfer_decode(header(headers, "Content-Transfer-Encoding"), body);
+                let (h, b) = split_part(&raw);
+                walk(&h, b, depth + 1, found);
+                return;
+            }
+            let slot = match mime.as_str() {
+                "text/plain" => &mut found.plain,
+                "text/html" => &mut found.html,
+                _ => {
+                    if !mime.starts_with("text/") {
+                        found
+                            .attachments
+                            .push(attachment_name.unwrap_or_else(|| format!("({mime})")));
+                    }
+                    return;
+                }
+            };
+            if slot.is_none() {
+                let raw = transfer_decode(header(headers, "Content-Transfer-Encoding"), body);
+                *slot = Some(decode_charset(
+                    param(&params, "charset").unwrap_or(""),
+                    &raw,
+                ));
+            }
+        }
+
+        /// A message's text and its attachments' file names. A message
+        /// with no MIME headers reads exactly as before: its body lines,
+        /// lossily UTF-8.
+        pub(super) fn message_text(
+            headers: &[(String, String)],
+            body: &[u8],
+        ) -> (String, Vec<String>) {
+            if header(headers, "Content-Type").is_none()
+                && header(headers, "Content-Transfer-Encoding").is_none()
+            {
+                return (String::from_utf8_lossy(body).into_owned(), Vec::new());
+            }
+            let mut found = Found::default();
+            walk(headers, body, 0, &mut found);
+            let text = found.plain.or(found.html).unwrap_or_default();
+            (text, found.attachments)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn encoded_words_decode_and_adjacent_ones_join() {
+                assert_eq!(decode_encoded_words("=?UTF-8?B?Y2Fmw6k=?="), "café");
+                assert_eq!(
+                    decode_encoded_words("=?ISO-8859-1?Q?caf=E9_au_lait?="),
+                    "café au lait"
+                );
+                assert_eq!(
+                    decode_encoded_words("Re: =?UTF-8?Q?a?= =?UTF-8?Q?b?= end"),
+                    "Re: ab end"
+                );
+                assert_eq!(decode_encoded_words("no =?bad words"), "no =?bad words");
+            }
+
+            #[test]
+            fn quoted_printable_and_base64() {
+                assert_eq!(
+                    qp_decode(b"caf=C3=A9 soft=\nbreak", false),
+                    "café softbreak".as_bytes()
+                );
+                assert_eq!(base64_decode(b"aGVs\nbG8="), b"hello");
+            }
+
+            #[test]
+            fn multipart_picks_plain_text_and_lists_attachments() {
+                let headers = vec![(
+                    "Content-Type".to_string(),
+                    "multipart/mixed; boundary=\"XX\"".to_string(),
+                )];
+                let body = b"preamble\n--XX\nContent-Type: text/html\n\n<p>hi</p>\n--XX\n\
+Content-Type: multipart/alternative; boundary=YY\n\n--YY\nContent-Type: text/plain; charset=utf-8\n\
+Content-Transfer-Encoding: quoted-printable\n\nH=C3=A9llo\n--YY--\n--XX\n\
+Content-Type: application/pdf; name=\"r.pdf\"\nContent-Disposition: attachment; filename*=utf-8''r%C3%A9sum%C3%A9.pdf\n\
+Content-Transfer-Encoding: base64\n\nJVBERg==\n--XX--\nepilogue\n";
+                let (text, att) = message_text(&headers, body);
+                assert_eq!(text, "Héllo");
+                assert_eq!(att, vec!["résumé.pdf".to_string()]);
+            }
         }
     }
 
@@ -64653,10 +65183,9 @@ mod mbox_support {
         let mut prev_blank = true; // the start of the file counts as "preceded by a blank line"
         let mut any_message = false;
 
-        for line in reader.lines() {
-            let line = line.with_context(|| format!("I/O error while reading {path:?}"))?;
-            let line = line.strip_suffix('\r').unwrap_or(&line).to_string();
-            if prev_blank && line.starts_with("From ") {
+        let mut lines = ByteLines::new(reader);
+        while let Some(line) = lines.next_line(path)? {
+            if prev_blank && line.starts_with(b"From ") {
                 if let Some(builder) = current.take() {
                     profiler.push(&JsonValue::from(builder.finish()));
                     seen += 1;
@@ -64666,14 +65195,14 @@ mod mbox_support {
                     }
                 }
                 any_message = true;
-                current = Some(MessageBuilder::new(&line));
+                current = Some(MessageBuilder::new(&String::from_utf8_lossy(line)));
                 prev_blank = false;
                 continue;
             }
             prev_blank = line.is_empty();
             if let Some(builder) = current.as_mut() {
                 builder
-                    .add_line(&line)
+                    .add_line(line)
                     .with_context(|| format!("{path:?}: malformed message #{}", seen + 1))?;
             }
         }
@@ -64726,13 +65255,12 @@ mod mbox_support {
         let mut prev_blank = true;
         let mut any_message = false;
 
-        for line in reader.lines() {
+        let mut lines = ByteLines::new(reader);
+        while let Some(line) = lines.next_line(path)? {
             if sink.done {
                 break;
             }
-            let line = line.with_context(|| format!("I/O error while reading {path:?}"))?;
-            let line = line.strip_suffix('\r').unwrap_or(&line).to_string();
-            if prev_blank && line.starts_with("From ") {
+            if prev_blank && line.starts_with(b"From ") {
                 if let Some(builder) = current.take() {
                     json_emit_row_for_sql(
                         &JsonValue::from(builder.finish()),
@@ -64746,14 +65274,14 @@ mod mbox_support {
                     }
                 }
                 any_message = true;
-                current = Some(MessageBuilder::new(&line));
+                current = Some(MessageBuilder::new(&String::from_utf8_lossy(line)));
                 prev_blank = false;
                 continue;
             }
             prev_blank = line.is_empty();
             if let Some(builder) = current.as_mut() {
                 builder
-                    .add_line(&line)
+                    .add_line(line)
                     .with_context(|| format!("{path:?}: malformed message"))?;
             }
         }

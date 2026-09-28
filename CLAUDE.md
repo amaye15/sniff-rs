@@ -5514,11 +5514,22 @@ flattener**, rather than reimplementing recursion per format:
   mboxrd/mboxcl2 quoting conventions exist), then each message's own
   RFC 822 headers (with header folding, and a repeated header like
   `Received:` pooling into an array the same way vCard/iCalendar's
-  shared module already does) become that message's own record. No MIME
-  multipart decoding at all - a `multipart/*` body's own boundary-
-  delimited parts stay one opaque `body` string, the same "isolate
-  what's out of scope" scope boundary the iCalendar reader's own VALARM
-  handling already draws.
+  shared module already does) become that message's own record. A later
+  pass added MIME (the `mime` submodule): header values have RFC 2047
+  encoded words decoded; the body is read as bytes (a message may be in
+  any charset, which `BufRead::lines` would reject) and decoded by its
+  transfer encoding (base64, quoted-printable) and charset (UTF-8,
+  ISO-8859-1 read as Windows-1252 per WHATWG, other single-byte charsets
+  through `codepage_support`, anything else lossy UTF-8); a multipart
+  message's `body` is its first `text/plain` part (else `text/html`),
+  found by recursing through nested multiparts and `message/rfc822`
+  parts (16 levels), and every attachment's file name (RFC 2231
+  `filename*` included) lands in an `attachments` column. A message with
+  no `Content-Type` or `Content-Transfer-Encoding` reads exactly as
+  before, and every pre-existing MBOX fixture's output is byte-identical.
+  `edge_mbox_mime.mbox` was built with Python's `email` package and its
+  subjects, bodies, and attachment names match that package's own
+  `get_body`/`iter_attachments` read of the same file.
 - XML is the one exception to "bridge via a ready-made dynamic Value type" -
   an XML element can carry attributes, text, and child elements all at
   once, which doesn't map onto a single generic enum the way

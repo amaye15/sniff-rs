@@ -20,6 +20,9 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- MBOX decodes MIME: RFC 2047 header words, base64/quoted-printable
+  bodies in their declared charset, the plain-text part of multipart
+  messages, and an `attachments` column of file names.
 - Stata `strL` long strings resolve to their text (releases 117-119)
   instead of a placeholder.
 - dBase memo fields read from their `.dbt`/`.fpt` file (dBase III/IV,
