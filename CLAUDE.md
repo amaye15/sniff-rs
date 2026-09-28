@@ -5063,9 +5063,19 @@ gives an absent value - while a genuinely present value keeps going
 through the normal `current_type`/`ideal_type` split (a Stata `double`
 column pandas wrote to hold one `NaN` alongside otherwise-integer data is
 exactly this tool's "missing values never fake a type change" principle
-in someone else's file format). A `strL` long-string reference needs a
-second read pass over a different file section to resolve, which this
-tool doesn't do, so it's a visible placeholder rather than a silent drop.
+in someone else's file format). A `strL` long-string cell holds a
+`(v, o)` reference into the `<strls>` section that follows the data; the
+reader locates that section through the XML `<map>` (its eleventh
+offset), reads every `GSO` record into a table first, then resolves each
+reference (`(0, 0)` is an empty strL, so missing). Release 117 stores the
+reference as two u32s; 118 and 119 split 8 bytes into a 2- or 3-byte `v`
+and the rest `o`, little-endian - the split pandas uses; a big-endian
+118/119 strL is refused, since nothing available writes one to verify
+against. Verified with pandas-written files at all three releases
+(`edge_stata_strl_{117,118,119}.dta`: a short strL, a 3,000-byte one, an
+empty one, and a non-ASCII one), matching pandas' own read back - including
+the release-117 file, where pandas writes UTF-8 bytes that both readers
+decode as Windows-1252.
 Variable and value labels - Stata's own human-authored variable
 descriptions and coded-value names (`1`/`2`/`3` meaning
 `"male"`/`"female"`/`"other"`) - aren't surfaced; see Known limitations.
@@ -12870,8 +12880,8 @@ this project could just implement directly rather than depend on:
        schema, and records, never writing, never the separate `.dct`
        dictionary format, never async I/O, never value labels or
        characteristics *content* (only their byte *extent*, to skip past
-       them), and never strL *resolution* (just recognizing the reference
-       shape). Scoping to exactly this usage surface - rather than porting
+       them), and originally never strL *resolution* (a later pass added
+       it - see the Architecture section's Stata entry). Scoping to exactly this usage surface - rather than porting
        the crate wholesale - is what kept an otherwise 18-release format
        tractable to hand-roll at all.
     2. **Missing-value detection never needs the crate's own 27-variant

@@ -11302,10 +11302,9 @@ fn columns_from_dbase(
 // per-value flag in the file format, not something this tool infers - a
 // Missing value is simply omitted from raw_values, the same way every
 // other reader here treats an absent/blank value. A `strL` long-string
-// reference needs a second read pass over a separate file section to
-// resolve (not just the row bytes already in hand), which this tool
-// doesn't do - it's represented as a visible placeholder rather than
-// silently dropped or guessed at. Variable/value labels (Stata's own
+// cell holds a reference into the `<strls>` section after the data; that
+// table is read first (`read_strl_table`) and each reference resolved to
+// its text. Variable/value labels (Stata's own
 // human-authored variable descriptions and coded-value names, e.g.
 // 1/2/3 meaning "male"/"female"/"other") aren't surfaced - see CLAUDE.md's
 // Known limitations. The reader itself (`stata_support`) is hand-rolled -
@@ -11795,7 +11794,10 @@ mod stata_support {
     /// path - the one this project's usage takes - never actually
     /// consults those offsets, only `seek_records`'s alternative
     /// direct-seek path would).
-    fn read_schema(r: &mut R, preamble: &Preamble) -> Result<(Vec<VariableType>, Vec<String>)> {
+    fn read_schema(
+        r: &mut R,
+        preamble: &Preamble,
+    ) -> Result<(Vec<VariableType>, Vec<String>, Option<u64>)> {
         let release = preamble.release;
         let bo = preamble.byte_order;
         let xml = release.is_xml_like();
@@ -11809,9 +11811,19 @@ mod stata_support {
                 )
             })?;
 
+        // The XML `<map>` lists 14 section offsets; the eleventh is
+        // `<strls>`, the long-string table strL values point into (it
+        // comes after `<data>`, so it's read up front by
+        // `read_strl_table`).
+        let mut strls_offset = None;
         if xml {
             r.expect_bytes(b"<map>")?;
-            r.skip(14 * 8)?;
+            for i in 0..14 {
+                let off = r.read_u64(preamble.byte_order)?;
+                if i == 10 {
+                    strls_offset = Some(off);
+                }
+            }
             r.expect_bytes(b"</map>")?;
         }
 
@@ -11881,7 +11893,91 @@ mod stata_support {
             b"</variable_labels>",
         )?;
 
-        Ok((variable_types, variable_names))
+        Ok((variable_types, variable_names, strls_offset))
+    }
+
+    /// strL values keyed by their `(v, o)` pair - variable and observation
+    /// number, the reference a strL cell holds in `<data>`.
+    type StrlTable = HashMap<(u32, u64), String>;
+
+    /// Reads the `<strls>` section: a run of `GSO` records, each `v`
+    /// (u32), `o` (u32 in release 117, u64 from 118), a type byte (130
+    /// text, null-terminated; 129 binary), a u32 length, and the bytes -
+    /// the layout Stata's own dta_117/dta_118 specifications give, and
+    /// the one pandas' `_read_strls` reads. Text decodes as UTF-8 from
+    /// 118 and Windows-1252 before, like every other string here; binary
+    /// content is read as lossy UTF-8.
+    fn read_strl_table(path: &Path, preamble: &Preamble, offset: u64) -> Result<StrlTable> {
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = R {
+            inner: BufReader::new(file),
+        };
+        r.inner
+            .seek(SeekFrom::Start(offset))
+            .context("failed seeking to the Stata <strls> section")?;
+        r.expect_bytes(b"<strls>")?;
+        let bo = preamble.byte_order;
+        let wide_o = preamble.release.0 >= 118;
+        let utf8 = preamble.release.default_encoding_is_utf8();
+        let mut table = StrlTable::new();
+        loop {
+            let tag = r.read_exact_buf(3)?;
+            if tag == b"</s" {
+                r.expect_bytes(b"trls>")?;
+                break;
+            }
+            if tag != b"GSO" {
+                bail!(
+                    "expected a GSO record in the Stata <strls> section, found {:?}",
+                    String::from_utf8_lossy(&tag)
+                );
+            }
+            let v = r.read_u32(bo)?;
+            let o = if wide_o {
+                r.read_u64(bo)?
+            } else {
+                u64::from(r.read_u32(bo)?)
+            };
+            let t = r.read_u8()?;
+            let len = r.read_u32(bo)? as usize;
+            if len > MAX_ROW_LEN {
+                bail!("Stata strL of {len} bytes is out of a sane range");
+            }
+            let mut data = r.read_exact_buf(len)?;
+            let text = if t == 130 {
+                if data.last() == Some(&0) {
+                    data.pop();
+                }
+                decode_text(&data, utf8)?
+            } else {
+                String::from_utf8_lossy(&data).into_owned()
+            };
+            table.insert((v, o), text);
+        }
+        Ok(table)
+    }
+
+    /// The `(v, o)` reference a strL cell holds: two u32s in release 117;
+    /// from 118, `v` in the first 2 bytes (3 in 119) and `o` in the rest,
+    /// little-endian (pandas splits the same 8 bytes the same way). A
+    /// big-endian 118/119 file is refused rather than guessed: neither
+    /// specification nor any available writer pins down that byte layout.
+    fn strl_ref(bytes: &[u8], release: Release, bo: ByteOrder) -> Result<(u32, u64)> {
+        if release.0 == 117 {
+            let v = bo.u32([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let o = bo.u32([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            return Ok((v, u64::from(o)));
+        }
+        if matches!(bo, ByteOrder::Big) {
+            bail!("big-endian Stata strL values (release 118+) aren't supported");
+        }
+        let vs = if release.0 == 118 { 2 } else { 3 };
+        let le = |b: &[u8]| {
+            b.iter()
+                .rev()
+                .fold(0u64, |acc, &x| (acc << 8) | u64::from(x))
+        };
+        Ok((le(&bytes[..vs]) as u32, le(&bytes[vs..8])))
     }
 
     fn read_fixed_string_array(
@@ -11994,6 +12090,7 @@ mod stata_support {
         release: Release,
         bo: ByteOrder,
         utf8: bool,
+        strls: &StrlTable,
     ) -> Result<Option<String>> {
         Ok(match vt {
             VariableType::Byte => {
@@ -12073,14 +12170,33 @@ mod stata_support {
                     Some(trimmed.to_string())
                 }
             }
-            VariableType::LongString => Some("<strL: long string not resolved>".to_string()),
+            VariableType::LongString => {
+                let key = strl_ref(bytes, release, bo)?;
+                if key == (0, 0) {
+                    None
+                } else {
+                    let s = strls.get(&key).ok_or_else(|| {
+                        anyhow!("Stata strL reference {key:?} has no entry in the <strls> section")
+                    })?;
+                    let trimmed = s.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                }
+            }
         })
     }
 
     /// `(reader, preamble, variable_types, variable_names, row_len, utf8)`,
     /// named here purely to keep `open_stata_for_records`'s signature
     /// readable (`clippy::type_complexity`).
-    type StataRecordSource = (R, Preamble, Vec<VariableType>, Vec<String>, usize, bool);
+    type StataRecordSource = (
+        R,
+        Preamble,
+        Vec<VariableType>,
+        Vec<String>,
+        usize,
+        bool,
+        StrlTable,
+    );
 
     /// Reads everything before the first observation row - the header,
     /// the variable schema, the characteristics section, and (for the
@@ -12097,8 +12213,15 @@ mod stata_support {
 
         let preamble = read_header(&mut r)
             .with_context(|| format!("failed reading the header of {path:?}"))?;
-        let (variable_types, variable_names) = read_schema(&mut r, &preamble)
+        let (variable_types, variable_names, strls_offset) = read_schema(&mut r, &preamble)
             .with_context(|| format!("failed reading the schema of {path:?}"))?;
+        let strls = match strls_offset {
+            Some(off) if variable_types.contains(&VariableType::LongString) => {
+                read_strl_table(path, &preamble, off)
+                    .with_context(|| format!("failed reading the strL table of {path:?}"))?
+            }
+            _ => StrlTable::new(),
+        };
         skip_characteristics(&mut r, preamble.release, preamble.byte_order)
             .with_context(|| format!("failed skipping characteristics in {path:?}"))?;
 
@@ -12113,7 +12236,15 @@ mod stata_support {
         }
 
         let utf8 = preamble.release.default_encoding_is_utf8();
-        Ok((r, preamble, variable_types, variable_names, row_len, utf8))
+        Ok((
+            r,
+            preamble,
+            variable_types,
+            variable_names,
+            row_len,
+            utf8,
+            strls,
+        ))
     }
 
     pub(crate) fn columns_from_stata(
@@ -12121,7 +12252,7 @@ mod stata_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let (mut r, preamble, variable_types, variable_names, row_len, utf8) =
+        let (mut r, preamble, variable_types, variable_names, row_len, utf8, strls) =
             open_stata_for_records(path)?;
 
         // One `ColumnAccumulatorState` per variable (the same shared,
@@ -12155,6 +12286,7 @@ mod stata_support {
                     preamble.release,
                     preamble.byte_order,
                     utf8,
+                    &strls,
                 )
                 .with_context(|| format!("failed decoding a record from {path:?}"))?;
                 if let Some(s) = value {
@@ -12197,7 +12329,7 @@ mod stata_support {
         path: &Path,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
-        let (mut r, preamble, variable_types, _variable_names, row_len, utf8) =
+        let (mut r, preamble, variable_types, _variable_names, row_len, utf8, strls) =
             open_stata_for_records(path)?;
 
         for _ in 0..preamble.observation_count {
@@ -12219,6 +12351,7 @@ mod stata_support {
                     preamble.release,
                     preamble.byte_order,
                     utf8,
+                    &strls,
                 )
                 .with_context(|| format!("failed decoding a record from {path:?}"))?;
                 row.push(value);

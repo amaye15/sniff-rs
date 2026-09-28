@@ -20,6 +20,8 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- Stata `strL` long strings resolve to their text (releases 117-119)
+  instead of a placeholder.
 - dBase memo fields read from their `.dbt`/`.fpt` file (dBase III/IV,
   FoxPro, Visual FoxPro) instead of refusing the file.
 - dBase and SAS7BDAT decode legacy single-byte code pages (DOS, Windows,

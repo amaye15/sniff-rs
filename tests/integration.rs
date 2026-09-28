@@ -15110,3 +15110,29 @@ fn sas7bdat_reads_a_windows_1251_file() {
     let cols = table(&doc, "sas7bdat_pandas_windows1251");
     assert_eq!(column(cols, "Date1")["ideal_type"], "NaiveDate / DateTime");
 }
+
+/// A strL cell resolves through the `<strls>` table at every release that
+/// has one; files written by pandas (`convert_strl`).
+#[cfg(feature = "stata")]
+#[test]
+fn stata_strl_values_resolve_to_their_text() {
+    for (release, accented) in [
+        (117, "cafÃ© naÃ¯ve"),
+        (118, "café naïve"),
+        (119, "café naïve"),
+    ] {
+        let stem = format!("edge_stata_strl_{release}");
+        let doc = run_json(&format!("{stem}.dta"), &["--samples", "5"]);
+        let note = column(table(&doc, &stem), "note");
+        let samples: Vec<&str> = note["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(samples[0], "short strL", "{release}");
+        assert_eq!(samples[1], "x".repeat(3000), "{release}");
+        assert_eq!(samples[2], accented, "{release}");
+        assert_eq!(note["missing_pct"], 25.0, "{release}");
+    }
+}
