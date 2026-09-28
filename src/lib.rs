@@ -4732,6 +4732,183 @@ impl NumericStats {
     }
 }
 
+/// One declared foreign-key target of a column: `table.column`, as a
+/// database's own schema states it (today: SQLite `REFERENCES`/`FOREIGN
+/// KEY` clauses). Ground truth, not a heuristic - the graph layer turns it
+/// into a `declared` edge.
+#[derive(Clone, Debug, PartialEq)]
+struct ColumnRef {
+    table: String,
+    column: String,
+    /// The whole key when this pair is one column of a composite foreign
+    /// key, as (referencing column, referenced column) pairs in declared
+    /// order - `shipments.(o, l) -> order_lines.(order_id, line_no)` - and
+    /// empty for a one-column key. A join on one pair alone is wrong.
+    composite: Vec<(String, String)>,
+}
+
+/// How many of a column's smallest distinct value hashes a `ValueSketch`
+/// keeps. 128 gives a distinct-count and containment estimate within about
+/// 1/sqrt(128) = 9% (KMV's standard error), for 1 KB of JSON per column.
+const VALUE_SKETCH_K: usize = 128;
+
+/// A bounded "k minimum values" (KMV) sketch of one column's distinct
+/// values (Bar-Yossef et al., 2002; Beyer et al., 2007): every non-null
+/// value is hashed to 32 bits and only the `VALUE_SKETCH_K` smallest
+/// distinct hashes are kept, in ascending order. Memory is fixed however
+/// long the column is, and it is built in the same streaming pass as the
+/// rest of the profile - no second read of the data.
+///
+/// Two things fall out of it. The column's distinct count: exact while
+/// fewer than `k` hashes are held, else `(k-1) / (h_k / 2^32)`. And
+/// containment between two columns (`contained_in`): every hash of `A` at
+/// or below `B`'s largest kept hash is a value `B` would have kept if it
+/// held it, so the share of those found in `B`'s sketch estimates the
+/// share of `A`'s distinct values present in `B` - an inclusion
+/// dependency, the value-level signature of a foreign key.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ValueSketch {
+    /// Non-null values pushed (not distinct).
+    count: usize,
+    /// The smallest distinct 32-bit hashes, ascending, at most `k`.
+    hashes: Vec<u32>,
+}
+
+impl ValueSketch {
+    /// FNV-1a over the value's bytes, finished with the splitmix64 mixer so
+    /// every output bit depends on every input bit (FNV alone leaves short
+    /// inputs' high bits poorly mixed, and KMV reads the high bits).
+    fn hash(v: &str) -> u32 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in v.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 27;
+        h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        (h >> 32) as u32
+    }
+
+    /// Folds one non-null value in. Values are compared exactly as the
+    /// reader rendered them, trimmed - `"1"` from one table and `"1"` from
+    /// another meet, `"001"` and `"1"` do not.
+    fn push(&mut self, v: &str) {
+        let v = v.trim();
+        if v.is_empty() {
+            return;
+        }
+        self.count += 1;
+        let h = Self::hash(v);
+        if self.hashes.len() == VALUE_SKETCH_K && h >= *self.hashes.last().expect("k > 0") {
+            return;
+        }
+        if let Err(pos) = self.hashes.binary_search(&h) {
+            self.hashes.insert(pos, h);
+            if self.hashes.len() > VALUE_SKETCH_K {
+                self.hashes.pop();
+            }
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.hashes.len() >= VALUE_SKETCH_K
+    }
+
+    /// Estimated distinct non-null values: exact below `k`, the KMV
+    /// estimator at `k`.
+    fn distinct(&self) -> f64 {
+        if !self.is_full() {
+            return self.hashes.len() as f64;
+        }
+        let kth = f64::from(*self.hashes.last().expect("full")) + 1.0;
+        (VALUE_SKETCH_K as f64 - 1.0) * (4_294_967_296.0 / kth)
+    }
+
+    /// Whether (almost) every value is distinct - the shape of a key. Exact
+    /// for a column with fewer than `k` distinct values; within the
+    /// estimator's error beyond that: with a ~9% standard error a truly
+    /// unique column can estimate well below its count, so anything
+    /// estimated 80%+ distinct reads as unique. Callers never lean on this
+    /// alone - a referenced key also has to look like one by name or
+    /// position (see `discovered_reference`).
+    fn looks_unique(&self) -> bool {
+        if self.count == 0 {
+            return false;
+        }
+        if !self.is_full() {
+            return self.hashes.len() == self.count;
+        }
+        self.distinct() >= 0.8 * self.count as f64
+    }
+
+    /// Estimated share of this column's distinct values that also occur in
+    /// `other`, with how many of this column's hashes that estimate rests
+    /// on. `None` when nothing is comparable (either side empty, or none of
+    /// this column's kept hashes falls in the range `other` covers).
+    fn contained_in(&self, other: &ValueSketch) -> Option<(f64, usize)> {
+        if self.hashes.is_empty() || other.hashes.is_empty() {
+            return None;
+        }
+        let limit = if other.is_full() {
+            *other.hashes.last().expect("non-empty")
+        } else {
+            u32::MAX
+        };
+        let mut seen = 0usize;
+        let mut hit = 0usize;
+        for h in self.hashes.iter().take_while(|h| **h <= limit) {
+            seen += 1;
+            if other.hashes.binary_search(h).is_ok() {
+                hit += 1;
+            }
+        }
+        (seen > 0).then(|| (hit as f64 / seen as f64, seen))
+    }
+
+    fn to_json(&self) -> json_support::Value {
+        use json_support::{Map, Value};
+        let mut obj = Map::with_capacity(3);
+        obj.insert("count".to_string(), Value::from(self.count));
+        obj.insert(
+            "distinct".to_string(),
+            Value::from(self.distinct().round() as u64),
+        );
+        let mut hex = String::with_capacity(self.hashes.len() * 8);
+        for h in &self.hashes {
+            hex.push_str(&format!("{h:08x}"));
+        }
+        obj.insert("hashes".to_string(), Value::from(hex));
+        Value::Object(obj)
+    }
+
+    /// Reads back `to_json`'s shape. Anything malformed (odd hex length,
+    /// non-hex characters, hashes out of order) is `None`: a sketch that
+    /// cannot be trusted is treated as absent, never repaired by guessing.
+    fn from_json(v: &json_support::Value) -> Option<ValueSketch> {
+        let json_support::Value::Object(obj) = v else {
+            return None;
+        };
+        let count = obj.get("count")?.as_f64()? as usize;
+        let json_support::Value::String(hex) = obj.get("hashes")? else {
+            return None;
+        };
+        if hex.len() % 8 != 0 || hex.len() / 8 > VALUE_SKETCH_K {
+            return None;
+        }
+        let mut hashes = Vec::with_capacity(hex.len() / 8);
+        for i in (0..hex.len()).step_by(8) {
+            hashes.push(u32::from_str_radix(hex.get(i..i + 8)?, 16).ok()?);
+        }
+        if hashes.windows(2).any(|w| w[0] >= w[1]) {
+            return None;
+        }
+        Some(ValueSketch { count, hashes })
+    }
+}
+
 // `Clone` is needed by `render_sql_inline_flat`'s own JSON-specific
 // column-filtering step (building an owned, struct-column-excluded
 // subset before the rest of that function's already-shared code runs) -
@@ -4782,6 +4959,14 @@ struct ColumnProfile {
     // the same "one engine at a time" rollout this project's own inline-
     // SQL and streaming-reads campaigns already established).
     numeric_stats: Option<NumericStats>,
+    /// Declared foreign keys this column carries (empty for every format
+    /// with no schema-level constraints) - see `ColumnRef`.
+    references: Vec<ColumnRef>,
+    /// Bounded sketch of the column's distinct values, for key-domain
+    /// columns (integers, text, identifiers) - see `ValueSketch` and
+    /// `sketch_worth_keeping`. `None` for measurements and attributes, and
+    /// for dictionaries written before sketches existed.
+    value_sketch: Option<ValueSketch>,
 }
 
 // This project used to have a hand-rolled `impl serde::Serialize for
@@ -4850,8 +5035,57 @@ impl ColumnProfile {
                 None => Value::Null,
             },
         );
+        // Appended after `numeric_stats`, per the same convention: the
+        // graph layer's declared keys and value sketches postdate it.
+        obj.insert(
+            "references".to_string(),
+            Value::Array(
+                self.references
+                    .iter()
+                    .map(|r| {
+                        let mut m = Map::with_capacity(3);
+                        m.insert("table".to_string(), Value::from(r.table.clone()));
+                        m.insert("column".to_string(), Value::from(r.column.clone()));
+                        // Only written for a composite key, so a one-column
+                        // reference keeps its original two-field shape.
+                        if !r.composite.is_empty() {
+                            m.insert(
+                                "composite".to_string(),
+                                Value::Array(
+                                    r.composite
+                                        .iter()
+                                        .map(|(l, t)| {
+                                            Value::Array(vec![
+                                                Value::from(l.clone()),
+                                                Value::from(t.clone()),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        Value::Object(m)
+                    })
+                    .collect(),
+            ),
+        );
+        obj.insert(
+            "value_sketch".to_string(),
+            match &self.value_sketch {
+                Some(sketch) => sketch.to_json(),
+                None => Value::Null,
+            },
+        );
         Value::Object(obj)
     }
+}
+
+/// Whether a column with this `ideal_type` gets a value sketch: only where
+/// a join key can live (`JoinBase::is_key_domain`) - measurements, flags,
+/// dates, and pooled arrays never join, so a sketch of them would only
+/// grow the JSON.
+fn sketch_worth_keeping(ideal_type: &str) -> bool {
+    join_base(ideal_type).is_some_and(|b| b.is_key_domain())
 }
 
 #[cfg(test)]
@@ -4870,6 +5104,8 @@ mod column_profile_to_json_tests {
             notes: "leading zeros".to_string(),
             row_count: 2,
             numeric_stats: None,
+            references: Vec::new(),
+            value_sketch: None,
         };
         let json_support::Value::Object(obj) = p.to_json() else {
             panic!("expected an Object");
@@ -4886,7 +5122,9 @@ mod column_profile_to_json_tests {
                 "sample_values",
                 "notes",
                 "row_count",
-                "numeric_stats"
+                "numeric_stats",
+                "references",
+                "value_sketch"
             ]
         );
         assert_eq!(
@@ -4912,6 +5150,8 @@ mod column_profile_to_json_tests {
             notes: "".to_string(),
             row_count: 5,
             numeric_stats: None,
+            references: Vec::new(),
+            value_sketch: None,
         };
         // `to_json()` rendered through the hand-rolled pretty-printer,
         // then parsed by a genuinely independent reference implementation
@@ -5142,6 +5382,8 @@ mod numeric_stats_tests {
                     ("p99".to_string(), 2.5),
                 ],
             }),
+            references: Vec::new(),
+            value_sketch: None,
         };
         let text = json_support::to_pretty_string(&p.to_json());
         let via_real: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -7327,6 +7569,7 @@ struct ColumnAccumulatorState {
     naive_acc: NaiveTypeAccumulator,
     numeric_acc: NumericStatsAccumulator,
     samples: Vec<String>,
+    sketch: ValueSketch,
 }
 
 impl ColumnAccumulatorState {
@@ -7337,6 +7580,7 @@ impl ColumnAccumulatorState {
             naive_acc: NaiveTypeAccumulator::new(),
             numeric_acc: NumericStatsAccumulator::new(),
             samples: Vec::new(),
+            sketch: ValueSketch::default(),
         }
     }
 
@@ -7362,6 +7606,7 @@ impl ColumnAccumulatorState {
         // consults this accumulator's own result once `ideal_type` has
         // already been decided to be `"i64"`/`"f64"`.
         self.numeric_acc.push(&field);
+        self.sketch.push(&field);
         self.total_non_null += 1;
     }
 
@@ -7408,6 +7653,7 @@ impl ColumnAccumulatorState {
             naive_acc: _,
             numeric_acc,
             samples,
+            sketch,
         } = self;
         let missing = total.saturating_sub(total_non_null);
         let missing_pct = round1(if total > 0 {
@@ -7440,6 +7686,7 @@ impl ColumnAccumulatorState {
         } else {
             None
         };
+        let value_sketch = sketch_worth_keeping(&ideal_type).then_some(sketch);
         ColumnProfile {
             name,
             current_type,
@@ -7450,6 +7697,8 @@ impl ColumnAccumulatorState {
             notes,
             row_count: total,
             numeric_stats,
+            references: Vec::new(),
+            value_sketch,
         }
     }
 }
@@ -15182,6 +15431,8 @@ mod orc_support {
                     notes: note,
                     row_count: total,
                     numeric_stats: None,
+                    references: Vec::new(),
+                    value_sketch: None,
                 });
                 continue;
             }
@@ -15793,6 +16044,7 @@ struct JsonPathAccumulator {
     // the un-wrapped, pre-`Vec<>` ideal type is exactly `"i64"`/`"f64"` -
     // see that method's own comment.
     numeric_acc: NumericStatsAccumulator,
+    sketch: ValueSketch,
     scalar_samples: Vec<String>,
     object_samples: Vec<String>,
     /// Child accumulators in first-seen key order, mirroring
@@ -15813,6 +16065,7 @@ impl JsonPathAccumulator {
             object_count: 0,
             ideal_acc: IdealTypeAccumulator::new(),
             numeric_acc: NumericStatsAccumulator::new(),
+            sketch: ValueSketch::default(),
             scalar_samples: Vec::new(),
             object_samples: Vec::new(),
             child_order: Vec::new(),
@@ -15897,6 +16150,7 @@ impl JsonPathAccumulator {
         self.scalar_count += 1;
         self.ideal_acc.push(s);
         self.numeric_acc.push(s);
+        self.sketch.push(s);
         if self.scalar_samples.len() < self.n_samples && !self.scalar_samples.iter().any(|x| x == s)
         {
             self.scalar_samples.push(s.to_string());
@@ -15922,6 +16176,8 @@ impl JsonPathAccumulator {
                 notes: "column is empty/all null".to_string(),
                 row_count: total,
                 numeric_stats: None,
+                references: Vec::new(),
+                value_sketch: None,
             }];
         }
 
@@ -15991,6 +16247,9 @@ impl JsonPathAccumulator {
             self.object_samples
         };
 
+        // Pooled arrays wrap to `Vec<T>` and never get a sketch: an
+        // element of an array isn't a row's own join key.
+        let value_sketch = sketch_worth_keeping(&ideal_type).then_some(self.sketch);
         let mut result = vec![ColumnProfile {
             name: name.clone(),
             current_type,
@@ -16001,6 +16260,8 @@ impl JsonPathAccumulator {
             notes,
             row_count: total,
             numeric_stats,
+            references: Vec::new(),
+            value_sketch,
         }];
 
         if self.object_count > 0 {
@@ -64696,6 +64957,8 @@ mod npy_support {
                     notes: format!("array '{array_name}' could not be profiled: {e}"),
                     row_count: 0, // unreadable - no real row count is knowable
                     numeric_stats: None,
+                    references: Vec::new(),
+                    value_sketch: None,
                 }],
             };
             out.push((array_name, profiles));
@@ -65654,6 +65917,121 @@ mod sqlite_support {
         // the one affinity that needs special handling on *read*, not
         // just at write time (see `apply_affinity`).
         real_affinity: Vec<bool>,
+        /// Declared primary-key columns, in key order: an inline
+        /// `PRIMARY KEY` column constraint or a table-level
+        /// `PRIMARY KEY (...)` clause. A bare `REFERENCES t` (no column
+        /// list) names exactly these.
+        primary_key: Vec<String>,
+        /// Declared foreign keys, one entry per referencing column:
+        /// (local column, referenced table, referenced column). A composite
+        /// `FOREIGN KEY (a, b) REFERENCES t (x, y)` becomes the two pairs
+        /// `a -> x` and `b -> y`; the fourth element numbers the clause each
+        /// pair came from, so the pairs of one composite key stay together.
+        foreign_keys: Vec<(String, String, FkTarget, usize)>,
+    }
+
+    /// The referenced column of one declared foreign-key pair: named in the
+    /// clause, or - `REFERENCES t` with no column list - the `n`th column of
+    /// `t`'s primary key, resolved once every table's schema is parsed.
+    #[derive(Clone, Debug, PartialEq)]
+    enum FkTarget {
+        Named(String),
+        PrimaryKey(usize),
+    }
+
+    /// Reads a parenthesized, comma-separated identifier list whose `(` is
+    /// the first non-whitespace character at or after `start`, returning the
+    /// identifiers and the index right after the closing `)`.
+    fn parse_identifier_list(s: &[char], start: usize, end: usize) -> Option<(Vec<String>, usize)> {
+        let mut i = start;
+        while i < end && s[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= end || s[i] != '(' {
+            return None;
+        }
+        let close = find_matching_paren(&s[..end], i)?;
+        let mut names = Vec::new();
+        for (a, b) in split_top_level_commas(s, i + 1, close) {
+            // `col COLLATE nocase` / `col DESC` inside an index-style list:
+            // only the leading identifier is the column.
+            let (name, _) = extract_identifier(s, a, b)?;
+            names.push(name);
+        }
+        Some((names, close + 1))
+    }
+
+    /// Like `first_keyword_boundary`, but never looks inside a quoted
+    /// string or identifier (`'...'`, `"..."`, `` `...` ``, `[...]`): a
+    /// `DEFAULT 'references x(y)'` or a column named `"primary"` must not
+    /// read as the keyword. Returns `end` when there is no match.
+    fn find_keyword_outside_quotes(s: &[char], start: usize, end: usize, kw: &str) -> usize {
+        let mut i = start;
+        while i < end {
+            match s[i] {
+                '\'' | '"' | '`' => {
+                    let quote = s[i];
+                    i += 1;
+                    while i < end {
+                        if s[i] == quote {
+                            if i + 1 < end && s[i + 1] == quote {
+                                i += 2;
+                                continue;
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                '[' => {
+                    while i < end && s[i] != ']' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                c if c.is_alphanumeric() || c == '_' => {
+                    let word_start = i;
+                    while i < end && (s[i].is_alphanumeric() || s[i] == '_') {
+                        i += 1;
+                    }
+                    if s[word_start..i]
+                        .iter()
+                        .collect::<String>()
+                        .eq_ignore_ascii_case(kw)
+                    {
+                        return word_start;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        end
+    }
+
+    /// Parses the `REFERENCES <table> [(<col>, ...)]` clause of a foreign
+    /// key whose `REFERENCES` keyword starts the search at `start`. A
+    /// schema-qualified target (`main.customers`) keeps only the table
+    /// name, since sniff-rs profiles one database file at a time.
+    fn parse_references_clause(
+        s: &[char],
+        start: usize,
+        end: usize,
+    ) -> Option<(String, Vec<String>)> {
+        let kw = find_keyword_outside_quotes(s, start, end, "references");
+        if kw >= end {
+            return None;
+        }
+        let (mut table, mut after) = extract_identifier(s, kw + "references".len(), end)?;
+        if after < end && s[after] == '.' {
+            let (t, a) = extract_identifier(s, after + 1, end)?;
+            table = t;
+            after = a;
+        }
+        let cols = parse_identifier_list(s, after, end)
+            .map(|(c, _)| c)
+            .unwrap_or_default();
+        Some((table, cols))
     }
 
     fn contains_word(haystack: &str, word: &str) -> bool {
@@ -66017,6 +66395,9 @@ mod sqlite_support {
         let mut real_affinity = Vec::new();
         let mut inline_rowid_alias = None;
         let mut pk_constraint_text: Option<String> = None;
+        let mut primary_key: Vec<String> = Vec::new();
+        let mut foreign_keys: Vec<(String, String, FkTarget, usize)> = Vec::new();
+        let mut fk_clauses = 0usize;
 
         for (item_start, item_end) in items {
             let text: String = chars[item_start..item_end].iter().collect();
@@ -66030,7 +66411,36 @@ mod sqlite_support {
                 || lower.starts_with("check")
                 || lower.starts_with("constraint");
             if is_table_constraint {
-                if contains_word(&lower, "primary") && contains_word(&lower, "key") {
+                let fk_kw = find_keyword_outside_quotes(&chars, item_start, item_end, "foreign");
+                if fk_kw < item_end {
+                    let key_kw = find_keyword_outside_quotes(&chars, fk_kw, item_end, "key");
+                    if let Some((locals, after)) =
+                        parse_identifier_list(&chars, key_kw + "key".len(), item_end)
+                        && let Some((table, targets)) =
+                            parse_references_clause(&chars, after, item_end)
+                    {
+                        for (i, local) in locals.into_iter().enumerate() {
+                            // A target list shorter than the local list is
+                            // malformed SQL - the unmatched pair is dropped.
+                            let target = if targets.is_empty() {
+                                FkTarget::PrimaryKey(i)
+                            } else {
+                                match targets.get(i) {
+                                    Some(t) => FkTarget::Named(t.clone()),
+                                    None => continue,
+                                }
+                            };
+                            foreign_keys.push((local, table.clone(), target, fk_clauses));
+                        }
+                        fk_clauses += 1;
+                    }
+                } else if contains_word(&lower, "primary") && contains_word(&lower, "key") {
+                    let pk_kw = find_keyword_outside_quotes(&chars, item_start, item_end, "key");
+                    if let Some((cols, _)) =
+                        parse_identifier_list(&chars, pk_kw + "key".len(), item_end)
+                    {
+                        primary_key = cols;
+                    }
                     pk_constraint_text = Some(text);
                 }
                 continue;
@@ -66066,6 +66476,21 @@ mod sqlite_support {
                 if !contains_word(&rest_lower[after_primary..], "desc") {
                     inline_rowid_alias = Some(columns.len());
                 }
+            }
+            // Column constraints: `PRIMARY KEY` and `REFERENCES t(c)`
+            // (optionally behind `CONSTRAINT <name>`). The constraint text
+            // starts at the type/constraint boundary, so a column literally
+            // named `references` is never mistaken for the keyword.
+            if find_keyword_outside_quotes(&chars, type_end, item_end, "primary") < item_end {
+                primary_key = vec![name.clone()];
+            }
+            if let Some((table, targets)) = parse_references_clause(&chars, type_end, item_end) {
+                let target = match targets.into_iter().next() {
+                    Some(t) => FkTarget::Named(t),
+                    None => FkTarget::PrimaryKey(0),
+                };
+                foreign_keys.push((name.clone(), table, target, fk_clauses));
+                fk_clauses += 1;
             }
             col_types_are_integer.push(type_is_integer);
             columns.push(name);
@@ -66113,6 +66538,8 @@ mod sqlite_support {
             },
             without_rowid,
             real_affinity,
+            primary_key,
+            foreign_keys,
         })
     }
 
@@ -66272,6 +66699,82 @@ mod sqlite_support {
         .with_context(|| format!("failed reading rows for table '{table_name}'"))
     }
 
+    /// Resolves one table's declared foreign keys to real (local column,
+    /// target) pairs, names spelled exactly as the schema defines them.
+    /// SQLite matches table and column names case-insensitively, so this
+    /// does too. A foreign key naming a table or column that doesn't exist
+    /// (legal in SQLite - enforcement is off by default and checked only at
+    /// write time) is dropped rather than reported as a real key, and so is
+    /// a bare `REFERENCES t` whose table declares no primary key (it would
+    /// point at the hidden rowid, which is no column here).
+    fn resolve_foreign_keys(
+        parsed: &ParsedTable,
+        entries: &[SchemaEntry],
+        parsed_all: &[Option<ParsedTable>],
+    ) -> Vec<(String, ColumnRef)> {
+        let mut out: Vec<(String, ColumnRef, usize)> = Vec::new();
+        for (local, table, target, clause) in &parsed.foreign_keys {
+            let Some(local) = parsed
+                .columns
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(local))
+            else {
+                continue;
+            };
+            let Some(t_idx) = entries
+                .iter()
+                .position(|e| e.name.eq_ignore_ascii_case(table))
+            else {
+                continue;
+            };
+            let Some(t_parsed) = &parsed_all[t_idx] else {
+                continue;
+            };
+            let wanted = match target {
+                FkTarget::Named(c) => c.as_str(),
+                FkTarget::PrimaryKey(i) => match t_parsed.primary_key.get(*i) {
+                    Some(c) => c.as_str(),
+                    None => continue,
+                },
+            };
+            let Some(column) = t_parsed
+                .columns
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(wanted))
+            else {
+                continue;
+            };
+            out.push((
+                local.clone(),
+                ColumnRef {
+                    table: entries[t_idx].name.clone(),
+                    column: column.clone(),
+                    composite: Vec::new(),
+                },
+                *clause,
+            ));
+        }
+        // A clause that resolved to two or more pairs is one composite key:
+        // every pair carries the whole key, so no single column of it ever
+        // reads as a complete join on its own.
+        let key_of = |clause: usize| -> Vec<(String, String)> {
+            out.iter()
+                .filter(|(_, _, c)| *c == clause)
+                .map(|(l, r, _)| (l.clone(), r.column.clone()))
+                .collect()
+        };
+        let keys: Vec<Vec<(String, String)>> = out.iter().map(|(_, _, c)| key_of(*c)).collect();
+        out.into_iter()
+            .zip(keys)
+            .map(|((local, mut r, _), key)| {
+                if key.len() > 1 {
+                    r.composite = key;
+                }
+                (local, r)
+            })
+            .collect()
+    }
+
     pub(crate) fn columns_from_sqlite(
         path: &Path,
         nrows: Option<usize>,
@@ -66300,10 +66803,34 @@ mod sqlite_support {
             bail!("no user tables found in {path:?}");
         }
 
+        // Every table's schema, parsed once up front: a declared foreign key
+        // names another table, whose own column list (or primary key, for a
+        // bare `REFERENCES t`) resolves the target.
+        let parsed_all: Vec<Option<ParsedTable>> = entries
+            .iter()
+            .map(|e| parse_create_table(&e.sql).ok())
+            .collect();
+        let resolved_fks: Vec<Vec<(String, ColumnRef)>> = parsed_all
+            .iter()
+            .map(|parsed| match parsed {
+                Some(p) => resolve_foreign_keys(p, &entries, &parsed_all),
+                None => Vec::new(),
+            })
+            .collect();
+
         let mut out = Vec::new();
-        for entry in entries {
+        for (entry, fks) in entries.into_iter().zip(resolved_fks) {
             let profiles = match profile_table(&mut file, &header, &entry, nrows, n_samples, path) {
-                Ok(p) => p,
+                Ok(mut p) => {
+                    for (local, target) in fks {
+                        if let Some(col) = p.iter_mut().find(|c| c.name == local)
+                            && !col.references.contains(&target)
+                        {
+                            col.references.push(target);
+                        }
+                    }
+                    p
+                }
                 Err(e) => vec![ColumnProfile {
                     name: "value".to_string(),
                     current_type: "unknown".to_string(),
@@ -66314,11 +66841,113 @@ mod sqlite_support {
                     notes: format!("table '{}' could not be profiled: {e}", entry.name),
                     row_count: 0, // unreadable - no real row count is knowable
                     numeric_stats: None,
+                    references: Vec::new(),
+                    value_sketch: None,
                 }],
             };
             out.push((entry.name, profiles));
         }
         Ok(out)
+    }
+
+    #[cfg(test)]
+    mod declared_key_tests {
+        use super::*;
+
+        #[test]
+        fn parses_inline_table_level_and_named_foreign_keys() {
+            let t = parse_create_table(
+                "CREATE TABLE t (\n\
+                   id INTEGER PRIMARY KEY,\n\
+                   a INT REFERENCES users(uid) ON DELETE CASCADE,\n\
+                   \"b col\" TEXT CONSTRAINT fk_b REFERENCES [Groups] ([gid]),\n\
+                   c INT REFERENCES staff, -- bare: staff's primary key\n\
+                   d INT, e INT,\n\
+                   note TEXT DEFAULT 'references x(y)',\n\
+                   CONSTRAINT fk_de FOREIGN KEY (d, e) REFERENCES pairs (p, q)\n\
+                 )",
+            )
+            .unwrap();
+            assert_eq!(t.primary_key, vec!["id".to_string()]);
+            assert_eq!(
+                t.foreign_keys,
+                vec![
+                    ("a".into(), "users".into(), FkTarget::Named("uid".into()), 0),
+                    (
+                        "b col".into(),
+                        "Groups".into(),
+                        FkTarget::Named("gid".into()),
+                        1
+                    ),
+                    ("c".into(), "staff".into(), FkTarget::PrimaryKey(0), 2),
+                    ("d".into(), "pairs".into(), FkTarget::Named("p".into()), 3),
+                    ("e".into(), "pairs".into(), FkTarget::Named("q".into()), 3),
+                ]
+            );
+        }
+
+        #[test]
+        fn composite_bare_reference_maps_positionally_onto_the_primary_key() {
+            let t = parse_create_table(
+                "CREATE TABLE s (o INT, l INT, FOREIGN KEY (o, l) REFERENCES lines)",
+            )
+            .unwrap();
+            assert_eq!(
+                t.foreign_keys,
+                vec![
+                    ("o".into(), "lines".into(), FkTarget::PrimaryKey(0), 0),
+                    ("l".into(), "lines".into(), FkTarget::PrimaryKey(1), 0),
+                ]
+            );
+            let lines = parse_create_table(
+                "CREATE TABLE lines (order_id INT, line_no INT, PRIMARY KEY (order_id, line_no))",
+            )
+            .unwrap();
+            assert_eq!(lines.primary_key, vec!["order_id", "line_no"]);
+        }
+
+        #[test]
+        fn a_column_named_like_the_keyword_is_not_a_foreign_key() {
+            let t = parse_create_table("CREATE TABLE t (\"references\" TEXT, x INT)").unwrap();
+            assert!(t.foreign_keys.is_empty());
+        }
+
+        #[test]
+        fn resolution_is_case_insensitive_and_drops_what_does_not_exist() {
+            let sqls = [
+                ("Staff", "CREATE TABLE Staff (Id INTEGER PRIMARY KEY)"),
+                ("nokey", "CREATE TABLE nokey (v INT)"),
+                (
+                    "t",
+                    "CREATE TABLE t (a INT REFERENCES staff(ID), b INT REFERENCES gone(x), \
+                     c INT REFERENCES staff(missing), d INT REFERENCES nokey)",
+                ),
+            ];
+            let entries: Vec<SchemaEntry> = sqls
+                .iter()
+                .map(|(n, q)| SchemaEntry {
+                    name: n.to_string(),
+                    rootpage: 2,
+                    sql: q.to_string(),
+                })
+                .collect();
+            let parsed: Vec<Option<ParsedTable>> = entries
+                .iter()
+                .map(|e| parse_create_table(&e.sql).ok())
+                .collect();
+            let fks = resolve_foreign_keys(parsed[2].as_ref().unwrap(), &entries, &parsed);
+            assert_eq!(
+                fks,
+                vec![(
+                    "a".to_string(),
+                    ColumnRef {
+                        table: "Staff".into(),
+                        column: "Id".into(),
+                        composite: Vec::new(),
+                    }
+                )]
+            );
+        }
     }
 } // mod sqlite_support
 
@@ -67503,6 +68132,16 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         None
     };
 
+    // The same bounded value sketch the incremental engines build as they
+    // go, here over the already-resident values.
+    let value_sketch = (!col.skip_heuristics && sketch_worth_keeping(&ideal_type)).then(|| {
+        let mut sketch = ValueSketch::default();
+        for v in non_null {
+            sketch.push(v);
+        }
+        sketch
+    });
+
     ColumnProfile {
         name: col.name,
         current_type: col.current_type,
@@ -67513,6 +68152,8 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         notes,
         row_count: col.total,
         numeric_stats,
+        references: Vec::new(),
+        value_sketch,
     }
 }
 
@@ -68009,19 +68650,38 @@ fn tables_to_json(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> json_support
 // on any realistic directory, so there is no cap and no truncation to
 // disclose.
 
-/// How a join-candidate edge was established - Graphify's own edge
-/// vocabulary, applied to data instead of code.
+/// Which tier established a join edge, strongest first:
+///   - `Declared`: the source's own schema states the key (a SQLite
+///     `REFERENCES`/`FOREIGN KEY` clause). Ground truth, probability 1.
+///   - `Discovered`: the data shows it - the referencing column's values
+///     are (almost) all found in a unique referenced column (an inclusion
+///     dependency, measured on `ValueSketch`es) - and the edge clears the
+///     probability threshold.
+///   - `Probable`: names and types make it more likely than not, per the
+///     Fellegi-Sunter model in `edge_probability`, with no value-level
+///     confirmation available or found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Confidence {
-    Extracted,
-    Inferred,
+    Declared,
+    Discovered,
+    Probable,
 }
 
 impl Confidence {
     fn as_str(self) -> &'static str {
         match self {
-            Confidence::Extracted => "extracted",
-            Confidence::Inferred => "inferred",
+            Confidence::Declared => "declared",
+            Confidence::Discovered => "discovered",
+            Confidence::Probable => "probable",
+        }
+    }
+
+    /// 0 is strongest - used to break ties between parallel edges.
+    fn rank(self) -> u8 {
+        match self {
+            Confidence::Declared => 0,
+            Confidence::Discovered => 1,
+            Confidence::Probable => 2,
         }
     }
 }
@@ -68030,10 +68690,11 @@ impl Confidence {
 /// tables. `from_*` is always the lexicographically smaller
 /// (table, column) pair, so the same logical edge serializes identically
 /// regardless of which table was profiled first. `reference` is `Some`
-/// exactly for foreign-key-pattern edges, where the data itself declares
-/// an orientation (the `<stem>_id` side references the bare-`id` side,
-/// many-to-one); every other edge is genuinely undirected and carries
-/// `None`, rather than a guessed direction.
+/// whenever the names say which side owns the key - the bare-`id` side of
+/// a foreign-key pattern, the original of a role-prefixed key, or the one
+/// table named for (or uniquely leading with) an exactly shared key; every
+/// other edge is genuinely undirected and carries `None`, rather than a
+/// guessed direction.
 struct Relationship {
     from_table: String,
     from_column: String,
@@ -68044,6 +68705,15 @@ struct Relationship {
     context: EdgeContext,
     evidence: Vec<String>,
     reason: String,
+    /// BM25-style relevance within this input (see `edge_score`): orders
+    /// edges, never gates them.
+    score: f64,
+    /// Probability the edge is a real join: 1.0 when declared, otherwise
+    /// the Fellegi-Sunter posterior over `features` (`edge_probability`).
+    probability: f64,
+    /// The comparison vector the probability was computed from. Internal:
+    /// not serialized, only the probability it produces is.
+    features: EdgeFeatures,
 }
 
 /// The orientation of a foreign-key-pattern edge: `referencing_*` names
@@ -68063,10 +68733,22 @@ struct Reference {
 /// link is still listed with full evidence - it only labels the pair so a
 /// god-table ranking with forty same-schema links reads honestly instead
 /// of mistaking repetition for importance.
+///
+/// `SharedReference` is the third reading: two columns that both
+/// reference the same owning table (`orders.customer_id` and
+/// `invoices.customer_id`, with a `customers` table present that owns
+/// that key). The direct link is real - the join works - but it is
+/// derived from the two references to the hub, not an independent
+/// relationship of its own. Counting it as a bridge turns every star
+/// schema into a clique (ten fact tables sharing `customer_id` would give
+/// each other nine "bridges" and bury the real hub); labelling it keeps the
+/// graph a star, the way the data is actually designed, while `path` can
+/// still take the direct hop.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EdgeContext {
     Bridge,
     DuplicateSchema,
+    SharedReference,
 }
 
 impl EdgeContext {
@@ -68074,13 +68756,44 @@ impl EdgeContext {
         match self {
             EdgeContext::Bridge => "bridge",
             EdgeContext::DuplicateSchema => "duplicate_schema",
+            EdgeContext::SharedReference => "shared_reference",
+        }
+    }
+
+    /// Rendered suffix for a Markdown row or path hop: bridges read plain,
+    /// every other context is marked, never hidden.
+    fn md_note(self) -> &'static str {
+        match self {
+            EdgeContext::Bridge => "",
+            EdgeContext::DuplicateSchema => " [duplicate-schema link]",
+            EdgeContext::SharedReference => " [shared-reference link]",
+        }
+    }
+
+    /// Listing order: the informative edges first. Bridges, then
+    /// shared-reference links (real joins, derived from a hub), then
+    /// duplicate-schema copies.
+    fn sort_rank(self) -> u8 {
+        match self {
+            EdgeContext::Bridge => 0,
+            EdgeContext::SharedReference => 1,
+            EdgeContext::DuplicateSchema => 2,
         }
     }
 }
 
 impl Relationship {
+    /// The tier as a reader sees it in Markdown: `declared`, or the tier
+    /// with its probability (`probable 0.93`).
+    fn tier_label(&self) -> String {
+        match self.confidence {
+            Confidence::Declared => "declared".to_string(),
+            c => format!("{} {:.2}", c.as_str(), self.probability),
+        }
+    }
+
     fn to_json(&self) -> JsonValue {
-        let mut obj = json_support::Map::with_capacity(9);
+        let mut obj = json_support::Map::with_capacity(11);
         obj.insert(
             "from_table".to_string(),
             JsonValue::from(self.from_table.clone()),
@@ -68144,6 +68857,13 @@ impl Relationship {
             "context".to_string(),
             JsonValue::from(self.context.as_str().to_string()),
         );
+        // Appended after `context`, per the same convention.
+        obj.insert("score".to_string(), JsonValue::from(self.score));
+        // Appended after `score`, per the same convention.
+        obj.insert(
+            "probability".to_string(),
+            JsonValue::from((self.probability * 1000.0).round() / 1000.0),
+        );
         JsonValue::Object(obj)
     }
 }
@@ -68178,16 +68898,125 @@ fn canon_name(name: &str) -> String {
     out
 }
 
-/// Best-effort singularization for comparison only (never surfaced): one
-/// trailing `s` off, unless the word is short or ends in `ss`. Consistently
-/// wrong on words like `status` is harmless here, since both sides get the
-/// identical treatment and only equality of the results is ever tested.
-fn singular(word: &str) -> &str {
-    if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
-        &word[..word.len() - 1]
-    } else {
-        word
+/// Every plausible singular reading of `word`, for comparison only (never
+/// surfaced): the word itself, one trailing `s` off, one trailing `es`
+/// off, and `ies` -> `y`, plus a handful of irregular plurals common in
+/// table names. Two names are the same noun when their reading sets
+/// intersect (`same_noun`), so `categories` meets `category`, `boxes`
+/// meets `box`, and `caches` still meets `cache` - a single "strip the
+/// plural" rule cannot get all three right, since English does not say
+/// which of `-s`/`-es` a word took. Short words and `-ss` endings keep
+/// only themselves, so `bus`/`class` never lose a letter.
+fn singular_forms(word: &str) -> Vec<String> {
+    let mut forms = vec![word.to_string()];
+    let n = word.len();
+    let irregular = match word {
+        "people" => Some("person"),
+        "children" => Some("child"),
+        "men" => Some("man"),
+        "women" => Some("woman"),
+        "data" => Some("datum"),
+        _ => None,
+    };
+    if let Some(s) = irregular {
+        forms.push(s.to_string());
     }
+    if n > 3 && word.ends_with('s') && !word.ends_with("ss") {
+        forms.push(word[..n - 1].to_string());
+        if n > 4 && word.ends_with("es") {
+            forms.push(word[..n - 2].to_string());
+        }
+        if n > 4 && word.ends_with("ies") {
+            forms.push(format!("{}y", &word[..n - 3]));
+        }
+    }
+    forms
+}
+
+/// Whether two canonical names are the same noun up to pluralization.
+fn same_noun(a: &str, b: &str) -> bool {
+    let fa = singular_forms(a);
+    singular_forms(b).iter().any(|f| fa.contains(f))
+}
+
+/// Conventional warehouse/staging prefixes and suffixes that decorate a
+/// table name without changing which entity it holds: `dim_customer` and
+/// `customer_dim` both hold customers, `stg_orders` holds orders. Stripped
+/// only as whole `_`-separated segments, never as a substring.
+const TABLE_PREFIXES: &[&str] = &[
+    "dim_", "fact_", "fct_", "tbl_", "stg_", "raw_", "src_", "ref_", "lkp_", "lookup_",
+];
+const TABLE_SUFFIXES: &[&str] = &["_dim", "_tbl", "_table", "_lookup", "_master"];
+
+/// Every entity stem one table name can stand for, canonicalized: the whole
+/// name, its last `--combine` qualifier segment (`<file>__<table>`, split on
+/// the RAW name because canonicalization would erase the `__` boundary),
+/// and each of those with one warehouse prefix/suffix stripped. A genuinely
+/// single-underscore table (`order_items`) takes no segment fallback, so an
+/// `item_id` elsewhere is never force-matched to it.
+fn table_stems(raw: &str) -> Vec<String> {
+    let mut bases = vec![canon_name(raw)];
+    if let Some(last) = raw.rsplit("__").next()
+        && last != raw
+    {
+        bases.push(canon_name(last));
+    }
+    let mut stems = Vec::new();
+    for base in bases {
+        if base.is_empty() {
+            continue;
+        }
+        for p in TABLE_PREFIXES {
+            if let Some(rest) = base.strip_prefix(p)
+                && !rest.is_empty()
+            {
+                stems.push(rest.to_string());
+            }
+        }
+        for s in TABLE_SUFFIXES {
+            if let Some(rest) = base.strip_suffix(s)
+                && !rest.is_empty()
+            {
+                stems.push(rest.to_string());
+            }
+        }
+        stems.push(base);
+    }
+    stems
+}
+
+/// Whether `table` is named after `stem` (up to pluralization and
+/// warehouse decoration) - i.e. the table holds the entity `stem` names.
+fn table_is_named_for(table_raw: &str, stem: &str) -> bool {
+    table_stems(table_raw).iter().any(|t| same_noun(t, stem))
+}
+
+/// Column names that are every table's own surrogate key rather than a
+/// reference to anything: `users.id` and `orders.id` share a name because
+/// both tables have a primary key, not because one joins the other. Two
+/// such columns in unrelated tables are two different entities' ids that
+/// merely use the same counter range, so an exact-name match between them
+/// is not evidence of a join (see `join_candidate`). Pandas' nameless
+/// index column (`Unnamed: 0`, `index`, `level_0`) is the same shape.
+fn is_surrogate_key_name(canon: &str) -> bool {
+    matches!(
+        canon,
+        "id" | "uuid"
+            | "guid"
+            | "pk"
+            | "key"
+            | "oid"
+            | "rowid"
+            | "row_id"
+            | "row"
+            | "row_num"
+            | "row_number"
+            | "index"
+            | "idx"
+            | "level_0"
+    ) || canon
+        .strip_prefix("unnamed_")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Strip one trailing key-like suffix (`user_id` -> `user`). Longest suffix
@@ -68250,6 +69079,34 @@ impl JoinBase {
     /// across unrelated tables far too often for that to mean anything.
     fn is_identifier_domain(&self) -> bool {
         matches!(self, JoinBase::Uuid | JoinBase::Ulid | JoinBase::Email)
+    }
+
+    /// Domains a join key can live in. Measurements and attributes -
+    /// floats, booleans, timestamps, times of day, coordinates, geometry,
+    /// schedules, colors, version strings - are shared by unrelated tables
+    /// constantly (`amount`, `active`, `created_at` appear everywhere) and
+    /// nobody joins on them, so between two different schemas they never
+    /// form an edge. Between two copies of one schema (`DuplicateSchema`)
+    /// every shared column still links, since there the whole row lines up.
+    /// Star-schema date joins go through an integer or text `date_key`,
+    /// which stays a key domain.
+    fn is_key_domain(&self) -> bool {
+        match self {
+            JoinBase::Int
+            | JoinBase::PlainString
+            | JoinBase::Uuid
+            | JoinBase::Ulid
+            | JoinBase::Email => true,
+            JoinBase::Float | JoinBase::Bool | JoinBase::Date | JoinBase::Time => false,
+            JoinBase::OtherSemantic(s) => !matches!(
+                s.as_str(),
+                "Geographic Coordinates"
+                    | "WKT Geometry"
+                    | "Cron Expression"
+                    | "Hex Color"
+                    | "SemVer"
+            ),
+        }
     }
 }
 
@@ -68314,26 +69171,243 @@ fn join_compatible(a: &JoinBase, b: &JoinBase) -> bool {
 }
 
 /// The conventional `users.id <- orders.user_id` foreign-key shape: one
-/// side is a bare `id` column, the other ends in `_id` with a stem matching
-/// the id side's table (singular-insensitive). The `__`-segment fallback
-/// exists for `--combine`-qualified names (`<file>__<table>`): it splits
-/// the RAW table name, because canonicalization collapses separator runs
-/// and would erase the qualifier boundary first. A genuinely
-/// single-underscore table (`order_items`) never takes this fallback, so
-/// an `item_id` elsewhere cannot be force-matched to it - only to a real
-/// `items` table.
-fn fk_stem_matches(id_table_raw: &str, other_col_canon: &str) -> bool {
-    let stem = match other_col_canon.strip_suffix("_id") {
-        Some(s) if !s.is_empty() => s,
-        _ => return false,
-    };
-    if singular(stem) == singular(&canon_name(id_table_raw)) {
-        return true;
+/// side is a bare surrogate key (`id`, `uuid`, `pk`, ...), the other is a
+/// key-suffixed name (`_id`, `_uuid`, `_key`, ...) whose stem names the
+/// surrogate side's table - up to pluralization (`category_id` ->
+/// `categories`) and warehouse decoration (`customer_id` -> `dim_customer`).
+/// See `table_stems` for the `--combine` qualifier handling and why a
+/// single-underscore table (`order_items`) never takes a segment fallback.
+///
+/// A role-prefixed name (`parent_user_id`, `created_by_user_id`) matches
+/// when the stem's last segment names the table: the role says which
+/// user, the entity says which table. Returns the matched entity segment
+/// when that fallback was needed, so the evidence can say so.
+fn fk_stem_matches(id_table_raw: &str, other_col_canon: &str) -> Option<Option<String>> {
+    let stem = strip_id_suffix(other_col_canon);
+    if stem == other_col_canon {
+        return None;
     }
-    match id_table_raw.rsplit("__").next() {
-        Some(last) if last != id_table_raw => singular(stem) == singular(&canon_name(last)),
-        _ => false,
+    if table_is_named_for(id_table_raw, stem) {
+        return Some(None);
     }
+    let (_, entity) = stem.rsplit_once('_')?;
+    (!entity.is_empty() && table_is_named_for(id_table_raw, entity))
+        .then(|| Some(entity.to_string()))
+}
+
+/// Trailing tokens that mark a column as a key: `customer_id`,
+/// `country_code`, `order_no`, `SupportRepId` (canonicalized to
+/// `support_rep_id`). Only the last token counts - `id_card_photo` is not
+/// a key. `number` is deliberately absent: `phone_number`, `house_number`
+/// and a race car's `number` are attributes far more often than keys.
+const KEY_MARKERS: &[&str] = &[
+    "id", "uuid", "guid", "key", "code", "no", "num", "nbr", "pk", "sku", "ref",
+];
+
+/// Whether a canonical column name is key-like by its own spelling: a
+/// surrogate-key name, or a name ending in a key-marker token.
+fn has_key_marker(canon: &str) -> bool {
+    // Compact one-letter-plus-`id` keys (`aid`, `pid`, `cid` - common in
+    // academic and legacy schemas) are key-like by spelling too.
+    let compact =
+        canon.len() == 3 && canon.as_bytes()[0].is_ascii_alphabetic() && canon.ends_with("id");
+    compact
+        || is_surrogate_key_name(canon)
+        || canon
+            .rsplit('_')
+            .next()
+            .is_some_and(|last| KEY_MARKERS.contains(&last))
+}
+
+/// Every entity a column could be named for: the whole name (`grape` in
+/// `grapes`), the name minus a key suffix (`customer_id`), and the name
+/// minus a natural-key head (`state_name` in `state`, `course_title` in
+/// `courses`) - the three ways real schemas spell a table's own key.
+fn owner_stems(canon: &str) -> Vec<&str> {
+    let mut stems = vec![canon];
+    let stripped = strip_id_suffix(canon);
+    if stripped != canon {
+        stems.push(stripped);
+    }
+    for head in ["_name", "_title", "_number"] {
+        if let Some(rest) = canon.strip_suffix(head)
+            && !rest.is_empty()
+        {
+            stems.push(rest);
+        }
+    }
+    // An unseparated `id` suffix (`dormid` in `Dorm`, `custid`): only when
+    // what remains is a real word-length stem, so `paid`/`void` never
+    // shed their last two letters into an entity name.
+    if let Some(rest) = canon.strip_suffix("id")
+        && rest.len() >= 3
+        && !rest.ends_with('_')
+        && rest.bytes().all(|b| b.is_ascii_alphabetic())
+    {
+        stems.push(rest);
+    }
+    stems
+}
+
+/// Whether `table` owns the key `col_canon`: the column names the table
+/// itself (`customers.customer_id`, `state.state_name`, `grapes.grape`).
+/// Between two tables sharing that exact column name, the owner is the one
+/// side, the other references it.
+fn owns_key(table_raw: &str, col_canon: &str) -> bool {
+    owner_stems(col_canon)
+        .iter()
+        .any(|s| table_is_named_for(table_raw, s))
+}
+
+/// Okapi BM25's inverse document frequency in its non-negative (Lucene)
+/// form: `ln(1 + (n - df + 0.5) / (df + 0.5))`. `n` documents, `df` of them
+/// contain the term. Rare terms weigh up to about `ln(2n)`, a term in every
+/// document weighs close to nothing but never less.
+fn bm25_idf(n: usize, df: usize) -> f64 {
+    let (n, df) = (n as f64, df as f64);
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+}
+
+/// Corpus statistics over one whole input, built once per
+/// `detect_relationships` call - the BM25 "collection" every edge is
+/// weighed against, so a name or value is judged by how common it is in
+/// *this* input rather than by a fixed stop-list.
+///
+/// - Name tokens: each table is one document whose terms are the `_`
+///   tokens of its canonical column names. `league` in `league_id` across
+///   fifteen tables weighs far less than `promo` in `promo_code` across two.
+/// - Sample values: each column with samples is one document. `1`, `2`,
+///   `true` sit in most integer or flag columns and weigh almost nothing;
+///   a customer code seen in exactly two columns weighs a lot.
+struct LinkIndex {
+    n_tables: usize,
+    token_df: HashMap<String, usize>,
+    /// Canonical column name -> tables containing a column of that name.
+    name_tables: HashMap<String, Vec<String>>,
+    /// Canonical key-like names some table containing them owns.
+    owned_names: HashSet<String>,
+    /// Canonical key-like name -> tables where that column is the table's
+    /// own key: it names the table (`owns_key`), or it is the table's
+    /// first column. Backs the role-prefixed foreign key, which needs to
+    /// know which single table a bare `staff_id` belongs to.
+    key_tables: HashMap<String, Vec<String>>,
+    /// Canonical name -> tables whose first column it is, whatever its
+    /// spelling: where a schema puts its own primary key.
+    lead_tables: HashMap<String, Vec<String>>,
+    n_value_cols: usize,
+    value_df: HashMap<String, usize>,
+}
+
+impl LinkIndex {
+    fn build(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> LinkIndex {
+        let mut idx = LinkIndex {
+            n_tables: tables.len(),
+            token_df: HashMap::new(),
+            name_tables: HashMap::new(),
+            owned_names: HashSet::new(),
+            key_tables: HashMap::new(),
+            lead_tables: HashMap::new(),
+            n_value_cols: 0,
+            value_df: HashMap::new(),
+        };
+        for (table, cols) in tables {
+            let mut tokens: HashSet<String> = HashSet::new();
+            let mut names: HashSet<String> = HashSet::new();
+            for (i, col) in cols.iter().enumerate() {
+                let canon = canon_name(&col.name);
+                if canon.is_empty() {
+                    continue;
+                }
+                tokens.extend(canon.split('_').map(str::to_string));
+                let owned = owns_key(table, &canon);
+                if owned {
+                    idx.owned_names.insert(canon.clone());
+                }
+                if i == 0 {
+                    idx.lead_tables
+                        .entry(canon.clone())
+                        .or_default()
+                        .push(table.clone());
+                }
+                if has_key_marker(&canon) && (owned || i == 0) {
+                    let entry = idx.key_tables.entry(canon.clone()).or_default();
+                    if !entry.contains(table) {
+                        entry.push(table.clone());
+                    }
+                }
+                names.insert(canon);
+                let values: HashSet<&str> = col
+                    .sample_values
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                if !values.is_empty() {
+                    idx.n_value_cols += 1;
+                    for v in values {
+                        *idx.value_df.entry(v.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+            for t in tokens {
+                *idx.token_df.entry(t).or_insert(0) += 1;
+            }
+            for n in names {
+                idx.name_tables.entry(n).or_default().push(table.clone());
+            }
+        }
+        idx
+    }
+
+    /// Summed BM25 idf of the non-marker tokens of `canon` - how specific
+    /// a name is to a few tables. Marker tokens (`id`, `code`) say "key",
+    /// not "which key", so they add nothing.
+    fn name_weight(&self, canon: &str) -> f64 {
+        canon
+            .split('_')
+            .filter(|t| !t.is_empty() && !KEY_MARKERS.contains(t))
+            .map(|t| bm25_idf(self.n_tables, self.token_df.get(t).copied().unwrap_or(0)))
+            .sum()
+    }
+
+    /// Whether `column` is `table`'s first column - where schemas put their
+    /// own primary key.
+    fn leads(&self, table: &str, column: &str) -> bool {
+        self.lead_tables
+            .get(&canon_name(column))
+            .is_some_and(|ts| ts.iter().any(|t| t == table))
+    }
+
+    fn value_idf(&self, v: &str) -> f64 {
+        bm25_idf(
+            self.n_value_cols,
+            self.value_df.get(v).copied().unwrap_or(0),
+        )
+    }
+
+    /// Whether a value shared by two columns is evidence at all - the
+    /// classic Robertson/Sparck Jones reading, where a term in more than
+    /// half the collection has non-positive idf. Judged against the
+    /// *other* columns only (both compared columns hold the value by
+    /// definition): a value in at most half of them is specific enough to
+    /// count, one in most of them (`1`, `true`) matches anything and proves
+    /// nothing. With no other columns there is nothing to contradict it.
+    fn value_is_informative(&self, v: &str) -> bool {
+        let others_with = self.value_df.get(v).copied().unwrap_or(0).saturating_sub(2);
+        let others = self.n_value_cols.saturating_sub(2);
+        2 * others_with <= others
+    }
+}
+
+/// Edge score, BM25-style: the idf of the matched name (its non-marker
+/// tokens, or the fk stem that matched) plus the idf of every shared
+/// sample value. Not a probability and not comparable across inputs - it
+/// orders edges within one input, so a specific key (`promo_code` in two
+/// tables, a rare shared value) lists above a generic one (`league_id` in
+/// fifteen, a shared `1`).
+fn edge_score(idx: &LinkIndex, matched_name: &str, overlap: &[String]) -> f64 {
+    let s = idx.name_weight(matched_name) + overlap.iter().map(|v| idx.value_idf(v)).sum::<f64>();
+    (s * 1000.0).round() / 1000.0
 }
 
 /// Sorted, de-duplicated intersection of two columns' non-empty sample
@@ -68359,16 +69433,50 @@ const MAX_OVERLAP_EVIDENCE: usize = 5;
 
 /// One candidate edge between two columns in different tables, or `None`
 /// when nothing observed supports a link. See the module doc comment above
-/// for the full tier rules.
+/// for the full tier rules. `same_schema` says the two tables are copies of
+/// one schema (`DUPLICATE_SCHEMA_SIMILARITY`): there every shared column
+/// lines up and links as before; between two genuinely different schemas an
+/// edge additionally has to look like a join key -
+///   - both columns in a key domain (`JoinBase::is_key_domain`), so
+///     `amount`/`active`/`created_at` shared by every table never wires the
+///     whole graph together;
+///   - an exact match on a surrogate-key name (`id`, `uuid`, `Unnamed: 0`,
+///     see `is_surrogate_key_name`) is two tables' own primary keys, not a
+///     reference - unless both are an identifier domain (UUID/ULID/Email)
+///     *and* share observed values, the one case where coincidence is
+///     implausible (a 1:1 extension table keyed by its parent's UUID).
+///     Integer ids overlap by construction (1, 2, 3 everywhere), so there
+///     overlap proves nothing;
+///   - any other exact match needs key evidence: a key-marker name
+///     (`customer_id`, `country_code` - see `KEY_MARKERS`), a table that
+///     owns the name (`state.state_name`, `grapes.grape` - see
+///     `owns_key`), or an identifier domain with shared values. `name`,
+///     `city`, `phone`, `email` in two unrelated tables are two entities'
+///     attributes that happen to share a word; measured against 790
+///     declared foreign keys across Spider's 166 real schemas, 876 such
+///     matches were wrong for every 29 right, and the right ones mostly
+///     carry an owner.
+///
+/// Beyond exact names, a foreign key is found three ways: the bare-id
+/// pattern (`users.id <- orders.user_id`, also `parent_user_id`), a
+/// role-prefixed copy of another table's own key (`store.manager_staff_id
+/// -> staff.staff_id`, `flights.host_city_id -> city.city_id` - see
+/// `LinkIndex::key_tables`), and a weak same-noun match
+/// (`customer` beside `customer_id`).
 fn join_candidate(
     t1: &str,
     c1: &ColumnProfile,
     t2: &str,
     c2: &ColumnProfile,
+    same_schema: bool,
+    idx: &LinkIndex,
 ) -> Option<Relationship> {
     let b1 = join_base(&c1.ideal_type)?;
     let b2 = join_base(&c2.ideal_type)?;
     if !join_compatible(&b1, &b2) {
+        return None;
+    }
+    if !same_schema && !(b1.is_key_domain() && b2.is_key_domain()) {
         return None;
     }
     let n1 = canon_name(&c1.name);
@@ -68382,52 +69490,158 @@ fn join_candidate(
         return None;
     }
     let exact = n1 == n2;
-    let id_side_1 = n1 == "id" && fk_stem_matches(t1, &n2);
-    let id_side_2 = n2 == "id" && fk_stem_matches(t2, &n1);
-    let fk = id_side_1 || id_side_2;
-    let strong = exact || fk;
-    // A weak name signal: equal once key-like suffixes (and plurals) are
-    // discounted, without being an exact match. Covers `customer` beside
-    // `customer_id` (a natural-key join) and near-miss plurals, but never
-    // fires on its own without either compatible types (checked above) or
-    // observed overlap (checked below).
-    let weak = !strong && singular(strip_id_suffix(&n1)) == singular(strip_id_suffix(&n2));
-    let rare = b1 == b2 && b1.is_identifier_domain();
-    if !(strong || weak || rare) {
+    let overlap = shared_samples(&c1.sample_values, &c2.sample_values);
+    let informative: Vec<&String> = overlap
+        .iter()
+        .filter(|v| idx.value_is_informative(v))
+        .collect();
+    let identifier_pair = b1 == b2 && b1.is_identifier_domain();
+    let shared_primary_key =
+        exact && is_surrogate_key_name(&n1) && identifier_pair && !overlap.is_empty();
+    if exact && !same_schema && is_surrogate_key_name(&n1) && !shared_primary_key {
         return None;
     }
-    let overlap = shared_samples(&c1.sample_values, &c2.sample_values);
-    // Observed shared values promote any weak or domain-only signal to
-    // `extracted`: at that point the link is measured, not guessed. A bare
-    // overlap with no name or domain signal at all never reaches this
-    // function branch - it returned `None` above.
-    let confidence = if strong || !overlap.is_empty() {
-        Confidence::Extracted
+    let owner_1 = exact && owns_key(t1, &n1);
+    let owner_2 = exact && owns_key(t2, &n2);
+    // No table is named for the key, but exactly one table in the whole
+    // input leads with it as its first column - where schemas put their
+    // own primary key (`Apartments.apt_id`, `DEPARTMENT.DEPT_CODE`). That
+    // table owns it; a key several tables lead with stays unresolved.
+    let lead_owner = if exact
+        && !same_schema
+        && (has_key_marker(&n1) || idx.name_tables.get(&n1).is_some_and(|ts| ts.len() == 2))
+    {
+        match idx.lead_tables.get(&n1).map(Vec::as_slice) {
+            Some([t]) if t == t1 && !idx.owned_names.contains(&n1) => {
+                Some((t1, &c1.name, t2, &c2.name))
+            }
+            Some([t]) if t == t2 && !idx.owned_names.contains(&n1) => {
+                Some((t2, &c2.name, t1, &c1.name))
+            }
+            _ => None,
+        }
     } else {
-        Confidence::Inferred
+        None
     };
-    let mut evidence = Vec::new();
-    // Resolved once for both the evidence text below and the edge's own
-    // `reference` orientation: the `<stem>_id` side references the bare-
-    // `id` side, many-to-one.
-    let fk_sides = if fk {
-        Some(if id_side_1 {
+    if exact
+        && !same_schema
+        && !has_key_marker(&n1)
+        && !owner_1
+        && !owner_2
+        && lead_owner.is_none()
+        && !(identifier_pair && !overlap.is_empty())
+    {
+        return None;
+    }
+    let fk_id_name = |n: &str| matches!(n, "id" | "uuid" | "guid" | "pk" | "key");
+    let id_side_1 = if fk_id_name(&n1) {
+        fk_stem_matches(t1, &n2)
+    } else {
+        None
+    };
+    let id_side_2 = if fk_id_name(&n2) {
+        fk_stem_matches(t2, &n1)
+    } else {
+        None
+    };
+    // Role-prefixed copy of another table's own key: `manager_staff_id`
+    // ends with `staff_id`, which is `staff`'s key and no other table's.
+    // A key claimed by several tables stays unresolved rather than guessed.
+    let role_target = |long: &str, short: &str, short_table: &str, long_table: &str| {
+        long.len() > short.len()
+            && !idx
+                .key_tables
+                .get(long)
+                .is_some_and(|ts| ts.iter().any(|t| t == long_table))
+            && long.ends_with(short)
+            && long.as_bytes()[long.len() - short.len() - 1] == b'_'
+            && short.contains('_')
+            && has_key_marker(short)
+            && idx
+                .key_tables
+                .get(short)
+                .is_some_and(|ts| ts.len() == 1 && ts[0] == short_table)
+    };
+    let role_1 = !exact && role_target(&n2, &n1, t1, t2);
+    let role_2 = !exact && role_target(&n1, &n2, t2, t1);
+    let fk = !exact && (id_side_1.is_some() || id_side_2.is_some() || role_1 || role_2);
+    let strong = exact || fk;
+    // A weak name signal: the same noun once key-like suffixes (and
+    // plurals) are discounted, without being an exact match. Covers
+    // `customer` beside `customer_id` (a natural-key join) and near-miss
+    // plurals, but never fires on its own without either compatible types
+    // (checked above) or observed overlap (checked below).
+    let weak = !strong && same_noun(strip_id_suffix(&n1), strip_id_suffix(&n2));
+    if !(strong || weak || identifier_pair) {
+        return None;
+    }
+    // Observed shared values promote a weak or domain-only signal to
+    // `extracted`: at that point the link is measured, not guessed - but
+    // only values rare enough in this input to mean something
+    // (`LinkIndex::value_is_informative`). A shared `1` or `true` sits in
+    // most columns and promotes nothing. An identifier domain (UUID, ULID,
+    // email) is itself rare, so any shared value of one counts.
+    let measured = if identifier_pair {
+        !overlap.is_empty()
+    } else {
+        !informative.is_empty()
+    };
+    // The key's owner, when the names say which side it is: the bare-`id`
+    // side of a foreign-key pattern, the side holding the original of a
+    // role-prefixed key, or - for an exact match - the one table named
+    // after the key (`customers.customer_id` owns it, `orders.customer_id`
+    // references it). Resolved once, as (referenced table, column,
+    // referencing table, column), for both the evidence text and the
+    // edge's `reference`. Never guessed when both or neither side is named
+    // for the key.
+    let owner_sides = if fk {
+        Some(if id_side_1.is_some() || role_1 {
             (t1, &c1.name, t2, &c2.name)
         } else {
             (t2, &c2.name, t1, &c1.name)
         })
+    } else if exact && !same_schema {
+        match (owner_1, owner_2) {
+            (true, false) => Some((t1, &c1.name, t2, &c2.name)),
+            (false, true) => Some((t2, &c2.name, t1, &c1.name)),
+            (false, false) if lead_owner.is_some() => lead_owner,
+            _ => None,
+        }
     } else {
         None
     };
+    let role_entity = id_side_1.clone().flatten().or(id_side_2.clone().flatten());
+    let mut evidence = Vec::new();
     if exact {
         evidence.push(format!(
             "column names match (\"{}\" vs \"{}\")",
             c1.name, c2.name
         ));
-    } else if let Some((id_tab, id_col, fk_tab, fk_col)) = fk_sides {
+        if let Some((owner_tab, owner_col, _, _)) = owner_sides {
+            if owner_1 || owner_2 {
+                evidence.push(format!(
+                    "\"{owner_col}\" is named for \"{owner_tab}\", so that table owns the key"
+                ));
+            } else {
+                evidence.push(format!(
+                    "\"{owner_col}\" is the first column of \"{owner_tab}\" and of no other table here, so that table owns the key"
+                ));
+            }
+        }
+    } else if role_1 || role_2 {
+        let (key_tab, key_col, fk_tab, fk_col) = owner_sides?;
         evidence.push(format!(
-            "foreign-key naming pattern (\"{id_col}\" in \"{id_tab}\", \"{fk_col}\" in \"{fk_tab}\")"
+            "role-prefixed key: \"{fk_col}\" in \"{fk_tab}\" ends with \"{key_col}\", the key of \"{key_tab}\""
         ));
+    } else if let Some((id_tab, id_col, fk_tab, fk_col)) = owner_sides {
+        match &role_entity {
+            Some(entity) => evidence.push(format!(
+                "foreign-key naming pattern with a role prefix (\"{fk_col}\" in \"{fk_tab}\" refers to a {entity}, \"{id_col}\" in \"{id_tab}\")"
+            )),
+            None => evidence.push(format!(
+                "foreign-key naming pattern (\"{id_col}\" in \"{id_tab}\", \"{fk_col}\" in \"{fk_tab}\")"
+            )),
+        }
     } else if weak {
         evidence.push(format!(
             "similar column names (\"{}\" vs \"{}\")",
@@ -68458,17 +69672,29 @@ fn join_candidate(
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+        if informative.is_empty() && !identifier_pair {
+            text.push_str(" (common to most columns here, so weak evidence)");
+        }
         evidence.push(text);
     }
-    let why = if exact {
+    let why = if shared_primary_key && !same_schema {
+        format!(
+            "both tables are keyed by the same {} values (a shared primary key)",
+            b1.label()
+        )
+    } else if exact && owner_sides.is_some() {
+        "identical key column names, owned by one side".to_string()
+    } else if exact {
         "identical column names with compatible types".to_string()
+    } else if role_1 || role_2 {
+        "role-prefixed copy of another table's key".to_string()
     } else if fk {
         "foreign-key naming pattern".to_string()
-    } else if weak && !overlap.is_empty() {
+    } else if weak && measured {
         "similar column names with observed shared values".to_string()
     } else if weak {
         "similar column names but no shared samples yet".to_string()
-    } else if !overlap.is_empty() {
+    } else if measured {
         format!(
             "same {} identifier domain with observed shared values",
             b1.label()
@@ -68479,6 +69705,54 @@ fn join_candidate(
             b1.label()
         )
     };
+    // The name the match rests on, for the score: the shared name, or the
+    // referencing side's name for a foreign key (its stem is the specific
+    // part - `customer` in `customer_id`).
+    let matched_name = match owner_sides {
+        Some((_, _, _, fk_col)) if fk => canon_name(fk_col),
+        _ => n1.clone(),
+    };
+    let score = edge_score(idx, &matched_name, &overlap);
+    let inclusion = inclusion_between(c1, c2);
+    let features = EdgeFeatures {
+        exact_name: exact,
+        fk_pattern: fk,
+        weak_name: weak,
+        abbrev_name: None,
+        oriented: owner_sides.is_some(),
+        key_marker: has_key_marker(&matched_name),
+        lead_key: match owner_sides {
+            Some((owner_tab, owner_col, _, _)) => idx.leads(owner_tab, owner_col),
+            None => idx.leads(t1, &c1.name) || idx.leads(t2, &c2.name),
+        },
+        same_type: b1 == b2,
+        identifier: identifier_pair,
+        common_name: idx
+            .name_tables
+            .get(&matched_name)
+            .is_some_and(|ts| ts.len() >= UNOWNED_SHARED_KEY_MIN_TABLES),
+        shared_values: (!c1.sample_values.is_empty() && !c2.sample_values.is_empty())
+            .then_some(measured),
+        contained: inclusion.as_ref().map(Option::is_some),
+    };
+    let mut owner_sides = owner_sides;
+    if let Some(Some(inc)) = &inclusion {
+        let (ref_tab, ref_col, key_tab, key_col) = if inc.first_in_second {
+            (t1, &c1.name, t2, &c2.name)
+        } else {
+            (t2, &c2.name, t1, &c1.name)
+        };
+        evidence.push(inc.evidence(ref_col, ref_tab, key_col, key_tab));
+        // Data orients an edge the names left undirected: the side whose
+        // values sit inside the other's unique values references it -
+        // unless some table in the input owns the name, in which case these
+        // two are siblings pointing at that owner (`film_actor.film_id` sits
+        // inside `film_category.film_id`, unique there, but both reference
+        // `film`) and orienting them would hide the hub.
+        if owner_sides.is_none() && !same_schema && !idx.owned_names.contains(&n1) {
+            owner_sides = Some((key_tab, key_col, ref_tab, ref_col));
+        }
+    }
     let ((from_table, from_column), (to_table, to_column)) = if (t1, &c1.name) <= (t2, &c2.name) {
         (
             (t1.to_string(), c1.name.clone()),
@@ -68498,19 +69772,25 @@ fn join_candidate(
         from_column,
         to_table,
         to_column,
-        confidence,
-        reference: fk_sides.map(|(id_tab, id_col, fk_tab, fk_col)| Reference {
+        // Settled by `detect_relationships` once every edge's probability,
+        // and any declared key, is known.
+        confidence: Confidence::Probable,
+        reference: owner_sides.map(|(id_tab, id_col, fk_tab, fk_col)| Reference {
             referencing_table: fk_tab.to_string(),
             referencing_column: fk_col.clone(),
             referenced_table: id_tab.to_string(),
             referenced_column: id_col.clone(),
         }),
         // Upgraded below by `detect_relationships` once the table pair's
-        // own similarity is known - a single column pair cannot tell a
-        // bridge from a duplicate schema on its own.
+        // own similarity, and every other edge, is known - a single column
+        // pair cannot tell a bridge from a duplicate schema or a derived
+        // shared reference on its own.
         context: EdgeContext::Bridge,
         evidence,
         reason,
+        score,
+        probability: 0.0,
+        features,
     })
 }
 
@@ -68571,10 +69851,388 @@ fn similar_tables(
     pairs
 }
 
+/// The minimum estimated share of a column's distinct values that must be
+/// found in another column for the pair to count as an inclusion
+/// dependency. Real foreign keys are 100% contained when the data is
+/// clean; 95% leaves room for a few orphaned rows and the sketch's own
+/// sampling, the same slack the inclusion-dependency literature gives
+/// "approximate" INDs.
+const INCLUSION_MIN: f64 = 0.95;
+
+/// An inclusion dependency between two columns, measured on their value
+/// sketches: every (sampled) distinct value of the referencing side is
+/// also a value of the referenced side, and the referenced side is unique.
+struct Inclusion {
+    /// `true` when the first column passed to `inclusion_between` is the
+    /// referencing (contained) side.
+    first_in_second: bool,
+    fraction: f64,
+    distinct: f64,
+}
+
+impl Inclusion {
+    fn evidence(&self, ref_col: &str, ref_tab: &str, key_col: &str, key_tab: &str) -> String {
+        format!(
+            "values match: {:.0}% of the ~{} distinct values of \"{ref_col}\" in \"{ref_tab}\" occur in \"{key_col}\" in \"{key_tab}\", whose values are unique",
+            self.fraction * 100.0,
+            self.distinct.round() as u64
+        )
+    }
+}
+
+/// Measures whether one column's values sit inside the other's unique
+/// values. `None` when it can't be measured (a side has no value sketch -
+/// a dictionary written before sketches, or a column that isn't a key
+/// domain, or neither side with two distinct values); `Some(None)` when it
+/// was measured and neither direction holds.
+/// A direction needs the referenced side to look unique, the referencing
+/// side to have at least two distinct values (one shared constant proves
+/// nothing), and `INCLUSION_MIN` containment. When both directions hold -
+/// two unique columns over the same values - the side with fewer distinct
+/// values is the referencing one.
+fn inclusion_between(c1: &ColumnProfile, c2: &ColumnProfile) -> Option<Option<Inclusion>> {
+    let (s1, s2) = (c1.value_sketch.as_ref()?, c2.value_sketch.as_ref()?);
+    // Neither side has two distinct values to test: nothing measurable.
+    if s1.hashes.len() < 2 && s2.hashes.len() < 2 {
+        return None;
+    }
+    let direction = |a: &ValueSketch, b: &ValueSketch| {
+        if !b.looks_unique() || a.hashes.len() < 2 {
+            return None;
+        }
+        let (fraction, _) = a.contained_in(b)?;
+        (fraction >= INCLUSION_MIN).then(|| (fraction, a.distinct()))
+    };
+    let forward = direction(s1, s2);
+    let backward = direction(s2, s1);
+    Some(match (forward, backward) {
+        (Some((fraction, distinct)), None) => Some(Inclusion {
+            first_in_second: true,
+            fraction,
+            distinct,
+        }),
+        (None, Some((fraction, distinct))) => Some(Inclusion {
+            first_in_second: false,
+            fraction,
+            distinct,
+        }),
+        (Some(f), Some(b)) => Some(if f.1 <= b.1 {
+            Inclusion {
+                first_in_second: true,
+                fraction: f.0,
+                distinct: f.1,
+            }
+        } else {
+            Inclusion {
+                first_in_second: false,
+                fraction: b.0,
+                distinct: b.1,
+            }
+        }),
+        (None, None) => None,
+    })
+}
+
+/// Whether a referencing column's leading name token and a referenced
+/// table's name abbreviate one another (`ship_via` -> `shippers`,
+/// `dept_name` -> `department`): the first is a prefix of the second, at
+/// least three letters. The one name signal a value-only edge can carry.
+fn abbreviates_table(col: &str, table: &str) -> bool {
+    let canon = canon_name(col);
+    let Some(head) = canon.split('_').next().filter(|h| h.len() >= 3) else {
+        return false;
+    };
+    table_stems(table)
+        .iter()
+        .any(|stem| stem.len() >= 3 && (stem.starts_with(head) || head.starts_with(stem.as_str())))
+}
+
+/// A join found from the values alone, with no name signal at all:
+/// `Orders.ShipVia` holds exactly `Shippers.ShipperID`'s values. Only
+/// proposed when the referenced side is its table's own key (unique, and
+/// its first column or named for the table) and the referencing side is not
+/// (a unique column contained in another unique one is two sequences over
+/// the same range far more often than a 1:1 key). Whether it is kept is
+/// the probability model's call, like every other edge.
+fn value_candidate(
+    t1: &str,
+    c1: &ColumnProfile,
+    t2: &str,
+    c2: &ColumnProfile,
+    idx: &LinkIndex,
+) -> Option<Relationship> {
+    let b1 = join_base(&c1.ideal_type)?;
+    let b2 = join_base(&c2.ideal_type)?;
+    if !join_compatible(&b1, &b2) || !(b1.is_key_domain() && b2.is_key_domain()) {
+        return None;
+    }
+    if canon_name(&c1.name).is_empty() || canon_name(&c2.name).is_empty() {
+        return None;
+    }
+    let inc = inclusion_between(c1, c2)??;
+    let (ref_tab, ref_c, key_tab, key_c) = if inc.first_in_second {
+        (t1, c1, t2, c2)
+    } else {
+        (t2, c2, t1, c1)
+    };
+    // Surrogate integers make containment cheap: every small-range integer
+    // column sits inside every `1..N` key (measured on Sakila, 120 such
+    // coincidences for its one real value-only key). An integer pair is
+    // therefore only proposed when the name abbreviates the table as well;
+    // text and identifier values coincide far less, so containment alone
+    // proposes them.
+    let abbrev = abbreviates_table(&ref_c.name, key_tab);
+    if b1 == JoinBase::Int && b2 == JoinBase::Int && !abbrev {
+        return None;
+    }
+    if ref_c
+        .value_sketch
+        .as_ref()
+        .is_some_and(ValueSketch::looks_unique)
+    {
+        return None;
+    }
+    // The referenced side must be its table's own key - its first column,
+    // or named for the table - not merely key-named: `customer.address_id`
+    // is unique and ends in `_id`, but it references `address`, and
+    // `payment.customer_id` sitting inside its range means nothing.
+    let key_canon = canon_name(&key_c.name);
+    if !(idx.leads(key_tab, &key_c.name) || owns_key(key_tab, &key_canon)) {
+        return None;
+    }
+    let overlap = shared_samples(&c1.sample_values, &c2.sample_values);
+    let measured = overlap.iter().any(|v| idx.value_is_informative(v));
+    let features = EdgeFeatures {
+        abbrev_name: Some(abbrev),
+        oriented: true,
+        key_marker: has_key_marker(&canon_name(&ref_c.name)),
+        lead_key: idx.leads(key_tab, &key_c.name),
+        same_type: b1 == b2,
+        identifier: b1 == b2 && b1.is_identifier_domain(),
+        shared_values: (!c1.sample_values.is_empty() && !c2.sample_values.is_empty())
+            .then_some(measured),
+        contained: Some(true),
+        ..EdgeFeatures::default()
+    };
+    let mut evidence = vec![inc.evidence(&ref_c.name, ref_tab, &key_c.name, key_tab)];
+    if abbrev {
+        evidence.push(format!(
+            "\"{}\" abbreviates the table name \"{key_tab}\"",
+            ref_c.name
+        ));
+    }
+    evidence.push(format!(
+        "compatible types ({} and {})",
+        b1.label(),
+        b2.label()
+    ));
+    let ((from_table, from_column), (to_table, to_column)) = if (t1, &c1.name) <= (t2, &c2.name) {
+        (
+            (t1.to_string(), c1.name.clone()),
+            (t2.to_string(), c2.name.clone()),
+        )
+    } else {
+        (
+            (t2.to_string(), c2.name.clone()),
+            (t1.to_string(), c1.name.clone()),
+        )
+    };
+    let reason = format!(
+        "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) look like join keys: the values of one are contained in the other's unique values"
+    );
+    Some(Relationship {
+        from_table,
+        from_column,
+        to_table,
+        to_column,
+        confidence: Confidence::Probable,
+        reference: Some(Reference {
+            referencing_table: ref_tab.to_string(),
+            referencing_column: ref_c.name.clone(),
+            referenced_table: key_tab.to_string(),
+            referenced_column: key_c.name.clone(),
+        }),
+        context: EdgeContext::Bridge,
+        evidence,
+        reason,
+        score: edge_score(idx, &canon_name(&ref_c.name), &overlap),
+        probability: 0.0,
+        features,
+    })
+}
+
+/// The comparison vector of one candidate edge - Fellegi-Sunter's gamma.
+/// Each field is one agreement test between the two columns; the
+/// tri-state ones are `None` when the test can't be run (no sample values,
+/// no value sketch), and an unrunnable test contributes nothing to the
+/// weight, as in the original model.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct EdgeFeatures {
+    /// Identical canonical column names.
+    exact_name: bool,
+    /// A foreign-key naming pattern (`users.id` <- `orders.user_id`) or a
+    /// role-prefixed copy of another table's key.
+    fk_pattern: bool,
+    /// The same noun without an exact match (`customer` vs `customer_id`).
+    weak_name: bool,
+    /// The referencing name abbreviates the referenced table - tested only
+    /// on value-only edges (see `abbreviates_table`); a name-matched edge
+    /// has its own, stronger name tests, so there it is `None`.
+    abbrev_name: Option<bool>,
+    /// The names (or values) say which side owns the key.
+    oriented: bool,
+    /// The matched name ends in a key marker (`_id`, `_code`, ...).
+    key_marker: bool,
+    /// The owning side (or either side, when unoriented) is its table's
+    /// first column.
+    lead_key: bool,
+    /// Identical join domains, not merely compatible ones.
+    same_type: bool,
+    /// Both sides are UUID/ULID/Email.
+    identifier: bool,
+    /// The matched name appears in three or more tables.
+    common_name: bool,
+    /// The two columns share an informative sample value.
+    shared_values: Option<bool>,
+    /// One side's values are contained in the other's unique values.
+    contained: Option<bool>,
+}
+
+impl EdgeFeatures {
+    /// The name-agreement level, one of `FS_NAME_LEVELS`.
+    fn name_level(&self) -> &'static str {
+        if self.fk_pattern {
+            "fk"
+        } else if self.exact_name {
+            match (self.oriented, self.lead_key) {
+                (true, true) => "exact_owned_lead",
+                (true, false) => "exact_owned",
+                (false, true) => "exact_lead",
+                (false, false) => "exact_plain",
+            }
+        } else if self.weak_name {
+            if self.lead_key {
+                "weak_lead"
+            } else {
+                "weak_plain"
+            }
+        } else if self.contained == Some(true) && !self.identifier {
+            "value"
+        } else {
+            "identifier"
+        }
+    }
+
+    /// The yes/no tests, in `FS_TESTS` order.
+    fn tests(&self) -> [Option<bool>; 6] {
+        [
+            Some(self.key_marker),
+            Some(self.same_type),
+            Some(self.common_name),
+            self.abbrev_name,
+            self.shared_values,
+            self.contained,
+        ]
+    }
+}
+
+/// Fellegi-Sunter agreement weights for `edge_probability`. A weight is
+/// the log-likelihood ratio `ln(m/u)` of one comparison outcome, where
+/// m = P(outcome | the edge is a real join) and u = P(outcome | it is not),
+/// estimated over the bridge candidates this module proposes. Fitted once
+/// against 834 declared foreign keys (Spider's 166 schemas plus Chinook,
+/// Northwind and Sakila), with the 15 keys Spider leaves undeclared in its
+/// `baseball_1` (Lahman) schema added, and committed as constants - see CLAUDE.md's graph
+/// section for the fit and its numbers; nothing is learned at run time.
+///
+/// The name comparison is multi-level, as Fellegi-Sunter allows: which kind
+/// of name agreement the edge rests on, crossed with whether the names say
+/// who owns the key and whether the owning side leads its table. The levels
+/// interact too strongly to be separate yes/no tests (a same-noun match is
+/// 82% real beside a table's first column and 0% elsewhere). Estimates are
+/// shrunk towards the pooled rate, and an outcome observed fewer than
+/// `FS_MIN_SUPPORT` times gets weight 0: too little evidence to move the
+/// prior either way (the identifier-domain and value-only levels, the
+/// abbreviation test).
+const FS_NAME_LEVELS: [(&str, f64); 9] = [
+    ("fk", 0.2646),
+    ("exact_owned_lead", 0.6777),
+    ("exact_owned", -0.3573),
+    ("exact_lead", -0.9607),
+    ("exact_plain", -3.3257),
+    ("weak_lead", -0.3793),
+    ("weak_plain", -7.6890),
+    ("identifier", 0.0),
+    ("value", 0.0),
+];
+
+/// The yes/no tests: (name, weight if it agrees, weight if it does not). A
+/// test that can't be run (`None` - no sample values, no value sketch)
+/// contributes nothing.
+const FS_TESTS: [(&str, f64, f64); 6] = [
+    ("key_marker", 0.1069, -1.2211),
+    ("same_type", 0.0, 0.0),
+    ("common_name", -0.1749, 0.1286),
+    ("abbrev_name", 0.0, 0.0),
+    ("shared_values", 0.4357, -0.6555),
+    ("contained", 0.4384, 0.0),
+];
+
+/// See `FS_NAME_LEVELS`: the fewest observations an outcome needs before
+/// its weight is trusted.
+#[allow(dead_code)]
+const FS_MIN_SUPPORT: usize = 5;
+
+/// P(real join) over all bridge candidates before any comparison is looked
+/// at - high, because a candidate already passed the name and type rules in
+/// `join_candidate`/`value_candidate`; the comparisons then sort out the
+/// 15% that are not joins.
+const FS_PRIOR: f64 = 0.8686;
+
+/// Multiplies the summed weight before it becomes a probability. The
+/// comparisons are not independent (an exact name and a key marker travel
+/// together), which makes a raw Fellegi-Sunter sum overconfident; one scale
+/// factor, fitted with the weights by maximum likelihood, calibrates it.
+const FS_SCALE: f64 = 1.01;
+
+/// Bridges below this probability are dropped. 0.5 is "more likely a join
+/// than not".
+const FS_THRESHOLD: f64 = 0.5;
+
+/// Fellegi-Sunter match weight turned into a posterior: the prior log-odds
+/// plus the name level's weight plus each runnable test's agreement or
+/// disagreement weight, scaled by `FS_SCALE`, through the logistic function.
+fn edge_probability(f: &EdgeFeatures) -> f64 {
+    let level = f.name_level();
+    let mut w = FS_NAME_LEVELS
+        .iter()
+        .find(|(name, _)| *name == level)
+        .map_or(0.0, |(_, w)| *w);
+    for (x, (_, agree, disagree)) in f.tests().iter().zip(FS_TESTS.iter()) {
+        match x {
+            Some(true) => w += agree,
+            Some(false) => w += disagree,
+            None => {}
+        }
+    }
+    let log_odds = (FS_PRIOR / (1.0 - FS_PRIOR)).ln() + FS_SCALE * w;
+    1.0 / (1.0 + (-log_odds).exp())
+}
+
 /// Every cross-table join candidate in a profiled `tables` map, sorted by
 /// (from-table, from-column, to-table, to-column) so output is stable
 /// regardless of profiling order. Single-table inputs yield zero edges.
 fn detect_relationships(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Vec<Relationship> {
+    detect_relationships_scored(tables, false)
+}
+
+/// `detect_relationships`, with `keep_all` retaining the edges the
+/// probability threshold would drop - the candidate set the model is
+/// fitted on.
+fn detect_relationships_scored(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    keep_all: bool,
+) -> Vec<Relationship> {
     let tables_vec: Vec<(&String, &Vec<ColumnProfile>)> = tables.iter().collect();
     // Table pairs at the duplicate bar, resolved once up front: every edge
     // between them is tagged `DuplicateSchema` below, so a ranking over
@@ -68585,13 +70243,19 @@ fn detect_relationships(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Vec<Re
             duplicate_pairs.insert((t1, t2));
         }
     }
+    let idx = LinkIndex::build(tables);
     let mut out = Vec::new();
     for (i, (t1, cols1)) in tables_vec.iter().enumerate() {
         for (t2, cols2) in &tables_vec[i + 1..] {
             let duplicate = duplicate_pairs.contains(&((*t1).clone(), (*t2).clone()));
             for c1 in cols1.iter() {
                 for c2 in cols2.iter() {
-                    if let Some(mut rel) = join_candidate(t1, c1, t2, c2) {
+                    let found = join_candidate(t1, c1, t2, c2, duplicate, &idx).or_else(|| {
+                        (!duplicate)
+                            .then(|| value_candidate(t1, c1, t2, c2, &idx))
+                            .flatten()
+                    });
+                    if let Some(mut rel) = found {
                         if duplicate {
                             rel.context = EdgeContext::DuplicateSchema;
                         }
@@ -68600,6 +70264,23 @@ fn detect_relationships(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Vec<Re
                 }
             }
         }
+    }
+    for rel in &mut out {
+        rel.probability = edge_probability(&rel.features);
+        rel.confidence = if rel.features.contained == Some(true) {
+            Confidence::Discovered
+        } else {
+            Confidence::Probable
+        };
+    }
+    apply_declared_keys(tables, &mut out, &idx);
+    mark_shared_references(&mut out, &idx);
+    // Only bridges are thresholded: a declared key is ground truth, and
+    // duplicate-schema and shared-reference links are labelled derived
+    // already - their low probability of being a *direct* key is exactly
+    // what their label says, and `path` still needs the hop.
+    if !keep_all {
+        out.retain(|rel| rel.context != EdgeContext::Bridge || rel.probability >= FS_THRESHOLD);
     }
     out.sort_by(|a, b| {
         (&a.from_table, &a.from_column, &a.to_table, &a.to_column).cmp(&(
@@ -68610,6 +70291,220 @@ fn detect_relationships(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> Vec<Re
         ))
     });
     out
+}
+
+/// Turns every declared foreign key (`ColumnProfile::references`) into a
+/// `declared` edge with probability 1: an edge the heuristics already
+/// found between the same two columns is upgraded in place (keeping its
+/// evidence, taking the declaration's direction); a key they missed is
+/// added. A key pointing at a table or column absent from this input, or
+/// at its own table (a self-reference, such as `Employee.ReportsTo ->
+/// Employee.EmployeeId` - the graph links tables, so a loop has nowhere to
+/// go), adds nothing.
+fn apply_declared_keys(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    edges: &mut Vec<Relationship>,
+    idx: &LinkIndex,
+) {
+    for (table, cols) in tables {
+        for col in cols {
+            for r in &col.references {
+                if r.table == *table
+                    || !tables
+                        .get(&r.table)
+                        .is_some_and(|tc| tc.iter().any(|c| c.name == r.column))
+                {
+                    continue;
+                }
+                let declared = if r.composite.is_empty() {
+                    format!(
+                        "declared foreign key: \"{}\".\"{}\" references \"{}\".\"{}\"",
+                        table, col.name, r.table, r.column
+                    )
+                } else {
+                    let list = |pick: fn(&(String, String)) -> &String| {
+                        r.composite
+                            .iter()
+                            .map(|p| format!("\"{}\"", pick(p)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    format!(
+                        "declared composite foreign key: \"{}\" ({}) references \"{}\" ({}) - join on every pair, not this one alone",
+                        table,
+                        list(|p| &p.0),
+                        r.table,
+                        list(|p| &p.1)
+                    )
+                };
+                let joined_by = if r.composite.is_empty() {
+                    "a declared foreign key"
+                } else {
+                    "one column pair of a declared composite foreign key"
+                };
+                let reference = Reference {
+                    referencing_table: table.clone(),
+                    referencing_column: col.name.clone(),
+                    referenced_table: r.table.clone(),
+                    referenced_column: r.column.clone(),
+                };
+                let ((from_table, from_column), (to_table, to_column)) =
+                    if (table.as_str(), &col.name) <= (r.table.as_str(), &r.column) {
+                        (
+                            (table.clone(), col.name.clone()),
+                            (r.table.clone(), r.column.clone()),
+                        )
+                    } else {
+                        (
+                            (r.table.clone(), r.column.clone()),
+                            (table.clone(), col.name.clone()),
+                        )
+                    };
+                let existing = edges.iter_mut().find(|e| {
+                    e.from_table == from_table
+                        && e.from_column == from_column
+                        && e.to_table == to_table
+                        && e.to_column == to_column
+                });
+                match existing {
+                    Some(e) => {
+                        if e.confidence == Confidence::Declared {
+                            continue;
+                        }
+                        e.evidence.insert(0, declared);
+                        e.confidence = Confidence::Declared;
+                        e.probability = 1.0;
+                        e.reference = Some(reference);
+                        e.context = EdgeContext::Bridge;
+                        e.reason = format!(
+                            "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) are joined by {joined_by}"
+                        );
+                    }
+                    None => edges.push(Relationship {
+                        reason: format!(
+                            "\"{from_column}\" ({from_table}) and \"{to_column}\" ({to_table}) are joined by {joined_by}"
+                        ),
+                        from_table,
+                        from_column,
+                        to_table,
+                        to_column,
+                        confidence: Confidence::Declared,
+                        reference: Some(reference),
+                        context: EdgeContext::Bridge,
+                        evidence: vec![declared],
+                        score: edge_score(idx, &canon_name(&col.name), &[]),
+                        probability: 1.0,
+                        features: EdgeFeatures::default(),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// Relabel derived links as `SharedReference`: an otherwise-unoriented
+/// bridge between two columns that each reference the same owning table
+/// (both carry a `reference` to it on some other edge). `orders.customer_id`
+/// and `invoices.customer_id` are joinable, but only because both point at
+/// `customers` - a star, not a triangle. Only unoriented bridges are
+/// relabelled: an edge that itself names an owner is one of the star's
+/// spokes, and duplicate-schema edges already carry their own reading.
+/// Evidence gains one line naming the hub, so the relabel is explained
+/// like every other claim an edge makes.
+fn mark_shared_references(edges: &mut [Relationship], idx: &LinkIndex) {
+    mark_hub_references(edges);
+    mark_unowned_shared_keys(edges, idx);
+}
+
+/// A key-like name repeated across three or more tables with no table in
+/// the input owning it (`league_id` in fifteen baseball tables, no
+/// `league` table) is a dimension key whose table was left out: every
+/// pair joins, but pairwise these links would make a clique of the whole
+/// set. Relabelled `SharedReference` for the same reason a hub's spokes
+/// are - the tables share a key, they do not reference one another - and
+/// kept, so `path` can still take the hop. Two tables sharing an unowned
+/// key stay a plain bridge: that is the whole relationship there is.
+const UNOWNED_SHARED_KEY_MIN_TABLES: usize = 3;
+
+fn mark_unowned_shared_keys(edges: &mut [Relationship], idx: &LinkIndex) {
+    for rel in edges.iter_mut() {
+        if rel.context != EdgeContext::Bridge || rel.reference.is_some() {
+            continue;
+        }
+        let name = canon_name(&rel.from_column);
+        if name != canon_name(&rel.to_column)
+            || !has_key_marker(&name)
+            || idx.owned_names.contains(&name)
+        {
+            continue;
+        }
+        let n = idx.name_tables.get(&name).map_or(0, Vec::len);
+        if n < UNOWNED_SHARED_KEY_MIN_TABLES {
+            continue;
+        }
+        rel.evidence.push(format!(
+            "\"{}\" appears in {n} tables and none of them owns it - a shared key whose own table is not in this input, not a reference between these two",
+            rel.from_column
+        ));
+        rel.context = EdgeContext::SharedReference;
+    }
+}
+
+fn mark_hub_references(edges: &mut [Relationship]) {
+    let mut owners: HashMap<(String, String), std::collections::BTreeSet<String>> = HashMap::new();
+    for rel in edges.iter() {
+        if let Some(r) = &rel.reference {
+            owners
+                .entry((r.referencing_table.clone(), r.referencing_column.clone()))
+                .or_default()
+                .insert(r.referenced_table.clone());
+        }
+    }
+    if owners.is_empty() {
+        return;
+    }
+    for rel in edges.iter_mut() {
+        if rel.context != EdgeContext::Bridge {
+            continue;
+        }
+        if let Some(r) = &rel.reference {
+            // A triangle: `trip.start_station_id` references both `station`
+            // and `status.station_id`, and `status.station_id` itself
+            // references `station`. The hop to `status` is the one derived
+            // through the hub, not a second target of the same column.
+            if rel.confidence == Confidence::Declared {
+                continue;
+            }
+            let hub = owners
+                .get(&(r.referencing_table.clone(), r.referencing_column.clone()))
+                .zip(owners.get(&(r.referenced_table.clone(), r.referenced_column.clone())))
+                .and_then(|(from, to)| {
+                    from.intersection(to)
+                        .find(|hub| **hub != r.referenced_table && **hub != r.referencing_table)
+                        .cloned()
+                });
+            if let Some(hub) = hub {
+                rel.evidence.push(format!(
+                    "\"{}.{}\" also references \"{hub}\", which \"{}.{}\" references too - a link derived through that hub, not a second target",
+                    r.referencing_table, r.referencing_column, r.referenced_table, r.referenced_column
+                ));
+                rel.context = EdgeContext::SharedReference;
+            }
+            continue;
+        }
+        let from = owners.get(&(rel.from_table.clone(), rel.from_column.clone()));
+        let to = owners.get(&(rel.to_table.clone(), rel.to_column.clone()));
+        let (Some(from), Some(to)) = (from, to) else {
+            continue;
+        };
+        let Some(hub) = from.intersection(to).next() else {
+            continue;
+        };
+        rel.evidence.push(format!(
+            "both columns reference \"{hub}\" - a link derived through that hub, not an independent one"
+        ));
+        rel.context = EdgeContext::SharedReference;
+    }
 }
 
 // --- Table graph: adjacency, paths, communities ---
@@ -68681,16 +70576,13 @@ fn incident_edges(graph: &TableGraph, table: &str) -> Vec<usize> {
 /// than the alphabetically first column: a 1-hop `path` between two tables
 /// sharing both a measured foreign key and a guessed email-domain link
 /// reports the foreign key. Length still dominates confidence - a 1-hop
-/// inferred chain always beats a 2-hop extracted one, since fewer joins is
-/// the primary objective and confidence only breaks ties. `None` means
+/// probable chain always beats a 2-hop declared one, since fewer joins is
+/// the primary objective; tier, then probability, only break ties. `None` means
 /// disconnected (including an isolated table, which has no hops to
 /// anything). A `from == to` query never reaches here: `run_path` rejects
 /// it as a usage error first.
 fn shortest_path(graph: &TableGraph, from: &str, to: &str) -> Option<Vec<usize>> {
-    let confidence_rank = |idx: &usize| match graph.relationships[*idx].confidence {
-        Confidence::Extracted => 0,
-        Confidence::Inferred => 1,
-    };
+    let confidence_rank = |idx: &usize| graph.relationships[*idx].confidence.rank();
     if !graph.adj.contains_key(from) || !graph.adj.contains_key(to) {
         return None;
     }
@@ -68708,7 +70600,18 @@ fn shortest_path(graph: &TableGraph, from: &str, to: &str) -> Option<Vec<usize>>
         for (next, edge_indices) in neighbors {
             if seen.insert(next.clone()) {
                 let mut ordered = edge_indices.clone();
-                ordered.sort_by_key(|idx| (confidence_rank(idx), *idx));
+                // Strongest tier first, then the more probable edge, then
+                // edge order - so the hop is deterministic.
+                ordered.sort_by(|a, b| {
+                    confidence_rank(a)
+                        .cmp(&confidence_rank(b))
+                        .then(
+                            graph.relationships[*b]
+                                .probability
+                                .total_cmp(&graph.relationships[*a].probability),
+                        )
+                        .then(a.cmp(b))
+                });
                 let hop = *ordered
                     .first()
                     .expect("a table pair is only adjacent through a real edge");
@@ -68816,6 +70719,269 @@ fn duplicate_degree(graph: &TableGraph, table: &str) -> usize {
         .into_iter()
         .filter(|&idx| graph.relationships[idx].context == EdgeContext::DuplicateSchema)
         .count()
+}
+
+/// The `SharedReference` share of `table`'s incident relationships - joins
+/// derived through a hub both endpoints reference (see `EdgeContext`),
+/// kept out of `bridge_degree` so a star schema ranks its hub first
+/// instead of every fact table tying on a clique of sibling links.
+fn shared_reference_degree(graph: &TableGraph, table: &str) -> usize {
+    incident_edges(graph, table)
+        .into_iter()
+        .filter(|&idx| graph.relationships[idx].context == EdgeContext::SharedReference)
+        .count()
+}
+
+/// Bridge edges as weighted table-index pairs `(u, v, weight)`, weight the
+/// edge's probability. Directed `referencing -> referenced` when the names
+/// say which side owns the key; an undirected edge contributes half its
+/// weight each way. Only `Bridge` edges: duplicate-schema copies and
+/// hub-derived shared references are repetition, not structure (see
+/// `EdgeContext`).
+fn bridge_arcs(graph: &TableGraph) -> Vec<(usize, usize, f64)> {
+    let index: HashMap<&str, usize> = graph
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let mut arcs = Vec::new();
+    for rel in &graph.relationships {
+        if rel.context != EdgeContext::Bridge {
+            continue;
+        }
+        let w = rel.probability;
+        match &rel.reference {
+            Some(r) => arcs.push((
+                index[r.referencing_table.as_str()],
+                index[r.referenced_table.as_str()],
+                w,
+            )),
+            None => {
+                let (a, b) = (index[rel.from_table.as_str()], index[rel.to_table.as_str()]);
+                arcs.push((a, b, w / 2.0));
+                arcs.push((b, a, w / 2.0));
+            }
+        }
+    }
+    arcs
+}
+
+const PAGERANK_DAMPING: f64 = 0.85;
+
+/// Weighted PageRank over bridge edges pointing from the referencing table
+/// to the referenced one, scaled so the average table scores 1.0. A table
+/// scores high when many tables - or important ones - reference it: in a
+/// snowflake, `country` sits above `city` sits above `address`, even though
+/// each has one reference. Degree counts a table's links; this follows them.
+/// A table with no outgoing references spreads its score uniformly (the
+/// standard dangling-node rule), so isolated tables score just under 1.0.
+/// Deterministic: fixed iteration order, stopping on an L1 change below
+/// 1e-12 or after 1000 rounds.
+fn table_importance(graph: &TableGraph) -> Vec<f64> {
+    let n = graph.tables.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let arcs = bridge_arcs(graph);
+    let mut out_weight = vec![0.0; n];
+    for &(u, _, w) in &arcs {
+        out_weight[u] += w;
+    }
+    let nf = n as f64;
+    let mut rank = vec![1.0 / nf; n];
+    for _ in 0..1000 {
+        let dangling: f64 = (0..n)
+            .filter(|&u| out_weight[u] == 0.0)
+            .map(|u| rank[u])
+            .sum();
+        let base = (1.0 - PAGERANK_DAMPING) / nf + PAGERANK_DAMPING * dangling / nf;
+        let mut next = vec![base; n];
+        for &(u, v, w) in &arcs {
+            next[v] += PAGERANK_DAMPING * rank[u] * w / out_weight[u];
+        }
+        let change: f64 = next.iter().zip(&rank).map(|(a, b)| (a - b).abs()).sum();
+        rank = next;
+        if change < 1e-12 {
+            break;
+        }
+    }
+    rank.into_iter().map(|r| r * nf).collect()
+}
+
+/// Subject areas: a modularity partition (Louvain: local moving, then
+/// aggregation, repeated until nothing moves) of the undirected bridge
+/// graph, weights summed per table pair. A connected component is often
+/// the whole schema; this splits it where links are dense inside and
+/// sparse between - Sakila's catalog (`film`, `actor`, `category`), its
+/// locations (`address`, `city`, `country`), its transactions. Modularity
+/// never groups tables with no path between them, so an area always sits
+/// inside one component. Returns an area id per table in `graph.tables`
+/// order, numbered by (size descending, first member). Deterministic:
+/// nodes visit in index order and a move needs a strictly positive gain.
+fn subject_areas(graph: &TableGraph) -> Vec<usize> {
+    let n = graph.tables.len();
+    let mut pair: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for (u, v, w) in bridge_arcs(graph) {
+        *pair.entry((u.min(v), u.max(v))).or_default() += w;
+    }
+    // Current level: node -> neighbor weights, and each original table's
+    // node at this level.
+    let mut adj: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); n];
+    for (&(u, v), &w) in &pair {
+        *adj[u].entry(v).or_default() += w;
+        *adj[v].entry(u).or_default() += w;
+    }
+    let mut member_of: Vec<usize> = (0..n).collect();
+    let two_m: f64 = adj.iter().flat_map(|a| a.values()).sum();
+    if two_m > 0.0 {
+        loop {
+            let size = adj.len();
+            let strength: Vec<f64> = adj.iter().map(|a| a.values().sum()).collect();
+            let mut comm: Vec<usize> = (0..size).collect();
+            let mut total: Vec<f64> = strength.clone();
+            let mut moved_any = false;
+            loop {
+                let mut moved = false;
+                for i in 0..size {
+                    let own = comm[i];
+                    let mut links: BTreeMap<usize, f64> = BTreeMap::new();
+                    for (&j, &w) in &adj[i] {
+                        if j != i {
+                            *links.entry(comm[j]).or_default() += w;
+                        }
+                    }
+                    total[own] -= strength[i];
+                    let gain = |c: usize, links: &BTreeMap<usize, f64>| {
+                        links.get(&c).copied().unwrap_or(0.0) - total[c] * strength[i] / two_m
+                    };
+                    let mut best = own;
+                    let mut best_gain = gain(own, &links);
+                    for &c in links.keys() {
+                        let g = gain(c, &links);
+                        if g > best_gain + 1e-12 {
+                            best = c;
+                            best_gain = g;
+                        }
+                    }
+                    total[best] += strength[i];
+                    if best != own {
+                        comm[i] = best;
+                        moved = true;
+                        moved_any = true;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+            if !moved_any {
+                break;
+            }
+            // Aggregate: renumber communities densely, fold edges.
+            let mut renumber: BTreeMap<usize, usize> = BTreeMap::new();
+            for &c in &comm {
+                let next = renumber.len();
+                renumber.entry(c).or_insert(next);
+            }
+            let mut folded: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); renumber.len()];
+            for (i, a) in adj.iter().enumerate() {
+                for (&j, &w) in a {
+                    *folded[renumber[&comm[i]]]
+                        .entry(renumber[&comm[j]])
+                        .or_default() += w;
+                }
+            }
+            for m in member_of.iter_mut() {
+                *m = renumber[&comm[*m]];
+            }
+            adj = folded;
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (table, &node) in member_of.iter().enumerate() {
+        groups.entry(node).or_default().push(table);
+    }
+    let mut ordered: Vec<Vec<usize>> = groups.into_values().collect();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
+    let mut area = vec![0; n];
+    for (id, members) in ordered.iter().enumerate() {
+        for &t in members {
+            area[t] = id;
+        }
+    }
+    area
+}
+
+/// Tables whose removal disconnects the rest of their community: every
+/// join path between some pair of other tables runs through them.
+/// Articulation points of the undirected table graph (all edge contexts,
+/// the same adjacency `path` walks), by Tarjan's low-link DFS, iterative
+/// so a long chain of tables cannot overflow the stack.
+fn articulation_tables(graph: &TableGraph) -> std::collections::BTreeSet<String> {
+    let names = &graph.tables;
+    let index: HashMap<&str, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let adj: Vec<Vec<usize>> = names
+        .iter()
+        .map(|t| graph.adj[t].keys().map(|k| index[k.as_str()]).collect())
+        .collect();
+    let n = names.len();
+    let mut disc = vec![usize::MAX; n];
+    let mut low = vec![0; n];
+    let mut cut = vec![false; n];
+    let mut timer = 0;
+    for root in 0..n {
+        if disc[root] != usize::MAX {
+            continue;
+        }
+        disc[root] = timer;
+        low[root] = timer;
+        timer += 1;
+        let mut root_children = 0;
+        // (node, parent, next neighbor position)
+        let mut stack: Vec<(usize, usize, usize)> = vec![(root, usize::MAX, 0)];
+        while let Some(&(u, parent, pos)) = stack.last() {
+            if pos < adj[u].len() {
+                let v = adj[u][pos];
+                if let Some(top) = stack.last_mut() {
+                    top.2 += 1;
+                }
+                if v == parent {
+                    continue;
+                }
+                if disc[v] == usize::MAX {
+                    disc[v] = timer;
+                    low[v] = timer;
+                    timer += 1;
+                    if u == root {
+                        root_children += 1;
+                    }
+                    stack.push((v, u, 0));
+                } else {
+                    low[u] = low[u].min(disc[v]);
+                }
+            } else {
+                stack.pop();
+                if parent != usize::MAX {
+                    low[parent] = low[parent].min(low[u]);
+                    if parent != root && low[u] >= disc[parent] {
+                        cut[parent] = true;
+                    }
+                }
+            }
+        }
+        if root_children > 1 {
+            cut[root] = true;
+        }
+    }
+    (0..n)
+        .filter(|&i| cut[i])
+        .map(|i| names[i].clone())
+        .collect()
 }
 
 /// Human label for one table's community: its highest-*bridge*-degree
@@ -68938,6 +71104,42 @@ fn graph_column_from_json_owned(v: JsonValue) -> Result<ColumnProfile> {
                     profile.notes = s;
                 }
             }
+            // Declared keys and value sketches: absent from dictionaries
+            // written before they existed, and a malformed entry is
+            // skipped rather than guessed at - the graph just has less to
+            // go on, exactly as for an older dictionary.
+            "references" => {
+                if let JsonValue::Array(items) = value {
+                    for item in items {
+                        let (Some(JsonValue::String(t)), Some(JsonValue::String(c))) =
+                            (item.get("table"), item.get("column"))
+                        else {
+                            continue;
+                        };
+                        let composite = match item.get("composite") {
+                            Some(JsonValue::Array(pairs)) => pairs
+                                .iter()
+                                .filter_map(|p| match p {
+                                    JsonValue::Array(v) => match v.as_slice() {
+                                        [JsonValue::String(l), JsonValue::String(r)] => {
+                                            Some((l.clone(), r.clone()))
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        profile.references.push(ColumnRef {
+                            table: t.clone(),
+                            column: c.clone(),
+                            composite,
+                        });
+                    }
+                }
+            }
+            "value_sketch" => profile.value_sketch = ValueSketch::from_json(&value),
             _ => {}
         }
     }
@@ -80292,8 +82494,27 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                     is_first_table = false;
                 }
             } else {
-                for (table_name, profiles) in tables {
-                    let qualified = namer.resolve(&qualifier, &table_name);
+                // Qualify every table first, so a declared foreign key can
+                // be rewritten to the qualified name of the table it
+                // points at in this same file.
+                let qualified_names: Vec<String> = tables
+                    .keys()
+                    .map(|table_name| namer.resolve(&qualifier, table_name))
+                    .collect();
+                let local_names: Vec<String> = tables.keys().cloned().collect();
+                for ((_, mut profiles), qualified) in tables.into_iter().zip(qualified_names.clone())
+                {
+                    for col in &mut profiles {
+                        col.references.retain_mut(|r| {
+                            match local_names.iter().position(|n| *n == r.table) {
+                                Some(i) => {
+                                    r.table = qualified_names[i].clone();
+                                    true
+                                }
+                                None => false,
+                            }
+                        });
+                    }
                     total_tables += 1;
                     total_columns += profiles.len();
                     combined_tables.insert(qualified, profiles);
@@ -81465,6 +83686,12 @@ fn diff_dictionaries(
     }
 }
 
+/// A probability move at least this large on a surviving edge counts as
+/// drift even when its tier stands still: new overlapping samples lifting a
+/// same-noun match from 0.54 to 0.77 is a real change in how much the link
+/// can be trusted.
+const RELATIONSHIP_DRIFT_PROBABILITY: f64 = 0.2;
+
 /// How one join-candidate edge moved between two snapshots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelDriftKind {
@@ -81472,9 +83699,11 @@ enum RelDriftKind {
     Added,
     /// Linked in old, not in new: a join queries may already rely on.
     Removed,
-    /// Still linked, but `inferred` now where it was `extracted`.
+    /// Still linked, but in a weaker tier, or at least
+    /// `RELATIONSHIP_DRIFT_PROBABILITY` less likely.
     Weakened,
-    /// Still linked, but `extracted` now where it was `inferred`.
+    /// Still linked, but in a stronger tier, or at least
+    /// `RELATIONSHIP_DRIFT_PROBABILITY` more likely.
     Strengthened,
 }
 
@@ -81700,11 +83929,32 @@ fn relationship_drift(
                     old_rel.reason
                 ),
             }),
-            Some(new_rel) if new_rel.confidence != old_rel.confidence => {
-                let (kind, verb) = if new_rel.confidence == Confidence::Extracted {
-                    (RelDriftKind::Strengthened, "measured where it was guessed")
+            Some(new_rel)
+                if new_rel.confidence != old_rel.confidence
+                    || (new_rel.probability - old_rel.probability).abs()
+                        >= RELATIONSHIP_DRIFT_PROBABILITY =>
+            {
+                let stronger = if new_rel.confidence != old_rel.confidence {
+                    new_rel.confidence.rank() < old_rel.confidence.rank()
                 } else {
-                    (RelDriftKind::Weakened, "guessed where it was measured")
+                    new_rel.probability > old_rel.probability
+                };
+                let (kind, verb) = if stronger {
+                    (
+                        RelDriftKind::Strengthened,
+                        format!(
+                            "probability {:.2} -> {:.2}",
+                            old_rel.probability, new_rel.probability
+                        ),
+                    )
+                } else {
+                    (
+                        RelDriftKind::Weakened,
+                        format!(
+                            "probability {:.2} -> {:.2}",
+                            old_rel.probability, new_rel.probability
+                        ),
+                    )
                 };
                 drift.push(RelDrift {
                     kind,
@@ -82339,9 +84589,12 @@ USAGE:
     is everything before the first dot, the column everything after it.
 
     Relationships are listed bridge edges first (the genuinely
-    informative ones), then duplicate-schema links; the md report caps
-    the table at 50 rows and discloses how many more of each kind exist
-    beyond it - --output-format json always carries the full list.
+    informative ones), then shared-reference links, then duplicate-schema
+    links, each group most specific first by its BM25-style score (how
+    rare the matched name and any shared sample values are in this
+    input); the md report caps the table at 50 rows and discloses how
+    many more of each kind exist beyond it - --output-format json always
+    carries the full list, each edge with its "score".
 
 ARGS:
     <INPUT>                 Dictionary or raw data file to query
@@ -82409,6 +84662,14 @@ USAGE:
     anywhere in it is labelled by its shared columns instead of naming
     an arbitrary member "the hub". Isolated tables rank with degree zero
     in single-member communities rather than vanishing.
+
+    Three more measures per table: Ref. rank (weighted PageRank along
+    references, 1.00 = average - high for the tables everything
+    ultimately points at, like a snowflake's country dimension), Area
+    (a modularity subject area splitting a community where links are
+    dense inside and sparse between; listed under "Subject areas" when
+    a community splits), and Cut (every join path between some other
+    pair of tables runs through this one).
 
     <INPUT> follows the same dictionary-or-raw-file rule as
     `sniff-rs explain` (see `sniff-rs explain --help`); directories are
@@ -82628,6 +84889,38 @@ fn escape_graph_md(text: &str) -> String {
     text.replace('|', "\\|")
 }
 
+/// Declared foreign keys from one table to itself that involve `column`,
+/// as (referencing column, referenced column) pairs: `staff.manager ->
+/// staff.id` is a hierarchy. The graph links tables, so a loop has no
+/// edge there (see `apply_declared_keys`); `explain` lists these
+/// separately instead of dropping them. Declared keys only - self-joins
+/// are too rare in the benchmark corpora (three in Spider's 166 schemas,
+/// one of them mislabelled) to fit or check a heuristic against.
+fn self_references(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    table: &str,
+    column: &str,
+) -> Vec<(String, String)> {
+    let Some(cols) = tables.get(table) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in cols {
+        for r in &c.references {
+            if r.table == table
+                && (c.name == column || r.column == column)
+                && cols.iter().any(|x| x.name == r.column)
+            {
+                let pair = (c.name.clone(), r.column.clone());
+                if !out.contains(&pair) {
+                    out.push(pair);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn render_explain_md(
     input: &Path,
     table: &str,
@@ -82682,13 +84975,24 @@ fn render_explain_md(
     // copies (many profiled PDFs, say, all sharing one fixed page_number/
     // text schema) should never read as if it had hundreds of genuine
     // cross-schema relationships. See `EdgeContext`'s own doc comment.
-    let bridge_count = edge_indices
-        .iter()
-        .filter(|&&idx| graph.relationships[idx].context == EdgeContext::Bridge)
-        .count();
-    let duplicate_count = edge_indices.len() - bridge_count;
+    let count_of = |context: EdgeContext| {
+        edge_indices
+            .iter()
+            .filter(|&&idx| graph.relationships[idx].context == context)
+            .count()
+    };
+    let bridge_count = count_of(EdgeContext::Bridge);
+    let duplicate_count = count_of(EdgeContext::DuplicateSchema);
+    let shared_count = count_of(EdgeContext::SharedReference);
+    // The shared-reference share is only named when there is one, so a
+    // graph with no hub-derived links reads exactly as it always has.
+    let shared_text = if shared_count > 0 {
+        format!(", {shared_count} shared-reference")
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "- Degree: {} ({bridge_count} bridge, {duplicate_count} duplicate-schema) · Community: {} ({})\n",
+        "- Degree: {} ({bridge_count} bridge{shared_text}, {duplicate_count} duplicate-schema) · Community: {} ({})\n",
         edge_indices.len(),
         community_of(graph, table),
         community_label(graph, table, tables)
@@ -82702,6 +85006,19 @@ fn render_explain_md(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    }
+    for (from, to) in self_references(tables, table, &profile.name) {
+        if from == profile.name {
+            out.push_str(&format!(
+                "- Self-reference: declared foreign key to `{}` in this same table (a hierarchy)\n",
+                escape_graph_md(&to)
+            ));
+        } else {
+            out.push_str(&format!(
+                "- Self-reference: `{}` in this same table declares a foreign key to this column (a hierarchy)\n",
+                escape_graph_md(&from)
+            ));
+        }
     }
     out.push('\n');
     if edge_indices.is_empty() {
@@ -82717,10 +85034,19 @@ fn render_explain_md(
         // rendered list in this project (`MAX_TOC_ENTRIES`) - the `json`
         // output stays uncapped for a machine consumer, per that
         // constant's own established convention.
+        // Within one context, the most specific edge first: `score` is the
+        // BM25-style weight (see `edge_score`), so a rare key or a rare
+        // shared value lists above a generic one. The sort is stable, so
+        // equal scores keep the graph's own deterministic order.
         let mut ordered: Vec<usize> = edge_indices.to_vec();
-        ordered.sort_by_key(|&idx| match graph.relationships[idx].context {
-            EdgeContext::Bridge => 0,
-            EdgeContext::DuplicateSchema => 1,
+        ordered.sort_by(|&a, &b| {
+            let (ra, rb) = (&graph.relationships[a], &graph.relationships[b]);
+            ra.context
+                .sort_rank()
+                .cmp(&rb.context.sort_rank())
+                .then_with(|| ra.confidence.rank().cmp(&rb.confidence.rank()))
+                .then_with(|| rb.probability.total_cmp(&ra.probability))
+                .then_with(|| rb.score.total_cmp(&ra.score))
         });
         out.push_str("## Relationships\n\n");
         out.push_str("| Table | Column | Confidence | Why |\n");
@@ -82733,27 +85059,33 @@ fn render_explain_md(
             } else {
                 (&rel.from_table, &rel.from_column)
             };
-            let context_note = match rel.context {
-                EdgeContext::DuplicateSchema => " [duplicate-schema link]",
-                EdgeContext::Bridge => "",
-            };
+            let context_note = rel.context.md_note();
             out.push_str(&format!(
                 "| {} | {} | {} | {}{} |\n",
                 escape_graph_md(other_table),
                 escape_graph_md(other_column),
-                rel.confidence.as_str(),
+                rel.tier_label(),
                 escape_graph_md(&rel.reason),
                 context_note,
             ));
         }
         if ordered.len() > shown {
-            let remaining_duplicate = ordered[shown..]
-                .iter()
-                .filter(|&&idx| graph.relationships[idx].context == EdgeContext::DuplicateSchema)
-                .count();
-            let remaining_bridge = ordered.len() - shown - remaining_duplicate;
+            let remaining_of = |context: EdgeContext| {
+                ordered[shown..]
+                    .iter()
+                    .filter(|&&idx| graph.relationships[idx].context == context)
+                    .count()
+            };
+            let remaining_duplicate = remaining_of(EdgeContext::DuplicateSchema);
+            let remaining_bridge = remaining_of(EdgeContext::Bridge);
+            let remaining_shared = remaining_of(EdgeContext::SharedReference);
+            let remaining_shared_text = if remaining_shared > 0 {
+                format!(", {remaining_shared} shared-reference")
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "\n…and {} more relationship{} not shown ({remaining_bridge} bridge, {remaining_duplicate} duplicate-schema) - see `--output-format json` for the full list.\n",
+                "\n…and {} more relationship{} not shown ({remaining_bridge} bridge{remaining_shared_text}, {remaining_duplicate} duplicate-schema) - see `--output-format json` for the full list.\n",
                 ordered.len() - shown,
                 if ordered.len() - shown == 1 { "" } else { "s" },
             ));
@@ -82816,11 +85148,15 @@ fn render_explain_json(
         }
         seen.into_iter().map(JsonValue::from).collect()
     };
-    let bridge_count = edge_indices
-        .iter()
-        .filter(|&&idx| graph.relationships[idx].context == EdgeContext::Bridge)
-        .count();
-    let duplicate_count = edge_indices.len() - bridge_count;
+    let count_of = |context: EdgeContext| {
+        edge_indices
+            .iter()
+            .filter(|&&idx| graph.relationships[idx].context == context)
+            .count()
+    };
+    let bridge_count = count_of(EdgeContext::Bridge);
+    let duplicate_count = count_of(EdgeContext::DuplicateSchema);
+    let shared_count = count_of(EdgeContext::SharedReference);
     doc.insert(
         "degree".to_string(),
         JsonValue::from(edge_indices.len() as i64),
@@ -82848,6 +85184,22 @@ fn render_explain_json(
             edge_indices
                 .iter()
                 .map(|idx| graph.relationships[*idx].to_json())
+                .collect(),
+        ),
+    );
+    // Appended last, per the additive-field convention: the
+    // shared-reference context postdates every other explain key.
+    doc.insert(
+        "shared_reference_degree".to_string(),
+        JsonValue::from(shared_count as i64),
+    );
+    // Appended last too: declared keys from this table to itself.
+    doc.insert(
+        "self_references".to_string(),
+        JsonValue::Array(
+            self_references(tables, table, &profile.name)
+                .into_iter()
+                .map(|(from, to)| json!({"column": from, "references": to}))
                 .collect(),
         ),
     );
@@ -82907,10 +85259,7 @@ fn render_path_md(
         // Duplicate-schema hops read differently from bridges: the link
         // is real, but it joins two copies of one schema, not two
         // independently-designed tables. Marked, never hidden.
-        let context_note = match rel.context {
-            EdgeContext::DuplicateSchema => " [duplicate-schema link]",
-            EdgeContext::Bridge => "",
-        };
+        let context_note = rel.context.md_note();
         out.push_str(&format!(
             "{}. {}.{} → {}.{} ({}) — {}{}\n",
             n + 1,
@@ -82918,7 +85267,7 @@ fn render_path_md(
             rel.from_column,
             rel.to_table,
             rel.to_column,
-            rel.confidence.as_str(),
+            rel.tier_label(),
             rel.reason,
             context_note,
         ));
@@ -82928,17 +85277,14 @@ fn render_path_md(
                 .iter()
                 .map(|i| {
                     let alt = &graph.relationships[*i];
-                    let note = match alt.context {
-                        EdgeContext::DuplicateSchema => " [duplicate-schema link]",
-                        EdgeContext::Bridge => "",
-                    };
+                    let note = alt.context.md_note();
                     format!(
                         "{}.{} → {}.{} ({}){}",
                         alt.from_table,
                         alt.from_column,
                         alt.to_table,
                         alt.to_column,
-                        alt.confidence.as_str(),
+                        alt.tier_label(),
                         note
                     )
                 })
@@ -83035,6 +85381,9 @@ fn render_rank_md(
 ) -> String {
     let mut out = String::new();
     out.push_str("# Tables by connectivity\n\n");
+    out.push_str(
+        "Degree counts bridge links. Ref. rank follows references transitively (weighted PageRank; 1.00 is average): high for the tables everything ultimately points at. Area is the table's subject area within its community. Cut marks a table every join path between some other pair runs through.\n\n",
+    );
     // Degree counts `Bridge` edges only - the real, distinct-schema
     // connectivity a "god table" ranking exists to surface. Duplicates
     // is the `DuplicateSchema` count reported alongside it, never folded
@@ -83043,36 +85392,34 @@ fn render_rank_md(
     // otherwise rank as if it were hundreds of times more central than a
     // table that genuinely bridges two different schemas once. See
     // `EdgeContext`'s own doc comment for the full reasoning.
-    out.push_str("| Table | Rows | Degree | Duplicates | Neighbors | Community |\n");
-    out.push_str("|---|---|---|---|---|---|\n");
-    let mut rows: Vec<(&String, usize, usize, usize, usize)> = graph
-        .tables
-        .iter()
-        .map(|t| {
-            let bridge = bridge_degree(graph, t);
-            let duplicate = duplicate_degree(graph, t);
-            let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
-            (t, bridge, duplicate, neighbors, community_of(graph, t))
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.0.cmp(b.0))
-    });
-    for (table, bridge, duplicate, neighbors, community) in rows {
-        let rows_text = match table_rows(tables, table) {
+    // Ref. rank is weighted PageRank along references (average table =
+    // 1.00), Area the modularity subject area inside a community, and a
+    // Cut table one every path between some other pair goes through.
+    out.push_str(
+        "| Table | Rows | Degree | Duplicates | Neighbors | Community | Ref. rank | Area | Cut |\n",
+    );
+    out.push_str("|---|---|---|---|---|---|---|---|---|\n");
+    let metrics = GraphMetrics::compute(graph);
+    for row in rank_rows(graph) {
+        let rows_text = match table_rows(tables, row.table) {
             Some(n) => n.to_string(),
             None => "(unknown)".to_string(),
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
-            escape_graph_md(table),
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {} | {} |\n",
+            escape_graph_md(row.table),
             rows_text,
-            bridge,
-            duplicate,
-            neighbors,
-            community
+            row.bridge,
+            row.duplicate,
+            row.neighbors,
+            row.community,
+            metrics.importance[row.index],
+            metrics.area[row.index],
+            if metrics.cut.contains(row.table) {
+                "yes"
+            } else {
+                ""
+            }
         ));
     }
     out.push_str("\n## Communities\n\n");
@@ -83089,6 +85436,35 @@ fn render_rank_md(
             let label = community_label(graph, &members[0], tables);
             out.push_str(&format!(
                 "- Community {id} ({label}, {} tables): {}\n",
+                members.len(),
+                members
+                    .iter()
+                    .map(|m| escape_graph_md(m))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    // Subject areas only say something when a community splits into
+    // more than one multi-table area; otherwise they repeat the list above.
+    let splits = components.iter().any(|members| {
+        let areas: std::collections::BTreeSet<usize> = members
+            .iter()
+            .filter_map(|m| graph.tables.binary_search(m).ok())
+            .map(|i| metrics.area[i])
+            .filter(|a| metrics.area_size(*a) > 1)
+            .collect();
+        areas.len() > 1
+    });
+    if splits {
+        out.push_str("\n## Subject areas\n\n");
+        for (id, members) in metrics.areas(graph).iter().enumerate() {
+            if members.len() < 2 {
+                continue;
+            }
+            out.push_str(&format!(
+                "- Area {id} ({} area, {} tables): {}\n",
+                escape_graph_md(&metrics.area_lead(graph, id)),
                 members.len(),
                 members
                     .iter()
@@ -83140,26 +85516,20 @@ fn render_rank_json(
         "input".to_string(),
         JsonValue::from(input.display().to_string()),
     );
-    let mut rows: Vec<(&String, usize, usize, usize, usize)> = graph
-        .tables
-        .iter()
-        .map(|t| {
-            let bridge = bridge_degree(graph, t);
-            let duplicate = duplicate_degree(graph, t);
-            let neighbors = graph.adj.get(t).map(BTreeMap::len).unwrap_or(0);
-            (t, bridge, duplicate, neighbors, community_of(graph, t))
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.0.cmp(b.0))
-    });
+    let metrics = GraphMetrics::compute(graph);
     doc.insert(
         "tables".to_string(),
         JsonValue::Array(
-            rows.iter()
-                .map(|(table, bridge, duplicate, neighbors, community)| {
+            rank_rows(graph)
+                .iter()
+                .map(|row| {
+                    let (table, bridge, duplicate, neighbors, community) = (
+                        row.table,
+                        &row.bridge,
+                        &row.duplicate,
+                        &row.neighbors,
+                        &row.community,
+                    );
                     let mut obj = json_support::Map::with_capacity(6);
                     obj.insert("table".to_string(), JsonValue::from(table.to_string()));
                     obj.insert(
@@ -83181,6 +85551,25 @@ fn render_rank_json(
                     );
                     obj.insert("neighbors".to_string(), JsonValue::from(*neighbors as i64));
                     obj.insert("community".to_string(), JsonValue::from(*community as i64));
+                    // Appended last (additive-field convention): links
+                    // derived through a shared hub, kept out of `degree`
+                    // like duplicate-schema copies are.
+                    obj.insert(
+                        "shared_reference_degree".to_string(),
+                        JsonValue::from(shared_reference_degree(graph, table) as i64),
+                    );
+                    obj.insert(
+                        "reference_rank".to_string(),
+                        JsonValue::from((metrics.importance[row.index] * 1e4).round() / 1e4),
+                    );
+                    obj.insert(
+                        "area".to_string(),
+                        JsonValue::from(metrics.area[row.index] as i64),
+                    );
+                    obj.insert(
+                        "articulation".to_string(),
+                        JsonValue::from(metrics.cut.contains(table)),
+                    );
                     JsonValue::Object(obj)
                 })
                 .collect(),
@@ -83237,7 +85626,137 @@ fn render_rank_json(
                 .collect(),
         ),
     );
+    // Appended last: the modularity partition, every area listed (a
+    // single-table area included) so a consumer can join on `area`.
+    doc.insert(
+        "areas".to_string(),
+        JsonValue::Array(
+            metrics
+                .areas(graph)
+                .iter()
+                .enumerate()
+                .map(|(id, members)| {
+                    let mut obj = json_support::Map::with_capacity(4);
+                    obj.insert("id".to_string(), JsonValue::from(id as i64));
+                    obj.insert("size".to_string(), JsonValue::from(members.len() as i64));
+                    obj.insert(
+                        "lead".to_string(),
+                        JsonValue::from(metrics.area_lead(graph, id)),
+                    );
+                    obj.insert(
+                        "members".to_string(),
+                        JsonValue::Array(members.iter().cloned().map(JsonValue::from).collect()),
+                    );
+                    JsonValue::Object(obj)
+                })
+                .collect(),
+        ),
+    );
     Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+}
+
+/// One `rank` row, in the order both renderers list them: bridge degree
+/// descending, then duplicate degree descending, then name.
+struct RankRow<'a> {
+    table: &'a String,
+    index: usize,
+    bridge: usize,
+    duplicate: usize,
+    neighbors: usize,
+    community: usize,
+}
+
+fn rank_rows(graph: &TableGraph) -> Vec<RankRow<'_>> {
+    // Components once, not per row (`community_of` recomputes them).
+    let mut community: HashMap<String, usize> = HashMap::new();
+    for (id, members) in connected_components(graph).into_iter().enumerate() {
+        for m in members {
+            community.insert(m, id);
+        }
+    }
+    let mut rows: Vec<RankRow> = graph
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(index, t)| RankRow {
+            table: t,
+            index,
+            bridge: bridge_degree(graph, t),
+            duplicate: duplicate_degree(graph, t),
+            neighbors: graph.adj.get(t).map(BTreeMap::len).unwrap_or(0),
+            community: community[t],
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.bridge
+            .cmp(&a.bridge)
+            .then_with(|| b.duplicate.cmp(&a.duplicate))
+            .then_with(|| a.table.cmp(b.table))
+    });
+    rows
+}
+
+/// The whole-graph measures `rank` reports, computed once: importance
+/// (`table_importance`), subject area (`subject_areas`), and articulation
+/// tables (`articulation_tables`), the first two indexed like
+/// `graph.tables`.
+struct GraphMetrics {
+    importance: Vec<f64>,
+    area: Vec<usize>,
+    cut: std::collections::BTreeSet<String>,
+}
+
+impl GraphMetrics {
+    fn compute(graph: &TableGraph) -> Self {
+        GraphMetrics {
+            importance: table_importance(graph),
+            area: subject_areas(graph),
+            cut: articulation_tables(graph),
+        }
+    }
+
+    fn area_size(&self, area: usize) -> usize {
+        self.area.iter().filter(|a| **a == area).count()
+    }
+
+    /// Members of each area, sorted, indexed by area id.
+    fn areas(&self, graph: &TableGraph) -> Vec<Vec<String>> {
+        let count = self.area.iter().max().map_or(0, |m| m + 1);
+        let mut out = vec![Vec::new(); count];
+        for (i, &a) in self.area.iter().enumerate() {
+            out[a].push(graph.tables[i].clone());
+        }
+        out
+    }
+
+    /// The area's hub: the member with the most bridge weight to other
+    /// members, ties to the higher reference rank, then the first name.
+    /// Reference rank alone would name an area after the lookup table
+    /// everything points at (`language` for Sakila's film catalog).
+    fn area_lead(&self, graph: &TableGraph, area: usize) -> String {
+        let mut inner = vec![0.0; graph.tables.len()];
+        for (u, v, w) in bridge_arcs(graph) {
+            if self.area[u] == area && self.area[v] == area {
+                inner[u] += w;
+                inner[v] += w;
+            }
+        }
+        let mut best: Option<usize> = None;
+        for (i, &a) in self.area.iter().enumerate() {
+            if a != area {
+                continue;
+            }
+            let better = best.is_none_or(|b| {
+                inner[i] > inner[b] + 1e-9
+                    || ((inner[i] - inner[b]).abs() <= 1e-9
+                        && self.importance[i] > self.importance[b] + 1e-9)
+            });
+            if better {
+                best = Some(i);
+            }
+        }
+        best.map(|i| graph.tables[i].clone()).unwrap_or_default()
+    }
 }
 
 fn run_rank(raw: &[String]) -> Result<()> {
@@ -83312,7 +85831,7 @@ mod diff_tests {
         let drift = &report.relationship_drift[0];
         assert_eq!(drift.kind, RelDriftKind::Removed);
         assert_eq!(drift.compatibility(), Compatibility::Breaking);
-        assert_eq!(drift.old_confidence, Some(Confidence::Extracted));
+        assert_eq!(drift.old_confidence, Some(Confidence::Probable));
         assert_eq!(drift.new_confidence, None);
         assert!(report.has_breaking());
     }
@@ -83342,14 +85861,41 @@ mod diff_tests {
         // Names and types stand still; only the samples move (overlap lost),
         // so there are no column entries at all - yet the measured link
         // degrades to a guess. This is the one drift shape with an empty
-        // `entries` list, and it still counts as breaking.
+        // `entries` list, and it still counts as breaking. `ref_code`
+        // leading two tables that don't own it is a mid-strength name: the
+        // lost overlap moves it by more than the drift bar (0.83 to 0.62)
+        // without dropping it.
         let old = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["acme"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let new = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["globex"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["globex"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let report = diff_dictionaries(&old, &new);
         assert!(report.entries.is_empty());
@@ -83361,12 +85907,36 @@ mod diff_tests {
     #[test]
     fn drift_reports_strengthened_confidence_from_new_overlap() {
         let old = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["globex"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["globex"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let new = drift_tables(&[
-            ("a", vec![drift_col("customer", "String", &["acme"])]),
-            ("b", vec![drift_col("customer_id", "String", &["acme"])]),
+            (
+                "a",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("alpha", "String", &[]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    drift_col("ref_code", "String", &["acme"]),
+                    drift_col("beta", "String", &[]),
+                ],
+            ),
         ]);
         let report = diff_dictionaries(&old, &new);
         assert_eq!(report.relationship_drift.len(), 1);
@@ -90649,6 +93219,8 @@ mod tests {
             notes: String::new(),
             row_count: 10,
             numeric_stats: None,
+            references: Vec::new(),
+            value_sketch: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = std::iter::once((
             "t".to_string(),
@@ -90724,6 +93296,8 @@ mod tests {
             notes: String::new(),
             row_count: 42,
             numeric_stats: None,
+            references: Vec::new(),
+            value_sketch: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> =
             std::iter::once(("t".to_string(), vec![profile])).collect();
@@ -90743,6 +93317,8 @@ mod tests {
             notes: String::new(),
             row_count,
             numeric_stats: None,
+            references: Vec::new(),
+            value_sketch: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = [
             ("events".to_string(), vec![profile_with_rows(3)]),
@@ -91142,6 +93718,8 @@ mod tests {
                 notes: String::new(),
                 row_count: 1,
                 numeric_stats: None,
+                references: Vec::new(),
+                value_sketch: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -91153,6 +93731,8 @@ mod tests {
                 notes: "matches email address format".to_string(),
                 row_count: 1,
                 numeric_stats: None,
+                references: Vec::new(),
+                value_sketch: None,
             },
         ];
         let mut tables = BTreeMap::new();
@@ -91229,6 +93809,8 @@ mod tests {
                     notes: String::new(),
                     row_count: 1,
                     numeric_stats: None,
+                    references: Vec::new(),
+                    value_sketch: None,
                 })
                 .collect()
         };
@@ -91308,6 +93890,8 @@ mod tests {
                 notes: String::new(),
                 row_count: 2,
                 numeric_stats: None,
+                references: Vec::new(),
+                value_sketch: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -91319,6 +93903,8 @@ mod tests {
                 notes: "matches email address format".to_string(),
                 row_count: 2,
                 numeric_stats: None,
+                references: Vec::new(),
+                value_sketch: None,
             },
         ];
         let dir = std::env::temp_dir().join(format!(
@@ -91377,6 +93963,8 @@ mod tests {
             notes: String::new(),
             row_count: 1,
             numeric_stats: None,
+            references: Vec::new(),
+            value_sketch: None,
         }];
         let dir = std::env::temp_dir().join(format!(
             "sniff-rs-sql-inline-trailing-newline-test-{}",
@@ -91550,27 +94138,29 @@ mod tests {
         assert_eq!(hops.len(), 1);
         assert_eq!(
             graph.relationships[hops[0]].confidence,
-            Confidence::Inferred
+            Confidence::Probable
         );
     }
 
     #[test]
-    fn graph_bfs_prefers_extracted_among_parallel_edges() {
-        // Two tables sharing both a measured `id` link and a guessed
+    fn graph_bfs_prefers_the_named_key_among_parallel_edges() {
+        // Two tables sharing both a measured `batch_id` link and a guessed
         // UUID-domain link: the reported hop must be the measured one,
-        // not the alphabetically-first column.
+        // not the alphabetically-first column. (Not `id`/`id`: two
+        // tables' own surrogate keys are not a join - see
+        // `is_surrogate_key_name`.)
         let graph = graph_tables(&[
             (
                 "a",
                 vec![
-                    rel_col("id", "i64", &["1"]),
+                    rel_col("batch_id", "i64", &["1"]),
                     rel_col("u1", "UUID", &["aaa"]),
                 ],
             ),
             (
                 "b",
                 vec![
-                    rel_col("id", "i64", &["1"]),
+                    rel_col("batch_id", "i64", &["1"]),
                     rel_col("u2", "UUID", &["bbb"]),
                 ],
             ),
@@ -91578,16 +94168,16 @@ mod tests {
         let hops = shortest_path(&graph, "a", "b").expect("a-b should connect");
         assert_eq!(hops.len(), 1);
         let rel = &graph.relationships[hops[0]];
-        assert_eq!(rel.confidence, Confidence::Extracted);
+        assert_eq!(rel.confidence, Confidence::Probable);
         assert_eq!(
             (rel.from_column.as_str(), rel.to_column.as_str()),
-            ("id", "id")
+            ("batch_id", "batch_id")
         );
     }
 
     #[test]
     fn graph_hop_alternatives_list_unchosen_parallel_edges() {
-        // users <-> orders share two links (region exact, id fk-pattern):
+        // users <-> orders share two links (region_code exact, id fk-pattern):
         // the hop reports one, alternatives the other, and a lone edge
         // reports none.
         let graph = graph_tables(&[
@@ -91595,14 +94185,14 @@ mod tests {
                 "users",
                 vec![
                     rel_col("id", "i64", &["1"]),
-                    rel_col("region", "String", &["n"]),
+                    rel_col("region_code", "String", &["n"]),
                 ],
             ),
             (
                 "orders",
                 vec![
+                    rel_col("region_code", "String", &["n"]),
                     rel_col("user_id", "i64", &["1"]),
-                    rel_col("region", "String", &["n"]),
                 ],
             ),
             ("audit", vec![rel_col("note", "String", &["x"])]),
@@ -91797,6 +94387,192 @@ mod tests {
         assert!(parse_graph_args(&graph_raw_args(&["--samples"]), EXPLAIN_HELP_TEXT).is_err());
     }
 
+    /// A graph from bare edges `(a, b, oriented)`: an oriented edge reads
+    /// `a` references `b`. Every edge is a probability-1 bridge on `id`.
+    fn synth_graph(tables: &[&str], edges: &[(&str, &str, bool)]) -> TableGraph {
+        let relationships: Vec<Relationship> = edges
+            .iter()
+            .map(|&(a, b, oriented)| Relationship {
+                from_table: a.to_string(),
+                from_column: format!("{b}_id"),
+                to_table: b.to_string(),
+                to_column: "id".to_string(),
+                confidence: Confidence::Probable,
+                reference: oriented.then(|| Reference {
+                    referencing_table: a.to_string(),
+                    referencing_column: format!("{b}_id"),
+                    referenced_table: b.to_string(),
+                    referenced_column: "id".to_string(),
+                }),
+                context: EdgeContext::Bridge,
+                evidence: Vec::new(),
+                reason: String::new(),
+                score: 0.0,
+                probability: 1.0,
+                features: EdgeFeatures::default(),
+            })
+            .collect();
+        let mut adj: BTreeMap<String, BTreeMap<String, Vec<usize>>> = tables
+            .iter()
+            .map(|t| (t.to_string(), BTreeMap::new()))
+            .collect();
+        for (i, rel) in relationships.iter().enumerate() {
+            adj.get_mut(&rel.from_table)
+                .unwrap()
+                .entry(rel.to_table.clone())
+                .or_default()
+                .push(i);
+            adj.get_mut(&rel.to_table)
+                .unwrap()
+                .entry(rel.from_table.clone())
+                .or_default()
+                .push(i);
+        }
+        let mut names: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+        names.sort();
+        TableGraph {
+            tables: names,
+            adj,
+            relationships,
+        }
+    }
+
+    fn metric<'a>(graph: &'a TableGraph, values: &'a [f64], table: &str) -> f64 {
+        values[graph.tables.iter().position(|t| t == table).unwrap()]
+    }
+
+    #[test]
+    fn graph_reference_rank_follows_references_transitively() {
+        // A snowflake: two facts reference customer, customer references
+        // address, address references country. Each dimension has the
+        // same single inbound link from below it, but rank accumulates.
+        let graph = synth_graph(
+            &["orders", "invoices", "customer", "address", "country"],
+            &[
+                ("orders", "customer", true),
+                ("invoices", "customer", true),
+                ("customer", "address", true),
+                ("address", "country", true),
+            ],
+        );
+        let rank = table_importance(&graph);
+        let r = |t| metric(&graph, &rank, t);
+        assert!(r("country") > r("address"));
+        assert!(r("address") > r("customer"));
+        assert!(r("customer") > r("orders"));
+        assert!((r("orders") - r("invoices")).abs() < 1e-9);
+        // Scaled so the average is 1.0.
+        assert!((rank.iter().sum::<f64>() - 5.0).abs() < 1e-6);
+        // No bridges at all: every table scores exactly average.
+        let flat = table_importance(&synth_graph(&["a", "b"], &[]));
+        assert!(flat.iter().all(|v| (v - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn graph_subject_areas_split_two_dense_clusters_joined_by_one_link() {
+        // Two triangles joined by a single edge c-d: one component, two
+        // areas; a disconnected pair is its own area.
+        let graph = synth_graph(
+            &["a", "b", "c", "d", "e", "f", "x", "y"],
+            &[
+                ("a", "b", false),
+                ("b", "c", false),
+                ("a", "c", false),
+                ("d", "e", false),
+                ("e", "f", false),
+                ("d", "f", false),
+                ("c", "d", false),
+                ("x", "y", false),
+            ],
+        );
+        let area = subject_areas(&graph);
+        let at = |t: &str| area[graph.tables.iter().position(|n| n == t).unwrap()];
+        assert_eq!(at("a"), at("b"));
+        assert_eq!(at("a"), at("c"));
+        assert_eq!(at("d"), at("e"));
+        assert_eq!(at("d"), at("f"));
+        assert_ne!(at("a"), at("d"));
+        assert_eq!(at("x"), at("y"));
+        assert_ne!(at("x"), at("a"));
+        assert_ne!(at("x"), at("d"));
+        // Numbered largest first; the pair comes last.
+        assert_eq!(at("x"), 2);
+        // Hub naming: the member with the most links inside its area.
+        let metrics = GraphMetrics::compute(&graph);
+        assert!(["a", "b", "c"].contains(&metrics.area_lead(&graph, at("a")).as_str()));
+    }
+
+    #[test]
+    fn graph_articulation_tables_are_the_cut_points() {
+        // A chain a-b-c plus a triangle c-d-e: b and c are cut points; a
+        // triangle member other than c is not, nor is an isolated table.
+        let graph = synth_graph(
+            &["a", "b", "c", "d", "e", "z"],
+            &[
+                ("a", "b", true),
+                ("b", "c", true),
+                ("c", "d", false),
+                ("d", "e", false),
+                ("c", "e", false),
+            ],
+        );
+        let cut = articulation_tables(&graph);
+        assert_eq!(
+            cut.into_iter().collect::<Vec<_>>(),
+            vec!["b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn graph_triangle_through_a_hub_is_relabelled_shared_reference() {
+        // trip.station_id references station and status.station_id; status
+        // references station too. The trip -> status hop is derived.
+        let entries = [
+            (
+                "station",
+                vec![
+                    rel_col("id", "i64", &["1", "2", "3"]),
+                    rel_col("name", "String", &["x", "y", "z"]),
+                ],
+            ),
+            (
+                "status",
+                vec![
+                    rel_col("station_id", "i64", &["1", "2"]),
+                    rel_col("bikes", "i64", &["4", "5"]),
+                ],
+            ),
+            (
+                "trip",
+                vec![
+                    rel_col("id", "i64", &["7", "8"]),
+                    rel_col("station_id", "i64", &["1", "3"]),
+                ],
+            ),
+        ];
+        let tables = rel_tables(&entries);
+        let rels = detect_relationships(&tables);
+        let find = |a: &str, b: &str| {
+            rels.iter()
+                .find(|r| {
+                    (r.from_table == a && r.to_table == b) || (r.from_table == b && r.to_table == a)
+                })
+                .unwrap_or_else(|| panic!("no {a}-{b} edge"))
+        };
+        assert_eq!(find("station", "trip").context, EdgeContext::Bridge);
+        assert_eq!(find("station", "status").context, EdgeContext::Bridge);
+        let derived = find("status", "trip");
+        assert_eq!(derived.context, EdgeContext::SharedReference);
+        assert!(
+            derived
+                .evidence
+                .iter()
+                .any(|e| e.contains("derived through that hub")),
+            "{:?}",
+            derived.evidence
+        );
+    }
+
     #[test]
     fn graph_community_label_names_the_hub_or_the_singleton() {
         let entries = [
@@ -91933,11 +94709,11 @@ mod tests {
     #[test]
     fn graph_duplicate_pair_edges_read_duplicate_schema() {
         // v1/v2 are column-identical (similarity 1.0): every edge between
-        // them reads duplicate_schema. w shares one column with each -
-        // same exact-name rule, but a 0.25-similarity pair, so those edges
-        // stay honest bridges.
+        // them reads duplicate_schema. `widgets` shares its own key with
+        // each - same exact-name rule, but a 0.2-similarity pair, so those
+        // edges stay honest bridges.
         let quad = || {
-            ["a", "b", "c", "d"]
+            ["widget_id", "b", "c", "d"]
                 .iter()
                 .map(|n| rel_col(n, "i64", &["1"]))
                 .collect::<Vec<_>>()
@@ -91946,9 +94722,9 @@ mod tests {
             ("v1", quad()),
             ("v2", quad()),
             (
-                "w",
+                "widgets",
                 vec![
-                    rel_col("a", "i64", &["1"]),
+                    rel_col("widget_id", "i64", &["1"]),
                     rel_col("zzz", "String", &["q"]),
                 ],
             ),
@@ -91969,7 +94745,7 @@ mod tests {
         );
         let bridge_edges: Vec<&Relationship> = edges
             .iter()
-            .filter(|e| e.from_table == "w" || e.to_table == "w")
+            .filter(|e| e.from_table == "widgets" || e.to_table == "widgets")
             .collect();
         assert_eq!(bridge_edges.len(), 2);
         assert!(
@@ -92040,8 +94816,311 @@ mod tests {
         assert_eq!(canon_name("  padded  "), "padded");
     }
 
+    fn sketched(name: &str, ideal: &str, values: &[String]) -> ColumnProfile {
+        let mut sketch = ValueSketch::default();
+        for v in values {
+            sketch.push(v);
+        }
+        ColumnProfile {
+            name: name.to_string(),
+            ideal_type: ideal.to_string(),
+            sample_values: values.iter().take(3).cloned().collect(),
+            value_sketch: Some(sketch),
+            ..Default::default()
+        }
+    }
+
+    fn strs(it: impl Iterator<Item = String>) -> Vec<String> {
+        it.collect()
+    }
+
     #[test]
-    fn relationships_exact_name_and_type_is_extracted() {
+    fn value_sketch_is_exact_below_k_and_bounded_above_it() {
+        let mut s = ValueSketch::default();
+        for round in 0..2 {
+            for i in 0..50 {
+                s.push(&format!("v{i}"));
+            }
+            assert_eq!(s.distinct(), 50.0);
+            assert_eq!(s.looks_unique(), round == 0);
+        }
+        assert_eq!(s.count, 100);
+        let mut big = ValueSketch::default();
+        for i in 0..20_000 {
+            big.push(&i.to_string());
+        }
+        assert_eq!(big.hashes.len(), VALUE_SKETCH_K);
+        assert!(big.hashes.windows(2).all(|w| w[0] < w[1]));
+        let d = big.distinct();
+        assert!((15_000.0..25_000.0).contains(&d), "{d}");
+        assert!(big.looks_unique());
+        // Blank values are not values.
+        let mut blank = ValueSketch::default();
+        blank.push("  ");
+        assert_eq!(blank.count, 0);
+    }
+
+    #[test]
+    fn value_sketch_measures_containment_both_exactly_and_estimated() {
+        let sk = |r: std::ops::Range<u32>| {
+            let mut s = ValueSketch::default();
+            for i in r {
+                s.push(&format!("K{i}"));
+            }
+            s
+        };
+        // Small referencing side, large referenced side: estimated.
+        let (f, seen) = sk(0..300).contained_in(&sk(0..5000)).unwrap();
+        assert!(f >= 0.99 && seen > 0, "{f}");
+        let (f, _) = sk(4000..6000).contained_in(&sk(0..5000)).unwrap();
+        assert!((0.3..0.7).contains(&f), "{f}");
+        // Both below k: exact.
+        let (f, seen) = sk(0..10).contained_in(&sk(5..20)).unwrap();
+        assert_eq!((f, seen), (0.5, 10));
+        assert!(ValueSketch::default().contained_in(&sk(0..3)).is_none());
+    }
+
+    #[test]
+    fn value_sketch_round_trips_and_rejects_malformed_json() {
+        let mut s = ValueSketch::default();
+        for i in 0..500 {
+            s.push(&format!("x{i}"));
+        }
+        let back = ValueSketch::from_json(&s.to_json()).unwrap();
+        assert_eq!(back, s);
+        for bad in [
+            json!({"count": 3, "hashes": "abc"}),
+            json!({"count": 3, "hashes": "zzzzzzzz"}),
+            json!({"count": 3, "hashes": "0000000200000001"}),
+            json!({"hashes": "00000001"}),
+            json!("00000001"),
+        ] {
+            assert!(ValueSketch::from_json(&bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn edge_probability_orders_the_name_levels_and_weighs_values() {
+        let base = EdgeFeatures {
+            exact_name: true,
+            oriented: true,
+            lead_key: true,
+            key_marker: true,
+            same_type: true,
+            ..Default::default()
+        };
+        let owned = edge_probability(&base);
+        let plain = edge_probability(&EdgeFeatures {
+            oriented: false,
+            lead_key: false,
+            ..base
+        });
+        assert!(owned > 0.9 && plain < FS_THRESHOLD, "{owned} {plain}");
+        let shared = edge_probability(&EdgeFeatures {
+            shared_values: Some(true),
+            contained: Some(true),
+            ..base
+        });
+        let disjoint = edge_probability(&EdgeFeatures {
+            shared_values: Some(false),
+            ..base
+        });
+        assert!(disjoint < owned && owned < shared);
+        // No evidence either way leaves the prior.
+        let unknown = EdgeFeatures {
+            identifier: true,
+            same_type: true,
+            key_marker: true,
+            ..Default::default()
+        };
+        assert_eq!(unknown.name_level(), "identifier");
+        let p = edge_probability(&unknown);
+        assert!((p - FS_PRIOR).abs() < 0.05, "{p}");
+    }
+
+    #[test]
+    fn relationships_values_alone_discover_a_text_code_reference() {
+        let codes = strs(["UPS", "DHL", "FEDEX", "TNT"].iter().map(|s| s.to_string()));
+        let used = strs(
+            ["DHL", "UPS", "UPS", "DHL", "TNT"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let tables = rel_tables(&[
+            (
+                "carriers",
+                vec![
+                    sketched("code", "String", &codes),
+                    rel_col("name", "String", &["x"]),
+                ],
+            ),
+            (
+                "shipments",
+                vec![
+                    sketched("shipment_no", "i64", &strs((1..6).map(|i| i.to_string()))),
+                    sketched("carrier", "String", &used),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        let e = rel_edge(&edges, "shipments", "carrier");
+        assert_eq!(e.confidence, Confidence::Discovered);
+        let r = e.reference.as_ref().unwrap();
+        assert_eq!(
+            (r.referencing_table.as_str(), r.referenced_column.as_str()),
+            ("shipments", "code")
+        );
+        assert!(e.evidence[0].starts_with("values match: 100%"));
+        assert!(e.probability >= FS_THRESHOLD);
+    }
+
+    #[test]
+    fn relationships_integer_ranges_alone_are_not_proposed() {
+        // `length` 46..185 sits inside `actor_id` 1..200 (Sakila): a range
+        // coincidence, not a key. Integers need the name to abbreviate the
+        // table before values alone propose them.
+        let tables = rel_tables(&[
+            (
+                "actor",
+                vec![sketched(
+                    "actor_id",
+                    "i64",
+                    &strs((1..201).map(|i| i.to_string())),
+                )],
+            ),
+            (
+                "film",
+                vec![
+                    sketched("film_id", "i64", &strs((1..1001).map(|i| i.to_string()))),
+                    sketched(
+                        "length",
+                        "i64",
+                        &strs((0..300).map(|i| (46 + i % 140).to_string())),
+                    ),
+                ],
+            ),
+        ]);
+        assert!(
+            detect_relationships_scored(&tables, true)
+                .iter()
+                .all(|e| e.from_column != "length" && e.to_column != "length")
+        );
+        // ...unless it does: ShipVia holds Shippers' ids.
+        let tables = rel_tables(&[
+            (
+                "shippers",
+                vec![sketched(
+                    "ShipperID",
+                    "i64",
+                    &strs((1..4).map(|i| i.to_string())),
+                )],
+            ),
+            (
+                "orders",
+                vec![
+                    sketched(
+                        "OrderID",
+                        "i64",
+                        &strs((10_000..10_040).map(|i| i.to_string())),
+                    ),
+                    sketched(
+                        "ShipVia",
+                        "i64",
+                        &strs((0..40).map(|i| (1 + i % 3).to_string())),
+                    ),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        let e = rel_edge(&edges, "orders", "ShipVia");
+        assert_eq!(e.confidence, Confidence::Discovered);
+        assert!(e.evidence.iter().any(|x| x.contains("abbreviates")));
+    }
+
+    #[test]
+    fn relationships_values_never_orient_siblings_of_an_owned_key() {
+        // film_category.film_id is unique and holds every film_actor.film_id,
+        // but both reference `film`: the values must not make one the other's
+        // owner, or the hub disappears.
+        let ids = strs((1..51).map(|i| i.to_string()));
+        let some = strs((1..51).map(|i| (1 + i % 20).to_string()));
+        let tables = rel_tables(&[
+            (
+                "film",
+                vec![
+                    sketched("film_id", "i64", &ids),
+                    rel_col("title", "String", &["x"]),
+                ],
+            ),
+            (
+                "film_category",
+                vec![
+                    sketched("film_id", "i64", &ids),
+                    rel_col("genre", "String", &["y"]),
+                ],
+            ),
+            (
+                "film_actor",
+                vec![
+                    sketched("actor_id", "i64", &ids),
+                    sketched("film_id", "i64", &some),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        let sibling = edges
+            .iter()
+            .find(|e| e.from_table == "film_actor" && e.to_table == "film_category")
+            .expect("sibling link kept");
+        assert_eq!(sibling.context, EdgeContext::SharedReference);
+        assert!(sibling.reference.is_none());
+    }
+
+    #[test]
+    fn relationships_declared_keys_are_edges_with_probability_one() {
+        let mut opened_by = rel_col("opened_by", "i64", &["2"]);
+        opened_by.references.push(ColumnRef {
+            table: "staff".into(),
+            column: "id".into(),
+            composite: Vec::new(),
+        });
+        let mut manager = rel_col("manager", "i64", &["1"]);
+        manager.references.push(ColumnRef {
+            table: "staff".into(),
+            column: "id".into(),
+            composite: Vec::new(),
+        });
+        let mut dangling = rel_col("legacy", "i64", &["1"]);
+        dangling.references.push(ColumnRef {
+            table: "gone".into(),
+            column: "id".into(),
+            composite: Vec::new(),
+        });
+        let tables = rel_tables(&[
+            ("staff", vec![rel_col("id", "i64", &["1", "2"]), manager]),
+            (
+                "tickets",
+                vec![rel_col("ticket_no", "i64", &["10"]), opened_by, dangling],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(
+            edges.len(),
+            1,
+            "self-reference and dangling key add nothing"
+        );
+        let e = &edges[0];
+        assert_eq!(e.confidence, Confidence::Declared);
+        assert_eq!(e.probability, 1.0);
+        assert_eq!(
+            e.reference.as_ref().unwrap().referencing_column,
+            "opened_by"
+        );
+        assert!(e.evidence[0].starts_with("declared foreign key"));
+    }
+
+    #[test]
+    fn relationships_exact_name_and_type_is_probable() {
         let tables = rel_tables(&[
             ("users", vec![rel_col("region", "String", &["north"])]),
             (
@@ -92051,7 +95130,7 @@ mod tests {
         ]);
         let edges = detect_relationships(&tables);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert_eq!(edges[0].confidence, Confidence::Probable);
         assert!(edges[0].evidence.iter().any(|e| e.contains("region")));
         assert!(edges[0].reason.contains("join keys"));
     }
@@ -92064,7 +95143,7 @@ mod tests {
         ]);
         let edges = detect_relationships(&tables);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert_eq!(edges[0].confidence, Confidence::Probable);
         assert!(edges[0].evidence.iter().any(|e| e.contains("foreign-key")));
         // The orientation is kept, not just the fact: orders.user_id
         // (many) references users.id (one).
@@ -92104,18 +95183,18 @@ mod tests {
         ]);
         let edges = detect_relationships(&tables);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert_eq!(edges[0].confidence, Confidence::Probable);
     }
 
     #[test]
-    fn relationships_same_uuid_different_names_is_inferred() {
+    fn relationships_same_uuid_different_names_is_probable() {
         let tables = rel_tables(&[
             ("a", vec![rel_col("owner_ref", "UUID", &["aaa"])]),
             ("b", vec![rel_col("creator", "UUID", &["bbb"])]),
         ]);
         let edges = detect_relationships(&tables);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Inferred);
+        assert_eq!(edges[0].confidence, Confidence::Probable);
         assert!(edges[0].evidence.iter().any(|e| e.contains("UUID")));
     }
 
@@ -92137,7 +95216,7 @@ mod tests {
     }
 
     #[test]
-    fn relationships_string_to_uuid_exact_name_is_extracted() {
+    fn relationships_string_to_uuid_exact_name_is_probable() {
         // A UUID stored as text genuinely does join a UUID column - the
         // documented weak-compatibility rule, not a promotion.
         let tables = rel_tables(&[
@@ -92146,7 +95225,7 @@ mod tests {
         ]);
         let edges = detect_relationships(&tables);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert_eq!(edges[0].confidence, Confidence::Probable);
     }
 
     #[test]
@@ -92178,9 +95257,9 @@ mod tests {
     }
 
     #[test]
-    fn relationships_sample_overlap_upgrades_weak_name_to_extracted() {
-        // `customer` beside `customer_id`: similar names, and the shared
-        // sample makes the link measured rather than guessed.
+    fn relationships_sample_overlap_raises_a_weak_names_probability() {
+        // `customer` beside `customer_id`: similar names either way; a
+        // shared sample makes the same link more likely.
         let tables = rel_tables(&[
             ("a", vec![rel_col("customer", "String", &["acme"])]),
             (
@@ -92190,19 +95269,17 @@ mod tests {
         ]);
         let edges = detect_relationships(&tables);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Extracted);
+        assert_eq!(edges[0].confidence, Confidence::Probable);
         assert!(edges[0].evidence.iter().any(|e| e.contains("acme")));
-    }
-
-    #[test]
-    fn relationships_weak_name_without_overlap_is_inferred() {
         let tables = rel_tables(&[
             ("a", vec![rel_col("customer", "String", &["acme"])]),
             ("b", vec![rel_col("customer_id", "String", &["globex"])]),
         ]);
-        let edges = detect_relationships(&tables);
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].confidence, Confidence::Inferred);
+        // Without the overlap this unmarked weak name falls under the
+        // threshold (0.44), so compare against the unthresholded edge.
+        let without = detect_relationships_scored(&tables, true);
+        assert_eq!(without.len(), 1);
+        assert!(edges[0].probability > without[0].probability + 0.1);
     }
 
     #[test]
@@ -92272,6 +95349,522 @@ mod tests {
     }
 
     #[test]
+    fn relationships_singular_forms_cover_s_es_ies_and_irregulars() {
+        assert!(same_noun("categories", "category"));
+        assert!(same_noun("boxes", "box"));
+        assert!(same_noun("caches", "cache"));
+        assert!(same_noun("users", "user"));
+        assert!(same_noun("people", "person"));
+        assert!(same_noun("order_items", "order_item"));
+        // `-ss` and short words keep every letter.
+        assert!(!same_noun("class", "clas"));
+        assert!(!same_noun("bus", "bu"));
+        assert!(!same_noun("orders", "order_items"));
+    }
+
+    #[test]
+    fn relationships_surrogate_ids_do_not_link_unrelated_tables() {
+        // Every table has its own `id`; two of them sharing the name (and,
+        // for integers, inevitably the values 1, 2, 3) is not a join.
+        for (ideal, a, b) in [("i64", "1", "1"), ("UUID", "aaa", "bbb")] {
+            let tables = rel_tables(&[
+                (
+                    "users",
+                    vec![
+                        rel_col("id", ideal, &[a]),
+                        rel_col("name", "String", &["x"]),
+                    ],
+                ),
+                (
+                    "orders",
+                    vec![
+                        rel_col("id", ideal, &[b]),
+                        rel_col("total", "f64", &["1.5"]),
+                    ],
+                ),
+            ]);
+            assert!(
+                detect_relationships(&tables).is_empty(),
+                "unexpected edge for {ideal} ids"
+            );
+        }
+        // Pandas' nameless index column is the same shape.
+        let tables = rel_tables(&[
+            (
+                "a",
+                vec![
+                    rel_col("Unnamed: 0", "i64", &["0"]),
+                    rel_col("x", "String", &["p"]),
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    rel_col("Unnamed: 0", "i64", &["0"]),
+                    rel_col("y", "String", &["q"]),
+                ],
+            ),
+        ]);
+        assert!(detect_relationships(&tables).is_empty());
+    }
+
+    #[test]
+    fn relationships_shared_uuid_primary_key_is_a_one_to_one_link() {
+        // The one surrogate-id case that is evidence: an identifier domain
+        // whose observed values coincide (an extension table keyed by its
+        // parent's UUID). UUIDs do not collide by accident.
+        let tables = rel_tables(&[
+            (
+                "users",
+                vec![
+                    rel_col("id", "UUID", &["aaa", "bbb"]),
+                    rel_col("name", "String", &["x"]),
+                ],
+            ),
+            (
+                "user_settings",
+                vec![
+                    rel_col("id", "UUID", &["bbb"]),
+                    rel_col("theme", "String", &["dark"]),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].confidence, Confidence::Probable);
+        assert!(edges[0].reason.contains("shared primary key"));
+    }
+
+    #[test]
+    fn relationships_attribute_columns_bridge_only_duplicate_schemas() {
+        // `amount`, `active`, `created_at` in two different schemas: shared
+        // attributes, not join keys - no edge.
+        let attrs = || {
+            vec![
+                rel_col("amount", "f64", &["1.5"]),
+                rel_col("active", "bool", &["true"]),
+                rel_col("created_at", "NaiveDate / DateTime", &["2024-01-01"]),
+            ]
+        };
+        let mut a = attrs();
+        a.push(rel_col("sku", "String", &["s1"]));
+        a.push(rel_col("color", "String", &["red"]));
+        let mut b = attrs();
+        b.push(rel_col("vendor", "String", &["v1"]));
+        b.push(rel_col("region", "String", &["north"]));
+        let tables = rel_tables(&[("products", a), ("vendors", b)]);
+        assert!(detect_relationships(&tables).is_empty());
+        // Two copies of one schema still line up column for column.
+        let tables = rel_tables(&[("v1", attrs()), ("v2", attrs())]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 3);
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.context == EdgeContext::DuplicateSchema)
+        );
+    }
+
+    #[test]
+    fn relationships_fk_pattern_handles_plurals_and_warehouse_prefixes() {
+        let cases = [
+            ("categories", "products", "category_id"),
+            ("dim_customer", "fact_sales", "customer_id"),
+            ("people", "orders", "person_id"),
+            ("boxes", "shipments", "box_id"),
+        ];
+        for (owner, other, fk_col) in cases {
+            let tables = rel_tables(&[
+                (owner, vec![rel_col("id", "i64", &["7"])]),
+                (other, vec![rel_col(fk_col, "i64", &["7"])]),
+            ]);
+            let edges = detect_relationships(&tables);
+            assert_eq!(edges.len(), 1, "no edge for {owner} <- {other}.{fk_col}");
+            let reference = edges[0].reference.as_ref().expect("fk edge is oriented");
+            assert_eq!(reference.referenced_table, owner);
+            assert_eq!(reference.referencing_column, fk_col);
+        }
+    }
+
+    #[test]
+    fn relationships_exact_key_name_is_oriented_to_its_owner() {
+        // `customers.customer_id` is named for its own table: it owns the
+        // key, `orders.customer_id` references it.
+        let tables = rel_tables(&[
+            (
+                "customers",
+                vec![
+                    rel_col("customer_id", "String", &["C-1"]),
+                    rel_col("name", "String", &["a"]),
+                ],
+            ),
+            (
+                "orders",
+                vec![
+                    rel_col("customer_id", "String", &["C-1"]),
+                    rel_col("total", "f64", &["1.0"]),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        let reference = edges[0].reference.as_ref().expect("owned key is oriented");
+        assert_eq!(reference.referenced_table, "customers");
+        assert_eq!(reference.referencing_table, "orders");
+        assert!(edges[0].evidence.iter().any(|e| e.contains("owns the key")));
+        // Neither side owning it (or both) is left undirected, never guessed.
+        let tables = rel_tables(&[
+            ("orders", vec![rel_col("customer_id", "String", &["C-1"])]),
+            (
+                "invoices",
+                vec![
+                    rel_col("customer_id", "String", &["C-1"]),
+                    rel_col("n", "i64", &["1"]),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].reference.is_none());
+    }
+
+    #[test]
+    fn relationships_star_schema_siblings_read_shared_reference() {
+        // Three fact tables all carry `customer_id`, which `customers`
+        // owns. The spokes stay bridges; the three sibling links (a
+        // triangle without the hub) are derived through it.
+        let spoke = |own: &str| {
+            vec![
+                rel_col("customer_id", "String", &["C-1"]),
+                rel_col(own, "i64", &["1"]),
+            ]
+        };
+        let tables = rel_tables(&[
+            (
+                "customers",
+                vec![
+                    rel_col("customer_id", "String", &["C-1"]),
+                    rel_col("name", "String", &["a"]),
+                ],
+            ),
+            ("orders", spoke("order_no")),
+            ("invoices", spoke("invoice_no")),
+            ("tickets", spoke("ticket_no")),
+        ]);
+        let graph = build_table_graph(&tables);
+        let shared: Vec<&Relationship> = graph
+            .relationships
+            .iter()
+            .filter(|e| e.context == EdgeContext::SharedReference)
+            .collect();
+        assert_eq!(shared.len(), 3);
+        assert!(shared.iter().all(|e| {
+            e.from_table != "customers"
+                && e.to_table != "customers"
+                && e.evidence.iter().any(|x| x.contains("\"customers\""))
+        }));
+        assert_eq!(bridge_degree(&graph, "customers"), 3);
+        for t in ["orders", "invoices", "tickets"] {
+            assert_eq!(bridge_degree(&graph, t), 1, "{t}");
+            assert_eq!(shared_reference_degree(&graph, t), 2, "{t}");
+        }
+        assert_eq!(
+            community_label(&graph, "orders", &tables),
+            "customers-centered"
+        );
+        // The direct sibling hop is still a real join `path` can take.
+        let hops = shortest_path(&graph, "orders", "tickets").expect("connected");
+        assert_eq!(hops.len(), 1);
+    }
+
+    #[test]
+    fn relationships_bm25_idf_matches_the_lucene_form() {
+        // ln(1 + (n - df + 0.5) / (df + 0.5)), checked by hand.
+        assert!((bm25_idf(10, 1) - (1.0f64 + 9.5 / 1.5).ln()).abs() < 1e-12);
+        assert!((bm25_idf(10, 10) - (1.0f64 + 0.5 / 10.5).ln()).abs() < 1e-12);
+        // Rarer always weighs more, and nothing ever goes negative.
+        assert!(bm25_idf(100, 2) > bm25_idf(100, 50));
+        assert!(bm25_idf(3, 3) > 0.0);
+    }
+
+    #[test]
+    fn relationships_key_markers_and_owner_stems() {
+        for name in [
+            "customer_id",
+            "country_code",
+            "order_no",
+            "cid",
+            "sku",
+            "id",
+        ] {
+            assert!(has_key_marker(name), "{name}");
+        }
+        for name in ["city", "phone_number", "name", "id_card", "paid_date"] {
+            assert!(!has_key_marker(name), "{name}");
+        }
+        assert!(owns_key("customers", "customer_id"));
+        assert!(owns_key("state", "state_name"));
+        assert!(owns_key("grapes", "grape"));
+        assert!(owns_key("invoices", "invoice_number"));
+        assert!(owns_key("Dorm", "dormid"));
+        assert!(!owns_key("orders", "customer_id"));
+        // `paid` never sheds its `id` into an entity called `pa`.
+        assert!(!owns_key("pa", "paid"));
+    }
+
+    #[test]
+    fn relationships_attribute_names_need_key_evidence_to_bridge() {
+        // Chinook's Customer/Employee share address, phone, email and
+        // name columns: attributes of two different entities, not joins.
+        let person = |key: &str| {
+            vec![
+                rel_col(key, "i64", &["1"]),
+                rel_col("city", "String", &["Paris"]),
+                rel_col("phone", "String", &["555-0100"]),
+                rel_col("email", "Email", &["a@example.com"]),
+            ]
+        };
+        let tables = rel_tables(&[
+            ("customer", person("customer_id")),
+            ("employee", person("employee_id")),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert!(
+            edges.iter().all(|e| e.from_column != "phone"),
+            "{:?}",
+            edges.iter().map(|e| &e.reason).collect::<Vec<_>>()
+        );
+        // city and email are shared by both, but with shared values they
+        // still need an owner or a key name: city has neither. Email is an
+        // identifier domain, so a shared address makes it a candidate - but
+        // an exact name nobody owns and nobody leads with was a real join
+        // only 6 times in 32 on the benchmark, so the probability model
+        // drops it too.
+        assert!(edges.iter().all(|e| e.from_column != "city"));
+        assert!(edges.iter().all(|e| e.from_column != "email"));
+        let scored = detect_relationships_scored(&tables, true);
+        let email = rel_edge(&scored, "customer", "email");
+        assert!(email.probability < FS_THRESHOLD, "{}", email.probability);
+        // A natural key the table is named for bridges without a marker.
+        let tables = rel_tables(&[
+            ("state", vec![rel_col("state_name", "String", &["Ohio"])]),
+            (
+                "city",
+                vec![
+                    rel_col("city_name", "String", &["Akron"]),
+                    rel_col("state_name", "String", &["Ohio"]),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        let e = rel_edge(&edges, "state", "state_name");
+        let r = e.reference.as_ref().expect("state owns state_name");
+        assert_eq!(r.referenced_table, "state");
+        assert_eq!(r.referencing_table, "city");
+    }
+
+    #[test]
+    fn relationships_role_prefixed_keys_resolve_to_their_owner() {
+        // sakila: store.manager_staff_id -> staff.staff_id, and a role
+        // prefix on the bare-id pattern: `parent_user_id` -> users.id.
+        let tables = rel_tables(&[
+            (
+                "staff",
+                vec![
+                    rel_col("staff_id", "i64", &["1"]),
+                    rel_col("first_name", "String", &["Mike"]),
+                ],
+            ),
+            (
+                "store",
+                vec![
+                    rel_col("store_id", "i64", &["1"]),
+                    rel_col("manager_staff_id", "i64", &["1"]),
+                ],
+            ),
+            ("users", vec![rel_col("id", "i64", &["7"])]),
+            ("teams", vec![rel_col("parent_user_id", "i64", &["7"])]),
+        ]);
+        let edges = detect_relationships(&tables);
+        let e = rel_edge(&edges, "store", "manager_staff_id");
+        let r = e.reference.as_ref().expect("oriented");
+        assert_eq!(
+            (r.referenced_table.as_str(), r.referenced_column.as_str()),
+            ("staff", "staff_id")
+        );
+        assert!(e.evidence.iter().any(|x| x.contains("role-prefixed")));
+        let e = rel_edge(&edges, "teams", "parent_user_id");
+        let r = e.reference.as_ref().expect("oriented");
+        assert_eq!(r.referenced_table, "users");
+        assert!(e.evidence.iter().any(|x| x.contains("role prefix")));
+    }
+
+    #[test]
+    fn relationships_a_tables_own_key_is_not_a_role_reference() {
+        // `person_address_id` is People_Addresses' own key, which merely
+        // ends with `address_id` - not a reference to Addresses.
+        let tables = rel_tables(&[
+            ("addresses", vec![rel_col("address_id", "i64", &["1"])]),
+            (
+                "people_addresses",
+                vec![
+                    rel_col("person_address_id", "i64", &["1"]),
+                    rel_col("address_id", "i64", &["1"]),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(
+            edges.len(),
+            1,
+            "{:?}",
+            edges.iter().map(|e| &e.reason).collect::<Vec<_>>()
+        );
+        assert_eq!(edges[0].from_column, "address_id");
+    }
+
+    #[test]
+    fn relationships_first_column_owns_an_unnamed_key() {
+        // No table is named for `apt_id`, but only `apartments` leads with
+        // it - where schemas keep their own primary key.
+        let tables = rel_tables(&[
+            (
+                "apartments",
+                vec![
+                    rel_col("apt_id", "i64", &["1"]),
+                    rel_col("rooms", "i64", &["3"]),
+                ],
+            ),
+            (
+                "bookings",
+                vec![
+                    rel_col("booking_id", "i64", &["9"]),
+                    rel_col("apt_id", "i64", &["1"]),
+                ],
+            ),
+        ]);
+        let edges = detect_relationships(&tables);
+        let e = rel_edge(&edges, "bookings", "apt_id");
+        assert_eq!(e.reference.as_ref().unwrap().referenced_table, "apartments");
+        assert!(e.evidence.iter().any(|x| x.contains("first column")));
+    }
+
+    #[test]
+    fn relationships_unowned_key_in_many_tables_is_a_shared_key() {
+        // `league_id` in four tables, no `league` table and nobody leading
+        // with it: every pair joins, but none references another.
+        let fact = |own: &str| {
+            vec![
+                rel_col(own, "i64", &["1"]),
+                rel_col("league_id", "String", &["AL"]),
+            ]
+        };
+        let tables = rel_tables(&[
+            ("batting", fact("batting_id")),
+            ("pitching", fact("pitching_id")),
+            ("fielding", fact("fielding_id")),
+            ("salary", fact("salary_id")),
+        ]);
+        let graph = build_table_graph(&tables);
+        let league: Vec<&Relationship> = graph
+            .relationships
+            .iter()
+            .filter(|e| e.from_column == "league_id")
+            .collect();
+        assert_eq!(league.len(), 6);
+        assert!(
+            league
+                .iter()
+                .all(|e| e.context == EdgeContext::SharedReference
+                    && e.evidence.iter().any(|x| x.contains("appears in 4 tables")))
+        );
+        assert_eq!(bridge_degree(&graph, "batting"), 0);
+        assert!(shortest_path(&graph, "batting", "salary").is_some());
+        // Two tables sharing it is simply their relationship: a bridge -
+        // here where both lead with it (an exact name in neither table's
+        // key position is too weak on its own to keep).
+        let lead = |own: &str| {
+            vec![
+                rel_col("league_id", "String", &["AL"]),
+                rel_col(own, "i64", &["1"]),
+            ]
+        };
+        let tables = rel_tables(&[
+            ("batting", lead("batting_id")),
+            ("salary", lead("salary_id")),
+        ]);
+        let edges = detect_relationships(&tables);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].context, EdgeContext::Bridge);
+    }
+
+    #[test]
+    fn relationships_common_values_promote_nothing_and_score_lower() {
+        // `1` sits in most columns with samples: sharing it measures
+        // nothing, so `customer` beside `customer_id` stays inferred (and, with no
+        // key marker on `customer`, under the threshold: compared unthresholded).
+        // A value only these two columns hold does promote.
+        let filler = |name: &str| vec![rel_col(name, "i64", &["1"])];
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("customer", "i64", &["1"])]),
+            ("b", vec![rel_col("customer_id", "i64", &["1"])]),
+            ("c", filler("x_qty")),
+            ("d", filler("y_qty")),
+            ("e", filler("z_qty")),
+        ]);
+        let edges = detect_relationships_scored(&tables, true);
+        let e = rel_edge(&edges, "a", "customer");
+        assert_eq!(e.confidence, Confidence::Probable);
+        assert!(e.evidence.iter().any(|x| x.contains("weak evidence")));
+        let tables = rel_tables(&[
+            ("a", vec![rel_col("customer", "i64", &["90417"])]),
+            ("b", vec![rel_col("customer_id", "i64", &["90417"])]),
+            ("c", filler("x_qty")),
+            ("d", filler("y_qty")),
+            ("e", filler("z_qty")),
+        ]);
+        let rare = detect_relationships_scored(&tables, true);
+        let r = rel_edge(&rare, "a", "customer");
+        assert_eq!(r.confidence, Confidence::Probable);
+        // The rarer shared value scores higher on the same names.
+        assert!(r.score > e.score, "{} vs {}", r.score, e.score);
+    }
+
+    #[test]
+    fn relationships_score_ranks_a_specific_key_above_a_ubiquitous_one() {
+        // `promo_code` is in two tables, `region_code` in all four: the
+        // promo link is the more specific one.
+        let t = |extra: Vec<ColumnProfile>| {
+            let mut cols = vec![rel_col("region_code", "String", &[])];
+            cols.extend(extra);
+            cols
+        };
+        let tables = rel_tables(&[
+            ("promos", t(vec![rel_col("promo_code", "String", &[])])),
+            ("orders", t(vec![rel_col("promo_code", "String", &[])])),
+            ("stores", t(vec![])),
+            ("staff", t(vec![])),
+        ]);
+        let edges = detect_relationships(&tables);
+        let promo = edges
+            .iter()
+            .find(|e| e.from_column == "promo_code")
+            .unwrap();
+        let region = edges
+            .iter()
+            .find(|e| {
+                e.from_column == "region_code" && e.from_table == "orders" && e.to_table == "promos"
+            })
+            .unwrap();
+        assert!(
+            promo.score > region.score,
+            "{} vs {}",
+            promo.score,
+            region.score
+        );
+    }
+
+    #[test]
     fn relationships_edge_finder_locates_either_endpoint() {
         let tables = rel_tables(&[
             ("users", vec![rel_col("id", "i64", &["1"])]),
@@ -92279,7 +95872,7 @@ mod tests {
         ]);
         let edges = detect_relationships(&tables);
         let e = rel_edge(&edges, "users", "id");
-        assert_eq!(e.confidence, Confidence::Extracted);
+        assert_eq!(e.confidence, Confidence::Probable);
         // Same edge found from the other endpoint.
         assert!(std::ptr::eq(e, rel_edge(&edges, "orders", "user_id")));
     }

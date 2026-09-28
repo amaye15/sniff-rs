@@ -12177,10 +12177,10 @@ fn stdin_input_survives_sql_inline_modes_second_pass_reread() {
 // emits an undirected edge list under every rich-JSON document's own
 // top-level "relationships" key - the "graphify for data" half of this
 // tool (profiling already produces the nodes). Confidence follows
-// Graphify's own EXTRACTED/INFERRED vocabulary: measured in the data
-// itself (matching names, a users.id <- orders.user_id shape, or shared
-// samples) versus worth surfacing but not asserted (similar names only,
-// or a shared identifier domain under different names).
+// Every edge carries a tier - `declared` (the schema states the key),
+// `discovered` (the values show it: one column's values sit inside another's
+// unique values), or `probable` (names and types make it more likely than
+// not) - and a Fellegi-Sunter `probability`; bridges below 0.5 are dropped.
 // ---------------------------------------------------------------------------
 
 /// Finds the edge touching `column` in `table` (either endpoint), or panics
@@ -12202,38 +12202,85 @@ fn find_edge<'a>(
 
 #[test]
 #[cfg(feature = "ini")]
-fn relationships_ini_reports_fk_exact_and_inferred_edges() {
+fn relationships_ini_reports_fk_and_identifier_domain_edges() {
     let doc = run_json("edge_relationships.ini", &[]);
     let rels = doc["relationships"].as_array().unwrap();
     // users.id <-> orders.user_id: foreign-key naming + UUID + a shared
-    // sample - extracted. region <-> region: identical names - extracted.
-    // email <-> contact: shared Email domain, different names - inferred.
+    // sample - probable, and very likely. email <-> contact: shared Email
+    // domain under different names - kept on the prior alone (the benchmark
+    // had no such pairs to weigh). region_code <-> region_code is an exact
+    // name neither table owns or leads with: a candidate, but one the
+    // benchmark says is a real join only 6 times in 32, so it is dropped.
     // orders.order_id (i64) matches nothing and correctly yields no edge.
-    assert_eq!(rels.len(), 3);
+    assert_eq!(rels.len(), 2);
     let fk = find_edge(rels, "users", "id");
-    assert_eq!(fk["confidence"], "extracted");
+    assert_eq!(fk["confidence"], "probable");
+    assert!(fk["probability"].as_f64().unwrap() > 0.9);
     assert!(find_edge(rels, "orders", "user_id").as_object() == fk.as_object());
     assert_eq!(fk["reference"]["referencing_table"], "orders");
     assert_eq!(fk["reference"]["referencing_column"], "user_id");
     assert_eq!(fk["reference"]["referenced_table"], "users");
     assert_eq!(fk["reference"]["referenced_column"], "id");
-    let exact = find_edge(rels, "users", "region");
-    assert_eq!(exact["confidence"], "extracted");
-    let inferred = find_edge(rels, "users", "email");
-    assert_eq!(inferred["confidence"], "inferred");
-    assert!(find_edge(rels, "orders", "contact").as_object() == inferred.as_object());
+    assert!(rels.iter().all(|e| e["from_column"] != "region_code"));
+    let domain = find_edge(rels, "users", "email");
+    assert_eq!(domain["confidence"], "probable");
+    let p = domain["probability"].as_f64().unwrap();
+    assert!((0.5..0.9).contains(&p), "{p}");
+    assert!(find_edge(rels, "orders", "contact").as_object() == domain.as_object());
     for e in rels {
         assert_eq!(e["kind"], "join_candidate");
         assert!(!e["evidence"].as_array().unwrap().is_empty());
         assert!(!e["reason"].as_str().unwrap().is_empty());
     }
-    // Edges sorted by (from-table, from-column): all three run orders ->
-    // users here, contact < region < user_id.
+    // Edges sorted by (from-table, from-column): both run orders -> users
+    // here, contact < user_id.
     let cols: Vec<&str> = rels
         .iter()
         .map(|e| e["from_column"].as_str().unwrap())
         .collect();
-    assert_eq!(cols, vec!["contact", "region", "user_id"]);
+    assert_eq!(cols, vec!["contact", "user_id"]);
+}
+
+#[test]
+#[cfg(feature = "ini")]
+fn relationships_need_key_evidence_and_resolve_roles_and_natural_keys() {
+    let doc = run_json("edge_graph_key_evidence.ini", &[]);
+    let rels = doc["relationships"].as_array().unwrap();
+    // customer/staff share city and phone: attributes, never a bridge.
+    for attr in ["city", "phone"] {
+        assert!(
+            rels.iter().all(|e| e["from_column"] != attr),
+            "{attr} must not link: {rels:#?}"
+        );
+    }
+    // store.manager_staff_id is a role-prefixed copy of staff's own key.
+    let role = find_edge(rels, "store", "manager_staff_id");
+    assert_eq!(role["reference"]["referenced_table"], "staff");
+    assert_eq!(role["reference"]["referenced_column"], "staff_id");
+    assert_eq!(role["context"], "bridge");
+    // state owns state_name, so customer.state_name references it.
+    let natural = find_edge(rels, "customer", "state_name");
+    assert_eq!(natural["reference"]["referenced_table"], "state");
+    // league_code sits in three tables and none owns it: shared, not a
+    // clique of bridges.
+    let league: Vec<&serde_json::Value> = rels
+        .iter()
+        .filter(|e| e["from_column"] == "league_code")
+        .collect();
+    assert_eq!(league.len(), 3);
+    assert!(league.iter().all(|e| e["context"] == "shared_reference"));
+    // Every edge carries its BM25-style score, then its probability as the
+    // last field.
+    for e in rels {
+        let obj = e.as_object().unwrap();
+        assert_eq!(
+            obj.keys().next_back().map(String::as_str),
+            Some("probability")
+        );
+        assert!(e["score"].as_f64().unwrap() >= 0.0);
+        let p = e["probability"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&p));
+    }
 }
 
 #[test]
@@ -12277,7 +12324,190 @@ fn relationships_combine_links_a_shared_column_across_files() {
     assert_eq!(edge["from_column"], "customer_id");
     assert_eq!(edge["to_column"], "customer_id");
     assert_ne!(edge["from_table"], edge["to_table"]);
-    assert_eq!(edge["confidence"], "extracted");
+    // Both order values sit inside the customers' unique ids: the values
+    // confirm what the names suggest.
+    assert_eq!(edge["confidence"], "discovered");
+    assert!(
+        edge["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().starts_with("values match: 100%"))
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn relationships_declared_sqlite_keys_are_declared_edges() {
+    // Four declared foreign keys none of the name rules could find
+    // (`opened_by -> staff.id`, `owner -> clients."client ref"`, and a
+    // composite `(o, l) -> order_lines` resolved onto its primary key), a
+    // self-reference, and one pointing at a table that doesn't exist.
+    let doc = run_json("edge_graph_declared_keys.sqlite", &[]);
+    let refs = |table: &str, column: &str| -> Vec<(String, String)> {
+        doc["tables"][table]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == column)
+            .unwrap()["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["table"].as_str().unwrap().to_string(),
+                    r["column"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        refs("tickets", "opened_by"),
+        vec![("staff".into(), "id".into())]
+    );
+    assert_eq!(
+        refs("tickets", "owner"),
+        vec![("clients".into(), "client ref".into())]
+    );
+    assert_eq!(
+        refs("shipments", "l"),
+        vec![("order_lines".into(), "line_no".into())]
+    );
+    assert_eq!(
+        refs("staff", "manager"),
+        vec![("staff".into(), "id".into())]
+    );
+    assert!(
+        refs("tickets", "legacy").is_empty(),
+        "dangling target dropped"
+    );
+    assert!(refs("tickets", "ticket_no").is_empty());
+
+    let rels = doc["relationships"].as_array().unwrap();
+    assert_eq!(rels.len(), 4, "{rels:#?}");
+    for e in rels {
+        assert_eq!(e["confidence"], "declared");
+        assert_eq!(e["probability"], 1.0);
+        assert_eq!(e["context"], "bridge");
+        assert!(e["evidence"][0].as_str().unwrap().starts_with("declared "));
+    }
+    let owner = rels.iter().find(|e| e["to_column"] == "owner").unwrap();
+    assert_eq!(owner["reference"]["referenced_column"], "client ref");
+
+    // The keys survive a round trip through a saved dictionary, which the
+    // graph subcommands read back.
+    let dir = TempDir::new();
+    let dict = dir.path().join("keys.json");
+    std::fs::write(&dict, serde_json::to_string(&doc).unwrap()).unwrap();
+    let output = run_graph(&["path", dict.to_str().unwrap(), "shipments", "order_lines"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("(declared)"), "{stdout}");
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn relationships_combine_qualifies_declared_keys() {
+    let dir = TempDir::new();
+    std::fs::copy(
+        fixture("edge_graph_declared_keys.sqlite"),
+        dir.path().join("desk.sqlite"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("notes.csv"),
+        "note_id,text
+1,hi
+",
+    )
+    .unwrap();
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.json"))).unwrap(),
+    )
+    .unwrap();
+    let opened_by = doc["tables"]["desk__tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "opened_by")
+        .unwrap();
+    assert_eq!(opened_by["references"][0]["table"], "desk__staff");
+    let declared = doc["relationships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["confidence"] == "declared")
+        .count();
+    assert_eq!(declared, 4);
+}
+
+#[test]
+fn relationships_values_discover_a_code_reference_across_files() {
+    // `shipments.carrier` shares no name with `carriers.code`, but every
+    // carrier value is one of the unique codes: discovered from the values.
+    let dir = TempDir::new();
+    std::fs::write(
+        dir.path().join("carriers.csv"),
+        "code,name
+UPS,United Parcel
+DHL,DHL Express
+FDX,FedEx
+TNT,TNT Express
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("shipments.csv"),
+        "shipment_no,carrier,weight
+1,UPS,2.5
+2,DHL,1.0
+3,UPS,4.2
+4,TNT,0.7
+5,DHL,3.3
+",
+    )
+    .unwrap();
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join(format!("{dir_name}.dictionary.json"))).unwrap(),
+    )
+    .unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    let e = rels
+        .iter()
+        .find(|e| e["from_column"] == "carrier" || e["to_column"] == "carrier")
+        .unwrap_or_else(|| panic!("no carrier edge: {rels:#?}"));
+    assert_eq!(e["confidence"], "discovered");
+    assert_eq!(e["reference"]["referenced_column"], "code");
+    assert!(e["probability"].as_f64().unwrap() >= 0.5);
+    // The sketch behind it is part of the column's own JSON.
+    let code = &doc["tables"]["carriers__carriers"][0];
+    assert_eq!(code["name"], "code");
+    assert_eq!(code["value_sketch"]["count"], 4);
+    assert_eq!(code["value_sketch"]["distinct"], 4);
+    assert_eq!(code["value_sketch"]["hashes"].as_str().unwrap().len(), 32);
 }
 
 #[test]
@@ -12320,8 +12550,91 @@ fn graph_explain_reports_profile_and_incident_edges() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("# orders.customer_id"));
     assert!(stdout.contains("customers"));
-    assert!(stdout.contains("extracted"));
+    assert!(stdout.contains("probable"));
     assert!(stdout.contains("Community: 0 (orders-centered)"));
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn graph_composite_foreign_keys_carry_the_whole_key_through_a_saved_dictionary() {
+    // FOREIGN KEY (o, l) REFERENCES order_lines: each pair's reference names
+    // the whole key, one-column keys keep their two-field shape, and the
+    // edge built from a saved dictionary says to join on every pair.
+    let doc = run_json("edge_graph_declared_keys.sqlite", &[]);
+    let refs = |table: &str, column: &str| {
+        doc["tables"][table]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == column)
+            .unwrap()["references"]
+            .clone()
+    };
+    let key = serde_json::json!([["o", "order_id"], ["l", "line_no"]]);
+    assert_eq!(refs("shipments", "o")[0]["composite"], key);
+    assert_eq!(refs("shipments", "l")[0]["composite"], key);
+    assert_eq!(
+        refs("tickets", "opened_by"),
+        serde_json::json!([{"table": "staff", "column": "id"}])
+    );
+
+    let dir = TempDir::new();
+    let saved = dir.path().join("dict.json");
+    std::fs::write(&saved, serde_json::to_string(&doc).unwrap()).unwrap();
+    let out = run_graph(&[
+        "explain",
+        saved.to_str().unwrap(),
+        "shipments.l",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let explained: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rel = &explained["relationships"][0];
+    assert_eq!(rel["confidence"], "declared");
+    assert!(
+        rel["evidence"][0]
+            .as_str()
+            .unwrap()
+            .contains("composite foreign key: \"shipments\" (\"o\", \"l\") references \"order_lines\" (\"order_id\", \"line_no\")"),
+        "{rel}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn graph_explain_lists_declared_self_references_from_both_ends() {
+    // staff.manager REFERENCES staff(id): no edge (the graph links tables),
+    // but explain names the hierarchy on both columns and nowhere else.
+    let path = fixture("edge_graph_declared_keys.sqlite");
+    let md = |col: &str| {
+        let out = run_graph(&["explain", path.to_str().unwrap(), col]);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    assert!(md("staff.manager").contains("declared foreign key to `id` in this same table"));
+    assert!(md("staff.id").contains("`manager` in this same table declares a foreign key"));
+    assert!(!md("staff.name").contains("Self-reference"));
+    let out = run_graph(&[
+        "explain",
+        path.to_str().unwrap(),
+        "staff.id",
+        "--output-format",
+        "json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc["self_references"],
+        serde_json::json!([{"column": "manager", "references": "id"}])
+    );
 }
 
 #[test]
@@ -12445,8 +12758,8 @@ fn graph_path_reports_a_two_hop_chain_in_order() {
 #[test]
 #[cfg(feature = "ini")]
 fn graph_path_lists_parallel_links_as_alternatives() {
-    // users <-> orders share three links in edge_relationships.ini; the
-    // hop reports the strongest and names the other two.
+    // users <-> orders share two links in edge_relationships.ini; the hop
+    // reports the more probable one and names the other.
     let output = run_graph(&[
         "path",
         fixture("edge_relationships.ini").to_str().unwrap(),
@@ -12464,16 +12777,17 @@ fn graph_path_lists_parallel_links_as_alternatives() {
         serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
     let hops = doc["hops"].as_array().unwrap();
     assert_eq!(hops.len(), 1);
-    assert_eq!(hops[0]["confidence"], "extracted");
+    assert_eq!(hops[0]["confidence"], "probable");
+    // The hop is the foreign key (user_id -> id, probability ~0.95); the
+    // Email-domain link (~0.59) is the unchosen parallel one.
+    assert_eq!(hops[0]["from_column"], "user_id");
     let alternatives = hops[0]["alternatives"].as_array().unwrap();
-    assert_eq!(alternatives.len(), 2);
+    assert_eq!(alternatives.len(), 1);
     let cols: Vec<&str> = alternatives
         .iter()
         .map(|e| e["from_column"].as_str().unwrap())
         .collect();
-    // The hop itself is region->region (first extracted edge); the two
-    // unchosen parallel links are named here, in edge order.
-    assert_eq!(cols, vec!["contact", "user_id"]);
+    assert_eq!(cols, vec!["contact"]);
 
     let output = run_graph(&[
         "path",
@@ -12589,6 +12903,51 @@ fn graph_rank_lists_the_link_table_first_with_communities() {
 }
 
 #[test]
+#[cfg(feature = "ini")]
+fn graph_rank_reports_reference_rank_areas_and_cut_tables() {
+    let output = run_graph(&[
+        "rank",
+        fixture("edge_graph_chain.ini").to_str().unwrap(),
+        "--output-format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
+    let row = |name: &str| {
+        doc["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["table"] == name)
+            .unwrap()
+            .clone()
+    };
+    // orders references both dimensions, so they outrank it; every join
+    // between customers and products runs through orders.
+    let rank = |name: &str| row(name)["reference_rank"].as_f64().unwrap();
+    assert!(rank("customers") > rank("orders"));
+    assert_eq!(rank("customers"), rank("products"));
+    assert_eq!(row("orders")["articulation"], true);
+    assert_eq!(row("customers")["articulation"], false);
+    assert_eq!(row("orders")["area"], row("customers")["area"]);
+    assert_ne!(row("audit")["area"], row("orders")["area"]);
+    let areas = doc["areas"].as_array().unwrap();
+    assert_eq!(areas.len(), 2);
+    assert_eq!(areas[0]["size"], 3);
+    assert_eq!(areas[0]["lead"], "orders");
+
+    let output = run_graph(&["rank", fixture("edge_graph_chain.ini").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("| Ref. rank | Area | Cut |"),
+        "got: {stdout}"
+    );
+    // One community, one area: nothing to split, no section.
+    assert!(!stdout.contains("## Subject areas"), "got: {stdout}");
+}
+
+#[test]
 fn graph_rank_single_table_reports_zero_degree() {
     let output = run_graph(&["rank", fixture("sample.csv").to_str().unwrap()]);
     assert!(
@@ -12606,18 +12965,19 @@ fn graph_rank_single_table_reports_zero_degree() {
 #[test]
 #[cfg(feature = "sqlite")]
 fn graph_samples_deepens_overlap_evidence_on_raw_files() {
-    // `label` vs `labels` is a weak name signal either way; the tier is
-    // decided by overlap, which only deeper samples can see. agents.label
-    // holds v1..v10, jobs.labels holds w1,w2,w3,v7,v8: the first three
-    // samples are disjoint, the full columns share v7 and v8.
+    // `ref_code` leading two tables that don't own it is a mid-strength
+    // name signal either way; its probability rises with overlap, which
+    // only deeper samples can see. agents.ref_code holds v1..v10,
+    // jobs.ref_code holds w1,w2,w3,v7,v8: the first three samples are
+    // disjoint, the full columns share v7 and v8.
     let dir = TempDir::new();
     let db = dir.path().join("overlap.sqlite");
     let setup = format!(
         "import sqlite3; con = sqlite3.connect(r'{}'); \
-         con.execute('CREATE TABLE agents (label TEXT)'); \
-         con.executemany('INSERT INTO agents VALUES (?)', [(f'v{{i}}',) for i in range(1, 11)]); \
-         con.execute('CREATE TABLE jobs (labels TEXT)'); \
-         con.executemany('INSERT INTO jobs VALUES (?)', [(f'w{{i}}',) for i in range(1, 4)] + [('v7',), ('v8',)]); \
+         con.execute('CREATE TABLE agents (ref_code TEXT, name TEXT)'); \
+         con.executemany('INSERT INTO agents VALUES (?, ?)', [(f'v{{i}}', f'n{{i}}') for i in range(1, 11)]); \
+         con.execute('CREATE TABLE jobs (ref_code TEXT, title TEXT)'); \
+         con.executemany('INSERT INTO jobs VALUES (?, ?)', [(f'w{{i}}', 't') for i in range(1, 4)] + [('v7', 't'), ('v8', 't')]); \
          con.commit(); con.close()",
         db.to_str().unwrap()
     );
@@ -12634,7 +12994,7 @@ fn graph_samples_deepens_overlap_evidence_on_raw_files() {
     let output = run_graph(&[
         "explain",
         db.to_str().unwrap(),
-        "label",
+        "agents.ref_code",
         "--output-format",
         "json",
         "--samples",
@@ -12648,12 +13008,13 @@ fn graph_samples_deepens_overlap_evidence_on_raw_files() {
     let doc: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
     assert_eq!(doc["relationships"].as_array().unwrap().len(), 1);
-    assert_eq!(doc["relationships"][0]["confidence"], "inferred");
+    assert_eq!(doc["relationships"][0]["confidence"], "probable");
+    let shallow = doc["relationships"][0]["probability"].as_f64().unwrap();
 
     let output = run_graph(&[
         "explain",
         db.to_str().unwrap(),
-        "label",
+        "agents.ref_code",
         "--output-format",
         "json",
         "--samples",
@@ -12668,7 +13029,9 @@ fn graph_samples_deepens_overlap_evidence_on_raw_files() {
         serde_json::from_slice(&output.stdout).expect("stdout must be JSON");
     let rels = doc["relationships"].as_array().unwrap();
     assert_eq!(rels.len(), 1);
-    assert_eq!(rels[0]["confidence"], "extracted");
+    assert_eq!(rels[0]["confidence"], "probable");
+    // Seeing the shared values makes the same link more likely.
+    assert!(rels[0]["probability"].as_f64().unwrap() > shallow + 0.1);
     assert!(
         rels[0]["evidence"]
             .as_array()
@@ -12845,11 +13208,24 @@ fn graph_blank_headers_neither_link_nor_break_queries() {
 fn graph_rank_reports_similar_tables_and_edge_context() {
     // v1/v2 are column-identical (similarity 1.0): their shared edges
     // read duplicate_schema. w shares one column with each (0.33) - below
-    // the reporting bar entirely - and those edges stay bridges.
+    // the reporting bar entirely - and those edges stay bridges. The
+    // shared column is `account_id`, a real reference key: a bare `id`
+    // in each would be three tables' own surrogate keys, which never
+    // bridge (see `graph_surrogate_ids_do_not_bridge_unrelated_tables`).
     let dir = TempDir::new();
-    std::fs::write(dir.path().join("v1.csv"), "id,name\n1,Alice\n2,Bob\n").unwrap();
-    std::fs::write(dir.path().join("v2.csv"), "id,name\n1,Alice\n2,Bob\n").unwrap();
-    std::fs::write(dir.path().join("w.csv"), "id,city\n1,Paris\n").unwrap();
+    std::fs::write(
+        dir.path().join("v1.csv"),
+        "name,account_id\nAlice,1\nBob,2\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("v2.csv"),
+        "name,account_id\nAlice,1\nBob,2\n",
+    )
+    .unwrap();
+    // `w` is the only table leading with `account_id`, so it owns the key:
+    // its two links are references into it, not a shared key.
+    std::fs::write(dir.path().join("w.csv"), "account_id,city\n1,Paris\n").unwrap();
     let out = TempDir::new();
     let output = Command::new(bin())
         .args([
@@ -12938,19 +13314,21 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     // The real-world shape this locks in: many near-identical tables
     // (hundreds of profiled PDFs, all sharing one fixed page_number/text
     // schema, is the motivating case) plus one genuinely different table
-    // that bridges them all via a shared id. Explaining one duplicate's
-    // own id column should surface the one real bridge first, cap the
-    // wall of duplicate-schema copies at 50 rows, and disclose exactly
-    // how many more of each kind exist beyond the cap.
+    // that bridges them all via a shared doc_id. Explaining one
+    // duplicate's own doc_id column should surface the one real bridge
+    // first, cap the wall of duplicate-schema copies at 50 rows, and
+    // disclose exactly how many more of each kind exist beyond the cap.
     let dir = TempDir::new();
     for i in 0..55 {
         std::fs::write(
             dir.path().join(format!("t{i}.csv")),
-            "id,text\n1,hello\n2,world\n",
+            "text,doc_id\nhello,1\nworld,2\n",
         )
         .unwrap();
     }
-    std::fs::write(dir.path().join("hub.csv"), "id\n1\n2\n").unwrap();
+    // `hub` is the only table leading with `doc_id`: it owns the key, so
+    // its links are references into it rather than one more shared copy.
+    std::fs::write(dir.path().join("hub.csv"), "doc_id\n1\n2\n").unwrap();
     let out = TempDir::new();
     let output = Command::new(bin())
         .args([
@@ -12971,9 +13349,9 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
     let dict = out.path().join(format!("{dir_name}.dictionary.json"));
 
-    // `t0`'s own `id` column: 1 real bridge (to hub) + 54 duplicate-schema
+    // `t0`'s own `doc_id` column: 1 real bridge (to hub) + 54 duplicate-schema
     // links (to every other t*) = 55 edges, past the 50-row md cap.
-    let output = run_graph(&["explain", dict.to_str().unwrap(), "t0__t0.id"]);
+    let output = run_graph(&["explain", dict.to_str().unwrap(), "t0__t0.doc_id"]);
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -13002,7 +13380,7 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     // (one header separator line plus 50 data rows).
     assert_eq!(
         stdout.matches("[duplicate-schema link]").count()
-            + stdout.matches("hub__hub | id | extracted").count(),
+            + stdout.matches("hub__hub | doc_id | ").count(),
         50,
         "got: {stdout}"
     );
@@ -13013,7 +13391,7 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     let output = run_graph(&[
         "explain",
         dict.to_str().unwrap(),
-        "t0__t0.id",
+        "t0__t0.doc_id",
         "--output-format",
         "json",
     ]);
@@ -13028,6 +13406,127 @@ fn graph_explain_caps_duplicate_schema_noise_and_leads_with_the_real_bridge() {
     // The community as a whole has a real bridge (hub) - its label should
     // name that hub, not an arbitrary near-duplicate.
     assert_eq!(doc["community_label"], "hub__hub-centered");
+}
+
+/// Profiles `files` as one `--combine` directory and returns the combined
+/// dictionary's path (kept alive by the returned `TempDir`s).
+fn combine_dictionary(files: &[(&str, &str)]) -> (TempDir, TempDir, std::path::PathBuf) {
+    let dir = TempDir::new();
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let out = TempDir::new();
+    let output = run_dir(&[
+        dir.path().to_str().unwrap(),
+        "--combine",
+        "--output-format",
+        "json",
+        "--output-dir",
+        out.path().to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let dict = out.path().join(format!("{dir_name}.dictionary.json"));
+    (dir, out, dict)
+}
+
+#[test]
+fn graph_surrogate_ids_do_not_bridge_unrelated_tables() {
+    // Every file has its own integer `id` (values 1, 2 in each) plus
+    // shared attributes (`amount`, `active`): none of that is a join.
+    // Only the real reference key, `vendors.id <- products.vendor_id`,
+    // connects anything.
+    let (_d, _o, dict) = combine_dictionary(&[
+        (
+            "vendors.csv",
+            "id,name,active\n1,Acme,true\n2,Globex,false\n",
+        ),
+        (
+            "products.csv",
+            "id,vendor_id,amount,active\n1,1,9.5,true\n2,2,3.25,false\n",
+        ),
+        ("audits.csv", "id,amount,note\n1,9.5,ok\n2,3.25,late\n"),
+    ]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dict).unwrap()).unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    assert_eq!(rels.len(), 1, "got: {rels:?}");
+    assert_eq!(rels[0]["reference"]["referencing_column"], "vendor_id");
+    assert_eq!(rels[0]["reference"]["referenced_table"], "vendors__vendors");
+    let output = run_graph(&["rank", dict.to_str().unwrap(), "--output-format", "json"]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let communities = doc["communities"].as_array().unwrap();
+    assert_eq!(
+        communities.len(),
+        2,
+        "audits stays on its own: {communities:?}"
+    );
+    assert_eq!(
+        communities[1]["members"],
+        serde_json::json!(["audits__audits"])
+    );
+}
+
+#[test]
+fn graph_star_schema_ranks_the_hub_and_marks_sibling_links() {
+    // customers owns `customer_id`; three fact tables carry it. The graph
+    // should read as a star around customers, with the fact tables' direct
+    // links to each other kept but labelled shared_reference.
+    let (_d, _o, dict) = combine_dictionary(&[
+        ("customers.csv", "customer_id,name\nC-1,Alice\nC-2,Bob\n"),
+        ("orders.csv", "order_no,customer_id\n1,C-1\n2,C-2\n"),
+        ("invoices.csv", "invoice_no,customer_id\n10,C-1\n11,C-2\n"),
+        ("tickets.csv", "ticket_no,customer_id\n100,C-2\n101,C-1\n"),
+    ]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dict).unwrap()).unwrap();
+    let rels = doc["relationships"].as_array().unwrap();
+    assert_eq!(rels.len(), 6);
+    let spokes: Vec<_> = rels.iter().filter(|e| e["context"] == "bridge").collect();
+    let siblings: Vec<_> = rels
+        .iter()
+        .filter(|e| e["context"] == "shared_reference")
+        .collect();
+    assert_eq!(spokes.len(), 3);
+    assert_eq!(siblings.len(), 3);
+    assert!(
+        spokes
+            .iter()
+            .all(|e| e["reference"]["referenced_table"] == "customers__customers")
+    );
+
+    let output = run_graph(&["rank", dict.to_str().unwrap(), "--output-format", "json"]);
+    assert!(output.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tables = doc["tables"].as_array().unwrap();
+    assert_eq!(tables[0]["table"], "customers__customers");
+    assert_eq!(tables[0]["degree"], 3);
+    assert_eq!(tables[1]["degree"], 1);
+    assert_eq!(tables[1]["shared_reference_degree"], 2);
+    assert_eq!(
+        doc["communities"][0]["label"],
+        "customers__customers-centered"
+    );
+
+    let output = run_graph(&[
+        "explain",
+        dict.to_str().unwrap(),
+        "orders__orders.customer_id",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("- Degree: 3 (1 bridge, 2 shared-reference, 0 duplicate-schema)"),
+        "got: {stdout}"
+    );
+    let hub = stdout.find("customers__customers").expect("hub row");
+    let sibling = stdout.find("[shared-reference link]").expect("sibling row");
+    assert!(hub < sibling, "the spoke must lead: {stdout}");
 }
 
 #[test]
