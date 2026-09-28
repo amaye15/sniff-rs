@@ -20,6 +20,9 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- Delta and Iceberg flatten nested struct/list/map columns into
+  sub-columns; Iceberg applies equality deletes and follows renamed
+  columns by field id.
 - MBOX decodes MIME: RFC 2047 header words, base64/quoted-printable
   bodies in their declared charset, the plain-text part of multipart
   messages, and an `attachments` column of file names.

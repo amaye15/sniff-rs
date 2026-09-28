@@ -4544,14 +4544,15 @@ common case, disclosed gap" boundary this project draws everywhere else
 (LZO compression, old-style BIFF2-5 `.xls`, SAS7BDAT's non-Latin-1/
 Windows-1252 encodings):
 
-- **A schema field whose own type is a nested struct/array/map** (legal
-  in Delta, since its data files are ordinary nested Parquet under the
-  hood) is read but not recursively flattened into dot-notation sub-
-  columns the way a native nested JSON/Parquet column elsewhere in this
-  project already is - it folds through the same scalar-stringification
-  fallback (`json_scalar_into_raw_string`) any other non-scalar `Value`
-  already uses, a real, disclosed simplification kept from this feature's
-  first phase.
+- **A schema field whose own type is a nested struct/array/map** used to
+  fold through the scalar-stringification fallback as one opaque string.
+  A later pass flattens it: `LakehouseColumn` (shared by Delta and
+  Iceberg) sends a flat column to `ColumnAccumulatorState` and a nested
+  one to `JsonPathAccumulator`, the recursive engine every nested format
+  uses, so `address` gets `address.city`/`address.zip` sub-columns and a
+  list pools into `Vec<T>`; the column itself keeps its declared type
+  (`struct`/`array`/`map`) as `current_type`. Verified with a `deltalake`-
+  written table (`edge_delta_nested`) against `deltalake`'s own read.
 - **Apache Iceberg is now supported too, as its own follow-up phase** -
   see this section's own dedicated Iceberg write-up further down for
   the full design (its own genuinely different, multi-hop metadata
@@ -4802,39 +4803,46 @@ comes from the row's own decoded Parquet content, looked up by name.
 "confident common case, disclosed gap" boundary `delta_support`'s own
 write-up above already draws:
 
-- **Equality-delete files are detected and refused loudly, not silently
-  ignored.** A manifest entry's own `data_file.content == 2` names an
-  equality-delete file - deleted rows specified via column-value
-  predicates rather than row positions, which would need every row of
-  every live data file evaluated against every such predicate to resolve
-  correctly. Full predicate evaluation was judged out of reasonable scope
-  for this reader; rather than silently include rows that should have
-  been deleted, `resolve_live_data_files` refuses to profile the table
-  at all the instant one is found, naming the actual offending file -
-  the same "confident common case, disclosed gap" trade `delta_support`'s
-  own deletion-vector handling already makes.
+- **Equality-delete files started as a loud refusal and are now
+  applied.** A manifest entry with `data_file.content == 2` names a
+  Parquet file holding, for its `equality_ids` columns, the value
+  combinations whose rows are deleted. Each is read into a set of key
+  tuples (columns found by field id in the delete file's footer; every
+  value rendered the way data rows are, so null matches null, as the
+  spec says), and a data row is dropped when its values for those ids
+  match - but only for data files whose data sequence number is lower
+  than the delete's (spec, "Scan Planning"; an entry with no sequence
+  number inherits its manifest's from the manifest list). pyiceberg 0.12
+  can't write equality deletes, so the fixtures are hand-built on a real
+  pyiceberg table: `edge_iceberg_equality_delete_applied` (delete at
+  sequence 2 removes `id = 2`) and `_same_seq` (the same delete at the
+  data file's own sequence 1 removes nothing); the original
+  `edge_iceberg_equality_delete`, whose delete file doesn't exist, is now
+  an error naming that file.
 - **Only Parquet data files are read** - a live entry naming an ORC or
   Avro data file (both legal per the Iceberg spec, both formats this
   project can otherwise read on their own) is a clear, disclosed error
   naming the actual format, not a silent skip or a guess.
-- **Schema resolution only ever uses the table's own *current* schema
-  id** - real schema evolution (a column renamed, widened, or added
-  partway through a table's history) means older data files can have
-  been written against an older schema-id than the current one; this
-  reader doesn't reconcile field-id-based schema evolution across
-  snapshots, it simply looks every live file's own Parquet column up by
-  the *current* schema's own column names.
+- **Schema evolution is followed by field id.** The current schema is
+  still the only one reported, but each data file's columns are matched
+  to it by the field id in the file's Parquet footer (Thrift
+  `SchemaElement` field 9, now parsed; `parquet_support::
+  top_level_field_ids`), the spec's "Column Projection" rule - so a file
+  written before a rename feeds the renamed column, and a column whose
+  id is no longer in the schema (dropped) is ignored. A file column with
+  no id falls back to its name. Verified with a `pyiceberg` table renamed
+  between two appends (`edge_iceberg_nested_renamed`): the renamed column
+  reads all three rows, matching pyiceberg's own scan. Type widening
+  needs nothing extra - `ideal_type` is re-derived from values anyway.
 - **No catalog integration of any kind** - this only ever reads a table
   directly off the local filesystem by its own on-disk layout, the
   identical "no network, no catalog service" scope `delta_support`
   already has. A manifest naming a remote-storage path (`s3://`,
   `hdfs://`, ...) is a clear, disclosed error rather than an attempted,
   and inevitably failing, network read.
-- **A nested struct/list/map schema field** folds through the same
-  scalar-stringification fallback any other non-scalar `Value` already
-  uses, not recursively flattened into dot-notation sub-columns - the
-  identical disclosed simplification `delta_support` already makes for
-  Delta's own nested columns.
+- **A nested struct/list/map schema field** flattens into sub-columns
+  through the same `LakehouseColumn` Delta uses (it used to be one
+  stringified value).
 
 **A real, non-obvious fixture-portability problem was found and fixed
 while building this feature's own committed test fixture, not assumed

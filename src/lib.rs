@@ -34948,9 +34948,14 @@ mod parquet_support {
         pub(crate) scale: Option<i32>,
         pub(crate) precision: Option<i32>,
         pub(crate) logical_type: Option<LogicalType>,
+        /// Thrift field 9 - the id Iceberg (and other writers) stamp on a
+        /// column so it survives a rename.
+        #[cfg_attr(not(feature = "iceberg"), allow(dead_code))]
+        pub(crate) field_id: Option<i32>,
     }
 
     fn read_schema_element(r: &mut ThriftReader) -> Result<SchemaElement> {
+        let mut field_id = None;
         let (mut type_, mut type_length, mut repetition_type) = (None, None, None);
         let mut name = None;
         let (mut num_children, mut converted_type) = (None, None);
@@ -34971,6 +34976,7 @@ mod parquet_support {
                 6 => converted_type = Some(ConvertedType::from_i32(r.read_i32()?)?),
                 7 => scale = Some(r.read_i32()?),
                 8 => precision = Some(r.read_i32()?),
+                9 => field_id = Some(r.read_i32()?),
                 10 => logical_type = Some(read_logical_type(r)?),
                 _ => r.skip(ft, MAX_SKIP_DEPTH)?,
             }
@@ -34986,6 +34992,7 @@ mod parquet_support {
             scale,
             precision,
             logical_type,
+            field_id,
         })
     }
 
@@ -38491,6 +38498,34 @@ mod parquet_support {
     /// bottom out at "profile a live Parquet data file," just resolved to
     /// via a genuinely different metadata chain each.
     #[cfg(any(feature = "delta", feature = "iceberg"))]
+    /// Each top-level column's name and field id (if the writer set one),
+    /// read from the footer alone.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn top_level_field_ids(path: &Path) -> Result<Vec<(String, Option<i32>)>> {
+        let (_, meta) = open_and_read_footer(path)?;
+        let mut out = Vec::new();
+        // Element 0 is the root; its `num_children` direct children follow
+        // depth-first, so a child's own subtree has to be skipped.
+        let root_children = meta
+            .schema
+            .first()
+            .and_then(|e| e.num_children)
+            .unwrap_or(0);
+        let mut i = 1usize;
+        for _ in 0..root_children {
+            let Some(el) = meta.schema.get(i) else { break };
+            out.push((el.name.clone(), el.field_id));
+            // Skip this element and all its descendants.
+            let mut pending = 1usize;
+            while pending > 0 && i < meta.schema.len() {
+                pending -= 1;
+                pending += meta.schema[i].num_children.unwrap_or(0).max(0) as usize;
+                i += 1;
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn stream_parquet_rows(
         path: &Path,
         nrows: Option<usize>,
@@ -39595,6 +39630,66 @@ mod parquet_support {
 // through the same scalar-stringification fallback `json_scalar_into_
 // raw_string` already uses for any non-scalar `Value`, a real, disclosed
 // simplification for this first phase rather than a silent gap.
+
+/// One Delta/Iceberg table column's accumulator: a flat column folds its
+/// values into `ColumnAccumulatorState` as before; a struct/list/map column
+/// goes through `JsonPathAccumulator`, the recursive engine every nested
+/// format uses, so its fields become dot-notation sub-columns
+/// (`address.city`) with their own types instead of one stringified blob.
+#[cfg(any(feature = "delta", feature = "iceberg"))]
+enum LakehouseColumn {
+    Flat(ColumnAccumulatorState),
+    Nested(JsonPathAccumulator),
+}
+
+#[cfg(any(feature = "delta", feature = "iceberg"))]
+impl LakehouseColumn {
+    fn new(nested: bool, n_samples: usize) -> Self {
+        if nested {
+            LakehouseColumn::Nested(JsonPathAccumulator::new(n_samples))
+        } else {
+            LakehouseColumn::Flat(ColumnAccumulatorState::new())
+        }
+    }
+
+    /// A non-null value from a decoded row.
+    fn push(&mut self, value: JsonValue, n_samples: usize) {
+        match self {
+            LakehouseColumn::Flat(s) => s.push(
+                parquet_support::json_scalar_into_raw_string(value),
+                n_samples,
+            ),
+            LakehouseColumn::Nested(acc) => acc.push(&value),
+        }
+    }
+
+    /// A value already in text form (a Delta partition value).
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
+    fn push_raw(&mut self, value: String, n_samples: usize) {
+        match self {
+            LakehouseColumn::Flat(s) => s.push(value, n_samples),
+            LakehouseColumn::Nested(acc) => acc.push(&JsonValue::String(value)),
+        }
+    }
+
+    /// The column's profile, plus one per nested sub-column. The declared
+    /// type labels the column itself.
+    fn finish(self, name: String, total: usize, declared: String) -> Vec<ColumnProfile> {
+        match self {
+            LakehouseColumn::Flat(s) => {
+                vec![s.into_profile_with_declared_type(name, total, declared)]
+            }
+            LakehouseColumn::Nested(acc) => {
+                let mut profiles = acc.finish(name, total);
+                if let Some(first) = profiles.first_mut() {
+                    first.current_type = declared;
+                }
+                profiles
+            }
+        }
+    }
+}
+
 #[cfg(feature = "delta")]
 mod delta_support {
     use super::*;
@@ -40089,10 +40184,13 @@ mod delta_support {
             }
         }
 
-        let mut states: Vec<ColumnAccumulatorState> = state
+        let mut states: Vec<LakehouseColumn> = state
             .schema
             .iter()
-            .map(|_| ColumnAccumulatorState::new())
+            .map(|f| {
+                let nested = matches!(f.spark_type.as_str(), "struct" | "array" | "map");
+                LakehouseColumn::new(nested && !f.is_partition, n_samples)
+            })
             .collect();
         // Looked up by *physical* name - the name actually present in a
         // live data file's own decoded Parquet row, which only differs
@@ -40156,15 +40254,12 @@ mod delta_support {
                     if let Some(&idx) = field_index.get(key.as_str())
                         && !state.schema[idx].is_partition
                     {
-                        states[idx].push(
-                            parquet_support::json_scalar_into_raw_string(value),
-                            n_samples,
-                        );
+                        states[idx].push(value, n_samples);
                     }
                 }
                 for &(idx, value) in &partition_raw {
                     if let Some(v) = value {
-                        states[idx].push(v.to_string(), n_samples);
+                        states[idx].push_raw(v.to_string(), n_samples);
                     }
                 }
                 file_rows += 1;
@@ -40179,11 +40274,7 @@ mod delta_support {
 
         let mut out = Vec::with_capacity(state.schema.len());
         for (field, col_state) in state.schema.into_iter().zip(states) {
-            out.push(col_state.into_profile_with_declared_type(
-                field.name,
-                total_rows,
-                field.spark_type,
-            ));
+            out.extend(col_state.finish(field.name, total_rows, field.spark_type));
         }
         Ok(out)
     }
@@ -40401,11 +40492,14 @@ mod delta_support {
 #[cfg(feature = "iceberg")]
 mod iceberg_support {
     use super::*;
-    use std::collections::BTreeSet;
 
     /// One field of an Iceberg table's own resolved *current* schema.
     struct IcebergField {
         name: String,
+        /// The field id, stable across renames - a data file written
+        /// under an older schema names the column its own way, and the id
+        /// in its Parquet footer is what ties it to this field.
+        id: Option<i32>,
         /// The Iceberg primitive type name verbatim (`"long"`, `"string"`,
         /// `"double"`, `"timestamp"`, ...), or - for a nested struct/list/
         /// map field - the same `"struct"`/`"list"`/`"map"` outer-shape
@@ -40590,7 +40684,15 @@ mod iceberg_support {
                 .get("type")
                 .map(iceberg_type_label)
                 .unwrap_or_else(|| "unknown".to_string());
-            out.push(IcebergField { name, iceberg_type });
+            let id = field
+                .get("id")
+                .and_then(JsonValue::as_i64)
+                .and_then(|i| i32::try_from(i).ok());
+            out.push(IcebergField {
+                name,
+                id,
+                iceberg_type,
+            });
         }
         Ok(out)
     }
@@ -40667,29 +40769,37 @@ mod iceberg_support {
     /// well-formed current snapshot's manifest list never should) and
     /// give a stable, deterministic read order - the same reasoning
     /// `delta_support`'s own `BTreeMap`-keyed live-file map already uses.
-    fn resolve_live_data_files(
-        manifest_list_path: &Path,
-        table_dir: &Path,
-    ) -> Result<(Vec<PathBuf>, PositionDeletesByFile)> {
-        let mut manifest_paths: Vec<PathBuf> = Vec::new();
+    fn resolve_live_data_files(manifest_list_path: &Path, table_dir: &Path) -> Result<LiveFiles> {
+        // Each manifest with its own sequence number (v2; 0 on v1), which
+        // an entry with no sequence number of its own inherits.
+        let mut manifest_paths: Vec<(PathBuf, i64)> = Vec::new();
         avro_support::stream_avro_rows(manifest_list_path, |row| {
             let manifest_path = row
                 .get("manifest_path")
                 .and_then(JsonValue::as_str)
                 .context("a manifest-list entry has no \"manifest_path\"")?;
-            manifest_paths.push(resolve_file_uri(manifest_path, table_dir)?);
+            let seq = row
+                .get("sequence_number")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0);
+            manifest_paths.push((resolve_file_uri(manifest_path, table_dir)?, seq));
             Ok(())
         })
         .with_context(|| format!("failed to read manifest list {manifest_list_path:?}"))?;
 
-        let mut live_files: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut live_files: BTreeMap<PathBuf, i64> = BTreeMap::new();
         let mut position_delete_files: Vec<PathBuf> = Vec::new();
-        for manifest_path in &manifest_paths {
+        let mut equality_delete_files: Vec<(PathBuf, Vec<i32>, i64)> = Vec::new();
+        for (manifest_path, manifest_seq) in &manifest_paths {
             avro_support::stream_avro_rows(manifest_path, |row| {
                 let status = row.get("status").and_then(JsonValue::as_i64).unwrap_or(0);
                 if status == 2 {
                     return Ok(()); // DELETED - no longer live
                 }
+                let seq = row
+                    .get("sequence_number")
+                    .and_then(JsonValue::as_i64)
+                    .unwrap_or(*manifest_seq);
                 let data_file = row.get("data_file").with_context(|| {
                     format!("a manifest entry in {manifest_path:?} has no \"data_file\"")
                 })?;
@@ -40715,7 +40825,7 @@ mod iceberg_support {
                                 "{manifest_path:?} names a live data file in {file_format} format - only Parquet data files are supported so far"
                             );
                         }
-                        live_files.insert(resolved_path);
+                        live_files.insert(resolved_path, seq);
                     }
                     1 => {
                         let file_format = data_file
@@ -40730,9 +40840,28 @@ mod iceberg_support {
                         position_delete_files.push(resolved_path);
                     }
                     2 => {
-                        bail!(
-                            "{resolved_path:?} is an Iceberg equality-delete file - this reader doesn't evaluate equality-delete predicates against every row, so this table's live rows can't be resolved correctly; refusing to profile it rather than silently including rows that should have been deleted"
-                        );
+                        let file_format = data_file
+                            .get("file_format")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("");
+                        if !file_format.eq_ignore_ascii_case("parquet") {
+                            bail!(
+                                "{manifest_path:?} names an equality-delete file in {file_format} format - only Parquet equality-delete files are supported so far"
+                            );
+                        }
+                        let ids: Vec<i32> = data_file
+                            .get("equality_ids")
+                            .and_then(JsonValue::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_i64().and_then(|i| i32::try_from(i).ok()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if ids.is_empty() {
+                            bail!("{resolved_path:?}: an equality-delete file with no equality_ids");
+                        }
+                        equality_delete_files.push((resolved_path, ids, seq));
                     }
                     // An unrecognized future content value - safe to
                     // ignore, the same "unknown fields/values are
@@ -40777,7 +40906,74 @@ mod iceberg_support {
             .with_context(|| format!("failed to read position-delete file {delete_path:?}"))?;
         }
 
-        Ok((live_files.into_iter().collect(), position_deletes))
+        // Equality-delete files hold, for their `equality_ids` columns, the
+        // value combinations whose rows are deleted. Each is read into a
+        // set of keys (every value rendered the same way the data rows'
+        // are, so a null matches a null, as the spec says).
+        let mut equality_deletes = Vec::with_capacity(equality_delete_files.len());
+        for (delete_path, ids, seq) in equality_delete_files {
+            if !delete_path.is_file() {
+                bail!(
+                    "{delete_path:?} is listed as an equality-delete file in an Iceberg manifest, but doesn't exist on disk"
+                );
+            }
+            let columns = parquet_support::top_level_field_ids(&delete_path)
+                .with_context(|| format!("failed to read equality-delete file {delete_path:?}"))?;
+            let names: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    columns
+                        .iter()
+                        .find(|(_, fid)| *fid == Some(*id))
+                        .map(|(n, _)| n.clone())
+                        .with_context(|| {
+                            format!("equality-delete file {delete_path:?} has no column with field id {id}")
+                        })
+                })
+                .collect::<Result<_>>()?;
+            let mut keys: HashSet<Vec<String>, FxBuildHasher> = HashSet::default();
+            parquet_support::stream_parquet_rows(&delete_path, None, |row| {
+                keys.insert(
+                    names
+                        .iter()
+                        .map(|n| equality_key_part(row.get(n)))
+                        .collect(),
+                );
+                Ok(())
+            })
+            .with_context(|| format!("failed to read equality-delete file {delete_path:?}"))?;
+            equality_deletes.push(EqualityDelete { ids, seq, keys });
+        }
+
+        Ok((
+            live_files.into_iter().collect(),
+            position_deletes,
+            equality_deletes,
+        ))
+    }
+
+    /// Live data files with their data sequence numbers, position deletes,
+    /// and equality deletes.
+    type LiveFiles = (
+        Vec<(PathBuf, i64)>,
+        PositionDeletesByFile,
+        Vec<EqualityDelete>,
+    );
+
+    /// One equality-delete file: the field ids it matches on, its data
+    /// sequence number (it deletes only rows of data files with a *lower*
+    /// one, per the spec's "Scan Planning"), and the deleted key tuples.
+    struct EqualityDelete {
+        ids: Vec<i32>,
+        seq: i64,
+        keys: HashSet<Vec<String>, FxBuildHasher>,
+    }
+
+    fn equality_key_part(v: Option<&JsonValue>) -> String {
+        match v {
+            None | Some(JsonValue::Null) => "\u{0}null".to_string(),
+            Some(v) => v.to_string(),
+        }
     }
 
     /// The real top-level entry point: resolves the table's current
@@ -40804,26 +41000,34 @@ mod iceberg_support {
             format!("failed to resolve the current schema from {metadata_path:?}")
         })?;
 
-        let (live_files, position_deletes) =
+        let (live_files, position_deletes, equality_deletes) =
             match resolve_current_snapshot_manifest_list(&metadata, table_dir)? {
                 Some(manifest_list_path) => {
                     resolve_live_data_files(&manifest_list_path, table_dir)?
                 }
-                None => (Vec::new(), BTreeMap::new()),
+                None => (Vec::new(), BTreeMap::new(), Vec::new()),
             };
 
-        let mut states: Vec<ColumnAccumulatorState> = schema
+        let mut states: Vec<LakehouseColumn> = schema
             .iter()
-            .map(|_| ColumnAccumulatorState::new())
+            .map(|f| {
+                let nested = matches!(f.iceberg_type.as_str(), "struct" | "list" | "map");
+                LakehouseColumn::new(nested, n_samples)
+            })
             .collect();
-        let field_index: HashMap<&str, usize, FxBuildHasher> = schema
+        let by_name: HashMap<&str, usize, FxBuildHasher> = schema
             .iter()
             .enumerate()
             .map(|(i, f)| (f.name.as_str(), i))
             .collect();
+        let by_id: HashMap<i32, usize, FxBuildHasher> = schema
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.id.map(|id| (id, i)))
+            .collect();
 
         let mut total_rows = 0usize;
-        'files: for file_path in &live_files {
+        'files: for (file_path, data_seq) in &live_files {
             if nrows.is_some_and(|limit| total_rows >= limit) {
                 break;
             }
@@ -40832,6 +41036,44 @@ mod iceberg_support {
                     "{file_path:?} is listed as a live data file in the Iceberg manifest, but doesn't exist on disk"
                 );
             }
+            // Iceberg's schema evolution is by field id (spec, "Column
+            // Projection"): a column in this file whose footer id matches
+            // a current field is that field, whatever the file calls it -
+            // a file written before a rename keeps the old name. A file
+            // column with no id falls back to its name; one whose id
+            // isn't in the current schema was dropped and is ignored.
+            let file_columns = parquet_support::top_level_field_ids(file_path)
+                .with_context(|| format!("failed to read {file_path:?}"))?;
+            // The equality deletes that reach this file, each with the
+            // file's own column name for every id it matches on.
+            let applicable: Vec<(&EqualityDelete, Vec<Option<&str>>)> = equality_deletes
+                .iter()
+                .filter(|d| d.seq > *data_seq)
+                .map(|d| {
+                    let names = d
+                        .ids
+                        .iter()
+                        .map(|id| {
+                            file_columns
+                                .iter()
+                                .find(|(_, fid)| *fid == Some(*id))
+                                .map(|(n, _)| n.as_str())
+                        })
+                        .collect();
+                    (d, names)
+                })
+                .collect();
+            let field_index: HashMap<String, usize, FxBuildHasher> = file_columns
+                .iter()
+                .cloned()
+                .filter_map(|(name, id)| {
+                    let idx = match id {
+                        Some(id) if !by_id.is_empty() => by_id.get(&id).copied(),
+                        _ => by_name.get(name.as_str()).copied(),
+                    }?;
+                    Some((name, idx))
+                })
+                .collect();
             let remaining = nrows.map(|limit| limit - total_rows);
             let mut file_rows = 0usize;
             let deleted_positions = position_deletes.get(file_path);
@@ -40849,6 +41091,16 @@ mod iceberg_support {
                 let JsonValue::Object(map) = row else {
                     bail!("{file_path:?}: expected each Parquet row to decode to an object");
                 };
+                let deleted_by_equality = applicable.iter().any(|(d, names)| {
+                    let key: Vec<String> = names
+                        .iter()
+                        .map(|n| equality_key_part(n.and_then(|n| map.get(n))))
+                        .collect();
+                    d.keys.contains(&key)
+                });
+                if deleted_by_equality {
+                    return Ok(());
+                }
                 // `map` is a fully owned row - nothing else reads it again
                 // after this loop - so each value is moved out via
                 // `into_iter` instead of cloned out of a borrowed
@@ -40859,10 +41111,7 @@ mod iceberg_support {
                         continue;
                     }
                     if let Some(&idx) = field_index.get(key.as_str()) {
-                        states[idx].push(
-                            parquet_support::json_scalar_into_raw_string(value),
-                            n_samples,
-                        );
+                        states[idx].push(value, n_samples);
                     }
                 }
                 file_rows += 1;
@@ -40877,11 +41126,7 @@ mod iceberg_support {
 
         let mut out = Vec::with_capacity(schema.len());
         for (field, col_state) in schema.into_iter().zip(states) {
-            out.push(col_state.into_profile_with_declared_type(
-                field.name,
-                total_rows,
-                field.iceberg_type,
-            ));
+            out.extend(col_state.finish(field.name, total_rows, field.iceberg_type));
         }
         Ok(out)
     }

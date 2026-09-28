@@ -11769,18 +11769,23 @@ fn iceberg_table_excludes_rows_named_by_a_position_delete_file() {
     assert!(!samples.contains(&"c"));
 }
 
-/// tests/fixtures/edge_iceberg_equality_delete is a real, committed
-/// Iceberg table (a plain 3-row `pyiceberg`-appended data file) with one
-/// hand-assembled equality-delete manifest entry attached (`data_file.
-/// content == 2`, built the same "re-encode the real manifest schema via
-/// fastavro" way as the position-delete fixture above) - this reader
-/// refuses to profile a table with an equality delete at all, rather
-/// than silently including rows a real predicate evaluation would have
-/// excluded, so this proves the refusal fires and names the real
-/// offending file rather than a generic message.
+/// Equality deletes (a hand-built delete file on field id 1 over a real
+/// `pyiceberg` table): a delete with a higher sequence number than the
+/// data file removes the matching row; one with an equal sequence number
+/// doesn't reach it (spec, "Scan Planning"); and a delete file that isn't
+/// on disk is an error naming it.
 #[cfg(feature = "iceberg")]
 #[test]
-fn iceberg_table_rejects_an_equality_delete_file_with_an_actionable_error() {
+fn iceberg_table_applies_equality_deletes_by_sequence_number() {
+    let doc = run_json("edge_iceberg_equality_delete_applied", &[]);
+    let id = column(table(&doc, "edge_iceberg_equality_delete_applied"), "id");
+    assert_eq!(id["row_count"], 2);
+    assert_eq!(id["sample_values"], serde_json::json!(["1", "3"]));
+
+    let doc = run_json("edge_iceberg_equality_delete_same_seq", &[]);
+    let id = column(table(&doc, "edge_iceberg_equality_delete_same_seq"), "id");
+    assert_eq!(id["row_count"], 3);
+
     let path = fixture("edge_iceberg_equality_delete");
     let output = Command::new(bin())
         .args([path.to_str().unwrap(), "-", "--output-format", "json"])
@@ -11788,7 +11793,27 @@ fn iceberg_table_rejects_an_equality_delete_file_with_an_actionable_error() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("equality-delete"));
+    assert!(stderr.contains("equality-delete") && stderr.contains("fake-eq-delete.parquet"));
+}
+
+/// A struct column flattens into dot-notation sub-columns and a list into
+/// a pooled `Vec<T>`; and a column renamed after the first append
+/// (`name` -> `full_name`) still reads the older file's values, matched by
+/// field id. Built with `pyiceberg`.
+#[cfg(feature = "iceberg")]
+#[test]
+fn iceberg_table_flattens_nested_columns_and_follows_renames_by_field_id() {
+    let doc = run_json("edge_iceberg_nested_renamed", &["--samples", "5"]);
+    let cols = table(&doc, "edge_iceberg_nested_renamed");
+    let full_name = column(cols, "full_name");
+    assert_eq!(full_name["missing_pct"], 0.0);
+    assert_eq!(full_name["row_count"], 3);
+    assert_eq!(column(cols, "address")["current_type"], "struct");
+    assert_eq!(
+        column(cols, "address.city")["sample_values"],
+        serde_json::json!(["Oslo", "Paris"])
+    );
+    assert_eq!(column(cols, "tags")["ideal_type"], "Vec<String>");
 }
 
 // tests/fixtures/edge_iceberg_position_delete_multi_file is a real,
@@ -15163,4 +15188,20 @@ fn mbox_decodes_mime_headers_bodies_and_attachments() {
         column(cols, "attachments")["sample_values"],
         serde_json::json!(["résumé.pdf"])
     );
+}
+
+/// Struct and array columns in a Delta table flatten the way nested
+/// Parquet does. Written with `deltalake`.
+#[cfg(feature = "delta")]
+#[test]
+fn delta_table_flattens_nested_columns() {
+    let doc = run_json("edge_delta_nested", &[]);
+    let cols = table(&doc, "edge_delta_nested");
+    assert_eq!(column(cols, "address")["current_type"], "struct");
+    assert_eq!(column(cols, "address")["missing_pct"], 33.3);
+    assert_eq!(
+        column(cols, "address.city")["sample_values"],
+        serde_json::json!(["Paris", "Oslo"])
+    );
+    assert_eq!(column(cols, "tags")["ideal_type"], "Vec<String>");
 }
