@@ -18,6 +18,8 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- YAML aliases (`*name`) and merge keys (`<<`) resolve, with an
+  expansion cap against alias bombs; they used to be a parse error.
 - `sniff-rs diff` accepts `-` for one side (stdin), with `--format` for
   that side when its format can't be sniffed.
 - `rank` gains three graph measures per table: `reference_rank`

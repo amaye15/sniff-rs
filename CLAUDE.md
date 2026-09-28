@@ -1664,9 +1664,9 @@ column mode resolves correctly; `edge_yaml_complex_mixed.yaml` (three
 levels of nested mapping, an explicit-tag scalar, and a mixed-type flow
 array) confirmed deep flattening (`nested.level1.level2.value`) and
 mixed-type array serialization both work; `edge_yaml_merge.yaml` (a real
-alias/merge-key file, already a disclosed, unsupported YAML shape -
-see the Dependency footprint section's own YAML entry) confirmed the
-identical parse error fires on both passes, not a new or different one.
+alias/merge-key file - a disclosed parse error at the time, resolved
+since; see the Dependency footprint section's own YAML entry) confirmed
+the identical parse error fired on both passes.
 Also verified as behavior-preserving for every already-shipped format
 (JSON included, modulo the one intentional wording change above): `diff`
 confirmed byte-identical inline SQL output against the pre-Phase-14
@@ -11962,6 +11962,21 @@ this project could just implement directly rather than depend on:
   alias-error findings are locked in as `#[cfg(test)]` unit tests
   directly on `yaml_support::parse_yaml_documents`, alongside the
   now-confirmed `on`/`off`/`yes`/`no` non-coercion behavior.
+
+  **A later pass resolved aliases and merge keys**, closing that gap.
+  Anchors are recorded as their values finish parsing (after `- &a`,
+  `key: &a`, or a flow scalar `&a x`) into a per-document table
+  (`ANCHORS`, thread-local, reset by `parse_document`, since YAML scopes
+  an anchor to its document); `*name` copies the recorded value, and an
+  alias with no earlier anchor is a clear error. `<<` (yaml.org's merge
+  key) takes a mapping or a sequence of mappings: explicit keys win, and
+  among merge sources the earlier one wins. Alias expansion is capped at
+  `MAX_ALIAS_EXPANSION_NODES` (1,000,000 copied values per document) so a
+  "billion laughs" chain of aliases-of-aliases fails cleanly instead of
+  exhausting memory. Not covered: an anchor directly on a flow collection
+  (`&a [1, 2]`) or on a whole document root, and a flow-mapping merge
+  key. `edge_yaml_merge.yaml`, which used to prove the disclosed error,
+  now proves the merge.
 
 - **`rust-ini` → a hand-rolled INI parser, the smallest and lowest-risk
   hand-roll in this whole effort.** INI's own grammar is far smaller

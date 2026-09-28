@@ -45841,6 +45841,77 @@ mod yaml_support {
     /// this fix, not assumed. Returns the remaining text and how many
     /// characters were consumed (name plus trailing whitespace), so a
     /// caller computing a column offset can adjust for it.
+    fn anchor_name(s: &str) -> Option<&str> {
+        let rest = s.strip_prefix('&')?;
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        (end > 0).then(|| &rest[..end])
+    }
+
+    /// Cap on how many JSON nodes alias expansion may copy in one
+    /// document - the "billion laughs" guard: nested aliases to aliases
+    /// grow exponentially, so a few lines could otherwise demand
+    /// gigabytes.
+    const MAX_ALIAS_EXPANSION_NODES: usize = 1_000_000;
+
+    struct Anchors {
+        values: HashMap<String, JsonValue>,
+        expanded_nodes: usize,
+    }
+
+    thread_local! {
+        /// The current document's anchors (YAML scopes an anchor to its
+        /// document; `parse_document` resets this). Thread-local rather
+        /// than threaded through every parse function, since only three
+        /// places record anchors and one resolves them.
+        static ANCHORS: std::cell::RefCell<Anchors> = std::cell::RefCell::new(Anchors {
+            values: HashMap::new(),
+            expanded_nodes: 0,
+        });
+    }
+
+    fn reset_anchors() {
+        ANCHORS.with(|a| {
+            let mut a = a.borrow_mut();
+            a.values.clear();
+            a.expanded_nodes = 0;
+        });
+    }
+
+    fn record_anchor(name: Option<&str>, value: &JsonValue) {
+        if let Some(name) = name {
+            ANCHORS.with(|a| {
+                a.borrow_mut()
+                    .values
+                    .insert(name.to_string(), value.clone());
+            });
+        }
+    }
+
+    fn node_count(v: &JsonValue) -> usize {
+        match v {
+            JsonValue::Array(items) => 1 + items.iter().map(node_count).sum::<usize>(),
+            JsonValue::Object(map) => 1 + map.iter().map(|(_, v)| node_count(v)).sum::<usize>(),
+            _ => 1,
+        }
+    }
+
+    fn resolve_alias(name: &str) -> Result<JsonValue> {
+        ANCHORS.with(|a| {
+            let mut a = a.borrow_mut();
+            let value = a.values.get(name).cloned().ok_or_else(|| {
+                anyhow!("YAML alias '*{name}' refers to an anchor that isn't defined before it")
+            })?;
+            a.expanded_nodes += node_count(&value);
+            if a.expanded_nodes > MAX_ALIAS_EXPANSION_NODES {
+                bail!(
+                    "YAML aliases expand to more than {MAX_ALIAS_EXPANSION_NODES} values in one \
+                     document - refusing (an alias-bomb guard)"
+                );
+            }
+            Ok(value)
+        })
+    }
+
     fn strip_anchor_prefix(s: &str) -> (&str, usize) {
         let Some(rest) = s.strip_prefix('&') else {
             return (s, 0);
@@ -46105,6 +46176,7 @@ mod yaml_support {
         if *pos >= lines.len() {
             return Ok(JsonValue::Null);
         }
+        reset_anchors();
         let indent = lines[*pos].indent;
         parse_block_node(lines, pos, indent, indent)
     }
@@ -46226,24 +46298,27 @@ mod yaml_support {
             }
             let after_dash_raw = &content[1..];
             let trimmed_len = after_dash_raw.len() - after_dash_raw.trim_start().len();
+            let anchor = anchor_name(after_dash_raw.trim_start());
             let (after_dash, anchor_consumed) = strip_anchor_prefix(after_dash_raw.trim_start());
             let value_col = line.indent + 1 + trimmed_len + anchor_consumed;
-            if after_dash.is_empty() {
+            let value = if after_dash.is_empty() {
                 *pos += 1;
                 skip_blank_and_comment_lines(lines, pos);
                 match lines.get(*pos).copied() {
                     Some(l) if is_nested_value_line(&l, indent) => {
                         let child_indent = l.indent;
-                        items.push(parse_block_node(lines, pos, child_indent, child_indent)?);
+                        parse_block_node(lines, pos, child_indent, child_indent)?
                     }
-                    _ => items.push(JsonValue::Null),
+                    _ => JsonValue::Null,
                 }
             } else {
                 let (value, consumed) =
                     parse_inline_value(lines, *pos, after_dash, value_col, line.indent)?;
-                items.push(value);
                 *pos += consumed;
-            }
+                value
+            };
+            record_anchor(anchor, &value);
+            items.push(value);
         }
         Ok(JsonValue::Array(items))
     }
@@ -46254,6 +46329,7 @@ mod yaml_support {
         indent: usize,
     ) -> Result<JsonValue> {
         let mut map = json_support::Map::new();
+        let mut merges: Vec<JsonValue> = Vec::new();
         loop {
             skip_blank_and_comment_lines(lines, pos);
             let Some(line) = lines.get(*pos).copied() else {
@@ -46269,26 +46345,56 @@ mod yaml_support {
             let key = resolve_scalar_key(content[..colon].trim())?;
             let after_colon_raw = &content[colon + 1..];
             let trimmed_len = after_colon_raw.len() - after_colon_raw.trim_start().len();
+            let anchor = anchor_name(after_colon_raw.trim_start());
             let (after_colon, anchor_consumed) = strip_anchor_prefix(after_colon_raw.trim_start());
             let value_col = line.indent + colon + 1 + trimmed_len + anchor_consumed;
-            if after_colon.is_empty() {
+            let value = if after_colon.is_empty() {
                 *pos += 1;
                 skip_blank_and_comment_lines(lines, pos);
                 match lines.get(*pos).copied() {
                     Some(l) if is_nested_value_line(&l, indent) => {
                         let child_indent = l.indent;
-                        let value = parse_block_node(lines, pos, child_indent, child_indent)?;
-                        map.insert(key, value);
+                        parse_block_node(lines, pos, child_indent, child_indent)?
                     }
-                    _ => {
-                        map.insert(key, JsonValue::Null);
-                    }
+                    _ => JsonValue::Null,
                 }
             } else {
                 let (value, consumed) =
                     parse_inline_value(lines, *pos, after_colon, value_col, line.indent)?;
-                map.insert(key, value);
                 *pos += consumed;
+                value
+            };
+            record_anchor(anchor, &value);
+            // `<<` is YAML's merge key (yaml.org/type/merge.html): its
+            // value - a mapping, or a sequence of mappings - contributes
+            // every key this mapping doesn't set itself. A quoted "<<"
+            // is an ordinary key and never reaches here unquoted-looking
+            // only by accident: `resolve_scalar_key` has already
+            // unquoted it, so the raw text is checked instead.
+            if content[..colon].trim() == "<<" {
+                merges.push(value);
+            } else {
+                map.insert(key, value);
+            }
+        }
+        // Earlier merge sources win over later ones, and explicit keys
+        // win over all of them - both per the merge-key spec.
+        for source in merges {
+            let sources = match source {
+                JsonValue::Array(items) => items,
+                other => vec![other],
+            };
+            for src in sources {
+                let JsonValue::Object(src) = src else {
+                    bail!(
+                        "a YAML merge key (<<) must refer to a mapping or a sequence of mappings"
+                    );
+                };
+                for (k, v) in src {
+                    if map.get(&k).is_none() {
+                        map.insert(k, v);
+                    }
+                }
             }
         }
         Ok(JsonValue::Object(map))
@@ -46741,7 +46847,12 @@ mod yaml_support {
         // reached, for column-tracking reasons - see
         // `strip_anchor_prefix`'s own doc comment); needed here for flow
         // context (`{a: &x 1}`), which has no equivalent earlier step.
-        let (trimmed, _) = strip_anchor_prefix(trimmed);
+        if let Some(name) = anchor_name(trimmed) {
+            let (rest, _) = strip_anchor_prefix(trimmed);
+            let value = resolve_scalar_value(rest)?;
+            record_anchor(Some(name), &value);
+            return Ok(value);
+        }
         if trimmed.starts_with('"') {
             let mut cursor = 0usize;
             return Ok(JsonValue::String(parse_double_quoted(
@@ -46803,11 +46914,11 @@ mod yaml_support {
         // literal `"*name"` string, this project's usual "no silent
         // misreading" rule applied to a real YAML feature gap instead of
         // a heuristic.
-        if s.starts_with('*') && s.len() > 1 {
-            bail!(
-                "YAML aliases (*name) aren't supported - the anchored value itself \
-                 (&name) is read normally, but referencing it elsewhere via '{s}' is not"
-            );
+        if let Some(name) = s.strip_prefix('*')
+            && !name.is_empty()
+            && !name.contains(char::is_whitespace)
+        {
+            return resolve_alias(name);
         }
         if let Some(b) = parse_plain_bool(s) {
             return Ok(JsonValue::Bool(b));
@@ -94674,12 +94785,38 @@ mod tests {
 
     #[cfg(feature = "yaml")]
     #[test]
-    fn yaml_parser_gives_a_clear_error_on_an_alias_reference() {
-        let err = yaml_support::parse_yaml_documents(
-            "defaults: &defaults\n  timeout: 30\nprod:\n  <<: *defaults\n",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("alias"), "{err}");
+    fn yaml_parser_resolves_aliases_and_merge_keys() {
+        let v = yaml_doc(
+            "base: &b\n  timeout: 30\n  retries: 2\nextra: &e {region: eu}\n\
+             prod:\n  <<: [*b, *e]\n  retries: 5\ncopy: *b\nlist:\n  - &x 7\n  - *x\n",
+        );
+        assert_eq!(
+            v["prod"],
+            json!({"retries": 5, "timeout": 30, "region": "eu"})
+        );
+        assert_eq!(v["copy"], json!({"timeout": 30, "retries": 2}));
+        assert_eq!(v["list"], json!([7, 7]));
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_parser_rejects_an_undefined_alias_and_an_alias_bomb() {
+        let err = yaml_support::parse_yaml_documents("a: *nope\n").unwrap_err();
+        assert!(err.to_string().contains("isn't defined"), "{err}");
+        // Each level doubles the previous one: 2^30 nodes if expanded.
+        let mut doc = String::from("l0: &l0 [x, x]\n");
+        for i in 1..30 {
+            doc.push_str(&format!("l{i}: &l{i} [*l{p}, *l{p}]\n", p = i - 1));
+        }
+        let err = yaml_support::parse_yaml_documents(&doc).unwrap_err();
+        assert!(err.to_string().contains("alias-bomb"), "{err}");
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn yaml_anchors_are_scoped_to_their_document() {
+        let err = yaml_support::parse_yaml_documents("a: &x 1\n---\nb: *x\n").unwrap_err();
+        assert!(err.to_string().contains("isn't defined"), "{err}");
     }
 
     #[cfg(feature = "yaml")]

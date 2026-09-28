@@ -9651,16 +9651,21 @@ fn csv_null_bytes_and_unicode_emoji() {
 
 #[cfg(feature = "yaml")]
 #[test]
-fn yaml_merge_alias_is_clean_error() {
-    let output = Command::new(bin())
-        .args([fixture("edge_yaml_merge.yaml").to_str().unwrap(), "-"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("alias") || stderr.contains("not supported"),
-        "expected alias error: {stderr}"
+fn yaml_merge_keys_resolve_through_aliases() {
+    let doc = run_json("edge_yaml_merge.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_merge");
+    assert_eq!(
+        column(cols, "development.adapter")["sample_values"][0],
+        "postgres"
+    );
+    assert_eq!(
+        column(cols, "development.database")["sample_values"][0],
+        "dev_db"
+    );
+    // An explicit key wins over the merged one.
+    assert_eq!(
+        column(cols, "production.host")["sample_values"][0],
+        "prod.example.com"
     );
 }
 
@@ -10300,18 +10305,6 @@ fn yaml_binary_tag_and_multiline_strings() {
             .unwrap()
             .contains("line1")
     );
-}
-
-#[cfg(feature = "yaml")]
-#[test]
-fn yaml_merge_alias_is_clean_error_second() {
-    let output = Command::new(bin())
-        .args([fixture("edge_yaml_merge.yaml").to_str().unwrap(), "-"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("alias") || stderr.contains("not supported"));
 }
 
 #[cfg(feature = "toml")]
