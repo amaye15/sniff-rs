@@ -4003,6 +4003,23 @@ fn npz_reports_one_table_per_named_array() {
     assert!(users.iter().any(|c| c["name"] == "user_id"));
 }
 
+// A fully Zip64 archive: every entry's sizes and local-header offset sit
+// behind 0xFFFFFFFF sentinels with their real values in the Zip64 extra
+// field, and the classic end record's counts point at a Zip64 end record.
+// One entry is stored, one deflated. Python's zipfile and NumPy both read
+// it; the reader used to refuse any archive with a Zip64 record.
+#[cfg(feature = "npy")]
+#[test]
+fn npz_reads_a_zip64_archive() {
+    let doc = run_json("edge_npz_zip64.npz", &[]);
+    let ids = column(table(&doc, "ids"), "value");
+    assert_eq!(ids["ideal_type"], "i64");
+    assert_eq!(ids["row_count"], 5);
+    let scores = column(table(&doc, "scores"), "value");
+    assert_eq!(scores["ideal_type"], "f64");
+    assert_eq!(scores["sample_values"][0], "1.5");
+}
+
 // Found via a real-world sweep against TensorFlow's own MNIST .npz
 // (x_train/x_test are genuine 3-D image arrays, (60000, 28, 28) and
 // (10000, 28, 28) - a real, documented boundary this tool correctly

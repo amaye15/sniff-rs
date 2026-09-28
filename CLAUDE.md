@@ -8379,10 +8379,10 @@ since real per-array decode work still legitimately scales with array
 count regardless of lookup cost). A further 80,000-array file hit a
 real, disclosed, pre-existing and unrelated limit instead - the
 resulting archive exceeds the plain (non-Zip64) format's own 32-bit
-size fields, and this project's Zip64 support is a known, disclosed
-gap (see the Known limitations section) - so this pass's own measured
-range tops out at 40,000 arrays, still enough to clearly demonstrate
-both the bug and the fix. Verified the same way as every pass before
+size fields, and Zip64 wasn't read yet at the time (it is now - see
+the Zip64 entry in the Dependency footprint section) - so this pass's
+own measured range tops out at 40,000 arrays, still enough to clearly
+demonstrate both the bug and the fix. Verified the same way as every pass before
 it: full test suite unchanged and passing under every affected feature
 combination (`--features xlsx`, `--features npy`, `--features full`,
 and the default build) individually, not just the usual two endpoints,
@@ -11473,6 +11473,21 @@ this project could just implement directly rather than depend on:
   plausibly differ (`--features xlsx` alone, `--features full`, and the
   default build with neither) was rebuilt and clippy-checked separately,
   not just the usual two endpoints.
+- **Zip64 in `ZipArchive`** (shared by `.xlsx`/`.ods`/`.xlsb`/`.npz`).
+  An archive with more than 65,535 entries, or sizes/offsets past 4 GiB,
+  stores the real 64-bit values in a Zip64 end-of-central-directory
+  record (found through the 20-byte locator right before the classic
+  one) and in each entry's Zip64 extra field (ID `0x0001`, holding only
+  the fields whose 32-bit slot is `0xFFFFFFFF`, in APPNOTE 4.5.3's fixed
+  order). `open` reads both, and rejects a central directory that runs
+  past the end of the file before allocating for it; entry sizes are
+  `u64` throughout, and `read` reads an entry through `take` instead of
+  pre-allocating its declared size. Verified with a hand-built fully
+  Zip64 `.npz` (`edge_npz_zip64.npz` - every size, offset, and count
+  behind a sentinel, one stored and one deflated entry) that Python's
+  `zipfile` and NumPy both read identically, and against a real
+  80,000-array `np.savez` archive, which used to be refused.
+
 - **`.ods` next, reusing the same ZIP/XML infrastructure.** ODF's own
   spreadsheet schema turned out considerably simpler than OOXML's for
   this project's purposes: a cell states its own value type directly

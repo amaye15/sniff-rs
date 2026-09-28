@@ -74298,6 +74298,9 @@ mod zip_support {
     const ZIP_CENTRAL_DIR_SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
     const ZIP_LOCAL_HEADER_SIG: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
     const ZIP_LOCAL_HEADER_SIZE: usize = 30;
+    const ZIP64_EOCD_SIG: [u8; 4] = [0x50, 0x4B, 0x06, 0x06];
+    const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4B, 0x06, 0x07];
+    const ZIP64_EXTRA_ID: u16 = 0x0001;
 
     fn zip_read_u16(data: &[u8], pos: usize) -> Result<u16> {
         let b = data
@@ -74313,11 +74316,59 @@ mod zip_support {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    fn zip_read_u64(data: &[u8], pos: usize) -> Result<u64> {
+        let b = data
+            .get(pos..pos + 8)
+            .context("unexpected end of zip data")?;
+        Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+    }
+
+    /// An entry's Zip64 extended-information extra field (APPNOTE 4.5.3,
+    /// header ID 0x0001) holds a 64-bit value for each of the uncompressed
+    /// size, compressed size, and local-header offset whose 32-bit
+    /// central-directory field is the 0xFFFFFFFF sentinel - only those,
+    /// in that fixed order. A sentinel with no matching value in the extra
+    /// field is a malformed archive, not a 4 GiB entry.
+    fn apply_zip64_extra(
+        extra: &[u8],
+        uncompressed: &mut u64,
+        compressed: &mut u64,
+        offset: &mut u64,
+    ) -> Result<()> {
+        let needs = [*uncompressed, *compressed, *offset]
+            .iter()
+            .any(|v| *v == 0xFFFF_FFFF);
+        if !needs {
+            return Ok(());
+        }
+        let mut pos = 0;
+        while pos + 4 <= extra.len() {
+            let id = zip_read_u16(extra, pos)?;
+            let len = zip_read_u16(extra, pos + 2)? as usize;
+            let body = extra
+                .get(pos + 4..pos + 4 + len)
+                .context("truncated zip extra field")?;
+            if id == ZIP64_EXTRA_ID {
+                let mut at = 0;
+                for field in [uncompressed, compressed, offset] {
+                    if *field == 0xFFFF_FFFF {
+                        *field = zip_read_u64(body, at)
+                            .context("zip64 extra field is missing a 64-bit value")?;
+                        at += 8;
+                    }
+                }
+                return Ok(());
+            }
+            pos += 4 + len;
+        }
+        bail!("zip entry has a 0xFFFFFFFF size/offset but no zip64 extra field")
+    }
+
     pub(crate) struct ZipEntry {
         pub(crate) name: String,
-        local_header_offset: u32,
-        compressed_size: u32,
-        uncompressed_size: u32,
+        local_header_offset: u64,
+        compressed_size: u64,
+        uncompressed_size: u64,
         method: u16,
         pub(crate) crc32: u32,
     }
@@ -74363,27 +74414,56 @@ mod zip_support {
                 .with_context(|| format!("failed reading {path:?}"))?;
             let eocd_pos = Self::find_eocd(&tail)?;
 
-            let entry_count = zip_read_u16(&tail, eocd_pos + 10)?;
-            let central_dir_size = zip_read_u32(&tail, eocd_pos + 12)?;
-            let central_dir_offset = zip_read_u32(&tail, eocd_pos + 16)?;
-            if central_dir_offset == 0xFFFF_FFFF
+            let mut entry_count = u64::from(zip_read_u16(&tail, eocd_pos + 10)?);
+            let mut central_dir_size = u64::from(zip_read_u32(&tail, eocd_pos + 12)?);
+            let mut central_dir_offset = u64::from(zip_read_u32(&tail, eocd_pos + 16)?);
+            // Zip64 (APPNOTE 4.3.14-4.3.15): a 20-byte locator sits right
+            // before the classic EOCD and points at a Zip64 EOCD record
+            // carrying the real 64-bit entry count, directory size, and
+            // directory offset. Writers emit it when a classic field
+            // overflows (the 0xFFFF/0xFFFFFFFF sentinels), and some emit
+            // it unconditionally - when present it's authoritative.
+            if eocd_pos >= 20 && tail[eocd_pos - 20..eocd_pos - 16] == ZIP64_LOCATOR_SIG {
+                let record_offset = zip_read_u64(&tail, eocd_pos - 12)?;
+                file.seek(SeekFrom::Start(record_offset))
+                    .with_context(|| format!("failed seeking into {path:?}"))?;
+                let mut record = [0u8; 56];
+                file.read_exact(&mut record)
+                    .context("truncated zip64 end of central directory record")?;
+                if record[0..4] != ZIP64_EOCD_SIG {
+                    bail!("invalid zip64 end of central directory record signature");
+                }
+                entry_count = zip_read_u64(&record, 32)?;
+                central_dir_size = zip_read_u64(&record, 40)?;
+                central_dir_offset = zip_read_u64(&record, 48)?;
+            } else if central_dir_offset == 0xFFFF_FFFF
                 || central_dir_size == 0xFFFF_FFFF
                 || entry_count == 0xFFFF
             {
-                bail!("zip64 archives are not supported");
+                bail!("zip archive needs zip64 records but has no zip64 locator");
+            }
+            if central_dir_offset
+                .checked_add(central_dir_size)
+                .is_none_or(|end| end > file_len)
+            {
+                bail!("zip central directory runs past the end of the file");
             }
 
             // Reads exactly the central directory's own declared size,
             // wherever it lives in the file - proportional to how many
             // entries the archive has, never to how large their
             // compressed content is.
-            file.seek(SeekFrom::Start(u64::from(central_dir_offset)))
+            file.seek(SeekFrom::Start(central_dir_offset))
                 .with_context(|| format!("failed seeking into {path:?}"))?;
             let mut central_dir = vec![0u8; central_dir_size as usize];
             file.read_exact(&mut central_dir)
                 .context("truncated zip central directory")?;
 
-            let mut entries = Vec::with_capacity(entry_count as usize);
+            // Each central-directory record is at least 46 bytes, so the
+            // directory's own size bounds a sane capacity even when a
+            // corrupt count claims billions of entries.
+            let mut entries =
+                Vec::with_capacity((entry_count as usize).min(central_dir.len() / 46));
             let mut pos = 0usize;
             for _ in 0..entry_count {
                 let sig = central_dir
@@ -74394,16 +74474,25 @@ mod zip_support {
                 }
                 let method = zip_read_u16(&central_dir, pos + 10)?;
                 let crc32 = zip_read_u32(&central_dir, pos + 16)?;
-                let compressed_size = zip_read_u32(&central_dir, pos + 20)?;
-                let uncompressed_size = zip_read_u32(&central_dir, pos + 24)?;
+                let mut compressed_size = u64::from(zip_read_u32(&central_dir, pos + 20)?);
+                let mut uncompressed_size = u64::from(zip_read_u32(&central_dir, pos + 24)?);
                 let name_len = zip_read_u16(&central_dir, pos + 28)? as usize;
                 let extra_len = zip_read_u16(&central_dir, pos + 30)? as usize;
                 let comment_len = zip_read_u16(&central_dir, pos + 32)? as usize;
-                let local_header_offset = zip_read_u32(&central_dir, pos + 42)?;
+                let mut local_header_offset = u64::from(zip_read_u32(&central_dir, pos + 42)?);
                 let name_start = pos + 46;
                 let name_bytes = central_dir
                     .get(name_start..name_start + name_len)
                     .context("truncated zip entry name")?;
+                let extra = central_dir
+                    .get(name_start + name_len..name_start + name_len + extra_len)
+                    .context("truncated zip entry extra field")?;
+                apply_zip64_extra(
+                    extra,
+                    &mut uncompressed_size,
+                    &mut compressed_size,
+                    &mut local_header_offset,
+                )?;
                 entries.push(ZipEntry {
                     name: String::from_utf8_lossy(name_bytes).into_owned(),
                     local_header_offset,
@@ -74475,7 +74564,7 @@ mod zip_support {
                 .ok_or_else(|| anyhow!("zip archive has no entry named '{name}'"))?;
 
             self.file
-                .seek(SeekFrom::Start(u64::from(entry.local_header_offset)))
+                .seek(SeekFrom::Start(entry.local_header_offset))
                 .context("failed seeking to a zip local file header")?;
             let mut header = [0u8; ZIP_LOCAL_HEADER_SIZE];
             self.file
@@ -74493,10 +74582,14 @@ mod zip_support {
             self.file
                 .seek(SeekFrom::Current((name_len + extra_len) as i64))
                 .context("failed seeking past a zip entry's name/extra fields")?;
-            let mut compressed = vec![0u8; entry.compressed_size as usize];
-            self.file
-                .read_exact(&mut compressed)
+            let mut compressed = Vec::new();
+            (&mut self.file)
+                .take(entry.compressed_size)
+                .read_to_end(&mut compressed)
                 .with_context(|| format!("truncated zip entry data for '{}'", entry.name))?;
+            if compressed.len() as u64 != entry.compressed_size {
+                bail!("truncated zip entry data for '{}'", entry.name);
+            }
 
             let decompressed = match entry.method {
                 0 => compressed,
@@ -74507,7 +74600,7 @@ mod zip_support {
                     entry.name
                 ),
             };
-            if decompressed.len() as u64 != u64::from(entry.uncompressed_size) {
+            if decompressed.len() as u64 != entry.uncompressed_size {
                 bail!(
                     "zip entry '{}' decompressed to {} bytes, expected {}",
                     entry.name,
@@ -74559,7 +74652,7 @@ mod zip_support {
             };
 
             self.file
-                .seek(SeekFrom::Start(u64::from(local_header_offset)))
+                .seek(SeekFrom::Start(local_header_offset))
                 .context("failed seeking to a zip local file header")?;
             let mut header = [0u8; ZIP_LOCAL_HEADER_SIZE];
             self.file
@@ -74575,7 +74668,7 @@ mod zip_support {
                 .context("failed seeking past a zip entry's name/extra fields")?;
 
             let mut tmp = TempFile::new()?;
-            let data = std::io::BufReader::new((&mut self.file).take(u64::from(compressed_size)));
+            let data = std::io::BufReader::new((&mut self.file).take(compressed_size));
 
             let (crc_got, len_got) = match method {
                 0 => {
@@ -74608,7 +74701,7 @@ mod zip_support {
                 ),
             };
 
-            if len_got != u64::from(uncompressed_size) {
+            if len_got != uncompressed_size {
                 bail!(
                     "zip entry '{entry_name}' decompressed to {len_got} bytes, expected {uncompressed_size}"
                 );
