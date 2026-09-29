@@ -39663,15 +39663,6 @@ impl LakehouseColumn {
         }
     }
 
-    /// A value already in text form (a Delta partition value).
-    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
-    fn push_raw(&mut self, value: String, n_samples: usize) {
-        match self {
-            LakehouseColumn::Flat(s) => s.push(value, n_samples),
-            LakehouseColumn::Nested(acc) => acc.push(&JsonValue::String(value)),
-        }
-    }
-
     /// The column's profile, plus one per nested sub-column. The declared
     /// type labels the column itself.
     fn finish(self, name: String, total: usize, declared: String) -> Vec<ColumnProfile> {
@@ -40404,30 +40395,20 @@ mod delta_support {
         })
     }
 
-    /// The real top-level entry point: resolves the table's current
-    /// schema and live file set, then folds every live file's own rows
-    /// into one shared `ColumnAccumulatorState` per schema column -
-    /// exactly the same incremental engine every other flat reader in
-    /// this project already trusts, driven here by a genuine multi-file
-    /// row stream instead of one file's own sequential records. `nrows`
-    /// bounds the *table's* total row count across every file combined,
-    /// not each file independently - stopping (skipping any remaining
-    /// live files entirely) the moment enough rows have been folded in.
-    pub(crate) fn resolve_delta_table_profiles(
+    /// Streams the table's live rows in file order, each as one value per
+    /// schema field (`Null` where absent) - data columns looked up by
+    /// physical name, partition columns filled from the file's
+    /// `partitionValues`, and rows a deletion vector marks deleted
+    /// skipped. `on_row` returns `false` to stop early. `nrows` bounds the
+    /// *table's* total across every file, skipping any remaining files
+    /// once reached. Returns the number of rows produced. Shared by
+    /// profiling and `--sql-mode inline`, so both see the same rows.
+    fn stream_delta_rows(
         table_dir: &Path,
+        state: &DeltaTableState,
         nrows: Option<usize>,
-        n_samples: usize,
-    ) -> Result<Vec<ColumnProfile>> {
-        let state = resolve_delta_log(table_dir)?;
-
-        let mut states: Vec<LakehouseColumn> = state
-            .schema
-            .iter()
-            .map(|f| {
-                let nested = matches!(f.spark_type.as_str(), "struct" | "array" | "map");
-                LakehouseColumn::new(nested && !f.is_partition, n_samples)
-            })
-            .collect();
+        mut on_row: impl FnMut(Vec<JsonValue>) -> Result<bool>,
+    ) -> Result<usize> {
         // Looked up by *physical* name - the name actually present in a
         // live data file's own decoded Parquet row, which only differs
         // from a field's logical `name` when `delta.columnMapping.mode`
@@ -40436,12 +40417,15 @@ mod delta_support {
             .schema
             .iter()
             .enumerate()
+            .filter(|(_, f)| !f.is_partition)
             .map(|(i, f)| (f.physical_name.as_str(), i))
             .collect();
+        let n_fields = state.schema.len();
 
         let mut total_rows = 0usize;
-        'files: for (rel_path, entry) in &state.live_files {
-            if nrows.is_some_and(|limit| total_rows >= limit) {
+        let mut stopped = false;
+        for (rel_path, entry) in &state.live_files {
+            if stopped || nrows.is_some_and(|limit| total_rows >= limit) {
                 break;
             }
             let file_path = table_dir.join(percent_decode(rel_path));
@@ -40455,19 +40439,18 @@ mod delta_support {
             // partitioning - the value lives in the log/path, never
             // repeated inside the Parquet content itself), so it's
             // resolved once per file, not once per row.
-            let partition_raw: Vec<(usize, Option<&str>)> = state
+            let partition_values: Vec<(usize, JsonValue)> = state
                 .schema
                 .iter()
                 .enumerate()
                 .filter(|(_, f)| f.is_partition)
                 .map(|(i, f)| {
-                    (
-                        i,
-                        entry
-                            .partition_values
-                            .get(&f.name)
-                            .and_then(|v| v.as_deref()),
-                    )
+                    let v = entry
+                        .partition_values
+                        .get(&f.name)
+                        .and_then(|v| v.clone())
+                        .map_or(JsonValue::Null, JsonValue::String);
+                    (i, v)
                 })
                 .collect();
             // Rows this file's deletion vector marks deleted are skipped,
@@ -40489,52 +40472,91 @@ mod delta_support {
             parquet_support::stream_parquet_rows(&file_path, read_limit, |row| {
                 let this_pos = row_pos;
                 row_pos += 1;
-                if deleted_rows.as_ref().is_some_and(|d| d.contains(&this_pos)) {
-                    return Ok(());
-                }
-                if remaining.is_some_and(|r| file_rows >= r) {
+                if stopped
+                    || deleted_rows.as_ref().is_some_and(|d| d.contains(&this_pos))
+                    || remaining.is_some_and(|r| file_rows >= r)
+                {
                     return Ok(());
                 }
                 let JsonValue::Object(map) = row else {
                     bail!("{file_path:?}: expected each Parquet row to decode to an object");
                 };
-                // `map` is a fully owned row - nothing else reads it again
-                // after this loop - so each value is moved out via
-                // `into_iter` instead of cloned out of a borrowed `.iter()`,
-                // the same "nothing left to preserve, so don't clone"
-                // principle this project's own Parquet reader already
-                // applies to the identical shape (see `FieldAccum::Flat`
-                // in `profile_parquet_file`).
+                let mut values = vec![JsonValue::Null; n_fields];
+                // `map` is a fully owned row, so each value is moved out.
                 for (key, value) in map.into_iter() {
-                    if value.is_null() {
-                        continue;
-                    }
-                    if let Some(&idx) = field_index.get(key.as_str())
-                        && !state.schema[idx].is_partition
-                    {
-                        states[idx].push(value, n_samples);
+                    if let Some(&idx) = field_index.get(key.as_str()) {
+                        values[idx] = value;
                     }
                 }
-                for &(idx, value) in &partition_raw {
-                    if let Some(v) = value {
-                        states[idx].push_raw(v.to_string(), n_samples);
-                    }
+                for (idx, v) in &partition_values {
+                    values[*idx] = v.clone();
                 }
                 file_rows += 1;
+                if !on_row(values)? {
+                    stopped = true;
+                }
                 Ok(())
             })
             .with_context(|| format!("failed to read {file_path:?}"))?;
             total_rows += file_rows;
-            if nrows.is_some_and(|limit| total_rows >= limit) {
-                break 'files;
-            }
         }
+        Ok(total_rows)
+    }
 
+    /// The real top-level entry point: resolves the table's current
+    /// schema and live file set, then folds every live row into one
+    /// `LakehouseColumn` per schema column (flat columns into the same
+    /// `ColumnAccumulatorState` every flat reader uses, nested ones into
+    /// `JsonPathAccumulator`).
+    pub(crate) fn resolve_delta_table_profiles(
+        table_dir: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let state = resolve_delta_log(table_dir)?;
+        let mut states: Vec<LakehouseColumn> = state
+            .schema
+            .iter()
+            .map(|f| {
+                let nested = matches!(f.spark_type.as_str(), "struct" | "array" | "map");
+                LakehouseColumn::new(nested && !f.is_partition, n_samples)
+            })
+            .collect();
+        let total_rows = stream_delta_rows(table_dir, &state, nrows, |values| {
+            for (col, v) in states.iter_mut().zip(values) {
+                if !v.is_null() {
+                    col.push(v, n_samples);
+                }
+            }
+            Ok(true)
+        })?;
         let mut out = Vec::with_capacity(state.schema.len());
         for (field, col_state) in state.schema.into_iter().zip(states) {
             out.extend(col_state.finish(field.name, total_rows, field.spark_type));
         }
         Ok(out)
+    }
+
+    /// The `--sql-mode inline` row-source: the same live rows profiling
+    /// reads, each as an object keyed by logical column name, emitted
+    /// through the shared JSON-bridge path (nested columns included).
+    pub(crate) fn stream_delta_rows_for_sql(
+        table_dir: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let state = resolve_delta_log(table_dir)?;
+        let names: Vec<String> = state.schema.iter().map(|f| f.name.clone()).collect();
+        stream_delta_rows(table_dir, &state, None, |values| {
+            let mut map = json_support::Map::with_capacity(names.len());
+            for (name, v) in names.iter().zip(values) {
+                map.push_unique(name.clone(), v);
+            }
+            json_emit_row_for_sql(&JsonValue::Object(map), columns, records_mode, sink)?;
+            Ok(!sink.done)
+        })?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -41281,45 +41303,36 @@ mod iceberg_support {
         }
     }
 
-    /// The real top-level entry point: resolves the table's current
-    /// schema and live file set, then folds every live file's own rows
-    /// into one shared `ColumnAccumulatorState` per schema column -
-    /// looked up purely by column name, with no partition-value special-
-    /// casing at all (see this module's own header comment for why that
-    /// genuinely isn't needed here, unlike `delta_support`'s identical-
-    /// looking function). `nrows` bounds the *table's* total row count
-    /// across every file combined, matching `delta_support::resolve_
-    /// delta_table_profiles`'s own identical convention.
-    pub(crate) fn resolve_iceberg_table_profiles(
-        table_dir: &Path,
-        nrows: Option<usize>,
-        n_samples: usize,
-    ) -> Result<Vec<ColumnProfile>> {
+    /// The current schema and live-file set of a table directory.
+    fn open_iceberg_table(table_dir: &Path) -> Result<(Vec<IcebergField>, LiveFiles)> {
         let metadata_path = find_latest_metadata_file(table_dir)?;
         let metadata_text = fs::read_to_string(&metadata_path)
             .with_context(|| format!("failed to read {metadata_path:?}"))?;
         let metadata: JsonValue = json_support::from_str(&metadata_text)
             .with_context(|| format!("{metadata_path:?} isn't valid JSON"))?;
-
         let schema = parse_iceberg_schema(&metadata).with_context(|| {
             format!("failed to resolve the current schema from {metadata_path:?}")
         })?;
+        let live = match resolve_current_snapshot_manifest_list(&metadata, table_dir)? {
+            Some(manifest_list_path) => resolve_live_data_files(&manifest_list_path, table_dir)?,
+            None => (Vec::new(), BTreeMap::new(), Vec::new()),
+        };
+        Ok((schema, live))
+    }
 
-        let (live_files, position_deletes, equality_deletes) =
-            match resolve_current_snapshot_manifest_list(&metadata, table_dir)? {
-                Some(manifest_list_path) => {
-                    resolve_live_data_files(&manifest_list_path, table_dir)?
-                }
-                None => (Vec::new(), BTreeMap::new(), Vec::new()),
-            };
-
-        let mut states: Vec<LakehouseColumn> = schema
-            .iter()
-            .map(|f| {
-                let nested = matches!(f.iceberg_type.as_str(), "struct" | "list" | "map");
-                LakehouseColumn::new(nested, n_samples)
-            })
-            .collect();
+    /// Streams the table's live rows in file order, each as one value per
+    /// current-schema field (`Null` where absent), with position and
+    /// equality deletes applied. `on_row` returns `false` to stop early;
+    /// `nrows` bounds the table's total across every file. Returns the
+    /// number of rows produced. Shared by profiling and `--sql-mode
+    /// inline`.
+    fn stream_iceberg_rows(
+        schema: &[IcebergField],
+        live: &LiveFiles,
+        nrows: Option<usize>,
+        mut on_row: impl FnMut(Vec<JsonValue>) -> Result<bool>,
+    ) -> Result<usize> {
+        let (live_files, position_deletes, equality_deletes) = live;
         let by_name: HashMap<&str, usize, FxBuildHasher> = schema
             .iter()
             .enumerate()
@@ -41332,8 +41345,9 @@ mod iceberg_support {
             .collect();
 
         let mut total_rows = 0usize;
-        'files: for (file_path, data_seq) in &live_files {
-            if nrows.is_some_and(|limit| total_rows >= limit) {
+        let mut stopped = false;
+        for (file_path, data_seq) in live_files {
+            if stopped || nrows.is_some_and(|limit| total_rows >= limit) {
                 break;
             }
             if !file_path.is_file() {
@@ -41379,18 +41393,21 @@ mod iceberg_support {
                     Some((name, idx))
                 })
                 .collect();
-            let remaining = nrows.map(|limit| limit - total_rows);
-            let mut file_rows = 0usize;
             let deleted_positions = position_deletes.get(file_path);
+            let has_deletes = deleted_positions.is_some() || !applicable.is_empty();
+            let remaining = nrows.map(|limit| limit - total_rows);
+            // With deletes in play, rows read aren't rows kept, so the
+            // limit is applied to kept rows below instead.
+            let read_limit = if has_deletes { None } else { remaining };
+            let mut file_rows = 0usize;
             let mut row_pos: i64 = 0;
-            parquet_support::stream_parquet_rows(file_path, remaining, |row| {
+            parquet_support::stream_parquet_rows(file_path, read_limit, |row| {
                 let this_pos = row_pos;
                 row_pos += 1;
-                if deleted_positions.is_some_and(|set| set.contains(&this_pos)) {
-                    // A row a position-delete file named as deleted -
-                    // excluded entirely, the same as if it never existed
-                    // in this table at all (never accumulated, never
-                    // counted toward this file's own row total).
+                if stopped
+                    || remaining.is_some_and(|r| file_rows >= r)
+                    || deleted_positions.is_some_and(|set| set.contains(&this_pos))
+                {
                     return Ok(());
                 }
                 let JsonValue::Object(map) = row else {
@@ -41406,34 +41423,76 @@ mod iceberg_support {
                 if deleted_by_equality {
                     return Ok(());
                 }
-                // `map` is a fully owned row - nothing else reads it again
-                // after this loop - so each value is moved out via
-                // `into_iter` instead of cloned out of a borrowed
-                // `.iter()`, the same fix `delta_support`'s own identical
-                // shape already got (see its own doc comment on this).
+                let mut values = vec![JsonValue::Null; schema.len()];
+                // `map` is a fully owned row, so each value is moved out.
                 for (key, value) in map.into_iter() {
-                    if value.is_null() {
-                        continue;
-                    }
                     if let Some(&idx) = field_index.get(key.as_str()) {
-                        states[idx].push(value, n_samples);
+                        values[idx] = value;
                     }
                 }
                 file_rows += 1;
+                if !on_row(values)? {
+                    stopped = true;
+                }
                 Ok(())
             })
             .with_context(|| format!("failed to read {file_path:?}"))?;
             total_rows += file_rows;
-            if nrows.is_some_and(|limit| total_rows >= limit) {
-                break 'files;
-            }
         }
+        Ok(total_rows)
+    }
 
+    /// The real top-level entry point: resolves the table's current
+    /// schema and live file set, then folds every live row into one
+    /// `LakehouseColumn` per current-schema column. Unlike Delta, there's
+    /// no partition-value special-casing (see this module's header
+    /// comment). `nrows` bounds the table's total row count.
+    pub(crate) fn resolve_iceberg_table_profiles(
+        table_dir: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let (schema, live) = open_iceberg_table(table_dir)?;
+        let mut states: Vec<LakehouseColumn> = schema
+            .iter()
+            .map(|f| {
+                let nested = matches!(f.iceberg_type.as_str(), "struct" | "list" | "map");
+                LakehouseColumn::new(nested, n_samples)
+            })
+            .collect();
+        let total_rows = stream_iceberg_rows(&schema, &live, nrows, |values| {
+            for (col, v) in states.iter_mut().zip(values) {
+                if !v.is_null() {
+                    col.push(v, n_samples);
+                }
+            }
+            Ok(true)
+        })?;
         let mut out = Vec::with_capacity(schema.len());
         for (field, col_state) in schema.into_iter().zip(states) {
             out.extend(col_state.finish(field.name, total_rows, field.iceberg_type));
         }
         Ok(out)
+    }
+
+    /// The `--sql-mode inline` row-source: the same live rows profiling
+    /// reads, each as an object keyed by current column name.
+    pub(crate) fn stream_iceberg_rows_for_sql(
+        table_dir: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let (schema, live) = open_iceberg_table(table_dir)?;
+        stream_iceberg_rows(&schema, &live, None, |values| {
+            let mut map = json_support::Map::with_capacity(schema.len());
+            for (field, v) in schema.iter().zip(values) {
+                map.push_unique(field.name.clone(), v);
+            }
+            json_emit_row_for_sql(&JsonValue::Object(map), columns, records_mode, sink)?;
+            Ok(!sink.done)
+        })?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -75059,6 +75118,26 @@ fn sql_load_hint(
                  -- MySQL: no native Parquet reader - convert to CSV first.\n"
             ));
         }
+        InputFormat::DeltaTable => {
+            s.push_str(&format!(
+                "--\n\
+                 -- DuckDB (delta extension):\n\
+                 --   INSERT INTO {staging_table} SELECT * FROM delta_scan('{file_name}');\n\
+                 --\n\
+                 -- PostgreSQL/SQLite/MySQL: no native Delta Lake reader -\n\
+                 -- use --sql-mode inline, which reads the table itself.\n"
+            ));
+        }
+        InputFormat::IcebergTable => {
+            s.push_str(&format!(
+                "--\n\
+                 -- DuckDB (iceberg extension):\n\
+                 --   INSERT INTO {staging_table} SELECT * FROM iceberg_scan('{file_name}');\n\
+                 --\n\
+                 -- PostgreSQL/SQLite/MySQL: no native Iceberg reader -\n\
+                 -- use --sql-mode inline, which reads the table itself.\n"
+            ));
+        }
         other => {
             s.push_str(&format!(
                 "--\n\
@@ -75709,6 +75788,8 @@ fn render_sql_inline_flat(
             | InputFormat::Mbox
             | InputFormat::Parquet
             | InputFormat::ArrowIpc
+            | InputFormat::DeltaTable
+            | InputFormat::IcebergTable
     );
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
@@ -75958,6 +76039,10 @@ fn render_sql_inline_flat(
         InputFormat::Mbox => render_sql_inline_flat_mbox(read_path, profiles, &mut sink)?,
         InputFormat::Parquet => render_sql_inline_flat_parquet(read_path, profiles, &mut sink)?,
         InputFormat::ArrowIpc => render_sql_inline_flat_arrow_ipc(read_path, profiles, &mut sink)?,
+        InputFormat::DeltaTable => render_sql_inline_flat_delta(read_path, profiles, &mut sink)?,
+        InputFormat::IcebergTable => {
+            render_sql_inline_flat_iceberg(read_path, profiles, &mut sink)?
+        }
         _ => {
             // CSV/TSV - every other format `render_sql`'s own
             // `inline_supported` check allows through to this function.
@@ -76663,6 +76748,46 @@ fn render_sql_inline_flat_parquet(
     parquet_support::stream_parquet_rows_for_sql(read_path, &columns, records_mode, sink)
 }
 
+/// Delta/Iceberg tables stream their live rows through the same
+/// JSON-bridge path (see `delta_support::stream_delta_rows_for_sql`).
+#[cfg(feature = "delta")]
+fn render_sql_inline_flat_delta(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    delta_support::stream_delta_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "delta"))]
+fn render_sql_inline_flat_delta(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!("Delta Lake support isn't compiled in - rebuild with --features delta")
+}
+
+#[cfg(feature = "iceberg")]
+fn render_sql_inline_flat_iceberg(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    iceberg_support::stream_iceberg_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "iceberg"))]
+fn render_sql_inline_flat_iceberg(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!("Apache Iceberg support isn't compiled in - rebuild with --features iceberg")
+}
+
 #[cfg(not(feature = "parquet"))]
 fn render_sql_inline_flat_parquet(
     _read_path: &Path,
@@ -76847,6 +76972,8 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::Mbox
             | InputFormat::Parquet
             | InputFormat::ArrowIpc
+            | InputFormat::DeltaTable
+            | InputFormat::IcebergTable
     )
 }
 
@@ -84361,16 +84488,7 @@ fn run_delta_table(args: &Args, output_format: &OutputFormat) -> Result<()> {
             "--widths/--delimiter/--skip-rows don't apply to a Delta table - its data files are Parquet, not delimited text"
         );
     }
-    if matches!(output_format, OutputFormat::Sql) {
-        bail!(
-            "--output-format sql isn't available yet for a Delta table - use --output-format json/md/json-schema instead"
-        );
-    }
-    if args.load_into.is_some() {
-        bail!(
-            "--load-into requires --output-format sql, which isn't available yet for a Delta table"
-        );
-    }
+    let load_target = single_input_load_target(args, output_format)?;
 
     let table_name = args
         .input_path
@@ -84385,6 +84503,21 @@ fn run_delta_table(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let tables: BTreeMap<String, Vec<ColumnProfile>> =
         std::iter::once((table_name.clone(), profiles)).collect();
 
+    if matches!(output_format, OutputFormat::Sql) {
+        return run_sql_output(
+            args,
+            output_format,
+            &table_name,
+            InputFormat::DeltaTable,
+            &tables,
+            &args.input_path,
+            &args.input_path,
+            0,
+            load_target.as_ref(),
+            table_count,
+            col_count,
+        );
+    }
     let rendered = render_output(&table_name, InputFormat::DeltaTable, &tables, output_format)?;
     if args.output_path.as_deref() == Some(Path::new("-")) {
         print!("{rendered}");
@@ -84461,16 +84594,7 @@ fn run_iceberg_table(args: &Args, output_format: &OutputFormat) -> Result<()> {
             "--widths/--delimiter/--skip-rows don't apply to an Iceberg table - its data files are Parquet, not delimited text"
         );
     }
-    if matches!(output_format, OutputFormat::Sql) {
-        bail!(
-            "--output-format sql isn't available yet for an Iceberg table - use --output-format json/md/json-schema instead"
-        );
-    }
-    if args.load_into.is_some() {
-        bail!(
-            "--load-into requires --output-format sql, which isn't available yet for an Iceberg table"
-        );
-    }
+    let load_target = single_input_load_target(args, output_format)?;
 
     let table_name = args
         .input_path
@@ -84488,6 +84612,21 @@ fn run_iceberg_table(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let tables: BTreeMap<String, Vec<ColumnProfile>> =
         std::iter::once((table_name.clone(), profiles)).collect();
 
+    if matches!(output_format, OutputFormat::Sql) {
+        return run_sql_output(
+            args,
+            output_format,
+            &table_name,
+            InputFormat::IcebergTable,
+            &tables,
+            &args.input_path,
+            &args.input_path,
+            0,
+            load_target.as_ref(),
+            table_count,
+            col_count,
+        );
+    }
     let rendered = render_output(
         &table_name,
         InputFormat::IcebergTable,
@@ -84608,6 +84747,32 @@ fn run_sql_output(
     Ok(())
 }
 
+/// `--load-into`'s validation for a single input (a file or a lakehouse
+/// table), before any reading starts - every check is answerable from
+/// args alone.
+fn single_input_load_target(
+    args: &Args,
+    output_format: &OutputFormat,
+) -> Result<Option<LoadTarget>> {
+    let Some(load_into) = &args.load_into else {
+        return Ok(None);
+    };
+    if !matches!(output_format, OutputFormat::Sql) {
+        bail!("--load-into requires --output-format sql");
+    }
+    if matches!(resolved_sql_mode(args)?, SqlMode::Staging) {
+        bail!(
+            "--load-into requires --sql-mode inline (the default) - --sql-mode staging assumes a separate manual load step --load-into can't perform automatically, since it would create the tables with zero rows actually loaded"
+        );
+    }
+    if args.output_path.is_some() {
+        bail!(
+            "--load-into can't be combined with an output path - the generated SQL streams directly into the target engine's own stdin instead of a file"
+        );
+    }
+    Ok(Some(LoadTarget::parse(load_into)?))
+}
+
 fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if args.output_dir.is_some() {
         bail!("--output-dir only applies when the input path is a directory");
@@ -84631,24 +84796,7 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     // --load-into's own validation, before any real work (decompression,
     // reading) even starts - every check here is answerable from args
     // alone.
-    let load_target = if let Some(load_into) = &args.load_into {
-        if !matches!(output_format, OutputFormat::Sql) {
-            bail!("--load-into requires --output-format sql");
-        }
-        if matches!(resolved_sql_mode(args)?, SqlMode::Staging) {
-            bail!(
-                "--load-into requires --sql-mode inline (the default) - --sql-mode staging assumes a separate manual load step --load-into can't perform automatically, since it would create the tables with zero rows actually loaded"
-            );
-        }
-        if args.output_path.is_some() {
-            bail!(
-                "--load-into can't be combined with an output path - the generated SQL streams directly into the target engine's own stdin instead of a file"
-            );
-        }
-        Some(LoadTarget::parse(load_into)?)
-    } else {
-        None
-    };
+    let load_target = single_input_load_target(args, output_format)?;
 
     // INPUT_PATH "-" means "read from stdin" - but only when there's
     // somewhere real for the output to go: a default output *name* is

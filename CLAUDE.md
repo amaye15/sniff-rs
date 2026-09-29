@@ -4527,12 +4527,18 @@ further live files entirely) the instant enough rows have been folded
 in. `--output-format md/json/json-schema` all work normally, rendering
 the merged result as one table named after the directory's own basename,
 the same "one file, one table" convention a single CSV file's own
-default naming already has. `--output-format sql` (and, transitively,
-`--load-into`) is a clear, disclosed error for now rather than a guess -
-none of the dozens of per-format SQL row-sources this project's own
-inline-SQL campaign already built know how to re-read a *multi-file
-Delta table* a second time, and building that properly is its own
-separately-scoped future phase, not squeezed into this one.
+default naming already has. `--output-format sql` started as a disclosed
+error and now works for both Delta and Iceberg, in both modes: inline
+mode re-resolves the table (`stream_delta_rows_for_sql`/
+`stream_iceberg_rows_for_sql`) and replays every live file's rows -
+partition values, column mapping, deletion vectors, position and
+equality deletes, field-id projection, and `--nrows` across files all
+applied exactly as in profiling - through the same JSON-bridge
+extractor Parquet uses, so a nested column flattens into its dotted
+sub-columns and an array of structs is the usual disclosed blocking
+error. `--load-into` works too (verified by loading all six committed
+Delta/Iceberg fixtures into a real SQLite and reading them back).
+Staging mode's load hint names DuckDB's `delta_scan`/`iceberg_scan`.
 `--combine`/`--output-dir`/`--format`/`--widths`/`--delimiter`/
 `--skip-rows` are all rejected too, each with its own specific reason
 (a Delta table is already exactly one logical table, has no delimiter or

@@ -20,6 +20,8 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- `--output-format sql` (inline and staging) and `--load-into` work on
+  Delta Lake and Iceberg tables.
 - Delta deletion vectors (inline and file-backed) are applied instead of
   refusing the table.
 - Delta and Iceberg flatten nested struct/list/map columns into

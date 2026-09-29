@@ -11308,15 +11308,35 @@ fn delta_table_nrows_bounds_the_total_row_count_across_every_file() {
 
 #[cfg(feature = "delta")]
 #[test]
-fn delta_table_rejects_output_format_sql_and_combine_with_actionable_errors() {
+fn delta_table_emits_inline_sql_and_rejects_combine() {
     let path = fixture("edge_delta_table");
 
     let sql_output = Command::new(bin())
         .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
         .output()
         .expect("failed to run binary");
-    assert!(!sql_output.status.success());
-    assert!(String::from_utf8_lossy(&sql_output.stderr).contains("--output-format sql"));
+    assert!(
+        sql_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sql_output.stderr)
+    );
+    let sql = String::from_utf8_lossy(&sql_output.stdout);
+    assert!(sql.contains("CREATE TABLE \"edge_delta_table\""), "{sql}");
+    assert!(sql.contains("INSERT INTO \"edge_delta_table\""), "{sql}");
+
+    let staging = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+            "--sql-mode",
+            "staging",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(staging.status.success());
+    assert!(String::from_utf8_lossy(&staging.stdout).contains("delta_scan("));
 
     let combine_output = Command::new(bin())
         .args([
@@ -11723,15 +11743,35 @@ fn iceberg_table_nrows_bounds_the_total_row_count() {
 
 #[cfg(feature = "iceberg")]
 #[test]
-fn iceberg_table_rejects_output_format_sql_and_combine_with_actionable_errors() {
+fn iceberg_table_emits_inline_sql_and_rejects_combine() {
     let path = fixture("edge_iceberg_table");
 
     let sql_output = Command::new(bin())
         .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
         .output()
         .expect("failed to run binary");
-    assert!(!sql_output.status.success());
-    assert!(String::from_utf8_lossy(&sql_output.stderr).contains("--output-format sql"));
+    assert!(
+        sql_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sql_output.stderr)
+    );
+    let sql = String::from_utf8_lossy(&sql_output.stdout);
+    assert!(sql.contains("CREATE TABLE \"edge_iceberg_table\""), "{sql}");
+    assert!(sql.contains("INSERT INTO \"edge_iceberg_table\""), "{sql}");
+
+    let staging = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+            "--sql-mode",
+            "staging",
+        ])
+        .output()
+        .expect("failed to run binary");
+    assert!(staging.status.success());
+    assert!(String::from_utf8_lossy(&staging.stdout).contains("iceberg_scan("));
 
     let combine_output = Command::new(bin())
         .args([
