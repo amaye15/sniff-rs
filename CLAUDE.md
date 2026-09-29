@@ -100,7 +100,7 @@ full, honest numbers.
 | Stata | `.dta` | `--features stata` | every DTA release (102-119); Stata's own missing markers become missing values, not literal strings |
 | SAS7BDAT | `.sas7bdat` | `--features sas7bdat` | `current_type` from the file's own declared type; SAS stores nearly all numerics as doubles, so `ideal_type` often narrows further |
 | SPSS | `.sav`, `.zsav` | `--features spss` | a native SPSS date/time/datetime variable is stored as a plain numeric offset, so `current_type` stays `f64` while `ideal_type` narrows to a real date once it's rendered; `.zsav` (zlib-block-compressed) is fully supported - see below |
-| ORC | `.orc` | `--features orc` | one section per top-level column; a nested Struct/List/Map/Union column is a disclosed placeholder (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
+| ORC | `.orc` | `--features orc` | one section per top-level column; Struct/List/Map/Union columns flatten into dotted sub-columns like any nested format (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
 | BSON | `.bson` | `--features bson` | stream of concatenated top-level documents (MongoDB's own on-disk/dump convention); always object-at-top-level, so there's no scalar/array top-level fallback the way MessagePack/CBOR need |
 | Property List (plist) | `.plist` | `--features plist` | both the XML and binary (`bplist00`) variants; a top-level `<dict>`/binary-plist root dict = one row, a top-level `<array>`/binary-plist root array = array-of-records, same dual-mode convention as YAML/TOML |
 | JSON5 / JSONC | `.json5`, `.jsonc` | `--features json5` | a deliberately independent relaxed-JSON parser implementing the full JSON5 1.0.0 grammar; a whole document, same dual-mode convention as plain JSON |
@@ -5214,13 +5214,25 @@ many independent stripes (each with its own compressed byte ranges) rather
 than being available as one flat pass over the whole file the way CSV/
 Excel/fixed-width text are. Every top-level column that's a plain scalar
 type (Boolean/Byte/Short/Int/Long/Float/Double/String/Varchar/Char/Binary/
-Decimal/Date/Timestamp/TimestampInstant) is decoded fully; a Struct/List/
-Map/Union column is a disclosed placeholder note instead (the same
-"isolate what fails/isn't supported, profile the rest of the file
-normally" treatment this project's Parquet reader already gives an
-unconvertible nested column, and `.npz` gives an unreadable array) - full
-nested-type support is a real, scoped-out gap here, not yet attempted the
-way it eventually was for Parquet's own multi-phase campaign. A native
+Decimal/Date/Timestamp/TimestampInstant) is decoded fully. A Struct/List/
+Map/Union column started as a disclosed placeholder; a later pass decodes
+it (`decode_column_json`) recursively into the shared JSON value shape and
+profiles it through `JsonPathAccumulator`, so it flattens into dotted
+sub-columns like every other nested format. The child-slot rule is taken
+from `orc-rust`'s array decoders: a struct's children hold one slot per
+non-null struct row, a list's element (and a map's key and value) one
+per entry summed over non-null rows (`LENGTH` stream), a union's variant
+`i` one per row tagged `i` (byte-RLE `DATA` stream). A Map becomes a list
+of `{"key", "value"}` entries (the Parquet reader's shape - a key needn't
+be a string), and a union row is its variant's value, unwrapped. The
+column's own `current_type` names the ORC kind (`Struct`, `List`, ...).
+Inline SQL routes a nested file through the JSON bridge (a Struct
+flattens, a List of scalars is JSON-array text, a Map or list of structs
+is the usual disclosed blocking error); a flat file keeps the flat
+row-source, byte-identical. Verified against pyarrow's read of
+`edge_orc_nested{,_zlib}.orc` (null structs, null fields, null lists and
+elements, list of lists, an int-keyed map, a list of structs) and
+`edge_orc_union.orc`. A native
 ORC date/timestamp column has the identical declared-type-vs-real-value
 gap SPSS/dBase/SAS7BDAT already demonstrate in their own formats: stored
 as a plain numeric offset (days since the Unix epoch for `DATE`, a
@@ -15358,12 +15370,9 @@ this project could just implement directly rather than depend on:
        format itself doesn't cleanly define one for.
 
   Scope is deliberately narrower than Parquet's own eventual multi-phase
-  campaign: only a flat, top-level `STRUCT`-of-scalars schema is fully
-  decoded. A Struct/List/Map/Union column - at the top level or nested -
-  is a disclosed placeholder rather than a guess, matching this project's
-  established "isolate what one column can't do, don't sink the whole
-  file over it" treatment (Parquet's own unconvertible-nested-column
-  fallback, `.npz`'s per-array isolation). Variable/value labels have no
+  campaign: at first only a flat, top-level `STRUCT`-of-scalars schema was
+  decoded, with nested columns as disclosed placeholders; nested columns
+  now decode too (see the Architecture section's ORC entry). Variable/value labels have no
   equivalent in ORC at all (it has no comparable metadata concept), and
   row indexes/bloom filters/column statistics/encryption are never read,
   matching the same "only ever do a full, unfiltered sequential scan, no

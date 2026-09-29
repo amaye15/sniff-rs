@@ -1246,15 +1246,25 @@ fn sql_output_inline_mode_orc_handles_every_compression_codec_and_missing_values
 
 #[test]
 #[cfg(feature = "orc")]
-fn sql_output_inline_mode_orc_rejects_a_file_with_a_nested_column() {
-    // A Struct/List/Map/Union column has no scalar value to embed as a
-    // literal at all (it's a disclosed placeholder in every other output
-    // format) - a clear, actionable error naming the column, not a
-    // guess, not a silently-wrong NULL that would violate that column's
-    // own NOT NULL constraint.
+fn sql_output_inline_mode_orc_flattens_nested_columns() {
+    // A Struct flattens into dotted columns and a List of scalars becomes
+    // JSON-array text, the same as every other nested format's SQL.
+    let sql = run_sql("edge_orc_edge_cases.orc", &[]);
+    assert!(
+        sql.contains("\"metadata.active\" BOOLEAN NOT NULL"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(
+            "(1, 'Alice', 95.5, '2024-01-15T00:00:00.000000000', '[\"a\",\"b\"]', TRUE, 10)"
+        ),
+        "{sql}"
+    );
+
+    // A Map (a list of key/value entries) has no single cell to embed.
     let output = Command::new(bin())
         .args([
-            fixture("edge_orc_edge_cases.orc").to_str().unwrap(),
+            fixture("edge_orc_nested.orc").to_str().unwrap(),
             "-",
             "--output-format",
             "sql",
@@ -1262,9 +1272,7 @@ fn sql_output_inline_mode_orc_rejects_a_file_with_a_nested_column() {
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for ORC column"));
-    assert!(stderr.contains("tags"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"attrs\""));
 }
 
 #[test]
@@ -9411,15 +9419,68 @@ fn parquet_edge_cases_nested_and_timestamp() {
 
 #[cfg(feature = "orc")]
 #[test]
-fn orc_edge_cases_nested_placeholder() {
+fn orc_edge_cases_flatten_nested_columns() {
     let doc = run_json("edge_orc_edge_cases.orc", &[]);
     let cols = table(&doc, "edge_orc_edge_cases");
     assert_eq!(column(cols, "score")["missing_pct"].as_f64().unwrap(), 33.3);
-    // ORC nested types are disclosed placeholders (not yet supported).
-    let tags = column(cols, "tags");
-    assert!(tags["notes"].as_str().unwrap().contains("nested") || tags["current_type"] == "List");
-    let meta = column(cols, "metadata");
-    assert!(meta["notes"].as_str().unwrap().contains("nested") || meta["current_type"] == "Struct");
+    assert_eq!(column(cols, "tags")["current_type"], "List");
+    assert_eq!(column(cols, "tags")["ideal_type"], "Vec<String>");
+    assert_eq!(column(cols, "metadata")["current_type"], "Struct");
+    assert_eq!(column(cols, "metadata.active")["ideal_type"], "bool");
+    assert_eq!(column(cols, "metadata.count")["ideal_type"], "i64");
+}
+
+// tests/fixtures/edge_orc_nested.orc (and its ZLIB twin) was written by
+// pyarrow.orc: a nullable struct with null fields, a list of doubles with
+// a null list and a null element, a list of lists, an int-keyed map with
+// a null value, and a list of structs. Expected values are pyarrow's own
+// read of the same file.
+#[cfg(feature = "orc")]
+#[test]
+fn orc_nested_columns_match_pyarrow() {
+    for name in ["edge_orc_nested", "edge_orc_nested_zlib"] {
+        let doc = run_json(&format!("{name}.orc"), &[]);
+        let cols = table(&doc, name);
+        let addr = column(cols, "addr");
+        assert_eq!(addr["current_type"], "Struct");
+        assert_eq!(addr["missing_pct"].as_f64().unwrap(), 25.0);
+        assert_eq!(
+            column(cols, "addr.city")["sample_values"],
+            serde_json::json!(["Paris", "Oslo"])
+        );
+        assert_eq!(column(cols, "addr.zip")["ideal_type"], "i64");
+        assert_eq!(column(cols, "scores")["ideal_type"], "Vec<f64>");
+        assert_eq!(
+            column(cols, "grid")["sample_values"],
+            serde_json::json!(["1", "2", "3"])
+        );
+        assert_eq!(column(cols, "attrs")["current_type"], "Map");
+        assert_eq!(
+            column(cols, "attrs.key")["sample_values"],
+            serde_json::json!(["1", "2", "3"])
+        );
+        assert_eq!(
+            column(cols, "attrs.value")["missing_pct"].as_f64().unwrap(),
+            33.3
+        );
+        assert_eq!(
+            column(cols, "events.kind")["sample_values"],
+            serde_json::json!(["x", "y"])
+        );
+        assert_eq!(column(cols, "events.n")["ideal_type"], "i64");
+    }
+}
+
+// tests/fixtures/edge_orc_union.orc: pyarrow.orc's write of a sparse
+// union [1 (int), "b" (string), 3 (int)]. A union row is its variant's
+// own value.
+#[cfg(feature = "orc")]
+#[test]
+fn orc_union_column_reads_each_rows_variant() {
+    let doc = run_json("edge_orc_union.orc", &[]);
+    let u = column(table(&doc, "edge_orc_union"), "u");
+    assert_eq!(u["current_type"], "Union");
+    assert_eq!(u["sample_values"], serde_json::json!(["1", "b", "3"]));
 }
 
 #[cfg(feature = "parquet")]

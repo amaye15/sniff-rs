@@ -17031,6 +17031,248 @@ mod orc_support {
     }
 
     // ---------------------------------------------------------------
+    // Nested columns: Struct/List/Map/Union, decoded recursively to the
+    // shared `json_support::Value` shape and profiled through the same
+    // `JsonPathAccumulator` every nested format uses.
+    //
+    // A child's own streams hold one slot per value its parent actually
+    // hands down (verified against `orc-rust`'s `array_decoder`): a
+    // struct's children one per non-null struct row, a list's element
+    // (and a map's key/value) one per list entry summed over non-null
+    // rows, a union's variant `i` one per row whose tag is `i`.
+    // ---------------------------------------------------------------
+
+    /// Deeper than any real schema nests; bounds the recursion below.
+    const MAX_ORC_NESTING: usize = 64;
+
+    /// Every column id under `type_id`, itself included.
+    fn collect_column_ids(
+        types: &[OrcType],
+        type_id: u32,
+        out: &mut HashSet<u32, FxBuildHasher>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > MAX_ORC_NESTING {
+            bail!("ORC schema nests deeper than {MAX_ORC_NESTING} levels");
+        }
+        let ty = types
+            .get(type_id as usize)
+            .context("ORC schema references a type id past the end of the type list")?;
+        if !out.insert(type_id) {
+            bail!("ORC schema references type id {type_id} twice");
+        }
+        for &child in &ty.subtypes {
+            collect_column_ids(types, child, out, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn column_streams(raw: &HashMap<(u32, OrcStreamKind), Vec<u8>>, id: u32) -> ColumnStreams<'_> {
+        let get = |kind| raw.get(&(id, kind)).map(Vec::as_slice);
+        ColumnStreams {
+            present: get(OrcStreamKind::Present),
+            data: get(OrcStreamKind::Data),
+            length: get(OrcStreamKind::Length),
+            secondary: get(OrcStreamKind::Secondary),
+            dictionary_data: get(OrcStreamKind::DictionaryData),
+        }
+    }
+
+    fn read_present(streams: &ColumnStreams, n: usize) -> Result<Vec<bool>> {
+        match streams.present {
+            Some(bytes) => {
+                let mut pos = 0usize;
+                read_boolean_rle(bytes, &mut pos, n)
+            }
+            None => Ok(vec![true; n]),
+        }
+    }
+
+    /// A decoded scalar as a JSON value of its real kind, so a nested
+    /// integer is profiled as `i64` rather than as text.
+    fn orc_scalar_to_json(kind: OrcTypeKind, s: String) -> JsonValue {
+        match kind {
+            OrcTypeKind::Boolean => JsonValue::Bool(s == "true"),
+            OrcTypeKind::Byte | OrcTypeKind::Short | OrcTypeKind::Int | OrcTypeKind::Long => {
+                match s.parse::<i64>() {
+                    Ok(v) => JsonValue::from(v),
+                    Err(_) => JsonValue::String(s),
+                }
+            }
+            OrcTypeKind::Float | OrcTypeKind::Double => match s.parse::<f64>() {
+                Ok(v) if v.is_finite() => JsonValue::from(v),
+                _ => JsonValue::String(s),
+            },
+            _ => JsonValue::String(s),
+        }
+    }
+
+    /// Per-list lengths (`LENGTH` stream, one per non-null row) and their
+    /// sum, which is how many child slots the list hands down.
+    fn read_lengths(
+        streams: &ColumnStreams,
+        encoding: &ColumnEncodingInfo,
+        count: usize,
+    ) -> Result<(Vec<usize>, usize)> {
+        let mut pos = 0usize;
+        let raw = read_int_stream(
+            streams.length.unwrap_or(&[]),
+            &mut pos,
+            encoding.kind.is_v2(),
+            false,
+            count,
+        )?;
+        let mut total = 0usize;
+        let mut lengths = Vec::with_capacity(raw.len());
+        for len in raw {
+            let len = usize::try_from(len).context("negative ORC list/map length")?;
+            total = total
+                .checked_add(len)
+                .filter(|&t| t <= u32::MAX as usize)
+                .context("implausible ORC list/map total length")?;
+            lengths.push(len);
+        }
+        Ok((lengths, total))
+    }
+
+    fn decode_column_json(
+        types: &[OrcType],
+        type_id: u32,
+        n: usize,
+        raw: &HashMap<(u32, OrcStreamKind), Vec<u8>>,
+        encodings: &[ColumnEncodingInfo],
+        depth: usize,
+    ) -> Result<Vec<Option<JsonValue>>> {
+        if depth > MAX_ORC_NESTING {
+            bail!("ORC schema nests deeper than {MAX_ORC_NESTING} levels");
+        }
+        let ty = types
+            .get(type_id as usize)
+            .context("ORC schema references a type id past the end of the type list")?;
+        let streams = column_streams(raw, type_id);
+        let encoding = encodings
+            .get(type_id as usize)
+            .context("ORC stripe footer is missing a column encoding entry")?;
+        match ty.kind {
+            OrcTypeKind::Struct => {
+                let present = read_present(&streams, n)?;
+                let k = present.iter().filter(|&&p| p).count();
+                let mut children = Vec::with_capacity(ty.subtypes.len());
+                for &child in &ty.subtypes {
+                    children.push(
+                        decode_column_json(types, child, k, raw, encodings, depth + 1)?.into_iter(),
+                    );
+                }
+                let mut out = Vec::with_capacity(n);
+                for p in present {
+                    if !p {
+                        out.push(None);
+                        continue;
+                    }
+                    let mut map = json_support::Map::with_capacity(children.len());
+                    for (i, child) in children.iter_mut().enumerate() {
+                        let name = ty
+                            .field_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("field_{i}"));
+                        map.insert(name, child.next().flatten().unwrap_or(JsonValue::Null));
+                    }
+                    out.push(Some(JsonValue::Object(map)));
+                }
+                Ok(out)
+            }
+            OrcTypeKind::List | OrcTypeKind::Map => {
+                let present = read_present(&streams, n)?;
+                let k = present.iter().filter(|&&p| p).count();
+                let (lengths, total) = read_lengths(&streams, encoding, k)?;
+                let mut decoded = Vec::with_capacity(ty.subtypes.len());
+                for &child in &ty.subtypes {
+                    decoded.push(
+                        decode_column_json(types, child, total, raw, encodings, depth + 1)?
+                            .into_iter(),
+                    );
+                }
+                let is_map = ty.kind == OrcTypeKind::Map;
+                if (is_map && decoded.len() != 2) || (!is_map && decoded.len() != 1) {
+                    bail!("ORC {:?} column has {} child types", ty.kind, decoded.len());
+                }
+                let mut lengths = lengths.into_iter();
+                let mut out = Vec::with_capacity(n);
+                for p in present {
+                    if !p {
+                        out.push(None);
+                        continue;
+                    }
+                    let len = lengths.next().unwrap_or(0);
+                    let mut items = Vec::with_capacity(len.min(4096));
+                    for _ in 0..len {
+                        if is_map {
+                            // The same `{"key", "value"}` entry shape the
+                            // Parquet reader reconstructs a Map as - a key
+                            // needn't be a string, so it can't be a JSON
+                            // object key.
+                            let mut entry = json_support::Map::with_capacity(2);
+                            entry.insert(
+                                "key".to_string(),
+                                decoded[0].next().flatten().unwrap_or(JsonValue::Null),
+                            );
+                            entry.insert(
+                                "value".to_string(),
+                                decoded[1].next().flatten().unwrap_or(JsonValue::Null),
+                            );
+                            items.push(JsonValue::Object(entry));
+                        } else {
+                            items.push(decoded[0].next().flatten().unwrap_or(JsonValue::Null));
+                        }
+                    }
+                    out.push(Some(JsonValue::Array(items)));
+                }
+                Ok(out)
+            }
+            OrcTypeKind::Union => {
+                let present = read_present(&streams, n)?;
+                let k = present.iter().filter(|&&p| p).count();
+                let mut pos = 0usize;
+                let tags = read_byte_rle(streams.data.unwrap_or(&[]), &mut pos, k)?;
+                let mut counts = vec![0usize; ty.subtypes.len()];
+                for &tag in &tags {
+                    *counts
+                        .get_mut(tag as usize)
+                        .context("ORC union tag names a variant the schema doesn't have")? += 1;
+                }
+                let mut variants = Vec::with_capacity(ty.subtypes.len());
+                for (&child, &count) in ty.subtypes.iter().zip(&counts) {
+                    variants.push(
+                        decode_column_json(types, child, count, raw, encodings, depth + 1)?
+                            .into_iter(),
+                    );
+                }
+                let mut tags = tags.into_iter();
+                let mut out = Vec::with_capacity(n);
+                for p in present {
+                    if !p {
+                        out.push(None);
+                        continue;
+                    }
+                    // A union row is its variant's own value, unwrapped -
+                    // the Arrow IPC reader's rendering of a Union.
+                    let tag = tags.next().unwrap_or(0) as usize;
+                    out.push(variants[tag].next().flatten());
+                }
+                Ok(out)
+            }
+            OrcTypeKind::Other(_) => Ok(vec![None; n]),
+            kind => Ok(
+                read_scalar_column(kind, encoding, &streams, n, ty.precision, ty.scale)?
+                    .into_iter()
+                    .map(|v| v.map(|s| orc_scalar_to_json(kind, s)))
+                    .collect(),
+            ),
+        }
+    }
+
+    // ---------------------------------------------------------------
     // File-level reading: PostScript -> Footer -> per-stripe streams.
     // ---------------------------------------------------------------
 
@@ -17184,8 +17426,20 @@ mod orc_support {
         // same lookup-in-a-loop shape already fixed for Parquet's and
         // Arrow IPC's own per-row/per-column extraction). `FxBuildHasher`
         // for the same "hot lookup, trusted keys" reason as those.
-        let wanted_column_ids: HashSet<u32, FxBuildHasher> =
-            top_level.iter().map(|c| c.column_id).collect();
+        let mut wanted_column_ids: HashSet<u32, FxBuildHasher> = HashSet::default();
+        for c in &top_level {
+            collect_column_ids(&footer.types, c.column_id, &mut wanted_column_ids, 0)?;
+        }
+        // A compound column's rows decode to nested JSON and flatten the
+        // way every other nested format's do.
+        let mut nested: Vec<Option<JsonPathAccumulator>> = top_level
+            .iter()
+            .map(|c| {
+                c.kind
+                    .is_compound()
+                    .then(|| JsonPathAccumulator::new(n_samples))
+            })
+            .collect();
 
         'stripes: for stripe_info in &footer.stripes {
             if nrows.is_some_and(|limit| row_count >= limit) {
@@ -17233,28 +17487,18 @@ mod orc_support {
 
             let num_rows = stripe_info.number_of_rows as usize;
             for (idx, col) in top_level.iter().enumerate() {
-                if col.kind.is_compound() {
-                    // A placeholder column stores nothing; `row_count`
-                    // below is what carries its length forward.
-                    placeholder_notes[idx] = Some(match col.kind {
-                        OrcTypeKind::Struct => {
-                            "nested Struct column - not yet supported, consider flattening upstream"
-                                .to_string()
-                        }
-                        OrcTypeKind::List => {
-                            "nested List column - not yet supported, consider flattening upstream"
-                                .to_string()
-                        }
-                        OrcTypeKind::Map => {
-                            "nested Map column - not yet supported, consider flattening upstream"
-                                .to_string()
-                        }
-                        OrcTypeKind::Union => {
-                            "nested Union column - not yet supported, consider flattening upstream"
-                                .to_string()
-                        }
-                        _ => unreachable!("is_compound() only true for the four kinds above"),
-                    });
+                if let Some(acc) = nested[idx].as_mut() {
+                    let values = decode_column_json(
+                        &footer.types,
+                        col.column_id,
+                        num_rows,
+                        &raw_streams,
+                        &stripe_footer.columns,
+                        0,
+                    )?;
+                    for v in values.into_iter().flatten() {
+                        acc.push(&v);
+                    }
                     continue;
                 }
                 if matches!(col.kind, OrcTypeKind::Other(_)) {
@@ -17304,7 +17548,20 @@ mod orc_support {
 
         let total = row_count;
         let mut out = Vec::with_capacity(top_level.len());
-        for ((col, state), note) in top_level.into_iter().zip(states).zip(placeholder_notes) {
+        for (((col, state), note), acc) in top_level
+            .into_iter()
+            .zip(states)
+            .zip(placeholder_notes)
+            .zip(nested)
+        {
+            if let Some(acc) = acc {
+                let mut profiles = acc.finish(col.name, total);
+                if let Some(first) = profiles.first_mut() {
+                    first.current_type = format!("{:?}", col.kind);
+                }
+                out.extend(profiles);
+                continue;
+            }
             if let Some(note) = note {
                 out.push(ColumnProfile {
                     name: col.name,
@@ -17381,13 +17638,15 @@ mod orc_support {
     pub(crate) fn stream_orc_rows_for_sql(
         path: &Path,
         nrows: Option<usize>,
+        json_columns: Option<(&[(String, bool)], bool)>,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
         let (mut file, postscript, footer, top_level) = open_orc_for_records(path)?;
 
-        if let Some(bad) = top_level
-            .iter()
-            .find(|c| c.kind.is_compound() || matches!(c.kind, OrcTypeKind::Other(_)))
+        if json_columns.is_none()
+            && let Some(bad) = top_level
+                .iter()
+                .find(|c| c.kind.is_compound() || matches!(c.kind, OrcTypeKind::Other(_)))
         {
             bail!(
                 "--sql-mode inline can't emit real data for ORC column \"{}\" ({:?}) - it has no \
@@ -17398,8 +17657,10 @@ mod orc_support {
             );
         }
 
-        let wanted_column_ids: HashSet<u32, FxBuildHasher> =
-            top_level.iter().map(|c| c.column_id).collect();
+        let mut wanted_column_ids: HashSet<u32, FxBuildHasher> = HashSet::default();
+        for c in &top_level {
+            collect_column_ids(&footer.types, c.column_id, &mut wanted_column_ids, 0)?;
+        }
         let mut row_count: usize = 0;
 
         'stripes: for stripe_info in &footer.stripes {
@@ -17441,6 +17702,40 @@ mod orc_support {
             }
 
             let num_rows = stripe_info.number_of_rows as usize;
+            // A file with nested columns goes through the JSON bridge:
+            // each row becomes an object and is flattened to the profiled
+            // dotted columns the way every nested format's rows are.
+            if let Some((columns, records_mode)) = json_columns {
+                let mut decoded = Vec::with_capacity(top_level.len());
+                for col in &top_level {
+                    decoded.push(
+                        decode_column_json(
+                            &footer.types,
+                            col.column_id,
+                            num_rows,
+                            &raw_streams,
+                            &stripe_footer.columns,
+                            0,
+                        )?
+                        .into_iter(),
+                    );
+                }
+                for _ in 0..num_rows {
+                    if sink.done {
+                        break 'stripes;
+                    }
+                    let mut map = json_support::Map::with_capacity(top_level.len());
+                    for (col, values) in top_level.iter().zip(decoded.iter_mut()) {
+                        map.insert(
+                            col.name.clone(),
+                            values.next().flatten().unwrap_or(JsonValue::Null),
+                        );
+                    }
+                    json_emit_row_for_sql(&JsonValue::Object(map), columns, records_mode, sink)?;
+                }
+                row_count += num_rows;
+                continue;
+            }
             let mut column_iters: Vec<std::vec::IntoIter<Option<String>>> =
                 Vec::with_capacity(top_level.len());
             for col in &top_level {
@@ -75790,7 +76085,8 @@ fn render_sql_inline_flat(
             | InputFormat::ArrowIpc
             | InputFormat::DeltaTable
             | InputFormat::IcebergTable
-    );
+    ) || (matches!(format, InputFormat::Orc)
+        && orc_profiles_are_nested(profiles));
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
         if let Some(bad) = json_inline_blocking_column(profiles) {
@@ -76012,7 +76308,7 @@ fn render_sql_inline_flat(
         InputFormat::Stata => render_sql_inline_flat_stata(read_path, &mut sink)?,
         InputFormat::Sas7bdat => render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?,
         InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
-        InputFormat::Orc => render_sql_inline_flat_orc(read_path, args.nrows, &mut sink)?,
+        InputFormat::Orc => render_sql_inline_flat_orc(read_path, profiles, args.nrows, &mut sink)?,
         InputFormat::Npy => render_sql_inline_flat_npy(read_path, args.nrows, &mut sink)?,
         InputFormat::Sqlite => {
             render_sql_inline_flat_sqlite(read_path, table_name, args.nrows, &mut sink)?
@@ -76188,18 +76484,33 @@ fn render_sql_inline_flat_spss(_read_path: &Path, _sink: &mut InlineRowSink<'_>)
 /// safe to call unconditionally even in a non-`orc` build. Like SAS7BDAT,
 /// this also threads `nrows` straight through (see `stream_orc_rows_for_
 /// sql`'s own doc comment for why).
+/// Whether an ORC file's profiles include a nested column (a top-level
+/// Struct/List/Map/Union), whose rows then go through the JSON bridge.
+fn orc_profiles_are_nested(profiles: &[ColumnProfile]) -> bool {
+    profiles
+        .iter()
+        .any(|p| matches!(p.current_type.as_str(), "Struct" | "List" | "Map" | "Union"))
+}
+
 #[cfg(feature = "orc")]
 fn render_sql_inline_flat_orc(
     read_path: &Path,
+    profiles: &[ColumnProfile],
     nrows: Option<usize>,
     sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {
-    orc_support::stream_orc_rows_for_sql(read_path, nrows, sink)
+    if orc_profiles_are_nested(profiles) {
+        let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+        orc_support::stream_orc_rows_for_sql(read_path, nrows, Some((&columns, records_mode)), sink)
+    } else {
+        orc_support::stream_orc_rows_for_sql(read_path, nrows, None, sink)
+    }
 }
 
 #[cfg(not(feature = "orc"))]
 fn render_sql_inline_flat_orc(
     _read_path: &Path,
+    _profiles: &[ColumnProfile],
     _nrows: Option<usize>,
     _sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {

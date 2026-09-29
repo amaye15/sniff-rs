@@ -20,6 +20,8 @@ All notable changes to sniff-rs are documented here. Format follows
   instead of reaching the readers still compressed.
 
 ### Added
+- ORC Struct/List/Map/Union columns are decoded and flattened into
+  sub-columns instead of placeholder notes, in profiling and inline SQL.
 - `--output-format sql` (inline and staging) and `--load-into` work on
   Delta Lake and Iceberg tables.
 - Delta deletion vectors (inline and file-backed) are applied instead of
