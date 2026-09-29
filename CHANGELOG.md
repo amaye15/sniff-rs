@@ -24,6 +24,8 @@ All notable changes to sniff-rs are documented here. Format follows
 - PDF: filled-in AcroForm field values become a `<file>_form` table and
   comment/note annotation text an `annotations` column, including in
   encrypted files.
+- `--output-format sql --sql-mode inline` and `--load-into` work on PDF
+  (pages and form) and Jupyter notebooks.
 - ORC Struct/List/Map/Union columns are decoded and flattened into
   sub-columns instead of placeholder notes, in profiling and inline SQL.
 - `--output-format sql` (inline and staging) and `--load-into` work on
@@ -131,6 +133,9 @@ All notable changes to sniff-rs are documented here. Format follows
   ZapfDingbats glyph names (`a20`) resolve in a ZapfDingbats font.
 
 ### Changed
+- Plain `--output-format sql` (inline by default) falls back to staging
+  when a column is an array of objects, instead of failing; an explicit
+  `--sql-mode inline` or `--load-into` still errors.
 - Relationship probabilities refitted after correcting the benchmark:
   Spider leaves 15 of its `baseball_1` (Lahman) keys undeclared, which had
   pushed an exact key name owned by a table named for it, outside that

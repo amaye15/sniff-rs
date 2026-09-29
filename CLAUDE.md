@@ -16904,7 +16904,34 @@ user password, pikepdf-written) match field for field; across the real
 names pypdf reports and all 136 text/name values compared match, 26
 files gain an `annotations` column, and no existing table or column
 changed byte-for-byte. `--output-format sql` staging covers the extra
-table; PDF still has no inline-SQL row source (staging only).
+table.
+
+**PDF and Jupyter notebooks gained inline-SQL row sources, closing a
+gap the campaign above had called complete.** The corpus sweep for the
+form pass found `--output-format sql` on a PDF silently falling back to
+staging, and `--load-into` refusing it outright - `.pdf` and `.ipynb`
+were added after Phase 28 and never got a row source. Both now go
+through the JSON bridge: a PDF page is `{page_number, text,
+annotations}` decoded exactly as profiling does, and the `<file>_form`
+table (picked by name) is the form's one record, nested by its `.`s
+since the extractor walks a column name's dots as nesting; a notebook
+streams `cells` with `stream_nested_array`. The duplicated format list
+`--load-into` validated against is gone - it calls
+`inline_supported_format`, the same predicate `render_sql` uses.
+
+Adding notebooks exposed a real usability trap: nearly every real
+notebook has an `outputs` array of objects, the one-to-many shape
+`json_inline_blocking_column` refuses - so a plain `--output-format sql`
+that used to fall back to staging would now fail. When inline mode is
+only the default (no `--sql-mode`, no `--load-into`), a blocking column
+now falls back to staging with a note, exactly as an unsupported format
+does; asking for inline by name, or `--load-into` (which needs real
+rows), still gets the specific error. Twelve existing "rejects an array
+of objects" tests now pass `--sql-mode inline` explicitly to keep
+testing the error. Verified on the real corpus: all 666 PDFs load into
+SQLite with every table's row count equal to its profiled `row_count`;
+22 notebooks load inline and the 186 with outputs fall back (or, under
+`--load-into`, refuse with the field named).
 
 ## Agent-friendly CLI surface
 

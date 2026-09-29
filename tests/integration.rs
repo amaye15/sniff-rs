@@ -615,6 +615,8 @@ fn sql_output_inline_mode_json_array_of_objects_needs_staging_instead() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -1268,6 +1270,8 @@ fn sql_output_inline_mode_orc_flattens_nested_columns() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -1763,6 +1767,8 @@ fn sql_output_inline_mode_json_rejects_an_array_of_objects_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -1868,6 +1874,8 @@ fn sql_output_inline_mode_toml_rejects_an_array_of_tables_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2103,6 +2111,8 @@ fn sql_output_inline_mode_xml_rejects_repeated_child_elements_as_an_array_of_obj
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2178,6 +2188,8 @@ fn sql_output_inline_mode_bson_rejects_an_array_of_documents_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2247,6 +2259,8 @@ fn sql_output_inline_mode_plist_rejects_an_array_of_dicts_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2317,6 +2331,8 @@ fn sql_output_inline_mode_json5_rejects_an_array_of_objects_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2387,6 +2403,8 @@ fn sql_output_inline_mode_har_rejects_an_array_of_objects_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2476,6 +2494,8 @@ fn sql_output_inline_mode_geojson_rejects_an_array_of_objects_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2712,6 +2732,8 @@ fn sql_output_inline_mode_parquet_rejects_a_map_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -2788,6 +2810,8 @@ fn sql_output_inline_mode_arrow_ipc_rejects_an_array_of_objects_column() {
             "-",
             "--output-format",
             "sql",
+            "--sql-mode",
+            "inline",
         ])
         .output()
         .expect("failed to run binary");
@@ -15416,4 +15440,62 @@ fn pdf_without_a_form_or_annotations_keeps_its_old_shape() {
     assert_eq!(tables.len(), 1);
     let pages = table(&doc, "sample");
     assert!(pages.iter().all(|c| c["name"] != "annotations"));
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn sql_output_inline_mode_pdf_emits_pages_and_the_form() {
+    let sql = run_sql("edge_pdf_form_and_annotations_encrypted.pdf", &[]);
+    assert!(sql.contains("--sql-mode inline"), "{sql}");
+    assert!(sql.contains("CREATE TABLE \"edge_pdf_form_and_annotations_encrypted\" ("));
+    assert!(sql.contains("CREATE TABLE \"edge_pdf_form_and_annotations_encrypted_form\" ("));
+    assert!(sql.contains("'Form page'"), "{sql}");
+    assert!(sql.contains("'[\"Signed off — ok\"]'"), "{sql}");
+    // The form's dotted field names nest, so every value lands.
+    assert!(
+        sql.contains("'José Álvarez', 'Paris', 75001, TRUE, FALSE"),
+        "{sql}"
+    );
+}
+
+#[test]
+#[cfg(feature = "ipynb")]
+fn sql_output_inline_mode_ipynb_emits_one_row_per_cell() {
+    let sql = run_sql("type_detection.ipynb", &[]);
+    assert!(sql.contains("--sql-mode inline"), "{sql}");
+    assert!(sql.contains("'alice@example.com'"), "{sql}");
+}
+
+#[test]
+#[cfg(feature = "ipynb")]
+fn sql_output_default_mode_falls_back_to_staging_for_an_array_of_objects() {
+    // sample.ipynb's `outputs` holds result objects: no single cell to
+    // embed. Inline wasn't asked for by name, so staging is used instead
+    // of failing; asking for it by name still gets the specific error.
+    let path = fixture("sample.ipynb");
+    let output = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let sql = String::from_utf8(output.stdout).unwrap();
+    assert!(sql.contains("\"sample_staging\""), "{sql}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"outputs\""));
+
+    let output = Command::new(bin())
+        .args([
+            path.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "sql",
+            "--sql-mode",
+            "inline",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("can't emit real data for field \"outputs\"")
+    );
 }

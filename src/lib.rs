@@ -54539,6 +54539,34 @@ mod ipynb_support {
         }
         Ok(profiler.finish())
     }
+
+    /// The notebook row-source for `--sql-mode inline`: one record per
+    /// `cells` element, streamed the same way `columns_from_ipynb` reads
+    /// them.
+    pub(crate) fn stream_ipynb_rows_for_sql(
+        path: &Path,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut first_err: Option<Error> = None;
+        json_support::stream_nested_array(reader, &["cells"], |v| {
+            if first_err.is_none()
+                && let Err(e) = json_emit_row_for_sql(&v, columns, records_mode, sink)
+            {
+                first_err = Some(e);
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("failed to parse {path:?} as JSON"))?;
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(())
+    }
 } // mod ipynb_support
 
 #[cfg(feature = "ipynb")]
@@ -56300,6 +56328,75 @@ mod pdf_support {
             record.push_unique(name, value);
         }
         Ok(Some(profile_json_records(&[record], n_samples)))
+    }
+
+    /// The PDF row-source for `--sql-mode inline`. The pages table is
+    /// one record per page (`page_number`, `text`, and `annotations`
+    /// when profiled), decoded exactly as `columns_from_pdf` does; the
+    /// `<file>_form` table (`form == true`) is the form's one record.
+    pub(crate) fn stream_pdf_rows_for_sql(
+        path: &Path,
+        form: bool,
+        columns: &[(String, bool)],
+        records_mode: bool,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut reader = PdfReader::open(path)?;
+        if form {
+            // A full field name's `.`s are the form's own hierarchy (a
+            // partial name can't contain one, ISO 32000-1 12.7.3.2), and
+            // the SQL extractor walks a column name's `.`s as nesting - so
+            // the record is nested to match.
+            let mut record = json_support::Map::new();
+            for (name, value) in reader.form_fields(path)? {
+                let mut parts: Vec<&str> = name.split('.').collect();
+                let leaf = parts.pop().unwrap_or_default().to_string();
+                let mut map = &mut record;
+                for part in parts {
+                    if !matches!(map.get(part), Some(JsonValue::Object(_))) {
+                        map.insert(
+                            part.to_string(),
+                            JsonValue::Object(json_support::Map::new()),
+                        );
+                    }
+                    let Some(JsonValue::Object(child)) = map.get_mut(part) else {
+                        unreachable!("just inserted an object");
+                    };
+                    map = child;
+                }
+                map.insert(leaf, value);
+            }
+            return json_emit_row_for_sql(&JsonValue::Object(record), columns, records_mode, sink);
+        }
+        let pages = reader.page_list(path)?;
+        let mut font_cache: HashMap<(FontScope, Vec<u8>), PdfFont> = HashMap::new();
+        for (idx, (page, resources)) in pages.iter().enumerate() {
+            if sink.done {
+                break;
+            }
+            let text = reader.page_text(page, resources, idx, &mut font_cache, path)?;
+            let annotations = reader.page_annotations(page, path)?;
+            let mut record = json_support::Map::new();
+            record.push_unique("page_number".to_string(), JsonValue::from(idx as u64 + 1));
+            record.push_unique(
+                "text".to_string(),
+                if text.is_empty() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::String(text)
+                },
+            );
+            record.push_unique(
+                "annotations".to_string(),
+                if annotations.is_empty() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::Array(annotations.into_iter().map(JsonValue::String).collect())
+                },
+            );
+            json_emit_row_for_sql(&JsonValue::Object(record), columns, records_mode, sink)?;
+        }
+        Ok(())
     }
 
     /// Profiles a PDF as one record per page (`page_number`, `text`) -
@@ -76250,6 +76347,35 @@ fn sql_unique_column_names(profiles: &[ColumnProfile]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `render_sql_inline_flat` runs this format's rows through the
+/// shared JSON bridge (and its upfront array-of-objects check).
+fn is_json_bridge_format(format: &InputFormat, profiles: &[ColumnProfile]) -> bool {
+    matches!(
+        format,
+        InputFormat::Json
+            | InputFormat::Yaml
+            | InputFormat::Toml
+            | InputFormat::MsgPack
+            | InputFormat::Cbor
+            | InputFormat::Avro
+            | InputFormat::Xml
+            | InputFormat::Bson
+            | InputFormat::Plist
+            | InputFormat::Json5
+            | InputFormat::Har
+            | InputFormat::GeoJson
+            | InputFormat::Vcard
+            | InputFormat::Ical
+            | InputFormat::Mbox
+            | InputFormat::Parquet
+            | InputFormat::ArrowIpc
+            | InputFormat::DeltaTable
+            | InputFormat::IcebergTable
+            | InputFormat::Pdf
+            | InputFormat::Ipynb
+    ) || (matches!(format, InputFormat::Orc) && orc_profiles_are_nested(profiles))
+}
+
 /// Builds the inline-mode script for one table of a flat, fixed-column,
 /// one-row-per-record format (today: CSV/TSV, fixed-width text - see
 /// `render_sql`'s own `inline_supported` check for the exact list),
@@ -76304,29 +76430,7 @@ fn render_sql_inline_flat(
     // SQLite's/INI's own upfront checks already established, just
     // reached here by scanning the already-profiled column list rather
     // than re-parsing the schema.
-    let json_bridge_format = matches!(
-        format,
-        InputFormat::Json
-            | InputFormat::Yaml
-            | InputFormat::Toml
-            | InputFormat::MsgPack
-            | InputFormat::Cbor
-            | InputFormat::Avro
-            | InputFormat::Xml
-            | InputFormat::Bson
-            | InputFormat::Plist
-            | InputFormat::Json5
-            | InputFormat::Har
-            | InputFormat::GeoJson
-            | InputFormat::Vcard
-            | InputFormat::Ical
-            | InputFormat::Mbox
-            | InputFormat::Parquet
-            | InputFormat::ArrowIpc
-            | InputFormat::DeltaTable
-            | InputFormat::IcebergTable
-    ) || (matches!(format, InputFormat::Orc)
-        && orc_profiles_are_nested(profiles));
+    let json_bridge_format = is_json_bridge_format(format, profiles);
     let mut json_filtered_profiles: Vec<ColumnProfile>;
     let profiles: &[ColumnProfile] = if json_bridge_format {
         if let Some(bad) = json_inline_blocking_column(profiles) {
@@ -76576,6 +76680,8 @@ fn render_sql_inline_flat(
         InputFormat::Parquet => render_sql_inline_flat_parquet(read_path, profiles, &mut sink)?,
         InputFormat::ArrowIpc => render_sql_inline_flat_arrow_ipc(read_path, profiles, &mut sink)?,
         InputFormat::DeltaTable => render_sql_inline_flat_delta(read_path, profiles, &mut sink)?,
+        InputFormat::Pdf => render_sql_inline_flat_pdf(read_path, table_name, profiles, &mut sink)?,
+        InputFormat::Ipynb => render_sql_inline_flat_ipynb(read_path, profiles, &mut sink)?,
         InputFormat::IcebergTable => {
             render_sql_inline_flat_iceberg(read_path, profiles, &mut sink)?
         }
@@ -77258,6 +77364,54 @@ fn render_sql_inline_flat_icalendar(
     )
 }
 
+/// The PDF row-source wrapper for `render_sql_inline_flat`: a table
+/// named `<file>_form` is the form's one record, anything else the pages.
+#[cfg(feature = "pdf")]
+fn render_sql_inline_flat_pdf(
+    read_path: &Path,
+    table_name: &str,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    let form = table_name.ends_with("_form");
+    pdf_support::stream_pdf_rows_for_sql(read_path, form, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "pdf"))]
+fn render_sql_inline_flat_pdf(
+    _read_path: &Path,
+    _table_name: &str,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "PDF support isn't compiled in - rebuild with `cargo build --release --features pdf` (or --features full)"
+    )
+}
+
+/// The Jupyter notebook row-source wrapper for `render_sql_inline_flat`.
+#[cfg(feature = "ipynb")]
+fn render_sql_inline_flat_ipynb(
+    read_path: &Path,
+    profiles: &[ColumnProfile],
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+    ipynb_support::stream_ipynb_rows_for_sql(read_path, &columns, records_mode, sink)
+}
+
+#[cfg(not(feature = "ipynb"))]
+fn render_sql_inline_flat_ipynb(
+    _read_path: &Path,
+    _profiles: &[ColumnProfile],
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "Jupyter notebook support isn't compiled in - rebuild with `cargo build --release --features ipynb` (or --features full)"
+    )
+}
+
 /// The MBOX row-source wrapper for `render_sql_inline_flat` (Phase 26,
 /// the FINAL format in this entire campaign) - see
 /// `render_sql_inline_flat_vcard`'s own doc comment; identical shape,
@@ -77525,6 +77679,8 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::ArrowIpc
             | InputFormat::DeltaTable
             | InputFormat::IcebergTable
+            | InputFormat::Pdf
+            | InputFormat::Ipynb
     )
 }
 
@@ -77552,7 +77708,7 @@ fn render_sql(
     if matches!(mode, SqlMode::Inline) && !inline_supported {
         if explicit {
             bail!(
-                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox/parquet/arrow are supported so far; use --sql-mode staging instead",
+                "--sql-mode inline isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox/parquet/arrow/delta/iceberg/pdf/ipynb are supported so far; use --sql-mode staging instead",
                 format.as_str()
             );
         }
@@ -77580,6 +77736,27 @@ fn render_sql(
             // to actually read).
             if tables.is_empty() {
                 bail!("no table to render as SQL");
+            }
+            // Inline mode wasn't asked for by name, so a nested column
+            // with no single cell to embed (an array of objects - every
+            // real notebook's `outputs`) falls back to staging, the same
+            // way an unsupported format does, instead of failing. An
+            // explicit --sql-mode inline, or --load-into (which needs real
+            // rows), still gets the specific error.
+            if !explicit
+                && args.load_into.is_none()
+                && let Some(bad) = tables.values().find_map(|profiles| {
+                    is_json_bridge_format(format, profiles)
+                        .then(|| json_inline_blocking_column(profiles))
+                        .flatten()
+                })
+            {
+                eprintln!(
+                    "inline SQL mode can't embed field \"{bad}\" (an array of objects, or a \
+                     value that's sometimes a scalar and sometimes an object) - using \
+                     --sql-mode staging instead"
+                );
+                return render_sql_staging(file_name, format, tables, sink);
             }
             for (i, (table_name, profiles)) in tables.iter().enumerate() {
                 render_sql_inline_flat(
@@ -85403,47 +85580,9 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         .to_string_lossy()
         .into_owned();
 
-    if load_target.is_some()
-        && !matches!(
-            format,
-            InputFormat::Csv
-                | InputFormat::Tsv
-                | InputFormat::FixedWidth
-                | InputFormat::CommonLog
-                | InputFormat::CombinedLog
-                | InputFormat::Syslog
-                | InputFormat::Syslog5424
-                | InputFormat::Dbase
-                | InputFormat::Stata
-                | InputFormat::Sas7bdat
-                | InputFormat::Spss
-                | InputFormat::Orc
-                | InputFormat::Npy
-                | InputFormat::Sqlite
-                | InputFormat::Npz
-                | InputFormat::Ini
-                | InputFormat::Xlsx
-                | InputFormat::Json
-                | InputFormat::Yaml
-                | InputFormat::Toml
-                | InputFormat::MsgPack
-                | InputFormat::Cbor
-                | InputFormat::Avro
-                | InputFormat::Xml
-                | InputFormat::Bson
-                | InputFormat::Plist
-                | InputFormat::Json5
-                | InputFormat::Har
-                | InputFormat::GeoJson
-                | InputFormat::Vcard
-                | InputFormat::Ical
-                | InputFormat::Mbox
-                | InputFormat::Parquet
-                | InputFormat::ArrowIpc
-        )
-    {
+    if load_target.is_some() && !inline_supported_format(&format) {
         bail!(
-            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox/parquet/arrow are supported so far",
+            "--load-into isn't available yet for {} - only csv/tsv/fixed-width/common-log/combined-log/syslog/syslog5424/dbase/stata/sas7bdat/spss/orc/npy/sqlite/npz/ini/xlsx/json/yaml/toml/msgpack/cbor/avro/xml/bson/plist/json5/har/geojson/vcard/icalendar/mbox/parquet/arrow/delta/iceberg/pdf/ipynb are supported so far",
             format.as_str()
         );
     }
