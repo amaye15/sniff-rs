@@ -15660,3 +15660,67 @@ fn xls_bare_biff2_is_refused_clearly() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("BIFF2"));
 }
+
+/// The page text of a one-page PDF fixture.
+#[cfg(feature = "pdf")]
+fn pdf_page_text(fixture_name: &str) -> String {
+    let doc = run_json(fixture_name, &["--samples", "50"]);
+    let stem = fixture_name.trim_end_matches(".pdf");
+    column(table(&doc, stem), "text")["sample_values"][0]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The source text both RTL fixtures were printed from (LibreOffice from
+/// a flat ODT, Chrome from HTML), one paragraph per line.
+#[cfg(feature = "pdf")]
+const RTL_SOURCE: [&str; 11] = [
+    "שלום עולם זה מבחן",
+    "مرحبا بالعالم هذا اختبار",
+    "המחיר הוא 250 שקלים עבור Apple",
+    "שלום!",
+    "התאריך 12/05/2024 והסכום 1,234.50 ש״ח.",
+    "السعر ١٢٣ ريال فقط",
+    "הטלפון (03) 555-1234 זמין",
+    "צרו קשר: info@example.co.il",
+    "The word שלום means peace.",
+    "Order 42 shipped to תל אביב today",
+    "זוהי פסקה ארוכה מאוד שנועדה לבדוק גלישה של שורות בתוך אותה פסקה כאשר הטקסט ממשיך הלאה והלאה ללא הפסקה עד שהוא עובר לשורה הבאה בעמוד",
+];
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_right_to_left_text_reads_in_logical_order() {
+    // LibreOffice draws a line's runs in reading order, which settles
+    // each line's direction: every line comes out exactly as typed (the
+    // last paragraph wraps, so it's two lines).
+    let text = pdf_page_text("edge_pdf_rtl_libreoffice.pdf");
+    assert_eq!(text.replace('\n', " "), RTL_SOURCE.join(" "));
+    // Chrome draws in visual order and gives a lam-alef ligature's text as
+    // ActualText in reading order. Every line matches but one: a
+    // right-to-left paragraph ending in Latin text looks, drawn left to
+    // right, exactly like a left-to-right paragraph ending in Hebrew, and
+    // with no other signal it reads as the latter.
+    let text = pdf_page_text("edge_pdf_rtl_chrome.pdf");
+    let lines: Vec<&str> = text.split('\n').collect();
+    assert_eq!(lines[..7], RTL_SOURCE[..7]);
+    assert_eq!(lines[7], "info@example.co.il :צרו קשר");
+    assert_eq!(lines[8..10], RTL_SOURCE[8..10]);
+    assert_eq!(lines[10..].join(" "), RTL_SOURCE[10]);
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_vertical_text_reads_down_its_columns() {
+    // LibreOffice sets vertical Japanese one horizontal glyph per position;
+    // a true Identity-V font advances down the page itself.
+    assert_eq!(
+        pdf_page_text("edge_pdf_vertical_libreoffice.pdf"),
+        "日本語の縦書きテストです。\n二行目の文章。"
+    );
+    assert_eq!(
+        pdf_page_text("edge_pdf_identity_v.pdf"),
+        "縦書きの例です\n二列目"
+    );
+}

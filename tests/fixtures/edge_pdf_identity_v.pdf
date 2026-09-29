@@ -1,0 +1,61 @@
+%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 121 >>
+stream
+BT /F1 20 Tf 1 0 0 1 300 700 Tm <000A000800010004000600030002> Tj ET
+BT /F1 20 Tf 1 0 0 1 270 700 Tm <000500070009> Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type0 /BaseFont /KozMinPr6N-Regular /Encoding /Identity-V /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /CIDFontType0 /BaseFont /KozMinPr6N-Regular /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >> /FontDescriptor 8 0 R /DW 1000 /DW2 [880 -1000] >>
+endobj
+7 0 obj
+<< /Length 358 >>
+stream
+/CIDInit /ProcSet findresource begin 12 dict begin begincmap
+/CMapName /X def 1 begincodespacerange <0000> <FFFF> endcodespacerange
+10 beginbfchar
+<0001> <304D>
+<0002> <3059>
+<0003> <3067>
+<0004> <306E>
+<0005> <4E8C>
+<0006> <4F8B>
+<0007> <5217>
+<0008> <66F8>
+<0009> <76EE>
+<000A> <7E26>
+endbfchar endcmap CMapName currentdict /CMap defineresource pop end end
+endstream
+endobj
+8 0 obj
+<< /Type /FontDescriptor /FontName /KozMinPr6N-Regular /Flags 4 /FontBBox [0 -120 1000 880] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000413 00000 n 
+0000000556 00000 n 
+0000000762 00000 n 
+0000001171 00000 n 
+trailer
+<< /Size 9 /Root 1 0 R >>
+startxref
+1347
+%%EOF

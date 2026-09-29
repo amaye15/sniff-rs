@@ -56726,8 +56726,41 @@ mod pdf_support {
     /// bullet or barcode font, typically) costs only its own text rather
     /// than the whole document. A composite Identity font keeps its real
     /// two-byte width, so each of its codes is one U+FFFD, not two.
+    /// An `Identity-V` font's vertical advance per unit of font size: its
+    /// descendant CIDFont's `/DW2 [v w1y]` second entry, negated and
+    /// divided by 1000, else 1 - the default `[880 -1000]` (ISO 32000-1
+    /// 9.7.4.3). Per-glyph `/W2` overrides aren't read: CJK glyphs, the
+    /// only ones written vertically in practice, all take the default.
+    fn vertical_advance(
+        reader: &mut PdfReader,
+        dict: &BTreeMap<Vec<u8>, PdfObj>,
+        path: &Path,
+    ) -> f64 {
+        let descendant = match dict.get(b"DescendantFonts".as_slice()) {
+            Some(d) => match reader.resolve(d, 0, path) {
+                Ok(PdfObj::Array(items)) => match items.first() {
+                    Some(first) => reader.resolve(first, 0, path).ok(),
+                    None => None,
+                },
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some(PdfObj::Dict(d)) = descendant
+            && let Some(dw2) = d.get(b"DW2".as_slice())
+            && let Ok(PdfObj::Array(dw2)) = reader.resolve(dw2, 0, path)
+            && let Some(w1y) = dw2.get(1).and_then(PdfObj::as_num)
+            && w1y.is_finite()
+            && w1y < 0.0
+        {
+            return -w1y / 1000.0;
+        }
+        1.0
+    }
+
     fn undecodable_font(reader: &mut PdfReader, font_obj: Option<&PdfObj>, path: &Path) -> PdfFont {
         let table: [String; 256] = std::array::from_fn(|_| "\u{FFFD}".to_string());
+        let mut vertical = false;
         let dict = match font_obj.map(|f| reader.resolve(f, 0, path)) {
             Some(Ok(PdfObj::Dict(d))) => Some(d),
             _ => None,
@@ -56739,6 +56772,7 @@ mod pdf_support {
                     .map(|e| reader.resolve(e, 0, path))
                 {
                     Some(Ok(PdfObj::Name(n))) if n == b"Identity-H" || n == b"Identity-V" => {
+                        vertical = n == b"Identity-V";
                         CodeWidth::Two
                     }
                     _ => CodeWidth::Variable,
@@ -56757,6 +56791,10 @@ mod pdf_support {
             table,
             width,
             advances,
+            vertical: match (&dict, vertical) {
+                (Some(d), true) => Some(vertical_advance(reader, d, path)),
+                _ => None,
+            },
         }
     }
 
@@ -61536,6 +61574,11 @@ mod pdf_support {
         table: [String; 256],
         width: CodeWidth,
         advances: Advances,
+        /// For an `Identity-V` font, how far each glyph moves the text
+        /// position *down*, per unit of font size: vertical writing
+        /// (ISO 32000-1 9.7.4.3). The descendant's `/DW2` second entry,
+        /// negated, or 1 (its default of -1000). `None` writes across.
+        vertical: Option<f64>,
     }
 
     impl PdfFont {
@@ -61606,13 +61649,21 @@ mod pdf_support {
             let mut unmapped = 0;
             self.each_code(bytes, |code, text| {
                 unmapped += usize::from(text == "\u{FFFD}");
-                let ink = self.advances.width(code, self.width) * state.size * state.h_scale;
-                f(text, pen, ink);
                 let word = if code == b" " {
                     state.word_spacing
                 } else {
                     0.0
                 };
+                // Vertical writing moves down by the vertical advance,
+                // unscaled by `Tz` (ISO 32000-1 9.4.4).
+                if let Some(v) = self.vertical {
+                    let ink = v * state.size;
+                    f(text, pen, ink);
+                    pen += ink + state.char_spacing + word;
+                    return;
+                }
+                let ink = self.advances.width(code, self.width) * state.size * state.h_scale;
+                f(text, pen, ink);
                 pen += ink + (state.char_spacing + word) * state.h_scale;
             });
             (pen, unmapped)
@@ -62497,14 +62548,14 @@ mod pdf_support {
             Some(PdfObj::Name(s)) if s == b"Type0"
         );
         let zapf = base_font_name(dict) == Some(b"ZapfDingbats".as_slice());
-        let identity = composite
-            && match dict.get(b"Encoding".as_slice()) {
-                Some(enc) => matches!(
-                    reader.resolve(enc, 0, path)?,
-                    PdfObj::Name(n) if n == b"Identity-H" || n == b"Identity-V"
-                ),
-                None => false,
-            };
+        let identity_name = match (composite, dict.get(b"Encoding".as_slice())) {
+            (true, Some(enc)) => match reader.resolve(enc, 0, path)? {
+                PdfObj::Name(n) if n == b"Identity-H" || n == b"Identity-V" => Some(n),
+                _ => None,
+            },
+            _ => None,
+        };
+        let identity = identity_name.is_some();
         // Base table: WinAnsi unless the font says MacRoman. Unknown
         // base names are fine *with* a CMap (it only backs unmapped
         // codes) but fatal without one.
@@ -62715,11 +62766,14 @@ mod pdf_support {
             CodeWidth::One
         };
         let advances = font_advances(reader, dict, &table, path);
+        let vertical = (identity_name.as_deref() == Some(b"Identity-V".as_slice()))
+            .then(|| vertical_advance(reader, dict, path));
         Ok(PdfFont {
             cmap,
             table,
             width,
             advances,
+            vertical,
         })
     }
 
@@ -63071,7 +63125,7 @@ mod pdf_support {
                 0,
                 path,
             )?;
-            Ok(layout.out.trim().to_string())
+            Ok(layout.finish().trim().to_string())
         }
 
         /// Walks one already-decoded content stream's text-showing
@@ -63271,29 +63325,52 @@ mod pdf_support {
                             &m,
                         );
                         let em = trm[2].hypot(trm[3]);
-                        let len = trm[0].hypot(trm[1]);
+                        // Text advances along text space x, or - written
+                        // vertically - down text space y.
+                        let (ax, ay) = if pdf_font.vertical.is_some() {
+                            (-m[2], -m[3])
+                        } else {
+                            (m[0], m[1])
+                        };
+                        let len = ax.hypot(ay);
                         let dir = if len > 1e-12 {
-                            (trm[0] / len, trm[1] / len)
+                            (ax / len, ay / len)
                         } else {
                             (1.0, 0.0)
                         };
-                        // Moving the text matrix `p` along the baseline moves
-                        // the glyph origin `p * (m[0], m[1])` in device space.
+                        // Moving the text matrix `p` along the line moves the
+                        // glyph origin `p * (ax, ay)` in device space.
                         let origin = (trm[4], trm[5]);
-                        let at = |p: f64| (origin.0 + p * m[0], origin.1 + p * m[1]);
+                        let at = |p: f64| (origin.0 + p * ax, origin.1 + p * ay);
                         // Codes ActualText stands in for aren't lost, however
                         // their font decodes them.
                         let replaced = layout.replacing();
                         layout.begin_string();
                         let (advance, unmapped) =
                             pdf_font.layout_glyphs(&bytes, &state, |text, pen, ink| {
+                                let start = at(pen);
                                 let end = at(pen + ink);
-                                layout.push(text, at(pen), LastGlyph { end, dir, em });
+                                let cjk = text.chars().any(is_cjk);
+                                layout.push(
+                                    text,
+                                    start,
+                                    LastGlyph {
+                                        start,
+                                        end,
+                                        dir,
+                                        em,
+                                        cjk,
+                                    },
+                                );
                             });
                         if !replaced {
                             self.text_stats.unmapped_codes += unmapped;
                         }
-                        tm = mat_mul(&translate(advance, 0.0), &tm);
+                        tm = if pdf_font.vertical.is_some() {
+                            mat_mul(&translate(0.0, -advance), &tm)
+                        } else {
+                            mat_mul(&translate(advance, 0.0), &tm)
+                        };
                     }
                     CSpan::XObjectRef(name) => {
                         // Resolving *any* stream object - Form or Image -
@@ -64011,6 +64088,11 @@ mod pdf_support {
     /// tell what separates it from the next one (`measure_gap`).
     #[derive(Clone, Copy, Debug)]
     struct LastGlyph {
+        /// Where it's drawn from (its origin).
+        start: (f64, f64),
+        /// Whether it's a CJK character - the only kind written in
+        /// stacked columns (see `stacked_below`).
+        cjk: bool,
         /// Where its ink ends: its origin plus its advance, without the
         /// character or word spacing after it (that moves the next glyph,
         /// not this one).
@@ -64069,6 +64151,163 @@ mod pdf_support {
         } else {
             Measured::Touching
         }
+    }
+
+    /// A CJK ideograph, kana, Hangul syllable/jamo, or CJK/fullwidth
+    /// punctuation - the scripts written in vertical columns.
+    fn is_cjk(c: char) -> bool {
+        matches!(u32::from(c),
+            0x1100..=0x11FF | 0x2E80..=0x2FDF | 0x3000..=0x303F | 0x3040..=0x30FF
+            | 0x3130..=0x318F | 0x31F0..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF
+            | 0x20000..=0x3FFFF)
+    }
+
+    /// A right-to-left letter (Unicode bidi class R or AL): Hebrew,
+    /// Arabic, Syriac, Thaana, N'Ko, and their presentation forms.
+    fn is_rtl(c: char) -> bool {
+        matches!(u32::from(c),
+            0x0590..=0x05FF | 0x0600..=0x065F | 0x066A..=0x06EF | 0x06FA..=0x08FF
+            | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
+    }
+
+    /// Whether `glyph` continues `last` one line down in a vertical column:
+    /// both CJK, drawn at the same position across the line and between
+    /// 0.8 and 1.3 em below it. That's how LibreOffice (and other writers
+    /// without vertical fonts) set vertical Japanese/Chinese - one
+    /// horizontal glyph per position, stepping down - and read by baseline
+    /// alone each glyph would be a line of its own. A table's single-digit
+    /// cells never qualify: they aren't CJK.
+    fn stacked_below(last: &LastGlyph, start: (f64, f64), glyph: &LastGlyph) -> bool {
+        if !(last.cjk && glyph.cjk) || last.dir.0 * glyph.dir.0 + last.dir.1 * glyph.dir.1 < 0.99 {
+            return false;
+        }
+        let em = last.em.max(glyph.em);
+        if !(em.is_finite() && em > 1e-9) {
+            return false;
+        }
+        let (dx, dy) = (start.0 - last.start.0, start.1 - last.start.1);
+        let along = (dx * last.dir.0 + dy * last.dir.1) / em;
+        let across = (dy * last.dir.0 - dx * last.dir.1) / em;
+        along.abs() < 0.3 && (-1.3..=-0.8).contains(&across)
+    }
+
+    /// Reorders one line of right-to-left or mixed text from the visual
+    /// order glyphs are drawn in (left to right) to logical reading order,
+    /// with the Unicode Bidirectional Algorithm's level resolution and
+    /// reordering (UAX #9: rules W1-W7 simplified, N1-N2, L2) run over the
+    /// visual string - the same reversible shortcut pdf.js takes. The
+    /// paragraph direction is `base` when the caller knows it, else
+    /// right-to-left when at least 30% of its letters are (pdf.js's
+    /// threshold, over letters rather than all characters). European digits keep their own left-to-right
+    /// order inside a right-to-left run, Arabic-Indic digits too, and
+    /// neutrals (spaces, punctuation) take the direction of the strong
+    /// characters around them. Mirrored brackets aren't swapped.
+    fn bidi_visual_to_logical(line: &str, base: Option<u8>) -> String {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Class {
+            L,
+            R,
+            Num,
+            Neutral,
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let class = |c: char| {
+            if is_rtl(c) {
+                Class::R
+            } else if c.is_ascii_digit()
+                || ('\u{0660}'..='\u{0669}').contains(&c)
+                || ('\u{06F0}'..='\u{06F9}').contains(&c)
+            {
+                Class::Num
+            } else if c.is_alphabetic() {
+                Class::L
+            } else {
+                Class::Neutral
+            }
+        };
+        let classes: Vec<Class> = chars.iter().map(|&c| class(c)).collect();
+        let rtl_count = classes.iter().filter(|&&k| k == Class::R).count();
+        if rtl_count == 0 {
+            return line.to_string();
+        }
+        let ltr_count = classes.iter().filter(|&&k| k == Class::L).count();
+        let base: u8 = base.unwrap_or(if rtl_count * 10 >= (rtl_count + ltr_count) * 3 {
+            1
+        } else {
+            0
+        });
+        // Strong direction for neutral resolution: numbers count as
+        // right-to-left (N1).
+        let strong = |k: Class| match k {
+            Class::L => Some(false),
+            Class::R | Class::Num => Some(true),
+            Class::Neutral => None,
+        };
+        let mut levels = vec![base; chars.len()];
+        for i in 0..chars.len() {
+            levels[i] = match classes[i] {
+                Class::R => base | 1,
+                Class::L => (base + 1) & !1,
+                Class::Num => {
+                    // A number inside right-to-left text keeps its digits
+                    // left to right one level up (W2, I2).
+                    let prev_rtl = classes[..i]
+                        .iter()
+                        .rev()
+                        .find_map(|&k| match k {
+                            Class::L => Some(false),
+                            Class::R => Some(true),
+                            _ => None,
+                        })
+                        .unwrap_or(base == 1);
+                    if base == 1 || prev_rtl { 2 } else { 0 }
+                }
+                Class::Neutral => {
+                    let before = classes[..i].iter().rev().find_map(|&k| strong(k));
+                    let after = classes[i + 1..].iter().find_map(|&k| strong(k));
+                    match (before, after) {
+                        (Some(a), Some(b)) if a == b => {
+                            if a {
+                                base | 1
+                            } else {
+                                (base + 1) & !1
+                            }
+                        }
+                        _ => base,
+                    }
+                }
+            };
+        }
+        // A neutral between two digits of one number stays with it
+        // (`1,234`, `12:30`).
+        for i in 1..chars.len().saturating_sub(1) {
+            if classes[i] == Class::Neutral
+                && !chars[i].is_whitespace()
+                && classes[i - 1] == Class::Num
+                && classes[i + 1] == Class::Num
+            {
+                levels[i] = levels[i - 1];
+            }
+        }
+        let max = levels.iter().copied().max().unwrap_or(0);
+        let mut out = chars;
+        for level in (1..=max).rev() {
+            let mut i = 0;
+            while i < out.len() {
+                if levels[i] >= level {
+                    let j = (i..out.len())
+                        .find(|&j| levels[j] < level)
+                        .unwrap_or(out.len());
+                    out[i..j].reverse();
+                    levels[i..j].reverse();
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
     /// Decodes a PDF text string (ISO 32000-1 7.9.2.2; ISO 32000-2 adds
@@ -64259,6 +64498,23 @@ mod pdf_support {
         in_string: bool,
         /// The ActualText standing in for the glyphs being drawn.
         replacement: Option<Replacement>,
+        /// Where the current line starts in `out`.
+        line_start: usize,
+        /// The current line's runs, in drawing order. A run starts at the
+        /// line's first glyph and wherever a glyph is drawn back behind the
+        /// last one - how right-to-left text arrives, run by run.
+        runs: Vec<TextRun>,
+    }
+
+    /// One run of a line (see `TextLayout::runs`): where it starts in the
+    /// text, where along the line its ink starts and ends, and its font
+    /// size.
+    #[derive(Clone, Copy, Debug)]
+    struct TextRun {
+        offset: usize,
+        from: f64,
+        to: f64,
+        em: f64,
     }
 
     /// Everything in a `TextLayout` but its text, plus the text's length:
@@ -64272,6 +64528,8 @@ mod pdf_support {
         space_in_string: bool,
         in_string: bool,
         replacement: Option<Replacement>,
+        line_start: usize,
+        runs: Vec<TextRun>,
     }
 
     impl TextLayout {
@@ -64284,6 +64542,8 @@ mod pdf_support {
                 space_in_string: self.space_in_string,
                 in_string: self.in_string,
                 replacement: self.replacement.clone(),
+                line_start: self.line_start,
+                runs: self.runs.clone(),
             }
         }
 
@@ -64295,6 +64555,76 @@ mod pdf_support {
             self.space_in_string = mark.space_in_string;
             self.in_string = mark.in_string;
             self.replacement = mark.replacement;
+            self.line_start = mark.line_start;
+            self.runs = mark.runs;
+        }
+
+        /// Ends the current line: a line holding right-to-left letters is
+        /// put into visual order - its runs sorted by where they're drawn,
+        /// joined with a space only where there's a gap between them - and
+        /// then into reading order (`bidi_visual_to_logical`). Its
+        /// direction comes from the drawing order when that tells: writers
+        /// that draw runs in reading order (LibreOffice) start a
+        /// right-to-left line with its rightmost run and a left-to-right one
+        /// with its leftmost. A line with no right-to-left letter is left
+        /// exactly as laid out.
+        fn finish_line(&mut self) {
+            let start = self.line_start.min(self.out.len());
+            let runs = std::mem::take(&mut self.runs);
+            if !self.out[start..].chars().any(is_rtl) {
+                return;
+            }
+            let mut pieces: Vec<(TextRun, &str)> = Vec::new();
+            for (i, run) in runs.iter().enumerate() {
+                let end = runs
+                    .get(i + 1)
+                    .map_or(self.out.len(), |r| r.offset)
+                    .min(self.out.len());
+                if run.offset >= start && run.offset <= end {
+                    let piece = self.out[run.offset..end].trim();
+                    if !piece.is_empty() {
+                        pieces.push((*run, piece));
+                    }
+                }
+            }
+            let base = match (pieces.first(), pieces.len()) {
+                (Some((first, _)), 2..) => {
+                    if pieces.iter().all(|(r, _)| r.from <= first.from) {
+                        Some(1)
+                    } else if pieces.iter().all(|(r, _)| r.from >= first.from) {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let visual = if pieces.is_empty() {
+                self.out[start..].to_string()
+            } else {
+                pieces.sort_by(|a, b| a.0.from.total_cmp(&b.0.from));
+                let mut visual = String::new();
+                let mut prev: Option<TextRun> = None;
+                for (run, piece) in pieces {
+                    if let Some(p) = prev
+                        && (run.from - p.to) / p.em.max(run.em).max(1e-9) > NOT_A_SPACE
+                    {
+                        visual.push(' ');
+                    }
+                    visual.push_str(piece);
+                    prev = Some(run);
+                }
+                visual
+            };
+            let logical = bidi_visual_to_logical(&visual, base);
+            self.out.truncate(start);
+            self.out.push_str(&logical);
+        }
+
+        /// The laid-out text, with its last line finished.
+        fn finish(mut self) -> String {
+            self.finish_line();
+            self.out
         }
 
         /// Starts replacing the glyphs drawn from here on with `text`.
@@ -64345,6 +64675,14 @@ mod pdf_support {
                 if run.starts_with(char::is_whitespace) {
                     self.space = self.space.or(run.chars().next());
                     self.space_after_last = true;
+                } else if run.chars().any(is_rtl) {
+                    // ActualText is in reading order, but a line of
+                    // right-to-left text is laid out in drawing order and
+                    // reordered when it ends - so the text goes in the way
+                    // it's drawn (Chrome writes a lam-alef ligature's
+                    // ActualText as the whole word `ريال`).
+                    self.push_glyph(&bidi_visual_to_logical(run, Some(1)), start, glyph);
+                    extends = true;
                 } else {
                     self.push_glyph(run, start, glyph);
                     extends = true;
@@ -64375,6 +64713,7 @@ mod pdf_support {
             let gap = match self.last.as_ref() {
                 None => Gap::None,
                 Some(last) => match measure_gap(last, start, glyph.dir, glyph.em) {
+                    Measured::NewLine if stacked_below(last, start, &glyph) => Gap::None,
                     Measured::NewLine => Gap::NewLine,
                     _ if attached => Gap::Space,
                     _ if self.in_string => Gap::None,
@@ -64383,6 +64722,16 @@ mod pdf_support {
                     Measured::Narrow | Measured::Touching => Gap::None,
                 },
             };
+            // Drawn back behind the last glyph on the same line: a new run.
+            let behind = gap != Gap::NewLine
+                && self.last.as_ref().is_some_and(|last| {
+                    let em = last.em.max(glyph.em);
+                    em > 1e-9
+                        && ((start.0 - last.end.0) * last.dir.0
+                            + (start.1 - last.end.1) * last.dir.1)
+                            / em
+                            < -0.5
+                });
             match gap {
                 Gap::NewLine => {
                     let kept = self
@@ -64390,9 +64739,11 @@ mod pdf_support {
                         .trim_end_matches(|c: char| c != '\n' && c.is_whitespace())
                         .len();
                     self.out.truncate(kept);
+                    self.finish_line();
                     if !self.out.is_empty() && !self.out.ends_with('\n') {
                         self.out.push('\n');
                     }
+                    self.line_start = self.out.len();
                 }
                 Gap::Space => {
                     if !self.out.is_empty() && !self.out.ends_with('\n') {
@@ -64400,6 +64751,17 @@ mod pdf_support {
                     }
                 }
                 Gap::None => {}
+            }
+            let along = |p: (f64, f64)| p.0 * glyph.dir.0 + p.1 * glyph.dir.1;
+            if self.runs.is_empty() || behind {
+                self.runs.push(TextRun {
+                    offset: self.out.len(),
+                    from: along(start),
+                    to: along(glyph.end),
+                    em: glyph.em,
+                });
+            } else if let Some(run) = self.runs.last_mut() {
+                run.to = run.to.max(along(glyph.end));
             }
             push_expanding_ligatures(&mut self.out, text);
             self.last = Some(glyph);
@@ -64738,6 +65100,7 @@ mod pdf_support {
                 },
                 width: CodeWidth::One,
                 advances: Advances::Simple(Box::new([0.5; 256])),
+                vertical: None,
             };
             let mut out = Vec::new();
             for span in content_spans(data).expect("test content must parse") {
@@ -64782,6 +65145,7 @@ mod pdf_support {
                 table: std::array::from_fn(|i| winansi_decode(i as u8).to_string()),
                 width,
                 advances: Advances::Simple(Box::new([0.5; 256])),
+                vertical: None,
             }
         }
 
@@ -64977,8 +65341,69 @@ mod pdf_support {
             assert_eq!(cid.width(b"\x03", CodeWidth::Variable), 1.0);
         }
 
+        #[test]
+        fn bidi_reorders_visual_right_to_left_text_into_reading_order() {
+            // Visual order in, reading order out; numbers keep their digits.
+            assert_eq!(
+                bidi_visual_to_logical("ןחבמ הז םלוע םולש", None),
+                "שלום עולם זה מבחן"
+            );
+            assert_eq!(
+                bidi_visual_to_logical("Apple רובע םילקש 250 אוה ריחמה", Some(1)),
+                "המחיר הוא 250 שקלים עבור Apple"
+            );
+            assert_eq!(
+                bidi_visual_to_logical("The word םולש means peace.", None),
+                "The word שלום means peace."
+            );
+            assert_eq!(
+                bidi_visual_to_logical("1,234.50 םוכסה", None),
+                "הסכום 1,234.50"
+            );
+            // Nothing right-to-left: untouched.
+            assert_eq!(
+                bidi_visual_to_logical("plain (text) 12", None),
+                "plain (text) 12"
+            );
+        }
+
+        #[test]
+        fn stacked_cjk_glyphs_join_but_other_stacks_do_not() {
+            let glyph = |x: f64, y: f64, cjk: bool| LastGlyph {
+                start: (x, y),
+                end: (x + 10.0, y),
+                dir: (1.0, 0.0),
+                em: 10.0,
+                cjk,
+            };
+            let last = glyph(100.0, 700.0, true);
+            assert!(stacked_below(
+                &last,
+                (100.0, 690.0),
+                &glyph(100.0, 690.0, true)
+            ));
+            // Not CJK (a table's digits), too far down, or shifted across.
+            assert!(!stacked_below(
+                &glyph(100.0, 700.0, false),
+                (100.0, 690.0),
+                &glyph(100.0, 690.0, false)
+            ));
+            assert!(!stacked_below(
+                &last,
+                (100.0, 680.0),
+                &glyph(100.0, 680.0, true)
+            ));
+            assert!(!stacked_below(
+                &last,
+                (106.0, 690.0),
+                &glyph(106.0, 690.0, true)
+            ));
+        }
+
         fn ends_at(x: f64, y: f64, em: f64) -> LastGlyph {
             LastGlyph {
+                start: (x - em * 0.5, y),
+                cjk: false,
                 end: (x, y),
                 dir: (1.0, 0.0),
                 em,

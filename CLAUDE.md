@@ -16834,9 +16834,10 @@ seven wrong) and unit tests on `measure_gap`, `TextLayout`, the `'`/`"`
 operators, `TJ` scaling, `layout_glyphs`, and the width tables lock it
 in; three older integration tests changed expectation where their
 fixtures really do draw lines on different baselines, or two strings
-back to back. Disclosed boundaries: vertical writing (`Identity-V`
-advancing down the page) is laid out as horizontal, and right-to-left
-text keeps content-stream order.
+back to back. Disclosed boundaries at the time: vertical writing
+(`Identity-V` advancing down the page) was laid out as horizontal, and
+right-to-left text kept content-stream order - both since fixed (see
+the vertical and right-to-left pass below).
 
 **A follow-up pass made marked-content `/ActualText` stand in for the
 glyphs it covers (ISO 32000-1 14.9.4).** A tagged PDF can say what a
@@ -16978,6 +16979,54 @@ testing the error. Verified on the real corpus: all 666 PDFs load into
 SQLite with every table's row count equal to its profiled `row_count`;
 22 notebooks load inline and the 186 with outputs fall back (or, under
 `--load-into`, refuse with the field named).
+
+**A follow-up pass laid out vertical and right-to-left text, the two
+layout boundaries the glyph-position pass disclosed.** The corpus has
+neither (checked: no RTL character in any extracted page, no
+`Identity-V` font anywhere), so the fixtures come from real producers
+instead - LibreOffice and headless Chrome printing the same eleven
+Hebrew/Arabic/mixed paragraphs, and LibreOffice printing vertical
+Japanese - plus one hand-built `Identity-V` file, since neither producer
+writes a vertical font. The source text is the oracle; PDFium was
+checked too and gets vertical columns right but leaves right-to-left
+words in visual order.
+
+- **Vertical.** LibreOffice sets vertical CJK with a horizontal font,
+  one glyph per `Tm`, stepping down exactly one em - read by baseline,
+  every glyph was its own line. `stacked_below` joins a glyph to the one
+  above when both are CJK, drawn at the same position across the line
+  (within 0.3 em), and 0.8-1.3 em below it; a table's stacked digits
+  never qualify, not being CJK. A true `Identity-V` font now advances
+  down text space y by its `/DW2` (default 1 em, ISO 32000-1 9.7.4.3)
+  instead of across by its widths, so each column is one line of text
+  (they used to merge into one). Per-glyph `/W2` isn't read.
+- **Right to left.** Glyphs arrive in drawing order, which for RTL text
+  is visual (left to right), so a line read `ןחבמ הז םלוע םולש`, and
+  LibreOffice draws a mixed line's runs in reading order, so their
+  positions were out of order too. `TextLayout` now records where each
+  run of a line starts (a run begins wherever a glyph is drawn back
+  behind the last one); when a line containing Hebrew/Arabic ends,
+  `finish_line` sorts its runs by position (joining them with a space
+  only where there's a gap) and `bidi_visual_to_logical` reorders it -
+  the Unicode Bidirectional Algorithm's level resolution and reordering
+  (UAX #9, simplified W/N rules, L2) run over the visual string, pdf.js's
+  shortcut. Numbers keep their digits, Arabic-Indic too, and a
+  separator between digits stays with them (`1,234.50`). The line's
+  direction comes from drawing order when that tells (a first-drawn run
+  that's rightmost means right to left), else from whether 30% of its
+  letters are right-to-left. Chrome gives a lam-alef ligature's text as
+  a multi-letter ActualText in reading order (`ريال`), so ActualText
+  holding RTL letters is placed in visual order to survive the line's
+  reordering. A line with no RTL letter is never touched: every corpus
+  PDF's full text is byte-identical to the previous build.
+
+The one wrong line left is a genuine ambiguity: drawn in visual order
+(Chrome), a right-to-left paragraph ending in Latin text (`צרו קשר:
+info@example.co.il`) looks exactly like a left-to-right one ending in
+Hebrew, and reads as the latter. The fixtures are
+`edge_pdf_rtl_libreoffice.pdf` (every line exactly as typed),
+`edge_pdf_rtl_chrome.pdf` (every line but that one),
+`edge_pdf_vertical_libreoffice.pdf`, and `edge_pdf_identity_v.pdf`.
 
 ## Agent-friendly CLI surface
 
@@ -17328,9 +17377,12 @@ established baselines exactly.
   `flate_decode`/`content_spans` writeup above for the fix. A file with
   *nothing* recoverable before the cut (the truncation lands before even
   the first symbol decodes) still refuses cleanly, the same as before.
-  Word and line breaks come from glyph positions; vertical writing
-  (`Identity-V`) is laid out as if horizontal, and right-to-left text
-  keeps content-stream order. Marked-content `/ActualText` stands in for
+  Word and line breaks come from glyph positions; vertical text reads
+  down its columns and right-to-left lines read in logical order, except
+  that a visual-order producer's right-to-left line ending in Latin text
+  is indistinguishable from a left-to-right line ending in Hebrew, and
+  reads as the latter; mirrored brackets aren't swapped and per-glyph
+  `/W2` vertical metrics aren't read. Marked-content `/ActualText` stands in for
   the glyphs it covers unless it holds U+FFFD; ActualText over a
   sequence that draws no glyph (an image) is dropped, and named property
   lists in an encrypted file are skipped. See the Dependency footprint
