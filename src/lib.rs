@@ -4766,6 +4766,22 @@ struct ColumnRef {
     composite: Vec<(String, String)>,
 }
 
+/// Folds hash `h` into a bottom-k sketch: `hashes` holds the `k` smallest
+/// distinct hashes seen, ascending. Shared by `ValueSketch` (the
+/// relationship graph's 32-bit, k=128 sketch) and the knowledge graph's
+/// content scan (64-bit, k=64): the two differ in hash, k, value
+/// canonicalization, and estimator - each calibrated against its own
+/// benchmark - but keep their minimum values the same way.
+fn kmv_insert<T: Ord + Copy>(hashes: &mut Vec<T>, h: T, k: usize) {
+    if hashes.len() >= k && hashes.last().is_some_and(|last| h >= *last) {
+        return;
+    }
+    if let Err(pos) = hashes.binary_search(&h) {
+        hashes.insert(pos, h);
+        hashes.truncate(k);
+    }
+}
+
 /// How many of a column's smallest distinct value hashes a `ValueSketch`
 /// keeps. 128 gives a distinct-count and containment estimate within about
 /// 1/sqrt(128) = 9% (KMV's standard error), for 1 KB of JSON per column.
@@ -4820,16 +4836,7 @@ impl ValueSketch {
             return;
         }
         self.count += 1;
-        let h = Self::hash(v);
-        if self.hashes.len() == VALUE_SKETCH_K && h >= *self.hashes.last().expect("k > 0") {
-            return;
-        }
-        if let Err(pos) = self.hashes.binary_search(&h) {
-            self.hashes.insert(pos, h);
-            if self.hashes.len() > VALUE_SKETCH_K {
-                self.hashes.pop();
-            }
-        }
+        kmv_insert(&mut self.hashes, Self::hash(v), VALUE_SKETCH_K);
     }
 
     fn is_full(&self) -> bool {
@@ -91409,14 +91416,7 @@ mod content_scan {
         }
 
         fn sketch_insert(&mut self, h: u64) {
-            if let Err(pos) = self.sketch.binary_search(&h) {
-                if self.sketch.len() < SKETCH_K {
-                    self.sketch.insert(pos, h);
-                } else if pos < SKETCH_K {
-                    self.sketch.insert(pos, h);
-                    self.sketch.pop();
-                }
-            }
+            super::kmv_insert(&mut self.sketch, h, SKETCH_K);
         }
 
         fn emit(&mut self, kind: EntityKind, value: String) {

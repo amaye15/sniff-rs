@@ -4140,6 +4140,13 @@ links and for passing through a widely shared identifier, so equally
 short routes prefer specific, extracted links. A dictionary or raw file
 keeps the table-join behavior unchanged.
 
+Its value sketch and the relationship graph's `ValueSketch` stay
+separate on purpose - 64-bit vs 32-bit hashes, k=64 vs 128, `1.0`==`1`
+canonicalization vs exact values, a Jaccard-derived vs a direct
+containment estimate, each calibrated against its own benchmark - but
+share one bottom-k insertion routine, `kmv_insert` (a later cleanup,
+verified byte-identical on every corpus dictionary and on `graph.json`).
+
 **Verified** with 26 new unit tests (every entity kind and its
 near-misses, file-reference resolution, sketch overlap estimates, OOXML
 parsing, join rules, Louvain, graph.json round-trip, identifier
