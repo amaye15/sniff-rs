@@ -2613,13 +2613,28 @@ guess:
   file(s) skipped as unrecognized)"` surfaces what's very likely a
   mistake (the wrong path, or a directory that doesn't hold what was
   expected) rather than silently doing nothing and exiting 0.
-- **Sequential, not parallel**, deliberately for now - directory-batch
-  processing is an embarrassingly parallel workload (independent files,
-  independent outputs) and a real future optimization candidate, but
-  shipping correct sequential behavior first and parallelizing only if a
-  real directory shows it matters matches this project's own
-  "measure before optimizing" discipline elsewhere (see "Performance"
-  below).
+- **Parallel, with sequential output.** Each file's own work
+  (decompress, detect, read, render, write) runs on a pool of worker
+  threads - `--jobs N`, default the machine's available parallelism -
+  via `run_batch_jobs`, which hands results back to the main thread in
+  walk order the moment each is next in line. Everything with an order
+  - stderr progress lines, counters, the index, which error fail-fast
+  reports - is handled there, so a run's output is byte-identical at any
+  job count. Without `--continue-on-error`, a failure stops workers from
+  starting any file past it; every file before it was already claimed
+  and still finishes, so the error reported is always the earliest
+  failing file in walk order, and files already written stay written
+  (the same "never roll back" rule the sequential loop had). Workers get
+  an 8 MiB stack, the main thread's own, since every reader's recursion
+  guard was sized against it. Measured on the real 1,400-file corpus
+  (10 cores): 54 s -> 19 s, every output and every stderr line identical
+  to the sequential build, peak RSS 1.67 GB -> 1.79 GB (the peak is one
+  large PDF either way). Disclosed: a reader's own stderr notes (e.g. a
+  staging fallback) can interleave out of walk order, and `--combine`
+  and `graph` still walk sequentially. Measuring this found a real
+  regression in the first version before it shipped: collecting every
+  result before reporting any meant no progress lines until the whole
+  run finished; results now stream in order instead.
 
 Architecturally, `run()` now only decides which of two modes to enter;
 every per-format reader dispatch (`dispatch_reader`) and every rendering

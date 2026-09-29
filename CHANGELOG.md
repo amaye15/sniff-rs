@@ -21,6 +21,9 @@ All notable changes to sniff-rs are documented here. Format follows
 - An empty `/FlateDecode` stream in a PDF no longer fails the file.
 
 ### Added
+- Directory mode profiles files in parallel (`--jobs N`, default: CPU
+  cores); output and progress lines stay in walk order, identical to a
+  sequential run.
 - PDF: filled-in AcroForm field values become a `<file>_form` table and
   comment/note annotation text an `annotations` column, including in
   encrypted files.

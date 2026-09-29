@@ -15499,3 +15499,87 @@ fn sql_output_default_mode_falls_back_to_staging_for_an_array_of_objects() {
             .contains("can't emit real data for field \"outputs\"")
     );
 }
+
+/// Reads every file under `root` into a sorted (relative path, bytes) list.
+fn read_tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn batch_mode_output_is_the_same_with_one_job_or_many() {
+    let mut runs = Vec::new();
+    for jobs in ["1", "8"] {
+        let out = TempDir::new();
+        let output = run_dir(&[
+            "tests/fixtures/edge_batch_directory",
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--output-format",
+            "json",
+            "--continue-on-error",
+            "--jobs",
+            jobs,
+        ]);
+        let stderr =
+            String::from_utf8_lossy(&output.stderr).replace(out.path().to_str().unwrap(), "OUT");
+        runs.push((output.status.code(), stderr, read_tree(out.path())));
+    }
+    assert_eq!(runs[0], runs[1]);
+}
+
+#[test]
+fn batch_mode_fails_fast_on_the_first_failing_file_in_walk_order() {
+    // Many good files, then two bad ones: with several workers, the error
+    // reported is still the earlier bad file, never the later one.
+    let dir = TempDir::new();
+    for i in 0..20 {
+        std::fs::write(dir.path().join(format!("a{i:02}.csv")), "x,y\n1,2\n").unwrap();
+    }
+    std::fs::write(dir.path().join("b_bad.csv"), "x,y\n1,2,3\n").unwrap();
+    std::fs::write(dir.path().join("c_bad.csv"), "x,y\n1,2,3\n").unwrap();
+    let out = TempDir::new();
+    for _ in 0..5 {
+        let output = run_dir(&[
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            out.path().to_str().unwrap(),
+            "--jobs",
+            "8",
+        ]);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("b_bad.csv"), "{stderr}");
+        assert!(!stderr.contains("c_bad.csv"), "{stderr}");
+    }
+}
+
+#[test]
+fn jobs_flag_is_validated() {
+    let output = run_dir(&["tests/fixtures/edge_batch_directory", "--jobs", "0"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--jobs must be a positive integer"));
+    let output = Command::new(bin())
+        .args([fixture("sample.csv").to_str().unwrap(), "-", "--jobs", "2"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--jobs only applies"));
+}

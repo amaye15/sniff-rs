@@ -3389,6 +3389,9 @@ struct Args {
     /// surprising failure should be loud, not something a re-run has to
     /// go looking for.
     continue_on_error: bool,
+    /// Directory-input mode only (not --combine): how many files to
+    /// profile at once. `None` means the machine's available parallelism.
+    jobs: Option<usize>,
     /// Directory-input mode only: only process files matching one of
     /// these glob patterns (`*` matches any run of characters except `/`,
     /// `?` matches one character except `/`, `**` matches anything
@@ -3536,6 +3539,10 @@ OPTIONS:
                                 that fails instead of aborting the whole run on
                                 it. Failures are recorded in the index (`failed`
                                 list) and on stderr - never silently dropped.
+        --jobs <N>              Directory-input mode only: profile N files at once
+                                (default: the number of CPU cores; 1 = one at a
+                                time). Output and the index are in walk order
+                                either way.
         --include <GLOB>        Directory-input mode only (repeatable): only
                                 process files matching one of these patterns.
                                 `*` matches any run except `/`, `?` one
@@ -3581,6 +3588,7 @@ impl Args {
         let mut output_dir: Option<PathBuf> = None;
         let mut combine = false;
         let mut continue_on_error = false;
+        let mut jobs: Option<usize> = None;
         let mut include: Vec<String> = Vec::new();
         let mut exclude: Vec<String> = Vec::new();
         let mut list_formats = false;
@@ -3662,6 +3670,13 @@ impl Args {
                     "output-dir" => output_dir = Some(PathBuf::from(value(&mut i)?)),
                     "combine" => combine = true,
                     "continue-on-error" => continue_on_error = true,
+                    "jobs" => {
+                        let v = value(&mut i)?;
+                        jobs =
+                            Some(v.parse().ok().filter(|n: &usize| *n >= 1).ok_or_else(|| {
+                                anyhow!("--jobs must be a positive integer, got {v:?}")
+                            })?);
+                    }
                     "include" => include.push(value(&mut i)?),
                     "exclude" => exclude.push(value(&mut i)?),
                     "list-formats" => list_formats = true,
@@ -3713,6 +3728,7 @@ impl Args {
             load_into,
             combine,
             continue_on_error,
+            jobs,
             include,
             exclude,
             list_formats,
@@ -75374,6 +75390,7 @@ fn load_graph_input(
         load_into: None,
         combine: false,
         continue_on_error: false,
+        jobs: None,
         include: Vec::new(),
         exclude: Vec::new(),
         list_formats: false,
@@ -85526,6 +85543,9 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if args.continue_on_error {
         bail!("--continue-on-error only applies when the input path is a directory");
     }
+    if args.jobs.is_some() {
+        bail!("--jobs only applies when the input path is a directory");
+    }
     if !args.include.is_empty() || !args.exclude.is_empty() {
         bail!("--include/--exclude only apply when the input path is a directory");
     }
@@ -86186,6 +86206,83 @@ fn render_directory_index_json(
     json_support::to_pretty_string(&Value::Object(doc))
 }
 
+/// Runs `work` over `items` on up to `jobs` worker threads (at least one;
+/// `None` means the machine's available parallelism) and hands each
+/// result to `consume` on the calling thread, in `items`' own order, as
+/// soon as it and everything before it are done - so progress streams
+/// out in order while later items are still being worked on. `work`
+/// returns `(result, failed)`: once an item fails and `keep_going` is
+/// false, workers start no item past it (every item before it was
+/// already claimed, so all of them still finish and are consumed first).
+/// `consume` returning an error stops the run: no new items start, the
+/// ones in flight finish, and that error is returned. Workers get an
+/// 8 MiB stack, the main thread's own, since every reader's recursion
+/// guard was sized against it.
+fn run_batch_jobs<T, R, F>(
+    items: &[T],
+    jobs: Option<usize>,
+    keep_going: bool,
+    work: F,
+    mut consume: impl FnMut(usize, R) -> Result<()>,
+) -> Result<()>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> (R, bool) + Sync,
+{
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let jobs = jobs
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .clamp(1, items.len().max(1));
+    let next = AtomicUsize::new(0);
+    let first_failure = AtomicUsize::new(usize::MAX);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, R)>();
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            let tx = tx.clone();
+            let (next, first_failure, stop, work) = (&next, &first_failure, &stop, &work);
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    loop {
+                        if stop.load(Ordering::SeqCst)
+                            && first_failure.load(Ordering::SeqCst) == usize::MAX
+                        {
+                            break;
+                        }
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        if i >= items.len() || i > first_failure.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let (result, failed) = work(&items[i]);
+                        if failed && !keep_going {
+                            first_failure.fetch_min(i, Ordering::SeqCst);
+                        }
+                        if tx.send((i, result)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("failed to spawn a worker thread");
+        }
+        drop(tx);
+        let mut pending: BTreeMap<usize, R> = BTreeMap::new();
+        let mut want = 0usize;
+        for (i, result) in rx.iter() {
+            pending.insert(i, result);
+            while let Some(result) = pending.remove(&want) {
+                if let Err(e) = consume(want, result) {
+                    stop.store(true, Ordering::SeqCst);
+                    return Err(e);
+                }
+                want += 1;
+            }
+        }
+        Ok(())
+    })
+}
+
 fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let dir = &args.input_path;
     if args.output_path.is_some() && !args.combine {
@@ -86281,60 +86378,39 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     let mut failed: Vec<BatchFailure> = Vec::new();
     let mut empty: Vec<String> = Vec::new();
 
-    for path in &files {
-        // Selection first: an excluded file is invisible, not skipped -
-        // never counted, listed, or even probed.
+    // Each file's own work - decompress, detect, read, render, write -
+    // runs on a bounded pool of worker threads (`--jobs`, default: the
+    // machine's cores); everything with an order (stderr lines, counters,
+    // the index, which error fail-fast reports) is then handled here in
+    // walk order from the collected outcomes, so a run's output doesn't
+    // depend on which thread finished first. Without --continue-on-error
+    // the first failure stops workers from starting new files, and the
+    // error reported is the earliest failing file in walk order; files
+    // other workers had already finished stay written, the same "never
+    // roll back" rule the sequential loop had.
+    enum BatchOutcome {
+        Excluded,
+        OwnOutput,
+        DecompressFailed(Error),
+        Unrecognized,
+        Done(Result<Option<(usize, usize, PathBuf)>>),
+    }
+    let process = |path: &PathBuf| -> BatchOutcome {
         if !file_selected(dir, path, &args.include, &args.exclude) {
-            continue;
+            return BatchOutcome::Excluded;
         }
         if looks_like_own_output(path) {
-            skipped += 1;
-            eprintln!(
-                "{}: skipped (looks like this tool's own prior output)",
-                path.display()
-            );
-            continue;
+            return BatchOutcome::OwnOutput;
         }
-
-        // Decompression failures route through the same continue/failed
-        // handling as every later per-file error below (rather than the
-        // unconditional `?` this used to be): a corrupt `.gz` is exactly
-        // the kind of single bad file the flag exists for.
         let (read_path, logical_path, _decompressed_tmp) = match decompress_if_needed(path)
             .with_context(|| format!("failed processing {path:?}"))
         {
             Ok(paths) => paths,
-            Err(err) => {
-                if !args.continue_on_error {
-                    return Err(err);
-                }
-                failed.push(BatchFailure {
-                    source_relative: relative_display_path(dir, path),
-                    error: format!("{err:?}"),
-                });
-                eprintln!("{}: failed (recorded, continuing)", path.display());
-                continue;
-            }
+            Err(err) => return BatchOutcome::DecompressFailed(err),
         };
-
-        // A file whose format can't be identified at all (no recognized
-        // extension, and no sniffable content signature) is skipped, not
-        // a fatal error - this is the one outcome directory mode treats
-        // as "nothing went wrong, this just isn't a file sniff-rs can
-        // read." Any error past this point (a corrupt file, a format
-        // whose reader isn't compiled into this build, a write failure)
-        // is fail-fast, deliberately with no special-casing between those
-        // causes.
-        let format = match detect_format(&read_path, &logical_path, &None) {
-            Ok(format) => format,
-            Err(_) => {
-                skipped += 1;
-                unrecognized.push(relative_display_path(dir, path));
-                eprintln!("{}: skipped (unrecognized format)", path.display());
-                continue;
-            }
+        let Ok(format) = detect_format(&read_path, &logical_path, &None) else {
+            return BatchOutcome::Unrecognized;
         };
-
         let outcome = (|| -> Result<Option<(usize, usize, PathBuf)>> {
             let (tables, resolved_skip_rows) =
                 dispatch_reader(&read_path, &logical_path, format, args)?;
@@ -86447,46 +86523,93 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             Ok(Some((table_count, col_count, output_path)))
         })()
         .with_context(|| format!("failed processing {path:?}"));
-
-        // Three outcomes, each explicit: a rendered file, an empty file
-        // skipped with a note, or - only under --continue-on-error - a
-        // recorded failure the run continues past. Without the flag any
-        // error returns here, the long-standing fail-fast behavior.
-        let (table_count, col_count, output_path) = match outcome {
-            Ok(Some(done)) => done,
-            Ok(None) => {
-                skipped += 1;
-                empty.push(relative_display_path(dir, path));
-                eprintln!("{}: skipped (no tables to profile)", path.display());
-                continue;
-            }
-            Err(err) => {
-                if !args.continue_on_error {
-                    return Err(err);
+        BatchOutcome::Done(outcome)
+    };
+    run_batch_jobs(
+        &files,
+        args.jobs,
+        args.continue_on_error,
+        |path| {
+            let outcome = process(path);
+            let failed = matches!(
+                outcome,
+                BatchOutcome::DecompressFailed(_) | BatchOutcome::Done(Err(_))
+            );
+            (outcome, failed)
+        },
+        |i, outcome| {
+            let path = &files[i];
+            let outcome = match outcome {
+                BatchOutcome::Excluded => return Ok(()),
+                BatchOutcome::OwnOutput => {
+                    skipped += 1;
+                    eprintln!(
+                        "{}: skipped (looks like this tool's own prior output)",
+                        path.display()
+                    );
+                    return Ok(());
                 }
-                failed.push(BatchFailure {
-                    source_relative: relative_display_path(dir, path),
-                    error: format!("{err:?}"),
-                });
-                eprintln!("{}: failed (recorded, continuing)", path.display());
-                continue;
-            }
-        };
-        processed += 1;
-        total_tables += table_count;
-        total_columns += col_count;
-        index_entries.push(BatchIndexEntry {
-            source_relative: relative_display_path(dir, path),
-            output_relative: relative_display_path(index_dir, &output_path),
-            table_count,
-            col_count,
-        });
-        eprintln!(
-            "{}: {table_count} tables, {col_count} columns -> {}",
-            path.display(),
-            output_path.display()
-        );
-    }
+                BatchOutcome::DecompressFailed(err) => {
+                    if !args.continue_on_error {
+                        return Err(err);
+                    }
+                    failed.push(BatchFailure {
+                        source_relative: relative_display_path(dir, path),
+                        error: format!("{err:?}"),
+                    });
+                    eprintln!("{}: failed (recorded, continuing)", path.display());
+                    return Ok(());
+                }
+                BatchOutcome::Unrecognized => {
+                    skipped += 1;
+                    unrecognized.push(relative_display_path(dir, path));
+                    eprintln!("{}: skipped (unrecognized format)", path.display());
+                    return Ok(());
+                }
+                BatchOutcome::Done(outcome) => outcome,
+            };
+
+            // Three outcomes, each explicit: a rendered file, an empty file
+            // skipped with a note, or - only under --continue-on-error - a
+            // recorded failure the run continues past. Without the flag any
+            // error returns here, the long-standing fail-fast behavior.
+            let (table_count, col_count, output_path) = match outcome {
+                Ok(Some(done)) => done,
+                Ok(None) => {
+                    skipped += 1;
+                    empty.push(relative_display_path(dir, path));
+                    eprintln!("{}: skipped (no tables to profile)", path.display());
+                    return Ok(());
+                }
+                Err(err) => {
+                    if !args.continue_on_error {
+                        return Err(err);
+                    }
+                    failed.push(BatchFailure {
+                        source_relative: relative_display_path(dir, path),
+                        error: format!("{err:?}"),
+                    });
+                    eprintln!("{}: failed (recorded, continuing)", path.display());
+                    return Ok(());
+                }
+            };
+            processed += 1;
+            total_tables += table_count;
+            total_columns += col_count;
+            index_entries.push(BatchIndexEntry {
+                source_relative: relative_display_path(dir, path),
+                output_relative: relative_display_path(index_dir, &output_path),
+                table_count,
+                col_count,
+            });
+            eprintln!(
+                "{}: {table_count} tables, {col_count} columns -> {}",
+                path.display(),
+                output_path.display()
+            );
+            Ok(())
+        },
+    )?;
 
     if processed == 0 {
         // `failed`/`empty` are only ever non-empty under
@@ -87335,6 +87458,7 @@ fn profile_raw_file_as_diff_columns(
         load_into: None,
         combine: false,
         continue_on_error: false,
+        jobs: None,
         include: Vec::new(),
         exclude: Vec::new(),
         list_formats: false,
@@ -91921,6 +92045,7 @@ mod knowledge_graph {
             load_into: None,
             combine: false,
             continue_on_error: false,
+            jobs: None,
             include: Vec::new(),
             exclude: Vec::new(),
             list_formats: false,
