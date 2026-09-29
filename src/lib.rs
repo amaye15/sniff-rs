@@ -8995,7 +8995,12 @@ fn columns_from_syslog(
 // SAS reference crate decodes through) maps them to the C1 control
 // character with the same value. Multi-byte encodings (Shift-JIS, GBK,
 // Big5, EUC-*, ISO-2022-*) aren't here and stay disclosed errors.
-#[cfg(any(feature = "dbase", feature = "sas7bdat", feature = "mbox"))]
+#[cfg(any(
+    feature = "dbase",
+    feature = "sas7bdat",
+    feature = "mbox",
+    feature = "xlsx"
+))]
 mod codepage_support {
     // Generated from Python's own codec tables (scratchpad gen_cp.py); every
     // entry is checked against encoding_rs where encoding_rs has the encoding.
@@ -69130,6 +69135,9 @@ fn columns_from_xlsx(
     {
         return xlsx_support::columns_from_xls(path, nrows, n_samples);
     }
+    if xlsx_support::raw_biff_version(path).is_some() {
+        return xlsx_support::columns_from_raw_biff(path, nrows, n_samples);
+    }
     bail!(
         "{path:?} doesn't match a recognized .xlsx/.xlsb/.ods ZIP structure or .xls OLE2 \
          structure - if this is genuinely one of those formats, its internal layout doesn't \
@@ -69254,6 +69262,9 @@ fn render_sql_inline_flat_xlsx(
         && (cfb.has_stream("Workbook") || cfb.has_stream("Book"))
     {
         return xlsx_support::stream_xls_sheet_rows_for_sql(read_path, sheet_name, sink);
+    }
+    if xlsx_support::raw_biff_version(read_path).is_some() {
+        return xlsx_support::stream_raw_biff_rows_for_sql(read_path, sink);
     }
     bail!(
         "{read_path:?} doesn't match a recognized .xlsx/.xlsb/.ods ZIP structure or .xls OLE2 \
@@ -81579,6 +81590,65 @@ mod xlsx_support {
         Ok((pos, name))
     }
 
+    /// The BIFF version a stream was written in (3, 4, 5, or 8), and the
+    /// single-byte code page its pre-BIFF8 strings use. BIFF8 strings are
+    /// UTF-16 or "compressed" Latin-1 and never need the code page;
+    /// BIFF3-5 strings are 8-bit bytes in the file's CODEPAGE [MS-XLS
+    /// 2.4.52] - Windows-1252 when the record is absent, the Western
+    /// default every Excel of that era wrote.
+    struct XlsText {
+        biff: u8,
+        table: Option<&'static [u16; 256]>,
+    }
+
+    impl XlsText {
+        fn decode(&self, bytes: &[u8]) -> String {
+            match self.table {
+                Some(t) => codepage_support::decode(t, bytes),
+                None => bytes.iter().map(|&b| b as char).collect(),
+            }
+        }
+
+        /// A BIFF2-5 byte string: an 8- or 16-bit length, then that many
+        /// code-page bytes (truncated cleanly if the record runs short,
+        /// like `xls_decode_plain`).
+        fn byte_string(&self, data: &[u8], wide_len: bool) -> Result<String> {
+            let (len, rest) = if wide_len {
+                (
+                    xls_read_u16(data, 0)? as usize,
+                    data.get(2..).unwrap_or(&[]),
+                )
+            } else {
+                (
+                    *data.first().context("truncated BIFF byte string")? as usize,
+                    &data[1..],
+                )
+            };
+            Ok(self.decode(&rest[..len.min(rest.len())]))
+        }
+    }
+
+    /// A CODEPAGE record's value as a single-byte table: Windows code
+    /// pages by number, the DOS ones, and Excel's own aliases (32768 is
+    /// Mac Roman, 32769 Windows-1252, per xlrd's and OpenOffice's maps).
+    /// 367 (ASCII) and anything unknown fall back to Windows-1252.
+    fn xls_codepage_table(cp: u16) -> &'static [u16; 256] {
+        let name = match cp {
+            437 | 737 | 775 | 850 | 852 | 855 | 857 | 858 | 860 | 861 | 862 | 863 | 864 | 865
+            | 866 | 869 | 720 => format!("CP{cp}"),
+            874 | 1250..=1258 => format!("WINDOWS-{cp}"),
+            10000 | 32768 => "MACINTOSH".to_string(),
+            10007 => "MACCYRILLIC".to_string(),
+            10006 => "MACGREEK".to_string(),
+            10081 => "MACTURKISH".to_string(),
+            10029 => "MACLATIN2".to_string(),
+            _ => "WINDOWS-1252".to_string(),
+        };
+        codepage_support::table(&name)
+            .or_else(|| codepage_support::table("WINDOWS-1252"))
+            .expect("the Windows-1252 table is always present")
+    }
+
     /// Parses the workbook-globals substream - the BIFF record stream
     /// from the very start of the "Workbook" stream up to its first EOF
     /// record - collecting everything needed to read the per-sheet
@@ -81594,35 +81664,46 @@ mod xlsx_support {
         sheet_positions: Vec<(usize, String)>,
         sst: Vec<String>,
         is_date_by_xf: Vec<bool>,
+        text: XlsText,
     }
 
     fn xls_parse_workbook_globals(stream: &[u8]) -> Result<XlsWorkbookGlobals> {
-        let mut biff_checked = false;
+        let mut biff: Option<u8> = None;
+        let mut codepage: Option<u16> = None;
         let mut custom_date_formats: HashMap<u16, bool> = HashMap::new();
+        // BIFF3/4 FORMAT records carry no index of their own: a format's
+        // index is its position among them.
+        let mut next_format_index: u16 = 0;
         let mut xfs: Vec<u16> = Vec::new();
         let mut sheet_positions: Vec<(usize, String)> = Vec::new();
         let mut sst: Vec<String> = Vec::new();
 
         for record in (XlsRecordIter { stream }) {
             let mut r = record?;
+            let text = XlsText {
+                biff: biff.unwrap_or(8),
+                table: codepage.map(xls_codepage_table),
+            };
             match r.typ {
-                0x0809 => {
-                    // BOF [MS-XLS 2.4.21] - only the very first one (this
-                    // substream's own) is checked; per-sheet substreams
-                    // are parsed separately by `xls_parse_sheet`.
-                    if !biff_checked {
-                        let biff_version = xls_read_u16(r.data, 0)?;
-                        if biff_version != 0x0600 {
-                            bail!(
-                                "this .xls file uses an older BIFF version (0x{biff_version:04X}) \
-                                 - only BIFF8 (Excel 97-2003) is supported; re-save from a newer \
-                                 Excel/LibreOffice, or convert to .xlsx"
-                            );
-                        }
-                        biff_checked = true;
-                    }
+                // BOF [MS-XLS 2.4.21]: BIFF5/7/8 use 0x0809 with the
+                // version in the record; BIFF3 and BIFF4 have their own
+                // record types. Only the very first one (this substream's
+                // own) sets the version.
+                0x0809 | 0x0209 | 0x0409 if biff.is_none() => {
+                    biff = Some(match (r.typ, xls_read_u16(r.data, 0)?) {
+                        (0x0809, 0x0600) => 8,
+                        (0x0809, 0x0500) => 5,
+                        (0x0209, _) => 3,
+                        (0x0409, _) => 4,
+                        (_, v) => bail!(
+                            "this .xls file uses an unrecognized BIFF version (0x{v:04X}) - \
+                             BIFF3, BIFF4, BIFF5/7 (Excel 5/95), and BIFF8 (Excel 97-2003) are \
+                             supported"
+                        ),
+                    });
                 }
-                0x041E => {
+                0x0042 => codepage = Some(xls_read_u16(r.data, 0)?),
+                0x041E if text.biff == 8 => {
                     // Format [MS-XLS 2.4.126] - only a fixed set of custom
                     // format IDs is valid; anything else is skipped
                     // exactly as calamine's own `parse_format` does
@@ -81635,15 +81716,57 @@ mod xlsx_support {
                         }
                     }
                 }
+                0x041E if text.biff == 5 => {
+                    // BIFF5 FORMAT: its index, then a byte string. Every
+                    // format a BIFF5 file uses is written out, built-ins
+                    // included, so all of them are taken at their word.
+                    if r.data.len() >= 3 {
+                        let ifmt = xls_read_u16(r.data, 0)?;
+                        let code = text.byte_string(&r.data[2..], false)?;
+                        custom_date_formats.insert(ifmt, xlsx_is_date_format_code(&code));
+                    }
+                }
+                0x041E | 0x001E => {
+                    // BIFF4 FORMAT (two unused bytes, then a byte string)
+                    // or BIFF2/3 FORMAT (just the byte string), indexed by
+                    // order.
+                    let body = if r.typ == 0x041E {
+                        r.data.get(2..).unwrap_or(&[])
+                    } else {
+                        r.data
+                    };
+                    if !body.is_empty() {
+                        let code = text.byte_string(body, false)?;
+                        custom_date_formats
+                            .insert(next_format_index, xlsx_is_date_format_code(&code));
+                    }
+                    next_format_index = next_format_index.saturating_add(1);
+                }
                 0x00E0 => {
-                    // XF [MS-XLS 2.4.353] - only the format index (ifmt,
-                    // at byte offset 2) is needed here.
+                    // XF [MS-XLS 2.4.353], BIFF5 and BIFF8 alike - only the
+                    // format index (ifmt, at byte offset 2) is needed here.
                     if r.data.len() >= 4 {
                         xfs.push(xls_read_u16(r.data, 2)?);
                     }
                 }
+                0x0243 | 0x0443 => {
+                    // BIFF3/BIFF4 XF: a 1-byte font index, then a 1-byte
+                    // format index.
+                    if r.data.len() >= 2 {
+                        xfs.push(u16::from(r.data[1]));
+                    }
+                }
                 0x0085 => {
-                    sheet_positions.push(xls_parse_boundsheet(r.data)?);
+                    sheet_positions.push(if text.biff == 8 {
+                        xls_parse_boundsheet(r.data)?
+                    } else {
+                        // BIFF5 BOUNDSHEET: offset, visibility, type, then
+                        // the name as a byte string.
+                        let pos = xls_read_u32(r.data, 0)? as usize;
+                        let mut name = text.byte_string(r.data.get(6..).unwrap_or(&[]), false)?;
+                        name.retain(|c| c != '\0');
+                        (pos, name)
+                    });
                 }
                 0x00FC => {
                     sst = xls_parse_sst(&mut r)?;
@@ -81653,9 +81776,9 @@ mod xlsx_support {
             }
         }
 
-        if !biff_checked {
+        let Some(biff) = biff else {
             bail!("no BOF record found - not a valid BIFF workbook stream");
-        }
+        };
 
         let is_date_by_xf: Vec<bool> = xfs
             .iter()
@@ -81663,7 +81786,7 @@ mod xlsx_support {
                 custom_date_formats
                     .get(&ifmt)
                     .copied()
-                    .unwrap_or_else(|| xls_builtin_format_is_date(ifmt))
+                    .unwrap_or_else(|| biff >= 5 && xls_builtin_format_is_date(ifmt))
             })
             .collect();
 
@@ -81671,6 +81794,10 @@ mod xlsx_support {
             sheet_positions,
             sst,
             is_date_by_xf,
+            text: XlsText {
+                biff,
+                table: (biff < 8).then(|| xls_codepage_table(codepage.unwrap_or(1252))),
+            },
         })
     }
 
@@ -81764,6 +81891,7 @@ mod xlsx_support {
         stream: &[u8],
         sst: &[String],
         is_date_by_xf: &[bool],
+        text: &XlsText,
         mut on_cell: impl FnMut(u32, u32, String) -> Result<()>,
     ) -> Result<()> {
         let mut fmla_pos: (u32, u32) = (0, 0);
@@ -81783,8 +81911,16 @@ mod xlsx_support {
                         on_cell(row, col, val)?;
                     }
                 }
-                0x0204 | 0x00D6 => {
+                0x0204 | 0x00D6 if text.biff == 8 => {
                     let (row, col, val) = xls_parse_label(r.data)?;
+                    on_cell(row, col, val)?;
+                }
+                0x0204 | 0x00D6 => {
+                    // BIFF3-5 LABEL/RSTRING: row, col, XF, then a byte
+                    // string with a 16-bit length.
+                    let row = xls_read_u16(r.data, 0)? as u32;
+                    let col = xls_read_u16(r.data, 2)? as u32;
+                    let val = text.byte_string(r.data.get(6..).unwrap_or(&[]), true)?;
                     on_cell(row, col, val)?;
                 }
                 0x00FD => {
@@ -81796,7 +81932,9 @@ mod xlsx_support {
                     let (row, col, val) = xls_parse_bool_err(r.data)?;
                     on_cell(row, col, val)?;
                 }
-                0x0006 => {
+                // FORMULA: BIFF5/8 0x0006, BIFF3 0x0206, BIFF4 0x0406 -
+                // the same row/col/XF/cached-value head in all three.
+                0x0006 | 0x0206 | 0x0406 => {
                     let d = r.data.get(0..14).context("truncated FORMULA record")?;
                     let row = xls_read_u16(d, 0)? as u32;
                     let col = xls_read_u16(d, 2)? as u32;
@@ -81808,7 +81946,11 @@ mod xlsx_support {
                     }
                 }
                 0x0207 => {
-                    let val = xls_parse_unicode_string(r.data)?;
+                    let val = if text.biff == 8 {
+                        xls_parse_unicode_string(r.data)?
+                    } else {
+                        text.byte_string(r.data, true)?
+                    };
                     on_cell(fmla_pos.0, fmla_pos.1, val)?;
                 }
                 0x000A => break, // EOF of this worksheet's substream
@@ -81834,6 +81976,7 @@ mod xlsx_support {
         stream: &[u8],
         sst: &[String],
         is_date_by_xf: &[bool],
+        text: &XlsText,
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Option<Vec<ColumnProfile>>> {
@@ -81842,7 +81985,7 @@ mod xlsx_support {
         let mut max_row: i64 = -1;
         let mut max_col: i64 = -1;
 
-        xls_walk_sheet_cells(stream, sst, is_date_by_xf, |row, col, val| {
+        xls_walk_sheet_cells(stream, sst, is_date_by_xf, text, |row, col, val| {
             biff_fold_cell(
                 row,
                 col,
@@ -81873,10 +82016,11 @@ mod xlsx_support {
         stream: &[u8],
         sst: &[String],
         is_date_by_xf: &[bool],
+        text: &XlsText,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
         let mut builder = BiffRowBuilder::new();
-        xls_walk_sheet_cells(stream, sst, is_date_by_xf, |row, col, val| {
+        xls_walk_sheet_cells(stream, sst, is_date_by_xf, text, |row, col, val| {
             builder.accept_cell(row, col, val, sink)
         })?;
         builder.finish(sink)
@@ -81897,6 +82041,7 @@ mod xlsx_support {
             sheet_positions,
             sst,
             is_date_by_xf,
+            text,
         } = xls_parse_workbook_globals(&stream)?;
         if sheet_positions.is_empty() {
             bail!("no sheets found in {path:?}");
@@ -81907,8 +82052,14 @@ mod xlsx_support {
             let sheet_stream = stream
                 .get(pos..)
                 .context("BOUNDSHEET8 position past the end of the Workbook stream")?;
-            let Some(profiles) =
-                xls_parse_sheet_profiles(sheet_stream, &sst, &is_date_by_xf, nrows, n_samples)?
+            let Some(profiles) = xls_parse_sheet_profiles(
+                sheet_stream,
+                &sst,
+                &is_date_by_xf,
+                &text,
+                nrows,
+                n_samples,
+            )?
             else {
                 continue; // empty sheet (or a non-tabular one, e.g. a chart)
             };
@@ -81941,6 +82092,7 @@ mod xlsx_support {
             sheet_positions,
             sst,
             is_date_by_xf,
+            text,
         } = xls_parse_workbook_globals(&stream)?;
         let pos = sheet_positions
             .into_iter()
@@ -81949,7 +82101,76 @@ mod xlsx_support {
         let sheet_stream = stream
             .get(pos..)
             .context("BOUNDSHEET8 position past the end of the Workbook stream")?;
-        xls_stream_sheet_rows_for_sql(sheet_stream, &sst, &is_date_by_xf, sink)
+        xls_stream_sheet_rows_for_sql(sheet_stream, &sst, &is_date_by_xf, &text, sink)
+    }
+
+    /// A bare BIFF2-4 file - no OLE2 container, just one worksheet's
+    /// record stream from byte 0 - as its BIFF version, or `None`. BIFF2
+    /// has different cell records and no fixture to verify them against,
+    /// so it's recognized only to be refused clearly.
+    pub(crate) fn raw_biff_version(path: &Path) -> Option<u8> {
+        let mut head = [0u8; 8];
+        let mut f = fs::File::open(path).ok()?;
+        std::io::Read::read_exact(&mut f, &mut head).ok()?;
+        let typ = u16::from_le_bytes([head[0], head[1]]);
+        let len = u16::from_le_bytes([head[2], head[3]]);
+        match (typ, len) {
+            (0x0009, 4) => Some(2),
+            (0x0209, 6) => Some(3),
+            (0x0409, 6) => Some(4),
+            _ => None,
+        }
+    }
+
+    /// Reads a bare BIFF3/4 worksheet file: its globals (CODEPAGE,
+    /// FORMAT, XF) and cells share one substream, so the same bytes are
+    /// parsed for both. A BIFF4 *workbook* (BOF type 0x0100, several
+    /// sheets in one bare stream) is refused - nothing verifiable writes
+    /// one.
+    fn raw_biff_stream(path: &Path) -> Result<(Vec<u8>, XlsWorkbookGlobals)> {
+        match raw_biff_version(path) {
+            Some(2) => bail!(
+                "{path:?} is a BIFF2 (Excel 2.x) worksheet - only BIFF3 and later are supported; \
+                 re-save it from a newer Excel/LibreOffice"
+            ),
+            Some(_) => {}
+            None => bail!("{path:?} isn't a bare BIFF3/BIFF4 worksheet"),
+        }
+        let stream = fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+        let bof_type = xls_read_u16(&stream, 6)?;
+        if bof_type == 0x0100 {
+            bail!(
+                "{path:?} is a BIFF4 workbook (several sheets in one bare stream) - only single \
+                 BIFF3/BIFF4 worksheets are supported"
+            );
+        }
+        let globals = xls_parse_workbook_globals(&stream)?;
+        Ok((stream, globals))
+    }
+
+    /// The table name a bare BIFF3/4 worksheet gets: it has no sheet name
+    /// of its own, and this is the name Excel shows for it.
+    pub(crate) const RAW_BIFF_SHEET_NAME: &str = "Sheet1";
+
+    pub(crate) fn columns_from_raw_biff(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let (stream, g) = raw_biff_stream(path)?;
+        Ok(
+            xls_parse_sheet_profiles(&stream, &g.sst, &g.is_date_by_xf, &g.text, nrows, n_samples)?
+                .map(|profiles| vec![(RAW_BIFF_SHEET_NAME.to_string(), profiles)])
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(crate) fn stream_raw_biff_rows_for_sql(
+        path: &Path,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let (stream, g) = raw_biff_stream(path)?;
+        xls_stream_sheet_rows_for_sql(&stream, &g.sst, &g.is_date_by_xf, &g.text, sink)
     }
 
     // --- Hand-rolled BIFF12 (.xlsb) reader ---

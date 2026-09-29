@@ -21,6 +21,8 @@ All notable changes to sniff-rs are documented here. Format follows
 - An empty `/FlateDecode` stream in a PDF no longer fails the file.
 
 ### Added
+- `.xls` reads Excel 5.0/95 (BIFF5/7) workbooks and bare BIFF3/BIFF4
+  worksheets, not just BIFF8.
 - Directory mode profiles files in parallel (`--jobs N`, default: CPU
   cores); output and progress lines stay in walk order, identical to a
   sequential run.

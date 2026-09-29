@@ -15583,3 +15583,80 @@ fn jobs_flag_is_validated() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--jobs only applies"));
 }
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn xls_biff5_reads_sheets_codepage_text_and_both_kinds_of_date_format() {
+    // Checked against xlrd. Format 165 is an explicit custom `m/d/y`;
+    // XF 25 uses built-in format 14, which BIFF5 never writes out.
+    let doc = run_json(
+        "edge_xls_biff5_dates_and_codepage.xls",
+        &["--samples", "20"],
+    );
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(tables.keys().collect::<Vec<_>>(), ["Feuil1"]);
+    let sheet = table(&doc, "Feuil1");
+    let values = |i: usize| sheet[i]["sample_values"].as_array().unwrap().clone();
+    assert!(values(1).contains(&serde_json::json!("Nümber")));
+    let formatted = values(4);
+    for v in [
+        "1900-01-01",
+        "1900-01-01T13:12:00",
+        "1900-06-17",
+        "1905-05-13",
+        "1903-06-06T19:40:48",
+    ] {
+        assert!(
+            formatted.contains(&serde_json::json!(v)),
+            "{v} not in {formatted:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn xls_bare_biff3_and_biff4_worksheets_are_read() {
+    let doc = run_json("poi_biff3.xls", &[]);
+    let sheet = table(&doc, "Sheet1");
+    assert_eq!(sheet.len(), 10);
+    assert_eq!(sheet[0]["row_count"], 34);
+    // BIFF4: format indices are positional, so XF 102 -> format 18 is
+    // `m/d/yy`. Serial 12 is 1900-01-12.
+    let doc = run_json("edge_xls_biff4_dates.xls", &["--samples", "1000"]);
+    let sheet = table(&doc, "Sheet1");
+    assert_eq!(sheet.len(), 12);
+    assert!(
+        sheet[1]["sample_values"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("1900-01-12"))
+    );
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn xls_biff5_empty_sheets_are_skipped() {
+    let doc = run_json("poi_biff5_excel95.xls", &[]);
+    assert_eq!(doc["tables"].as_object().unwrap().len(), 1);
+}
+
+#[test]
+#[cfg(feature = "xlsx")]
+fn xls_bare_biff2_is_refused_clearly() {
+    let dir = TempDir::new();
+    let path = dir.path().join("old.xls");
+    // BOF (BIFF2, worksheet) then EOF.
+    std::fs::write(
+        &path,
+        [
+            0x09, 0x00, 0x04, 0x00, 0x02, 0x00, 0x10, 0x00, 0x0A, 0x00, 0x00, 0x00,
+        ],
+    )
+    .unwrap();
+    let output = Command::new(bin())
+        .args([path.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("BIFF2"));
+}

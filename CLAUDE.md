@@ -79,7 +79,7 @@ full, honest numbers.
 | Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List/Map |
 | Arrow IPC / Feather | `.arrow`, `.feather` | `--features parquet` | shares Parquet's Arrow infrastructure |
 | Avro | `.avro` | `--features avro` | recurses into records/arrays/unions |
-| Excel | `.xlsx`, `.xls`, `.xlsb`, `.ods` | `--features xlsx` | one section per sheet, like SQLite (see below) |
+| Excel | `.xlsx`, `.xls`, `.xlsb`, `.ods` | `--features xlsx` | one section per sheet, like SQLite (see below); `.xls` covers BIFF8 (97-2003), BIFF5/7 (5.0/95), and bare BIFF3/BIFF4 worksheets |
 | SQLite | `.db`, `.sqlite`, `.sqlite3` | `--features sqlite` | one section per table (see below) |
 | MessagePack | `.msgpack`, `.mp` | `--features msgpack` | stream of concatenated records, or a single top-level array |
 | TOML | `.toml` | `--features toml` | whole document = one row; array-of-tables flattens like a nested JSON array |
@@ -11721,7 +11721,8 @@ this project could just implement directly rather than depend on:
   string.
 
   Two scope boundaries were chosen deliberately, both disclosed rather
-  than silently assumed: this reader targets BIFF8 only (Excel 97-2003 -
+  than silently assumed (the first was later narrowed - see the BIFF3-5
+  entry just below): this reader targets BIFF8 only (Excel 97-2003 -
   the version every writer anyone would actually feed this tool today
   produces, LibreOffice's own filter included; an older BIFF2-5 stream is
   a clear, actionable error rather than guessed-at, since there's no
@@ -11752,6 +11753,36 @@ this project could just implement directly rather than depend on:
   and sample values - before the dispatcher was wired to prefer this
   reader over calamine for `.xls`.
 
+- **BIFF3, BIFF4, and BIFF5/7 `.xls`, added later - the "no fixture"
+  boundary above turned out to be closable.** No tool here writes them
+  (modern LibreOffice dropped its Excel 5.0/95 export filter), but Apache
+  POI's test corpus has real ones (`testEXCEL_95.xls`, `testEXCEL_4.xls`,
+  `testEXCEL_3.xls`), and `xlrd` - which reads BIFF2-8 - is an
+  independent oracle for all of them. The differences from BIFF8, each
+  read from the OpenOffice Excel file-format documentation and xlrd's
+  source: strings are 8-bit bytes in the file's CODEPAGE (0x0042; absent
+  means Windows-1252, and Excel's aliases 32768/32769 are Mac
+  Roman/Windows-1252), with LABEL/STRING carrying a 16-bit length and
+  BOUNDSHEET/FORMAT an 8-bit one; there's no SST; BIFF5's FORMAT carries
+  its own index and writes only custom formats (built-ins 0-163 stay
+  implicit, so the built-in date range still applies), while BIFF3/4
+  write every format and index them by position; BIFF3/4 XF records
+  (0x0243/0x0443) hold a one-byte format index at offset 1; FORMULA is
+  0x0206/0x0406 in BIFF3/4 with the same head. BIFF5 lives in an OLE2
+  `Book` stream exactly like BIFF8; BIFF3/4 files are bare record
+  streams of one worksheet, detected by their BOF (0x0209/0x0409) and
+  named `Sheet1`. A BIFF4 *workbook* (several sheets in one bare stream)
+  and BIFF2 (different cell records) are refused clearly - nothing here
+  can produce or verify either. Two fixtures are POI's files patched in
+  place (same length, via `olefile` for the OLE2 one) so the date paths
+  are exercised - a custom `m/d/y` format, a built-in format 14, and a
+  BIFF4 positional format 18 - plus a cp1252 `ü`; see
+  `tests/fixtures/poi_biff_PROVENANCE.md`. All four files and xlrd's own
+  BIFF4 sample match xlrd column for column (every value, every row
+  count), every existing spreadsheet fixture is byte-identical in JSON
+  and SQL output, and inline SQL loads them into SQLite. BIFF8's own
+  compressed strings still decode as Latin-1 rather than through the
+  CODEPAGE (a BIFF8 file always stores non-ASCII as UTF-16 in practice).
 - **`.xlsb` (Excel Binary Workbook, BIFF12) - initially declined, then
   revisited once a real verification fixture turned out to be reachable
   after all.** This was first written up as a permanent gap: LibreOffice
