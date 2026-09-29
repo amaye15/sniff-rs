@@ -110,7 +110,7 @@ full, honest numbers.
 | iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
 | MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
 | Jupyter notebooks (.ipynb) | `.ipynb` | `--features ipynb` | standard JSON with a fixed top-level shape (nbformat v4); the top-level `cells` array is the natural records array, one record per object in it; a cell's own `source` line-list pools into a `Vec<String>` column by the existing array convention |
-| PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode), breaking words and lines where the glyphs are drawn and letting marked-content `/ActualText` stand in for the glyphs it covers - see the Dependency footprint section |
+| PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode), breaking words and lines where the glyphs are drawn and letting marked-content `/ActualText` stand in for the glyphs it covers; comment/note annotation text lands in an `annotations` column, and a filled-in AcroForm becomes a second `<file>_form` table (one record, one column per field) - see the Dependency footprint section |
 | Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
 | Apache Iceberg | *(directory)* | `--features iceberg` | also detected from directory structure (a `metadata/` subdirectory with a real `*.metadata.json` file); resolves the current metadata.json's own snapshot to a manifest-list (Avro) naming manifest files (Avro) naming live Parquet data files, then profiles them the same "one merged table" way - see "Lakehouse table formats" below |
 
@@ -16867,6 +16867,45 @@ it in. Disclosed boundaries: ActualText over a sequence that draws no
 glyph (an image) has nowhere to be placed and is dropped, and named
 property lists in an encrypted file are skipped.
 
+**A follow-up pass surfaced interactive-form field values and annotation
+text** - both were disclosed as "not surfaced at all". A filled-in form
+is one row of data, so its terminal fields (ISO 32000-1 12.7) become a
+second table, `<file>_form`, with one record and one column per fully
+qualified field name (ancestor `/T` partial names joined by `.`, the
+spec's own rule, so `address.city` flattens like any nested field). A
+kid with no `/T` is a widget of its parent, not a field; `/V` inherits
+down the tree; a field with no value is still a column, 100% missing.
+Values render the way their object says: a text string through
+`decode_text_string` (UTF-16BE/LE, UTF-8, PDFDocEncoding), a name
+(checkbox/radio state, `Yes`/`Off`) as its text, an array (a
+multi-select list) as `Vec<T>`. Annotation `/Contents` - comments,
+notes, free text; widgets, links, and pop-ups skipped since they only
+repeat other text - is a per-page `annotations` column, added only when
+some page has one, so a PDF with neither keeps its exact old shape.
+
+Dictionary-level strings needed decryption for the first time: an
+encrypted file's stream contents were already decrypted, but `/T`, `/V`,
+and `/Contents` live in dictionaries. `decrypt_strings` walks a resolved
+object with the key of the indirect object it came from (Algorithm 1, or
+the file key for `/V` 5); objects inside an object stream are already
+decrypted with the stream, and a direct object has no number to key from
+- in an encrypted file those are skipped. Both walks are best-effort: an
+object that won't resolve is skipped with everything under it, never an
+error - found on the real corpus, where the first version made two
+previously-readable PDFs fail on a broken object only a form field or
+annotation pointed at. `flate_decode` also stops treating an empty or
+whitespace-only `/FlateDecode` stream as corrupt (a real, pre-existing
+bug that pikepdf's blank pages hit).
+
+Verified against pikepdf and pypdf: the two fixtures
+(`edge_pdf_form_and_annotations.pdf` and an AES-128 copy with an empty
+user password, pikepdf-written) match field for field; across the real
+666-PDF corpus, all 51 PDFs with form fields produce the same field
+names pypdf reports and all 136 text/name values compared match, 26
+files gain an `annotations` column, and no existing table or column
+changed byte-for-byte. `--output-format sql` staging covers the extra
+table; PDF still has no inline-SQL row source (staging only).
+
 ## Agent-friendly CLI surface
 
 Prompted directly by a "make this CLI as agent-friendly as possible - not
@@ -17192,8 +17231,10 @@ established baselines exactly.
   ToUnicode covers it. LZWDecode streams
   (a whole-file refusal), and image-only scanned pages (present record,
   missing text - OCR is out of scope) round out the same
-  disclosed-boundary set; annotations and AcroForm field values are not
-  surfaced at all. Encryption is decrypted with an empty user password
+  disclosed-boundary set. Annotation `/Contents` (not widget, link, or
+  pop-up annotations) and AcroForm field values are surfaced
+  best-effort; appearance streams, XFA forms, and strings stored as
+  direct objects in an encrypted file are not. Encryption is decrypted with an empty user password
   across every Standard Security Handler revision the PDF spec defines -
   classic `/V` 1/2/4 (RC4 and AES-128) and `/V` 5 (AES-256, `/R` 5's
   deprecated single-round SHA-256 KDF and `/R` 6's own "hardened hash")

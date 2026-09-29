@@ -56090,6 +56090,218 @@ mod pdf_support {
         }
     }
 
+    /// Every string in `obj` decrypted under indirect object `num`'s key -
+    /// a string in an encrypted file is encrypted with the key of the
+    /// indirect object that contains it (ISO 32000-1 7.6.2), direct
+    /// sub-objects included. A string that fails to decrypt stays as is.
+    fn decrypt_strings(enc: &PdfEncryption, num: u32, gen_num: u16, obj: PdfObj) -> PdfObj {
+        match obj {
+            PdfObj::Str(bytes) => PdfObj::Str(enc.decrypt(num, gen_num, &bytes).unwrap_or(bytes)),
+            PdfObj::Array(items) => PdfObj::Array(
+                items
+                    .into_iter()
+                    .map(|o| decrypt_strings(enc, num, gen_num, o))
+                    .collect(),
+            ),
+            PdfObj::Dict(map) => PdfObj::Dict(
+                map.into_iter()
+                    .map(|(k, v)| (k, decrypt_strings(enc, num, gen_num, v)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    /// A form field's `/V` as a JSON value: text as a string (a PDF text
+    /// string, 7.9.2.2), a checkbox/radio state name as its name (`Off`
+    /// when unchecked), a multi-select choice as an array. A rich-text
+    /// stream or signature dictionary has no plain value.
+    fn form_value_to_json(v: &PdfObj) -> JsonValue {
+        match v {
+            PdfObj::Str(b) => JsonValue::String(decode_text_string(b)),
+            PdfObj::Name(n) => JsonValue::String(String::from_utf8_lossy(n).into_owned()),
+            PdfObj::Int(i) => JsonValue::from(*i),
+            PdfObj::Float(f) => JsonValue::from(*f),
+            PdfObj::Bool(b) => JsonValue::Bool(*b),
+            PdfObj::Array(items) => {
+                JsonValue::Array(items.iter().map(form_value_to_json).collect())
+            }
+            _ => JsonValue::Null,
+        }
+    }
+
+    /// More fields than any real form has; bounds a hostile field tree.
+    const MAX_FORM_FIELDS: usize = 100_000;
+
+    impl PdfReader {
+        /// `obj` resolved, with its strings decrypted when it's an
+        /// indirect object stored directly in an encrypted file (objects
+        /// inside an object stream are covered by the stream's own
+        /// decryption). A direct object has no number to derive a key
+        /// from, so in an encrypted file its strings can't be trusted -
+        /// `None` then.
+        fn resolve_plain(&mut self, obj: &PdfObj, path: &Path) -> Result<Option<PdfObj>> {
+            let resolved = self.resolve(obj, 0, path)?;
+            let Some(enc) = &self.encryption else {
+                return Ok(Some(resolved));
+            };
+            match obj {
+                PdfObj::Ref(num, gen_num) => match self.xref.get(num) {
+                    Some(XrefEntry::Offset(_)) => {
+                        Ok(Some(decrypt_strings(enc, *num, *gen_num as u16, resolved)))
+                    }
+                    _ => Ok(Some(resolved)),
+                },
+                _ => Ok(None),
+            }
+        }
+
+        /// The interactive form's terminal fields (ISO 32000-1 12.7), as
+        /// `(fully qualified name, value)` in document order. A field's
+        /// full name joins its ancestors' partial names (`/T`) with `.`;
+        /// a kid with no `/T` is one of the field's widgets, not a field.
+        /// `/V` inherits down the tree. A field with no value is `null`,
+        /// so it still shows up as a column. No `/AcroForm` means none.
+        fn form_fields(&mut self, path: &Path) -> Result<Vec<(String, JsonValue)>> {
+            let root_ref = self
+                .trailer
+                .get(b"Root".as_slice())
+                .cloned()
+                .unwrap_or(PdfObj::Null);
+            let Ok(PdfObj::Dict(root)) = self.resolve(&root_ref, 0, path) else {
+                return Ok(Vec::new());
+            };
+            let Some(form_ref) = root.get(b"AcroForm".as_slice()) else {
+                return Ok(Vec::new());
+            };
+            let Ok(PdfObj::Dict(form)) = self.resolve(form_ref, 0, path) else {
+                return Ok(Vec::new());
+            };
+            let fields_ref = form
+                .get(b"Fields".as_slice())
+                .cloned()
+                .unwrap_or(PdfObj::Null);
+            let Ok(PdfObj::Array(fields)) = self.resolve(&fields_ref, 0, path) else {
+                return Ok(Vec::new());
+            };
+            let mut out: Vec<(String, JsonValue)> = Vec::new();
+            let mut seen_names: HashSet<String> = HashSet::new();
+            let mut visited: HashSet<u32> = HashSet::new();
+            let mut stack: Vec<(PdfObj, String, Option<PdfObj>, usize)> = fields
+                .into_iter()
+                .rev()
+                .map(|f| (f, String::new(), None, 0))
+                .collect();
+            while let Some((field_ref, parent, inherited, depth)) = stack.pop() {
+                if depth > MAX_PDF_DEPTH || out.len() >= MAX_FORM_FIELDS {
+                    break;
+                }
+                if let PdfObj::Ref(num, _) = field_ref
+                    && !visited.insert(num)
+                {
+                    continue;
+                }
+                let Some(PdfObj::Dict(field)) = self.resolve_plain(&field_ref, path).ok().flatten()
+                else {
+                    continue;
+                };
+                let name = match field.get(b"T".as_slice()) {
+                    Some(PdfObj::Str(t)) => {
+                        let t = decode_text_string(t);
+                        if parent.is_empty() {
+                            t
+                        } else {
+                            format!("{parent}.{t}")
+                        }
+                    }
+                    _ => parent.clone(),
+                };
+                let value = field.get(b"V".as_slice()).cloned().or(inherited);
+                let kids = match field.get(b"Kids".as_slice()) {
+                    Some(k) => match self.resolve(k, 0, path) {
+                        Ok(PdfObj::Array(k)) => k,
+                        _ => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                let mut field_kids = Vec::new();
+                for kid in kids {
+                    if let Some(PdfObj::Dict(d)) = self.resolve_plain(&kid, path).ok().flatten()
+                        && d.contains_key(b"T".as_slice())
+                    {
+                        field_kids.push(kid);
+                    }
+                }
+                if field_kids.is_empty() {
+                    if !name.is_empty() && seen_names.insert(name.clone()) {
+                        let v = value.as_ref().map_or(JsonValue::Null, form_value_to_json);
+                        out.push((name, v));
+                    }
+                } else {
+                    for kid in field_kids.into_iter().rev() {
+                        stack.push((kid, name.clone(), value.clone(), depth + 1));
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        /// A page's annotation text: the `/Contents` of every annotation
+        /// except form widgets, links, and pop-ups (which only repeat
+        /// their parent's text) - comments, notes, highlights' remarks,
+        /// free-text boxes. Best-effort like `form_fields`: an annotation
+        /// that won't resolve is skipped.
+        fn page_annotations(
+            &mut self,
+            page: &BTreeMap<Vec<u8>, PdfObj>,
+            path: &Path,
+        ) -> Result<Vec<String>> {
+            let Some(annots_ref) = page.get(b"Annots".as_slice()) else {
+                return Ok(Vec::new());
+            };
+            let Ok(PdfObj::Array(annots)) = self.resolve(annots_ref, 0, path) else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for annot in annots {
+                let Some(PdfObj::Dict(d)) = self.resolve_plain(&annot, path).ok().flatten() else {
+                    continue;
+                };
+                let subtype = d.get(b"Subtype".as_slice()).and_then(PdfObj::as_name);
+                if matches!(subtype, Some(b"Widget") | Some(b"Link") | Some(b"Popup")) {
+                    continue;
+                }
+                if let Some(PdfObj::Str(c)) = d.get(b"Contents".as_slice()) {
+                    let text = decode_text_string(c);
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        out.push(text.to_string());
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// A PDF's interactive-form field values as one record, one column
+    /// per fully qualified field name - the way a filled-in form is one
+    /// row of data. `None` when the file has no form fields.
+    pub(crate) fn pdf_form_profiles(
+        path: &Path,
+        n_samples: usize,
+    ) -> Result<Option<Vec<ColumnProfile>>> {
+        let mut reader = PdfReader::open(path)?;
+        let fields = reader.form_fields(path)?;
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let mut record = json_support::Map::with_capacity(fields.len());
+        for (name, value) in fields {
+            record.push_unique(name, value);
+        }
+        Ok(Some(profile_json_records(&[record], n_samples)))
+    }
+
     /// Profiles a PDF as one record per page (`page_number`, `text`) -
     /// the natural record shape the way MBOX is one record per message:
     /// a whole document as one row would lose all per-page signal, and
@@ -56108,6 +56320,8 @@ mod pdf_support {
         let mut num_acc = ColumnAccumulatorState::new();
         let mut text_acc = ColumnAccumulatorState::new();
         let mut font_cache: HashMap<(FontScope, Vec<u8>), PdfFont> = HashMap::new();
+        let mut annot_acc = JsonPathAccumulator::new(n_samples);
+        let mut any_annotations = false;
         let mut kept = 0usize;
         for (idx, (page, resources)) in pages.iter().enumerate() {
             if nrows.is_some_and(|limit| kept >= limit) {
@@ -56117,6 +56331,13 @@ mod pdf_support {
             let text = reader.page_text(page, resources, idx, &mut font_cache, path)?;
             if !text.is_empty() {
                 text_acc.push(text, n_samples);
+            }
+            let annotations = reader.page_annotations(page, path)?;
+            if !annotations.is_empty() {
+                any_annotations = true;
+                annot_acc.push(&JsonValue::Array(
+                    annotations.into_iter().map(JsonValue::String).collect(),
+                ));
             }
             kept += 1;
         }
@@ -56166,10 +56387,13 @@ mod pdf_support {
             }
             text.notes.push_str(&disclosed.join("; "));
         }
-        Ok(vec![
-            num_acc.into_profile("page_number".to_string(), kept),
-            text,
-        ])
+        let mut out = vec![num_acc.into_profile("page_number".to_string(), kept), text];
+        // Only a document that has annotation text gets the column, so
+        // every other PDF's output is unchanged.
+        if any_annotations {
+            out.extend(annot_acc.finish("annotations".to_string(), kept));
+        }
+        Ok(out)
     }
 
     /// One cross-reference entry: where object `n` lives. `Free` covers
@@ -57614,6 +57838,11 @@ mod pdf_support {
             parms: Option<&BTreeMap<Vec<u8>, PdfObj>>,
             path: &Path,
         ) -> Result<Vec<u8>> {
+            // A zero-length stream holds no data (a blank page's content,
+            // as pikepdf and other writers emit it) - nothing to inflate.
+            if data.iter().all(u8::is_ascii_whitespace) {
+                return Ok(Vec::new());
+            }
             let framed = Self::zlib_framed(data).is_some();
             let inflated = if framed {
                 // The Adler trailer sits where the DEFLATE stream *ends*,
@@ -65402,6 +65631,17 @@ fn columns_from_pdf(
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
     pdf_support::columns_from_pdf(path, nrows, n_samples)
+}
+
+/// A PDF's form-field values as a second table, when it has any.
+#[cfg(feature = "pdf")]
+fn pdf_form_profiles(path: &Path, n_samples: usize) -> Result<Option<Vec<ColumnProfile>>> {
+    pdf_support::pdf_form_profiles(path, n_samples)
+}
+
+#[cfg(not(feature = "pdf"))]
+fn pdf_form_profiles(_path: &Path, _n_samples: usize) -> Result<Option<Vec<ColumnProfile>>> {
+    Ok(None)
 }
 
 #[cfg(not(feature = "pdf"))]
@@ -84624,7 +84864,16 @@ fn dispatch_reader(
                 "an Iceberg table is a directory, resolved and profiled directly by run_iceberg_table - it never reaches detect_format/dispatch_reader at all"
             ),
         };
-        std::iter::once((file_stem, profiles)).collect()
+        let mut tables: BTreeMap<String, Vec<ColumnProfile>> = BTreeMap::new();
+        // A PDF's filled-in form is one record of its own, beside the
+        // pages - named after the file so the pages table keeps its name.
+        if matches!(format, InputFormat::Pdf)
+            && let Some(form) = pdf_form_profiles(read_path, args.samples)?
+        {
+            tables.insert(format!("{file_stem}_form"), form);
+        }
+        tables.insert(file_stem, profiles);
+        tables
     };
     Ok((tables, resolved_skip_rows))
 }

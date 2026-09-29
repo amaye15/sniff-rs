@@ -18,8 +18,12 @@ All notable changes to sniff-rs are documented here. Format follows
 - gzip/zstd input with no telling extension (an extensionless file, or
   data piped to `-`) is recognized by its magic bytes and decompressed,
   instead of reaching the readers still compressed.
+- An empty `/FlateDecode` stream in a PDF no longer fails the file.
 
 ### Added
+- PDF: filled-in AcroForm field values become a `<file>_form` table and
+  comment/note annotation text an `annotations` column, including in
+  encrypted files.
 - ORC Struct/List/Map/Union columns are decoded and flattened into
   sub-columns instead of placeholder notes, in profiling and inline SQL.
 - `--output-format sql` (inline and staging) and `--load-into` work on

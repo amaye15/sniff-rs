@@ -15344,3 +15344,76 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) {
         }
     }
 }
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_form_fields_and_annotations_are_surfaced() {
+    // Checked against pikepdf and pypdf reading the same files. The
+    // encrypted copy (AES-128, empty user password) stores every string
+    // encrypted, so it also proves strings are decrypted with their
+    // object's key.
+    for (fixture_name, stem) in [
+        (
+            "edge_pdf_form_and_annotations.pdf",
+            "edge_pdf_form_and_annotations",
+        ),
+        (
+            "edge_pdf_form_and_annotations_encrypted.pdf",
+            "edge_pdf_form_and_annotations_encrypted",
+        ),
+    ] {
+        let doc = run_json(fixture_name, &[]);
+        let pages = table(&doc, stem);
+        assert_eq!(
+            column(pages, "annotations")["sample_values"],
+            serde_json::json!(["Please review section 2", "Signed off — ok"]),
+            "{fixture_name}"
+        );
+        let form = table(&doc, &format!("{stem}_form"));
+        let names: Vec<&str> = form.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "name",
+                "address.city",
+                "address.zip",
+                "agree",
+                "subscribe",
+                "langs",
+                "notes",
+                "email"
+            ],
+            "{fixture_name}"
+        );
+        for (name, value) in [
+            ("name", serde_json::json!(["José Álvarez"])),
+            ("address.city", serde_json::json!(["Paris"])),
+            ("address.zip", serde_json::json!(["75001"])),
+            ("agree", serde_json::json!(["Yes"])),
+            ("subscribe", serde_json::json!(["Off"])),
+            ("langs", serde_json::json!(["en", "fr"])),
+            ("email", serde_json::json!(["jose@example.com"])),
+        ] {
+            assert_eq!(
+                column(form, name)["sample_values"],
+                value,
+                "{fixture_name} {name}"
+            );
+        }
+        assert_eq!(
+            column(form, "notes")["missing_pct"],
+            100.0,
+            "{fixture_name}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "pdf")]
+fn pdf_without_a_form_or_annotations_keeps_its_old_shape() {
+    let doc = run_json("sample.pdf", &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(tables.len(), 1);
+    let pages = table(&doc, "sample");
+    assert!(pages.iter().all(|c| c["name"] != "annotations"));
+}
