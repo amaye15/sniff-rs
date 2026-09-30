@@ -16425,3 +16425,258 @@ fn nested_delta_table_without_the_feature_fails_with_a_rebuild_hint() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("--features delta"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --- Compression and archive wrappers ---
+
+fn container_table_columns(fixture_name: &str) -> (String, Vec<String>, u64) {
+    let doc = run_json(fixture_name, &[]);
+    let tables = doc["tables"].as_object().unwrap();
+    assert_eq!(tables.len(), 1, "{fixture_name}: {tables:?}");
+    let (name, cols) = tables.iter().next().unwrap();
+    let cols = cols.as_array().unwrap();
+    (
+        name.clone(),
+        cols.iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect(),
+        cols[0]["row_count"].as_u64().unwrap(),
+    )
+}
+
+#[test]
+fn a_single_file_archive_is_read_as_the_file_inside_it() {
+    // The table is named for the archive member, not the archive.
+    for (file, member) in [
+        ("edge_container_single.zip", "data"),
+        ("edge_container_zip_macos_junk.zip", "people"),
+        ("edge_container_single.tar", "data"),
+        ("edge_container_single.tar.gz", "people"),
+        ("edge_container_single.tgz", "people"),
+        ("edge_container_long_name.tar", "deep"),
+        ("edge_container_gnu_long.tar", "deep"),
+        // gzip around a zip: peeled layer by layer.
+        ("edge_container_zip_in_gzip.zip.gz", "data"),
+        // No extension at all: gzip, then tar, both recognized by magic.
+        ("edge_container_tar_gz_noext", "people"),
+    ] {
+        let (name, columns, rows) = container_table_columns(file);
+        assert_eq!(name, member, "{file}");
+        assert_eq!(columns[..2], ["id", "name"], "{file}");
+        assert_eq!(rows, 3, "{file}");
+    }
+}
+
+#[test]
+fn an_archive_of_several_files_is_refused_and_says_what_it_holds() {
+    for file in [
+        "edge_container_two_files.zip",
+        "edge_container_two_files.tar",
+    ] {
+        let out = Command::new(bin())
+            .args([fixture(file).to_str().unwrap(), "-"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{file}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("holds 2 files (a.csv, b.csv)"),
+            "{file}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_directory_walk_reads_archives_and_skips_multi_file_ones() {
+    let dir = std::env::temp_dir().join(format!("sniff-archives-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in [
+        "edge_container_single.zip",
+        "edge_container_single.tar.gz",
+        "edge_container_two_files.zip",
+        "edge_container_two_files.tar",
+    ] {
+        std::fs::copy(fixture(f), dir.join(f)).unwrap();
+    }
+    let out_dir = dir.join("out");
+    let out = Command::new(bin())
+        .args([
+            dir.to_str().unwrap(),
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    // The two readable archives each get an output, named for their
+    // member; the multi-file ones are skipped like any unrecognized file.
+    assert_eq!(
+        names,
+        [
+            "_index.dictionary.json",
+            "data.csv.dictionary.json",
+            "people.csv.dictionary.json"
+        ]
+    );
+    let index = std::fs::read_to_string(out_dir.join("_index.dictionary.json")).unwrap();
+    assert!(index.contains("edge_container_two_files.zip"), "{index}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_piped_archive_is_unwrapped_by_its_magic_bytes() {
+    let bytes = std::fs::read(fixture("edge_container_single.tar.gz")).unwrap();
+    let out = run_with_stdin(
+        &bytes,
+        &["-", "-", "--format", "csv", "--output-format", "json"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(table(&doc, "stdin")[0]["row_count"], 3);
+}
+
+#[test]
+fn a_corrupt_tar_is_an_error_not_a_guess() {
+    let mut bytes = std::fs::read(fixture("edge_container_single.tar")).unwrap();
+    bytes[10] ^= 0xFF; // a byte inside the first header, which breaks its checksum
+    let dir = std::env::temp_dir().join(format!("sniff-badtar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bad.tar");
+    std::fs::write(&path, bytes).unwrap();
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("isn't a valid tar archive"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn brotli_and_lz4_files_are_unwrapped() {
+    for (file, rows) in [
+        ("edge_container_single.csv.br", 3),
+        ("edge_container_brotli_large.csv.br", 6000),
+        ("edge_container_single.csv.lz4", 3),
+        // 6,000 rows across two linked 64 KiB blocks: the second block's
+        // matches reach back into the first.
+        ("edge_container_lz4_multi_block.csv.lz4", 6000),
+        // Two concatenated frames, which `cat a.lz4 b.lz4` produces.
+        ("edge_container_lz4_two_frames.csv.lz4", 6),
+    ] {
+        let (name, columns, got) = container_table_columns(file);
+        assert_eq!(name, file.split('.').next().unwrap(), "{file}");
+        assert_eq!(columns[..2], ["id", "name"], "{file}");
+        assert_eq!(got, rows, "{file}");
+    }
+}
+
+#[cfg(not(feature = "parquet"))]
+#[test]
+fn brotli_without_its_feature_says_what_to_rebuild_with() {
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_container_single.csv.br").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--features parquet"));
+}
+
+#[test]
+fn list_formats_names_the_wrappers() {
+    let out = Command::new(bin())
+        .args(["--list-formats", "--output-format", "json"])
+        .output()
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let containers = doc["containers"].as_array().unwrap();
+    let names: Vec<&str> = containers
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["gzip", "zstd", "zip", "tar", "brotli", "lz4"]);
+    let zip = containers.iter().find(|c| c["name"] == "zip").unwrap();
+    assert_eq!(zip["compiled_in"], true);
+    assert!(
+        zip["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == "zip")
+    );
+}
+
+// --- Arrow IPC streams (.arrows) ---
+
+#[cfg(feature = "parquet")]
+#[test]
+fn an_arrow_ipc_stream_file_profiles_like_a_feather_file() {
+    let doc = run_json("edge_arrow_stream.arrows", &[]);
+    let cols = table(&doc, "edge_arrow_stream");
+    assert_eq!(column(cols, "id")["ideal_type"], "i64");
+    assert_eq!(column(cols, "id")["row_count"], 3);
+    // A dictionary-encoded column resolves to its values.
+    assert_eq!(
+        column(cols, "tag")["sample_values"],
+        serde_json::json!(["a", "b"])
+    );
+    // Dictionary batches that grow between record batches accumulate.
+    let doc = run_json("edge_arrow_stream_delta_dict.arrows", &[]);
+    let cols = table(&doc, "edge_arrow_stream_delta_dict");
+    assert_eq!(column(cols, "tag")["row_count"], 5);
+    assert_eq!(
+        column(cols, "tag")["sample_values"],
+        serde_json::json!(["a", "b", "c"])
+    );
+    // --nrows stops after the batch that reaches the limit.
+    let doc = run_json("edge_arrow_stream_delta_dict.arrows", &["--nrows", "2"]);
+    assert_eq!(
+        column(table(&doc, "edge_arrow_stream_delta_dict"), "tag")["row_count"],
+        2
+    );
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn an_extensionless_arrow_stream_is_recognized_by_content_and_loads_as_sql() {
+    let dir = std::env::temp_dir().join(format!("sniff-arrows-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("stream_no_ext");
+    std::fs::copy(fixture("edge_arrow_stream.arrows"), &path).unwrap();
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8(out.stdout).unwrap();
+    assert!(sql.contains("INSERT INTO \"stream_no_ext\""), "{sql}");
+    assert!(
+        sql.contains("(10, 'a')") && sql.contains("(30, 'a')"),
+        "{sql}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

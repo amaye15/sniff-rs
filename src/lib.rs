@@ -35050,6 +35050,80 @@ mod lz4_support {
         }
     }
 
+    /// Decodes one complete LZ4 frame from the start of `input`, appending
+    /// to `out`, and returns how many input bytes the frame took - see
+    /// `arrow_ipc_support::lz4_frame_decompress`'s own doc comment for the
+    /// format and for why every block decodes into one frame-wide buffer
+    /// (linked blocks). The header and content checksums are skipped, not
+    /// verified. Shared by Arrow IPC's `LZ4_FRAME` body compression and
+    /// the `.lz4` file wrapper (`decompress_if_needed`).
+    pub(crate) fn lz4_frame_decode(input: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+        const LZ4_FRAME_MAGIC: u32 = 0x184D_2204;
+        let magic_bytes = input
+            .get(0..4)
+            .context("truncated LZ4 frame magic number")?;
+        let magic = u32::from_le_bytes(magic_bytes.try_into().unwrap());
+        if magic != LZ4_FRAME_MAGIC {
+            bail!("not a valid LZ4 frame (bad magic number)");
+        }
+        let flg = *input.get(4).context("truncated LZ4 frame descriptor")?;
+        let version = (flg >> 6) & 0b11;
+        if version != 1 {
+            bail!("unrecognized LZ4 frame version {version}");
+        }
+        let block_checksum_flag = (flg >> 4) & 1 == 1;
+        let content_size_flag = (flg >> 3) & 1 == 1;
+        let content_checksum_flag = (flg >> 2) & 1 == 1;
+        let dict_id_flag = flg & 1 == 1;
+
+        // FLG + BD = 2 bytes, then the optional fields, then a 1-byte
+        // header checksum - all fixed-width, so the header's total length
+        // is fully determined by the flag bits alone.
+        let mut pos = 6usize;
+        if content_size_flag {
+            pos += 8;
+        }
+        if dict_id_flag {
+            pos += 4;
+        }
+        pos += 1; // header checksum, unverified
+        if input.len() < pos {
+            bail!("truncated LZ4 frame header");
+        }
+
+        loop {
+            let size_bytes = input
+                .get(pos..pos + 4)
+                .context("truncated LZ4 frame block size")?;
+            let size_word = u32::from_le_bytes(size_bytes.try_into().unwrap());
+            pos += 4;
+            if size_word == 0 {
+                break;
+            }
+            let is_uncompressed = size_word & 0x8000_0000 != 0;
+            let block_len = (size_word & 0x7FFF_FFFF) as usize;
+            let block = input
+                .get(pos..pos + block_len)
+                .context("truncated LZ4 frame block data")?;
+            pos += block_len;
+            if is_uncompressed {
+                out.extend_from_slice(block);
+            } else {
+                lz4_block_decompress_into(block, out)?;
+            }
+            if block_checksum_flag {
+                pos += 4;
+            }
+        }
+        if content_checksum_flag {
+            pos += 4;
+        }
+        if pos > input.len() {
+            bail!("truncated LZ4 frame checksum");
+        }
+        Ok(pos)
+    }
+
     /// Decodes a raw LZ4 block (RFC-less, but a small, stable, widely
     /// implemented format - LZ4_Block_format.md in the reference `lz4`
     /// project) until the input is exhausted, which is how a decoder
@@ -43754,68 +43828,8 @@ mod arrow_ipc_support {
     /// checksum), ending with an optional 4-byte content checksum (also
     /// skipped).
     fn lz4_frame_decompress(input: &[u8], expected_len: usize) -> Result<Vec<u8>> {
-        const LZ4_FRAME_MAGIC: u32 = 0x184D_2204;
-        let magic_bytes = input
-            .get(0..4)
-            .context("truncated LZ4 frame magic number")?;
-        let magic = u32::from_le_bytes(magic_bytes.try_into().unwrap());
-        if magic != LZ4_FRAME_MAGIC {
-            bail!("not a valid LZ4 frame (bad magic number)");
-        }
-        let flg = *input.get(4).context("truncated LZ4 frame descriptor")?;
-        let version = (flg >> 6) & 0b11;
-        if version != 1 {
-            bail!("unrecognized LZ4 frame version {version}");
-        }
-        let block_checksum_flag = (flg >> 4) & 1 == 1;
-        let content_size_flag = (flg >> 3) & 1 == 1;
-        let content_checksum_flag = (flg >> 2) & 1 == 1;
-        let dict_id_flag = flg & 1 == 1;
-
-        // FLG + BD = 2 bytes, then the optional fields, then a 1-byte
-        // header checksum - all fixed-width, so the header's total length
-        // is fully determined by the flag bits alone.
-        let mut pos = 6usize;
-        if content_size_flag {
-            pos += 8;
-        }
-        if dict_id_flag {
-            pos += 4;
-        }
-        pos += 1; // header checksum, unverified
-        if input.len() < pos {
-            bail!("truncated LZ4 frame header");
-        }
-
         let mut out = Vec::with_capacity(expected_len);
-        loop {
-            let size_bytes = input
-                .get(pos..pos + 4)
-                .context("truncated LZ4 frame block size")?;
-            let size_word = u32::from_le_bytes(size_bytes.try_into().unwrap());
-            pos += 4;
-            if size_word == 0 {
-                break;
-            }
-            let is_uncompressed = size_word & 0x8000_0000 != 0;
-            let block_len = (size_word & 0x7FFF_FFFF) as usize;
-            let block = input
-                .get(pos..pos + block_len)
-                .context("truncated LZ4 frame block data")?;
-            pos += block_len;
-            if is_uncompressed {
-                out.extend_from_slice(block);
-            } else {
-                super::lz4_support::lz4_block_decompress_into(block, &mut out)?;
-            }
-            if block_checksum_flag {
-                pos += 4;
-            }
-        }
-        if content_checksum_flag {
-            pos += 4;
-        }
-        let _ = pos;
+        super::lz4_support::lz4_frame_decode(input, &mut out)?;
         if out.len() != expected_len {
             bail!(
                 "LZ4 frame decompressed to {} bytes, expected {expected_len}",
@@ -45288,6 +45302,9 @@ mod arrow_ipc_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
+        if arrow_ipc_is_stream(path)? {
+            return profile_arrow_ipc_stream(path, nrows, n_samples);
+        }
         let (mut file, footer) = open_and_read_footer(path)?;
         // Column-oriented from end to end: every RecordBatch is decoded
         // column-major already, so this reads straight into one
@@ -45296,7 +45313,23 @@ mod arrow_ipc_support {
         // them straight back to columns. Fields line up with
         // `footer.schema.fields` by position, so no name lookup is
         // needed at all.
-        let mut columns = read_arrow_ipc_file_columns_streaming(&mut file, &footer, nrows)?;
+        let columns = read_arrow_ipc_file_columns_streaming(&mut file, &footer, nrows)?;
+        Ok(profile_arrow_columns(
+            &footer.schema.fields,
+            columns,
+            nrows,
+            n_samples,
+        ))
+    }
+
+    /// Profiles one decoded column per schema field - the shared tail of
+    /// the File and Streaming format readers.
+    fn profile_arrow_columns(
+        fields: &[ArrowField],
+        mut columns: Vec<Vec<JsonValue>>,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Vec<ColumnProfile> {
         if let Some(limit) = nrows {
             for col in &mut columns {
                 col.truncate(limit);
@@ -45304,8 +45337,8 @@ mod arrow_ipc_support {
         }
         let total = columns.first().map_or(0, Vec::len);
 
-        let mut out = Vec::with_capacity(footer.schema.fields.len());
-        for (field, values) in footer.schema.fields.iter().zip(columns) {
+        let mut out = Vec::with_capacity(fields.len());
+        for (field, values) in fields.iter().zip(columns) {
             let name = field.name.clone();
             if arrow_data_type_is_nested(&field.data_type) {
                 let refs: Vec<&JsonValue> = values.iter().filter(|v| !v.is_null()).collect();
@@ -45326,7 +45359,159 @@ mod arrow_ipc_support {
                 out.push(profile_column(col, n_samples));
             }
         }
-        Ok(out)
+        out
+    }
+
+    /// Whether `path` is an Arrow IPC *Streaming* file (`.arrows`): it
+    /// opens with the 0xFFFFFFFF continuation marker of its first message
+    /// instead of the File format's `ARROW1` magic.
+    fn arrow_ipc_is_stream(path: &Path) -> Result<bool> {
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut head = [0u8; 4];
+        Ok(file.read_exact(&mut head).is_ok() && head == [0xFF; 4])
+    }
+
+    /// Walks an Arrow IPC *Streaming* file message by message, straight
+    /// off the file: each `RecordBatch` is decoded column-major and handed
+    /// to `on_batch` (schema, columns, row count; return `false` to stop),
+    /// then dropped, so memory is one batch. There's no footer to find the
+    /// schema or the batch offsets in, hence the sequential walk - the
+    /// first message is the schema, and a zero-length message (or the end
+    /// of the file) ends the stream. Dictionary batches are folded in as
+    /// they arrive. Returns the schema.
+    fn read_arrow_ipc_stream_batches(
+        path: &Path,
+        mut on_batch: impl FnMut(&ArrowSchema, Vec<(String, Vec<JsonValue>)>, usize) -> Result<bool>,
+    ) -> Result<ArrowSchema> {
+        let mut input = std::io::BufReader::new(
+            fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?,
+        );
+        let mut schema: Option<ArrowSchema> = None;
+        let mut dict_field_by_id: HashMap<i64, ArrowField> = HashMap::new();
+        let mut dictionaries: HashMap<i64, Vec<JsonValue>> = HashMap::new();
+        loop {
+            let mut prefix = [0u8; 8];
+            match input.read_exact(&mut prefix) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e).with_context(|| format!("failed to read {path:?}")),
+            }
+            if prefix[..4] != [0xFF; 4] {
+                bail!(
+                    "{path:?} isn't an Arrow IPC stream (a message doesn't start with the \
+                     0xFFFFFFFF continuation marker)"
+                );
+            }
+            let meta_len = i32::from_le_bytes(prefix[4..8].try_into().unwrap());
+            if meta_len == 0 {
+                break;
+            }
+            let meta_len =
+                usize::try_from(meta_len).context("negative Arrow IPC message length")?;
+            // A sane metadata block is a few KiB; refuse a corrupt length
+            // before allocating for it.
+            if meta_len > 64 << 20 {
+                bail!("{path:?} has an implausible Arrow IPC message length ({meta_len} bytes)");
+            }
+            // `parse_message` wants the 8-byte prefix plus the metadata.
+            let mut meta_buf = vec![0u8; 8 + meta_len];
+            meta_buf[..8].copy_from_slice(&prefix);
+            input
+                .read_exact(&mut meta_buf[8..])
+                .with_context(|| format!("truncated Arrow IPC stream message in {path:?}"))?;
+            let Some(message) = parse_message(&meta_buf)? else {
+                break;
+            };
+            let body_len = usize::try_from(message.body_length)
+                .context("negative Arrow IPC message body length")?;
+            let mut body = Vec::new();
+            (&mut input)
+                .take(body_len as u64)
+                .read_to_end(&mut body)
+                .with_context(|| format!("failed to read {path:?}"))?;
+            if body.len() != body_len {
+                bail!("{path:?} is truncated inside an Arrow IPC message body");
+            }
+
+            match message.header {
+                ArrowMessageHeader::Schema => {
+                    // `parse_message` doesn't decode a Schema message's
+                    // own body, so the schema table is re-found here.
+                    let fb_buf = &meta_buf[8..];
+                    let root = fb_root(fb_buf)?;
+                    let header_loc = fb_get_ref(fb_buf, root, 2)?
+                        .context("Arrow IPC stream Schema message missing its own header")?;
+                    let parsed = parse_schema(fb_buf, header_loc)?;
+                    let mut map = HashMap::new();
+                    for field in &parsed.fields {
+                        collect_dictionary_fields(field, &mut map);
+                    }
+                    dict_field_by_id = map;
+                    schema = Some(parsed);
+                }
+                ArrowMessageHeader::DictionaryBatch(dict_meta) => {
+                    let value_field = dict_field_by_id.get(&dict_meta.id).with_context(|| {
+                        format!(
+                            "Arrow IPC stream DictionaryBatch id {} has no matching schema field",
+                            dict_meta.id
+                        )
+                    })?;
+                    let values = decode_dictionary_batch(
+                        value_field,
+                        &dict_meta.data,
+                        &body,
+                        &dictionaries,
+                    )?;
+                    if dict_meta.is_delta {
+                        dictionaries.entry(dict_meta.id).or_default().extend(values);
+                    } else {
+                        dictionaries.insert(dict_meta.id, values);
+                    }
+                }
+                ArrowMessageHeader::RecordBatch(batch_meta) => {
+                    let schema = schema.as_ref().context(
+                        "Arrow IPC stream has a RecordBatch message before its own Schema message",
+                    )?;
+                    let cols =
+                        decode_record_batch_columns(schema, &batch_meta, &body, &dictionaries)?;
+                    let rows = usize::try_from(batch_meta.length).unwrap_or(0);
+                    if !on_batch(schema, cols, rows)? {
+                        break;
+                    }
+                }
+                ArrowMessageHeader::None => {}
+            }
+        }
+        schema.context("Arrow IPC stream has no Schema message")
+    }
+
+    /// `profile_arrow_ipc_file` for a Streaming-format file.
+    fn profile_arrow_ipc_stream(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let mut columns: Vec<Vec<JsonValue>> = Vec::new();
+        let mut total = 0usize;
+        let schema = read_arrow_ipc_stream_batches(path, |schema, cols, rows| {
+            if columns.is_empty() {
+                columns = schema.fields.iter().map(|_| Vec::new()).collect();
+            }
+            for (acc, (_, vals)) in columns.iter_mut().zip(cols) {
+                acc.extend(vals);
+            }
+            total += rows;
+            Ok(nrows.is_none_or(|limit| total < limit))
+        })?;
+        if columns.is_empty() {
+            columns = schema.fields.iter().map(|_| Vec::new()).collect();
+        }
+        Ok(profile_arrow_columns(
+            &schema.fields,
+            columns,
+            nrows,
+            n_samples,
+        ))
     }
 
     /// The Arrow IPC row-source for `render_sql_inline_flat` - the
@@ -45369,6 +45554,25 @@ mod arrow_ipc_support {
         records_mode: bool,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
+        if arrow_ipc_is_stream(path)? {
+            read_arrow_ipc_stream_batches(path, |_, cols, rows| {
+                for i in 0..rows {
+                    if sink.done {
+                        break;
+                    }
+                    let mut obj = json_support::Map::with_capacity(cols.len());
+                    for (name, col) in &cols {
+                        obj.push_unique(
+                            name.clone(),
+                            col.get(i).cloned().unwrap_or(JsonValue::Null),
+                        );
+                    }
+                    json_emit_row_for_sql(&JsonValue::Object(obj), columns, records_mode, sink)?;
+                }
+                Ok(!sink.done)
+            })?;
+            return Ok(());
+        }
         let (mut file, footer) = open_and_read_footer(path)?;
         let dictionaries = resolve_dictionaries_streaming(&mut file, &footer)?;
 
@@ -72129,7 +72333,7 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
     },
     FormatInfo {
         name: "arrow",
-        extensions: &["arrow", "feather"],
+        extensions: &["arrow", "feather", "arrows"],
         // Arrow IPC/Feather shares the `parquet` feature flag - both are
         // Arrow-ecosystem formats with their own hand-rolled reader gated
         // by the same flag, per Cargo.toml's own comment on `parquet`.
@@ -72475,9 +72679,23 @@ fn print_format_catalog(output_format: &str) -> Result<()> {
             .iter()
             .map(format_catalog_entry_json)
             .collect();
+        let containers: Vec<JsonValue> = CONTAINER_CATALOG
+            .iter()
+            .map(|c| {
+                json!({
+                    "name": c.name,
+                    "extensions": JsonValue::Array(
+                        c.extensions.iter().map(|e| JsonValue::from(*e)).collect()
+                    ),
+                    "feature": c.feature.map_or(JsonValue::Null, JsonValue::from),
+                    "compiled_in": c.compiled_in,
+                })
+            })
+            .collect();
         let doc = json!({
             "sniff_rs_version": env!("CARGO_PKG_VERSION"),
             "formats": JsonValue::Array(formats),
+            "containers": JsonValue::Array(containers),
         });
         println!("{doc}");
     } else {
@@ -72508,6 +72726,24 @@ fn print_format_catalog(output_format: &str) -> Result<()> {
             println!(
                 "{:<12} {:<9} {:<13} {}",
                 f.name, compiled, feature, detected
+            );
+        }
+        println!();
+        println!(
+            "{:<12} {:<9} {:<13} DETECTED FROM",
+            "WRAPPER", "COMPILED", "FEATURE"
+        );
+        for c in CONTAINER_CATALOG {
+            println!(
+                "{:<12} {:<9} {:<13} {}",
+                c.name,
+                if c.compiled_in { "yes" } else { "no" },
+                c.feature.unwrap_or("-"),
+                c.extensions
+                    .iter()
+                    .map(|e| format!(".{e}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         eprintln!("(pass --output-format json for a machine-readable version)");
@@ -72717,6 +72953,21 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
     if head.starts_with(b"ARROW1") {
         return Some(InputFormat::ArrowIpc);
     }
+    // An Arrow IPC *stream* has no file magic: it opens with its first
+    // message's 0xFFFFFFFF continuation marker, then that message's
+    // metadata length (8-byte aligned, a few KiB at most in practice),
+    // then a FlatBuffers root offset that points inside that metadata -
+    // three corroborating fields, since none alone is distinctive.
+    if head.len() >= 16 && head[..4] == [0xFF; 4] {
+        let meta_len = i32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        let root = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
+        if (16..=(16 << 20)).contains(&meta_len)
+            && meta_len % 8 == 0
+            && (4..meta_len as u32).contains(&root)
+        {
+            return Some(InputFormat::ArrowIpc);
+        }
+    }
     if head.starts_with(b"\x93NUMPY") {
         return Some(InputFormat::Npy);
     }
@@ -72911,7 +73162,7 @@ fn detect_format(
 ) -> Result<InputFormat> {
     // A directory inside a directory walk is only ever a lakehouse table
     // (`collect_files_sorted` yields no other kind).
-    if read_path.is_dir() {
+    if override_fmt.is_none() && read_path.is_dir() {
         return lakehouse_dir_format(read_path).ok_or_else(|| {
             anyhow!("{read_path:?} is a directory that isn't a Delta Lake or Apache Iceberg table")
         });
@@ -72922,7 +73173,7 @@ fn detect_format(
             "tsv" => Ok(InputFormat::Tsv),
             "json" | "jsonl" | "ndjson" => Ok(InputFormat::Json),
             "parquet" => Ok(InputFormat::Parquet),
-            "arrow" | "feather" | "ipc" => Ok(InputFormat::ArrowIpc),
+            "arrow" | "feather" | "arrows" | "ipc" => Ok(InputFormat::ArrowIpc),
             "avro" => Ok(InputFormat::Avro),
             "xlsx" | "xls" | "xlsb" | "ods" => Ok(InputFormat::Xlsx),
             "sqlite" | "db" => Ok(InputFormat::Sqlite),
@@ -72992,7 +73243,7 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "tsv" => InputFormat::Tsv,
         "json" | "jsonl" | "ndjson" => InputFormat::Json,
         "parquet" | "pqt" => InputFormat::Parquet,
-        "arrow" | "feather" => InputFormat::ArrowIpc,
+        "arrow" | "feather" | "arrows" => InputFormat::ArrowIpc,
         "avro" => InputFormat::Avro,
         "xlsx" | "xls" | "xlsb" | "ods" => InputFormat::Xlsx,
         "db" | "sqlite" | "sqlite3" => InputFormat::Sqlite,
@@ -79620,7 +79871,6 @@ fn gzip_decompress_to<R: std::io::Read>(input: R, sink: &mut impl std::io::Write
 // - there's no behavioral divergence a ZIP reader would ever need between
 // the two callers, so sharing one implementation is strictly better here,
 // not just more convenient.
-#[cfg(any(feature = "xlsx", feature = "npy"))]
 mod zip_support {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
@@ -86292,33 +86542,151 @@ mod text_encoding_tests {
 // above, pure std, no dependency at all) is always available; zstd needs
 // --features zstd since the zstd crate compiles a small vendored C library.
 
-enum Compression {
+/// A compression or archive wrapper around the data file proper. Each is
+/// peeled off into a temporary file before format detection runs, so
+/// every reader keeps opening a plain file - and the peeling repeats, so
+/// `data.tar.gz` (gzip, then tar, then the CSV inside) and a gzip-
+/// compressed `.zip` entry's own contents resolve the same way a plain
+/// file does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Container {
     Gzip,
     Zstd,
+    /// A zip archive holding exactly one file.
+    Zip,
+    /// A tar archive holding exactly one file.
+    Tar,
+    /// Brotli (RFC 7932) - needs `--features parquet`, where the decoder lives.
+    Brotli,
+    /// An LZ4 frame file - needs `--features parquet` or `orc`.
+    Lz4,
 }
 
-fn compression_from_extension(path: &Path) -> Option<Compression> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase()
-        .as_str()
-    {
-        "gz" | "gzip" => Some(Compression::Gzip),
-        "zst" | "zstd" => Some(Compression::Zstd),
-        _ => None,
+impl Container {
+    fn name(self) -> &'static str {
+        match self {
+            Container::Gzip => "gzip",
+            Container::Zstd => "zstd",
+            Container::Zip => "zip",
+            Container::Tar => "tar",
+            Container::Brotli => "brotli",
+            Container::Lz4 => "lz4",
+        }
     }
 }
 
-/// Compression recognized from a file's own leading bytes, for input whose
+/// The wrappers and the file extensions that name them, for
+/// `--list-formats`. `.tgz` is gzip around a tar archive.
+const CONTAINER_CATALOG: &[ContainerInfo] = &[
+    ContainerInfo {
+        name: "gzip",
+        extensions: &["gz", "gzip", "tgz"],
+        feature: None,
+        compiled_in: true,
+    },
+    ContainerInfo {
+        name: "zstd",
+        extensions: &["zst", "zstd"],
+        feature: Some("zstd"),
+        compiled_in: cfg!(feature = "zstd"),
+    },
+    ContainerInfo {
+        name: "zip",
+        extensions: &["zip"],
+        feature: None,
+        compiled_in: true,
+    },
+    ContainerInfo {
+        name: "tar",
+        extensions: &["tar", "tgz"],
+        feature: None,
+        compiled_in: true,
+    },
+    ContainerInfo {
+        name: "brotli",
+        extensions: &["br"],
+        feature: Some("parquet"),
+        compiled_in: cfg!(feature = "parquet"),
+    },
+    ContainerInfo {
+        name: "lz4",
+        extensions: &["lz4"],
+        feature: Some("parquet"),
+        compiled_in: cfg!(any(feature = "parquet", feature = "orc")),
+    },
+];
+
+struct ContainerInfo {
+    name: &'static str,
+    extensions: &'static [&'static str],
+    feature: Option<&'static str>,
+    compiled_in: bool,
+}
+
+/// The wrapper a path's last extension names, and what the wrapped
+/// file's name is when that's just the path minus the extension.
+fn container_from_extension(path: &Path) -> Option<(Container, PathBuf)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let stripped = path.with_extension("");
+    Some(match ext.as_str() {
+        "gz" | "gzip" => (Container::Gzip, stripped),
+        "zst" | "zstd" => (Container::Zstd, stripped),
+        "zip" => (Container::Zip, stripped),
+        "tar" => (Container::Tar, stripped),
+        "tgz" => (Container::Gzip, path.with_extension("tar")),
+        "br" => (Container::Brotli, stripped),
+        "lz4" => (Container::Lz4, stripped),
+        _ => return None,
+    })
+}
+
+/// Whether a 512-byte tar header block carries a valid header checksum
+/// (the unsigned byte sum with the checksum field itself read as spaces).
+fn tar_header_checksum_ok(block: &[u8]) -> bool {
+    if block.len() < 512 {
+        return false;
+    }
+    let stored = block[148..156]
+        .iter()
+        .copied()
+        .take_while(|b| *b != 0 && *b != b' ')
+        .try_fold(0u64, |acc, b| {
+            (b'0'..=b'7')
+                .contains(&b)
+                .then(|| acc * 8 + u64::from(b - b'0'))
+        });
+    let Some(stored) = stored else {
+        return false;
+    };
+    let sum: u64 = block
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                u64::from(*b)
+            }
+        })
+        .sum();
+    sum == stored
+}
+
+/// A wrapper recognized from a file's own leading bytes, for input whose
 /// name says nothing (no extension, an unrecognized one, or piped stdin).
-/// A recognized *data-format* extension is never second-guessed - MessagePack
-/// and CBOR streams can legally start with these same bytes - so this only
-/// runs when `format_from_extension` has no answer either. gzip needs its
-/// full 3-byte ID1/ID2/CM=deflate header (RFC 1952 2.3.1); zstd its 4-byte
-/// frame magic (RFC 8878 3.1.1). Skippable zstd frames aren't sniffed.
-fn compression_from_magic(path: &Path) -> Option<Compression> {
+/// A recognized *data-format* extension is never second-guessed -
+/// MessagePack and CBOR streams can legally start with these same bytes -
+/// so this only runs when `format_from_extension` has no answer either.
+/// gzip needs its full 3-byte ID1/ID2/CM=deflate header (RFC 1952 2.3.1);
+/// zstd its 4-byte frame magic (RFC 8878 3.1.1); LZ4 its 4-byte frame
+/// magic; tar `ustar` at offset 257 *and* a valid header checksum.
+/// Skippable zstd frames, zip (whose magic an `.xlsx`/`.ods`/`.npz` shares)
+/// and brotli (which has no magic at all) aren't sniffed.
+fn container_from_magic(path: &Path) -> Option<Container> {
     use std::io::Read;
     let ext = path
         .extension()
@@ -86328,7 +86696,7 @@ fn compression_from_magic(path: &Path) -> Option<Compression> {
     if format_from_extension(&ext).is_some() {
         return None;
     }
-    let mut head = [0u8; 4];
+    let mut head = [0u8; 512];
     let mut file = std::fs::File::open(path).ok()?;
     let mut n = 0;
     while n < head.len() {
@@ -86339,9 +86707,13 @@ fn compression_from_magic(path: &Path) -> Option<Compression> {
         }
     }
     if n >= 3 && head[..3] == [0x1F, 0x8B, 0x08] {
-        Some(Compression::Gzip)
-    } else if n == 4 && head == [0x28, 0xB5, 0x2F, 0xFD] {
-        Some(Compression::Zstd)
+        Some(Container::Gzip)
+    } else if n >= 4 && head[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+        Some(Container::Zstd)
+    } else if n >= 4 && head[..4] == [0x04, 0x22, 0x4D, 0x18] {
+        Some(Container::Lz4)
+    } else if n == 512 && &head[257..262] == b"ustar" && tar_header_checksum_ok(&head) {
+        Some(Container::Tar)
     } else {
         None
     }
@@ -86491,57 +86863,419 @@ mod stdin_input_tests {
     }
 }
 
-/// If `path` ends in `.gz`/`.gzip` or `.zst`/`.zstd` - or has no recognized
-/// extension but starts with a gzip/zstd magic number - decompresses it into a
-/// real temporary file and returns (the path to actually read bytes from,
-/// the compression-stripped logical path used for format detection and
-/// default output naming, a guard that deletes the temp file on drop).
-/// Non-compressed input passes through unchanged with no guard.
-fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFile>)> {
-    use std::fs::File;
+/// Archive members that are filesystem litter, not data: macOS resource
+/// forks (`__MACOSX/`, `._name`) and the usual index files.
+fn is_archive_junk(name: &str) -> bool {
+    let mut parts = name.split('/').filter(|p| !p.is_empty()).peekable();
+    let mut last = "";
+    while let Some(p) = parts.next() {
+        if p == "__MACOSX" {
+            return true;
+        }
+        if parts.peek().is_none() {
+            last = p;
+        }
+    }
+    last.starts_with("._") || last == ".DS_Store" || last == "Thumbs.db"
+}
 
+/// One regular file in a tar archive: its name, where its data starts,
+/// and how long it is.
+struct TarEntry {
+    name: String,
+    offset: u64,
+    size: u64,
+}
+
+fn tar_cstr(field: &[u8]) -> String {
+    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).into_owned()
+}
+
+/// A tar header's size field: octal text, or - for a file past 8 GiB -
+/// GNU/star base-256 (high bit of the first byte set).
+fn tar_size(field: &[u8]) -> Option<u64> {
+    if field.first().is_some_and(|b| b & 0x80 != 0) {
+        let mut v = u64::from(field[0] & 0x7F);
+        for b in &field[1..] {
+            v = v.checked_mul(256)?.checked_add(u64::from(*b))?;
+        }
+        return Some(v);
+    }
+    let text: Vec<u8> = field
+        .iter()
+        .copied()
+        .skip_while(|b| *b == b' ')
+        .take_while(|b| *b != 0 && *b != b' ')
+        .collect();
+    text.iter().try_fold(0u64, |acc, b| {
+        (b'0'..=b'7')
+            .contains(b)
+            .then(|| acc.checked_mul(8)?.checked_add(u64::from(b - b'0')))
+            .flatten()
+    })
+}
+
+/// The `key=value` records of a pax extended header (`"<len> key=value\n"`).
+fn tar_pax_records(data: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(space) = data[pos..].iter().position(|b| *b == b' ') else {
+            break;
+        };
+        let Some(len) = std::str::from_utf8(&data[pos..pos + space])
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            break;
+        };
+        if len <= space + 1 || pos + len > data.len() {
+            break;
+        }
+        let record = &data[pos + space + 1..pos + len];
+        let record = record.strip_suffix(b"\n").unwrap_or(record);
+        if let Some(eq) = record.iter().position(|b| *b == b'=') {
+            out.push((
+                String::from_utf8_lossy(&record[..eq]).into_owned(),
+                String::from_utf8_lossy(&record[eq + 1..]).into_owned(),
+            ));
+        }
+        pos += len;
+    }
+    out
+}
+
+/// Walks a tar archive's headers (ustar, pax `x`/`g`, and GNU `L` long
+/// names; hard/symbolic links, directories and devices are skipped) and
+/// lists its regular files without reading their contents. A header whose
+/// checksum doesn't match means this isn't a tar archive (or it's
+/// corrupt) - a clean error, never a guess.
+fn tar_list_files(path: &Path) -> Result<Vec<TarEntry>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_META: u64 = 1 << 20;
+    let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("failed to stat {path:?}"))?
+        .len();
+    let mut entries = Vec::new();
+    let mut pos = 0u64;
+    let mut zero_blocks = 0;
+    let mut pax_path: Option<String> = None;
+    let mut pax_size: Option<u64> = None;
+    let mut long_name: Option<String> = None;
+    let mut block = [0u8; 512];
+    while pos + 512 <= len {
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(&mut block)
+            .with_context(|| format!("failed to read {path:?}"))?;
+        if block.iter().all(|b| *b == 0) {
+            zero_blocks += 1;
+            pos += 512;
+            if zero_blocks >= 2 {
+                break;
+            }
+            continue;
+        }
+        zero_blocks = 0;
+        if !tar_header_checksum_ok(&block) {
+            bail!(
+                "{path:?} isn't a valid tar archive (the header at byte {pos} fails its checksum)"
+            );
+        }
+        let Some(header_size) = tar_size(&block[124..136]) else {
+            bail!("{path:?} isn't a valid tar archive (unreadable size field at byte {pos})");
+        };
+        let typeflag = block[156];
+        let data_off = pos + 512;
+        let mut name = tar_cstr(&block[0..100]);
+        if &block[257..262] == b"ustar" {
+            let prefix = tar_cstr(&block[345..500]);
+            if !prefix.is_empty() {
+                name = format!("{prefix}/{name}");
+            }
+        }
+        let mut size = header_size;
+        match typeflag {
+            b'x' | b'L' | b'g' if header_size <= MAX_META => {
+                let mut data = vec![0u8; header_size as usize];
+                file.seek(SeekFrom::Start(data_off))?;
+                file.read_exact(&mut data)
+                    .with_context(|| format!("truncated tar header data in {path:?}"))?;
+                match typeflag {
+                    b'x' => {
+                        for (k, v) in tar_pax_records(&data) {
+                            match k.as_str() {
+                                "path" => pax_path = Some(v),
+                                "size" => pax_size = v.parse().ok(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    b'L' => long_name = Some(tar_cstr(&data)),
+                    _ => {}
+                }
+            }
+            b'0' | 0 | b'7' => {
+                if let Some(n) = pax_path.take().or_else(|| long_name.take()) {
+                    name = n;
+                }
+                if let Some(s) = pax_size.take() {
+                    size = s;
+                }
+                long_name = None;
+                entries.push(TarEntry {
+                    name,
+                    offset: data_off,
+                    size,
+                });
+            }
+            _ => {
+                pax_path = None;
+                pax_size = None;
+                long_name = None;
+            }
+        }
+        pos = data_off
+            .checked_add(size.div_ceil(512).saturating_mul(512))
+            .context("tar entry size overflows")?;
+    }
+    Ok(entries)
+}
+
+/// What peeling one wrapper yields.
+enum Layer {
+    /// The wrapped bytes in a temporary file, and - for an archive - the
+    /// member's own file name, which names the result from then on.
+    Unwrapped(TempFile, Option<String>),
+    /// Not something a single-file profile can read (an archive holding
+    /// zero or several files), with why. A directory walk skips it like
+    /// any unrecognized file; a single-file run reports it.
+    Skip(String),
+}
+
+fn describe_archive_files(names: &[String]) -> String {
+    let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
+    let more = names.len().saturating_sub(shown.len());
+    let mut text = shown.join(", ");
+    if more > 0 {
+        text.push_str(&format!(", and {more} more"));
+    }
+    text
+}
+
+fn unwrap_layer(container: Container, read_path: &Path) -> Result<Layer> {
+    use std::io::{Read, Seek, SeekFrom};
+    match container {
+        Container::Gzip | Container::Zstd => {
+            let input = fs::File::open(read_path)
+                .with_context(|| format!("failed to open {read_path:?}"))?;
+            let mut tmp = TempFile::new()?;
+            if container == Container::Gzip {
+                // Streams straight into the temp file (bounded to
+                // DEFLATE_WINDOW bytes of memory regardless of the file's
+                // own decompressed size, per GzipStreamSink's own doc
+                // comment) rather than decompressing the whole thing into
+                // a Vec<u8> first and then writing that buffer out - the
+                // same "stop double-buffering" win already delivered for
+                // CSV/fixed-width/JSON Lines, applied to the layer in
+                // front of every one of them.
+                gzip_decompress_to(input, tmp.as_file_mut())
+                    .with_context(|| format!("failed to decompress {read_path:?}"))?;
+            } else {
+                // Streams straight into the temp file too, bounded to each
+                // frame's own declared Window_Size worth of memory rather
+                // than the file's total decompressed size - see
+                // ZstdStreamSink's own doc comment for why this needs a
+                // per-frame dynamic window instead of gzip's fixed one.
+                decompress_zstd(input, tmp.as_file_mut(), read_path)?;
+            }
+            Ok(Layer::Unwrapped(tmp, None))
+        }
+        Container::Zip => {
+            let mut archive = zip_support::ZipArchive::open(read_path)?;
+            let files: Vec<String> = archive
+                .names()
+                .filter(|n| !n.ends_with('/') && !is_archive_junk(n))
+                .map(str::to_string)
+                .collect();
+            match files.as_slice() {
+                [] => Ok(Layer::Skip(format!(
+                    "{read_path:?} is an empty zip archive"
+                ))),
+                [only] => {
+                    let tmp = archive.read_to_temp(only)?;
+                    let name = Path::new(only)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned());
+                    Ok(Layer::Unwrapped(tmp, name))
+                }
+                many => Ok(Layer::Skip(format!(
+                    "the zip archive {read_path:?} holds {} files ({}) - sniff-rs reads one \
+                     file per archive, so extract it and point sniff-rs at the directory",
+                    many.len(),
+                    describe_archive_files(many)
+                ))),
+            }
+        }
+        Container::Tar => {
+            let entries: Vec<TarEntry> = tar_list_files(read_path)?
+                .into_iter()
+                .filter(|e| !is_archive_junk(&e.name))
+                .collect();
+            match entries.as_slice() {
+                [] => Ok(Layer::Skip(format!(
+                    "{read_path:?} is an empty tar archive"
+                ))),
+                [only] => {
+                    let mut input = fs::File::open(read_path)
+                        .with_context(|| format!("failed to open {read_path:?}"))?;
+                    input.seek(SeekFrom::Start(only.offset))?;
+                    let mut tmp = TempFile::new()?;
+                    let copied =
+                        std::io::copy(&mut (&mut input).take(only.size), tmp.as_file_mut())
+                            .with_context(|| format!("failed to read {read_path:?}"))?;
+                    if copied != only.size {
+                        bail!("{read_path:?} is truncated inside the file {:?}", only.name);
+                    }
+                    let name = Path::new(&only.name)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned());
+                    Ok(Layer::Unwrapped(tmp, name))
+                }
+                many => {
+                    let names: Vec<String> = many.iter().map(|e| e.name.clone()).collect();
+                    Ok(Layer::Skip(format!(
+                        "the tar archive {read_path:?} holds {} files ({}) - sniff-rs reads one \
+                         file per archive, so extract it and point sniff-rs at the directory",
+                        names.len(),
+                        describe_archive_files(&names)
+                    )))
+                }
+            }
+        }
+        Container::Brotli => {
+            #[cfg(feature = "parquet")]
+            {
+                let data =
+                    fs::read(read_path).with_context(|| format!("failed to read {read_path:?}"))?;
+                let out = brotli_support::brotli_decompress(&data)
+                    .with_context(|| format!("failed to decompress {read_path:?}"))?;
+                let mut tmp = TempFile::new()?;
+                std::io::Write::write_all(&mut tmp, &out)?;
+                Ok(Layer::Unwrapped(tmp, None))
+            }
+            #[cfg(not(feature = "parquet"))]
+            bail!(
+                "brotli support isn't compiled in - rebuild with --features parquet (or --features full) to read {read_path:?}"
+            )
+        }
+        Container::Lz4 => {
+            #[cfg(any(feature = "parquet", feature = "orc"))]
+            {
+                let data =
+                    fs::read(read_path).with_context(|| format!("failed to read {read_path:?}"))?;
+                let mut out = Vec::new();
+                let mut pos = 0usize;
+                while pos < data.len() {
+                    let magic = data
+                        .get(pos..pos + 4)
+                        .map(|m| u32::from_le_bytes([m[0], m[1], m[2], m[3]]))
+                        .with_context(|| {
+                            format!("{read_path:?} ends inside an LZ4 frame header")
+                        })?;
+                    if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+                        // A skippable frame: a 4-byte size, then that many
+                        // bytes of application data.
+                        let size = data
+                            .get(pos + 4..pos + 8)
+                            .map(|m| u32::from_le_bytes([m[0], m[1], m[2], m[3]]) as usize)
+                            .with_context(|| format!("{read_path:?} ends inside an LZ4 frame"))?;
+                        pos = pos.saturating_add(8).saturating_add(size);
+                        continue;
+                    }
+                    pos += lz4_support::lz4_frame_decode(&data[pos..], &mut out)
+                        .with_context(|| format!("failed to decompress {read_path:?}"))?;
+                }
+                let mut tmp = TempFile::new()?;
+                std::io::Write::write_all(&mut tmp, &out)?;
+                Ok(Layer::Unwrapped(tmp, None))
+            }
+            #[cfg(not(any(feature = "parquet", feature = "orc")))]
+            bail!(
+                "LZ4 support isn't compiled in - rebuild with --features parquet (or --features full) to read {read_path:?}"
+            )
+        }
+    }
+}
+
+/// The deepest `.tar.gz`-style nesting peeled before giving up.
+const MAX_CONTAINER_LAYERS: usize = 8;
+
+/// A file with its wrappers peeled off, for a directory walk: the path to
+/// read, the wrapper-stripped logical path, and the guard that deletes
+/// the last temporary copy on drop - or `None` when the file is an
+/// archive that can't be read as one file (see `Layer::Skip`).
+fn unwrap_containers(path: &Path) -> Result<std::result::Result<UnwrappedInput, String>> {
     // A lakehouse table directory met during a directory walk.
     if path.is_dir() {
-        return Ok((path.to_path_buf(), path.to_path_buf(), None));
+        return Ok(Ok((path.to_path_buf(), path.to_path_buf(), None)));
     }
-    let (compression, logical_path) = match compression_from_extension(path) {
-        Some(c) => (c, path.with_extension("")),
-        None => match compression_from_magic(path) {
-            // A sniffed stream keeps its own name: it had no compression
+    let mut read_path = path.to_path_buf();
+    let mut logical = path.to_path_buf();
+    let mut guard: Option<TempFile> = None;
+    for _ in 0..MAX_CONTAINER_LAYERS {
+        let (container, stripped) = match container_from_extension(&logical) {
+            Some(found) => found,
+            // A sniffed stream keeps its own name: it had no wrapper
             // extension to strip, and format detection then sniffs the
-            // decompressed bytes the same way it would an extensionless
+            // unwrapped bytes the same way it would an extensionless
             // plain file.
-            Some(c) => (c, path.to_path_buf()),
-            None => return Ok((path.to_path_buf(), path.to_path_buf(), None)),
-        },
-    };
-
-    let input = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-    let mut tmp = TempFile::new()?;
-    match compression {
-        Compression::Gzip => {
-            // Streams straight into the temp file (bounded to
-            // DEFLATE_WINDOW bytes of memory regardless of the file's
-            // own decompressed size, per GzipStreamSink's own doc
-            // comment) rather than decompressing the whole thing into a
-            // Vec<u8> first and then writing that buffer out - the same
-            // "stop double-buffering" win already delivered for CSV/
-            // fixed-width/JSON Lines, applied to the layer in front of
-            // every one of them.
-            gzip_decompress_to(input, tmp.as_file_mut())
-                .with_context(|| format!("failed to decompress {path:?}"))?;
-        }
-        Compression::Zstd => {
-            // Streams straight into the temp file too, bounded to each
-            // frame's own declared Window_Size worth of memory rather
-            // than the file's total decompressed size - see
-            // ZstdStreamSink's own doc comment for why this needs a
-            // per-frame dynamic window instead of gzip's fixed one.
-            decompress_zstd(input, tmp.as_file_mut(), path)?;
+            None => match container_from_magic(&read_path) {
+                Some(c) => (c, logical.clone()),
+                None => return Ok(Ok((read_path, logical, guard))),
+            },
+        };
+        match unwrap_layer(container, &read_path)
+            .with_context(|| format!("while reading the {} layer of {path:?}", container.name()))?
+        {
+            Layer::Skip(reason) => return Ok(Err(reason)),
+            Layer::Unwrapped(tmp, member) => {
+                logical = match member {
+                    Some(name) => logical.with_file_name(name),
+                    None => stripped,
+                };
+                read_path = tmp.path().to_path_buf();
+                // The previous layer's temporary copy is no longer needed
+                // once this one is fully written.
+                guard = Some(tmp);
+            }
         }
     }
+    bail!("{path:?} is wrapped in more than {MAX_CONTAINER_LAYERS} layers of compression/archives")
+}
 
-    Ok((tmp.path().to_path_buf(), logical_path, Some(tmp)))
+type UnwrappedInput = (PathBuf, PathBuf, Option<TempFile>);
+
+/// If `path` is wrapped in compression or an archive - named by its
+/// extension (`.gz`, `.zst`, `.zip`, `.tar`, `.tgz`, `.br`, `.lz4`, in any
+/// nesting such as `.tar.gz`), or, with no data-format extension,
+/// recognized by its own leading bytes - peels every layer into a real
+/// temporary file and returns (the path to actually read bytes from, the
+/// wrapper-stripped logical path used for format detection and default
+/// output naming, a guard that deletes the temporary file on drop).
+/// Unwrapped input passes through unchanged with no guard. An archive
+/// holding more than one file is an error here: one run profiles one file.
+fn decompress_if_needed(path: &Path) -> Result<UnwrappedInput> {
+    unwrap_containers(path)?.map_err(Error::msg)
+}
+
+/// `decompress_if_needed` for a directory walk, where an archive holding
+/// several files is skipped like any file sniff-rs can't identify rather
+/// than aborting the run: `None` means skip.
+fn decompress_for_walk(path: &Path) -> Result<Option<UnwrappedInput>> {
+    Ok(unwrap_containers(path)?.ok())
 }
 
 enum OutputFormat {
@@ -88533,10 +89267,12 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
         if looks_like_own_output(path) {
             return BatchOutcome::OwnOutput;
         }
-        let (read_path, logical_path, _decompressed_tmp) = match decompress_if_needed(path)
+        let (read_path, logical_path, _decompressed_tmp) = match decompress_for_walk(path)
             .with_context(|| format!("failed processing {path:?}"))
         {
-            Ok(paths) => paths,
+            Ok(Some(paths)) => paths,
+            // An archive holding several files: not one file to profile.
+            Ok(None) => return BatchOutcome::Unrecognized,
             Err(err) => return BatchOutcome::PrepareFailed(err),
         };
         let (format, read_path, _text_tmp) =
@@ -89125,10 +89861,17 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
             continue;
         }
 
-        let (read_path, logical_path, _decompressed_tmp) = match decompress_if_needed(path)
+        let (read_path, logical_path, _decompressed_tmp) = match decompress_for_walk(path)
             .with_context(|| format!("failed processing {path:?}"))
         {
-            Ok(paths) => paths,
+            Ok(Some(paths)) => paths,
+            // An archive holding several files: not one file to profile.
+            Ok(None) => {
+                skipped += 1;
+                unrecognized.push(relative_display_path(dir, path));
+                eprintln!("{}: skipped (an archive of several files)", path.display());
+                continue;
+            }
             Err(err) => {
                 if !args.continue_on_error {
                     return Err(err);
@@ -94369,8 +95112,10 @@ mod knowledge_graph {
             fixed_schema: false,
             truncated_scan: false,
         };
-        let (read_path, logical_path, _decompressed) = match decompress_if_needed(path) {
-            Ok(paths) => paths,
+        let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
+            Ok(Some(paths)) => paths,
+            // An archive holding several files stays an opaque file here.
+            Ok(None) => (path.to_path_buf(), path.to_path_buf(), None),
             Err(e) => {
                 file.kind = FileKind::Failed;
                 file.error = Some(root_cause(&e));

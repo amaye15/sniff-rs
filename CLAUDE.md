@@ -3551,8 +3551,8 @@ clippy baseline exactly.
 
 Three more CLI subcommands, dispatched the same way `diff` is (the
 literal first positional argument checked before `Args::parse` ever
-runs) - `sniff-rs explain <TABLE> <INPUT> [OUTPUT_PATH] [OPTIONS]`,
-`sniff-rs path <FROM> <TO> <INPUT> [OUTPUT_PATH] [OPTIONS]`, and
+runs) - `sniff-rs explain <INPUT> <COLUMN> [OUTPUT_PATH] [OPTIONS]`,
+`sniff-rs path <INPUT> <FROM_TABLE> <TO_TABLE> [OUTPUT_PATH] [OPTIONS]`, and
 `sniff-rs rank <INPUT> [OUTPUT_PATH] [OPTIONS]` - all querying one
 shared relationship graph built over an already-profiled multi-table
 dictionary. `<INPUT>` follows the identical three-way resolution
