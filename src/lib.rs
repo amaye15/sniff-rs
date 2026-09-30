@@ -76429,6 +76429,45 @@ fn json_schema_type_value(base: &str, nullable: bool) -> JsonValue {
     }
 }
 
+/// The file's own words about a column - its variable label plus its
+/// value labels (`1 = male; 2 = female`) - as one line of text, or `None`
+/// when the file says nothing. The value-label part is whatever
+/// `apply_variable_labels` appended to `notes`; it's always the last
+/// entry there, so everything from its marker on is the label list.
+fn column_label_text(description: &str, notes: &str) -> Option<String> {
+    const MARKER: &str = "value labels: ";
+    let labels = notes
+        .match_indices(MARKER)
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || notes[..i].ends_with("; "))
+        .map(|i| &notes[i..]);
+    let description = description.trim();
+    let text = match (description.is_empty(), labels) {
+        (true, None) => return None,
+        (true, Some(l)) => l.to_string(),
+        (false, None) => description.to_string(),
+        (false, Some(l)) => format!("{description} ({l})"),
+    };
+    // One line, so it can ride in a SQL `--` comment unchanged.
+    Some(
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect(),
+    )
+}
+
+/// `json_schema_property` plus the column's label as the standard
+/// `description` keyword.
+fn json_schema_property_with_description(p: &ColumnProfile) -> JsonValue {
+    let mut prop = json_schema_property(p);
+    if let (JsonValue::Object(map), Some(text)) =
+        (&mut prop, column_label_text(&p.description, &p.notes))
+    {
+        map.insert("description".to_string(), JsonValue::String(text));
+    }
+    prop
+}
+
 fn json_schema_property(p: &ColumnProfile) -> JsonValue {
     let nullable = p.missing_pct > 0.0;
 
@@ -76468,7 +76507,7 @@ fn render_json_schema(
         // does.
         let properties: json_support::Map = profiles
             .iter()
-            .map(|p| (p.name.clone(), json_schema_property(p)))
+            .map(|p| (p.name.clone(), json_schema_property_with_description(p)))
             .collect();
         let required: Vec<JsonValue> = profiles
             .iter()
@@ -76522,6 +76561,30 @@ fn render_json_schema(
 // `INSERT ... SELECT CAST(...)` step, built entirely from standard ANSI
 // `CAST`/`CASE`/`NULLIF`/`TRIM` - the actual "convert to the correct
 // type" logic this output format exists to hand over.
+
+/// Writes a `CREATE TABLE`'s column definitions, one per line, comma
+/// separated with no trailing newline. A column the file itself described
+/// (a Stata/SAS/SPSS variable or value label) carries that text as a `--`
+/// comment after its comma - the only way to keep it in the script that
+/// every engine this targets accepts (`COMMENT ON COLUMN` is PostgreSQL/
+/// DuckDB-only, `COMMENT '...'` MySQL-only, and SQLite has neither).
+fn write_sql_column_defs(
+    sink: &mut dyn std::io::Write,
+    defs: impl Iterator<Item = (String, Option<String>)>,
+) -> Result<()> {
+    let defs: Vec<(String, Option<String>)> = defs.collect();
+    let last = defs.len().saturating_sub(1);
+    for (i, (def, comment)) in defs.iter().enumerate() {
+        write!(sink, "{def}{}", if i < last { "," } else { "" })?;
+        if let Some(text) = comment {
+            write!(sink, " -- {text}")?;
+        }
+        if i < last {
+            writeln!(sink)?;
+        }
+    }
+    Ok(())
+}
 
 /// A double-quoted SQL identifier - the ANSI-standard form SQLite/
 /// DuckDB/PostgreSQL all accept natively. MySQL needs `SET
@@ -76841,21 +76904,19 @@ fn write_staging_table_body(
 
     // The real, typed table.
     writeln!(sink, "CREATE TABLE {quoted_table} (")?;
-    write!(
+    write_sql_column_defs(
         sink,
-        "{}",
-        profiles
-            .iter()
-            .map(|p| {
-                let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
+        profiles.iter().map(|p| {
+            let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
+            (
                 format!(
                     "    {} {}{nullability}",
                     sql_quote_ident(&p.name),
                     sql_column_type(&p.ideal_type)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",\n")
+                ),
+                column_label_text(&p.description, &p.notes),
+            )
+        }),
     )?;
     writeln!(sink, "\n);\n")?;
 
@@ -77592,29 +77653,26 @@ fn render_sql_inline_flat(
     }
 
     writeln!(sink, "CREATE TABLE {quoted_table} (")?;
-    write!(
+    write_sql_column_defs(
         sink,
-        "{}",
-        profiles
-            .iter()
-            .zip(column_names.iter())
-            .map(|(p, name)| {
-                let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
-                // MySQL's `TIMESTAMP` is a 1970-2038 instant that converts
-                // through the session time zone; the column here is a
-                // plain calendar value of any year, which is `DATETIME`.
-                // Both it and `TIME` default to whole seconds and round a
-                // fraction (`09:00:00.5` becomes `09:00:01`), where
-                // PostgreSQL keeps microseconds by default - so ask for them.
-                let ty = match p.ideal_type.as_str() {
-                    "NaiveDate / DateTime" if loading_into_mysql => "DATETIME(6)",
-                    "NaiveTime" if loading_into_mysql => "TIME(6)",
-                    other => sql_column_type(other),
-                };
-                format!("    {} {ty}{nullability}", sql_quote_ident(name))
-            })
-            .collect::<Vec<_>>()
-            .join(",\n"),
+        profiles.iter().zip(column_names.iter()).map(|(p, name)| {
+            let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
+            // MySQL's `TIMESTAMP` is a 1970-2038 instant that converts
+            // through the session time zone; the column here is a
+            // plain calendar value of any year, which is `DATETIME`.
+            // Both it and `TIME` default to whole seconds and round a
+            // fraction (`09:00:00.5` becomes `09:00:01`), where
+            // PostgreSQL keeps microseconds by default - so ask for them.
+            let ty = match p.ideal_type.as_str() {
+                "NaiveDate / DateTime" if loading_into_mysql => "DATETIME(6)",
+                "NaiveTime" if loading_into_mysql => "TIME(6)",
+                other => sql_column_type(other),
+            };
+            (
+                format!("    {} {ty}{nullability}", sql_quote_ident(name)),
+                column_label_text(&p.description, &p.notes),
+            )
+        }),
     )?;
     // Deliberately just one trailing newline here, not a blank-line
     // separator - see InlineRowSink::flush_batch's own doc comment on
@@ -89352,6 +89410,10 @@ struct DiffColumn {
     ideal_type: String,
     missing_pct: f64,
     sample_values: Vec<String>,
+    /// The file's own words about the column (`column_label_text`), empty
+    /// when it says nothing. Compared so a relabelled variable or a
+    /// recoded value-label set shows up as drift.
+    labels: String,
 }
 
 impl DiffColumn {
@@ -89376,8 +89438,20 @@ impl DiffColumn {
         let mut ideal_type = String::new();
         let mut missing_pct = 0.0;
         let mut sample_values = Vec::new();
+        let mut description = String::new();
+        let mut notes = String::new();
         for (key, value) in obj {
             match key.as_str() {
+                "description" => {
+                    if let JsonValue::String(s) = value {
+                        description = s;
+                    }
+                }
+                "notes" => {
+                    if let JsonValue::String(s) = value {
+                        notes = s;
+                    }
+                }
                 "name" => {
                     if let JsonValue::String(s) = value {
                         name = Some(s);
@@ -89416,6 +89490,7 @@ impl DiffColumn {
             ideal_type,
             missing_pct,
             sample_values,
+            labels: column_label_text(&description, &notes).unwrap_or_default(),
         })
     }
 }
@@ -89571,6 +89646,7 @@ fn profile_raw_file_as_diff_columns(
                     current_type: p.current_type,
                     ideal_type: p.ideal_type,
                     missing_pct: p.missing_pct,
+                    labels: column_label_text(&p.description, &p.notes).unwrap_or_default(),
                     sample_values: p.sample_values,
                 })
                 .collect();
@@ -89693,6 +89769,14 @@ enum DiffChange {
         old: f64,
         new: f64,
     },
+    /// The file's own description or value labels changed (Stata/SAS/SPSS
+    /// variable and value labels). Never schema-breaking - labels don't
+    /// change what a column holds - but a recoded label set (`1 = male`
+    /// becoming `1 = female`) is exactly the drift worth seeing.
+    LabelsChanged {
+        old: String,
+        new: String,
+    },
 }
 
 fn diff_change_label(change: &DiffChange) -> &'static str {
@@ -89705,6 +89789,7 @@ fn diff_change_label(change: &DiffChange) -> &'static str {
         DiffChange::ColumnRenamed { .. } => "possible rename",
         DiffChange::TypeChanged { .. } => "type changed",
         DiffChange::MissingPctChanged { .. } => "missing % changed",
+        DiffChange::LabelsChanged { .. } => "labels changed",
     }
 }
 
@@ -89938,6 +90023,7 @@ fn table_fingerprint(cols: &[DiffColumn]) -> String {
         for sv in &c.sample_values {
             push_len_prefixed(&mut buf, sv);
         }
+        push_len_prefixed(&mut buf, &c.labels);
     }
     format!("{:016x}", fnv1a64(&buf))
 }
@@ -90141,6 +90227,23 @@ fn diff_table_columns(
                 },
                 compatibility,
                 reason,
+            });
+        }
+        // Independent of the type/missing-% checks above: a column can
+        // change both its type and its labels.
+        if old_col.labels != new_col.labels {
+            entries.push(DiffEntry {
+                table: table.to_string(),
+                sql_table: sql_table.map(str::to_string),
+                column: Some(name.to_string()),
+                change: DiffChange::LabelsChanged {
+                    old: old_col.labels.clone(),
+                    new: new_col.labels.clone(),
+                },
+                compatibility: Compatibility::Safe,
+                reason: "the file's own description or value labels changed - the stored \
+                         values are unaffected, but what they mean may have been recoded"
+                    .to_string(),
             });
         }
     }
@@ -90517,7 +90620,9 @@ fn relationship_drift(
             }
             // A type or missing-% change on a stable endpoint is exactly
             // what drift reports on - never suppressed.
-            DiffChange::TypeChanged { .. } | DiffChange::MissingPctChanged { .. } => {}
+            DiffChange::TypeChanged { .. }
+            | DiffChange::MissingPctChanged { .. }
+            | DiffChange::LabelsChanged { .. } => {}
         }
     }
     let touched = |table: &str, column: &str| {
@@ -90807,6 +90912,10 @@ fn diff_change_extra_json(change: &DiffChange) -> Vec<(&'static str, JsonValue)>
         DiffChange::MissingPctChanged { old, new } => vec![
             ("old_missing_pct", JsonValue::from(*old)),
             ("new_missing_pct", JsonValue::from(*new)),
+        ],
+        DiffChange::LabelsChanged { old, new } => vec![
+            ("old_labels", JsonValue::from(old.clone())),
+            ("new_labels", JsonValue::from(new.clone())),
         ],
     }
 }
@@ -98275,6 +98384,7 @@ mod diff_tests {
             ideal_type: ideal_type.to_string(),
             missing_pct,
             sample_values: samples.iter().map(|s| s.to_string()).collect(),
+            labels: String::new(),
         }
     }
 
@@ -98947,6 +99057,7 @@ mod diff_tests {
             ideal_type: types[i % types.len()].to_string(),
             missing_pct: 0.0,
             sample_values: vec![format!("v{i}_a"), format!("v{i}_b")],
+            labels: String::new(),
         };
         let old: Vec<DiffColumn> = (0..n).map(|i| make("old", i)).collect();
         let new: Vec<DiffColumn> = (0..n).map(|i| make("new", i)).collect();

@@ -16099,3 +16099,130 @@ fn encoding_applies_across_a_directory() {
     assert!(a.contains("Zoë"), "{a}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- Labels in every output ---
+
+#[cfg(feature = "stata")]
+#[test]
+fn labels_reach_json_schema_and_sql() {
+    // json-schema carries the variable label and value labels in the
+    // standard `description` keyword.
+    let doc = run_with_format("edge_stata_labels_118.dta", "json-schema", &[]);
+    let props = &doc["tables"]["edge_stata_labels_118"]["properties"];
+    assert_eq!(
+        props["sex"]["description"],
+        "Respondent sex (value labels: 1 = male; 2 = female; 3 = other)"
+    );
+    assert_eq!(
+        props["income"]["description"],
+        "Household income, last year (USD)"
+    );
+    // A column the file never described has no description at all.
+    let plain = run_with_format("sample.csv", "json-schema", &[]);
+    assert!(
+        plain["tables"]["sample"]["properties"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .all(|(_, p)| p.get("description").is_none())
+    );
+
+    // SQL keeps them as `--` comments after each column's comma, which
+    // every engine accepts; the last column has no comma at all.
+    let sql = run_sql("edge_stata_labels_118.dta", &[]);
+    assert!(
+        sql.contains("\"sex\" BIGINT NOT NULL, -- Respondent sex (value labels: 1 = male; 2 = female; 3 = other)"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("\"name\" TEXT NOT NULL -- Free-text name\n);"),
+        "{sql}"
+    );
+    let staging = run_sql("edge_stata_labels_118.dta", &["--sql-mode", "staging"]);
+    assert!(
+        staging.contains("-- Household income, last year (USD)"),
+        "{staging}"
+    );
+}
+
+#[cfg(feature = "stata")]
+#[test]
+fn diff_reports_a_changed_label_and_recoded_value_labels() {
+    let dir = std::env::temp_dir().join(format!("sniff-label-diff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("old.json");
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_stata_labels_118.dta").to_str().unwrap(),
+            old.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // Recode a value label and reword a variable label, keep the data.
+    let text = std::fs::read_to_string(&old).unwrap();
+    assert!(text.contains("2 = female") && text.contains("Household income, last year (USD)"));
+    let new = dir.join("new.json");
+    std::fs::write(
+        &new,
+        text.replace("2 = female", "2 = nonbinary").replace(
+            "Household income, last year (USD)",
+            "Household income (USD)",
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args([
+            "diff",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let changes = report["changes"].as_array().unwrap();
+    let labelled: Vec<&serde_json::Value> = changes
+        .iter()
+        .filter(|c| c["kind"] == "labels changed")
+        .collect();
+    assert_eq!(labelled.len(), 2, "{report}");
+    let sex = labelled.iter().find(|c| c["column"] == "sex").unwrap();
+    assert_eq!(sex["compatibility"], "safe");
+    assert!(
+        sex["new_labels"]
+            .as_str()
+            .unwrap()
+            .contains("2 = nonbinary")
+    );
+    assert!(sex["old_labels"].as_str().unwrap().contains("2 = female"));
+    // Not breaking: a label never changes what's stored.
+    assert_eq!(report["has_breaking_changes"], false);
+
+    // Identical dictionaries still report nothing.
+    let out = Command::new(bin())
+        .args([
+            "diff",
+            old.to_str().unwrap(),
+            old.to_str().unwrap(),
+            "-",
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let same: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(same["changes"].as_array().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
