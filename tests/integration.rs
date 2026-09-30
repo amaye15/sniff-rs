@@ -15766,3 +15766,106 @@ fn pdf_vertical_text_reads_down_its_columns() {
         "縦書きの例です\n二列目"
     );
 }
+
+// Variable labels become `description`, value labels a note - values below
+// are what pyreadstat wrote into each file (and read back from it).
+
+#[test]
+#[cfg(feature = "stata")]
+fn stata_variable_and_value_labels_are_surfaced_for_every_layout() {
+    // XML releases 117/118 and binary 113/114 keep their labels in
+    // different places; all four must read the same.
+    for release in ["118", "117", "114", "113"] {
+        let doc = run_json(&format!("edge_stata_labels_{release}.dta"), &[]);
+        let cols = table(&doc, &format!("edge_stata_labels_{release}"));
+        let sex = column(cols, "sex");
+        assert_eq!(sex["description"], "Respondent sex", "release {release}");
+        assert!(
+            sex["notes"]
+                .as_str()
+                .unwrap()
+                .contains("value labels: 1 = male; 2 = female; 3 = other"),
+            "release {release}: {}",
+            sex["notes"]
+        );
+        assert_eq!(
+            column(cols, "income")["description"],
+            "Household income, last year (USD)"
+        );
+        // A variable with a label but no value labels gets only the label.
+        let name = column(cols, "name");
+        assert_eq!(name["description"], "Free-text name");
+        assert!(!name["notes"].as_str().unwrap().contains("value labels"));
+    }
+}
+
+#[test]
+#[cfg(feature = "stata")]
+fn stata_value_labels_are_capped_and_keep_non_ascii_text() {
+    let doc = run_json("edge_stata_labels_edge_cases.dta", &[]);
+    let cols = table(&doc, "edge_stata_labels_edge_cases");
+    let code = column(cols, "code")["notes"].as_str().unwrap().to_string();
+    assert!(code.contains("20 = occupation 20; ... 5 more"), "{code}");
+    assert!(!code.contains("21 = occupation 21"), "{code}");
+    let cafe = column(cols, "cafe")["notes"].as_str().unwrap().to_string();
+    assert!(cafe.contains("1 = café au lait ☕"), "{cafe}");
+    // A 100-character label is cut, with an ellipsis.
+    assert!(cafe.contains("past t..."), "{cafe}");
+    // No label at all leaves description empty.
+    assert_eq!(column(cols, "unlabeled")["description"], "");
+}
+
+#[test]
+#[cfg(feature = "sas7bdat")]
+fn sas7bdat_column_labels_become_descriptions() {
+    let doc = run_json("sas7bdat_pandas_airline.sas7bdat", &[]);
+    let cols = table(&doc, "sas7bdat_pandas_airline");
+    assert_eq!(column(cols, "Y")["description"], "level of output");
+    assert_eq!(column(cols, "YEAR")["description"], "year");
+    let doc = run_json("sas7bdat_pandas_cars.sas7bdat", &[]);
+    let cols = table(&doc, "sas7bdat_pandas_cars");
+    assert_eq!(column(cols, "MPG")["description"], "miles per gallon");
+    assert_eq!(column(cols, "CYL")["description"], "number of cylinders");
+    // A file with no labels leaves every description empty.
+    let doc = run_json("sas7bdat_people_nonascii.sas7bdat", &[]);
+    assert!(
+        table(&doc, "sas7bdat_people_nonascii")
+            .iter()
+            .all(|c| c["description"] == "")
+    );
+}
+
+#[test]
+#[cfg(feature = "spss")]
+fn spss_variable_and_value_labels_are_surfaced_in_plain_and_zlib_files() {
+    for (file, tbl) in [
+        ("edge_spss_labels.sav", "edge_spss_labels"),
+        (
+            "edge_spss_labels_compressed.zsav",
+            "edge_spss_labels_compressed",
+        ),
+    ] {
+        let doc = run_json(file, &[]);
+        let cols = table(&doc, tbl);
+        let sex = column(cols, "sex");
+        assert_eq!(sex["description"], "Respondent sex", "{file}");
+        assert!(
+            sex["notes"]
+                .as_str()
+                .unwrap()
+                .contains("value labels: 1 = male; 2 = female; 3 = other"),
+            "{file}: {}",
+            sex["notes"]
+        );
+        // A short string variable's value labels are text.
+        let grp = column(cols, "grp");
+        assert!(
+            grp["notes"]
+                .as_str()
+                .unwrap()
+                .contains("value labels: m = Male; f = Female"),
+            "{file}: {}",
+            grp["notes"]
+        );
+    }
+}

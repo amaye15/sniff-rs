@@ -4995,7 +4995,7 @@ struct ColumnProfile {
     name: String,
     current_type: String,
     ideal_type: String,
-    description: String, // always empty - intentionally left for manual fill-in
+    description: String, // empty unless the file says what the column is (a Stata/SAS/SPSS variable label) - never guessed
     missing_pct: f64,
     sample_values: Vec<String>,
     notes: String,
@@ -5052,6 +5052,59 @@ struct ColumnProfile {
     /// `to_json`, and `None` for every other column and for a dictionary
     /// read back from disk.
     temporal_format: Option<&'static str>,
+}
+
+/// The most value labels written into a column's notes; a column with
+/// hundreds (a country or occupation code) gets the first few and a count.
+#[cfg(any(feature = "stata", feature = "sas7bdat", feature = "spss"))]
+const MAX_VALUE_LABELS_NOTED: usize = 20;
+/// A single value label is cut to this many characters in the notes.
+#[cfg(any(feature = "stata", feature = "sas7bdat", feature = "spss"))]
+const MAX_VALUE_LABEL_CHARS: usize = 60;
+
+/// Attaches what a statistical-package file says about a variable:
+/// its label (a sentence like "Household income, last year") becomes the
+/// column's `description`, and its value labels (`1 = male`, `2 = female`)
+/// are appended to the notes - a coded column reads as codes to the type
+/// detection, and the labels are the only place the file says what they
+/// mean. Both are the file's own words, never a guess: an empty label
+/// leaves `description` empty, no value labels adds no note.
+#[cfg(any(feature = "stata", feature = "sas7bdat", feature = "spss"))]
+fn apply_variable_labels(
+    profile: &mut ColumnProfile,
+    variable_label: &str,
+    value_labels: &[(String, String)],
+) {
+    let label = variable_label.trim();
+    if !label.is_empty() {
+        profile.description = label.to_string();
+    }
+    if value_labels.is_empty() {
+        return;
+    }
+    let mut parts: Vec<String> = value_labels
+        .iter()
+        .take(MAX_VALUE_LABELS_NOTED)
+        .map(|(value, text)| {
+            let text = text.trim();
+            match text.char_indices().nth(MAX_VALUE_LABEL_CHARS) {
+                Some((cut, _)) => format!("{value} = {}...", &text[..cut]),
+                None => format!("{value} = {text}"),
+            }
+        })
+        .collect();
+    if value_labels.len() > MAX_VALUE_LABELS_NOTED {
+        parts.push(format!(
+            "... {} more",
+            value_labels.len() - MAX_VALUE_LABELS_NOTED
+        ));
+    }
+    let note = format!("value labels: {}", parts.join("; "));
+    profile.notes = if profile.notes.is_empty() {
+        note
+    } else {
+        format!("{}; {note}", profile.notes)
+    };
 }
 
 // This project used to have a hand-rolled `impl serde::Serialize for
@@ -11901,21 +11954,31 @@ mod stata_support {
         Ok(Release(n))
     }
 
+    /// What `read_schema` surfaces: the variable types and names, the
+    /// offsets of the two sections that live after `<data>` (XML-tagged
+    /// files only - a binary file's value labels simply follow its
+    /// records), and the per-variable label text.
+    struct Schema {
+        variable_types: Vec<VariableType>,
+        variable_names: Vec<String>,
+        strls_offset: Option<u64>,
+        value_labels_offset: Option<u64>,
+        /// Which value-label table each variable uses (empty for none).
+        value_label_names: Vec<String>,
+        variable_labels: Vec<String>,
+    }
+
     /// Reads the schema (variable types, names, sort list, formats,
-    /// value-label names, variable labels), returning just the types and
-    /// names this reader actually surfaces - every other subsection is
-    /// still read from the stream (its byte width is release-dependent,
-    /// so it can't just be skipped as one opaque blob) but its content is
-    /// discarded. Verified field-by-field against the `dta` crate's own
+    /// value-label names, variable labels), returning the types, names,
+    /// and labels this reader surfaces - the sort list and display formats
+    /// are still read past (their byte width is release-dependent, so
+    /// they can't just be skipped as one opaque blob) but discarded. Verified field-by-field against the `dta` crate's own
     /// `schema_reader.rs`, including the XML-only 14-`u64` `<map>` section
     /// this reader skips wholesale (`into_record_reader`'s own sequential
     /// path - the one this project's usage takes - never actually
     /// consults those offsets, only `seek_records`'s alternative
     /// direct-seek path would).
-    fn read_schema(
-        r: &mut R,
-        preamble: &Preamble,
-    ) -> Result<(Vec<VariableType>, Vec<String>, Option<u64>)> {
+    fn read_schema(r: &mut R, preamble: &Preamble) -> Result<Schema> {
         let release = preamble.release;
         let bo = preamble.byte_order;
         let xml = release.is_xml_like();
@@ -11934,12 +11997,15 @@ mod stata_support {
         // comes after `<data>`, so it's read up front by
         // `read_strl_table`).
         let mut strls_offset = None;
+        let mut value_labels_offset = None;
         if xml {
             r.expect_bytes(b"<map>")?;
             for i in 0..14 {
                 let off = r.read_u64(preamble.byte_order)?;
-                if i == 10 {
-                    strls_offset = Some(off);
+                match i {
+                    10 => strls_offset = Some(off),
+                    11 => value_labels_offset = Some(off),
+                    _ => {}
                 }
             }
             r.expect_bytes(b"</map>")?;
@@ -11994,24 +12060,33 @@ mod stata_support {
             b"<formats>",
             b"</formats>",
         )?;
-        skip_fixed_string_array(
+        let value_label_names = read_fixed_string_array(
             r,
             n,
             release.variable_name_len(),
             xml,
             b"<value_label_names>",
             b"</value_label_names>",
+            utf8,
         )?;
-        skip_fixed_string_array(
+        let variable_labels = read_fixed_string_array(
             r,
             n,
             release.variable_label_len(),
             xml,
             b"<variable_labels>",
             b"</variable_labels>",
+            utf8,
         )?;
 
-        Ok((variable_types, variable_names, strls_offset))
+        Ok(Schema {
+            variable_types,
+            variable_names,
+            strls_offset,
+            value_labels_offset,
+            value_label_names,
+            variable_labels,
+        })
     }
 
     /// strL values keyed by their `(v, o)` pair - variable and observation
@@ -12303,18 +12378,29 @@ mod stata_support {
         })
     }
 
-    /// `(reader, preamble, variable_types, variable_names, row_len, utf8)`,
-    /// named here purely to keep `open_stata_for_records`'s signature
-    /// readable (`clippy::type_complexity`).
-    type StataRecordSource = (
-        R,
-        Preamble,
-        Vec<VariableType>,
-        Vec<String>,
-        usize,
-        bool,
-        StrlTable,
-    );
+    /// Where a file's labels are, for `columns_from_stata` to read after
+    /// the observations (value labels live past `<data>`, so reading them
+    /// is a second, seeking pass over the file).
+    struct StataLabels {
+        variable_labels: Vec<String>,
+        value_label_names: Vec<String>,
+        /// Absolute offset of the value-label tables, when the file has
+        /// any to read (release 108 and later).
+        value_labels_offset: Option<u64>,
+    }
+
+    /// Everything before the first observation, from
+    /// `open_stata_for_records`.
+    struct StataRecordSource {
+        r: R,
+        preamble: Preamble,
+        variable_types: Vec<VariableType>,
+        variable_names: Vec<String>,
+        row_len: usize,
+        utf8: bool,
+        strls: StrlTable,
+        labels: StataLabels,
+    }
 
     /// Reads everything before the first observation row - the header,
     /// the variable schema, the characteristics section, and (for the
@@ -12331,10 +12417,10 @@ mod stata_support {
 
         let preamble = read_header(&mut r)
             .with_context(|| format!("failed reading the header of {path:?}"))?;
-        let (variable_types, variable_names, strls_offset) = read_schema(&mut r, &preamble)
+        let schema = read_schema(&mut r, &preamble)
             .with_context(|| format!("failed reading the schema of {path:?}"))?;
-        let strls = match strls_offset {
-            Some(off) if variable_types.contains(&VariableType::LongString) => {
+        let strls = match schema.strls_offset {
+            Some(off) if schema.variable_types.contains(&VariableType::LongString) => {
                 read_strl_table(path, &preamble, off)
                     .with_context(|| format!("failed reading the strL table of {path:?}"))?
             }
@@ -12348,21 +12434,165 @@ mod stata_support {
                 .with_context(|| format!("failed reading {path:?}"))?;
         }
 
-        let row_len: usize = variable_types.iter().map(|t| t.width()).sum();
+        let row_len: usize = schema.variable_types.iter().map(|t| t.width()).sum();
         if row_len > MAX_ROW_LEN {
             bail!("Stata row width {row_len} is out of a sane range");
         }
 
+        // A binary file's value labels follow its records directly; an
+        // XML file says where they are in its `<map>`.
+        let value_labels_offset = if preamble.release.0 < 108 {
+            None
+        } else if preamble.release.is_xml_like() {
+            schema.value_labels_offset
+        } else {
+            let data_start = r
+                .inner
+                .stream_position()
+                .with_context(|| format!("failed locating the data in {path:?}"))?;
+            preamble
+                .observation_count
+                .checked_mul(row_len as u64)
+                .and_then(|len| data_start.checked_add(len))
+        };
+
         let utf8 = preamble.release.default_encoding_is_utf8();
-        Ok((
+        Ok(StataRecordSource {
             r,
             preamble,
-            variable_types,
-            variable_names,
+            variable_types: schema.variable_types,
+            variable_names: schema.variable_names,
             row_len,
             utf8,
             strls,
-        ))
+            labels: StataLabels {
+                variable_labels: schema.variable_labels,
+                value_label_names: schema.value_label_names,
+                value_labels_offset,
+            },
+        })
+    }
+
+    /// Reads the value-label tables at `offset`: for each, a `u32`
+    /// payload length, the table's name (a fixed-width slot) and 3 bytes
+    /// of padding, then `n` (u32), the text length (u32), `n` text
+    /// offsets, `n` `i32` values, and the NUL-terminated label text -
+    /// wrapped in `<value_labels>`/`<lbl>` tags from release 117 on.
+    /// Verified against the `dta` crate's `parse_modern_payload`.
+    /// (Releases 102-107 lay these out differently and aren't read.)
+    fn read_value_labels(
+        path: &Path,
+        preamble: &Preamble,
+        offset: u64,
+    ) -> Result<HashMap<String, Vec<(i32, String)>>> {
+        let file = File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = R {
+            inner: BufReader::new(file),
+        };
+        r.inner
+            .seek(SeekFrom::Start(offset))
+            .context("failed seeking to the Stata value labels")?;
+        let bo = preamble.byte_order;
+        let release = preamble.release;
+        let xml = release.is_xml_like();
+        let utf8 = release.default_encoding_is_utf8();
+        if xml {
+            r.expect_bytes(b"<value_labels>")?;
+        }
+        let mut tables = HashMap::new();
+        loop {
+            if xml {
+                let head = r.read_exact_buf(5)?;
+                if head == b"</val" {
+                    break;
+                }
+                if head != b"<lbl>" {
+                    bail!("expected <lbl> in the Stata value labels");
+                }
+            }
+            let len = if xml {
+                r.read_u32(bo)?
+            } else {
+                // A binary file just ends after its last table.
+                match std::io::BufRead::fill_buf(&mut r.inner) {
+                    Ok([]) => break,
+                    Err(e) => return Err(e.into()),
+                    _ => r.read_u32(bo)?,
+                }
+            } as usize;
+            if len > MAX_ROW_LEN {
+                bail!("a Stata value-label table of {len} bytes is out of a sane range");
+            }
+            let name = decode_text(&r.read_exact_buf(release.variable_name_len())?, utf8)?;
+            r.skip(3)?;
+            let payload = r.read_exact_buf(len)?;
+            if xml {
+                r.expect_bytes(b"</lbl>")?;
+            }
+            let entries = parse_value_label_payload(&payload, bo, utf8)?;
+            // First table of a name wins, as in the `dta` crate.
+            tables.entry(name).or_insert(entries);
+        }
+        Ok(tables)
+    }
+
+    /// How a value-label code reads in the notes: the number, except that
+    /// from release 113 the top of the `long` range is Stata's missing
+    /// values (`0x7FFFFFE5` is `.`, then `.a` through `.z`), which a label
+    /// can name ("Refused", "Don't know") - shown as Stata shows them.
+    fn value_label_display(value: i32, release: Release) -> String {
+        const SYSTEM_MISSING_113: i32 = 0x7FFF_FFE5;
+        if release.0 >= 113 && value >= SYSTEM_MISSING_113 {
+            let code = value - SYSTEM_MISSING_113;
+            if code == 0 {
+                ".".to_string()
+            } else {
+                format!(".{}", char::from(b'a' + (code as u8 - 1)))
+            }
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn parse_value_label_payload(
+        payload: &[u8],
+        bo: ByteOrder,
+        utf8: bool,
+    ) -> Result<Vec<(i32, String)>> {
+        if payload.len() < 8 {
+            bail!("a Stata value-label table is shorter than its header");
+        }
+        let n = bo.u32([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        let text_len = bo.u32([payload[4], payload[5], payload[6], payload[7]]) as usize;
+        let values_start = n
+            .checked_mul(4)
+            .and_then(|o| o.checked_add(8))
+            .filter(|_| n <= payload.len())
+            .context("a Stata value-label table declares too many entries")?;
+        let text_start = values_start + n * 4;
+        if text_start
+            .checked_add(text_len)
+            .is_none_or(|end| end > payload.len())
+        {
+            bail!("a Stata value-label table is shorter than it declares");
+        }
+        let text = &payload[text_start..text_start + text_len];
+        let mut entries = Vec::with_capacity(n.min(1024));
+        for i in 0..n {
+            let off = bo.u32([
+                payload[8 + i * 4],
+                payload[9 + i * 4],
+                payload[10 + i * 4],
+                payload[11 + i * 4],
+            ]) as usize;
+            let v = values_start + i * 4;
+            let value = bo.u32([payload[v], payload[v + 1], payload[v + 2], payload[v + 3]]) as i32;
+            if off >= text.len() {
+                bail!("a Stata value label points outside its text");
+            }
+            entries.push((value, decode_text(&text[off..], utf8)?));
+        }
+        Ok(entries)
     }
 
     pub(crate) fn columns_from_stata(
@@ -12370,8 +12600,16 @@ mod stata_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<ColumnProfile>> {
-        let (mut r, preamble, variable_types, variable_names, row_len, utf8, strls) =
-            open_stata_for_records(path)?;
+        let StataRecordSource {
+            mut r,
+            preamble,
+            variable_types,
+            variable_names,
+            row_len,
+            utf8,
+            strls,
+            labels,
+        } = open_stata_for_records(path)?;
 
         // One `ColumnAccumulatorState` per variable (the same shared,
         // bounded-footprint accumulator CSV/fixed-width/dBase already
@@ -12414,12 +12652,39 @@ mod stata_support {
             total += 1;
         }
 
+        // Labels are documentation, not data: a value-label section that
+        // won't parse costs the notes, never the profile.
+        let value_labels = labels
+            .value_labels_offset
+            .and_then(|off| read_value_labels(path, &preamble, off).ok())
+            .unwrap_or_default();
         let columns = variable_names
             .into_iter()
             .zip(variable_types)
             .zip(col_states)
-            .map(|((name, vt), state)| {
-                state.into_profile_with_declared_type(name, total, type_label(vt).to_string())
+            .enumerate()
+            .map(|(i, ((name, vt), state))| {
+                let mut profile =
+                    state.into_profile_with_declared_type(name, total, type_label(vt).to_string());
+                let shown: Vec<(String, String)> = labels
+                    .value_label_names
+                    .get(i)
+                    .and_then(|set| value_labels.get(set))
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|(v, text)| {
+                                (value_label_display(*v, preamble.release), text.clone())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                apply_variable_labels(
+                    &mut profile,
+                    labels.variable_labels.get(i).map_or("", String::as_str),
+                    &shown,
+                );
+                profile
             })
             .collect();
         Ok(columns)
@@ -12447,8 +12712,15 @@ mod stata_support {
         path: &Path,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
-        let (mut r, preamble, variable_types, _variable_names, row_len, utf8, strls) =
-            open_stata_for_records(path)?;
+        let StataRecordSource {
+            mut r,
+            preamble,
+            variable_types,
+            row_len,
+            utf8,
+            strls,
+            ..
+        } = open_stata_for_records(path)?;
 
         for _ in 0..preamble.observation_count {
             if sink.done {
@@ -12478,6 +12750,49 @@ mod stata_support {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    mod label_tests {
+        use super::*;
+
+        /// The top of the `long` range is missing values from release 113
+        /// (`.`, then `.a` to `.z`); before that it's ordinary data.
+        #[test]
+        fn extended_missing_codes_read_as_stata_writes_them() {
+            let r118 = Release(118);
+            assert_eq!(value_label_display(3, r118), "3");
+            assert_eq!(value_label_display(-7, r118), "-7");
+            assert_eq!(value_label_display(0x7FFF_FFE4, r118), "2147483620");
+            assert_eq!(value_label_display(0x7FFF_FFE5, r118), ".");
+            assert_eq!(value_label_display(0x7FFF_FFE6, r118), ".a");
+            assert_eq!(value_label_display(0x7FFF_FFFF, r118), ".z");
+            assert_eq!(value_label_display(0x7FFF_FFE6, Release(112)), "2147483622");
+        }
+
+        /// A hand-built table: two entries, text offsets out of order, the
+        /// second label multi-byte UTF-8.
+        #[test]
+        fn a_value_label_payload_decodes_offsets_values_and_text() {
+            let mut p = Vec::new();
+            p.extend(2u32.to_le_bytes()); // n
+            let text = b"beta\0caf\xc3\xa9\0"; // "beta", "café"
+            p.extend((text.len() as u32).to_le_bytes());
+            p.extend(5u32.to_le_bytes()); // entry 0 -> "café"
+            p.extend(0u32.to_le_bytes()); // entry 1 -> "beta"
+            p.extend((-2i32).to_le_bytes());
+            p.extend(7i32.to_le_bytes());
+            p.extend(text);
+            let got = parse_value_label_payload(&p, ByteOrder::Little, true).unwrap();
+            assert_eq!(got, [(-2, "café".to_string()), (7, "beta".to_string())]);
+            // Truncated or lying payloads are errors, never a panic.
+            for cut in 0..p.len() {
+                let _ = parse_value_label_payload(&p[..cut], ByteOrder::Little, true);
+            }
+            let mut lying = p.clone();
+            lying[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(parse_value_label_payload(&lying, ByteOrder::Little, true).is_err());
+        }
+    }
 } // mod stata_support
 
 #[cfg(feature = "stata")]
@@ -12506,9 +12821,9 @@ fn columns_from_stata(
 // values - the same "trust the format's own declaration, then let
 // ideal_type independently verify it" split every other binary/typed
 // format here already gets. A variable label (SAS's own human-authored
-// per-column description) exists in ColumnMeta but isn't surfaced, the
-// same considered decision as Stata's variable/value labels - see
-// CLAUDE.md's Known limitations.
+// per-column description) becomes the column's `description`; value
+// labels live in a separate `.sas7bcat` catalog file, not in this one,
+// so there are none to surface.
 
 #[cfg(feature = "sas7bdat")]
 mod sas7bdat_support {
@@ -12540,9 +12855,9 @@ mod sas7bdat_support {
     /// they reference, then fall back to whatever contiguous row bytes
     /// remain on the page - since a single straightforward full-table
     /// read has no need for the reference crate's performance-motivated
-    /// fast-path split. Value labels and per-column labels aren't
-    /// surfaced, the same considered decision as Stata's own (see Known
-    /// limitations).
+    /// fast-path split. A column's label is read (it becomes the
+    /// `description`); value labels aren't, since SAS keeps them in a
+    /// separate catalog file.
     const MAGIC: [u8; 32] = [
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC2, 0xEA, 0x81,
         0x60, 0xB3, 0x14, 0x11, 0xCF, 0xBD, 0x92, 0x08, 0x00, 0x09, 0xC7, 0x31, 0x8C, 0x18, 0x1F,
@@ -12803,6 +13118,11 @@ mod sas7bdat_support {
     struct ColumnRaw {
         name_ref: TextRef,
         format_ref: TextRef,
+        label_ref: TextRef,
+        /// The column's own human-written description (SAS's `LABEL`),
+        /// resolved from `label_ref` once the text store is complete;
+        /// empty when the column has none.
+        label: String,
         offset: u32,
         width: u32,
         type_code: u8,
@@ -13091,12 +13411,20 @@ mod sas7bdat_support {
     ) -> Result<()> {
         let index = meta.formats_seen;
         let column = meta.ensure_column(index)?;
+        // The label's text reference sits right after the format's: the
+        // format at 34 (46 in a 64-bit file), the label at 40 (52).
         let format_off = if header.uses_u64_pointers { 46 } else { 34 };
         column.format_ref = parse_text_ref(
             header.endianness,
             bytes
                 .get(format_off..format_off + 6)
                 .context("truncated column format ref")?,
+        );
+        column.label_ref = parse_text_ref(
+            header.endianness,
+            bytes
+                .get(format_off + 6..format_off + 12)
+                .context("truncated column label ref")?,
         );
         meta.formats_seen += 1;
         Ok(())
@@ -14032,6 +14360,17 @@ mod sas7bdat_support {
                     .unwrap_or_else(|| format!("COL{}", i + 1))
             })
             .collect();
+        // A label is written at its declared width, so only trailing
+        // padding is trimmed - a leading space was typed (the reference
+        // crate's own finding, and ReadStat keeps it).
+        for c in &mut columns_raw {
+            c.label = meta
+                .text_store
+                .resolve(c.label_ref)
+                .and_then(|b| decode_text(b, decoder))
+                .map(|l| l.trim_end_matches([' ', '\0']).to_string())
+                .unwrap_or_default();
+        }
         let logical_types: Vec<LogicalType> = columns_raw
             .iter()
             .map(|c| {
@@ -14114,11 +14453,16 @@ mod sas7bdat_support {
             .zip(states)
             .enumerate()
             .map(|(i, (name, state))| {
-                state.into_profile_with_declared_type(
+                let mut profile = state.into_profile_with_declared_type(
                     name,
                     total,
                     logical_type_label(logical_types[i]).to_string(),
-                )
+                );
+                // SAS keeps value labels (formats) in a separate catalog
+                // file, so the data file itself only ever has the
+                // variable's own label.
+                apply_variable_labels(&mut profile, &columns_raw[i].label, &[]);
+                profile
             })
             .collect();
         Ok(profiles)
@@ -14531,6 +14875,15 @@ mod spss_support {
         /// Number of named segments for a "very long string" (subtype 14) -
         /// 1 for every ordinary variable.
         n_segments: usize,
+        /// The variable's own label as stored (its encoding isn't known
+        /// until the whole dictionary has been read), then decoded into
+        /// `label` once it is.
+        label_bytes: Vec<u8>,
+        /// The variable's own description ("Household income"), or empty.
+        label: String,
+        /// `(value, text)` for each of this variable's value labels
+        /// (`1` = `Male`), in the order the file lists them.
+        value_labels: Vec<(String, String)>,
     }
 
     /// Parses one type-2 (variable) record - verified against `ambers`'s
@@ -14553,13 +14906,16 @@ mod spss_support {
             _ => (VarType::Numeric, true),
         };
 
+        let mut label_bytes = Vec::new();
         if has_label == 1 {
             let label_len = read_i32(r)?;
             if label_len < 0 {
                 bail!("SPSS variable record has a negative label length ({label_len})");
             }
-            let padded = round_up(label_len as usize, 4);
-            skip_bytes(r, padded)?; // variable labels aren't surfaced - see Known limitations
+            let label_len = label_len as usize;
+            let padded = round_up(label_len, 4);
+            label_bytes = read_bytes(r, padded)?;
+            label_bytes.truncate(label_len);
         }
 
         let missing_values = read_missing_values(r, n_missing, &var_type)?;
@@ -14574,6 +14930,9 @@ mod spss_support {
             var_type,
             is_ghost,
             n_segments: 1,
+            label_bytes,
+            label: String::new(),
+            value_labels: Vec::new(),
         })
     }
 
@@ -14654,6 +15013,10 @@ mod spss_support {
             .collect()
     }
 
+    /// One type 3 record's `(8-byte value, label bytes)` pairs and the
+    /// slot indexes its type 4 record attaches them to.
+    type RawValueLabelSet = (Vec<([u8; 8], Vec<u8>)>, Vec<usize>);
+
     struct Dictionary {
         header: FileHeader,
         variables: Vec<VariableRecord>,
@@ -14679,6 +15042,11 @@ mod spss_support {
         let mut encoding_name: Option<String> = None;
         let mut character_code: Option<i32> = None;
         let mut slot_index = 0usize;
+        // Each type 3 record's `(8-byte value, label bytes)` pairs, with
+        // the type 4 record's slot indexes for the variables that share
+        // them - resolved to per-variable labels once the encoding and
+        // each variable's type are known.
+        let mut label_sets: Vec<RawValueLabelSet> = Vec::new();
 
         loop {
             let record_type = read_i32(r)?;
@@ -14689,20 +15057,27 @@ mod spss_support {
                 }
                 RECORD_TYPE_VALUE_LABEL => {
                     // Type 3 (value labels) + the type 4 (variable indices)
-                    // record that must immediately follow it - parsed only
-                    // far enough to skip past correctly; the labels
-                    // themselves aren't surfaced (matching this project's
-                    // existing Stata/SAS7BDAT precedent - see Known
-                    // limitations).
+                    // record that must immediately follow it: each label
+                    // is an 8-byte value (a double, or up to 8 bytes of
+                    // text), a length byte, and the label padded so the
+                    // length byte plus text fill a multiple of 8.
                     let count = read_i32(r)?;
+                    if count < 0 {
+                        bail!("SPSS value label record declares {count} labels");
+                    }
+                    let mut entries = Vec::new();
                     for _ in 0..count {
-                        skip_bytes(r, 8)?; // value (numeric or 8-byte string)
+                        let mut value = [0u8; 8];
+                        r.read_exact(&mut value)
+                            .context("truncated SPSS value label record")?;
                         let mut len_byte = [0u8; 1];
                         r.read_exact(&mut len_byte)
                             .context("truncated SPSS value label record")?;
                         let label_len = usize::from(len_byte[0]);
                         let padded = round_up(label_len + 1, 8) - 1;
-                        skip_bytes(r, padded)?;
+                        let mut text = read_bytes(r, padded)?;
+                        text.truncate(label_len);
+                        entries.push((value, text));
                     }
                     let next_type = read_i32(r)?;
                     if next_type != RECORD_TYPE_VALUE_LABEL_VARS {
@@ -14715,7 +15090,13 @@ mod spss_support {
                     if n_vars <= 0 {
                         bail!("SPSS type 4 record declares {n_vars} variables");
                     }
-                    skip_bytes(r, usize::try_from(n_vars).unwrap_or(0) * 4)?;
+                    // The indexes are 1-based positions among the type 2
+                    // records, continuation slots of a long string included.
+                    let mut indexes = Vec::new();
+                    for _ in 0..n_vars {
+                        indexes.push((read_i32(r)?.max(1) as usize) - 1);
+                    }
+                    label_sets.push((entries, indexes));
                 }
                 RECORD_TYPE_DOCUMENT => {
                     let n_lines = read_i32(r)?;
@@ -14829,6 +15210,32 @@ mod spss_support {
                 _ => TextEncoding::Windows1252,
             },
         };
+
+        // Labels are documentation: text that doesn't decode drops that
+        // label rather than failing a file whose data is fine.
+        for var in &mut variables {
+            var.label = decode_text(text_encoding, &var.label_bytes).unwrap_or_default();
+        }
+        for (entries, indexes) in &label_sets {
+            for &slot in indexes {
+                // `variables` holds one entry per type 2 record, in order,
+                // so a slot index is a position.
+                let Some(var) = variables.get_mut(slot).filter(|v| v.slot_index == slot) else {
+                    continue;
+                };
+                for (raw, text) in entries {
+                    let value = match var.var_type {
+                        VarType::Numeric => format_numeric_value(0, f64::from_le_bytes(*raw)),
+                        VarType::Str(_) => decode_text(text_encoding, trim_trailing_padding(raw))
+                            .unwrap_or_default(),
+                    };
+                    let Ok(text) = decode_text(text_encoding, text) else {
+                        continue;
+                    };
+                    var.value_labels.push((value, text));
+                }
+            }
+        }
 
         Ok(Dictionary {
             header,
@@ -15430,11 +15837,13 @@ mod spss_support {
                 VarType::Numeric => "f64",
                 VarType::Str(_) => "String",
             };
-            out.push(state.into_profile_with_declared_type(
+            let mut profile = state.into_profile_with_declared_type(
                 var.long_name.clone(),
                 total,
                 current_type.to_string(),
-            ));
+            );
+            apply_variable_labels(&mut profile, &var.label, &var.value_labels);
+            out.push(profile);
         }
         Ok(out)
     }
@@ -72976,13 +73385,12 @@ fn render_markdown_tables(md: &mut String, tables: &BTreeMap<String, Vec<ColumnP
             }
         }
 
-        // Description is always empty today (intentionally left for a human
-        // to fill in - see the design-philosophy section in CLAUDE.md), so
-        // rendering it as its own column in every single table wastes a
-        // column on nothing but blank cells. Drop it per-table whenever
-        // every profile's description really is blank; the moment even one
-        // profile in a table carries real text, the column comes back for
-        // that table.
+        // Description is empty for every format except the few whose files
+        // carry a variable label (Stata/SAS/SPSS), so rendering it as its
+        // own column in every table wastes a column on blank cells. Drop
+        // it per-table whenever every profile's description really is
+        // blank; the moment even one profile in a table carries real text,
+        // the column comes back for that table.
         let show_description = profiles.iter().any(|p| !p.description.is_empty());
 
         if show_description {
@@ -103711,6 +104119,104 @@ mod tests {
         }
     }
 
+    /// A variable's label and its `(value, text)` value labels.
+    #[cfg(all(test, feature = "stata"))]
+    type DtaVariableLabels = (String, Vec<(i32, String)>);
+
+    /// Test-only: what the `dta` crate says each variable's label and
+    /// value labels are - the independent side of
+    /// `stata_labels_match_the_dta_crate_and_pyreadstat`.
+    #[cfg(all(test, feature = "stata"))]
+    fn stata_labels_via_dta_crate(path: &Path) -> Result<Vec<DtaVariableLabels>> {
+        use dta::stata::dta::dta_reader::DtaReader;
+        use dta::stata::dta::value_label_table::ValueLabelTable;
+
+        let mut characteristic_reader = DtaReader::new()
+            .from_path(path)?
+            .read_header()?
+            .read_schema()?;
+        characteristic_reader.skip_to_end()?;
+        let mut record_reader = characteristic_reader.into_record_reader()?;
+        let variables: Vec<(String, String)> = record_reader
+            .schema()
+            .variables()
+            .iter()
+            .map(|v| (v.label().to_string(), v.value_label_name().to_string()))
+            .collect();
+        record_reader.skip_to_end()?;
+        let mut strl_reader = record_reader.into_long_string_reader()?;
+        strl_reader.skip_to_end()?;
+        let mut label_reader = strl_reader.into_value_label_reader()?;
+        let mut table = ValueLabelTable::new();
+        label_reader.read_remaining_into(&mut table)?;
+        Ok(variables
+            .into_iter()
+            .map(|(label, set)| {
+                let entries = table
+                    .get(&set)
+                    .map(|s| {
+                        s.entries()
+                            .iter()
+                            .map(|e| (e.value(), e.label().to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (label, entries)
+            })
+            .collect())
+    }
+
+    /// Variable labels become the column's `description` and value labels
+    /// a note, verified for every layout (XML 117/118, binary 113/114)
+    /// against the `dta` crate's own read of the same file - and, for the
+    /// values themselves, against what pyreadstat wrote into them.
+    #[cfg(feature = "stata")]
+    #[test]
+    fn stata_labels_match_the_dta_crate_and_pyreadstat() {
+        for f in [
+            "tests/fixtures/edge_stata_labels_118.dta",
+            "tests/fixtures/edge_stata_labels_117.dta",
+            "tests/fixtures/edge_stata_labels_114.dta",
+            "tests/fixtures/edge_stata_labels_113.dta",
+            "tests/fixtures/edge_stata_labels_edge_cases.dta",
+            "tests/fixtures/sample.dta",
+            "tests/fixtures/type_detection.dta",
+        ] {
+            let path = Path::new(f);
+            let mine = stata_support::columns_from_stata(path, None, 3).unwrap();
+            let theirs = stata_labels_via_dta_crate(path)
+                .unwrap_or_else(|e| panic!("{f}: dta-crate oracle failed: {e:?}"));
+            assert_eq!(mine.len(), theirs.len(), "{f}");
+            for (m, (label, entries)) in mine.iter().zip(&theirs) {
+                assert_eq!(&m.description, label, "{f} col '{}': description", m.name);
+                let expected = {
+                    let mut shown = ColumnProfile::default();
+                    let pairs: Vec<(String, String)> = entries
+                        .iter()
+                        .map(|(v, t)| (v.to_string(), t.clone()))
+                        .collect();
+                    apply_variable_labels(&mut shown, "", &pairs);
+                    shown.notes
+                };
+                if expected.is_empty() {
+                    assert!(
+                        !m.notes.contains("value labels"),
+                        "{f} col '{}': unexpected value labels in {:?}",
+                        m.name,
+                        m.notes
+                    );
+                } else {
+                    assert!(
+                        m.notes.contains(&expected),
+                        "{f} col '{}': {:?} lacks {expected:?}",
+                        m.name,
+                        m.notes
+                    );
+                }
+            }
+        }
+    }
+
     /// Test-only: `apache-avro` (plus `num-bigint`) is a dev-dependency now
     /// (see Cargo.toml and CLAUDE.md's Dependency footprint section) -
     /// `avro_support`'s own hand-rolled reader replaced it at runtime, so
@@ -104207,6 +104713,8 @@ mod tests {
         for f in [
             "tests/fixtures/sas7bdat_people_nonascii.sas7bdat",
             "tests/fixtures/sas7bdat_pandas_windows1251.sas7bdat",
+            "tests/fixtures/sas7bdat_pandas_airline.sas7bdat",
+            "tests/fixtures/sas7bdat_pandas_cars.sas7bdat",
         ] {
             let path = Path::new(f);
             let mine = sas7bdat_support::columns_from_sas7bdat(path, None, 100)
@@ -104237,6 +104745,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A column's `LABEL` becomes its `description`, checked against the
+    /// `sas7bdat` crate's own `ColumnMeta::label` on every fixture (the
+    /// two pandas files carry real ones; the rest have none, which must
+    /// stay an empty description).
+    #[cfg(feature = "sas7bdat")]
+    #[test]
+    fn sas7bdat_labels_match_the_sas7bdat_crate() {
+        let mut labelled = 0;
+        for f in [
+            "tests/fixtures/sas7bdat_people_nonascii.sas7bdat",
+            "tests/fixtures/sas7bdat_pandas_windows1251.sas7bdat",
+            "tests/fixtures/sas7bdat_pandas_airline.sas7bdat",
+            "tests/fixtures/sas7bdat_pandas_cars.sas7bdat",
+        ] {
+            let path = Path::new(f);
+            let mine = sas7bdat_support::columns_from_sas7bdat(path, None, 3).unwrap();
+            let ds = sas7bdat::Dataset::open(path).unwrap();
+            let theirs: Vec<String> = ds
+                .columns()
+                .iter()
+                .map(|c| c.label.clone().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                mine.iter()
+                    .map(|c| c.description.clone())
+                    .collect::<Vec<_>>(),
+                theirs,
+                "{f}"
+            );
+            labelled += theirs.iter().filter(|l| !l.is_empty()).count();
+        }
+        assert!(
+            labelled >= 8,
+            "the labelled fixtures must actually have labels"
+        );
     }
 
     /// Both readers must agree on success/failure for genuinely bad
@@ -104380,6 +104925,58 @@ mod tests {
     /// downstream type inference, not raw string equality, is what this
     /// project actually guarantees for a date column - see the design
     /// philosophy section in CLAUDE.md).
+    /// Variable labels become `description` and value labels a note,
+    /// checked against `ambers`' own `SpssMetadata` on every fixture that
+    /// has any and on the ones that have none - which must stay empty.
+    #[cfg(feature = "spss")]
+    #[test]
+    fn spss_labels_match_the_ambers_crate() {
+        let mut labelled = 0;
+        for f in [
+            "tests/fixtures/edge_spss_labels.sav",
+            "tests/fixtures/edge_spss_labels_compressed.zsav",
+            "tests/fixtures/type_detection.sav",
+            "tests/fixtures/edge_spss_missing_values.sav",
+            "tests/fixtures/edge_spss_very_long_string.sav",
+        ] {
+            let path = Path::new(f);
+            let mine = spss_support::columns_from_spss(path, None, 3).unwrap();
+            let (_, meta) = ambers::read_sav(path).unwrap();
+            for col in &mine {
+                let label = meta
+                    .variable_labels
+                    .get(&col.name)
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(col.description, label, "{f} col '{}': label", col.name);
+                let pairs: Vec<(String, String)> = meta
+                    .variable_value_labels
+                    .get(&col.name)
+                    .map(|m| m.iter().map(|(v, t)| (v.to_string(), t.clone())).collect())
+                    .unwrap_or_default();
+                let mut expected = ColumnProfile::default();
+                apply_variable_labels(&mut expected, "", &pairs);
+                if expected.notes.is_empty() {
+                    assert!(
+                        !col.notes.contains("value labels"),
+                        "{f} col '{}'",
+                        col.name
+                    );
+                } else {
+                    assert!(
+                        col.notes.contains(&expected.notes),
+                        "{f} col '{}': {:?} lacks {:?}",
+                        col.name,
+                        col.notes,
+                        expected.notes
+                    );
+                    labelled += 1;
+                }
+            }
+        }
+        assert!(labelled >= 6, "expected labelled columns, saw {labelled}");
+    }
+
     #[cfg(feature = "spss")]
     #[test]
     fn spss_reader_matches_the_ambers_crate_output_exactly() {

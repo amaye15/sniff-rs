@@ -329,9 +329,13 @@ that pools several elements per parent record). `row_count` is deliberately
 many rows," the same reason that format never carried `sample_values`/
 `notes` either.
 
-`description` is always empty — intentionally left for a human (or an agent
-downstream of this one) to fill in; no heuristic should be guessing what a
-column *means*.
+`description` is empty unless the file itself says what the column is: a
+Stata, SAS7BDAT, or SPSS variable label (the author's own words) lands
+there, and nothing else ever does - no heuristic guesses what a column
+*means*, so for every other format it's left for a human (or an agent
+downstream of this one) to fill in. A coded column's value labels
+(`1 = male; 2 = female`) go in `notes` as `value labels: ...`, capped at
+20 entries with a count of the rest and 60 characters per label.
 
 `numeric_stats` is `null` for every column except one whose `ideal_type`
 resolved to exactly `"i64"` or `"f64"`, in which case it's a real
@@ -779,8 +783,8 @@ What that found and what fixed it:
   honest cell to write instead.
 
 Result: every fixture that generates inline SQL loads into PostgreSQL
-(368 of 368) and into MySQL apart from the two non-finite-float fixtures
-(366 of 368); the rest refuse to generate for a documented reason. The
+(377 of 377) and into MySQL apart from the two non-finite-float fixtures
+(375 of 377); the rest refuse to generate for a documented reason. The
 SQLite corpus output is unchanged except for date/time literals and
 identifiers that needed the fixes above (38 of 1,028 fixture/mode
 combinations, all in inline mode; staging is byte-identical).
@@ -4245,6 +4249,57 @@ topic in different vocabulary won't link. Peak memory on the corpus is
 1.6 GB, almost all of it the existing PDF reader on two large PDFs, not
 the graph.
 
+## Variable and value labels (Stata, SAS7BDAT, SPSS)
+
+Prompted by the last open item from the earlier report ("description
+field vs new field"), settled with best judgement: **the variable label
+is the column's `description`, and value labels are one `notes` entry** -
+no new `ColumnProfile` field, so every other output stays byte-identical
+and no renderer or JSON consumer changes shape. `description` was always
+documented as "left for a human" because no heuristic should guess what a
+column means; a label is the file's author saying exactly that, so
+filling it from a label doesn't break the rule, it's the case the rule
+was waiting for. A coded column reads as codes to type detection (`sex`
+resolves to `i64`), and the label table is the only place the file says
+what the codes mean, which is why they go in the notes next to that
+verdict. `apply_variable_labels` (shared, feature-gated to the three
+formats) does the attaching: `value labels: 1 = male; 2 = female; 3 =
+other`, at most 20 entries then `... N more`, each label cut at 60
+characters, and an empty label or no labels adds nothing.
+
+- **Stata**: `read_schema` now reads the variable-label and
+  value-label-name arrays instead of skipping them (`Schema` struct, with
+  the `<map>`'s value-labels offset for the XML releases 117+; a binary
+  file's tables follow its records, so the offset is data start plus
+  `observation_count * row_len`). `read_value_labels` reads each table
+  (`u32` length, name, 3 padding bytes, then count, text length, offsets,
+  `i32` values, text; wrapped in `<value_labels>`/`<lbl>` from 117) with
+  its own bounds checks, and a table that doesn't parse costs the notes,
+  never the profile. From release 113 the top of the `long` range is
+  Stata's missing values, and a label can name one, so `0x7FFFFFE5..` shows
+  as `.`, `.a`..`.z` as Stata writes them. Releases 102-107 use another
+  layout and get variable labels only.
+- **SAS7BDAT**: the column-format subheader holds the label's text
+  reference right after the format's (offset 40, or 52 in a 64-bit file -
+  the `sas7bdat` crate's own layout); the label is trimmed of trailing
+  padding only, since a leading space was typed. Value labels live in a
+  separate `.sas7bcat` catalog, so there are none to read.
+- **SPSS**: the type-2 record's label is kept raw until the file's
+  encoding is known; type 3/4 records now yield `(value, text)` pairs per
+  variable (a type 4 record's indexes are 1-based positions among the
+  type 2 records, continuation slots included).
+
+Verified against three independent readers: for Stata the `dta` crate's
+own schema and `ValueLabelTable` (`stata_labels_match_the_dta_crate_and_
+pyreadstat`, run over the XML 117/118 and binary 113/114 layouts and an
+edge file with 25 labels, non-ASCII text, and an over-long label); for
+SAS the `sas7bdat` crate's `ColumnMeta::label` plus pyreadstat across the
+whole 30-file pandas corpus (25 readable ones matched, 5 with labels; two
+of them are vendored as fixtures); for SPSS `ambers`' `SpssMetadata`
+(both `.sav` and `.zsav`). The fixtures are `edge_stata_labels_*.dta`,
+`sas7bdat_pandas_airline`/`_cars.sas7bdat` (pandas, BSD-3-Clause - see
+`sas7bdat_PROVENANCE.md`), and `edge_spss_labels.sav`/`.zsav`.
+
 ## Numeric/statistical column summaries
 
 `ColumnProfile` gained a new field, `numeric_stats: Option<{count, min,
@@ -5188,7 +5243,9 @@ the release-117 file, where pandas writes UTF-8 bytes that both readers
 decode as Windows-1252.
 Variable and value labels - Stata's own human-authored variable
 descriptions and coded-value names (`1`/`2`/`3` meaning
-`"male"`/`"female"`/`"other"`) - aren't surfaced; see Known limitations.
+`"male"`/`"female"`/`"other"`) - are surfaced (see "Variable and value
+labels" below): the variable label becomes the column's `description`
+and the value labels a `value labels: ...` note.
 
 SAS7BDAT (`columns_from_sas7bdat`, via `sas7bdat_support` - a hand-rolled
 reader now, see the Dependency footprint section) follows the same shape,
@@ -5202,8 +5259,9 @@ genuinely worth cross-checking: SAS stores nearly all numeric data as
 for a whole-number column isn't a bug in either the reader or this tool -
 it's the same "declared type is a hint, not the truth" lesson Parquet/
 Avro/dBase/Stata all already demonstrate, in one more format's own way of
-losing that distinction. SAS also has per-column labels (same considered
-non-surfacing decision as Stata's).
+losing that distinction. SAS also has per-column labels, read from the
+column-format subheader's own label reference and surfaced as the
+column's `description`.
 
 SPSS (`columns_from_spss`, via `spss_support` - a hand-rolled reader from
 the start, see the Dependency footprint section) is architecturally the
@@ -5223,8 +5281,8 @@ variable's own separately-declared user-missing specification (discrete
 values, or a range, e.g. "900-999 means not administered") - both are
 treated as absent, the same "missing values never fake a type change"
 principle Stata's own `.`-through-`.z` missing markers already get.
-Variable/value labels aren't surfaced (same considered non-surfacing
-decision as Stata's/SAS7BDAT's).
+Variable labels and value labels are surfaced (see "Variable and value
+labels" below).
 
 **A `.zsav` file's own zlib-block compression layer is fully supported**,
 closed in a later pass prompted by a direct "what else can be improved"
@@ -13426,8 +13484,9 @@ this project could just implement directly rather than depend on:
   uses - walk a page's subheader pointers (if any), decompress or borrow
   whatever they reference, then fall back to whatever contiguous row
   bytes remain on the page - since a single straightforward full-table
-  read has no need for a fast-path split at all. Variable/value labels
-  aren't surfaced, the same considered decision as Stata's own.
+  read has no need for a fast-path split at all. A column's label
+  becomes its `description`; value labels aren't read, since SAS keeps
+  them in a separate `.sas7bcat` catalog file.
 
   The format layers similarly to Stata's own binary form (unsurprising,
   since both are proprietary statistical-package formats of a similar
@@ -15225,9 +15284,8 @@ this project could just implement directly rather than depend on:
   a handful of typed records: type-2 variable records (one per column,
   each carrying its own declared width, print/write format, and
   optionally a declared missing-value specification), type-3/4 value-label
-  records (parsed only far enough to skip correctly - the labels
-  themselves aren't surfaced, matching this project's existing Stata/
-  SAS7BDAT precedent), type-6 document records, and type-7 "info"
+  records (the labels are read and surfaced - see "Variable and value
+  labels" below), type-6 document records, and type-7 "info"
   extension records dispatched by subtype - of which this reader only
   actually needs four (machine-integer info for a codepage fallback, long
   variable names, very-long-string segment widths, and the file's own
@@ -17390,20 +17448,15 @@ established baselines exactly.
   stack for one format was judged not worth it here; would reconsider if
   the crate trims that footprint, or if there's a concrete need for
   `.duckdb` files.
-- **Stata/SAS7BDAT/SPSS variable/value labels aren't surfaced.** A `.dta`,
-  `.sas7bdat`, or `.sav` file can carry a human-authored description per
-  variable (a "variable label") and, for Stata and SPSS, a named mapping
-  for coded values (a "value label", e.g. `1`/`2`/`3` →
-  `"male"`/`"female"`/`"other"`) - both genuinely useful, authoritative
-  metadata, not a guess. Deliberately out of scope for now: surfacing them
-  well would mean either overloading the existing (always-empty)
-  `description` field with format-provided text - a different kind of
-  content than what it's documented to hold - or
-  adding a new field to `ColumnProfile`, which is shared by every format's
-  renderer and output shape. Worth adding if there's real demand;
-  `Variable::label()` in the `dta` crate, `ColumnMeta::label` in the
-  `sas7bdat` crate, and `SpssMetadata::variable_labels`/
-  `variable_value_labels` in `ambers` already expose it.
+- **Stata/SAS7BDAT/SPSS labels: only the file's own words, and not every
+  kind.** Variable labels (all three formats) and value labels (Stata,
+  SPSS) are surfaced; SAS value labels live in a separate `.sas7bcat`
+  catalog file that isn't read, and Stata releases 102-107 (an older
+  value-label layout) get variable labels only. Stata's value-label
+  tables are read after the data, so a label section that won't parse
+  costs the notes but never the profile. Labels are not part of
+  `--output-format json-schema` or SQL output - only `description` and
+  `notes`.
 - **SAS7BDAT and dBase don't decode multi-byte East Asian encodings**
   (Shift-JIS, EUC-JP/KR, Big5, GB18030, ISO-2022-\*, and dBase's code
   pages 932/936/949/950), nor a few rare single-byte ones with no

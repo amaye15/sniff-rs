@@ -34,6 +34,10 @@ All notable changes to sniff-rs are documented here. Format follows
 - An empty `/FlateDecode` stream in a PDF no longer fails the file.
 
 ### Added
+- Stata, SAS7BDAT, and SPSS variable labels become each column's
+  `description`, and Stata and SPSS value labels a `value labels: 1 =
+  male; 2 = female` note (SAS keeps value labels in a separate catalog
+  file, which isn't read).
 - Directory mode `--load-into postgres:...`/`mysql:...` (or a connection
   URI) creates one database per file, named from its path
   (`sub/types.csv` becomes `<prefix>_sub_types_csv`); an existing

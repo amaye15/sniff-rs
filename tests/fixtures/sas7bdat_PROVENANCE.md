@@ -25,3 +25,9 @@ verbatim from pandas' own test data (`pandas/tests/io/sas/data/`,
 https://github.com/pandas-dev/pandas, BSD-3-Clause). It declares the
 WINDOWS-1251 text encoding, which this reader used to refuse; it now
 reads through the shared single-byte code page tables.
+
+`sas7bdat_pandas_airline.sas7bdat` and `sas7bdat_pandas_cars.sas7bdat` are
+`airline.sas7bdat` and `cars.sas7bdat` from the same pandas directory
+(BSD-3-Clause). Both carry per-column labels (`level of output`,
+`miles per gallon`, ...), which the reader now surfaces as each column's
+`description`; the expected labels were cross-checked against pyreadstat.
