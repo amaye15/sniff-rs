@@ -72909,6 +72909,13 @@ fn detect_format(
     logical_path: &Path,
     override_fmt: &Option<String>,
 ) -> Result<InputFormat> {
+    // A directory inside a directory walk is only ever a lakehouse table
+    // (`collect_files_sorted` yields no other kind).
+    if read_path.is_dir() {
+        return lakehouse_dir_format(read_path).ok_or_else(|| {
+            anyhow!("{read_path:?} is a directory that isn't a Delta Lake or Apache Iceberg table")
+        });
+    }
     if let Some(f) = override_fmt {
         return match f.to_lowercase().as_str() {
             "csv" => Ok(InputFormat::Csv),
@@ -86493,6 +86500,10 @@ mod stdin_input_tests {
 fn decompress_if_needed(path: &Path) -> Result<(PathBuf, PathBuf, Option<TempFile>)> {
     use std::fs::File;
 
+    // A lakehouse table directory met during a directory walk.
+    if path.is_dir() {
+        return Ok((path.to_path_buf(), path.to_path_buf(), None));
+    }
     let (compression, logical_path) = match compression_from_extension(path) {
         Some(c) => (c, path.with_extension("")),
         None => match compression_from_magic(path) {
@@ -86974,11 +86985,17 @@ fn dispatch_reader(
     format: InputFormat,
     args: &Args,
 ) -> Result<(BTreeMap<String, Vec<ColumnProfile>>, usize)> {
-    let file_stem = logical_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    // A lakehouse table is a directory: its table is named for the whole
+    // directory name, exactly as `run_delta_table`/`run_iceberg_table` do,
+    // not for a "stem" with an imagined extension cut off.
+    let file_stem = if matches!(format, InputFormat::DeltaTable | InputFormat::IcebergTable) {
+        logical_path.file_name()
+    } else {
+        logical_path.file_stem()
+    }
+    .unwrap_or_default()
+    .to_string_lossy()
+    .into_owned();
 
     // Only CSV/TSV ever set this to anything but 0 - it's the already-
     // resolved `skip_rows` (explicit `--skip-rows`, or auto-detected via
@@ -87068,12 +87085,9 @@ fn dispatch_reader(
             InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
                 unreachable!("handled above")
             }
-            InputFormat::DeltaTable => unreachable!(
-                "a Delta table is a directory, resolved and profiled directly by run_delta_table - it never reaches detect_format/dispatch_reader at all"
-            ),
-            InputFormat::IcebergTable => unreachable!(
-                "an Iceberg table is a directory, resolved and profiled directly by run_iceberg_table - it never reaches detect_format/dispatch_reader at all"
-            ),
+            InputFormat::DeltaTable | InputFormat::IcebergTable => {
+                profile_lakehouse_table(format, read_path, args)?
+            }
         };
         let mut tables: BTreeMap<String, Vec<ColumnProfile>> = BTreeMap::new();
         // A PDF's filled-in form is one record of its own, beside the
@@ -87087,6 +87101,46 @@ fn dispatch_reader(
         tables
     };
     Ok((tables, resolved_skip_rows))
+}
+
+/// One lakehouse table (a directory) as one table's columns - what a
+/// directory walk, `--combine` and `graph` use for a Delta/Iceberg table
+/// nested inside the input, so it's profiled as the single logical table
+/// it is rather than as a pile of Parquet data files and log JSON.
+#[cfg(feature = "delta")]
+fn profile_delta_dir(path: &Path, args: &Args) -> Result<Vec<ColumnProfile>> {
+    delta_support::resolve_delta_table_profiles(path, args.nrows, args.samples)
+}
+
+#[cfg(not(feature = "delta"))]
+fn profile_delta_dir(_path: &Path, _args: &Args) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "this looks like a Delta Lake table (a _delta_log/ directory with real commit files was found) - support for it isn't compiled in - rebuild with --features delta"
+    )
+}
+
+#[cfg(feature = "iceberg")]
+fn profile_iceberg_dir(path: &Path, args: &Args) -> Result<Vec<ColumnProfile>> {
+    iceberg_support::resolve_iceberg_table_profiles(path, args.nrows, args.samples)
+}
+
+#[cfg(not(feature = "iceberg"))]
+fn profile_iceberg_dir(_path: &Path, _args: &Args) -> Result<Vec<ColumnProfile>> {
+    bail!(
+        "this looks like an Apache Iceberg table (a metadata/ directory with a *.metadata.json file was found) - support for it isn't compiled in - rebuild with --features iceberg"
+    )
+}
+
+fn profile_lakehouse_table(
+    format: InputFormat,
+    path: &Path,
+    args: &Args,
+) -> Result<Vec<ColumnProfile>> {
+    match format {
+        InputFormat::DeltaTable => profile_delta_dir(path, args),
+        InputFormat::IcebergTable => profile_iceberg_dir(path, args),
+        _ => unreachable!("only a lakehouse table is profiled as a directory"),
+    }
 }
 
 /// Renders the shared table shape into one of the three `String`-
@@ -87171,6 +87225,18 @@ pub fn run() -> Result<()> {
             std::process::exit(1);
         }
         Err(e) => Err(e),
+    }
+}
+
+/// `DeltaTable`/`IcebergTable` when `path` is a lakehouse table directory
+/// (see `is_delta_table_dir`/`is_iceberg_table_dir`), else `None`.
+fn lakehouse_dir_format(path: &Path) -> Option<InputFormat> {
+    if is_delta_table_dir(path) {
+        Some(InputFormat::DeltaTable)
+    } else if is_iceberg_table_dir(path) {
+        Some(InputFormat::IcebergTable)
+    } else {
+        None
     }
 }
 
@@ -87804,6 +87870,15 @@ fn collect_files_sorted(
             // vault) is output, not input - never walked, so a later run
             // doesn't profile its own `graph.json`.
             if path.join(knowledge_graph::MARKER_FILE).exists() {
+                continue;
+            }
+            // A Delta Lake / Iceberg table is one logical table, not a
+            // folder of files: it's a single entry, resolved through its
+            // own transaction log / metadata chain, and never descended
+            // into (its Parquet data files and log JSON mean nothing on
+            // their own).
+            if lakehouse_dir_format(&path).is_some() {
+                out.push(path);
                 continue;
             }
             // Prune excluded directories without descending: `--exclude

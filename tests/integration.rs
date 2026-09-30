@@ -16226,3 +16226,202 @@ fn diff_reports_a_changed_label_and_recoded_value_labels() {
     assert!(same["changes"].as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- Lakehouse tables nested in a directory ---
+
+/// A warehouse folder holding a Delta table, an Iceberg table and a CSV.
+#[cfg(all(feature = "delta", feature = "iceberg"))]
+fn nested_lakehouse_tree(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("sniff-lake-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let wh = root.join("warehouse");
+    copy_dir_recursive(&fixture("edge_delta_table"), &wh.join("sales_delta"));
+    copy_dir_recursive(&fixture("edge_iceberg_table"), &wh.join("events_iceberg"));
+    std::fs::copy(fixture("sample.csv"), wh.join("sample.csv")).unwrap();
+    root
+}
+
+#[cfg(all(feature = "delta", feature = "iceberg"))]
+#[test]
+fn nested_delta_and_iceberg_tables_are_one_table_each_in_directory_mode() {
+    let root = nested_lakehouse_tree("dir");
+    let out_dir = root.join("out");
+    let out = Command::new(bin())
+        .args([
+            root.join("warehouse").to_str().unwrap(),
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // One output per table - not one per Parquet data file and log commit.
+    let mut names: Vec<String> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "_index.dictionary.json",
+            "events_iceberg.dictionary.json",
+            "sales_delta.dictionary.json",
+            "sample.csv.dictionary.json",
+        ]
+    );
+    let delta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.join("sales_delta.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(delta["format"], "delta");
+    let id = column(table(&delta, "sales_delta"), "id");
+    assert_eq!(id["row_count"], 5);
+    // The partition column only exists in the transaction log.
+    assert!(
+        table(&delta, "sales_delta")
+            .iter()
+            .any(|c| c["name"] == "category")
+    );
+    let iceberg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.join("events_iceberg.dictionary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(iceberg["format"], "iceberg");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(all(feature = "delta", feature = "iceberg"))]
+#[test]
+fn nested_lakehouse_tables_combine_and_load_as_one_table_each() {
+    let root = nested_lakehouse_tree("combine");
+    let wh = root.join("warehouse");
+    let out = Command::new(bin())
+        .args([
+            wh.to_str().unwrap(),
+            "--combine",
+            "--output-format",
+            "json",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names: Vec<&String> = doc["tables"].as_object().unwrap().keys().collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("sales_delta__sales_delta")),
+        "{names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("events_iceberg__events_iceberg")),
+        "{names:?}"
+    );
+
+    // Inline SQL replays each table's live rows, not loose files.
+    let out = Command::new(bin())
+        .args([
+            wh.to_str().unwrap(),
+            "--combine",
+            "--output-format",
+            "sql",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        sql.contains("CREATE TABLE \"sales_delta__sales_delta\""),
+        "{sql}"
+    );
+    assert_eq!(
+        sql.matches("INSERT INTO \"sales_delta__sales_delta\"")
+            .count(),
+        1,
+        "{sql}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(all(feature = "delta", feature = "iceberg"))]
+#[test]
+fn nested_lakehouse_tables_are_single_nodes_in_the_graph() {
+    let root = nested_lakehouse_tree("graph");
+    let out_dir = root.join("graph_out");
+    let out = Command::new(bin())
+        .args([
+            "graph",
+            root.join("warehouse").to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let graph: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir.join("graph.json")).unwrap())
+            .unwrap();
+    let files: Vec<&serde_json::Value> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == "file")
+        .collect();
+    let labels: Vec<&str> = files.iter().map(|n| n["label"].as_str().unwrap()).collect();
+    // Exactly three file nodes - the two tables and the CSV - and none of
+    // the Parquet data files or commit JSON inside them.
+    assert_eq!(files.len(), 3, "{labels:?}");
+    assert!(
+        labels.contains(&"sales_delta") && labels.contains(&"events_iceberg"),
+        "{labels:?}"
+    );
+    let file_type =
+        |label: &str| files.iter().find(|n| n["label"] == label).unwrap()["file_type"].clone();
+    assert_eq!(file_type("sales_delta"), "delta");
+    assert_eq!(file_type("events_iceberg"), "iceberg");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// A build without the feature still recognizes the table and says what to
+// rebuild with, instead of profiling its log and data files as loose files.
+#[cfg(not(feature = "delta"))]
+#[test]
+fn nested_delta_table_without_the_feature_fails_with_a_rebuild_hint() {
+    let root = std::env::temp_dir().join(format!("sniff-lake-nofeat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    copy_dir_recursive(&fixture("edge_delta_table"), &root.join("wh").join("t"));
+    let out = Command::new(bin())
+        .args([
+            root.join("wh").to_str().unwrap(),
+            "--output-dir",
+            root.join("o").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--features delta"));
+    let _ = std::fs::remove_dir_all(&root);
+}
