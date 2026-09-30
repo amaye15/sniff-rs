@@ -6,7 +6,39 @@ All notable changes to sniff-rs are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- `--encoding <name>` and byte-order-mark handling for every text format:
+  UTF-8/UTF-16/UTF-32 BOMs are honored, and UTF-16/32 or any single-byte
+  code page (windows-125x, ISO-8859-x, cp437/cp866, koi8, macintosh;
+  `latin1` means windows-1252) can be named. Files are transcoded once, in
+  front of every reader, through a temporary UTF-8 copy.
+- Archive and compression wrappers beyond gzip/zstd: `.bz2`, `.xz`,
+  `.zip`, `.tar`, `.tgz`/`.tar.gz`/`.tbz2`/`.txz`, `.br`, `.lz4`, peeled
+  off in any nesting. An archive must hold exactly one file (a directory
+  walk skips one that holds several). bzip2 and xz/LZMA2 are hand-rolled
+  and checked against CPython and the `xz` command. `--list-formats` lists
+  the wrappers.
+- Arrow IPC streams (`.arrows`), profiled and loadable like Feather files.
+- Inline SQL (and `--load-into`) for one-to-many data: an array of
+  objects - including a Parquet/ORC/Arrow map or list of structs and a
+  notebook's `outputs` - becomes a child table with `_parent_row_id` and
+  `_index` keys and a foreign key to the parent's `_row_id`. Values that
+  mix scalars and objects, and repeated INI keys, are written too.
+- SQLite `WITHOUT ROWID` tables are read (profile and SQL).
+- NumPy arrays of three or more axes: one row per slice of the first axis.
+- Variable and value labels appear in JSON-Schema (`description`), as SQL
+  column comments, and in `diff` (`labels changed`).
+
+### Changed
+- A Delta Lake or Iceberg table inside a directory is one table in
+  directory mode, `--combine` and `graph`, instead of a pile of its data
+  files.
+
 ### Fixed
+- A UTF-8 byte-order mark no longer ends up inside the first YAML key or
+  makes JSON, JSONL, XML, INI and vCard files fail.
+- `--help` and the docs disagreed on `explain`/`path` argument order and on
+  whether piped compressed input is unwrapped.
 - Inline SQL loaded into a real PostgreSQL or MySQL server (found by
   loading every fixture into both): dates and times are written as ISO
   literals using the column's own detected format (`15/01/2024`,

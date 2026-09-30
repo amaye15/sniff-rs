@@ -3481,8 +3481,10 @@ ARGS:
             Path to the input file, or a directory to batch-process (see
             above). A file's format is inferred from its extension; if
             there isn't one, or it's not recognized, its own bytes are
-            sniffed instead. A .gz or .zst extension is transparently
-            decompressed first. Pass "-" to read from stdin instead of a
+            sniffed instead. Compression and archive wrappers - .gz, .zst,
+            .bz2, .xz, .br, .lz4, and .zip/.tar/.tgz holding exactly one
+            file, in any nesting such as .tar.gz - are peeled off first
+            (--list-formats shows what each needs). Pass "-" to read from stdin instead of a
             real file (buffered into a real temp file first, so every
             reader works unchanged) - since there's no extension to infer
             from, this needs either --format or content that sniffs

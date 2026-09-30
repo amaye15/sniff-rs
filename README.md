@@ -8,9 +8,12 @@ Reads CSV, TSV, JSON, JSON Lines, Parquet, Arrow IPC/Feather, Avro, Excel,
 SQLite, MessagePack, TOML, YAML, CBOR, INI, XML, fixed-width text, NumPy,
 Common/Combined access logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT,
 SPSS, ORC, BSON, plist, JSON5/JSONC, HAR, GeoJSON, MBOX, vCard, iCalendar,
-Jupyter notebooks, and PDF page text — any of them gzip- or
-zstd-compressed — plus Delta Lake and Iceberg tables.
-Writes Markdown, rich JSON, JSON-Schema, or a runnable SQL script.
+Jupyter notebooks, and PDF page text — any of them inside a gzip, zstd,
+bzip2, xz, brotli, LZ4, zip or tar wrapper (`data.tar.gz` works), in UTF-8,
+UTF-16/32 or a single-byte code page (`--encoding`) — plus Delta Lake and
+Iceberg tables.
+Writes Markdown, rich JSON, JSON-Schema, or a runnable SQL script; nested
+data (arrays of objects, maps) becomes child tables keyed to the parent row.
 `sniff-rs diff` compares two dictionaries (or two raw files) and flags
 schema drift. `sniff-rs graph` builds a knowledge graph across every file
 in a folder.
@@ -91,7 +94,8 @@ sniff-rs --list-formats          # every format this binary can read
 sniff-rs data.csv
 sniff-rs events.jsonl out.md --samples 5
 sniff-rs warehouse.db - --output-format json | jq .
-sniff-rs data.csv.gz
+sniff-rs data.csv.gz                  # or .tar.gz, .zip, .xz, .bz2, ...
+sniff-rs legacy.csv --encoding windows-1252
 sniff-rs ./data/ --output-dir ./dictionaries/
 sniff-rs diff old.json new.json
 ```

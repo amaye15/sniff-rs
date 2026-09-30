@@ -77,20 +77,19 @@ full, honest numbers.
 | JSON | `.json` | *(default)* | array-of-objects, a single (optionally pretty-printed) object, or JSON Lines, auto-detected by content; a top-level array/stream of non-object values profiles as one `value` column |
 | JSON Lines / NDJSON | `.jsonl`, `.ndjson` | *(default)* | same reader as JSON |
 | Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List/Map |
-| Arrow IPC / Feather | `.arrow`, `.feather` | `--features parquet` | shares Parquet's Arrow infrastructure |
+| Arrow IPC / Feather | `.arrow`, `.feather`, `.arrows` | `--features parquet` | shares Parquet's Arrow infrastructure; `.arrows` is the Streaming format (no footer - read message by message, also recognized by content) |
 | Avro | `.avro` | `--features avro` | recurses into records/arrays/unions |
 | Excel | `.xlsx`, `.xls`, `.xlsb`, `.ods` | `--features xlsx` | one section per sheet, like SQLite (see below); `.xls` covers BIFF8 (97-2003), BIFF5/7 (5.0/95), and bare BIFF3/BIFF4 worksheets |
-| SQLite | `.db`, `.sqlite`, `.sqlite3` | `--features sqlite` | one section per table (see below) |
+| SQLite | `.db`, `.sqlite`, `.sqlite3` | `--features sqlite` | one section per table (see below); `WITHOUT ROWID` tables (index b-tree storage, key-first records) read like any other |
 | MessagePack | `.msgpack`, `.mp` | `--features msgpack` | stream of concatenated records, or a single top-level array |
 | TOML | `.toml` | `--features toml` | whole document = one row; array-of-tables flattens like a nested JSON array |
 | YAML | `.yaml`, `.yml` | `--features yaml` | single mapping = one row, single sequence = array-of-records, `---`-multi-doc = one row per document; a non-mapping document/sequence-of-scalars profiles as one `value` column |
 | CBOR | `.cbor` | `--features cbor` | same convention as MessagePack: concatenated records, or a single top-level array |
-| INI | `.ini` | `--features ini` | one section per table, like SQLite (see below); a repeated key pools into an array |
+| INI | `.ini` | `--features ini` | one section per table, like SQLite (see below); a repeated key pools into an array (JSON-array text in SQL) |
 | XML | `.xml` | `--features xml` | homogeneous same-tag children of the root = records; otherwise the root = one row; attributes become `@name` columns |
 | Fixed-width text | *(none — `--format fixed-width` only)* | *(default)* | needs `--widths 10,5,20`; no delimiter, so boundaries are never guessed |
-| gzip | any of the above + `.gz`/`.gzip` | *(default)* | transparently decompressed before the inner format's own reader runs |
-| zstd | any of the above + `.zst`/`.zstd` | `--features zstd` | same as gzip |
-| NumPy | `.npy` | `--features npy` | structured (record) dtype = one column per field; plain dtype = positional `col_0..col_N` (2D) or one `value` column (1D) |
+| Wrappers | any of the above + `.gz`/`.gzip`, `.zst`/`.zstd`, `.bz2`, `.xz`, `.zip`, `.tar`, `.tgz`/`.tar.gz`/`.tbz2`/`.txz`, `.br`, `.lz4` | gzip, bz2, xz, zip, tar: *(default)*; zstd: `--features zstd`; br, lz4: `--features parquet` | peeled off (repeatedly - `data.tar.gz`) into a temporary file before the inner format's own reader runs; an archive must hold exactly one file; `--list-formats` lists them with what each needs - see "Compression and archive wrappers" below |
+| NumPy | `.npy` | `--features npy` | structured (record) dtype = one column per field; plain dtype = positional `col_0..col_N` (2D) or one `value` column (1D); 3+ axes = one row per slice of the first axis (`index`, `value`) |
 | NumPy archive | `.npz` | `--features npy` | zip of named `.npy` arrays; one table per array, like SQLite (see below) |
 | Common Log Format | *(none — `--format common-log` only)* | `--features weblog` | `host ident authuser [ts] "req" status bytes`; request splits into method/path/protocol |
 | Combined Log Format | *(none — `--format combined-log` only)* | `--features weblog` | Common Log plus `"referer" "user-agent"` |
@@ -132,9 +131,11 @@ text is the one exception: it needs no new dependency (pure `std` string
 slicing), so it's always compiled in, gated by nothing but the required
 `--widths` flag.
 
-gzip/zstd decompression (`decompress_if_needed`) isn't a format of its own —
-it's a preprocessing step in front of every reader above, not a new
-`InputFormat` variant. A `.gz`/`.zst` input gets decompressed into a real
+Compression and archive wrappers (`decompress_if_needed` - gzip, zstd, bzip2,
+xz, zip, tar, brotli, lz4; see "Compression and archive wrappers" below for
+the full set) aren't formats of their own —
+they're a preprocessing step in front of every reader above, not a new
+`InputFormat` variant. A `.gz`/`.zst` (or any other wrapper) input gets peeled into a real
 temporary file (via the hand-rolled `TempFile` guard - see the Dependency
 footprint section below), cleaned up on drop) *before* format detection
 ever runs, so every reader keeps opening a plain file path exactly as
@@ -390,6 +391,11 @@ guessing:
   }
 }
 ```
+
+*(Updated later: the "disclosed error" cases this section's history describes - an
+array of objects, a mixed scalar/object value, a repeated INI key, a
+`WITHOUT ROWID` table, a 3-D array - are all written now, as child tables
+or array text; see "Normalisation pass" below. Staging mode is unchanged.)*
 
 SQL script (`sql`) — a fourth rendering, and the only one that's meant to
 be *run* rather than read. `--sql-mode` picks between two genuinely
@@ -17338,14 +17344,15 @@ sniffing (`sniff_format`) still works too, since it's already just a
 peek at a file's own bytes and the materialized stdin content is a real
 file by the time it runs.
 
-Two real, disclosed scope boundaries, both deliberate rather than
-oversights: a gzip/zstd-compressed stream piped this way is *not* auto-
-decompressed, since a literal `-` carries no extension for `compression_
-from_extension` to key off - the same `gunzip -c foo.csv.gz | sniff-rs -`
-shell-pipeline workaround this tool already needs for any other
-extensionless compressed file; and `sniff-rs diff`'s own two-input
-grammar doesn't get this treatment - out of scope for this pass, named
-here rather than silently unsupported.
+One disclosed scope boundary, deliberate rather than an oversight: a
+compressed or archived stream piped this way *is* unwrapped - by its
+magic bytes (gzip, zstd, bzip2, xz, lz4, tar; see "Compression and
+archive wrappers"), since a literal `-` has no extension to go by - but a
+format brotli (no magic) or zip (whose magic an `.xlsx`/`.npz` shares)
+needs a real file name. (This paragraph used to say the opposite, which
+was true only until the magic-byte sniffing of extensionless input landed;
+`edge_gzip_no_extension` and the piped-gzip test cover it.) `sniff-rs
+diff` accepts `-` for one of its two inputs through the same path.
 
 An explicit `OUTPUT_PATH` is required whenever `INPUT_PATH` is `-` (a
 clear, actionable error otherwise) - the default output-naming fallback
@@ -17401,6 +17408,227 @@ safe and meaningful to test in-process) plus five new integration tests
 were added. Full test suite (1083 `--features full` / 521 default, six
 new tests total) passing, clippy/fmt clean on both builds matching
 established baselines exactly.
+
+## Normalisation pass: encodings, wrappers, child tables, labels
+
+An audit of the whole CLI against a sweep of every committed fixture in
+every output mode (`md`, `json`, `json-schema`, `sql` inline and staging)
+found seven places where one part of the tool did not line up with the
+others. Each is fixed here; the Output formats and Lakehouse sections
+above describe their own histories and, where they say "a disclosed
+error" for something below, this section supersedes them.
+
+### Text encodings and byte-order marks
+
+Every text reader wants plain, BOM-less UTF-8, and they used to disagree
+about a byte-order mark: CSV, TSV, TOML and JSON5 skipped a UTF-8 BOM,
+YAML kept U+FEFF inside its first key, and JSON, JSONL, XML, INI and vCard
+refused the file. There is now one policy, applied once in front of every
+reader the way `decompress_if_needed` handles compression.
+
+`try_detect_and_normalize` (`detect_and_normalize` for a caller where
+"unrecognized" is just an error) runs between decompression and the
+reader in every entry point - a single file, a directory walk,
+`--combine`, `diff`, `graph` and stdin. A text format (`is_text_format`;
+a property list is excluded because its binary variant must never be
+transcoded) whose file starts with a UTF-8/UTF-16/UTF-32 byte-order mark,
+or that is named by `--encoding`, is streamed through `normalize_text_bytes`
+into a temporary UTF-8 copy in 64 KiB chunks, and every reader - including
+inline SQL's own second pass - opens that copy instead. A file that is
+already plain UTF-8 is never copied, and neither is one carrying only a
+UTF-8 BOM for a reader that already skips it (`reader_skips_utf8_bom`).
+
+`--encoding <name>` takes utf-8, utf-16/-le/-be, utf-32/-le/-be, or any
+single-byte code page `codepage_support` has a table for (windows-125x,
+cp437/cp866/..., ISO-8859-x, koi8-r/u, macintosh; `latin1`, `iso-8859-1`
+and `ascii` mean windows-1252, per the WHATWG standard, like the MBOX and
+Stata readers already did). The 50 tables were already there for dBase and
+SAS7BDAT; the module is simply no longer feature-gated. Shift-JIS, GBK,
+Big5 and EUC-* are not supported, and a name that isn't recognized says so
+and lists what is. UTF-16/32 are transcoded with `char::decode_utf16` (a
+lone surrogate becomes U+FFFD, a trailing high surrogate is held back
+until its partner arrives in the next chunk); a file cut in the middle of
+a code unit is an error. A byte-order mark that contradicts `--encoding`
+is refused rather than resolved by guessing; `--encoding utf-16` with no
+BOM is refused too (it can't tell the byte order). `--encoding` on a
+binary format is an error naming the format it was read as.
+
+A text reader's own "contains invalid UTF-8" failure gets the hint
+appended - `if the file isn't UTF-8, pass --encoding <name> (for example
+windows-1252, latin1, utf-16le)` - through `with_encoding_hint`. A BOM also
+comes before content sniffing: an extensionless UTF-16 JSON file is
+transcoded first and then sniffed.
+
+Verified by `text_encoding_tests` (UTF-16/32 transcoding is independent of
+read boundaries, swept over every chunk size 1-9 and both byte orders,
+including surrogate pairs), fourteen fixtures (`edge_encoding_*`,
+`edge_bom_*`) and integration tests through a single file, stdin, inline
+SQL, and a directory walk.
+
+### Compression and archive wrappers
+
+`decompress_if_needed` peels any number of wrappers (`MAX_CONTAINER_LAYERS`
+= 8) until what is left is a data file, so `data.tar.gz`, a zip inside a
+gzip, and an extensionless `tar.gz` all resolve the same way a plain file
+does. The wrapper is named by the last extension of the (already
+unwrapped) name, or - only when that name has no data-format extension -
+by the file's own leading bytes.
+
+| Wrapper | Extensions | Sniffed by | Notes |
+|---|---|---|---|
+| gzip | `.gz`, `.gzip`, `.tgz` | `1F 8B 08` | streamed; `.tgz` is gzip around a tar |
+| zstd | `.zst`, `.zstd` | `28 B5 2F FD` | `--features zstd` |
+| bzip2 | `.bz2`, `.tbz2`, `.tbz` | `BZh1-9` + a block/end magic | hand-rolled; every block CRC and the stream CRC verified; multi-stream; the obsolete randomised mode is refused |
+| xz | `.xz`, `.txz` | `FD 37 7A 58 5A 00` | hand-rolled LZMA2; container CRC-32/CRC-64 checks verified, a SHA-256 check skipped; blocks, streams and padding; a filter other than LZMA2 refused |
+| zip | `.zip` | not sniffed (an `.xlsx` shares the magic) | exactly one file inside |
+| tar | `.tar` | `ustar` at 257 + a valid header checksum | ustar, pax (`x`/`g`), GNU long names; exactly one regular file |
+| brotli | `.br` | no magic | `--features parquet` (where the decoder lives); the whole file is held in memory |
+| LZ4 | `.lz4` | `04 22 4D 18` | `--features parquet` or `orc`; frame format, linked blocks, concatenated and skippable frames; held in memory |
+
+An archive holding zero or several files can't be one profile: a single
+file run says what it holds (`holds 2 files (a.csv, b.csv) - sniff-rs
+reads one file per archive`), while a directory walk, `--combine` and
+`graph` skip it like any unrecognized file (`decompress_for_walk`).
+macOS litter (`__MACOSX/`, `._name`, `.DS_Store`, `Thumbs.db`) doesn't
+count as a file. The archive member's name becomes the logical name, so
+the table is named for it (`people`, not `data.tar`). Not wrapped, by
+choice: snappy (no standard extension or framing convention), and a zip
+of a whole dataset folder (it would need to be profiled as a directory).
+
+The bzip2 and xz decoders were checked byte for byte against CPython's
+`bz2`/`lzma` and the `xz` command: 12 bzip2 inputs (empty, one byte, every
+run length, incompressible, 2.5 MB of zeros, multi-block at level 1,
+concatenated streams) and 82 xz inputs (every preset 0-9, all four check
+types, `lc/lp/pb` combinations, a 4 KiB dictionary that forces the window
+to slide, incompressible data that uses uncompressed LZMA2 chunks, multiple
+blocks via `xz --block-size`, stream padding). 7,500 (bzip2) and 9,600 (xz)
+randomly bit-flipped or truncated inputs, run in a debug build with
+overflow checks, produced no panic. `--list-formats` (and its JSON) now
+carries a `containers` list with each wrapper's extensions, feature and
+whether it is compiled in.
+
+### Arrow IPC streams
+
+`.arrows` (the Streaming format: no `ARROW1` magic, no footer) was a
+test-only decoder. `read_arrow_ipc_stream_batches` now walks the messages
+straight off the file - the schema first, dictionary batches folded in as
+they arrive, a record batch decoded column-major and dropped, a
+zero-length message or end of file ending the stream - so memory is one
+batch. Profiling (`profile_arrow_ipc_stream`), inline SQL and `--nrows`
+all use it; `profile_arrow_ipc_file` and the SQL row source check the
+first four bytes (`0xFFFFFFFF` means a stream) rather than adding an
+`InputFormat` variant. Content sniffing recognizes a stream by the
+continuation marker, a metadata length that is a multiple of eight, and a
+FlatBuffers root offset inside that metadata.
+
+### One-to-many data becomes child tables
+
+`--sql-mode inline` used to refuse any file with an array of objects, a
+Parquet/ORC/Arrow map, a notebook's `outputs`, a value that mixes scalars
+and objects, a repeated INI key, a `WITHOUT ROWID` table, or a 3-D array -
+35 of 536 fixtures - and `--load-into` with it. It now writes all of them.
+
+An array of objects (`ideal_type == "Vec<struct>"` - anything that
+profiles as `events[]`, including a map's `{key, value}` entries and a
+list of structs) becomes a child table, one row per element
+(`json_sql_table_plan`). The columns beneath the array (by dotted path,
+the nearest enclosing array winning) move to the child with names
+relative to the element, so `events.items.sku` is the `sku` column of a
+grandchild table inside `events`. The tables are written by separate
+passes over the source (`JsonPass`, carried by `InlineRowSink::json_pass`
+and applied in `json_emit_row_for_sql`, so none of the twenty-odd row
+sources needed a change), which keeps memory at one record however many
+tables there are.
+
+Rows are keyed by ordinal, never by anything in the data: `_row_id` (the
+1-based position in the table's own rows, written only when the table has
+children, and its primary key), `_parent_row_id`, and `_index` (the
+element's 1-based position among its array's objects). A foreign key
+names the parent explicitly (`CONSTRAINT "<table>_fk"`) because MySQL
+names an anonymous one `<table>_ibfk_N` and refuses it past 64 characters,
+which a long child-table name makes easy (found by the MySQL sweep). Child
+tables are named `<table>__<path with . as _>`, fitted and de-duplicated
+like every other identifier. `--nrows` bounds the records read, not the
+child rows, in every pass. A file with no array of objects produces
+exactly the script it always did.
+
+A value that is sometimes a scalar and sometimes an object keeps a text
+column (the scalar, or the object as JSON) and its object fields stay
+columns, forced nullable since they are NULL wherever the value was a
+scalar; an array mixing the two keeps a JSON-text column holding the
+whole array and gets a child table for its objects. The default inline
+mode no longer falls back to staging for any of these, and
+`json_inline_blocking_column` is gone.
+
+A repeated INI key in SQL is one JSON-array text cell, the convention
+vCard, iCalendar and MBOX already used; it used to bail.
+
+Checked against real engines with the `--load-into` sweep: PostgreSQL 17
+loads all 451 fixtures that generate inline SQL (377 before), MySQL 8 all
+but the two non-finite-float fixtures (449 of 451), and joins across the
+foreign keys return the right rows in PostgreSQL and SQLite.
+
+### SQLite `WITHOUT ROWID`
+
+A `WITHOUT ROWID` table is stored as an index b-tree keyed by its primary
+key, and used to profile as a disclosed placeholder and refuse SQL.
+`collect_index_entries` walks it in key order (an index b-tree's interior
+cells hold real entries, so the walk is in-order, not leaf-only) with the
+index payload limit `((U - 12) * 64 / 255) - 23` in place of a table
+leaf's `U - 35` (`assemble_payload` is the shared overflow logic). Each
+entry's record leads with the primary-key columns in key order and then
+the rest in declared order, so `ParsedTable::record_position` maps each
+declared column back; `table_row_values` does that for both table kinds.
+Verified against `sqlite3` on a composite `PRIMARY KEY (c DESC, a)`, a
+1,200-row table (several index levels, one 5,000-byte value that spills
+into overflow pages), a quoted table and column name, and `--nrows`.
+
+### Arrays of three or more axes
+
+`npy_support` refused a plain `.npy` (or `.npz` entry) of 3+ dimensions.
+Each slice along the first axis is now one row: `index` and `value`, the
+slice's values as a pooled array (`Vec<f64>`, `Vec<i64>`, ...) flattened in
+row-major order - a JSON-bridge format, so SQL writes the values as array
+text. The `value` column's description carries the shape (`NumPy array of
+shape (60000, 28, 28): one row per index along the first axis...`), which
+also rides into json-schema and the SQL column comment. Row-major data
+streams a slice at a time; column-major data is read whole (the same
+exception 2D Fortran order already has) and gathered by stride. A
+structured dtype with several axes is unchanged.
+
+### Labels in every output
+
+A Stata/SAS/SPSS variable label (`description`) and value labels
+(`notes`) used to stop at `md` and `json`. `column_label_text` joins them
+(`Respondent sex (value labels: 1 = male; 2 = female)`), and that text is
+the JSON-Schema `description` keyword, a `--` comment after each column
+in `CREATE TABLE` (the one form every target accepts - `COMMENT ON COLUMN`
+is PostgreSQL/DuckDB-only, MySQL's `COMMENT` is its own syntax, SQLite has
+neither), and - in `diff` - part of what is compared: a `labels changed`
+entry (always safe, since a label never changes what's stored, but a
+recoded value-label set is exactly the drift worth seeing) also folded
+into the table fingerprint.
+
+### Lakehouse tables inside a directory
+
+A Delta or Iceberg table found while walking a directory was profiled as a
+pile of Parquet data files and log JSON. `collect_files_sorted` now treats
+such a directory (`lakehouse_dir_format`) as one entry and never descends
+into it; `detect_format` resolves it, `decompress_if_needed` passes it
+through, and `dispatch_reader` profiles it (`profile_lakehouse_table`,
+with the usual "rebuild with --features delta/iceberg" error when that
+feature is off) and names the table for the directory. Directory mode,
+`--combine` (including `--load-into` and SQL), and `graph` all get one
+table or node per lakehouse table.
+
+### Documentation drift
+
+`--help` and CLAUDE.md disagreed about `explain`/`path` argument order
+(the code and `--help` are right: `explain <INPUT> <COLUMN>`, `path
+<INPUT> <FROM_TABLE> <TO_TABLE>`) and about whether piped compressed input
+is unwrapped (it is). Both are corrected, `--encoding` and the wrappers
+are in `--help` and `--list-formats`, and the format tables here match
+the code.
 
 ## Known limitations / roadmap
 
