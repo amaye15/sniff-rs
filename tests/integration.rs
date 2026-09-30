@@ -16471,6 +16471,14 @@ fn a_single_file_archive_is_read_as_the_file_inside_it() {
         ("edge_container_zip_in_gzip.zip.gz", "data"),
         // No extension at all: gzip, then tar, both recognized by magic.
         ("edge_container_tar_gz_noext", "people"),
+        ("edge_container_tar_xz_noext", "people"),
+        // bzip2 and xz, alone and around a tar archive.
+        ("edge_container_single.csv.bz2", "edge_container_single"),
+        ("edge_container_single.csv.xz", "edge_container_single"),
+        ("edge_container_single.tar.bz2", "people"),
+        ("edge_container_single.tbz2", "people"),
+        ("edge_container_single.tar.xz", "people"),
+        ("edge_container_single.txz", "people"),
     ] {
         let (name, columns, rows) = container_table_columns(file);
         assert_eq!(name, member, "{file}");
@@ -16627,7 +16635,10 @@ fn list_formats_names_the_wrappers() {
         .iter()
         .map(|c| c["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["gzip", "zstd", "zip", "tar", "brotli", "lz4"]);
+    assert_eq!(
+        names,
+        ["gzip", "zstd", "zip", "tar", "brotli", "lz4", "bzip2", "xz"]
+    );
     let zip = containers.iter().find(|c| c["name"] == "zip").unwrap();
     assert_eq!(zip["compiled_in"], true);
     assert!(
@@ -16741,4 +16752,49 @@ fn assert_child_table(sql: &str, parent: &str, child: &str) {
         )),
         "{block}"
     );
+}
+
+// Several blocks/streams: a bzip2 file holds 100 kB blocks and may be
+// several streams back to back; an xz file holds blocks and streams with
+// padding between them. Each yields every row, in order.
+#[test]
+fn bzip2_and_xz_files_with_several_blocks_and_streams_are_read_whole() {
+    for (file, rows) in [
+        ("edge_container_bzip2_multi_block.csv.bz2", 9000),
+        ("edge_container_xz_multi_block.csv.xz", 9000),
+        ("edge_container_bzip2_two_streams.csv.bz2", 4),
+        ("edge_container_xz_two_streams.csv.xz", 4),
+    ] {
+        let (name, columns, got) = container_table_columns(file);
+        assert_eq!(name, file.split('.').next().unwrap(), "{file}");
+        assert_eq!(columns[..2], ["id", "name"], "{file}");
+        assert_eq!(got, rows, "{file}");
+    }
+}
+
+#[test]
+fn a_corrupt_bzip2_or_xz_file_is_an_error_not_garbage() {
+    let dir = std::env::temp_dir().join(format!("sniff-badcomp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, tail) in [
+        ("edge_container_single.csv.bz2", "bz2"),
+        ("edge_container_single.csv.xz", "xz"),
+    ] {
+        let mut bytes = std::fs::read(fixture(file)).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        let path = dir.join(format!("bad.csv.{tail}"));
+        std::fs::write(&path, &bytes).unwrap();
+        let out = Command::new(bin())
+            .args([path.to_str().unwrap(), "-"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{file}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("corrupt") || err.contains("mismatch"),
+            "{file}: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

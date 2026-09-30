@@ -80370,6 +80370,7 @@ fn crc32_table() -> &'static [u32; 256] {
 /// from memory, updating a running state one chunk at a time instead of
 /// needing the complete decompressed output held in memory at once to
 /// scan over.
+#[derive(Clone)]
 struct Crc32Incremental {
     crc: u32,
 }
@@ -86812,6 +86813,1361 @@ mod zstd_support {
     }
 } // mod zstd_support
 
+// --- Hand-rolled bzip2 decoder ---
+// Decode-only, pure `std`, for `.bz2` input (`decompress_if_needed`).
+// The format is a sequence of independent blocks, each a Burrows-Wheeler
+// transform of up to 900 kB run through move-to-front, zero-run coding and
+// Huffman coding, followed by a run-length pass over the original bytes -
+// decoded here in the reverse order, straight from the published layout
+// and checked byte for byte against CPython's `bz2` over many inputs.
+// Every block's CRC and the stream's combined CRC are verified, and
+// concatenated streams (`bzip2 a b`, `pbzip2`) are read in turn. The
+// long-deprecated "randomised" block mode (no encoder since 0.9.5) is
+// refused rather than guessed at.
+mod bzip2_support {
+    use super::*;
+
+    const BLOCK_MAGIC: u64 = 0x3141_5926_5359;
+    const END_MAGIC: u64 = 0x1772_4538_5090;
+    const MAX_CODE_LEN: usize = 20;
+    const GROUP_SIZE: usize = 50;
+    const MAX_ALPHA: usize = 258;
+    /// A selector list holds one entry per 50 symbols of a block.
+    const MAX_SELECTORS: usize = 18_002;
+
+    /// The MSB-first bit reader bzip2 uses.
+    struct Bits<R: std::io::BufRead> {
+        inner: R,
+        buf: u64,
+        count: u32,
+    }
+
+    impl<R: std::io::BufRead> Bits<R> {
+        fn new(inner: R) -> Self {
+            Bits {
+                inner,
+                buf: 0,
+                count: 0,
+            }
+        }
+
+        /// Reads `n` (at most 32) bits.
+        fn read(&mut self, n: u32) -> Result<u32> {
+            while self.count < n {
+                let mut byte = [0u8; 1];
+                self.inner
+                    .read_exact(&mut byte)
+                    .context("unexpected end of bzip2 data")?;
+                self.buf = (self.buf << 8) | u64::from(byte[0]);
+                self.count += 8;
+            }
+            self.count -= n;
+            Ok(((self.buf >> self.count) & ((1u64 << n) - 1)) as u32)
+        }
+
+        fn bit(&mut self) -> Result<bool> {
+            Ok(self.read(1)? == 1)
+        }
+
+        fn read48(&mut self) -> Result<u64> {
+            let hi = u64::from(self.read(24)?);
+            let lo = u64::from(self.read(24)?);
+            Ok((hi << 24) | lo)
+        }
+
+        /// Drops the rest of the current byte: a stream ends byte-aligned.
+        fn align(&mut self) {
+            self.count -= self.count % 8;
+        }
+
+        /// Whether any input remains past the bits already buffered.
+        fn at_end(&mut self) -> Result<bool> {
+            if self.count >= 8 {
+                return Ok(false);
+            }
+            Ok(self
+                .inner
+                .fill_buf()
+                .context("failed to read bzip2 data")?
+                .is_empty())
+        }
+    }
+
+    /// The table-driven MSB-first CRC-32 (polynomial 0x04C11DB7) bzip2 uses
+    /// - not the reflected one gzip and zip use.
+    fn crc_table() -> &'static [u32; 256] {
+        static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            let mut table = [0u32; 256];
+            for (i, slot) in table.iter_mut().enumerate() {
+                let mut c = (i as u32) << 24;
+                for _ in 0..8 {
+                    c = if c & 0x8000_0000 != 0 {
+                        (c << 1) ^ 0x04C1_1DB7
+                    } else {
+                        c << 1
+                    };
+                }
+                *slot = c;
+            }
+            table
+        })
+    }
+
+    /// One Huffman table in bzip2's `limit`/`base`/`perm` form.
+    struct Huffman {
+        min_len: usize,
+        limit: [i32; MAX_CODE_LEN + 2],
+        base: [i32; MAX_CODE_LEN + 2],
+        perm: [u16; MAX_ALPHA],
+    }
+
+    impl Huffman {
+        fn new(lengths: &[u8]) -> Self {
+            let min_len = usize::from(*lengths.iter().min().unwrap_or(&1));
+            let max_len = usize::from(*lengths.iter().max().unwrap_or(&1));
+            let mut perm = [0u16; MAX_ALPHA];
+            let mut pp = 0;
+            for len in min_len..=max_len {
+                for (sym, l) in lengths.iter().enumerate() {
+                    if usize::from(*l) == len {
+                        perm[pp] = sym as u16;
+                        pp += 1;
+                    }
+                }
+            }
+            let mut base = [0i32; MAX_CODE_LEN + 2];
+            for l in lengths {
+                base[usize::from(*l) + 1] += 1;
+            }
+            for i in 1..base.len() {
+                base[i] += base[i - 1];
+            }
+            let mut limit = [0i32; MAX_CODE_LEN + 2];
+            let mut vec = 0i32;
+            for i in min_len..=max_len {
+                vec += base[i + 1] - base[i];
+                limit[i] = vec - 1;
+                vec <<= 1;
+            }
+            for i in (min_len + 1)..=max_len {
+                base[i] = ((limit[i - 1] + 1) << 1) - base[i];
+            }
+            Huffman {
+                min_len,
+                limit,
+                base,
+                perm,
+            }
+        }
+
+        fn decode<R: std::io::BufRead>(&self, bits: &mut Bits<R>) -> Result<u16> {
+            let mut len = self.min_len;
+            let mut code = bits.read(len as u32)? as i32;
+            loop {
+                if len > MAX_CODE_LEN {
+                    bail!("corrupt bzip2 data (a Huffman code is longer than 20 bits)");
+                }
+                if code <= self.limit[len] {
+                    let index = code - self.base[len];
+                    return usize::try_from(index)
+                        .ok()
+                        .and_then(|i| self.perm.get(i).copied())
+                        .context("corrupt bzip2 data (Huffman index out of range)");
+                }
+                len += 1;
+                code = (code << 1) | bits.read(1)? as i32;
+            }
+        }
+    }
+
+    /// Decodes one block's symbols into the BWT `tt` array (low byte =
+    /// the byte, high 24 bits filled in later by the inverse transform).
+    /// Returns the block length, the byte counts, and `origPtr`.
+    fn read_block<R: std::io::BufRead>(
+        bits: &mut Bits<R>,
+        block_max: usize,
+        tt: &mut Vec<u32>,
+    ) -> Result<(usize, [usize; 256], usize)> {
+        if bits.bit()? {
+            bail!("this bzip2 file uses the obsolete randomised block mode, which isn't supported");
+        }
+        let orig_ptr = bits.read(24)? as usize;
+
+        // Which byte values occur, as a 16x16 bitmap.
+        let groups_used = bits.read(16)?;
+        let mut seq_to_unseq: Vec<u8> = Vec::with_capacity(256);
+        for group in 0..16u32 {
+            if groups_used & (0x8000 >> group) != 0 {
+                let used = bits.read(16)?;
+                for k in 0..16u32 {
+                    if used & (0x8000 >> k) != 0 {
+                        seq_to_unseq.push((group * 16 + k) as u8);
+                    }
+                }
+            }
+        }
+        if seq_to_unseq.is_empty() {
+            bail!("corrupt bzip2 data (a block uses no byte values)");
+        }
+        let n_in_use = seq_to_unseq.len();
+        let alpha_size = n_in_use + 2;
+
+        let n_groups = bits.read(3)? as usize;
+        if !(2..=6).contains(&n_groups) {
+            bail!("corrupt bzip2 data (invalid number of Huffman tables)");
+        }
+        let n_selectors = bits.read(15)? as usize;
+        if n_selectors == 0 {
+            bail!("corrupt bzip2 data (a block has no selectors)");
+        }
+        // Selectors are move-to-front coded, each a unary number.
+        let mut order: Vec<u8> = (0..n_groups as u8).collect();
+        let mut selectors: Vec<u8> = Vec::with_capacity(n_selectors.min(MAX_SELECTORS));
+        for _ in 0..n_selectors {
+            let mut j = 0usize;
+            while bits.bit()? {
+                j += 1;
+                if j >= n_groups {
+                    bail!("corrupt bzip2 data (selector out of range)");
+                }
+            }
+            let value = order[j];
+            order.copy_within(0..j, 1);
+            order[0] = value;
+            // bzip2 1.0.8 accepts (and ignores) selectors past the limit.
+            if selectors.len() < MAX_SELECTORS {
+                selectors.push(value);
+            }
+        }
+
+        // The delta-coded code lengths of each table.
+        let mut tables: Vec<Huffman> = Vec::with_capacity(n_groups);
+        for _ in 0..n_groups {
+            let mut current = bits.read(5)? as i32;
+            let mut lengths = vec![0u8; alpha_size];
+            for slot in lengths.iter_mut() {
+                loop {
+                    if !(1..=MAX_CODE_LEN as i32).contains(&current) {
+                        bail!("corrupt bzip2 data (invalid Huffman code length)");
+                    }
+                    if !bits.bit()? {
+                        break;
+                    }
+                    current += if bits.bit()? { -1 } else { 1 };
+                }
+                *slot = current as u8;
+            }
+            tables.push(Huffman::new(&lengths));
+        }
+
+        // Symbols: RUNA/RUNB spell zero-run lengths in bijective base 2,
+        // the rest are move-to-front indices (offset by one), then EOB.
+        let eob = (n_in_use + 1) as u16;
+        let mut mtf: Vec<u8> = (0..n_in_use as u32).map(|i| i as u8).collect();
+        let mut counts = [0usize; 256];
+        tt.clear();
+        let mut group_no = 0usize;
+        let mut group_left = 0usize;
+        let mut table = &tables[0];
+        let mut next_symbol = |bits: &mut Bits<R>| -> Result<u16> {
+            if group_left == 0 {
+                let selector = *selectors
+                    .get(group_no)
+                    .context("corrupt bzip2 data (ran out of selectors)")?;
+                group_no += 1;
+                group_left = GROUP_SIZE;
+                table = &tables[usize::from(selector)];
+            }
+            group_left -= 1;
+            table.decode(bits)
+        };
+        let mut symbol = next_symbol(bits)?;
+        while symbol != eob {
+            if symbol <= 1 {
+                let mut run = 0usize;
+                let mut weight = 1usize;
+                while symbol <= 1 {
+                    run += weight << symbol;
+                    weight <<= 1;
+                    if weight >= 2 * 1024 * 1024 {
+                        bail!("corrupt bzip2 data (a zero run is too long)");
+                    }
+                    symbol = next_symbol(bits)?;
+                }
+                let byte = seq_to_unseq[usize::from(mtf[0])];
+                if tt.len() + run > block_max {
+                    bail!("corrupt bzip2 data (block larger than its declared size)");
+                }
+                counts[usize::from(byte)] += run;
+                tt.extend(std::iter::repeat_n(u32::from(byte), run));
+                continue;
+            }
+            if tt.len() >= block_max {
+                bail!("corrupt bzip2 data (block larger than its declared size)");
+            }
+            let index = usize::from(symbol) - 1;
+            if index >= n_in_use {
+                bail!("corrupt bzip2 data (move-to-front index out of range)");
+            }
+            let value = mtf[index];
+            mtf.copy_within(0..index, 1);
+            mtf[0] = value;
+            let byte = seq_to_unseq[usize::from(value)];
+            counts[usize::from(byte)] += 1;
+            tt.push(u32::from(byte));
+            symbol = next_symbol(bits)?;
+        }
+        if orig_ptr >= tt.len().max(1) && !tt.is_empty() {
+            bail!("corrupt bzip2 data (BWT origin pointer out of range)");
+        }
+        Ok((tt.len(), counts, orig_ptr))
+    }
+
+    /// Inverts the BWT and the initial run-length pass of one block,
+    /// appending the original bytes to `out` and returning their CRC.
+    fn unbwt_and_unrle(
+        tt: &mut [u32],
+        counts: &[usize; 256],
+        orig_ptr: usize,
+        out: &mut Vec<u8>,
+    ) -> u32 {
+        let n = tt.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut starts = [0usize; 256];
+        let mut sum = 0usize;
+        for (slot, count) in starts.iter_mut().zip(counts) {
+            *slot = sum;
+            sum += count;
+        }
+        for i in 0..n {
+            let byte = (tt[i] & 0xFF) as usize;
+            let at = starts[byte];
+            starts[byte] += 1;
+            tt[at] |= (i as u32) << 8;
+        }
+        let table = crc_table();
+        let mut crc = 0xFFFF_FFFFu32;
+        let mut emit = |byte: u8, out: &mut Vec<u8>| {
+            crc = (crc << 8) ^ table[((crc >> 24) as u8 ^ byte) as usize];
+            out.push(byte);
+        };
+        let mut pos = (tt[orig_ptr] >> 8) as usize;
+        let mut prev: Option<u8> = None;
+        let mut run = 0u32;
+        for _ in 0..n {
+            let entry = tt[pos];
+            let byte = (entry & 0xFF) as u8;
+            pos = (entry >> 8) as usize;
+            if run == 4 {
+                for _ in 0..byte {
+                    emit(prev.unwrap_or(0), out);
+                }
+                run = 0;
+                prev = None;
+                continue;
+            }
+            if prev == Some(byte) {
+                run += 1;
+            } else {
+                run = 1;
+                prev = Some(byte);
+            }
+            emit(byte, out);
+        }
+        !crc
+    }
+
+    /// Decompresses every bzip2 stream in `input` into `out`.
+    pub(crate) fn bzip2_decompress_to<R: std::io::Read>(
+        input: R,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let mut bits = Bits::new(std::io::BufReader::new(input));
+        let mut tt: Vec<u32> = Vec::new();
+        let mut block_out: Vec<u8> = Vec::new();
+        let mut first_stream = true;
+        loop {
+            if !first_stream && bits.at_end()? {
+                return Ok(());
+            }
+            first_stream = false;
+            if bits.read(8)? != u32::from(b'B')
+                || bits.read(8)? != u32::from(b'Z')
+                || bits.read(8)? != u32::from(b'h')
+            {
+                bail!("not a bzip2 stream (missing the BZh header)");
+            }
+            let level = bits.read(8)?;
+            if !(u32::from(b'1')..=u32::from(b'9')).contains(&level) {
+                bail!("corrupt bzip2 header (invalid block size)");
+            }
+            let block_max = (level - u32::from(b'0')) as usize * 100_000;
+            let mut combined = 0u32;
+            loop {
+                let magic = bits.read48()?;
+                if magic == END_MAGIC {
+                    let stored = bits.read(32)?;
+                    if stored != combined {
+                        bail!("bzip2 stream CRC mismatch (the data is corrupt)");
+                    }
+                    bits.align();
+                    break;
+                }
+                if magic != BLOCK_MAGIC {
+                    bail!("corrupt bzip2 data (bad block header)");
+                }
+                let stored_crc = bits.read(32)?;
+                let (_, counts, orig_ptr) = read_block(&mut bits, block_max, &mut tt)?;
+                block_out.clear();
+                let crc = unbwt_and_unrle(&mut tt, &counts, orig_ptr, &mut block_out);
+                if crc != stored_crc {
+                    bail!("bzip2 block CRC mismatch (the data is corrupt)");
+                }
+                combined = combined.rotate_left(1) ^ crc;
+                out.write_all(&block_out)?;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn decode(data: &[u8]) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            bzip2_decompress_to(data, &mut out)?;
+            Ok(out)
+        }
+
+        /// `bz2.compress(b"hello world\n" * 3)` from CPython.
+        const HELLO: &[u8] = &[
+            0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0xa3, 0x54, 0x56, 0x92,
+            0x00, 0x00, 0x07, 0x51, 0x80, 0x00, 0x10, 0x40, 0x00, 0x06, 0x44, 0x90, 0x80, 0x20,
+            0x00, 0x22, 0xbf, 0xd5, 0x43, 0x4f, 0x44, 0x20, 0xc9, 0x88, 0xe2, 0x22, 0x29, 0x6b,
+            0x56, 0x98, 0x8c, 0x7c, 0x5d, 0xc9, 0x14, 0xe1, 0x42, 0x42, 0x8d, 0x51, 0x5a, 0x48,
+        ];
+
+        #[test]
+        fn decodes_a_known_stream() {
+            assert_eq!(
+                decode(HELLO).unwrap(),
+                b"hello world\nhello world\nhello world\n"
+            );
+        }
+
+        #[test]
+        fn decodes_concatenated_streams() {
+            let doubled = [HELLO, HELLO].concat();
+            let expected = b"hello world\nhello world\nhello world\n".repeat(2);
+            assert_eq!(decode(&doubled).unwrap(), expected);
+        }
+
+        #[test]
+        fn corruption_is_an_error_not_a_panic() {
+            for i in 0..HELLO.len() * 8 {
+                let mut data = HELLO.to_vec();
+                data[i / 8] ^= 1 << (i % 8);
+                let _ = decode(&data);
+            }
+            for cut in 0..HELLO.len() {
+                assert!(decode(&HELLO[..cut]).is_err(), "cut at {cut}");
+            }
+            assert!(decode(b"BZh0").is_err());
+            assert!(decode(b"not bzip2").is_err());
+        }
+    }
+}
+
+// --- Hand-rolled xz / LZMA2 decoder ---
+// Decode-only, pure `std`, for `.xz` input (`decompress_if_needed`). An
+// `.xz` file is a small container (stream header, blocks, an index, a
+// footer) around LZMA2 chunks, which in turn carry range-coded LZMA
+// symbols; all three layers are decoded here from the published
+// specifications (tukaani.org's xz file format and the LZMA SDK's
+// description of the range coder and symbol grammar) and checked byte for
+// byte against CPython's `lzma` and the `xz` command over many inputs and
+// every preset. The container's CRC-32 and CRC-64 checks - the stream
+// flags, each block header, the index, and every block's data when it
+// carries one - are verified; a SHA-256 block check is skipped, not
+// verified, and a filter other than LZMA2 (x86/ARM branch converters,
+// delta) is refused. Concatenated streams, stream padding, and multiple
+// blocks are all read. Output is written as it is produced, keeping only
+// the dictionary window in memory.
+mod xz_support {
+    use super::*;
+
+    const HEADER_MAGIC: [u8; 6] = *b"\xFD7zXZ\x00";
+    const FOOTER_MAGIC: [u8; 2] = *b"YZ";
+    /// The largest dictionary accepted. The window only grows as output is
+    /// produced, so this bounds memory only for data that really is that
+    /// large; `xz -9` uses 64 MiB.
+    const MAX_DICT: u64 = 1 << 30;
+    /// Output is flushed between LZMA2 chunks once the window holds more
+    /// than the dictionary plus this much.
+    const FLUSH_SLACK: usize = 1 << 21;
+
+    const PROB_INIT: u16 = 1024;
+    const STATES: usize = 12;
+
+    fn crc64_table() -> &'static [u64; 256] {
+        static TABLE: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            let mut table = [0u64; 256];
+            for (i, slot) in table.iter_mut().enumerate() {
+                let mut c = i as u64;
+                for _ in 0..8 {
+                    c = if c & 1 == 1 {
+                        (c >> 1) ^ 0xC96C_5795_D787_0F42
+                    } else {
+                        c >> 1
+                    };
+                }
+                *slot = c;
+            }
+            table
+        })
+    }
+
+    /// A block's integrity check, folded over its decoded bytes.
+    enum Check {
+        None,
+        Crc32(Crc32Incremental),
+        Crc64(u64),
+        /// A check this decoder doesn't compute (SHA-256, or a reserved
+        /// type); its bytes are skipped.
+        Skipped,
+    }
+
+    impl Check {
+        fn new(kind: u8) -> Check {
+            match kind {
+                0 => Check::None,
+                1 => Check::Crc32(Crc32Incremental::new()),
+                4 => Check::Crc64(!0),
+                _ => Check::Skipped,
+            }
+        }
+
+        fn update(&mut self, data: &[u8]) {
+            match self {
+                Check::Crc32(c) => c.update(data),
+                Check::Crc64(state) => {
+                    let table = crc64_table();
+                    for b in data {
+                        *state = table[((*state ^ u64::from(*b)) & 0xFF) as usize] ^ (*state >> 8);
+                    }
+                }
+                Check::None | Check::Skipped => {}
+            }
+        }
+
+        /// The check value as stored on disk, if this decoder computes one.
+        fn expected(&self) -> Option<Vec<u8>> {
+            match self {
+                Check::Crc32(c) => Some(c.clone().finish().to_le_bytes().to_vec()),
+                Check::Crc64(state) => Some((!*state).to_le_bytes().to_vec()),
+                Check::None | Check::Skipped => None,
+            }
+        }
+    }
+
+    /// The decoded-data window: the last `dict_size` bytes are history
+    /// matches may reach into, and everything since the last flush is
+    /// waiting to be written.
+    struct Window<'a> {
+        buf: Vec<u8>,
+        out: &'a mut dyn std::io::Write,
+        dict_size: usize,
+        /// Bytes decoded since the last dictionary reset: the most a match
+        /// distance may reach back, and the position LZMA's contexts use.
+        since_reset: u64,
+        check: Check,
+        /// Bytes of `buf` the check has already been folded over.
+        checked: usize,
+        produced: u64,
+    }
+
+    impl Window<'_> {
+        fn push(&mut self, byte: u8) {
+            self.buf.push(byte);
+            self.since_reset += 1;
+            self.produced += 1;
+        }
+
+        fn last(&self) -> u8 {
+            if self.since_reset == 0 {
+                0
+            } else {
+                self.buf.last().copied().unwrap_or(0)
+            }
+        }
+
+        fn fold_check(&mut self) {
+            self.check.update(&self.buf[self.checked..]);
+            self.checked = self.buf.len();
+        }
+
+        /// Between chunks: fold the check over what the chunk produced and
+        /// write out whatever has aged out of the dictionary.
+        fn end_chunk(&mut self, force_all: bool) -> Result<()> {
+            self.fold_check();
+            let keep = if force_all { 0 } else { self.dict_size };
+            if self.buf.len() > keep + if force_all { 0 } else { FLUSH_SLACK } {
+                let cut = self.buf.len() - keep;
+                self.out.write_all(&self.buf[..cut])?;
+                self.buf.drain(..cut);
+                self.checked = self.buf.len();
+            }
+            Ok(())
+        }
+
+        fn reset_dictionary(&mut self) {
+            self.since_reset = 0;
+        }
+    }
+
+    struct RangeDecoder<'a> {
+        data: &'a [u8],
+        pos: usize,
+        range: u32,
+        code: u32,
+        overrun: bool,
+    }
+
+    impl<'a> RangeDecoder<'a> {
+        fn new(data: &'a [u8]) -> Result<Self> {
+            if data.len() < 5 || data[0] != 0 {
+                bail!("corrupt xz data (bad range coder start)");
+            }
+            Ok(RangeDecoder {
+                data,
+                pos: 5,
+                range: 0xFFFF_FFFF,
+                code: u32::from_be_bytes([data[1], data[2], data[3], data[4]]),
+                overrun: false,
+            })
+        }
+
+        fn next_byte(&mut self) -> u8 {
+            let byte = self.data.get(self.pos).copied().unwrap_or_else(|| {
+                self.overrun = true;
+                0
+            });
+            self.pos += 1;
+            byte
+        }
+
+        fn normalize(&mut self) {
+            if self.range < (1 << 24) {
+                self.range <<= 8;
+                self.code = (self.code << 8) | u32::from(self.next_byte());
+            }
+        }
+
+        fn bit(&mut self, prob: &mut u16) -> u32 {
+            self.normalize();
+            let bound = (self.range >> 11) * u32::from(*prob);
+            if self.code < bound {
+                self.range = bound;
+                *prob += (2048 - *prob) >> 5;
+                0
+            } else {
+                self.range -= bound;
+                self.code -= bound;
+                *prob -= *prob >> 5;
+                1
+            }
+        }
+
+        fn direct_bits(&mut self, count: u32) -> u32 {
+            let mut result = 0u32;
+            for _ in 0..count {
+                self.normalize();
+                self.range >>= 1;
+                self.code = self.code.wrapping_sub(self.range);
+                let mask = 0u32.wrapping_sub(self.code >> 31);
+                self.code = self.code.wrapping_add(self.range & mask);
+                result = (result << 1).wrapping_add(mask.wrapping_add(1));
+            }
+            result
+        }
+
+        fn bit_tree(&mut self, probs: &mut [u16], bits: u32) -> u32 {
+            let mut m = 1usize;
+            for _ in 0..bits {
+                m = (m << 1) | self.bit(&mut probs[m]) as usize;
+            }
+            (m - (1 << bits)) as u32
+        }
+
+        fn reverse_bit_tree(&mut self, probs: &mut [u16], base: usize, bits: u32) -> u32 {
+            let mut m = 1usize;
+            let mut symbol = 0u32;
+            for i in 0..bits {
+                let bit = self.bit(&mut probs[base + m]);
+                m = (m << 1) | bit as usize;
+                symbol |= bit << i;
+            }
+            symbol
+        }
+    }
+
+    struct LenCoder {
+        choice: u16,
+        choice2: u16,
+        low: [[u16; 8]; 16],
+        mid: [[u16; 8]; 16],
+        high: [u16; 256],
+    }
+
+    impl LenCoder {
+        fn new() -> Self {
+            LenCoder {
+                choice: PROB_INIT,
+                choice2: PROB_INIT,
+                low: [[PROB_INIT; 8]; 16],
+                mid: [[PROB_INIT; 8]; 16],
+                high: [PROB_INIT; 256],
+            }
+        }
+
+        fn decode(&mut self, rc: &mut RangeDecoder<'_>, pos_state: usize) -> usize {
+            if rc.bit(&mut self.choice) == 0 {
+                return 2 + rc.bit_tree(&mut self.low[pos_state], 3) as usize;
+            }
+            if rc.bit(&mut self.choice2) == 0 {
+                return 10 + rc.bit_tree(&mut self.mid[pos_state], 3) as usize;
+            }
+            18 + rc.bit_tree(&mut self.high, 8) as usize
+        }
+    }
+
+    struct Lzma {
+        lc: u32,
+        lp: u32,
+        pb: u32,
+        literal: Vec<u16>,
+        is_match: [u16; STATES * 16],
+        is_rep: [u16; STATES],
+        is_rep_g0: [u16; STATES],
+        is_rep_g1: [u16; STATES],
+        is_rep_g2: [u16; STATES],
+        is_rep0_long: [u16; STATES * 16],
+        pos_slot: [[u16; 64]; 4],
+        pos_special: [u16; 115],
+        align: [u16; 16],
+        match_len: LenCoder,
+        rep_len: LenCoder,
+        state: usize,
+        reps: [u32; 4],
+    }
+
+    impl Lzma {
+        fn new(lc: u32, lp: u32, pb: u32) -> Self {
+            Lzma {
+                lc,
+                lp,
+                pb,
+                literal: vec![PROB_INIT; 0x300 << (lc + lp)],
+                is_match: [PROB_INIT; STATES * 16],
+                is_rep: [PROB_INIT; STATES],
+                is_rep_g0: [PROB_INIT; STATES],
+                is_rep_g1: [PROB_INIT; STATES],
+                is_rep_g2: [PROB_INIT; STATES],
+                is_rep0_long: [PROB_INIT; STATES * 16],
+                pos_slot: [[PROB_INIT; 64]; 4],
+                pos_special: [PROB_INIT; 115],
+                align: [PROB_INIT; 16],
+                match_len: LenCoder::new(),
+                rep_len: LenCoder::new(),
+                state: 0,
+                reps: [0; 4],
+            }
+        }
+
+        /// Resets the probabilities and the match history, keeping (or, for
+        /// a new properties byte, replacing) `lc`/`lp`/`pb`.
+        fn reset(&mut self, props: Option<(u32, u32, u32)>) {
+            let (lc, lp, pb) = props.unwrap_or((self.lc, self.lp, self.pb));
+            *self = Lzma::new(lc, lp, pb);
+        }
+
+        /// Decodes symbols into `window` until it has grown by `count`
+        /// bytes.
+        fn decode(
+            &mut self,
+            rc: &mut RangeDecoder<'_>,
+            window: &mut Window<'_>,
+            count: usize,
+        ) -> Result<()> {
+            let end = window.buf.len() + count;
+            let pb_mask = (1u64 << self.pb) - 1;
+            let lp_mask = (1u64 << self.lp) - 1;
+            while window.buf.len() < end {
+                let pos = window.since_reset;
+                let pos_state = (pos & pb_mask) as usize;
+                let state = self.state;
+                if rc.bit(&mut self.is_match[(state << 4) + pos_state]) == 0 {
+                    // A literal, coded under the previous byte's high bits
+                    // and the position's low bits.
+                    let prev = u32::from(window.last());
+                    let context = (((pos & lp_mask) as u32) << self.lc) + (prev >> (8 - self.lc));
+                    let probs = &mut self.literal[0x300 * context as usize..][..0x300];
+                    let mut symbol = 1usize;
+                    if state >= 7 {
+                        // After a match the byte at the last distance steers
+                        // the coding until the two first disagree.
+                        let since = window.since_reset.min(window.dict_size as u64);
+                        if u64::from(self.reps[0]) >= since {
+                            bail!("corrupt xz data (distance beyond the dictionary)");
+                        }
+                        let mut match_byte =
+                            usize::from(window.buf[window.buf.len() - self.reps[0] as usize - 1]);
+                        let mut offset = 0x100usize;
+                        while symbol < 0x100 {
+                            match_byte <<= 1;
+                            let match_bit = match_byte & offset;
+                            let bit = rc.bit(&mut probs[offset + match_bit + symbol]) as usize;
+                            symbol = (symbol << 1) | bit;
+                            if bit == 0 {
+                                offset &= !match_bit;
+                            } else {
+                                offset &= match_bit;
+                            }
+                        }
+                    } else {
+                        while symbol < 0x100 {
+                            symbol = (symbol << 1) | rc.bit(&mut probs[symbol]) as usize;
+                        }
+                    }
+                    window.push(symbol as u8);
+                    self.state = if state < 4 {
+                        0
+                    } else if state < 10 {
+                        state - 3
+                    } else {
+                        state - 6
+                    };
+                    continue;
+                }
+
+                let len;
+                if rc.bit(&mut self.is_rep[state]) == 0 {
+                    // A new match: length, then distance.
+                    len = self.match_len.decode(rc, pos_state);
+                    let len_state = (len - 2).min(3);
+                    let slot = rc.bit_tree(&mut self.pos_slot[len_state], 6);
+                    let distance = if slot < 4 {
+                        slot
+                    } else {
+                        let direct = (slot >> 1) - 1;
+                        let mut d = (2 | (slot & 1)) << direct;
+                        if slot < 14 {
+                            d += rc.reverse_bit_tree(
+                                &mut self.pos_special,
+                                (d - slot) as usize,
+                                direct,
+                            );
+                        } else {
+                            d = d.wrapping_add(rc.direct_bits(direct - 4) << 4);
+                            d = d.wrapping_add(rc.reverse_bit_tree(&mut self.align, 0, 4));
+                        }
+                        d
+                    };
+                    if distance == 0xFFFF_FFFF {
+                        bail!("corrupt xz data (an LZMA end marker inside LZMA2)");
+                    }
+                    self.reps = [distance, self.reps[0], self.reps[1], self.reps[2]];
+                    self.state = if state < 7 { 7 } else { 10 };
+                } else {
+                    // A repeat of one of the last four distances.
+                    if rc.bit(&mut self.is_rep_g0[state]) == 0 {
+                        if rc.bit(&mut self.is_rep0_long[(state << 4) + pos_state]) == 0 {
+                            // A "short rep": one byte at the last distance.
+                            let since = window.since_reset.min(window.dict_size as u64);
+                            if u64::from(self.reps[0]) >= since {
+                                bail!("corrupt xz data (distance beyond the dictionary)");
+                            }
+                            let byte = window.buf[window.buf.len() - self.reps[0] as usize - 1];
+                            window.push(byte);
+                            self.state = if state < 7 { 9 } else { 11 };
+                            continue;
+                        }
+                    } else {
+                        let distance;
+                        if rc.bit(&mut self.is_rep_g1[state]) == 0 {
+                            distance = self.reps[1];
+                        } else {
+                            if rc.bit(&mut self.is_rep_g2[state]) == 0 {
+                                distance = self.reps[2];
+                            } else {
+                                distance = self.reps[3];
+                                self.reps[3] = self.reps[2];
+                            }
+                            self.reps[2] = self.reps[1];
+                        }
+                        self.reps[1] = self.reps[0];
+                        self.reps[0] = distance;
+                    }
+                    len = self.rep_len.decode(rc, pos_state);
+                    self.state = if state < 7 { 8 } else { 11 };
+                }
+
+                let since = window.since_reset.min(window.dict_size as u64);
+                if u64::from(self.reps[0]) >= since {
+                    bail!("corrupt xz data (distance beyond the dictionary)");
+                }
+                if len > end - window.buf.len() {
+                    bail!("corrupt xz data (a match runs past the end of its chunk)");
+                }
+                let from = window.buf.len() - self.reps[0] as usize - 1;
+                for i in 0..len {
+                    let byte = window.buf[from + i];
+                    window.push(byte);
+                }
+            }
+            // The range coder's last byte is pulled in lazily.
+            rc.normalize();
+            if rc.overrun {
+                bail!("corrupt xz data (an LZMA chunk is shorter than it says)");
+            }
+            Ok(())
+        }
+    }
+
+    /// Reads a little-endian-base-128 "multibyte integer" from `data`.
+    fn varint(data: &[u8], pos: &mut usize) -> Result<u64> {
+        let mut value = 0u64;
+        for i in 0..9 {
+            let byte = *data
+                .get(*pos)
+                .context("corrupt xz data (truncated number)")?;
+            *pos += 1;
+            value |= u64::from(byte & 0x7F) << (7 * i);
+            if byte & 0x80 == 0 {
+                if byte == 0 && i > 0 {
+                    bail!("corrupt xz data (a number isn't minimally encoded)");
+                }
+                return Ok(value);
+            }
+        }
+        bail!("corrupt xz data (a number is too long)")
+    }
+
+    fn check_size(kind: u8) -> usize {
+        if kind == 0 { 0 } else { 4 << ((kind - 1) / 3) }
+    }
+
+    /// Decodes the LZMA2 chunks of one block, returning the compressed
+    /// bytes consumed.
+    fn decode_lzma2<R: std::io::Read>(
+        input: &mut R,
+        dict_size: usize,
+        out: &mut dyn std::io::Write,
+        check: Check,
+    ) -> Result<(u64, u64, Check)> {
+        let mut window = Window {
+            buf: Vec::new(),
+            out,
+            dict_size,
+            since_reset: 0,
+            check,
+            checked: 0,
+            produced: 0,
+        };
+        let mut lzma: Option<Lzma> = None;
+        let mut need_dict_reset = true;
+        let mut need_props = true;
+        let mut consumed = 0u64;
+        let mut chunk = Vec::new();
+        loop {
+            let mut control = [0u8; 1];
+            input
+                .read_exact(&mut control)
+                .context("unexpected end of xz data")?;
+            consumed += 1;
+            let control = control[0];
+            if control == 0 {
+                break;
+            }
+            if control == 1 || control >= 0xE0 {
+                need_dict_reset = false;
+                window.reset_dictionary();
+                if control == 1 {
+                    need_props = true;
+                }
+            } else if need_dict_reset {
+                bail!("corrupt xz data (the first LZMA2 chunk doesn't reset the dictionary)");
+            }
+            if control >= 0x80 {
+                let mut head = [0u8; 4];
+                input
+                    .read_exact(&mut head)
+                    .context("unexpected end of xz data")?;
+                consumed += 4;
+                let uncompressed = ((usize::from(control & 0x1F) << 16)
+                    | (usize::from(head[0]) << 8)
+                    | usize::from(head[1]))
+                    + 1;
+                let compressed = ((usize::from(head[2]) << 8) | usize::from(head[3])) + 1;
+                if control >= 0xC0 {
+                    let mut props = [0u8; 1];
+                    input
+                        .read_exact(&mut props)
+                        .context("unexpected end of xz data")?;
+                    consumed += 1;
+                    let p = u32::from(props[0]);
+                    if p >= 9 * 5 * 5 {
+                        bail!("corrupt xz data (invalid LZMA properties)");
+                    }
+                    let (lc, lp, pb) = (p % 9, (p / 9) % 5, p / 45);
+                    if lc + lp > 4 {
+                        bail!("corrupt xz data (lc + lp is more than 4 in LZMA2)");
+                    }
+                    match lzma.as_mut() {
+                        Some(l) => l.reset(Some((lc, lp, pb))),
+                        None => lzma = Some(Lzma::new(lc, lp, pb)),
+                    }
+                    need_props = false;
+                } else if need_props {
+                    bail!("corrupt xz data (an LZMA2 chunk comes before its properties)");
+                } else if control >= 0xA0
+                    && let Some(l) = lzma.as_mut()
+                {
+                    l.reset(None);
+                }
+                let Some(l) = lzma.as_mut() else {
+                    bail!("corrupt xz data (an LZMA2 chunk comes before its properties)");
+                };
+                chunk.clear();
+                chunk.resize(compressed, 0);
+                input
+                    .read_exact(&mut chunk)
+                    .context("unexpected end of xz data")?;
+                consumed += compressed as u64;
+                let mut rc = RangeDecoder::new(&chunk)?;
+                l.decode(&mut rc, &mut window, uncompressed)?;
+                if rc.pos != compressed || rc.code != 0 {
+                    bail!("corrupt xz data (an LZMA chunk doesn't end where it says)");
+                }
+            } else if control == 2 || control == 1 {
+                let mut head = [0u8; 2];
+                input
+                    .read_exact(&mut head)
+                    .context("unexpected end of xz data")?;
+                consumed += 2;
+                let size = ((usize::from(head[0]) << 8) | usize::from(head[1])) + 1;
+                chunk.clear();
+                chunk.resize(size, 0);
+                input
+                    .read_exact(&mut chunk)
+                    .context("unexpected end of xz data")?;
+                consumed += size as u64;
+                for byte in &chunk {
+                    window.push(*byte);
+                }
+            } else {
+                bail!("corrupt xz data (invalid LZMA2 control byte {control:#04x})");
+            }
+            window.end_chunk(false)?;
+        }
+        window.end_chunk(true)?;
+        Ok((consumed, window.produced, window.check))
+    }
+
+    /// Reads one index number straight off the stream, keeping its bytes
+    /// for the index's CRC.
+    fn read_index_varint<R: std::io::Read>(input: &mut R, index: &mut Vec<u8>) -> Result<u64> {
+        let mut value = 0u64;
+        for i in 0..9 {
+            let byte: [u8; 1] = read_array(input)?;
+            index.push(byte[0]);
+            value |= u64::from(byte[0] & 0x7F) << (7 * i);
+            if byte[0] & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        bail!("corrupt xz data (an index number is too long)")
+    }
+
+    fn read_array<R: std::io::Read, const N: usize>(input: &mut R) -> Result<[u8; N]> {
+        let mut buf = [0u8; N];
+        input
+            .read_exact(&mut buf)
+            .context("unexpected end of xz data")?;
+        Ok(buf)
+    }
+
+    /// Decompresses every xz stream in `input` into `out`.
+    pub(crate) fn xz_decompress_to<R: std::io::Read>(
+        input: R,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        use std::io::{BufRead, Read};
+        let mut input = std::io::BufReader::new(input);
+        let mut first = true;
+        loop {
+            // Stream padding: zero bytes in multiples of four, then either
+            // another stream or the end.
+            let mut padding = 0u64;
+            loop {
+                let next = input.fill_buf().context("failed to read xz data")?;
+                if next.first() == Some(&0) && !first {
+                    input.consume(1);
+                    padding += 1;
+                } else {
+                    break;
+                }
+            }
+            if !first
+                && input
+                    .fill_buf()
+                    .context("failed to read xz data")?
+                    .is_empty()
+            {
+                if !padding.is_multiple_of(4) {
+                    bail!("corrupt xz data (stream padding isn't a multiple of four bytes)");
+                }
+                return Ok(());
+            }
+            if !padding.is_multiple_of(4) {
+                bail!("corrupt xz data (stream padding isn't a multiple of four bytes)");
+            }
+            first = false;
+
+            let header: [u8; 12] = read_array(&mut input)?;
+            if header[..6] != HEADER_MAGIC {
+                bail!("not an xz stream (bad magic bytes)");
+            }
+            let flags = [header[6], header[7]];
+            if crc32(&flags) != u32::from_le_bytes([header[8], header[9], header[10], header[11]]) {
+                bail!("corrupt xz data (stream header CRC mismatch)");
+            }
+            if flags[0] != 0 || flags[1] & 0xF0 != 0 {
+                bail!("unsupported xz stream flags");
+            }
+            let check_kind = flags[1] & 0x0F;
+
+            let mut blocks: Vec<(u64, u64)> = Vec::new();
+            loop {
+                let size_byte: [u8; 1] = read_array(&mut input)?;
+                if size_byte[0] == 0 {
+                    break;
+                }
+                let header_size = (usize::from(size_byte[0]) + 1) * 4;
+                let mut block_header = vec![0u8; header_size];
+                block_header[0] = size_byte[0];
+                input
+                    .read_exact(&mut block_header[1..])
+                    .context("unexpected end of xz data")?;
+                let (body, crc_bytes) = block_header.split_at(header_size - 4);
+                if crc32(body)
+                    != u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]])
+                {
+                    bail!("corrupt xz data (block header CRC mismatch)");
+                }
+                let block_flags = body[1];
+                let mut pos = 2usize;
+                let declared_compressed = if block_flags & 0x40 != 0 {
+                    Some(varint(body, &mut pos)?)
+                } else {
+                    None
+                };
+                let declared_uncompressed = if block_flags & 0x80 != 0 {
+                    Some(varint(body, &mut pos)?)
+                } else {
+                    None
+                };
+                let n_filters = usize::from(block_flags & 3) + 1;
+                let mut dict_size = None;
+                for i in 0..n_filters {
+                    let id = varint(body, &mut pos)?;
+                    let props_len = varint(body, &mut pos)? as usize;
+                    let props = body
+                        .get(pos..pos + props_len)
+                        .context("corrupt xz data (truncated filter properties)")?;
+                    pos += props_len;
+                    if id != 0x21 || i + 1 != n_filters {
+                        bail!(
+                            "this xz file uses a filter other than LZMA2 (filter id {id:#x}), \
+                             which isn't supported"
+                        );
+                    }
+                    let byte = *props
+                        .first()
+                        .context("corrupt xz data (LZMA2 needs a dictionary size)")?;
+                    if byte > 40 {
+                        bail!("corrupt xz data (invalid LZMA2 dictionary size)");
+                    }
+                    dict_size = Some(if byte == 40 {
+                        u64::from(u32::MAX)
+                    } else {
+                        (2 | u64::from(byte & 1)) << (byte / 2 + 11)
+                    });
+                }
+                if body[pos..].iter().any(|b| *b != 0) {
+                    bail!("corrupt xz data (nonzero block header padding)");
+                }
+                let dict_size = dict_size.context("corrupt xz data (a block has no filters)")?;
+                if dict_size > MAX_DICT {
+                    bail!(
+                        "this xz file needs a {} MiB dictionary, more than the {} MiB this decoder allows",
+                        dict_size >> 20,
+                        MAX_DICT >> 20
+                    );
+                }
+
+                let (consumed, produced, check) =
+                    decode_lzma2(&mut input, dict_size as usize, out, Check::new(check_kind))?;
+                if declared_compressed.is_some_and(|c| c != consumed)
+                    || declared_uncompressed.is_some_and(|u| u != produced)
+                {
+                    bail!("corrupt xz data (a block's size doesn't match its header)");
+                }
+                // The block (header + data) is padded to a multiple of four
+                // before its check.
+                let pad = (4 - (header_size as u64 + consumed) % 4) % 4;
+                let mut padding = vec![0u8; pad as usize];
+                input
+                    .read_exact(&mut padding)
+                    .context("unexpected end of xz data")?;
+                if padding.iter().any(|b| *b != 0) {
+                    bail!("corrupt xz data (nonzero block padding)");
+                }
+                let mut stored = vec![0u8; check_size(check_kind)];
+                input
+                    .read_exact(&mut stored)
+                    .context("unexpected end of xz data")?;
+                if let Some(expected) = check.expected()
+                    && expected != stored
+                {
+                    bail!("xz block check mismatch (the data is corrupt)");
+                }
+                // The index's "unpadded size": header + data + check, no padding.
+                blocks.push((
+                    header_size as u64 + consumed + stored.len() as u64,
+                    produced,
+                ));
+            }
+
+            // The index: a record count, one (size, size) record per block,
+            // padding to four, and a CRC-32 over the lot.
+            let mut index = vec![0u8];
+            let count = read_index_varint(&mut input, &mut index)?;
+            if count != blocks.len() as u64 {
+                bail!("corrupt xz data (the index lists a different number of blocks)");
+            }
+            for (size, uncompressed) in &blocks {
+                let unpadded = read_index_varint(&mut input, &mut index)?;
+                let total = read_index_varint(&mut input, &mut index)?;
+                if unpadded != *size || total != *uncompressed {
+                    bail!("corrupt xz data (the index disagrees with the blocks)");
+                }
+            }
+            let index_pad = (4 - index.len() % 4) % 4;
+            let mut pad = vec![0u8; index_pad];
+            input
+                .read_exact(&mut pad)
+                .context("unexpected end of xz data")?;
+            index.extend_from_slice(&pad);
+            let stored: [u8; 4] = read_array(&mut input)?;
+            if crc32(&index) != u32::from_le_bytes(stored) {
+                bail!("corrupt xz data (index CRC mismatch)");
+            }
+
+            let footer: [u8; 12] = read_array(&mut input)?;
+            if footer[10..] != FOOTER_MAGIC || footer[8..10] != flags {
+                bail!("corrupt xz data (bad stream footer)");
+            }
+            if crc32(&footer[4..10])
+                != u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]])
+            {
+                bail!("corrupt xz data (stream footer CRC mismatch)");
+            }
+            let backward = (u64::from(u32::from_le_bytes([
+                footer[4], footer[5], footer[6], footer[7],
+            ])) + 1)
+                * 4;
+            if backward != index.len() as u64 + 4 {
+                bail!("corrupt xz data (the footer's index size is wrong)");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn decode(data: &[u8]) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            xz_decompress_to(data, &mut out)?;
+            Ok(out)
+        }
+
+        /// `lzma.compress(b"hello world\n" * 3, preset=1)` from CPython.
+        const HELLO: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x02, 0x00,
+            0x21, 0x01, 0x10, 0x00, 0x00, 0x00, 0xa8, 0x70, 0x8e, 0x86, 0xe0, 0x00, 0x23, 0x00,
+            0x13, 0x5d, 0x00, 0x34, 0x19, 0x49, 0xdb, 0x85, 0x5c, 0x63, 0xad, 0x3e, 0xf9, 0x63,
+            0x73, 0xbc, 0xa2, 0x5b, 0x85, 0xb1, 0x80, 0x00, 0x00, 0x00, 0x1d, 0xbb, 0x97, 0x87,
+            0xcb, 0xa2, 0xdb, 0xd1, 0x00, 0x01, 0x2f, 0x24, 0x97, 0x69, 0x99, 0x0e, 0x1f, 0xb6,
+            0xf3, 0x7d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+        ];
+
+        #[test]
+        fn decodes_a_known_stream_and_concatenated_streams() {
+            let expected = b"hello world\nhello world\nhello world\n";
+            assert_eq!(decode(HELLO).unwrap(), expected);
+            // Two streams, with padding between them.
+            let doubled = [HELLO, &[0u8; 8], HELLO].concat();
+            assert_eq!(decode(&doubled).unwrap(), expected.repeat(2));
+            // Padding that isn't a multiple of four is corrupt.
+            assert!(decode(&[HELLO, &[0u8; 3]].concat()).is_err());
+        }
+
+        #[test]
+        fn corruption_is_an_error_not_a_panic() {
+            for i in 0..HELLO.len() * 8 {
+                let mut data = HELLO.to_vec();
+                data[i / 8] ^= 1 << (i % 8);
+                let _ = decode(&data);
+            }
+            for cut in 0..HELLO.len() {
+                assert!(decode(&HELLO[..cut]).is_err(), "cut at {cut}");
+            }
+        }
+
+        #[test]
+        fn rejects_garbage_and_truncation() {
+            assert!(decode(b"").is_err());
+            assert!(decode(b"not an xz file at all").is_err());
+            assert!(decode(&HEADER_MAGIC).is_err());
+        }
+
+        #[test]
+        fn check_sizes_follow_the_spec() {
+            assert_eq!(
+                (0..16).map(check_size).collect::<Vec<_>>(),
+                [0, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64]
+            );
+        }
+
+        #[test]
+        fn crc64_matches_the_ecma_182_check_value() {
+            // "123456789" -> 0x995DC9BBDF1939FA, the standard CRC-64/XZ check.
+            let mut check = Check::Crc64(!0);
+            check.update(b"123456789");
+            assert_eq!(
+                check.expected().unwrap(),
+                0x995D_C9BB_DF19_39FAu64.to_le_bytes()
+            );
+        }
+    }
+}
+
 // --- Text encoding normalisation ---
 // Every text reader here reads UTF-8, and most of them fail (or, worse,
 // quietly keep a U+FEFF inside the first key) on a byte-order mark. Rather
@@ -87358,6 +88714,8 @@ enum Container {
     Brotli,
     /// An LZ4 frame file - needs `--features parquet` or `orc`.
     Lz4,
+    Bzip2,
+    Xz,
 }
 
 impl Container {
@@ -87369,6 +88727,8 @@ impl Container {
             Container::Tar => "tar",
             Container::Brotli => "brotli",
             Container::Lz4 => "lz4",
+            Container::Bzip2 => "bzip2",
+            Container::Xz => "xz",
         }
     }
 }
@@ -87396,7 +88756,7 @@ const CONTAINER_CATALOG: &[ContainerInfo] = &[
     },
     ContainerInfo {
         name: "tar",
-        extensions: &["tar", "tgz"],
+        extensions: &["tar", "tgz", "tbz2", "tbz", "txz"],
         feature: None,
         compiled_in: true,
     },
@@ -87411,6 +88771,18 @@ const CONTAINER_CATALOG: &[ContainerInfo] = &[
         extensions: &["lz4"],
         feature: Some("parquet"),
         compiled_in: cfg!(any(feature = "parquet", feature = "orc")),
+    },
+    ContainerInfo {
+        name: "bzip2",
+        extensions: &["bz2", "tbz2", "tbz"],
+        feature: None,
+        compiled_in: true,
+    },
+    ContainerInfo {
+        name: "xz",
+        extensions: &["xz", "txz"],
+        feature: None,
+        compiled_in: true,
     },
 ];
 
@@ -87438,6 +88810,10 @@ fn container_from_extension(path: &Path) -> Option<(Container, PathBuf)> {
         "tgz" => (Container::Gzip, path.with_extension("tar")),
         "br" => (Container::Brotli, stripped),
         "lz4" => (Container::Lz4, stripped),
+        "bz2" => (Container::Bzip2, stripped),
+        "tbz2" | "tbz" => (Container::Bzip2, path.with_extension("tar")),
+        "xz" => (Container::Xz, stripped),
+        "txz" => (Container::Xz, path.with_extension("tar")),
         _ => return None,
     })
 }
@@ -87510,6 +88886,17 @@ fn container_from_magic(path: &Path) -> Option<Container> {
         Some(Container::Zstd)
     } else if n >= 4 && head[..4] == [0x04, 0x22, 0x4D, 0x18] {
         Some(Container::Lz4)
+    } else if n >= 6 && head[..6] == *b"\xFD7zXZ\x00" {
+        Some(Container::Xz)
+    } else if n >= 10
+        && &head[..3] == b"BZh"
+        && (b'1'..=b'9').contains(&head[3])
+        && (head[4..10] == [0x31, 0x41, 0x59, 0x26, 0x53, 0x59]
+            || head[4..10] == [0x17, 0x72, 0x45, 0x38, 0x50, 0x90])
+    {
+        // "BZh" + a block-size digit, then the first block's (or, for an
+        // empty stream, the end-of-stream) 48-bit magic.
+        Some(Container::Bzip2)
     } else if n == 512 && &head[257..262] == b"ustar" && tar_header_checksum_ok(&head) {
         Some(Container::Tar)
     } else {
@@ -87952,6 +89339,22 @@ fn unwrap_layer(container: Container, read_path: &Path) -> Result<Layer> {
                     )))
                 }
             }
+        }
+        Container::Bzip2 => {
+            let input = fs::File::open(read_path)
+                .with_context(|| format!("failed to open {read_path:?}"))?;
+            let mut tmp = TempFile::new()?;
+            bzip2_support::bzip2_decompress_to(input, tmp.as_file_mut())
+                .with_context(|| format!("failed to decompress {read_path:?}"))?;
+            Ok(Layer::Unwrapped(tmp, None))
+        }
+        Container::Xz => {
+            let input = fs::File::open(read_path)
+                .with_context(|| format!("failed to open {read_path:?}"))?;
+            let mut tmp = TempFile::new()?;
+            xz_support::xz_decompress_to(input, tmp.as_file_mut())
+                .with_context(|| format!("failed to decompress {read_path:?}"))?;
+            Ok(Layer::Unwrapped(tmp, None))
         }
         Container::Brotli => {
             #[cfg(feature = "parquet")]
