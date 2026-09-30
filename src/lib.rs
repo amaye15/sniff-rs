@@ -3417,6 +3417,10 @@ struct Args {
     /// --list-formats` alone is a complete, valid invocation. See
     /// `print_format_catalog`/`FORMAT_CATALOG` for the full design.
     list_formats: bool,
+    /// Source text encoding for a text format (`--encoding`). Absent, a
+    /// byte-order mark decides and everything else is read as UTF-8; see
+    /// `normalize_text_bytes`.
+    encoding: Option<TextEncoding>,
 }
 
 const HELP_TEXT: &str = r#"sniff-rs - profile a data file and produce a data dictionary
@@ -3503,6 +3507,13 @@ OPTIONS:
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
                                 in.
+        --encoding <NAME>       Source text encoding for a text format (csv, json,
+                                xml, yaml, ...): utf-8, utf-16le/-be, utf-32le/-be, or
+                                a single-byte code page (windows-1252, latin1,
+                                iso-8859-15, cp437, cp866, koi8-r, macintosh, ...).
+                                Without it a UTF-8/UTF-16/UTF-32 byte-order mark
+                                decides and everything else is read as UTF-8.
+                                Shift-JIS, GBK, Big5 and EUC-* aren't supported.
         --delimiter <CHAR>      Override the field delimiter for csv/tsv (single character)
         --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
         --widths <N,N,...>      Column widths for --format fixed-width, comma-separated -
@@ -3592,6 +3603,7 @@ impl Args {
         let mut include: Vec<String> = Vec::new();
         let mut exclude: Vec<String> = Vec::new();
         let mut list_formats = false;
+        let mut encoding: Option<TextEncoding> = None;
         let mut positionals: Vec<String> = Vec::new();
 
         let mut i = 0;
@@ -3634,6 +3646,7 @@ impl Args {
                         );
                     }
                     "format" => format = Some(value(&mut i)?),
+                    "encoding" => encoding = Some(parse_text_encoding(&value(&mut i)?)?),
                     "delimiter" => {
                         let v = value(&mut i)?;
                         let mut chars = v.chars();
@@ -3732,6 +3745,7 @@ impl Args {
             include,
             exclude,
             list_formats,
+            encoding,
         })
     }
 }
@@ -9145,12 +9159,6 @@ fn columns_from_syslog(
 // SAS reference crate decodes through) maps them to the C1 control
 // character with the same value. Multi-byte encodings (Shift-JIS, GBK,
 // Big5, EUC-*, ISO-2022-*) aren't here and stay disclosed errors.
-#[cfg(any(
-    feature = "dbase",
-    feature = "sas7bdat",
-    feature = "mbox",
-    feature = "xlsx"
-))]
 mod codepage_support {
     // Generated from Python's own codec tables (scratchpad gen_cp.py); every
     // entry is checked against encoding_rs where encoding_rs has the encoding.
@@ -76322,7 +76330,8 @@ fn load_graph_input(
         );
     }
     let (read_path, logical_path, _decompressed_tmp) = decompress_if_needed(path)?;
-    let format = detect_format(&read_path, &logical_path, &None)?;
+    let (format, read_path, _text_tmp) =
+        detect_and_normalize(&read_path, &logical_path, &None, None)?;
     if matches!(format, InputFormat::Json)
         && let Some(tables) = try_load_graph_tables(path, &read_path)?
     {
@@ -76353,6 +76362,7 @@ fn load_graph_input(
         include: Vec::new(),
         exclude: Vec::new(),
         list_formats: false,
+        encoding: None,
     };
     let (tables, _resolved_skip_rows) =
         dispatch_reader(&read_path, &logical_path, format, &synthetic_args)?;
@@ -85689,6 +85699,524 @@ mod zstd_support {
     }
 } // mod zstd_support
 
+// --- Text encoding normalisation ---
+// Every text reader here reads UTF-8, and most of them fail (or, worse,
+// quietly keep a U+FEFF inside the first key) on a byte-order mark. Rather
+// than teach thirty readers about encodings one at a time, input is
+// normalised once, in front of all of them, the same way
+// `decompress_if_needed` already handles compression: a text file that
+// isn't plain BOM-less UTF-8 (a UTF-8/UTF-16/UTF-32 byte-order mark, or
+// `--encoding` naming another single-byte code page) is streamed through
+// a bounded-memory transcoder into a temporary UTF-8 file, and every
+// reader - including the SQL row-sources' own second pass - opens that
+// instead. A file that's already plain UTF-8 is never copied.
+
+/// A source text encoding, as `--encoding` names it.
+#[derive(Clone, Copy, Debug)]
+enum TextEncoding {
+    Utf8,
+    /// UTF-16/UTF-32 with the byte order taken from the file's own BOM.
+    Utf16,
+    Utf16Le,
+    Utf16Be,
+    Utf32,
+    Utf32Le,
+    Utf32Be,
+    /// A legacy single-byte code page (`codepage_support`'s tables).
+    SingleByte(&'static [u16; 256]),
+}
+
+/// Parses an `--encoding` value. `latin1`/`iso-8859-1`/`ascii` follow the
+/// WHATWG Encoding Standard (the same choice the MBOX/Stata readers
+/// make): every real file labelled that way is windows-1252, which agrees
+/// with Latin-1 everywhere Latin-1 assigns a printable character.
+fn parse_text_encoding(name: &str) -> Result<TextEncoding> {
+    let key = name.trim().to_ascii_lowercase().replace('_', "-");
+    let alias = match key.as_str() {
+        "utf-8" | "utf8" => return Ok(TextEncoding::Utf8),
+        "utf-16" | "utf16" => return Ok(TextEncoding::Utf16),
+        "utf-16le" | "utf16le" | "utf-16-le" => return Ok(TextEncoding::Utf16Le),
+        "utf-16be" | "utf16be" | "utf-16-be" => return Ok(TextEncoding::Utf16Be),
+        "utf-32" | "utf32" => return Ok(TextEncoding::Utf32),
+        "utf-32le" | "utf32le" | "utf-32-le" => return Ok(TextEncoding::Utf32Le),
+        "utf-32be" | "utf32be" | "utf-32-be" => return Ok(TextEncoding::Utf32Be),
+        "latin1" | "latin-1" | "l1" | "iso-8859-1" | "iso8859-1" | "ascii" | "us-ascii"
+        | "cp1252" | "windows1252" => "windows-1252",
+        "iso-8859-9" | "latin5" | "cp1254" => "windows-1254",
+        "iso-8859-11" | "cp874" => "windows-874",
+        "macroman" | "mac-roman" | "mac" => "macintosh",
+        "cp1250" => "windows-1250",
+        "cp1251" => "windows-1251",
+        "cp1253" => "windows-1253",
+        "cp1255" => "windows-1255",
+        "cp1256" => "windows-1256",
+        "cp1257" => "windows-1257",
+        "cp1258" => "windows-1258",
+        other => {
+            let ibm = other.strip_prefix("ibm").map(|n| format!("cp{n}"));
+            return codepage_support::table(ibm.as_deref().unwrap_or(other))
+                .map(TextEncoding::SingleByte)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unrecognized --encoding {name:?} (expected utf-8, utf-16, utf-16le, \
+                         utf-16be, utf-32, utf-32le, utf-32be, or a single-byte code page such \
+                         as windows-1252, latin1, iso-8859-15, cp437, cp866, koi8-r, or \
+                         macintosh; multi-byte East Asian encodings (Shift-JIS, GBK, Big5, \
+                         EUC-*) aren't supported)"
+                    )
+                });
+        }
+    };
+    codepage_support::table(alias)
+        .map(TextEncoding::SingleByte)
+        .ok_or_else(|| anyhow!("no code page table for --encoding {name:?}"))
+}
+
+/// Formats whose content is text a BOM or a non-UTF-8 encoding can apply
+/// to. Binary formats (and a property list, whose binary variant must
+/// never be transcoded) are left alone.
+fn is_text_format(format: &InputFormat) -> bool {
+    matches!(
+        format,
+        InputFormat::Csv
+            | InputFormat::Tsv
+            | InputFormat::Json
+            | InputFormat::Toml
+            | InputFormat::Yaml
+            | InputFormat::Ini
+            | InputFormat::Xml
+            | InputFormat::FixedWidth
+            | InputFormat::CommonLog
+            | InputFormat::CombinedLog
+            | InputFormat::Syslog
+            | InputFormat::Syslog5424
+            | InputFormat::Json5
+            | InputFormat::Har
+            | InputFormat::GeoJson
+            | InputFormat::Mbox
+            | InputFormat::Vcard
+            | InputFormat::Ical
+            | InputFormat::Ipynb
+    )
+}
+
+/// Readers that already skip a leading UTF-8 BOM themselves, so a file
+/// carrying only that needs no copy.
+fn reader_skips_utf8_bom(format: &InputFormat) -> bool {
+    matches!(
+        format,
+        InputFormat::Csv | InputFormat::Tsv | InputFormat::Toml | InputFormat::Json5
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bom {
+    None,
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Utf32Le,
+    Utf32Be,
+}
+
+impl Bom {
+    fn len(self) -> u64 {
+        match self {
+            Bom::None => 0,
+            Bom::Utf8 => 3,
+            Bom::Utf16Le | Bom::Utf16Be => 2,
+            Bom::Utf32Le | Bom::Utf32Be => 4,
+        }
+    }
+}
+
+fn bom_of(head: &[u8]) -> Bom {
+    if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Bom::Utf8
+    } else if head.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        Bom::Utf32Le
+    } else if head.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+        Bom::Utf32Be
+    } else if head.starts_with(&[0xFF, 0xFE]) {
+        Bom::Utf16Le
+    } else if head.starts_with(&[0xFE, 0xFF]) {
+        Bom::Utf16Be
+    } else {
+        Bom::None
+    }
+}
+
+fn sniff_bom(path: &Path) -> Result<Bom> {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    let mut n = 0;
+    while n < head.len() {
+        match file.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) => return Err(e).with_context(|| format!("failed to read {path:?}")),
+        }
+    }
+    Ok(bom_of(&head[..n]))
+}
+
+/// Streams UTF-16/UTF-32 (`unit` bytes per code unit, 2 or 4) into UTF-8.
+/// A trailing partial unit is an error; a lone surrogate or an invalid
+/// scalar becomes U+FFFD, so one bad character never costs the file.
+fn transcode_wide_to_utf8(
+    mut input: impl std::io::Read,
+    out: &mut impl std::io::Write,
+    unit: usize,
+    big_endian: bool,
+    label: &Path,
+) -> Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut text = String::new();
+    loop {
+        let n = input
+            .read(&mut buf)
+            .with_context(|| format!("failed to read {label:?}"))?;
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        let mut take = pending.len() / unit * unit;
+        text.clear();
+        if unit == 2 {
+            let read_unit = |c: &[u8; 2]| {
+                if big_endian {
+                    u16::from_be_bytes(*c)
+                } else {
+                    u16::from_le_bytes(*c)
+                }
+            };
+            // Hold a trailing high surrogate back until its partner
+            // arrives in the next chunk.
+            if take >= 2
+                && (0xD800..0xDC00).contains(&read_unit(&[pending[take - 2], pending[take - 1]]))
+            {
+                take -= 2;
+            }
+            let units = pending[..take].as_chunks::<2>().0.iter().map(read_unit);
+            for r in char::decode_utf16(units) {
+                text.push(r.unwrap_or('\u{FFFD}'));
+            }
+        } else {
+            for c in pending[..take].as_chunks::<4>().0 {
+                let cp = if big_endian {
+                    u32::from_be_bytes(*c)
+                } else {
+                    u32::from_le_bytes(*c)
+                };
+                text.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        }
+        out.write_all(text.as_bytes())?;
+        pending.drain(..take);
+    }
+    match pending.len() {
+        0 => {}
+        2 if unit == 2 => out.write_all("\u{FFFD}".as_bytes())?,
+        _ => bail!(
+            "{label:?} ends in the middle of a UTF-{} code unit - it's truncated, or isn't UTF-{} at all",
+            unit * 8,
+            unit * 8
+        ),
+    }
+    Ok(())
+}
+
+/// Normalises a text file to plain, BOM-less UTF-8 when it needs it,
+/// returning the temporary copy (or `None` when `path` can already be
+/// read as it is). `requested` is `--encoding`; absent, the file's own
+/// byte-order mark decides. `keep_utf8_bom` is true for a reader that
+/// skips a UTF-8 BOM itself, so a BOM-only file isn't copied for nothing.
+fn normalize_text_bytes(
+    path: &Path,
+    requested: Option<TextEncoding>,
+    keep_utf8_bom: bool,
+) -> Result<Option<TempFile>> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let bom = sniff_bom(path)?;
+    // (source encoding, how many leading BOM bytes to drop)
+    enum Source {
+        Utf8,
+        Wide(usize, bool),
+        Single(&'static [u16; 256]),
+    }
+    let mismatch = |asked: &str| {
+        anyhow!(
+            "{path:?} starts with a byte-order mark that contradicts --encoding {asked} - drop --encoding to let the byte-order mark decide"
+        )
+    };
+    let (source, skip) = match (requested, bom) {
+        (None, Bom::None) => return Ok(None),
+        (None, Bom::Utf8) if keep_utf8_bom => return Ok(None),
+        (None, Bom::Utf8) | (Some(TextEncoding::Utf8), Bom::Utf8) => (Source::Utf8, 3),
+        (Some(TextEncoding::Utf8), Bom::None) => return Ok(None),
+        (None | Some(TextEncoding::Utf16), Bom::Utf16Le)
+        | (Some(TextEncoding::Utf16Le), Bom::Utf16Le | Bom::None) => {
+            (Source::Wide(2, false), bom.len())
+        }
+        (None | Some(TextEncoding::Utf16), Bom::Utf16Be)
+        | (Some(TextEncoding::Utf16Be), Bom::Utf16Be | Bom::None) => {
+            (Source::Wide(2, true), bom.len())
+        }
+        (None | Some(TextEncoding::Utf32), Bom::Utf32Le)
+        | (Some(TextEncoding::Utf32Le), Bom::Utf32Le | Bom::None) => {
+            (Source::Wide(4, false), bom.len())
+        }
+        (None | Some(TextEncoding::Utf32), Bom::Utf32Be)
+        | (Some(TextEncoding::Utf32Be), Bom::Utf32Be | Bom::None) => {
+            (Source::Wide(4, true), bom.len())
+        }
+        (Some(TextEncoding::Utf16 | TextEncoding::Utf32), Bom::None | Bom::Utf8) => bail!(
+            "--encoding utf-16/utf-32 needs a byte-order mark to tell the byte order - use utf-16le, utf-16be, utf-32le or utf-32be for {path:?}"
+        ),
+        (Some(TextEncoding::SingleByte(t)), Bom::None | Bom::Utf8) => (Source::Single(t), 0),
+        (Some(TextEncoding::SingleByte(_)), _) => return Err(mismatch("<code page>")),
+        (Some(TextEncoding::Utf8), _) => return Err(mismatch("utf-8")),
+        (Some(TextEncoding::Utf16 | TextEncoding::Utf16Le | TextEncoding::Utf16Be), _) => {
+            return Err(mismatch("utf-16"));
+        }
+        (Some(TextEncoding::Utf32 | TextEncoding::Utf32Le | TextEncoding::Utf32Be), _) => {
+            return Err(mismatch("utf-32"));
+        }
+    };
+
+    let mut input = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+    input
+        .seek(SeekFrom::Start(skip))
+        .with_context(|| format!("failed to read {path:?}"))?;
+    let mut tmp = TempFile::new()?;
+    {
+        let mut out = std::io::BufWriter::with_capacity(64 * 1024, tmp.as_file_mut());
+        match source {
+            Source::Utf8 => {
+                std::io::copy(&mut input, &mut out)
+                    .with_context(|| format!("failed to copy {path:?}"))?;
+            }
+            Source::Wide(unit, big_endian) => {
+                transcode_wide_to_utf8(input, &mut out, unit, big_endian, path)?;
+            }
+            Source::Single(table) => {
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    let n = input
+                        .read(&mut buf)
+                        .with_context(|| format!("failed to read {path:?}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    out.write_all(codepage_support::decode(table, &buf[..n]).as_bytes())?;
+                }
+            }
+        }
+        out.flush()?;
+    }
+    Ok(Some(tmp))
+}
+
+/// What `try_detect_and_normalize` yields: the format, the path to
+/// actually read (the original, or a UTF-8 temporary copy), and that
+/// copy's guard.
+type DetectedInput = (InputFormat, PathBuf, Option<TempFile>);
+
+/// Detects `read_path`'s format, then normalises its text encoding when
+/// the format is text - the one step every entry point (a single file, a
+/// directory walk, `--combine`, `diff`, `graph`) runs between
+/// `decompress_if_needed` and its reader. The outer `Err` is a real
+/// failure (the file couldn't be read or transcoded); the inner `Err` is
+/// "no format could be identified", which a directory walk skips rather
+/// than fails on. A file whose extension says nothing and whose bytes
+/// don't sniff because a BOM precedes them is normalised first and then
+/// sniffed again, so a UTF-16 JSON file with no extension still resolves.
+fn try_detect_and_normalize(
+    read_path: &Path,
+    logical_path: &Path,
+    format_override: &Option<String>,
+    encoding: Option<TextEncoding>,
+) -> Result<std::result::Result<DetectedInput, Error>> {
+    match detect_format(read_path, logical_path, format_override) {
+        Ok(format) => {
+            let tmp = if is_text_format(&format) {
+                normalize_text_bytes(read_path, encoding, reader_skips_utf8_bom(&format))?
+            } else {
+                None
+            };
+            let path = tmp
+                .as_ref()
+                .map_or_else(|| read_path.to_path_buf(), |t| t.path().to_path_buf());
+            Ok(Ok((format, path, tmp)))
+        }
+        Err(err) => {
+            if !matches!(sniff_bom(read_path), Ok(b) if b != Bom::None) {
+                return Ok(Err(err));
+            }
+            let Ok(Some(tmp)) = normalize_text_bytes(read_path, encoding, false) else {
+                return Ok(Err(err));
+            };
+            match detect_format(tmp.path(), logical_path, format_override) {
+                Ok(format) if is_text_format(&format) => {
+                    let path = tmp.path().to_path_buf();
+                    Ok(Ok((format, path, Some(tmp))))
+                }
+                _ => Ok(Err(err)),
+            }
+        }
+    }
+}
+
+/// `try_detect_and_normalize` for a caller where "unrecognized" is just
+/// another error (a single file, `diff`).
+fn detect_and_normalize(
+    read_path: &Path,
+    logical_path: &Path,
+    format_override: &Option<String>,
+    encoding: Option<TextEncoding>,
+) -> Result<DetectedInput> {
+    try_detect_and_normalize(read_path, logical_path, format_override, encoding)?
+}
+
+/// Appends the `--encoding` hint to a text reader's failure when it looks
+/// like an encoding problem, so "contains invalid UTF-8" says what to do.
+fn with_encoding_hint<T>(result: Result<T>, format: &InputFormat) -> Result<T> {
+    match result {
+        Err(err) if is_text_format(format) => {
+            let text = format!("{err:?}");
+            if text.contains("invalid UTF-8") || text.contains("not valid UTF-8") {
+                Err(Error {
+                    message: format!(
+                        "{} - if the file isn't UTF-8, pass --encoding <name> (for example windows-1252, latin1, utf-16le)",
+                        err.message
+                    ),
+                    source: err.source,
+                })
+            } else {
+                Err(err)
+            }
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod text_encoding_tests {
+    use super::*;
+
+    /// A reader that hands out at most `step` bytes per call, so every
+    /// code unit - and every surrogate pair - straddles a read boundary
+    /// somewhere across the sweep.
+    struct Dribble<'a>(&'a [u8], usize);
+    impl std::io::Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.1.min(buf.len()).min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn utf16_transcoding_is_independent_of_read_boundaries() {
+        let text = "a😀é𝄞z漢";
+        for big in [false, true] {
+            let bytes: Vec<u8> = text
+                .encode_utf16()
+                .flat_map(|u| {
+                    if big {
+                        u.to_be_bytes()
+                    } else {
+                        u.to_le_bytes()
+                    }
+                })
+                .collect();
+            for step in 1..=9 {
+                let mut out = Vec::new();
+                transcode_wide_to_utf8(Dribble(&bytes, step), &mut out, 2, big, Path::new("t"))
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    text,
+                    "step {step} big {big}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utf32_transcoding_is_independent_of_read_boundaries() {
+        let text = "a😀é漢";
+        let bytes: Vec<u8> = text
+            .chars()
+            .flat_map(|c| (c as u32).to_le_bytes())
+            .collect();
+        for step in 1..=9 {
+            let mut out = Vec::new();
+            transcode_wide_to_utf8(Dribble(&bytes, step), &mut out, 4, false, Path::new("t"))
+                .unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), text, "step {step}");
+        }
+    }
+
+    #[test]
+    fn malformed_wide_text_degrades_to_replacement_chars_or_errors() {
+        // A lone surrogate becomes U+FFFD; a file cut mid-unit is an error.
+        let mut out = Vec::new();
+        let lone = [0x00, 0xD8, b'a', 0x00];
+        transcode_wide_to_utf8(&lone[..], &mut out, 2, false, Path::new("t")).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\u{FFFD}a");
+        let mut out = Vec::new();
+        assert!(
+            transcode_wide_to_utf8(&[b'a', 0, b'b'][..], &mut out, 2, false, Path::new("t"))
+                .is_err()
+        );
+        let mut out = Vec::new();
+        // A high surrogate that ends the file has no partner.
+        transcode_wide_to_utf8(&[0x00, 0xD8][..], &mut out, 2, false, Path::new("t")).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn encoding_names_resolve() {
+        for ok in [
+            "utf-8",
+            "UTF8",
+            "utf-16",
+            "utf-16le",
+            "UTF-16BE",
+            "utf-32le",
+            "latin1",
+            "iso-8859-1",
+            "windows-1252",
+            "cp1252",
+            "cp437",
+            "ibm437",
+            "cp866",
+            "koi8-r",
+            "macintosh",
+            "iso-8859-15",
+            "windows-1251",
+        ] {
+            assert!(parse_text_encoding(ok).is_ok(), "{ok}");
+        }
+        for bad in ["shift_jis", "gbk", "big5", "nonsense", ""] {
+            assert!(parse_text_encoding(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bom_detection_prefers_utf32_over_utf16_le() {
+        assert!(bom_of(&[0xFF, 0xFE, 0, 0]) == Bom::Utf32Le);
+        assert!(bom_of(&[0xFF, 0xFE, b'a', 0]) == Bom::Utf16Le);
+        assert!(bom_of(&[0xEF, 0xBB, 0xBF, b'x']) == Bom::Utf8);
+        assert!(bom_of(b"plain") == Bom::None);
+    }
+}
+
 // --- Transparent gzip/zstd decompression ---
 // Not a format of its own - a preprocessing step in front of every reader
 // above. Every reader just opens a plain file path, so materializing
@@ -87023,7 +87551,15 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         logical_path = PathBuf::from("stdin");
     }
 
-    let format = detect_format(&read_path, &logical_path, &args.format)?;
+    let (format, read_path, _text_tmp) =
+        detect_and_normalize(&read_path, &logical_path, &args.format, args.encoding)?;
+    if args.encoding.is_some() && !is_text_format(&format) {
+        bail!(
+            "--encoding only applies to text formats, but {:?} was read as {}",
+            args.input_path,
+            format.as_str()
+        );
+    }
     let file_name = args
         .input_path
         .file_name()
@@ -87038,7 +87574,10 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         );
     }
 
-    let (tables, resolved_skip_rows) = dispatch_reader(&read_path, &logical_path, format, args)?;
+    let (tables, resolved_skip_rows) = with_encoding_hint(
+        dispatch_reader(&read_path, &logical_path, format, args),
+        &format,
+    )?;
     // A reader yielding zero tables (an Excel-family workbook with no
     // non-empty sheets - the only shape that reaches here, since every
     // other empty input is still a hard error inside its own reader, the
@@ -87850,7 +88389,7 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     enum BatchOutcome {
         Excluded,
         OwnOutput,
-        DecompressFailed(Error),
+        PrepareFailed(Error),
         Unrecognized,
         Done(Result<Option<(usize, usize, PathBuf)>>),
     }
@@ -87865,14 +88404,24 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             .with_context(|| format!("failed processing {path:?}"))
         {
             Ok(paths) => paths,
-            Err(err) => return BatchOutcome::DecompressFailed(err),
+            Err(err) => return BatchOutcome::PrepareFailed(err),
         };
-        let Ok(format) = detect_format(&read_path, &logical_path, &None) else {
-            return BatchOutcome::Unrecognized;
-        };
+        let (format, read_path, _text_tmp) =
+            match try_detect_and_normalize(&read_path, &logical_path, &None, args.encoding) {
+                Ok(Ok(detected)) => detected,
+                Ok(Err(_)) => return BatchOutcome::Unrecognized,
+                Err(err) => {
+                    return BatchOutcome::PrepareFailed(Error::wrap(
+                        format!("failed processing {path:?}"),
+                        err,
+                    ));
+                }
+            };
         let outcome = (|| -> Result<Option<(usize, usize, PathBuf)>> {
-            let (tables, resolved_skip_rows) =
-                dispatch_reader(&read_path, &logical_path, format, args)?;
+            let (tables, resolved_skip_rows) = with_encoding_hint(
+                dispatch_reader(&read_path, &logical_path, format, args),
+                &format,
+            )?;
             // A reader yielding zero tables (an Excel-family workbook with
             // no non-empty sheets - the only shape that reaches here) is
             // a skip with a note, not a failure and not a fatal error:
@@ -88007,7 +88556,7 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             let outcome = process(path);
             let failed = matches!(
                 outcome,
-                BatchOutcome::DecompressFailed(_) | BatchOutcome::Done(Err(_))
+                BatchOutcome::PrepareFailed(_) | BatchOutcome::Done(Err(_))
             );
             (outcome, failed)
         },
@@ -88023,7 +88572,7 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                     );
                     return Ok(());
                 }
-                BatchOutcome::DecompressFailed(err) => {
+                BatchOutcome::PrepareFailed(err) => {
                     if !args.continue_on_error {
                         return Err(err);
                     }
@@ -88460,22 +89009,37 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
             }
         };
 
-        let format = match detect_format(&read_path, &logical_path, &None) {
-            Ok(format) => format,
-            Err(_) => {
-                skipped += 1;
-                unrecognized.push(relative_display_path(dir, path));
-                eprintln!("{}: skipped (unrecognized format)", path.display());
-                continue;
-            }
-        };
+        let (format, read_path, _text_tmp) =
+            match try_detect_and_normalize(&read_path, &logical_path, &None, args.encoding) {
+                Ok(Ok(detected)) => detected,
+                Ok(Err(_)) => {
+                    skipped += 1;
+                    unrecognized.push(relative_display_path(dir, path));
+                    eprintln!("{}: skipped (unrecognized format)", path.display());
+                    continue;
+                }
+                Err(err) => {
+                    let err = Error::wrap(format!("failed processing {path:?}"), err);
+                    if !args.continue_on_error {
+                        return Err(err);
+                    }
+                    failed.push(BatchFailure {
+                        source_relative: relative_display_path(dir, path),
+                        error: format!("{err:?}"),
+                    });
+                    eprintln!("{}: failed (recorded, continuing)", path.display());
+                    continue;
+                }
+            };
 
         let relative_path = relative_display_path(dir, path);
         let qualifier = combine_qualifier_from_path(&relative_path);
 
         let counted: Result<bool> = (|| -> Result<bool> {
-            let (tables, resolved_skip_rows) =
-                dispatch_reader(&read_path, &logical_path, format, args)?;
+            let (tables, resolved_skip_rows) = with_encoding_hint(
+                dispatch_reader(&read_path, &logical_path, format, args),
+                &format,
+            )?;
             // Zero tables (an Excel-family workbook with no non-empty
             // sheets) skips with a note here too - same reasoning as the
             // per-file loop's own empty case, just without an index entry
@@ -88993,6 +89557,7 @@ fn profile_raw_file_as_diff_columns(
         include: Vec::new(),
         exclude: Vec::new(),
         list_formats: false,
+        encoding: None,
     };
     let (tables, _resolved_skip_rows) =
         dispatch_reader(read_path, logical_path, format, &synthetic_args)?;
@@ -89052,7 +89617,8 @@ fn load_diff_input(
     if is_stdin {
         logical_path = PathBuf::from("stdin");
     }
-    let format = detect_format(&read_path, &logical_path, &override_fmt)?;
+    let (format, read_path, _text_tmp) =
+        detect_and_normalize(&read_path, &logical_path, &override_fmt, None)?;
     if matches!(format, InputFormat::Json)
         && let Some(tables) = try_load_dictionary_tables(path, &read_path)?
     {
@@ -93573,6 +94139,7 @@ mod knowledge_graph {
             include: Vec::new(),
             exclude: Vec::new(),
             list_formats: false,
+            encoding: None,
         }
     }
 
@@ -93626,7 +94193,16 @@ mod knowledge_graph {
                 return file;
             }
         };
-        if let Ok(format) = detect_format(&read_path, &logical_path, &None) {
+        let detected = match try_detect_and_normalize(&read_path, &logical_path, &None, None) {
+            Ok(Ok(detected)) => Some(detected),
+            Ok(Err(_)) => None,
+            Err(e) => {
+                file.kind = FileKind::Failed;
+                file.error = Some(root_cause(&e));
+                return file;
+            }
+        };
+        if let Some((format, read_path, _text_tmp)) = detected {
             file.file_type = format.as_str().to_string();
             file.fixed_schema = has_fixed_schema(&format);
             let args = graph_args(path, opts.samples);

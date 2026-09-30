@@ -10265,22 +10265,11 @@ fn toml_dotted_table_conflict_and_valid() {
 #[cfg(feature = "ini")]
 #[test]
 fn ini_bom_and_no_section() {
-    // BOM-prefixed INI: either succeeds (if parser strips BOM) or fails with actionable error, but must not panic.
-    let output = Command::new(bin())
-        .args([fixture("edge_ini_bom.ini").to_str().unwrap(), "-"])
-        .output()
-        .unwrap();
-    // Must not be a panic; either success or clean error.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
-        "BOM handling should not panic: {stderr}"
-    );
-    if output.status.success() {
-        let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let s = table(&doc, "section");
-        assert!(s.iter().any(|c| c["name"] == "key"));
-    }
+    // A leading UTF-8 BOM is stripped before the INI reader runs, so the
+    // first section header still parses (it used to be a hard error).
+    let doc = run_json("edge_ini_bom.ini", &[]);
+    let s = table(&doc, "section");
+    assert!(s.iter().any(|c| c["name"] == "key"));
 
     let doc2 = run_json("edge_ini_no_section.ini", &[]);
     let tables = doc2["tables"].as_object().unwrap();
@@ -15868,4 +15857,245 @@ fn spss_variable_and_value_labels_are_surfaced_in_plain_and_zlib_files() {
             grp["notes"]
         );
     }
+}
+
+// --- Text encodings and byte-order marks ---
+
+fn sample_names(doc: &serde_json::Value, tbl: &str, col: &str) -> Vec<String> {
+    column(table(doc, tbl), col)["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn utf16_and_utf32_csvs_with_a_bom_read_with_no_flags() {
+    for (file, tbl) in [
+        ("edge_encoding_utf16le_bom.csv", "edge_encoding_utf16le_bom"),
+        ("edge_encoding_utf16be_bom.csv", "edge_encoding_utf16be_bom"),
+        ("edge_encoding_utf32le_bom.csv", "edge_encoding_utf32le_bom"),
+    ] {
+        let doc = run_json(file, &["--samples", "3"]);
+        let cols = table(&doc, tbl);
+        assert_eq!(
+            cols.iter()
+                .map(|c| c["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["id", "name", "city"],
+            "{file}"
+        );
+        assert_eq!(
+            sample_names(&doc, tbl, "name"),
+            ["Zoë", "Søren", "Ann"],
+            "{file}"
+        );
+        assert_eq!(
+            sample_names(&doc, tbl, "city"),
+            ["Köln", "Łódź", "Paris"],
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn utf16_surrogate_pairs_survive_transcoding() {
+    let doc = run_json("edge_encoding_utf16le_emoji.csv", &[]);
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_utf16le_emoji", "tag"),
+        ["😀", "ok"]
+    );
+}
+
+#[test]
+fn a_utf16_file_with_no_bom_needs_an_explicit_encoding() {
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_encoding_utf16le_nobom.csv").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("invalid UTF-8") && err.contains("--encoding"),
+        "{err}"
+    );
+
+    let doc = run_json(
+        "edge_encoding_utf16le_nobom.csv",
+        &["--encoding", "utf-16le"],
+    );
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_utf16le_nobom", "city"),
+        ["Köln", "Łódź", "Paris"]
+    );
+}
+
+#[test]
+fn single_byte_encodings_decode_through_the_code_page_tables() {
+    let doc = run_json(
+        "edge_encoding_windows1252.csv",
+        &["--encoding", "windows-1252"],
+    );
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_windows1252", "city"),
+        ["Köln", "Málaga", "Paris"]
+    );
+    // latin1 is the WHATWG alias for windows-1252.
+    let doc = run_json("edge_encoding_windows1252.csv", &["--encoding", "latin1"]);
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_windows1252", "name")[0],
+        "Zoë"
+    );
+    let doc = run_json("edge_encoding_cp866.csv", &["--encoding", "cp866"]);
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_cp866", "word"),
+        ["Привет", "мир"]
+    );
+}
+
+#[test]
+fn encoding_flag_errors_are_specific() {
+    let run = |args: &[&str]| {
+        let out = Command::new(bin()).args(args).output().unwrap();
+        assert!(!out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let csv = fixture("edge_encoding_windows1252.csv");
+    let csv = csv.to_str().unwrap();
+    assert!(run(&[csv, "-", "--encoding", "klingon"]).contains("unrecognized --encoding"));
+    // utf-16 without a BOM can't pick a byte order.
+    assert!(run(&[csv, "-", "--encoding", "utf-16"]).contains("needs a byte-order mark"));
+    // A BOM that contradicts the flag is refused rather than guessed at.
+    let bom = fixture("edge_encoding_utf16le_bom.csv");
+    assert!(
+        run(&[bom.to_str().unwrap(), "-", "--encoding", "utf-16be"])
+            .contains("contradicts --encoding")
+    );
+}
+
+// A binary format has no text encoding.
+#[cfg(feature = "sqlite")]
+#[test]
+fn encoding_is_refused_for_a_binary_format() {
+    let sqlite = fixture("sample.sqlite");
+    let out = Command::new(bin())
+        .args([sqlite.to_str().unwrap(), "-", "--encoding", "utf-8"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("only applies to text formats"), "{err}");
+}
+
+fn assert_bom_ignored(file: &str, tbl: &str, col: &str) {
+    let doc = run_json(file, &[]);
+    let names: Vec<&str> = table(&doc, tbl)
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&col), "{file}: {names:?}");
+    assert!(
+        names.iter().all(|n| !n.contains('\u{feff}')),
+        "{file}: {names:?}"
+    );
+}
+
+// Before, YAML put U+FEFF inside the first key and JSON/JSONL/XML/INI/
+// vCard refused the file outright.
+#[test]
+fn a_utf8_bom_is_ignored_by_the_json_readers() {
+    assert_bom_ignored("edge_bom_json.json", "edge_bom_json", "name");
+    assert_bom_ignored("edge_bom_jsonl.jsonl", "edge_bom_jsonl", "name");
+}
+
+#[cfg(feature = "yaml")]
+#[test]
+fn a_utf8_bom_is_ignored_by_the_yaml_reader() {
+    assert_bom_ignored("edge_bom_yaml.yaml", "edge_bom_yaml", "name");
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn a_utf8_bom_is_ignored_by_the_xml_reader() {
+    assert_bom_ignored("edge_bom_xml.xml", "edge_bom_xml", "name");
+}
+
+#[cfg(feature = "ini")]
+#[test]
+fn a_utf8_bom_is_ignored_by_the_ini_reader() {
+    assert_bom_ignored("edge_bom_ini.ini", "server", "host");
+}
+
+#[cfg(feature = "vcard")]
+#[test]
+fn a_utf8_bom_is_ignored_by_the_vcard_reader() {
+    assert_bom_ignored("edge_bom_vcard.vcf", "edge_bom_vcard", "FN");
+}
+
+#[test]
+fn a_bom_precedes_content_sniffing_for_an_extensionless_file() {
+    let doc = run_json("edge_bom_utf16_json_noext", &[]);
+    assert_eq!(doc["format"], "json");
+    assert_eq!(
+        sample_names(&doc, "edge_bom_utf16_json_noext", "name"),
+        ["é"]
+    );
+}
+
+#[test]
+fn encoding_applies_through_stdin_and_inline_sql() {
+    let bytes = std::fs::read(fixture("edge_encoding_windows1252.csv")).unwrap();
+    let out = run_with_stdin(
+        &bytes,
+        &[
+            "-",
+            "-",
+            "--format",
+            "csv",
+            "--encoding",
+            "latin1",
+            "--output-format",
+            "sql",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8(out.stdout).unwrap();
+    // The inline second pass re-reads the transcoded copy, not the raw bytes.
+    assert!(sql.contains("Köln") && sql.contains("Málaga"), "{sql}");
+}
+
+#[test]
+fn encoding_applies_across_a_directory() {
+    let dir = std::env::temp_dir().join(format!("sniff-enc-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(fixture("edge_encoding_utf16le_bom.csv"), dir.join("a.csv")).unwrap();
+    std::fs::copy(fixture("edge_bom_json.json"), dir.join("b.json")).unwrap();
+    let out_dir = dir.join("out");
+    let out = Command::new(bin())
+        .args([
+            dir.to_str().unwrap(),
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let a = std::fs::read_to_string(out_dir.join("a.csv.dictionary.json")).unwrap();
+    assert!(a.contains("Zoë"), "{a}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
