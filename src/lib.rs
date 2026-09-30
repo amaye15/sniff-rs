@@ -3923,6 +3923,8 @@ struct DateFields {
     is_pm: Option<bool>,
     minute: Option<u32>,
     second: Option<u32>,
+    /// The digits after the decimal point of `%.f`, if the value had any.
+    fraction: Option<String>,
     weekday: Option<u32>,
 }
 
@@ -4023,8 +4025,9 @@ fn parse_date_fields(value: &str, fmt: &str) -> Option<DateFields> {
                     // Tolerates a value with no fractional seconds at all -
                     // only consumes it if a '.' is actually present.
                     if let Some(rest) = v.strip_prefix('.') {
-                        let (_frac, rest) = scan_digits(rest, 1, 9)?;
-                        v = rest;
+                        let (_frac, after) = scan_digits(rest, 1, 9)?;
+                        f.fraction = Some(rest[..rest.len() - after.len()].to_string());
+                        v = after;
                     }
                 }
                 'z' => {
@@ -4091,6 +4094,48 @@ fn parse_date_fields(value: &str, fmt: &str) -> Option<DateFields> {
 
 fn matches_date_format(value: &str, fmt: &str) -> bool {
     parse_date_fields(value, fmt).is_some()
+}
+
+/// Rewrites a value the given `DATE_FORMATS`/`TIME_FORMATS` entry matches
+/// as an ISO 8601 literal - `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.f]`, or
+/// `HH:MM:SS[.f]` - the one spelling PostgreSQL, MySQL, DuckDB and SQLite
+/// all read identically. Inline SQL used to embed the source text as-is,
+/// which a real server rejects or misreads for most of the formats this
+/// tool detects (`15/01/2024`, `Jan 15, 2024`, RFC 2822, `10:00 AM`, ...).
+/// A numeric UTC offset is dropped, matching the `TIMESTAMP` (no time
+/// zone) column type the value lands in. `None` when the value doesn't
+/// match `fmt` or names no calendar date (year 0 included - no engine
+/// stores it), so the caller keeps the raw text.
+fn normalize_temporal(value: &str, fmt: &str) -> Option<String> {
+    let f = parse_date_fields(value, fmt)?;
+    let hour = match (f.hour, f.hour12) {
+        (Some(h), _) => Some(h),
+        (None, Some(h12)) => Some(h12 % 12 + if f.is_pm == Some(true) { 12 } else { 0 }),
+        (None, None) => None,
+    };
+    let time = hour.map(|h| {
+        let mut t = format!(
+            "{h:02}:{:02}:{:02}",
+            f.minute.unwrap_or(0),
+            f.second.unwrap_or(0)
+        );
+        if let Some(frac) = &f.fraction {
+            t.push('.');
+            t.push_str(frac);
+        }
+        t
+    });
+    match (f.year, f.month, f.day) {
+        (Some(y), Some(m), Some(d)) if y >= 1 => {
+            let date = format!("{y:04}-{m:02}-{d:02}");
+            Some(match time {
+                Some(t) => format!("{date} {t}"),
+                None => date,
+            })
+        }
+        (None, None, None) => time,
+        _ => None,
+    }
 }
 
 // A minimal date/time/datetime value type covering exactly what the Avro
@@ -4999,6 +5044,14 @@ struct ColumnProfile {
     /// `sketch_worth_keeping`. `None` for measurements and attributes, and
     /// for dictionaries written before sketches existed.
     value_sketch: Option<ValueSketch>,
+    /// The `DATE_FORMATS`/`TIME_FORMATS` entry every value of a
+    /// `NaiveDate / DateTime`/`NaiveTime` column matched - what lets
+    /// inline SQL rewrite each value as an ISO literal every engine reads
+    /// the same way (`01/02/2024` is January 2nd or February 1st depending
+    /// on this format, and no engine guesses it). Internal: never part of
+    /// `to_json`, and `None` for every other column and for a dictionary
+    /// read back from disk.
+    temporal_format: Option<&'static str>,
 }
 
 // This project used to have a hand-rolled `impl serde::Serialize for
@@ -5139,6 +5192,7 @@ mod column_profile_to_json_tests {
             content: None,
             references: Vec::new(),
             value_sketch: None,
+            temporal_format: None,
         };
         let json_support::Value::Object(obj) = p.to_json() else {
             panic!("expected an Object");
@@ -5186,6 +5240,7 @@ mod column_profile_to_json_tests {
             content: None,
             references: Vec::new(),
             value_sketch: None,
+            temporal_format: None,
         };
         // `to_json()` rendered through the hand-rolled pretty-printer,
         // then parsed by a genuinely independent reference implementation
@@ -5419,6 +5474,7 @@ mod numeric_stats_tests {
             content: None,
             references: Vec::new(),
             value_sketch: None,
+            temporal_format: None,
         };
         let text = json_support::to_pretty_string(&p.to_json());
         let via_real: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -6514,6 +6570,35 @@ impl IdealTypeAccumulator {
         }
 
         self.total += 1;
+    }
+
+    /// The `DATE_FORMATS`/`TIME_FORMATS` entry `finish` would resolve a
+    /// date/time to, ignoring whether an earlier check claims the column
+    /// first - see `finish_with_temporal` for the checked form.
+    fn resolved_temporal_format(&self) -> Option<&'static str> {
+        DATE_FORMATS
+            .iter()
+            .zip(self.date_ok.iter())
+            .find(|(_, ok)| **ok)
+            .map(|(fmt, _)| *fmt)
+            .or_else(|| {
+                TIME_FORMATS
+                    .iter()
+                    .zip(self.time_ok.iter())
+                    .find(|(_, ok)| **ok)
+                    .map(|(fmt, _)| *fmt)
+            })
+    }
+
+    /// `finish`, plus the date/time format the column resolved to - `Some`
+    /// only when the resolved type is actually a date/datetime/time.
+    fn finish_with_temporal(self, current: &str) -> (String, String, Option<&'static str>) {
+        let format = self.resolved_temporal_format();
+        let (ideal, note) = self.finish(current);
+        let format = matches!(ideal.as_str(), "NaiveDate / DateTime" | "NaiveTime")
+            .then_some(format)
+            .flatten();
+        (ideal, note, format)
     }
 
     fn finish(self, current: &str) -> (String, String) {
@@ -7703,10 +7788,14 @@ impl ColumnAccumulatorState {
         } else {
             0.0
         });
-        let (ideal_type, mut notes) = if total_non_null == 0 {
-            ("String".to_string(), "column is empty/all null".to_string())
+        let (ideal_type, mut notes, temporal_format) = if total_non_null == 0 {
+            (
+                "String".to_string(),
+                "column is empty/all null".to_string(),
+                None,
+            )
         } else {
-            ideal_acc.finish(&current_type)
+            ideal_acc.finish_with_temporal(&current_type)
         };
         if missing_pct > 0.0 {
             let extra = "has missing values -> wrap in Option<T> / handle nulls";
@@ -7743,6 +7832,7 @@ impl ColumnAccumulatorState {
             content,
             references: Vec::new(),
             value_sketch,
+            temporal_format,
         }
     }
 }
@@ -17604,6 +17694,7 @@ mod orc_support {
                     content: None,
                     references: Vec::new(),
                     value_sketch: None,
+                    temporal_format: None,
                 });
                 continue;
             }
@@ -18394,6 +18485,7 @@ impl JsonPathAccumulator {
                 content: None,
                 references: Vec::new(),
                 value_sketch: None,
+                temporal_format: None,
             }];
         }
 
@@ -18416,6 +18508,7 @@ impl JsonPathAccumulator {
         // identical scope decision for the flat-reader engine.
         let numeric_stats_candidate = self.numeric_acc.finish();
 
+        let mut temporal_format = None;
         let (current_type, ideal_type, mut notes, numeric_stats) = if pool_is_empty {
             // saw_array must be true: something was pushed but every array was empty.
             (
@@ -18433,7 +18526,10 @@ impl JsonPathAccumulator {
             )
         } else if self.scalar_count > 0 && self.object_count == 0 {
             let base_current = describe_kinds(&self.kind_counts);
-            let (ideal, note) = self.ideal_acc.finish(&base_current);
+            let (ideal, note, format) = self.ideal_acc.finish_with_temporal(&base_current);
+            // A pooled array is emitted as JSON-array text, never as
+            // per-element date/time literals.
+            temporal_format = if saw_array { None } else { format };
             let numeric_stats = if matches!(ideal.as_str(), "i64" | "f64") {
                 numeric_stats_candidate
             } else {
@@ -18480,6 +18576,7 @@ impl JsonPathAccumulator {
             content,
             references: Vec::new(),
             value_sketch,
+            temporal_format,
         }];
 
         if self.object_count > 0 {
@@ -69385,6 +69482,7 @@ mod npy_support {
                     content: None,
                     references: Vec::new(),
                     value_sketch: None,
+                    temporal_format: None,
                 }],
             };
             out.push((array_name, profiles));
@@ -71276,6 +71374,7 @@ mod sqlite_support {
                     content: None,
                     references: Vec::new(),
                     value_sketch: None,
+                    temporal_format: None,
                 }],
             };
             out.push((entry.name, profiles));
@@ -72511,16 +72610,24 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         0.0
     });
 
-    let (ideal_type, mut notes) = if non_null.is_empty() {
-        ("String".to_string(), "column is empty/all null".to_string())
+    let (ideal_type, mut notes, temporal_format) = if non_null.is_empty() {
+        (
+            "String".to_string(),
+            "column is empty/all null".to_string(),
+            None,
+        )
     } else if col.skip_heuristics {
         (
             "String".to_string(),
             "nested value (array/object) - consider flattening before typing".to_string(),
+            None,
         )
     } else {
-        let refs: Vec<&str> = non_null.iter().map(|s| s.as_str()).collect();
-        suggest_ideal_type(&refs, &col.current_type)
+        let mut acc = IdealTypeAccumulator::new();
+        for v in non_null {
+            acc.push(v);
+        }
+        acc.finish_with_temporal(&col.current_type)
     };
 
     if missing_pct > 0.0 {
@@ -72601,6 +72708,7 @@ fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
         content,
         references: Vec::new(),
         value_sketch,
+        temporal_format,
     }
 }
 
@@ -76683,6 +76791,9 @@ struct InlineRowSink<'a> {
     nrows: Option<usize>,
     header_len: usize,
     ideal_types: &'a [&'a str],
+    // Per column, the date/time format its values matched - see
+    // `ColumnProfile::temporal_format` and `normalize_temporal`.
+    temporal_formats: &'a [Option<&'static str>],
     quoted_table: &'a str,
     insert_cols: &'a str,
     record_index: usize,
@@ -76750,11 +76861,18 @@ impl InlineRowSink<'_> {
             }
             let tuple = record
                 .iter()
-                .zip(self.ideal_types.iter())
-                .map(|(v, t)| match v {
+                .zip(self.ideal_types.iter().zip(self.temporal_formats.iter()))
+                .map(|(v, (t, fmt))| match v {
                     None => "NULL".to_string(),
-                    Some(raw) if self.values_pre_resolved => sql_literal_for_resolved_value(raw, t),
-                    Some(raw) => sql_literal_for_value(raw, t),
+                    Some(raw) => {
+                        let iso = fmt.and_then(|f| normalize_temporal(raw.trim(), f));
+                        let raw = iso.as_deref().unwrap_or(raw);
+                        if self.values_pre_resolved {
+                            sql_literal_for_resolved_value(raw, t)
+                        } else {
+                            sql_literal_for_value(raw, t)
+                        }
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -76791,20 +76909,43 @@ fn sql_unique_column_names(profiles: &[ColumnProfile]) -> Vec<String> {
     profiles
         .iter()
         .map(|p| {
-            let base = if p.name.is_empty() {
-                "column".to_string()
-            } else {
-                p.name.clone()
-            };
+            let base = sql_fit_identifier(&p.name);
             let count = seen.entry(base.clone()).or_insert(0);
             *count += 1;
             if *count == 1 {
                 base
             } else {
-                format!("{base}_{count}")
+                sql_fit_identifier(&format!("{base}_{count}"))
             }
         })
         .collect()
+}
+
+/// The longest identifier PostgreSQL keeps (63 bytes; MySQL's own limit is
+/// 64 characters, so this fits both). PostgreSQL truncates a longer one
+/// with only a NOTICE, which turns two long names sharing a prefix into a
+/// duplicate column - and MySQL refuses the statement outright.
+const SQL_IDENTIFIER_MAX_BYTES: usize = 63;
+
+/// An identifier every target engine accepts as written: trailing
+/// whitespace trimmed (MySQL rejects it in a name), a blank name replaced
+/// with `column`, and one over `SQL_IDENTIFIER_MAX_BYTES` cut short with
+/// an 8-hex-digit hash of the full name appended, so two long names that
+/// share a prefix stay distinct - deterministically, run after run. A name
+/// that already fits comes back unchanged. Applied to the SQL output only:
+/// every other output keeps the real name.
+fn sql_fit_identifier(name: &str) -> String {
+    let name = name.trim_end();
+    let name = if name.is_empty() { "column" } else { name };
+    if name.len() <= SQL_IDENTIFIER_MAX_BYTES {
+        return name.to_string();
+    }
+    let suffix = format!("_{:08x}", fnv1a64(name.as_bytes()) as u32);
+    let mut cut = SQL_IDENTIFIER_MAX_BYTES - suffix.len();
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", name[..cut].trim_end())
 }
 
 /// Whether `render_sql_inline_flat` runs this format's rows through the
@@ -76945,7 +77086,7 @@ fn render_sql_inline_flat(
     };
 
     let clean_file_name = file_name.replace(['\n', '\r'], " ");
-    let quoted_table = sql_quote_ident(table_name);
+    let quoted_table = sql_quote_ident(&sql_fit_identifier(table_name));
     // See sql_unique_column_names' own doc comment - a real CSV header
     // can be duplicate or blank, neither of which SQL tolerates.
     let column_names = sql_unique_column_names(profiles);
@@ -76955,6 +77096,13 @@ fn render_sql_inline_flat(
         .collect::<Vec<_>>()
         .join(", ");
     let ideal_types: Vec<&str> = profiles.iter().map(|p| p.ideal_type.as_str()).collect();
+    let temporal_formats: Vec<Option<&'static str>> =
+        profiles.iter().map(|p| p.temporal_format).collect();
+    let loading_into_mysql = args
+        .load_into
+        .as_deref()
+        .and_then(|t| LoadTarget::parse(t).ok())
+        .is_some_and(|t| matches!(t.engine, LoadEngine::MySql));
 
     // Written once per *file*, not once per table - a multi-table source
     // (SQLite, the first format in this campaign's own multi-table tier)
@@ -77034,11 +77182,18 @@ fn render_sql_inline_flat(
             .zip(column_names.iter())
             .map(|(p, name)| {
                 let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
-                format!(
-                    "    {} {}{nullability}",
-                    sql_quote_ident(name),
-                    sql_column_type(&p.ideal_type)
-                )
+                // MySQL's `TIMESTAMP` is a 1970-2038 instant that converts
+                // through the session time zone; the column here is a
+                // plain calendar value of any year, which is `DATETIME`.
+                // Both it and `TIME` default to whole seconds and round a
+                // fraction (`09:00:00.5` becomes `09:00:01`), where
+                // PostgreSQL keeps microseconds by default - so ask for them.
+                let ty = match p.ideal_type.as_str() {
+                    "NaiveDate / DateTime" if loading_into_mysql => "DATETIME(6)",
+                    "NaiveTime" if loading_into_mysql => "TIME(6)",
+                    other => sql_column_type(other),
+                };
+                format!("    {} {ty}{nullability}", sql_quote_ident(name))
             })
             .collect::<Vec<_>>()
             .join(",\n"),
@@ -77085,6 +77240,7 @@ fn render_sql_inline_flat(
         nrows: args.nrows,
         header_len: profiles.len(),
         ideal_types: &ideal_types,
+        temporal_formats: &temporal_formats,
         quoted_table: &quoted_table,
         insert_cols: &insert_cols,
         record_index: 0,
@@ -85461,31 +85617,38 @@ impl LoadEngine {
         }
     }
 
-    /// Extra flags making the spawned CLI's own credential handling never
-    /// block on an interactive prompt - real, if narrow, hardening
-    /// prompted by an "agent-friendly CLI" investigation: this project's
-    /// own stdin is already piped with the generated SQL (never a real
-    /// terminal, human-run or not), so a client that decides it needs a
-    /// password and tries to prompt for one either reads garbage off the
-    /// SQL stream or blocks forever with nothing to actually satisfy it -
-    /// a genuine hang risk for a non-interactive/agent-driven invocation,
-    /// not merely a human inconvenience. `psql` is the one real case:
-    /// unlike every other engine here, it prompts *automatically*
-    /// whenever the server demands password auth and none is available
-    /// via `PGPASSWORD`/`.pgpass`/a URI's own embedded credentials, with
-    /// no equivalent of `mysql`'s "only if you pass -p" gate - `-w`
-    /// (`--no-password`) is `psql`'s own documented way to disable that
-    /// prompt entirely, turning a missing credential into a clean,
-    /// immediate connection error instead. `sqlite3`/`duckdb` never
-    /// prompt for anything at all (a local file, no auth concept), and
-    /// `mysql` only ever prompts when explicitly told to via `-p` - a
-    /// flag this project never passes - so neither needs an equivalent
-    /// flag here.
-    fn non_interactive_args(&self) -> &'static [&'static str] {
+    /// Flags every spawn of this engine's CLI gets, ahead of its own
+    /// connection argument - all aimed at one property: a load either
+    /// finishes or fails loudly, and never blocks. The generated SQL is
+    /// piped on stdin (never a terminal), so:
+    ///
+    /// - `psql` prompts for a password *automatically* whenever the
+    ///   server demands one and none is available via
+    ///   `PGPASSWORD`/`.pgpass`/the URI - with stdin already claimed by
+    ///   the SQL pipe that prompt can only hang or read the script as the
+    ///   password, so `-w` turns it into a connection error. `-X` skips
+    ///   the user's `~/.psqlrc`, which a load script must not depend on,
+    ///   and `ON_ERROR_STOP=1` makes the first failing statement fatal:
+    ///   without it `psql` runs the rest of the script and still exits 0,
+    ///   so a half-loaded table would report success.
+    /// - `sqlite3 -bail` stops at the first error instead of running on
+    ///   past it (it exits non-zero either way).
+    /// - `duckdb` and `mysql` already abort on the first error when
+    ///   reading a script from stdin (`mysql` only prompts when told to
+    ///   with `-p`, which this never passes).
+    fn fixed_args(&self) -> &'static [&'static str] {
         match self {
-            LoadEngine::Postgres => &["-w"],
-            LoadEngine::Sqlite | LoadEngine::DuckDb | LoadEngine::MySql => &[],
+            LoadEngine::Postgres => &["-X", "-w", "-v", "ON_ERROR_STOP=1"],
+            LoadEngine::Sqlite => &["-bail"],
+            LoadEngine::DuckDb | LoadEngine::MySql => &[],
         }
+    }
+
+    /// Whether the target is a server that holds many named databases
+    /// (so a per-file database has to be `CREATE`d) rather than one
+    /// file per database.
+    fn is_server(&self) -> bool {
+        matches!(self, LoadEngine::Postgres | LoadEngine::MySql)
     }
 
     fn parse(s: &str) -> Result<Self> {
@@ -85502,15 +85665,15 @@ impl LoadEngine {
 
     /// The extension a directory-mode `--load-into` run gives each
     /// per-file database it creates (see `run_directory`'s own
-    /// `--load-into` handling) - only ever called after that code has
-    /// already confirmed the engine is one of these two file-based ones,
-    /// so Postgres/MySql never reach here.
+    /// `--load-into` handling) - only ever called for a file-based
+    /// engine; a server engine names its per-file databases instead (see
+    /// `server_database_names`).
     fn per_file_db_extension(&self) -> &'static str {
         match self {
             LoadEngine::Sqlite => "sqlite",
             LoadEngine::DuckDb => "duckdb",
             LoadEngine::Postgres | LoadEngine::MySql => {
-                unreachable!("directory-mode --load-into already rejects Postgres/MySql")
+                unreachable!("server engines name their per-file databases instead")
             }
         }
     }
@@ -85561,19 +85724,226 @@ impl LoadTarget {
     }
 }
 
+/// The pieces of a `scheme://[user[:password]@]host[:port][/path][?query]`
+/// connection URI, undecoded.
+struct UriParts<'a> {
+    scheme: &'a str,
+    userinfo: Option<&'a str>,
+    hostport: &'a str,
+    path: &'a str,
+    query: &'a str,
+}
+
+fn split_connection_uri(s: &str) -> Option<UriParts<'_>> {
+    let (scheme, rest) = s.split_once("://")?;
+    let (rest, query) = match rest.find('?') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
+        None => (None, authority),
+    };
+    Some(UriParts {
+        scheme,
+        userinfo,
+        hostport,
+        path,
+        query,
+    })
+}
+
+/// `%XX` escapes in a URI's user/password/database - a malformed escape
+/// is kept literally, and the bytes are read as UTF-8 (lossily).
+fn percent_decode_uri_part(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+impl LoadTarget {
+    /// The connection with no database chosen, for a server engine's own
+    /// admin step (`CREATE DATABASE`): PostgreSQL connects to its
+    /// always-present `postgres` maintenance database, MySQL to no
+    /// database at all.
+    fn admin(&self) -> LoadTarget {
+        match self.engine {
+            LoadEngine::Postgres => self.for_database("postgres"),
+            _ => self.for_database(""),
+        }
+    }
+
+    /// Whatever the target names as a database - the URI's path, a
+    /// conninfo string's `dbname=`, or the bare name - which directory
+    /// mode reads as a prefix for the databases it creates (an empty
+    /// prefix is fine).
+    fn database_prefix(&self) -> String {
+        if let Some(uri) = split_connection_uri(&self.target) {
+            return percent_decode_uri_part(uri.path);
+        }
+        if matches!(self.engine, LoadEngine::Postgres) && self.target.contains('=') {
+            return self
+                .target
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("dbname="))
+                .unwrap_or_default()
+                .to_string();
+        }
+        self.target.clone()
+    }
+
+    /// This same connection, pointed at `db` instead: the URI's path is
+    /// replaced, a conninfo string's `dbname=` is replaced, a bare name is
+    /// just the new name (the host, port, and user then come from the
+    /// client's own environment - `PGHOST`/`~/.my.cnf`/...).
+    fn for_database(&self, db: &str) -> LoadTarget {
+        let target = if let Some(uri) = split_connection_uri(&self.target) {
+            let userinfo = uri.userinfo.map(|u| format!("{u}@")).unwrap_or_default();
+            format!(
+                "{}://{userinfo}{}/{db}{}",
+                uri.scheme, uri.hostport, uri.query
+            )
+        } else if matches!(self.engine, LoadEngine::Postgres) && self.target.contains('=') {
+            let mut kept: Vec<&str> = self
+                .target
+                .split_whitespace()
+                .filter(|t| !t.starts_with("dbname="))
+                .collect();
+            let db_token = format!("dbname={db}");
+            kept.push(&db_token);
+            kept.join(" ")
+        } else {
+            db.to_string()
+        };
+        LoadTarget {
+            engine: self.engine,
+            target,
+        }
+    }
+
+    /// The engine's CLI, ready to spawn: `fixed_args`, then the
+    /// connection. `psql` takes a URI or conninfo string as its database
+    /// argument as-is; the classic `mysql` client doesn't read URIs at
+    /// all (it would treat one as a database name), so a `mysql://` target
+    /// is unpacked into `--host`/`--port`/`--user` and the database, with
+    /// the password passed in `MYSQL_PWD` rather than on the command line
+    /// where any local user could read it. Every `mysql` session also
+    /// gets `ANSI_QUOTES` (the script double-quotes its identifiers) and
+    /// `NO_BACKSLASH_ESCAPES` (a backslash in a value is data, not an
+    /// escape) appended to the server's own `sql_mode`.
+    fn command(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(self.engine.command_name());
+        cmd.args(self.engine.fixed_args());
+        match self.engine {
+            LoadEngine::MySql => {
+                cmd.arg("--init-command=SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES,NO_BACKSLASH_ESCAPES')");
+                if let Some(uri) = split_connection_uri(&self.target) {
+                    if let Some(userinfo) = uri.userinfo {
+                        let (user, password) = match userinfo.split_once(':') {
+                            Some((u, p)) => (u, Some(p)),
+                            None => (userinfo, None),
+                        };
+                        cmd.arg(format!("--user={}", percent_decode_uri_part(user)));
+                        if let Some(password) = password {
+                            cmd.env("MYSQL_PWD", percent_decode_uri_part(password));
+                        }
+                    }
+                    let (host, port) = match uri.hostport.rsplit_once(':') {
+                        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+                            (h, Some(p))
+                        }
+                        _ => (uri.hostport, None),
+                    };
+                    if !host.is_empty() {
+                        cmd.arg(format!("--host={host}"));
+                        // `localhost` would silently switch the client to a
+                        // Unix socket; a URI names a network endpoint.
+                        cmd.arg("--protocol=TCP");
+                    }
+                    if let Some(port) = port {
+                        cmd.arg(format!("--port={port}"));
+                    }
+                    let db = percent_decode_uri_part(uri.path);
+                    if !db.is_empty() {
+                        cmd.arg(db);
+                    }
+                } else if !self.target.is_empty() {
+                    cmd.arg(&self.target);
+                }
+            }
+            _ => {
+                cmd.arg(&self.target);
+            }
+        }
+        cmd
+    }
+
+    /// `CREATE DATABASE <db>` on a server engine, refusing (through the
+    /// server's own "already exists" error) to reuse a database that's
+    /// already there - this is a load into a fresh database, and silently
+    /// pouring rows into someone's existing one is not something to
+    /// guess at.
+    fn create_database(&self, db: &str) -> Result<()> {
+        let admin = self.admin();
+        let mut cmd = admin.command();
+        match self.engine {
+            LoadEngine::Postgres => {
+                cmd.arg("-c")
+                    .arg(format!("CREATE DATABASE {}", sql_quote_ident(db)));
+            }
+            LoadEngine::MySql => {
+                cmd.arg("-e")
+                    .arg(format!("CREATE DATABASE `{}`", db.replace('`', "``")));
+            }
+            _ => bail!("only a server engine creates databases"),
+        }
+        let name = self.engine.command_name();
+        let output = cmd
+            .stdin(std::process::Stdio::null())
+            .output()
+            .with_context(|| {
+                format!("failed to launch `{name}` to create database {db:?} - is it installed and on PATH?")
+            })?;
+        if !output.status.success() {
+            bail!(
+                "{name} could not create database {db:?} (an existing database is never reused - drop it or pick a different prefix):\n{}",
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Spawns the target engine's own CLI with its stdin piped, so the
 /// generated SQL can be streamed straight into it - the same thing typing
 /// `sqlite3 mydb.db < script.sql` does by hand, just without the
 /// intermediate file. stdout/stderr are inherited so the tool's own
 /// prompts, row-count messages, and any real SQL errors show through
 /// directly and immediately, exactly as they would running it yourself.
-/// `non_interactive_args` (e.g. `psql`'s own `-w`) comes first, so it's
-/// never mistaken for part of the target's own positional argument.
 fn spawn_load_target(target: &LoadTarget) -> Result<std::process::Child> {
     let cmd_name = target.engine.command_name();
-    std::process::Command::new(cmd_name)
-        .args(target.engine.non_interactive_args())
-        .arg(&target.target)
+    target
+        .command()
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -86956,7 +87326,10 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if args.combine {
         return run_directory_combined(args, output_format, dir);
     }
-    // Directory-mode `--load-into`: one database *per file*, not one
+    // Directory-mode `--load-into` (for a server engine - PostgreSQL or
+    // MySQL - the target is a connection and each file gets a database
+    // `CREATE`d for it; see `server_database_names`). One database *per
+    // file*, not one
     // shared target every file's tables get poured into sequentially -
     // asked and settled directly with the user, since CLAUDE.md's own
     // prior "different, unscoped feature" boundary here had left the
@@ -86982,23 +87355,27 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 "--load-into requires --sql-mode inline (the default) - --sql-mode staging assumes a separate manual load step --load-into can't perform automatically, since it would create the tables with zero rows actually loaded"
             );
         }
-        if args.output_dir.is_some() {
-            bail!(
-                "--load-into's own <target> already names the directory each file's own database lands in - combining it with --output-dir would leave two different directories both claiming that role; drop --output-dir and fold its path into --load-into's <target> instead"
-            );
-        }
         let target = LoadTarget::parse(load_into)?;
-        if matches!(target.engine, LoadEngine::Postgres | LoadEngine::MySql) {
-            bail!(
-                "--load-into in directory mode only supports sqlite/duckdb - postgres/mysql are server connection targets, not files, so \"one database per file\" would need this tool to issue its own CREATE DATABASE per file first (a real, unimplemented feature, not a file-path detail); run sniff-rs once per file against a postgres/mysql target instead"
-            );
+        if target.engine.is_server() {
+            if args.output_dir.is_some() {
+                bail!(
+                    "--output-dir has nothing to do with a {} target - every file is loaded into a database it creates on the server, and nothing is written to disk",
+                    target.engine.command_name()
+                );
+            }
+        } else {
+            if args.output_dir.is_some() {
+                bail!(
+                    "--load-into's own <target> already names the directory each file's own database lands in - combining it with --output-dir would leave two different directories both claiming that role; drop --output-dir and fold its path into --load-into's <target> instead"
+                );
+            }
+            fs::create_dir_all(&target.target).with_context(|| {
+                format!(
+                    "failed to create --load-into's own target directory {:?}",
+                    target.target
+                )
+            })?;
         }
-        fs::create_dir_all(&target.target).with_context(|| {
-            format!(
-                "failed to create --load-into's own target directory {:?}",
-                target.target
-            )
-        })?;
         Some(target)
     } else {
         None
@@ -87013,9 +87390,30 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
     // what's routing every file's own output instead - so every link
     // inside it is a short, correct relative path with no directory-
     // walking needed to follow.
+    // A server engine leaves nothing on disk, so it has no index either.
+    let server_target = load_target.as_ref().is_some_and(|t| t.engine.is_server());
     let index_dir: &Path = match &load_target {
-        Some(target) => Path::new(&target.target),
-        None => args.output_dir.as_deref().unwrap_or(dir),
+        Some(target) if !target.engine.is_server() => Path::new(&target.target),
+        _ => args.output_dir.as_deref().unwrap_or(dir),
+    };
+    // Every file's database name, fixed up front from the whole walk so a
+    // name never depends on which files happen to be recognized or which
+    // thread gets there first.
+    let server_databases: HashMap<PathBuf, String> = match &load_target {
+        Some(target) if target.engine.is_server() => {
+            let selected: Vec<&PathBuf> = files
+                .iter()
+                .filter(|p| file_selected(dir, p, &args.include, &args.exclude))
+                .filter(|p| !looks_like_own_output(p))
+                .collect();
+            let relative: Vec<String> = selected
+                .iter()
+                .map(|p| relative_display_path(dir, p))
+                .collect();
+            let names = server_database_names(&target.database_prefix(), &relative);
+            selected.into_iter().cloned().zip(names).collect()
+        }
+        _ => HashMap::new(),
     };
 
     let mut processed = 0usize;
@@ -87084,26 +87482,41 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 .into_owned();
 
             if let Some(target) = &load_target {
-                // Every file gets its own fresh database, named the same
-                // way a `.dictionary.sql` file would be under
+                // Every file gets its own fresh database. On a server
+                // engine that means `CREATE DATABASE` under a name
+                // derived from the file's path (an existing database is
+                // an error, never reused); for a file engine it's a file
+                // named the same way a `.dictionary.sql` would be under
                 // `--output-dir` - `batch_output_path` already handles
                 // mirroring the source tree's own subdirectories under
                 // that directory, so this is a pure extension swap, not
                 // new naming logic.
-                let db_path = batch_output_path(
-                    dir,
-                    path,
-                    &logical_path,
-                    Some(Path::new(&target.target)),
-                    target.engine.per_file_db_extension(),
-                )?;
-                if let Some(parent) = db_path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create directory {parent:?}"))?;
-                }
-                let per_file_target = LoadTarget {
-                    engine: target.engine,
-                    target: db_path.to_string_lossy().into_owned(),
+                let (per_file_target, db_label) = if target.engine.is_server() {
+                    let db = server_databases
+                        .get(path)
+                        .expect("every selected file was given a database name up front");
+                    target.create_database(db)?;
+                    (target.for_database(db), format!("database {db}"))
+                } else {
+                    let db_path = batch_output_path(
+                        dir,
+                        path,
+                        &logical_path,
+                        Some(Path::new(&target.target)),
+                        target.engine.per_file_db_extension(),
+                    )?;
+                    if let Some(parent) = db_path.parent() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("failed to create directory {parent:?}"))?;
+                    }
+                    let label = db_path.to_string_lossy().into_owned();
+                    (
+                        LoadTarget {
+                            engine: target.engine,
+                            target: label.clone(),
+                        },
+                        label,
+                    )
                 };
                 let mut child = spawn_load_target(&per_file_target)?;
                 let mut stdin = child
@@ -87128,13 +87541,13 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 })?;
                 if !status.success() {
                     bail!(
-                        "{} exited with a non-zero status while loading {path:?} into {db_path:?} - see its own output above for the real error",
+                        "{} exited with a non-zero status while loading {path:?} into {db_label} - see its own output above for the real error",
                         target.engine.command_name()
                     );
                 }
                 let table_count = tables.len();
                 let col_count: usize = tables.values().map(Vec::len).sum();
-                return Ok(Some((table_count, col_count, db_path)));
+                return Ok(Some((table_count, col_count, PathBuf::from(db_label))));
             }
 
             let output_path = batch_output_path(
@@ -87306,18 +87719,75 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             )
         }
     };
-    fs::write(&index_path, &index_content)
-        .with_context(|| format!("failed to write {index_path:?}"))?;
-
     let mut summary = format!(
         "{processed} file(s) processed ({skipped} skipped), {total_tables} tables, {total_columns} columns total"
     );
     if !failed.is_empty() {
         summary.push_str(&format!(", {} failed", failed.len()));
     }
-    eprintln!("{summary} -> {}", index_path.display());
+    if server_target {
+        eprintln!("{summary}");
+    } else {
+        fs::write(&index_path, &index_content)
+            .with_context(|| format!("failed to write {index_path:?}"))?;
+        eprintln!("{summary} -> {}", index_path.display());
+    }
 
     Ok(())
+}
+
+/// The database each file gets in a directory-mode load into a server
+/// engine, from the files' paths relative to the directory (in walk order)
+/// and the target's own database name as a prefix. A name is the prefix
+/// and the whole relative path - extension included, so `data.csv` and
+/// `data.json` never share one - lowercased with every run of characters
+/// outside `[a-z0-9]` collapsed to `_`, which is legal unquoted in both
+/// PostgreSQL and MySQL and can't collide by case (MySQL database names
+/// are case-insensitive on some file systems). One over the 63-byte limit
+/// is cut short with a hash of the whole name; two files that still land
+/// on the same name (`a/b.csv` and `a_b.csv`) get `_2`, `_3`, ... The
+/// result depends only on the paths, so a rerun names every file the same.
+fn server_database_names(prefix: &str, relative_paths: &[String]) -> Vec<String> {
+    fn slug(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            } else if !out.ends_with('_') {
+                out.push('_');
+            }
+        }
+        out.trim_matches('_').to_string()
+    }
+    fn fit(name: &str, suffix: &str) -> String {
+        let name = format!("{name}{suffix}");
+        if name.len() <= SQL_IDENTIFIER_MAX_BYTES {
+            return name;
+        }
+        let tag = format!("_{:08x}", fnv1a64(name.as_bytes()) as u32);
+        format!("{}{tag}", &name[..SQL_IDENTIFIER_MAX_BYTES - tag.len()])
+    }
+    let prefix = slug(prefix);
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    relative_paths
+        .iter()
+        .map(|rel| {
+            let body = slug(rel);
+            let full = match (prefix.is_empty(), body.is_empty()) {
+                (true, true) => "db".to_string(),
+                (true, false) => body,
+                (false, true) => prefix.clone(),
+                (false, false) => format!("{prefix}_{body}"),
+            };
+            let mut name = fit(&full, "");
+            let mut n = 1;
+            while !taken.insert(name.clone()) {
+                n += 1;
+                name = fit(&full, &format!("_{n}"));
+            }
+            name
+        })
+        .collect()
 }
 
 /// Turns a file's own path (relative to the directory root a `--combine`
@@ -104279,6 +104749,7 @@ mod tests {
             content: None,
             references: Vec::new(),
             value_sketch: None,
+            temporal_format: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = std::iter::once((
             "t".to_string(),
@@ -104357,6 +104828,7 @@ mod tests {
             content: None,
             references: Vec::new(),
             value_sketch: None,
+            temporal_format: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> =
             std::iter::once(("t".to_string(), vec![profile])).collect();
@@ -104379,6 +104851,7 @@ mod tests {
             content: None,
             references: Vec::new(),
             value_sketch: None,
+            temporal_format: None,
         };
         let tables: BTreeMap<String, Vec<ColumnProfile>> = [
             ("events".to_string(), vec![profile_with_rows(3)]),
@@ -104781,6 +105254,7 @@ mod tests {
                 content: None,
                 references: Vec::new(),
                 value_sketch: None,
+                temporal_format: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -104795,6 +105269,7 @@ mod tests {
                 content: None,
                 references: Vec::new(),
                 value_sketch: None,
+                temporal_format: None,
             },
         ];
         let mut tables = BTreeMap::new();
@@ -104857,6 +105332,152 @@ mod tests {
     }
 
     #[test]
+    fn normalize_temporal_rewrites_every_detected_shape_as_an_iso_literal() {
+        let cases = [
+            ("15/01/2024", "%d/%m/%Y", "2024-01-15"),
+            ("01/02/2024", "%d/%m/%Y", "2024-02-01"),
+            ("01/02/2024", "%m/%d/%Y", "2024-01-02"),
+            ("15/01/24", "%d/%m/%y", "2024-01-15"),
+            ("January 5, 2024", "%B %d, %Y", "2024-01-05"),
+            ("5 Jan 2024", "%d %b %Y", "2024-01-05"),
+            ("20240115", "%Y%m%d", "2024-01-15"),
+            (
+                "01/15/2024 10:00:00 PM",
+                "%m/%d/%Y %I:%M:%S %p",
+                "2024-01-15 22:00:00",
+            ),
+            (
+                "12/31/2024 12:05:09 AM",
+                "%m/%d/%Y %I:%M:%S %p",
+                "2024-12-31 00:05:09",
+            ),
+            (
+                "12/31/2024 12:05:09 PM",
+                "%m/%d/%Y %I:%M:%S %p",
+                "2024-12-31 12:05:09",
+            ),
+            ("2024-01-15T09:00", "%Y-%m-%dT%H:%M", "2024-01-15 09:00:00"),
+            (
+                "2024-01-15T09:00:00.25+02:00",
+                "%Y-%m-%dT%H:%M:%S%.f%z",
+                "2024-01-15 09:00:00.25",
+            ),
+            (
+                "2024-01-15T09:00:00Z",
+                "%Y-%m-%dT%H:%M:%S%.fZ",
+                "2024-01-15 09:00:00",
+            ),
+            (
+                "Mon, 15 Jan 2024 10:00:00 GMT",
+                "%a, %d %b %Y %H:%M:%S GMT",
+                "2024-01-15 10:00:00",
+            ),
+            ("20240115T100000Z", "%Y%m%dT%H%M%SZ", "2024-01-15 10:00:00"),
+            (
+                "15/Jan/2024:10:00:00 +0000",
+                "%d/%b/%Y:%H:%M:%S %z",
+                "2024-01-15 10:00:00",
+            ),
+            ("2:30 PM", "%I:%M %p", "14:30:00"),
+            ("14:30", "%H:%M", "14:30:00"),
+            ("09:00:00.5", "%H:%M:%S%.f", "09:00:00.5"),
+        ];
+        for (value, fmt, expected) in cases {
+            assert_eq!(
+                normalize_temporal(value, fmt).as_deref(),
+                Some(expected),
+                "{value:?} as {fmt:?}"
+            );
+        }
+        // Doesn't match, or names no real date: the caller keeps the text.
+        assert_eq!(normalize_temporal("2024-01-15", "%d/%m/%Y"), None);
+        assert_eq!(normalize_temporal("31/02/2024", "%d/%m/%Y"), None);
+        assert_eq!(normalize_temporal("0000-01-01", "%Y-%m-%d"), None);
+    }
+
+    /// The same text is a different date under a different format - the
+    /// reason the column's resolved format has to be carried to SQL
+    /// generation rather than re-guessed per value.
+    #[test]
+    fn a_column_profile_records_the_date_format_its_values_resolved_to() {
+        let profile = |values: &[&str]| {
+            let mut acc = IdealTypeAccumulator::new();
+            for v in values {
+                acc.push(v);
+            }
+            acc.finish_with_temporal("String")
+        };
+        // 25 can only be a day, so this column is day-first even though
+        // `01/02/2024` alone would read month-first.
+        let (ideal, _, fmt) = profile(&["01/02/2024", "25/01/2024"]);
+        assert_eq!(ideal, "NaiveDate / DateTime");
+        assert_eq!(fmt, Some("%d/%m/%Y"));
+        let (_, _, fmt) = profile(&["01/02/2024", "01/25/2024"]);
+        assert_eq!(fmt, Some("%m/%d/%Y"));
+        let (ideal, _, fmt) = profile(&["14:30", "09:00"]);
+        assert_eq!(ideal, "NaiveTime");
+        assert_eq!(fmt, Some("%H:%M"));
+        // Anything that isn't a date/time carries no format.
+        let (ideal, _, fmt) = profile(&["alpha", "beta"]);
+        assert_eq!((ideal.as_str(), fmt), ("String", None));
+    }
+
+    #[test]
+    fn sql_fit_identifier_trims_pads_and_shortens_only_what_needs_it() {
+        assert_eq!(sql_fit_identifier("id"), "id");
+        assert_eq!(sql_fit_identifier(" id "), " id");
+        assert_eq!(sql_fit_identifier("   "), "column");
+        assert_eq!(sql_fit_identifier(""), "column");
+        let exactly = "a".repeat(SQL_IDENTIFIER_MAX_BYTES);
+        assert_eq!(sql_fit_identifier(&exactly), exactly);
+        // Two long names sharing a long prefix stay distinct, within the
+        // limit, and identical input always gives identical output.
+        let a = format!("{}_one", "x".repeat(80));
+        let b = format!("{}_two", "x".repeat(80));
+        let (fa, fb) = (sql_fit_identifier(&a), sql_fit_identifier(&b));
+        assert!(fa.len() <= SQL_IDENTIFIER_MAX_BYTES && fb.len() <= SQL_IDENTIFIER_MAX_BYTES);
+        assert_ne!(fa, fb);
+        assert_eq!(fa, sql_fit_identifier(&a));
+        // Never cuts a multi-byte character in half.
+        let wide = "é".repeat(60);
+        let fitted = sql_fit_identifier(&wide);
+        assert!(fitted.len() <= SQL_IDENTIFIER_MAX_BYTES);
+        assert!(fitted.starts_with('é'));
+    }
+
+    #[test]
+    fn server_database_names_are_legal_unique_and_stable() {
+        let names = |prefix: &str, paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            server_database_names(prefix, &paths)
+        };
+        assert_eq!(
+            names("", &["data.csv", "data.json", "2024/Sales Q1.csv"]),
+            ["data_csv", "data_json", "2024_sales_q1_csv"]
+        );
+        assert_eq!(names("Ware-House", &["a.csv"]), ["ware_house_a_csv"]);
+        // Different paths that slug to the same name are told apart, in
+        // order, and a rerun gives the same answer.
+        let clash = ["a/b.csv", "a_b.csv", "a b.csv"];
+        assert_eq!(names("", &clash), ["a_b_csv", "a_b_csv_2", "a_b_csv_3"]);
+        assert_eq!(names("", &clash), names("", &clash));
+        // Nothing to slug at all still gets a name.
+        assert_eq!(names("", &["...", "---"]), ["db", "db_2"]);
+        // Over 63 bytes: cut with a hash, two long names sharing a prefix
+        // stay different, and every name stays within the limit.
+        let long = |tail: &str| format!("{}/{tail}.csv", "d".repeat(70));
+        let (l1, l2) = (long("one"), long("two"));
+        let out = names("pre", &[l1.as_str(), l2.as_str()]);
+        assert!(out.iter().all(|n| n.len() <= SQL_IDENTIFIER_MAX_BYTES));
+        assert_ne!(out[0], out[1]);
+        assert!(out[0].starts_with("pre_dddd"));
+        assert!(out.iter().all(|n| {
+            n.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }));
+    }
+
+    #[test]
     fn sql_unique_column_names_disambiguates_a_duplicate_or_blank_header() {
         let profiles = |names: &[&str]| -> Vec<ColumnProfile> {
             names
@@ -104874,6 +105495,7 @@ mod tests {
                     content: None,
                     references: Vec::new(),
                     value_sketch: None,
+                    temporal_format: None,
                 })
                 .collect()
         };
@@ -104956,6 +105578,7 @@ mod tests {
                 content: None,
                 references: Vec::new(),
                 value_sketch: None,
+                temporal_format: None,
             },
             ColumnProfile {
                 name: "email".to_string(),
@@ -104970,6 +105593,7 @@ mod tests {
                 content: None,
                 references: Vec::new(),
                 value_sketch: None,
+                temporal_format: None,
             },
         ];
         let dir = std::env::temp_dir().join(format!(
@@ -105031,6 +105655,7 @@ mod tests {
             content: None,
             references: Vec::new(),
             value_sketch: None,
+            temporal_format: None,
         }];
         let dir = std::env::temp_dir().join(format!(
             "sniff-rs-sql-inline-trailing-newline-test-{}",
@@ -105116,21 +105741,112 @@ mod tests {
         assert!(LoadTarget::parse("oracle:mydb").is_err());
     }
 
-    /// Only `psql` gets `-w` - it's the one engine here that prompts for
-    /// a password *automatically* whenever the server demands one and
-    /// none is available, with nothing equivalent to `mysql`'s "only if
-    /// you pass -p" gate. sniff-rs's own stdin is always piped with the
-    /// generated SQL (never a real terminal), so a `psql` process left
-    /// free to prompt either reads SQL bytes as a bogus password or
-    /// blocks forever - a real hang risk for any non-interactive/agent-
-    /// driven `--load-into postgres:...` invocation, not just human
-    /// inconvenience. See `non_interactive_args`'s own doc comment.
+    fn command_args(t: &LoadTarget) -> Vec<String> {
+        t.command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// `psql` is the one engine that prompts for a password on its own
+    /// (`-w` turns that into an error), ignores `~/.psqlrc` only with
+    /// `-X`, and exits 0 after a failed statement unless told
+    /// `ON_ERROR_STOP` - all three are what make a piped load either
+    /// finish or fail loudly. See `LoadEngine::fixed_args`.
     #[test]
-    fn only_postgres_gets_the_no_password_prompt_flag() {
-        assert_eq!(LoadEngine::Postgres.non_interactive_args(), &["-w"]);
-        assert!(LoadEngine::Sqlite.non_interactive_args().is_empty());
-        assert!(LoadEngine::DuckDb.non_interactive_args().is_empty());
-        assert!(LoadEngine::MySql.non_interactive_args().is_empty());
+    fn postgres_is_spawned_non_interactive_and_stops_on_the_first_error() {
+        let args = command_args(&LoadTarget::parse("postgres:mydb").unwrap());
+        assert_eq!(args, ["-X", "-w", "-v", "ON_ERROR_STOP=1", "mydb"]);
+        assert_eq!(
+            command_args(&LoadTarget::parse("sqlite:x.db").unwrap()),
+            ["-bail", "x.db"]
+        );
+        assert_eq!(
+            command_args(&LoadTarget::parse("duckdb:x.duckdb").unwrap()),
+            ["x.duckdb"]
+        );
+    }
+
+    #[test]
+    fn a_mysql_uri_is_unpacked_into_client_flags_with_the_password_in_the_environment() {
+        let t = LoadTarget::parse("mysql://bob:p%40ss@db.example:3307/shop").unwrap();
+        let cmd = t.command();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args[0].starts_with("--init-command=SET SESSION sql_mode"));
+        assert!(args[0].contains("ANSI_QUOTES,NO_BACKSLASH_ESCAPES"));
+        assert_eq!(
+            &args[1..],
+            [
+                "--user=bob",
+                "--host=db.example",
+                "--protocol=TCP",
+                "--port=3307",
+                "shop"
+            ]
+        );
+        let pwd = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "MYSQL_PWD")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(
+            pwd.as_deref(),
+            Some("p@ss"),
+            "the password must never be in argv"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("p@ss") || a.contains("p%40ss"))
+        );
+    }
+
+    #[test]
+    fn a_plain_mysql_name_is_the_database_and_an_empty_one_selects_none() {
+        let named = command_args(&LoadTarget::parse("mysql:shop").unwrap());
+        assert_eq!(named.last().map(String::as_str), Some("shop"));
+        let admin = command_args(&LoadTarget::parse("mysql:shop").unwrap().admin());
+        assert_eq!(
+            admin.len(),
+            1,
+            "only --init-command, no database: {admin:?}"
+        );
+    }
+
+    #[test]
+    fn for_database_repoints_a_uri_a_conninfo_string_or_a_plain_name() {
+        let pg = |s: &str| LoadTarget::parse(s).unwrap();
+        assert_eq!(
+            pg("postgresql://u:pw@h:5432/prefix?sslmode=require")
+                .for_database("new_db")
+                .target,
+            "postgresql://u:pw@h:5432/new_db?sslmode=require"
+        );
+        assert_eq!(
+            pg("postgresql://h").for_database("d").target,
+            "postgresql://h/d"
+        );
+        assert_eq!(
+            pg("postgres:host=h dbname=old user=u")
+                .for_database("d")
+                .target,
+            "host=h user=u dbname=d"
+        );
+        assert_eq!(pg("postgres:old").for_database("d").target, "d");
+        assert_eq!(
+            pg("postgres:host=h").admin().target,
+            "host=h dbname=postgres"
+        );
+        assert_eq!(
+            pg("postgresql://h/prefix").admin().target,
+            "postgresql://h/postgres"
+        );
+        assert_eq!(pg("postgresql://h/pre%5Ffix").database_prefix(), "pre_fix");
+        assert_eq!(pg("postgres:host=h dbname=pre").database_prefix(), "pre");
+        assert_eq!(pg("postgres:pre").database_prefix(), "pre");
     }
 
     // `TableGraph` unit tests (see also the `relationships_*` tests above
@@ -105894,6 +106610,7 @@ mod tests {
             ideal_type: ideal.to_string(),
             sample_values: values.iter().take(3).cloned().collect(),
             value_sketch: Some(sketch),
+            temporal_format: None,
             ..Default::default()
         }
     }

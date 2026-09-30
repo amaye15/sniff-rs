@@ -771,22 +771,62 @@ fn load_into_directory_mode_rejects_combining_with_output_dir() {
 }
 
 #[test]
-fn load_into_directory_mode_rejects_postgres_and_mysql() {
+fn sql_output_inline_mode_rewrites_dates_as_iso_literals_using_the_columns_own_format() {
+    // Each column resolved to its own format (`15/01/2024` is day-first
+    // only because 20/02/2024 can't be a month), and every value is
+    // rewritten as the ISO literal PostgreSQL, MySQL, DuckDB and SQLite
+    // all read the same way - not the source text, which most of them
+    // reject or misread.
+    let sql = run_sql("edge_csv_date_formats.csv", &[]);
+    assert!(
+        sql.contains("('2024-01-15', '2024-01-15', '2024-01-15', '2024-01-15 10:00:00')"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("('2024-02-20', '2024-02-20', '2024-02-20', '2024-02-20 11:30:00')"),
+        "{sql}"
+    );
+}
+
+#[test]
+fn sql_output_inline_mode_shortens_identifiers_past_the_engines_limit() {
+    // PostgreSQL silently truncates a name past 63 bytes (two long names
+    // with a shared prefix then collide) and MySQL rejects it, so the SQL
+    // cuts it and appends a hash of the whole name instead.
+    let sql = run_sql("edge_csv_very_long_header.csv", &[]);
+    let long = "x".repeat(200);
+    assert!(!sql.contains(&long));
+    assert!(sql.contains("\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_aecd5c45\""));
+}
+
+#[test]
+fn load_into_directory_mode_takes_postgres_and_mysql_but_not_an_output_dir() {
+    // A server engine creates a database per file on the server; nothing
+    // is written to disk, so `--output-dir` has no meaning. (No test here
+    // spawns `psql`/`mysql` - that needs a server - so this only checks
+    // the validation that runs before any process is started.)
     let dir = TempDir::new();
     std::fs::copy(fixture("sample.csv"), dir.path().join("sample.csv")).unwrap();
-    let output = Command::new(bin())
-        .args([
-            dir.path().to_str().unwrap(),
-            "--output-format",
-            "sql",
-            "--load-into",
-            "postgres:mydb",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("only supports sqlite/duckdb"));
+    for target in ["postgres:mydb", "mysql:mydb"] {
+        let output = Command::new(bin())
+            .args([
+                dir.path().to_str().unwrap(),
+                "--output-format",
+                "sql",
+                "--load-into",
+                target,
+                "--output-dir",
+                "/tmp/whatever-output-dir",
+            ])
+            .output()
+            .expect("failed to run binary");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("nothing is written to disk"),
+            "{target}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -1258,7 +1298,7 @@ fn sql_output_inline_mode_orc_flattens_nested_columns() {
     );
     assert!(
         sql.contains(
-            "(1, 'Alice', 95.5, '2024-01-15T00:00:00.000000000', '[\"a\",\"b\"]', TRUE, 10)"
+            "(1, 'Alice', 95.5, '2024-01-15 00:00:00.000000000', '[\"a\",\"b\"]', TRUE, 10)"
         ),
         "{sql}"
     );
@@ -2031,7 +2071,8 @@ fn sql_output_inline_mode_avro_optional_nested_record_is_never_falsely_not_null(
 #[cfg(feature = "avro")]
 fn sql_output_inline_mode_avro_logical_types_resolve_correctly() {
     let sql = run_sql("avro_logical_types.avro", &[]);
-    assert!(sql.contains("'2024-01-15T10:00:00.000'"));
+    // Dates are rewritten as ISO literals every engine reads the same way.
+    assert!(sql.contains("'2024-01-15 10:00:00.000'"));
     assert!(sql.contains("'14:10:00.123'"));
     assert!(sql.contains("123.45"));
 }
@@ -2090,9 +2131,10 @@ fn sql_output_inline_mode_xml_non_homogeneous_root_is_a_single_record() {
     // parse as one single record, the same choice TOML's own whole-
     // document shape already makes.
     let sql = run_sql("edge_xml_deeply_nested_10.xml", &[]);
-    assert!(sql.contains(
-        "\"level9.level8.level7.level6.level5.level4.level3.level2.level1.level0.value\""
-    ));
+    // The full name is 76 bytes, past the 63 PostgreSQL keeps, so the SQL
+    // cuts it and appends a hash of the whole name (the JSON output keeps
+    // the real one).
+    assert!(sql.contains("\"level9.level8.level7.level6.level5.level4.level3.level_f32830f7\""));
     assert!(sql.contains("'deep'"));
 }
 

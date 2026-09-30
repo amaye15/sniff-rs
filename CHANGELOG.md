@@ -7,6 +7,19 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Fixed
+- Inline SQL loaded into a real PostgreSQL or MySQL server (found by
+  loading every fixture into both): dates and times are written as ISO
+  literals using the column's own detected format (`15/01/2024`,
+  `Jan 15, 2024`, RFC 2822, `10:00 PM` used to be embedded as-is and were
+  rejected or misread); identifiers past 63 bytes are shortened with a
+  hash suffix instead of being silently truncated into duplicate columns
+  (PostgreSQL) or rejected (MySQL), and trailing whitespace in a name is
+  trimmed; `--load-into mysql` sets `ANSI_QUOTES`/`NO_BACKSLASH_ESCAPES`,
+  uses `DATETIME(6)`/`TIME(6)`, and accepts a `mysql://` URI (the classic
+  client can't read one); `--load-into` stops at the first failing
+  statement (`psql` used to run on and exit 0). A non-finite float
+  (`Infinity`, `NaN`) still can't be stored in a MySQL `DOUBLE` and
+  fails that load.
 - dBase files with a backlink after the field descriptors but not marked
   Visual FoxPro (FoxPro 2 writes these) no longer fail on phantom fields.
 - Near-identical tables (same column names) now link as a star on the
@@ -21,6 +34,10 @@ All notable changes to sniff-rs are documented here. Format follows
 - An empty `/FlateDecode` stream in a PDF no longer fails the file.
 
 ### Added
+- Directory mode `--load-into postgres:...`/`mysql:...` (or a connection
+  URI) creates one database per file, named from its path
+  (`sub/types.csv` becomes `<prefix>_sub_types_csv`); an existing
+  database is an error, never reused.
 - PDF right-to-left (Hebrew/Arabic) lines read in logical order, and
   vertical text reads down its columns (stacked glyphs and `Identity-V`
   fonts).

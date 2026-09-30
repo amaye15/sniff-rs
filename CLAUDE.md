@@ -732,6 +732,59 @@ above), and can't combine with an explicit output path (including `-`)
 since the SQL has nowhere else to go once it's streaming into the
 subprocess.
 
+**Loading into real PostgreSQL/MySQL servers surfaced a second round of
+inline-SQL bugs, invisible while the only real engine in the loop was
+SQLite.** Every fixture in `tests/fixtures` was piped through
+`--load-into` into a throwaway PostgreSQL 17 and MySQL 8 server (a
+scratch script in the session, not committed - it needs both servers).
+What that found and what fixed it:
+
+- **Date/time text was embedded as-is**, which the servers reject or
+  misread for most formats this tool detects (`15/01/2024`, `Jan 15, 2024`,
+  RFC 2822, `10:00 PM`; MySQL is strict, PostgreSQL only guesses by its
+  `DateStyle`). `ColumnProfile::temporal_format` (internal, never
+  serialized) records the `DATE_FORMATS`/`TIME_FORMATS` entry the whole
+  column resolved to - set where `IdealTypeAccumulator` resolves it, via
+  `finish_with_temporal` - and `normalize_temporal` rewrites each value
+  as `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.f]`, or `HH:MM:SS[.f]`. The
+  column's own format has to be the one used: `01/02/2024` is January 2nd
+  or February 1st depending on whether some other value in the column
+  (`25/01/2024`) rules one reading out, and no engine can know that. A
+  numeric UTC offset is dropped, matching the offset-less `TIMESTAMP` the
+  value lands in; year 0 and anything that doesn't match keep the raw text.
+- **Identifiers past 63 bytes** are silently truncated by PostgreSQL (two
+  long names with a shared prefix become duplicate columns) and rejected
+  by MySQL, and MySQL rejects trailing whitespace in a name.
+  `sql_fit_identifier` trims, replaces a blank with `column`, and cuts a
+  long name with an 8-hex-digit hash of the whole name (deterministic);
+  `sql_unique_column_names` and the table name use it. SQL output only -
+  every other output keeps the real name.
+- **`--load-into` didn't stop at the first error**: `psql` runs the rest of
+  the script and exits 0 unless `ON_ERROR_STOP` is set, so a half-loaded
+  table reported success. `LoadEngine::fixed_args` now gives `psql`
+  `-X -w -v ON_ERROR_STOP=1` and `sqlite3` `-bail`.
+- **MySQL needs a configured session and its own client flags.**
+  `LoadTarget::command` adds `ANSI_QUOTES,NO_BACKSLASH_ESCAPES` to the
+  session's `sql_mode` (`--init-command`; the script double-quotes
+  identifiers and a backslash is data), unpacks a `mysql://user:pw@host:port/db`
+  URI into `--host`/`--port`/`--user`/database (the classic client can't
+  read a URI; the password goes in `MYSQL_PWD`, never argv), and creates
+  date/time columns as `DATETIME(6)`/`TIME(6)` - MySQL's `TIMESTAMP` is a
+  1970-2038 instant, and both types round a fraction to whole seconds by
+  default.
+- **Still fails on MySQL, by design**: a non-finite float (`Infinity`,
+  `NaN`) can't be stored in a MySQL `DOUBLE` (`Incorrect DOUBLE value`);
+  PostgreSQL and DuckDB accept the quoted spelling. The error names the
+  column and value, and the column is a real `f64` column, so there's no
+  honest cell to write instead.
+
+Result: every fixture that generates inline SQL loads into PostgreSQL
+(368 of 368) and into MySQL apart from the two non-finite-float fixtures
+(366 of 368); the rest refuse to generate for a documented reason. The
+SQLite corpus output is unchanged except for date/time literals and
+identifiers that needed the fixes above (38 of 1,028 fixture/mode
+combinations, all in inline mode; staging is byte-identical).
+
 **Directory mode: `--load-into` creates one fresh database per file, not
 one shared target every file's tables pour into.** This shape was a
 genuine, previously undecided fork - the original single-file design
@@ -750,12 +803,30 @@ fresh `sqlite3`/`duckdb` process spawned against
 the source tree's own subdirectories exactly the way `batch_output_path`
 already mirrors them for `.dictionary.*` files - a pure extension swap
 on that same existing naming function, not new naming logic. Postgres/
-MySQL are deliberately rejected in directory mode with a clear, disclosed
-error: they're server connection targets, not files, so "one database
-per file" would need this tool to issue its own `CREATE DATABASE` per
-file first - a real, unimplemented feature in its own right, not a
-file-path detail sqlite/duckdb's own "the target is just a path" model
-already gives for free. The remaining validation (requires
+MySQL were first rejected here (a server connection target isn't a
+path, so "one database per file" needs a `CREATE DATABASE` per file) and
+are now supported: `LoadTarget::create_database` runs the CLI's own
+`CREATE DATABASE` (PostgreSQL through its `postgres` maintenance
+database, MySQL with no database selected) and then the load goes
+through `LoadTarget::for_database`, which repoints the same connection -
+a URI's path, a conninfo string's `dbname=`, or a bare name (host, port
+and user then come from `PGHOST`/`~/.my.cnf`/...). The target's own
+database name is a *prefix*, not the database: `--load-into
+postgresql://u@host/shop` loads `sub/types.csv` into `shop_sub_types_csv`,
+and an empty one gives `sub_types_csv`. `server_database_names` derives
+every file's name up front from the whole walk (lowercased, runs of
+non-alphanumerics collapsed to `_`, the extension kept so `data.csv` and
+`data.json` differ, cut with a hash past 63 bytes, `_2`/`_3` for a path
+that still collides) so a name never depends on which files are
+recognized or which worker gets there first. An existing database is an
+error naming it, never reused - this loads into fresh databases, and
+pouring rows into someone's is not something to guess at. A server
+engine leaves nothing on disk, so it writes no index and `--output-dir`
+is rejected. Verified by loading a mixed directory (two `sales.csv` in
+different folders, a SQLite file with two tables, an unrecognized file)
+into a real PostgreSQL 17 and MySQL 8 server both through a URI and
+through a bare name with `PG*` variables, and the rerun refusing.
+The remaining validation (requires
 `--output-format sql`, requires `--sql-mode inline`) is identical to
 single-file mode's own, just checked before the directory walk starts
 rather than before a single file's read.
