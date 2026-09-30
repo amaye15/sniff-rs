@@ -19229,37 +19229,6 @@ fn columns_from_json(
     stream_json_document(path, nrows, n_samples)
 }
 
-/// A JSON-shaped `--sql-mode inline` table's own upfront "is there any
-/// column here with no honest single-cell literal" check, run once
-/// before a single row is emitted - the same "no data to emit" boundary
-/// SQLite's own `WITHOUT ROWID` check, ORC's own nested-column check, and
-/// INI's own repeated-key check already established, just reached here by
-/// scanning the already-profiled column list rather than re-parsing the
-/// schema a second time.
-///
-/// Two structural shapes can't honestly round-trip through one scalar
-/// cell per record, and both are detectable directly from a
-/// `ColumnProfile`'s own already-computed fields, with no need to re-walk
-/// the JSON tree: an array of objects (`ideal_type == "Vec<struct>"` -
-/// `JsonPathAccumulator::finish`'s own `wrap("struct")` branch, meaning
-/// *this* column's own value is genuinely one-to-many relative to its
-/// parent record, not a single cell), and a value that's sometimes a
-/// scalar and sometimes an object across different records (`finish`'s
-/// own "mix of scalars and objects" branch, flagged by its distinctive
-/// note text). A plain, non-array nested object (`ideal_type == "struct"`)
-/// is *not* blocking - it's a pure flattening label with no column of its
-/// own to emit at all (see `json_column_is_emittable`), transparent to
-/// walk through on the way to its own dot-notation children.
-fn json_inline_blocking_column(profiles: &[ColumnProfile]) -> Option<&str> {
-    profiles
-        .iter()
-        .find(|p| {
-            p.ideal_type == "Vec<struct>"
-                || p.notes.contains("object fields listed separately under")
-        })
-        .map(|p| p.name.as_str())
-}
-
 /// A pure, non-array nested-object column (`metadata`, say) exists only
 /// to label where its own dot-notation children came from - it has no
 /// scalar/array leaf value of its own to embed as a literal, so it never
@@ -19387,6 +19356,19 @@ fn json_emit_row_for_sql(
     records_mode: bool,
     sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {
+    if let Some(mut pass) = sink.json_pass.take() {
+        let mut rows = Vec::new();
+        json_pass_rows(&mut pass, record, records_mode, &mut rows);
+        let limit_reached = pass.nrows.is_some_and(|n| pass.records >= n as u64);
+        sink.json_pass = Some(pass);
+        for row in rows {
+            sink.accept(row)?;
+        }
+        if limit_reached {
+            sink.done = true;
+        }
+        return Ok(());
+    }
     let row: Vec<Option<String>> = columns
         .iter()
         .map(|(name, is_array)| json_extract_value_for_sql(record, name, *is_array, records_mode))
@@ -19481,6 +19463,280 @@ fn json_bridge_columns_and_mode(profiles: &[ColumnProfile]) -> (Vec<(String, boo
         .map(|p| (p.name.clone(), p.ideal_type.starts_with("Vec<")))
         .collect();
     (columns, records_mode)
+}
+
+/// How one table of a multi-table JSON inline script pulls its rows out
+/// of each top-level record. A file whose records hold arrays of objects
+/// (`events: [{...}, {...}]`, a Parquet/ORC map, a notebook's `outputs`)
+/// becomes several tables: the records themselves, plus one child table
+/// per array, one row per element, keyed back to the parent row. Each
+/// table is written by its own pass over the source, so memory stays one
+/// record however many tables there are.
+///
+/// Rows are keyed by ordinal, not by anything in the data: `_row_id` is
+/// the 1-based position of the row in its own table (only written when
+/// the table has children), `_parent_row_id` the `_row_id` of the row one
+/// level up, and `_index` the element's 1-based position within its
+/// array. Every pass walks the records in the same order, so the
+/// ordinals agree across passes without any of them holding state for
+/// the others.
+#[derive(Clone)]
+struct JsonPass {
+    /// From the record down to this table's rows: the array (of objects)
+    /// at each level, as a dotted path relative to the previous level's
+    /// element - or to the record, for the first. Empty for the top table.
+    levels: Vec<String>,
+    /// This table's own columns (name relative to its element, pooled
+    /// array or not); the top table's are named relative to the record.
+    columns: Vec<(String, bool)>,
+    /// Whether rows carry a `_row_id` of their own.
+    has_children: bool,
+    /// Rows counted so far at each level - a level's running `_row_id`.
+    ids: Vec<u64>,
+    /// Top-level records seen, which is the top table's `_row_id`.
+    records: u64,
+    /// `--nrows`: bounds the records read, not the child rows.
+    nrows: Option<usize>,
+}
+
+/// The object elements at `path` under `node`: the value there, with any
+/// nesting of arrays flattened (the same transparent flattening
+/// `JsonPathAccumulator::absorb` applies), keeping only the objects.
+/// `records_mode` has the meaning it has in `json_extract_value_for_sql`.
+fn json_collect_elements<'a>(
+    node: &'a JsonValue,
+    path: &str,
+    records_mode: bool,
+) -> Vec<&'a JsonValue> {
+    let rest = if records_mode {
+        path
+    } else {
+        path.strip_prefix("value.").unwrap_or("")
+    };
+    let mut current = node;
+    if !rest.is_empty() {
+        for seg in rest.split('.') {
+            match current {
+                JsonValue::Object(map) => match map.get(seg) {
+                    Some(v) if !v.is_null() => current = v,
+                    _ => return Vec::new(),
+                },
+                _ => return Vec::new(),
+            }
+        }
+    }
+    fn walk<'a>(v: &'a JsonValue, out: &mut Vec<&'a JsonValue>) {
+        match v {
+            JsonValue::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            JsonValue::Object(_) => out.push(v),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(current, &mut out);
+    out
+}
+
+/// Every row `pass` produces for one top-level record, in table order.
+fn json_pass_rows(
+    pass: &mut JsonPass,
+    record: &JsonValue,
+    records_mode: bool,
+    rows: &mut Vec<Vec<Option<String>>>,
+) {
+    pass.records += 1;
+    let record_id = pass.records;
+    if pass.levels.is_empty() {
+        let mut row = Vec::with_capacity(pass.columns.len() + 1);
+        if pass.has_children {
+            row.push(Some(record_id.to_string()));
+        }
+        for (name, is_array) in &pass.columns {
+            row.push(json_extract_value_for_sql(
+                record,
+                name,
+                *is_array,
+                records_mode,
+            ));
+        }
+        rows.push(row);
+        return;
+    }
+    json_pass_walk(pass, record, 0, record_id, records_mode, rows);
+}
+
+fn json_pass_walk(
+    pass: &mut JsonPass,
+    node: &JsonValue,
+    level: usize,
+    parent_id: u64,
+    records_mode: bool,
+    rows: &mut Vec<Vec<Option<String>>>,
+) {
+    let elements = json_collect_elements(node, &pass.levels[level], level > 0 || records_mode);
+    for (i, element) in elements.into_iter().enumerate() {
+        pass.ids[level] += 1;
+        let id = pass.ids[level];
+        if level + 1 < pass.levels.len() {
+            json_pass_walk(pass, element, level + 1, id, records_mode, rows);
+            continue;
+        }
+        let mut row = Vec::with_capacity(pass.columns.len() + 3);
+        if pass.has_children {
+            row.push(Some(id.to_string()));
+        }
+        row.push(Some(parent_id.to_string()));
+        row.push(Some((i + 1).to_string()));
+        for (name, is_array) in &pass.columns {
+            row.push(json_extract_value_for_sql(element, name, *is_array, true));
+        }
+        rows.push(row);
+    }
+}
+
+/// One table of a JSON-bridge inline script, before its synthetic key
+/// columns are added.
+struct JsonSqlTable {
+    name: String,
+    /// Full profile names of the arrays leading to this table's rows,
+    /// outermost first; empty for the top table.
+    chain: Vec<String>,
+    /// This table's own emittable columns - named relative to the
+    /// element for a child table - with nullability already corrected
+    /// for optional ancestors.
+    profiles: Vec<ColumnProfile>,
+    has_children: bool,
+    /// Index of the table one level up.
+    parent: Option<usize>,
+}
+
+/// Whether a profile is a path whose values are sometimes scalars and
+/// sometimes objects (`JsonPathAccumulator::finish`'s own "mix of scalars
+/// and objects" branch, flagged by its note text).
+fn json_profile_is_mixed(p: &ColumnProfile) -> bool {
+    p.notes.contains("object fields listed separately under")
+}
+
+/// Whether a profile is an array holding objects - a pure array of
+/// objects, or one that mixes them with scalars - so that its objects
+/// become the rows of a child table.
+fn json_profile_is_object_array(p: &ColumnProfile) -> bool {
+    p.ideal_type == "Vec<struct>" || (json_profile_is_mixed(p) && p.ideal_type.starts_with("Vec<"))
+}
+
+/// Splits a JSON-bridge column list into tables: the top table, plus one
+/// child table per array of objects (`ideal_type == "Vec<struct>"`), each
+/// owning the columns beneath that array (by dotted path, the nearest
+/// enclosing array winning) - so `events.amount` belongs to `events`, and
+/// `events.items.sku` to the `events.items` table inside it. A pure
+/// nested-object column labels where its children came from and gets no
+/// column of its own. With no array of objects anywhere there is exactly
+/// one table, identical to what the flat path always produced.
+fn json_sql_table_plan(table_name: &str, profiles: &[ColumnProfile]) -> Vec<JsonSqlTable> {
+    let anchors: Vec<&str> = profiles
+        .iter()
+        .filter(|p| json_profile_is_object_array(p))
+        .map(|p| p.name.as_str())
+        .collect();
+    let mut tables = vec![JsonSqlTable {
+        name: table_name.to_string(),
+        chain: Vec::new(),
+        profiles: Vec::new(),
+        has_children: false,
+        parent: None,
+    }];
+    let mut used: HashSet<String> = HashSet::new();
+    used.insert(sql_fit_identifier(table_name));
+    let mut table_of_anchor: HashMap<&str, usize> = HashMap::new();
+    // The profile list is in document order, so an array always precedes
+    // the arrays nested inside it.
+    for &anchor in &anchors {
+        let mut chain: Vec<&str> = anchors
+            .iter()
+            .copied()
+            .filter(|a| anchor.starts_with(&format!("{a}.")))
+            .collect();
+        chain.sort_by_key(|a| a.len());
+        chain.push(anchor);
+        let parent = chain
+            .len()
+            .checked_sub(2)
+            .and_then(|i| table_of_anchor.get(chain[i]).copied())
+            .unwrap_or(0);
+        let mut name = format!("{table_name}__{}", anchor.replace('.', "_"));
+        let mut n = 1;
+        while !used.insert(sql_fit_identifier(&name)) {
+            n += 1;
+            name = format!("{table_name}__{}_{n}", anchor.replace('.', "_"));
+        }
+        table_of_anchor.insert(anchor, tables.len());
+        tables[parent].has_children = true;
+        tables.push(JsonSqlTable {
+            name,
+            chain: chain.into_iter().map(str::to_string).collect(),
+            profiles: Vec::new(),
+            has_children: false,
+            parent: Some(parent),
+        });
+    }
+
+    // Deal every column to its table (structs included for now - they
+    // carry the optionality their children inherit).
+    let mut all: Vec<Vec<ColumnProfile>> = vec![Vec::new(); tables.len()];
+    for p in profiles {
+        // A pure array of objects is only a table; an array that mixes
+        // objects with scalars also keeps a column of its own holding the
+        // whole array as JSON text, scalars and all.
+        if p.ideal_type == "Vec<struct>" {
+            continue;
+        }
+        let owner = anchors
+            .iter()
+            .copied()
+            .filter(|a| p.name.starts_with(&format!("{a}.")))
+            .max_by_key(|a| a.len());
+        let (table, relative) = match owner {
+            Some(a) => (table_of_anchor[a], p.name[a.len() + 1..].to_string()),
+            None => (0, p.name.clone()),
+        };
+        let mut p = p.clone();
+        p.name = relative;
+        all[table].push(p);
+    }
+    // A descendant of an optional nested-object ancestor has its own
+    // `missing_pct` computed relative to how often that ancestor was
+    // present (`JsonPathAccumulator::finish`'s `child_total`), so a column
+    // reporting 0% can still be NULL whenever an ancestor is missing -
+    // found via a real Avro fixture whose optional `backup_address`
+    // object produced a `NOT NULL` column that failed to load. Force such
+    // a column nullable when any ancestor on its dotted path, up to its
+    // own table's root, is optional.
+    for (table, cols) in tables.iter_mut().zip(all) {
+        let mut cols = cols;
+        for i in 0..cols.len() {
+            if cols[i].missing_pct > 0.0 {
+                continue;
+            }
+            let mut rest = cols[i].name.as_str();
+            let mut inherited = None;
+            while let Some((parent, _)) = rest.rsplit_once('.') {
+                // A value that's sometimes a scalar and sometimes an object
+                // leaves its object fields NULL wherever it was the scalar.
+                if let Some(a) = cols.iter().find(|c| c.name == parent)
+                    && (a.missing_pct > 0.0 || json_profile_is_mixed(a))
+                {
+                    inherited = Some(a.missing_pct.max(0.1));
+                    break;
+                }
+                rest = parent;
+            }
+            if let Some(pct) = inherited {
+                cols[i].missing_pct = pct;
+            }
+        }
+        table.profiles = cols.into_iter().filter(json_column_is_emittable).collect();
+    }
+    tables
 }
 
 /// The JSON row-source wrapper for `render_sql_inline_flat` - resolves
@@ -67928,16 +68184,12 @@ mod ini_support {
     /// section has no repeating-row concept at all, so its "table" is
     /// always exactly one profiled record).
     ///
-    /// A repeated key (which `columns_from_ini` already pools into a
-    /// `Vec<T>` column for profiling) has no single cell to honestly
-    /// embed as a literal - the same not-yet-settled pooled-array-to-
-    /// cell question the nested/JSON-bridge tier's own future phase
-    /// still needs to answer - so this bails with a clear, actionable
-    /// error naming the section and the repeated key, rather than a
-    /// guess, matching the "no honest literal to emit" boundary SQLite's
-    /// `WITHOUT ROWID` check and ORC's nested-column check already
-    /// established for their own, differently-caused gaps. Every section
-    /// with no repeated key - the overwhelming common case - still works.
+    /// A repeated key (which `columns_from_ini` pools into a `Vec<T>`
+    /// column for profiling) becomes one JSON-array text cell
+    /// (`["a","b"]`), the convention every other format that pools a
+    /// repeated property or header already uses (vCard, iCalendar, MBOX,
+    /// a JSON array). Columns come out in first-seen key order, the order
+    /// `columns_from_ini` profiles them in.
     pub(crate) fn stream_ini_section_row_for_sql(
         path: &Path,
         section_name: &str,
@@ -67956,18 +68208,31 @@ mod ini_support {
             })
             .with_context(|| format!("section '{section_name}' not found in {path:?}"))?;
 
-        let mut values: Vec<Option<String>> = Vec::with_capacity(props.len());
-        let mut seen: HashSet<&str, FxBuildHasher> = HashSet::default();
+        let mut fields: Vec<(&str, Vec<&str>)> = Vec::with_capacity(props.len());
+        let mut index: HashMap<&str, usize, FxBuildHasher> = HashMap::default();
         for (k, v) in &props {
-            if !seen.insert(k.as_str()) {
-                bail!(
-                    "--sql-mode inline can't emit real data for INI section \"{section_name}\" - \
-                     its \"{k}\" key repeats (pools into an array column for profiling), which \
-                     has no single cell to embed as a literal yet; use --sql-mode staging instead"
-                );
+            match index.get(k.as_str()) {
+                Some(&i) => fields[i].1.push(v.as_str()),
+                None => {
+                    index.insert(k.as_str(), fields.len());
+                    fields.push((k.as_str(), vec![v.as_str()]));
+                }
             }
-            values.push(Some(v.clone()));
         }
+        let values: Vec<Option<String>> = fields
+            .into_iter()
+            .map(|(_, vals)| match vals.as_slice() {
+                [only] => Some((*only).to_string()),
+                many => Some(
+                    JsonValue::Array(
+                        many.iter()
+                            .map(|v| JsonValue::String((*v).to_string()))
+                            .collect(),
+                    )
+                    .to_string(),
+                ),
+            })
+            .collect();
         sink.accept(values)
     }
 }
@@ -69707,6 +69972,215 @@ mod npy_support {
         }
     }
 
+    /// One array element as a JSON leaf, typed by the dtype (an integer
+    /// stays an integer, a finite float a float, a bool a bool; anything
+    /// else - or a float that's NaN or infinite, which JSON can't hold - is
+    /// its text).
+    fn npy_leaf_to_json(dtype: &DType, bytes: &[u8]) -> JsonValue {
+        let DType::Plain(ty) = dtype else {
+            return JsonValue::String(npy_value_to_string(dtype, bytes));
+        };
+        let text = npy_scalar_to_string(ty, bytes);
+        match ty.type_char {
+            TypeChar::Bool => match text.as_str() {
+                "true" => JsonValue::Bool(true),
+                "false" => JsonValue::Bool(false),
+                _ => JsonValue::String(text),
+            },
+            TypeChar::Int | TypeChar::Uint => text
+                .parse::<i64>()
+                .map(JsonValue::from)
+                .or_else(|_| text.parse::<u64>().map(JsonValue::from))
+                .unwrap_or(JsonValue::String(text)),
+            TypeChar::Float => match text.parse::<f64>() {
+                Ok(f) if f.is_finite() => JsonValue::from(f),
+                _ => JsonValue::String(text),
+            },
+            _ => JsonValue::String(text),
+        }
+    }
+
+    /// `bytes` (row-major, `dims` trailing axes) as nested JSON arrays.
+    fn npy_nested_c(dtype: &DType, dims: &[usize], bytes: &[u8], elem: usize) -> JsonValue {
+        if dims.len() == 1 {
+            return JsonValue::Array(
+                (0..dims[0])
+                    .map(|j| npy_leaf_to_json(dtype, &bytes[j * elem..(j + 1) * elem]))
+                    .collect(),
+            );
+        }
+        let chunk = dims[1..].iter().product::<usize>() * elem;
+        JsonValue::Array(
+            (0..dims[0])
+                .map(|j| npy_nested_c(dtype, &dims[1..], &bytes[j * chunk..(j + 1) * chunk], elem))
+                .collect(),
+        )
+    }
+
+    /// The same for a column-major buffer: element `(i0, i1, ...)` lives at
+    /// `i0 + i1 * s1 + ...`, `strides` being the trailing axes' `s`.
+    fn npy_nested_f(
+        dtype: &DType,
+        dims: &[usize],
+        strides: &[usize],
+        base: usize,
+        bytes: &[u8],
+        elem: usize,
+    ) -> JsonValue {
+        if dims.len() == 1 {
+            return JsonValue::Array(
+                (0..dims[0])
+                    .map(|j| {
+                        let at = (base + j * strides[0]) * elem;
+                        npy_leaf_to_json(dtype, &bytes[at..at + elem])
+                    })
+                    .collect(),
+            );
+        }
+        JsonValue::Array(
+            (0..dims[0])
+                .map(|j| {
+                    npy_nested_f(
+                        dtype,
+                        &dims[1..],
+                        &strides[1..],
+                        base + j * strides[0],
+                        bytes,
+                        elem,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Walks a plain array of 3 or more axes one slice of the first axis
+    /// at a time (`on_sample(index, nested values)`; return `false` to
+    /// stop). Row-major data streams a slice at a time; column-major data
+    /// scatters a slice across the whole file, so it's read whole first -
+    /// the same disclosed exception 2D Fortran order already has.
+    /// `nrows` bounds the slices read.
+    fn npy_nd_for_each_sample<R: std::io::Read>(
+        dtype: &DType,
+        shape: &[u64],
+        order: Order,
+        mut reader: R,
+        nrows: Option<usize>,
+        mut on_sample: impl FnMut(usize, JsonValue) -> Result<bool>,
+    ) -> Result<()> {
+        let elem = dtype
+            .num_bytes()
+            .context("this array's dtype has no fixed byte size")?;
+        let n0 = usize::try_from(shape[0]).context("array length overflows usize")?;
+        let dims: Vec<usize> = shape[1..]
+            .iter()
+            .map(|d| usize::try_from(*d).context("array axis overflows usize"))
+            .collect::<Result<_>>()?;
+        let per = dims
+            .iter()
+            .try_fold(1usize, |acc, d| acc.checked_mul(*d))
+            .context("array size overflows usize")?;
+        let limit = nrows.map_or(n0, |l| l.min(n0));
+        if order == Order::C {
+            let mut buf = vec![
+                0u8;
+                per.checked_mul(elem)
+                    .context("array size overflows usize")?
+            ];
+            for i in 0..limit {
+                reader
+                    .read_exact(&mut buf)
+                    .with_context(|| format!("failed reading slice {i}"))?;
+                if !on_sample(i, npy_nested_c(dtype, &dims, &buf, elem))? {
+                    break;
+                }
+            }
+        } else {
+            let total = n0
+                .checked_mul(per)
+                .and_then(|n| n.checked_mul(elem))
+                .context("array size overflows usize")?;
+            let mut buf = vec![0u8; total];
+            reader
+                .read_exact(&mut buf)
+                .context("failed reading the array body")?;
+            let mut strides = Vec::with_capacity(shape.len());
+            let mut acc = 1usize;
+            for d in std::iter::once(&n0).chain(dims.iter()) {
+                strides.push(acc);
+                acc = acc.saturating_mul(*d);
+            }
+            for i in 0..limit {
+                let value = npy_nested_f(dtype, &dims, &strides[1..], i * strides[0], &buf, elem);
+                if !on_sample(i, value)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn npy_nd_record(index: usize, value: JsonValue) -> JsonValue {
+        let mut record = json_support::Map::with_capacity(2);
+        record.push_unique("index".to_string(), JsonValue::from(index as u64));
+        record.push_unique("value".to_string(), value);
+        JsonValue::Object(record)
+    }
+
+    /// The text `describe_npy_nd` gives the `value` column - also what
+    /// `npy_profiles_are_nd` recognizes one by.
+    const NPY_ND_MARKER: &str = "NumPy array of shape ";
+
+    /// A plain array of 3 or more axes as a table of `index` (position
+    /// along the first axis) and `value` (that slice, a pooled array of
+    /// the dtype's values) - one row per slice, like the samples of an
+    /// image set.
+    fn profile_npy_nd<R: std::io::Read>(
+        dtype: &DType,
+        shape: &[u64],
+        order: Order,
+        reader: R,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<ColumnProfile>> {
+        let mut profiler = JsonRecordStreamProfiler::new(n_samples);
+        npy_nd_for_each_sample(dtype, shape, order, reader, nrows, |i, value| {
+            profiler.push(&npy_nd_record(i, value));
+            Ok(true)
+        })?;
+        let mut columns = profiler.finish();
+        let shape_text = format!(
+            "({})",
+            shape
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for column in &mut columns {
+            match column.name.as_str() {
+                "index" => {
+                    column.description = format!("position along the first axis of {shape_text}");
+                }
+                "value" => {
+                    column.description = format!(
+                        "{NPY_ND_MARKER}{shape_text}: one row per index along the first axis, \
+                         the slice's values flattened in row-major order"
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(columns)
+    }
+
+    /// Whether `profiles` came from `profile_npy_nd`.
+    pub(crate) fn npy_profiles_are_nd(profiles: &[ColumnProfile]) -> bool {
+        matches!(profiles, [index, value]
+            if index.name == "index"
+                && value.name == "value"
+                && value.description.starts_with(NPY_ND_MARKER))
+    }
+
     /// Reads one already-parsed `.npy` header plus its data stream (a
     /// standalone file, or one array inside a `.npz` archive - the two
     /// share this same core). A structured dtype gives one column per
@@ -69744,16 +70218,18 @@ mod npy_support {
         // honest equivalent of a headerless CSV's columns. Anything with more
         // axes than that has no natural row/column reading, so it's a clear
         // error instead of silently flattening or guessing.
+        // 3 or more axes have no positional-column reading, so each slice
+        // along the first axis becomes one row: its index, and the slice
+        // itself as a value.
+        if !is_record && shape.len() >= 3 {
+            return profile_npy_nd(&dtype, &shape, order, reader, nrows, n_samples);
+        }
         let n_cols = if is_record {
             1
         } else {
             match shape.len() {
                 0 | 1 => 1,
-                2 => usize::try_from(shape[1]).context("array width overflows usize")?,
-                n => bail!(
-                    "a {n}-dimensional plain (non-structured) array has no natural row/column \
-                     reading - only 1D, 2D, or a structured (record) dtype are supported"
-                ),
+                _ => usize::try_from(shape[1]).context("array width overflows usize")?,
             }
         };
         let n_rows = usize::try_from(shape.first().copied().unwrap_or(1))
@@ -69900,6 +70376,7 @@ mod npy_support {
     pub(crate) fn stream_npy_rows_for_sql(
         path: &Path,
         nrows: Option<usize>,
+        json: Option<(&[(String, bool)], bool)>,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
         use std::fs::File;
@@ -69909,13 +70386,14 @@ mod npy_support {
         let mut reader = BufReader::new(file);
         let header = read_npy_header(&mut reader)
             .with_context(|| format!("failed to parse {path:?} as a .npy file"))?;
-        stream_npy_reader_rows_for_sql(header, reader, nrows, sink)
+        stream_npy_reader_rows_for_sql(header, reader, nrows, json, sink)
     }
 
     fn stream_npy_reader_rows_for_sql<R: std::io::Read>(
         header: NpyHeader,
         mut reader: R,
         nrows: Option<usize>,
+        json: Option<(&[(String, bool)], bool)>,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
         let NpyHeader {
@@ -69939,16 +70417,21 @@ mod npy_support {
         };
         let is_record = matches!(dtype, DType::Record(_));
 
+        if !is_record && shape.len() >= 3 {
+            let (columns, records_mode) = json.context(
+                "a 3+-dimensional array's rows come from its slices, which need its profile",
+            )?;
+            return npy_nd_for_each_sample(&dtype, &shape, order, reader, nrows, |i, value| {
+                json_emit_row_for_sql(&npy_nd_record(i, value), columns, records_mode, sink)?;
+                Ok(!sink.done)
+            });
+        }
         let n_cols = if is_record {
             1
         } else {
             match shape.len() {
                 0 | 1 => 1,
-                2 => usize::try_from(shape[1]).context("array width overflows usize")?,
-                n => bail!(
-                    "a {n}-dimensional plain (non-structured) array has no natural row/column \
-                     reading - only 1D, 2D, or a structured (record) dtype are supported"
-                ),
+                _ => usize::try_from(shape[1]).context("array width overflows usize")?,
             }
         };
         let n_rows = usize::try_from(shape.first().copied().unwrap_or(1))
@@ -70132,6 +70615,7 @@ mod npy_support {
         path: &Path,
         array_name: &str,
         nrows: Option<usize>,
+        json: Option<(&[(String, bool)], bool)>,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
         let mut archive = zip_support::ZipArchive::open(path)
@@ -70150,7 +70634,7 @@ mod npy_support {
         let header = read_npy_header(tmp.as_file_mut()).with_context(|| {
             format!("failed to parse array '{array_name}' in {path:?} as .npy data")
         })?;
-        stream_npy_reader_rows_for_sql(header, tmp.as_file_mut(), nrows, sink)
+        stream_npy_reader_rows_for_sql(header, tmp.as_file_mut(), nrows, json, sink)
     }
 } // mod npy_support
 
@@ -70802,35 +71286,31 @@ mod sqlite_support {
         Ok(())
     }
 
-    /// Table b-tree leaf cell: varint payload size, varint rowid, the
-    /// initial payload bytes, and - only when the payload is too large to
-    /// fit locally - a trailing 4-byte pointer to a linked list of
-    /// overflow pages. The `X`/`M`/`K` formulas are sqlite.org's own,
-    /// verified directly against its file-format documentation rather
-    /// than recalled from memory.
-    fn parse_leaf_cell(
+    /// The payload of a b-tree cell whose body starts at `body_off`: the
+    /// `payload_size` bytes when they fit locally (`max_local`, the spec's
+    /// `X`), else the local part (`K` or `M`, per sqlite.org's own
+    /// formulas) followed by the linked list of overflow pages. The only
+    /// thing that differs between a table leaf cell and an index cell is
+    /// `X` - `U - 35` against `((U - 12) * 64 / 255) - 23`.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_payload(
         file: &mut fs::File,
         page: &[u8],
-        cell_off: usize,
+        body_off: usize,
+        payload_size: i64,
+        max_local: i64,
         page_size: u32,
         usable_size: u32,
         path: &Path,
-    ) -> Result<(i64, Vec<u8>)> {
-        let (payload_size, n1) =
-            read_varint(page, cell_off).context("truncated SQLite leaf cell")?;
-        let (rowid, n2) = read_varint(page, cell_off + n1).context("truncated SQLite leaf cell")?;
-        if !(0..=MAX_ROW_PAYLOAD).contains(&payload_size) {
-            bail!("SQLite row payload size {payload_size} in {path:?} is out of a sane range");
-        }
-        let body_off = cell_off + n1 + n2;
+    ) -> Result<Vec<u8>> {
         let usable = usable_size as i64;
-        let x = usable - 35;
-        let payload = if payload_size <= x {
+        let x = max_local;
+        Ok(if payload_size <= x {
             let end = body_off
                 .checked_add(payload_size as usize)
-                .context("SQLite leaf cell payload length overflow")?;
+                .context("SQLite cell payload length overflow")?;
             page.get(body_off..end)
-                .context("truncated SQLite leaf cell payload")?
+                .context("truncated SQLite cell payload")?
                 .to_vec()
         } else {
             let m = ((usable - 12) * 32 / 255) - 23;
@@ -70838,10 +71318,10 @@ mod sqlite_support {
             let local_size = (if k <= x { k } else { m }) as usize;
             let local_end = body_off
                 .checked_add(local_size)
-                .context("SQLite leaf cell local payload length overflow")?;
+                .context("SQLite cell local payload length overflow")?;
             let mut buf = page
                 .get(body_off..local_end)
-                .context("truncated SQLite leaf cell local payload")?
+                .context("truncated SQLite cell local payload")?
                 .to_vec();
             let overflow_off = local_end;
             let mut next_page = u32::from_be_bytes(
@@ -70875,7 +71355,169 @@ mod sqlite_support {
                 bail!("SQLite overflow chain in {path:?} ended before the full payload was read");
             }
             buf
+        })
+    }
+
+    /// Walks an index b-tree - which is how a `WITHOUT ROWID` table is
+    /// stored, every row being one index entry keyed by the primary key -
+    /// in key order, invoking `on_entry` with each entry's record payload.
+    /// Unlike a table b-tree, an index b-tree's interior cells hold real
+    /// entries too, so the walk is in-order: each cell's left subtree,
+    /// then the cell's own entry, then finally the rightmost subtree. An
+    /// index cell is `[4-byte left child, interior only] [payload size
+    /// varint] [payload] [4-byte overflow pointer, if the payload spills]`.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_index_entries(
+        file: &mut fs::File,
+        page_num: u32,
+        page_size: u32,
+        usable_size: u32,
+        path: &Path,
+        depth: u32,
+        limit: Option<usize>,
+        count: &mut usize,
+        on_entry: &mut dyn FnMut(Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        if limit.is_some_and(|n| *count >= n) {
+            return Ok(());
+        }
+        if depth > MAX_BTREE_DEPTH {
+            bail!(
+                "SQLite b-tree in {path:?} is nested past {MAX_BTREE_DEPTH} levels (likely a corrupt page-number cycle)"
+            );
+        }
+        let page = read_page(file, page_num, page_size, path)?;
+        let hdr_off = if page_num == 1 { 100 } else { 0 };
+        let page_type = *page.get(hdr_off).context("truncated SQLite page header")?;
+        let num_cells = u16::from_be_bytes([
+            *page
+                .get(hdr_off + 3)
+                .context("truncated SQLite page header")?,
+            *page
+                .get(hdr_off + 4)
+                .context("truncated SQLite page header")?,
+        ]) as usize;
+        let (is_interior, header_len) = match page_type {
+            0x0a => (false, 8),
+            0x02 => (true, 12),
+            other => bail!(
+                "unexpected SQLite page type {other:#04x} at page {page_num} in {path:?} (a WITHOUT ROWID table is stored as an index b-tree)"
+            ),
         };
+        let max_local = ((usable_size as i64 - 12) * 64 / 255) - 23;
+        let cell_ptr_base = hdr_off + header_len;
+        for i in 0..num_cells {
+            if limit.is_some_and(|n| *count >= n) {
+                return Ok(());
+            }
+            let ptr_off = cell_ptr_base + i * 2;
+            let cell_off = u16::from_be_bytes([
+                *page
+                    .get(ptr_off)
+                    .context("truncated SQLite cell pointer array")?,
+                *page
+                    .get(ptr_off + 1)
+                    .context("truncated SQLite cell pointer array")?,
+            ]) as usize;
+            let mut body = cell_off;
+            if is_interior {
+                let child = u32::from_be_bytes(
+                    page.get(cell_off..cell_off + 4)
+                        .context("truncated SQLite interior index cell")?
+                        .try_into()
+                        .unwrap(),
+                );
+                collect_index_entries(
+                    file,
+                    child,
+                    page_size,
+                    usable_size,
+                    path,
+                    depth + 1,
+                    limit,
+                    count,
+                    on_entry,
+                )?;
+                if limit.is_some_and(|n| *count >= n) {
+                    return Ok(());
+                }
+                body += 4;
+            }
+            let (payload_size, n) =
+                read_varint(&page, body).context("truncated SQLite index cell")?;
+            if !(0..=MAX_ROW_PAYLOAD).contains(&payload_size) {
+                bail!(
+                    "SQLite index payload size {payload_size} in {path:?} is out of a sane range"
+                );
+            }
+            let payload = assemble_payload(
+                file,
+                &page,
+                body + n,
+                payload_size,
+                max_local,
+                page_size,
+                usable_size,
+                path,
+            )?;
+            on_entry(payload)?;
+            *count += 1;
+        }
+        if is_interior && limit.is_none_or(|n| *count < n) {
+            let rightmost = u32::from_be_bytes(
+                page.get(hdr_off + 8..hdr_off + 12)
+                    .context("truncated SQLite interior page header")?
+                    .try_into()
+                    .unwrap(),
+            );
+            collect_index_entries(
+                file,
+                rightmost,
+                page_size,
+                usable_size,
+                path,
+                depth + 1,
+                limit,
+                count,
+                on_entry,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Table b-tree leaf cell: varint payload size, varint rowid, the
+    /// initial payload bytes, and - only when the payload is too large to
+    /// fit locally - a trailing 4-byte pointer to a linked list of
+    /// overflow pages. The `X`/`M`/`K` formulas are sqlite.org's own,
+    /// verified directly against its file-format documentation rather
+    /// than recalled from memory.
+    fn parse_leaf_cell(
+        file: &mut fs::File,
+        page: &[u8],
+        cell_off: usize,
+        page_size: u32,
+        usable_size: u32,
+        path: &Path,
+    ) -> Result<(i64, Vec<u8>)> {
+        let (payload_size, n1) =
+            read_varint(page, cell_off).context("truncated SQLite leaf cell")?;
+        let (rowid, n2) = read_varint(page, cell_off + n1).context("truncated SQLite leaf cell")?;
+        if !(0..=MAX_ROW_PAYLOAD).contains(&payload_size) {
+            bail!("SQLite row payload size {payload_size} in {path:?} is out of a sane range");
+        }
+        let body_off = cell_off + n1 + n2;
+        // A table leaf cell keeps up to `U - 35` bytes of payload locally.
+        let x = usable_size as i64 - 35;
+        let payload = assemble_payload(
+            file,
+            page,
+            body_off,
+            payload_size,
+            x,
+            page_size,
+            usable_size,
+            path,
+        )?;
         Ok((rowid, payload))
     }
 
@@ -71064,6 +71706,11 @@ mod sqlite_support {
         columns: Vec<String>,
         rowid_alias_index: Option<usize>,
         without_rowid: bool,
+        /// For a `WITHOUT ROWID` table, where each declared column sits in
+        /// the stored record: the table is an index b-tree, whose entries
+        /// lead with the primary-key columns (in key order) and then carry
+        /// the remaining columns in declared order. Empty otherwise.
+        record_position: Vec<usize>,
         // Whether each column's declared type resolves to REAL affinity -
         // the one affinity that needs special handling on *read*, not
         // just at write time (see `apply_affinity`).
@@ -71680,6 +72327,26 @@ mod sqlite_support {
             }
         }
 
+        let record_position = if without_rowid && !primary_key.is_empty() {
+            let mut order: Vec<usize> = Vec::with_capacity(columns.len());
+            for name in &primary_key {
+                if let Some(i) = columns.iter().position(|c| c.eq_ignore_ascii_case(name))
+                    && !order.contains(&i)
+                {
+                    order.push(i);
+                }
+            }
+            let rest: Vec<usize> = (0..columns.len()).filter(|i| !order.contains(i)).collect();
+            order.extend(rest);
+            let mut position = vec![0usize; columns.len()];
+            for (record_pos, declared) in order.into_iter().enumerate() {
+                position[declared] = record_pos;
+            }
+            position
+        } else {
+            Vec::new()
+        };
+
         Ok(ParsedTable {
             columns,
             rowid_alias_index: if without_rowid {
@@ -71688,10 +72355,75 @@ mod sqlite_support {
                 rowid_alias_index
             },
             without_rowid,
+            record_position,
             real_affinity,
             primary_key,
             foreign_keys,
         })
+    }
+
+    /// One stored row as its column values in declared order, with the
+    /// rowid alias filled in and REAL affinity applied. A `WITHOUT ROWID`
+    /// entry is reordered from its key-first storage order.
+    fn table_row_values(parsed: &ParsedTable, rowid: i64, payload: &[u8]) -> Result<Vec<Value>> {
+        let values = decode_record(payload)?;
+        let mut out = Vec::with_capacity(parsed.columns.len());
+        for i in 0..parsed.columns.len() {
+            // A record can legitimately have fewer values than the
+            // table's current column count (rows written before a later
+            // `ALTER TABLE ADD COLUMN`) - treated as NULL for that
+            // column, the same graceful-degradation choice every other
+            // reader in this project makes for a short row.
+            let at = parsed.record_position.get(i).copied().unwrap_or(i);
+            let value = values.get(at).cloned().unwrap_or(Value::Null);
+            let value = if Some(i) == parsed.rowid_alias_index && matches!(value, Value::Null) {
+                Value::Integer(rowid)
+            } else {
+                value
+            };
+            out.push(apply_affinity(value, parsed.real_affinity[i]));
+        }
+        Ok(out)
+    }
+
+    /// Walks every row of one table in storage order - the table b-tree
+    /// for an ordinary table, the index b-tree for a `WITHOUT ROWID` one
+    /// (the rowid handed to `on_row` is 0 there; there is none).
+    fn walk_table_rows(
+        file: &mut fs::File,
+        header: &DbHeader,
+        entry: &SchemaEntry,
+        parsed: &ParsedTable,
+        path: &Path,
+        limit: Option<usize>,
+        on_row: &mut dyn FnMut(i64, Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let mut count = 0usize;
+        if parsed.without_rowid {
+            collect_index_entries(
+                file,
+                entry.rootpage,
+                header.page_size,
+                header.usable_size,
+                path,
+                0,
+                limit,
+                &mut count,
+                &mut |payload| on_row(0, payload),
+            )
+        } else {
+            collect_table_rows(
+                file,
+                entry.rootpage,
+                header.page_size,
+                header.usable_size,
+                path,
+                0,
+                limit,
+                &mut count,
+                on_row,
+            )
+        }
     }
 
     fn profile_table(
@@ -71703,9 +72435,6 @@ mod sqlite_support {
         path: &Path,
     ) -> Result<Vec<ColumnProfile>> {
         let parsed = parse_create_table(&entry.sql)?;
-        if parsed.without_rowid {
-            bail!("uses WITHOUT ROWID storage, which isn't supported");
-        }
 
         let n_cols = parsed.columns.len();
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
@@ -71717,38 +72446,15 @@ mod sqlite_support {
         // "fold into per-column storage as records arrive" shape
         // `CsvColumnAccumulator` already uses for CSV, applied here to a
         // b-tree walk instead of a byte stream.
-        let mut count = 0usize;
         let mut on_row = |rowid: i64, payload: Vec<u8>| -> Result<()> {
-            let values = decode_record(&payload)?;
-            for i in 0..n_cols {
-                // A record can legitimately have fewer values than the
-                // table's current column count (rows written before a
-                // later `ALTER TABLE ADD COLUMN`) - treated as NULL for
-                // that column, the same graceful-degradation choice every
-                // other reader in this project makes for a short row.
-                let value = values.get(i).cloned().unwrap_or(Value::Null);
-                let value = if Some(i) == parsed.rowid_alias_index && matches!(value, Value::Null) {
-                    Value::Integer(rowid)
-                } else {
-                    value
-                };
-                let value = apply_affinity(value, parsed.real_affinity[i]);
+            let values = table_row_values(&parsed, rowid, &payload)?;
+            for (i, value) in values.into_iter().enumerate() {
                 raw[i].push(value_to_string(&value, &mut kind_counts[i]));
             }
             Ok(())
         };
-        collect_table_rows(
-            file,
-            entry.rootpage,
-            header.page_size,
-            header.usable_size,
-            path,
-            0,
-            nrows,
-            &mut count,
-            &mut on_row,
-        )
-        .with_context(|| format!("failed reading rows for table '{}'", entry.name))?;
+        walk_table_rows(file, header, entry, &parsed, path, nrows, &mut on_row)
+            .with_context(|| format!("failed reading rows for table '{}'", entry.name))?;
 
         let mut profiles = Vec::new();
         for (i, name) in parsed.columns.into_iter().enumerate() {
@@ -71811,43 +72517,18 @@ mod sqlite_support {
             .with_context(|| format!("table '{table_name}' not found in {path:?}"))?;
 
         let parsed = parse_create_table(&entry.sql)?;
-        if parsed.without_rowid {
-            bail!(
-                "--sql-mode inline can't emit real data for SQLite table \"{table_name}\" - it \
-                 uses WITHOUT ROWID storage, which isn't supported; use --sql-mode staging instead"
-            );
-        }
 
-        let n_cols = parsed.columns.len();
         let mut dummy_counts = SqlKindCounts::default();
-        let mut count = 0usize;
         let mut on_row = |rowid: i64, payload: Vec<u8>| -> Result<()> {
-            let values = decode_record(&payload)?;
-            let mut row: Vec<Option<String>> = Vec::with_capacity(n_cols);
-            for i in 0..n_cols {
-                let value = values.get(i).cloned().unwrap_or(Value::Null);
-                let value = if Some(i) == parsed.rowid_alias_index && matches!(value, Value::Null) {
-                    Value::Integer(rowid)
-                } else {
-                    value
-                };
-                let value = apply_affinity(value, parsed.real_affinity[i]);
-                row.push(value_to_string(&value, &mut dummy_counts));
-            }
+            let values = table_row_values(&parsed, rowid, &payload)?;
+            let row: Vec<Option<String>> = values
+                .iter()
+                .map(|value| value_to_string(value, &mut dummy_counts))
+                .collect();
             sink.accept(row)
         };
-        collect_table_rows(
-            &mut file,
-            entry.rootpage,
-            header.page_size,
-            header.usable_size,
-            path,
-            0,
-            nrows,
-            &mut count,
-            &mut on_row,
-        )
-        .with_context(|| format!("failed reading rows for table '{table_name}'"))
+        walk_table_rows(&mut file, &header, entry, &parsed, path, nrows, &mut on_row)
+            .with_context(|| format!("failed reading rows for table '{table_name}'"))
     }
 
     /// Resolves one table's declared foreign keys to real (local column,
@@ -77549,6 +78230,23 @@ struct InlineRowSink<'a> {
     // trimming afterward.
     separator_written: bool,
     done: bool,
+    // Set for a table of a multi-table JSON script: how its rows are
+    // pulled out of each top-level record (see `JsonPass`). `None` is the
+    // ordinary case - `json_emit_row_for_sql` extracts one row per record.
+    json_pass: Option<JsonPass>,
+}
+
+/// One table of an inline script: its SQL name, its final columns (the
+/// synthetic `_row_id`/`_parent_row_id`/`_index` keys included), any
+/// table-level constraints, and - for a table of a multi-table JSON
+/// script - the pass that extracts its rows.
+struct InlineTableJob<'a> {
+    sql_name: String,
+    profiles: Vec<ColumnProfile>,
+    constraints: Vec<String>,
+    pass: Option<JsonPass>,
+    /// What to hand the format's own row source instead of `profiles`.
+    source: Option<&'a [ColumnProfile]>,
 }
 
 impl InlineRowSink<'_> {
@@ -77712,6 +78410,20 @@ fn is_json_bridge_format(format: &InputFormat, profiles: &[ColumnProfile]) -> bo
             | InputFormat::Pdf
             | InputFormat::Ipynb
     ) || (matches!(format, InputFormat::Orc) && orc_profiles_are_nested(profiles))
+        || (matches!(format, InputFormat::Npy | InputFormat::Npz) && npy_profiles_are_nd(profiles))
+}
+
+/// Whether `profiles` are those of a NumPy array of 3 or more axes, read
+/// one slice per row (see `npy_support::profile_npy_nd`), which takes the
+/// JSON bridge to SQL.
+#[cfg(feature = "npy")]
+fn npy_profiles_are_nd(profiles: &[ColumnProfile]) -> bool {
+    npy_support::npy_profiles_are_nd(profiles)
+}
+
+#[cfg(not(feature = "npy"))]
+fn npy_profiles_are_nd(_profiles: &[ColumnProfile]) -> bool {
+    false
 }
 
 /// Builds the inline-mode script for one table of a flat, fixed-column,
@@ -77757,297 +78469,384 @@ fn render_sql_inline_flat(
     is_first_table: bool,
 ) -> Result<()> {
     // Every format that bridges to the shared `json_support::Value` shape
-    // (see the Architecture section) - JSON itself, and now YAML - needs
-    // a real, upfront shape check no format in the two tiers before this
-    // one ever needed: a pure nested-object "struct" column has no
-    // literal value of its own to embed (only its own flattened `.`
-    // children do - see `json_column_is_emittable`), and an array-of-
-    // objects or mixed scalar/object column has no *honest* single-cell
-    // literal at all (see `json_inline_blocking_column`'s own doc
-    // comment) - the exact same "no data to emit" boundary ORC's/
-    // SQLite's/INI's own upfront checks already established, just
-    // reached here by scanning the already-profiled column list rather
-    // than re-parsing the schema.
+    // (see the Architecture section) needs an upfront look at the profiled
+    // column list: a pure nested-object "struct" column has no literal
+    // value of its own to embed (only its own flattened `.` children do -
+    // see `json_column_is_emittable`); an array of objects is one-to-many
+    // relative to its parent record, so it becomes a child table keyed to
+    // the parent row (`json_sql_table_plan`); and a value that's sometimes
+    // a scalar and sometimes an object across records has no honest
+    // single-cell literal at all (`json_inline_blocking_column`).
     let json_bridge_format = is_json_bridge_format(format, profiles);
-    let mut json_filtered_profiles: Vec<ColumnProfile>;
-    let profiles: &[ColumnProfile] = if json_bridge_format {
-        if let Some(bad) = json_inline_blocking_column(profiles) {
-            bail!(
-                "--sql-mode inline can't emit real data for field \"{bad}\" - it's an \
-                 array of objects, or a value that's sometimes a scalar and sometimes an \
-                 object across different records, which has no single cell to embed as a \
-                 literal; use --sql-mode staging instead"
-            );
-        }
-        json_filtered_profiles = profiles
-            .iter()
-            .filter(|p| json_column_is_emittable(p))
-            .cloned()
-            .collect();
-        // A descendant of an optional (non-array) nested-object ancestor
-        // has its own `missing_pct` computed relative to how often that
-        // ancestor itself was present, not the true top-level record
-        // count (`JsonPathAccumulator::finish`'s own `child_total` -
-        // see this project's own JSON-output docs on why a descendant's
-        // `row_count` can legitimately differ from its own top-level
-        // sibling's). A column whose narrow `missing_pct` reports 0% this
-        // way can still genuinely be `NULL` at the real record level
-        // whenever some ancestor along its own dot path was itself
-        // missing - found directly, not assumed, via a real Avro fixture
-        // whose optional `backup_address` object triggered exactly this:
-        // a genuine `NOT NULL` constraint violation once the generated
-        // SQL was actually loaded into SQLite. Force such a column's own
-        // effective `missing_pct` above zero whenever any ancestor
-        // prefix (by dot path, walked the whole way up - not just the
-        // immediate parent) is itself optional, so the `CREATE TABLE`
-        // below never declares a column `NOT NULL` that a real record
-        // could actually leave missing.
-        for p in json_filtered_profiles.iter_mut() {
-            if p.missing_pct > 0.0 {
-                continue;
-            }
-            let mut rest = p.name.as_str();
-            while let Some((parent, _)) = rest.rsplit_once('.') {
-                if let Some(ancestor) = profiles.iter().find(|a| a.name == parent)
-                    && ancestor.missing_pct > 0.0
-                {
-                    p.missing_pct = ancestor.missing_pct;
-                    break;
+    let mut jobs: Vec<InlineTableJob<'_>> = Vec::new();
+    if json_bridge_format {
+        let plan = json_sql_table_plan(table_name, profiles);
+        if plan.len() == 1 {
+            let only = plan
+                .into_iter()
+                .next()
+                .expect("the plan always has a top table");
+            jobs.push(InlineTableJob {
+                sql_name: only.name,
+                profiles: only.profiles,
+                constraints: Vec::new(),
+                pass: None,
+                source: None,
+            });
+        } else {
+            let key = |name: &str| ColumnProfile {
+                name: name.to_string(),
+                current_type: "i64".to_string(),
+                ideal_type: "i64".to_string(),
+                missing_pct: 0.0,
+                ..Default::default()
+            };
+            for table in &plan {
+                let mut final_profiles = Vec::new();
+                let mut constraints = Vec::new();
+                if table.has_children {
+                    final_profiles.push(key("_row_id"));
+                    constraints.push(format!("PRIMARY KEY ({})", sql_quote_ident("_row_id")));
                 }
-                rest = parent;
+                if let Some(parent) = table.parent {
+                    final_profiles.push(key("_parent_row_id"));
+                    final_profiles.push(key("_index"));
+                    // Named explicitly: MySQL names an anonymous foreign key
+                    // `<table>_ibfk_N` and refuses one past 64 characters,
+                    // which a long child-table name easily makes.
+                    constraints.push(format!(
+                        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+                        sql_quote_ident(&sql_fit_identifier(&format!("{}_fk", table.name))),
+                        sql_quote_ident("_parent_row_id"),
+                        sql_quote_ident(&sql_fit_identifier(&plan[parent].name)),
+                        sql_quote_ident("_row_id")
+                    ));
+                }
+                final_profiles.extend(table.profiles.iter().cloned());
+                let mut levels: Vec<String> = Vec::new();
+                for (i, anchor) in table.chain.iter().enumerate() {
+                    levels.push(match i.checked_sub(1) {
+                        None => anchor.clone(),
+                        Some(prev) => anchor
+                            .strip_prefix(&format!("{}.", table.chain[prev]))
+                            .unwrap_or(anchor)
+                            .to_string(),
+                    });
+                }
+                let ids = vec![0; levels.len()];
+                jobs.push(InlineTableJob {
+                    sql_name: table.name.clone(),
+                    profiles: final_profiles,
+                    constraints,
+                    pass: Some(JsonPass {
+                        levels,
+                        columns: table
+                            .profiles
+                            .iter()
+                            .map(|p| (p.name.clone(), p.ideal_type.starts_with("Vec<")))
+                            .collect(),
+                        has_children: table.has_children,
+                        ids,
+                        records: 0,
+                        nrows: args.nrows,
+                    }),
+                    source: Some(profiles),
+                });
             }
         }
-        &json_filtered_profiles
     } else {
-        profiles
-    };
+        jobs.push(InlineTableJob {
+            sql_name: table_name.to_string(),
+            profiles: profiles.to_vec(),
+            constraints: Vec::new(),
+            pass: None,
+            source: None,
+        });
+    }
 
     let clean_file_name = file_name.replace(['\n', '\r'], " ");
-    let quoted_table = sql_quote_ident(&sql_fit_identifier(table_name));
-    // See sql_unique_column_names' own doc comment - a real CSV header
-    // can be duplicate or blank, neither of which SQL tolerates.
-    let column_names = sql_unique_column_names(profiles);
-    let insert_cols = column_names
-        .iter()
-        .map(|name| sql_quote_ident(name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ideal_types: Vec<&str> = profiles.iter().map(|p| p.ideal_type.as_str()).collect();
-    let temporal_formats: Vec<Option<&'static str>> =
-        profiles.iter().map(|p| p.temporal_format).collect();
     let loading_into_mysql = args
         .load_into
         .as_deref()
         .and_then(|t| LoadTarget::parse(t).ok())
         .is_some_and(|t| matches!(t.engine, LoadEngine::MySql));
 
-    // Written once per *file*, not once per table - a multi-table source
-    // (SQLite, the first format in this campaign's own multi-table tier)
-    // would otherwise repeat this entire comment block once per table,
-    // which is correct but needlessly noisy for a database with dozens
-    // of tables.
-    if is_first_table {
-        write!(
+    for (ji, job) in jobs.into_iter().enumerate() {
+        let profiles: &[ColumnProfile] = &job.profiles;
+        // What the format's own row source is handed: this table's columns,
+        // except for a table of a multi-table JSON script, whose rows come
+        // from the `JsonPass` instead and whose source only needs the
+        // whole file's column names (to tell records mode from
+        // single-`value`-column mode).
+        let source_profiles: &[ColumnProfile] = job.source.unwrap_or(profiles);
+        let quoted_table = sql_quote_ident(&sql_fit_identifier(&job.sql_name));
+        // See sql_unique_column_names' own doc comment - a real CSV header
+        // can be duplicate or blank, neither of which SQL tolerates.
+        let column_names = sql_unique_column_names(profiles);
+        let insert_cols = column_names
+            .iter()
+            .map(|name| sql_quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ideal_types: Vec<&str> = profiles.iter().map(|p| p.ideal_type.as_str()).collect();
+        let temporal_formats: Vec<Option<&'static str>> =
+            profiles.iter().map(|p| p.temporal_format).collect();
+
+        if ji == 0 && is_first_table {
+            write!(
+                sink,
+                "-- Data dictionary for {clean_file_name}\n\
+                 -- Generated by sniff-rs --output-format sql --sql-mode inline\n\
+                 --\n\
+                 -- The whole dataset is embedded below as literal INSERT statements -\n\
+                 -- there is no load step at all, and no file for the engine to find on\n\
+                 -- disk: run this script directly on SQLite, DuckDB, PostgreSQL, or\n\
+                 -- MySQL and it just works. Any real SQL engine can execute a bare\n\
+                 -- INSERT ... VALUES (...) - the same convention pg_dump/mysqldump/\n\
+                 -- `sqlite3 .dump` already use for a portable SQL data file - so this\n\
+                 -- isn't limited to just those four; they're simply the four this\n\
+                 -- project has actually verified end to end against a real engine.\n\
+                 --\n\
+                 -- For a file too large to comfortably embed as literal SQL, see\n\
+                 -- --sql-mode staging instead: a raw-text staging table plus a\n\
+                 -- per-engine bulk-load command, better suited to a real bulk load\n\
+                 -- than millions of individual INSERT statements.\n\
+                 --\n\
+                 -- Every identifier below is double-quoted, the ANSI-standard form\n\
+                 -- SQLite/DuckDB/PostgreSQL already accept with no setup; MySQL needs\n\
+                 -- `SET sql_mode='ANSI_QUOTES';` first (or a find/replace of \" for `).\n\
+                 -- MySQL's own default sql_mode also treats a bare backslash inside a\n\
+                 -- string literal as an escape character, unlike the other three\n\
+                 -- engines - a value containing a literal backslash needs\n\
+                 -- `NO_BACKSLASH_ESCAPES` added to that same SET, or it round-trips\n\
+                 -- incorrectly on MySQL specifically.\n\
+                 --\n\
+                 -- One disclosed scope boundary: a numeric literal below assumes the\n\
+                 -- same cleanup that let this column resolve to a numeric type at all\n\
+                 -- (stripped currency symbols/thousands separators/parenthesized\n\
+                 -- negatives/a trailing '%' - see normalize_numeric_str) - a raw\n\
+                 -- value this project's own heuristics couldn't already parse as\n\
+                 -- numeric was never going to resolve to i64/f64 in the first place.\n\n"
+            )?;
+        } else {
+            // A later table in the same multi-table file still gets a blank
+            // line separating it from whatever the previous table's own
+            // INSERT statements ended with.
+            writeln!(sink)?;
+        }
+
+        // A genuinely empty schema - no columns were ever profiled at all,
+        // as opposed to a real, known column set with zero *rows* (which
+        // already produces a valid `CREATE TABLE` with no trailing `INSERT`
+        // - see Phase 9's own SQLite writeup for that already-handled case).
+        // `CREATE TABLE t ( )` is invalid SQL syntax on every real engine
+        // (confirmed directly against a real SQLite build - a bare,
+        // columnless table definition is rejected outright), so there is no
+        // honest `CREATE TABLE` to emit here at all. Found via real-world
+        // testing on a real, zero-field Avro file - not Avro-specific once
+        // checked: a genuinely zero-byte CSV hits the identical gap, and had
+        // ever since Phase 1, invisible until an actual database load
+        // finally surfaced it.
+        if profiles.is_empty() {
+            writeln!(
+                sink,
+                "-- {quoted_table}: no columns were profiled at all (a genuinely \
+                 empty schema) - nothing to create a table for."
+            )?;
+            return Ok(());
+        }
+
+        writeln!(sink, "CREATE TABLE {quoted_table} (")?;
+        write_sql_column_defs(
             sink,
-            "-- Data dictionary for {clean_file_name}\n\
-             -- Generated by sniff-rs --output-format sql --sql-mode inline\n\
-             --\n\
-             -- The whole dataset is embedded below as literal INSERT statements -\n\
-             -- there is no load step at all, and no file for the engine to find on\n\
-             -- disk: run this script directly on SQLite, DuckDB, PostgreSQL, or\n\
-             -- MySQL and it just works. Any real SQL engine can execute a bare\n\
-             -- INSERT ... VALUES (...) - the same convention pg_dump/mysqldump/\n\
-             -- `sqlite3 .dump` already use for a portable SQL data file - so this\n\
-             -- isn't limited to just those four; they're simply the four this\n\
-             -- project has actually verified end to end against a real engine.\n\
-             --\n\
-             -- For a file too large to comfortably embed as literal SQL, see\n\
-             -- --sql-mode staging instead: a raw-text staging table plus a\n\
-             -- per-engine bulk-load command, better suited to a real bulk load\n\
-             -- than millions of individual INSERT statements.\n\
-             --\n\
-             -- Every identifier below is double-quoted, the ANSI-standard form\n\
-             -- SQLite/DuckDB/PostgreSQL already accept with no setup; MySQL needs\n\
-             -- `SET sql_mode='ANSI_QUOTES';` first (or a find/replace of \" for `).\n\
-             -- MySQL's own default sql_mode also treats a bare backslash inside a\n\
-             -- string literal as an escape character, unlike the other three\n\
-             -- engines - a value containing a literal backslash needs\n\
-             -- `NO_BACKSLASH_ESCAPES` added to that same SET, or it round-trips\n\
-             -- incorrectly on MySQL specifically.\n\
-             --\n\
-             -- One disclosed scope boundary: a numeric literal below assumes the\n\
-             -- same cleanup that let this column resolve to a numeric type at all\n\
-             -- (stripped currency symbols/thousands separators/parenthesized\n\
-             -- negatives/a trailing '%' - see normalize_numeric_str) - a raw\n\
-             -- value this project's own heuristics couldn't already parse as\n\
-             -- numeric was never going to resolve to i64/f64 in the first place.\n\n"
+            profiles
+                .iter()
+                .zip(column_names.iter())
+                .map(|(p, name)| {
+                    let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
+                    // MySQL's `TIMESTAMP` is a 1970-2038 instant that converts
+                    // through the session time zone; the column here is a
+                    // plain calendar value of any year, which is `DATETIME`.
+                    // Both it and `TIME` default to whole seconds and round a
+                    // fraction (`09:00:00.5` becomes `09:00:01`), where
+                    // PostgreSQL keeps microseconds by default - so ask for them.
+                    let ty = match p.ideal_type.as_str() {
+                        "NaiveDate / DateTime" if loading_into_mysql => "DATETIME(6)",
+                        "NaiveTime" if loading_into_mysql => "TIME(6)",
+                        other => sql_column_type(other),
+                    };
+                    (
+                        format!("    {} {ty}{nullability}", sql_quote_ident(name)),
+                        column_label_text(&p.description, &p.notes),
+                    )
+                })
+                .chain(job.constraints.iter().map(|c| (format!("    {c}"), None))),
         )?;
-    } else {
-        // A later table in the same multi-table file still gets a blank
-        // line separating it from whatever the previous table's own
-        // INSERT statements ended with.
-        writeln!(sink)?;
+        // Deliberately just one trailing newline here, not a blank-line
+        // separator - see InlineRowSink::flush_batch's own doc comment on
+        // separator_written for why the blank line before the first INSERT
+        // is written lazily instead, only once real row content follows.
+        writeln!(sink, "\n);")?;
+
+        // CSV/TSV/fixed-width are the only formats in this tier with a real
+        // header row at all - every other flat format (the log formats, and
+        // every declared-type binary format joining this tier one at a time:
+        // dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy) has no header concept
+        // whatsoever, every record is a data record. See `InlineRowSink::
+        // has_header`'s own doc comment. Written as a positive list rather
+        // than "everything except the log formats" specifically so adding
+        // the next headerless format here needs no change to this line at
+        // all - only its own new match arm below.
+        let has_header = matches!(
+            format,
+            InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
+        );
+        // CSV/TSV/fixed-width are also the *only* formats in this tier with
+        // no native-null concept whatsoever - every other row-source already
+        // resolves missingness precisely at the reader level (a decoded
+        // `None`, a `-`/nilvalue placeholder, a PRESENT-stream bit, or - for
+        // NumPy - simply never being missing at all) before it ever reaches
+        // `InlineRowSink::accept`, so re-guessing from the rendered text via
+        // `is_missing_sentinel` a second time can only make a correct answer
+        // wrong. See `sql_literal_for_resolved_value`'s own doc comment for
+        // the real bug this flag was added to fix. A negative list on
+        // purpose, mirroring `has_header`'s own positive one: these three
+        // are the fixed, closed set that can never gain a `None` from their
+        // own row-source, everything else already can.
+        let values_pre_resolved = !matches!(
+            format,
+            InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
+        );
+        let mut sink = InlineRowSink {
+            resolved_skip_rows,
+            has_header,
+            values_pre_resolved,
+            nrows: if job.pass.is_some() { None } else { args.nrows },
+            header_len: profiles.len(),
+            ideal_types: &ideal_types,
+            temporal_formats: &temporal_formats,
+            quoted_table: &quoted_table,
+            insert_cols: &insert_cols,
+            record_index: 0,
+            emitted: 0,
+            batch: Vec::new(),
+            sink: &mut *sink,
+            separator_written: false,
+            done: false,
+            json_pass: job.pass,
+        };
+
+        match format {
+            InputFormat::FixedWidth => {
+                let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
+                    anyhow!(
+                        "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
+                    )
+                })?;
+                render_sql_inline_flat_fixed_width(read_path, widths, &mut sink)?;
+            }
+            InputFormat::CommonLog => render_sql_inline_flat_weblog(read_path, false, &mut sink)?,
+            InputFormat::CombinedLog => render_sql_inline_flat_weblog(read_path, true, &mut sink)?,
+            InputFormat::Syslog => render_sql_inline_flat_syslog(read_path, false, &mut sink)?,
+            InputFormat::Syslog5424 => render_sql_inline_flat_syslog(read_path, true, &mut sink)?,
+            InputFormat::Dbase => render_sql_inline_flat_dbase(read_path, &mut sink)?,
+            InputFormat::Stata => render_sql_inline_flat_stata(read_path, &mut sink)?,
+            InputFormat::Sas7bdat => {
+                render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?
+            }
+            InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
+            InputFormat::Orc => {
+                render_sql_inline_flat_orc(read_path, source_profiles, args.nrows, &mut sink)?
+            }
+            InputFormat::Npy => {
+                render_sql_inline_flat_npy(read_path, source_profiles, args.nrows, &mut sink)?
+            }
+            InputFormat::Sqlite => {
+                render_sql_inline_flat_sqlite(read_path, table_name, args.nrows, &mut sink)?
+            }
+            InputFormat::Npz => render_sql_inline_flat_npz(
+                read_path,
+                table_name,
+                source_profiles,
+                args.nrows,
+                &mut sink,
+            )?,
+            InputFormat::Ini => render_sql_inline_flat_ini(read_path, table_name, &mut sink)?,
+            InputFormat::Xlsx => render_sql_inline_flat_xlsx(read_path, table_name, &mut sink)?,
+            InputFormat::Json => {
+                render_sql_inline_flat_json(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Yaml => {
+                render_sql_inline_flat_yaml(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Toml => {
+                render_sql_inline_flat_toml(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::MsgPack => {
+                render_sql_inline_flat_msgpack(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Cbor => {
+                render_sql_inline_flat_cbor(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Avro => {
+                render_sql_inline_flat_avro(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Xml => render_sql_inline_flat_xml(read_path, source_profiles, &mut sink)?,
+            InputFormat::Bson => {
+                render_sql_inline_flat_bson(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Plist => {
+                render_sql_inline_flat_plist(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Json5 => {
+                render_sql_inline_flat_json5(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Har => render_sql_inline_flat_har(read_path, source_profiles, &mut sink)?,
+            InputFormat::GeoJson => {
+                render_sql_inline_flat_geojson(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Vcard => {
+                render_sql_inline_flat_vcard(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Ical => {
+                render_sql_inline_flat_icalendar(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Mbox => {
+                render_sql_inline_flat_mbox(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Parquet => {
+                render_sql_inline_flat_parquet(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::ArrowIpc => {
+                render_sql_inline_flat_arrow_ipc(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::DeltaTable => {
+                render_sql_inline_flat_delta(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::Pdf => {
+                render_sql_inline_flat_pdf(read_path, table_name, source_profiles, &mut sink)?
+            }
+            InputFormat::Ipynb => {
+                render_sql_inline_flat_ipynb(read_path, source_profiles, &mut sink)?
+            }
+            InputFormat::IcebergTable => {
+                render_sql_inline_flat_iceberg(read_path, source_profiles, &mut sink)?
+            }
+            _ => {
+                // CSV/TSV - every other format `render_sql`'s own
+                // `inline_supported` check allows through to this function.
+                let delim = if matches!(format, InputFormat::Tsv) {
+                    args.delimiter.unwrap_or('\t')
+                } else {
+                    args.delimiter.unwrap_or(',')
+                };
+                render_sql_inline_flat_csv(read_path, delim, &mut sink)?;
+            }
+        }
+
+        sink.flush_batch()?;
     }
-
-    // A genuinely empty schema - no columns were ever profiled at all,
-    // as opposed to a real, known column set with zero *rows* (which
-    // already produces a valid `CREATE TABLE` with no trailing `INSERT`
-    // - see Phase 9's own SQLite writeup for that already-handled case).
-    // `CREATE TABLE t ( )` is invalid SQL syntax on every real engine
-    // (confirmed directly against a real SQLite build - a bare,
-    // columnless table definition is rejected outright), so there is no
-    // honest `CREATE TABLE` to emit here at all. Found via real-world
-    // testing on a real, zero-field Avro file - not Avro-specific once
-    // checked: a genuinely zero-byte CSV hits the identical gap, and had
-    // ever since Phase 1, invisible until an actual database load
-    // finally surfaced it.
-    if profiles.is_empty() {
-        writeln!(
-            sink,
-            "-- {quoted_table}: no columns were profiled at all (a genuinely \
-             empty schema) - nothing to create a table for."
-        )?;
-        return Ok(());
-    }
-
-    writeln!(sink, "CREATE TABLE {quoted_table} (")?;
-    write_sql_column_defs(
-        sink,
-        profiles.iter().zip(column_names.iter()).map(|(p, name)| {
-            let nullability = if p.missing_pct > 0.0 { "" } else { " NOT NULL" };
-            // MySQL's `TIMESTAMP` is a 1970-2038 instant that converts
-            // through the session time zone; the column here is a
-            // plain calendar value of any year, which is `DATETIME`.
-            // Both it and `TIME` default to whole seconds and round a
-            // fraction (`09:00:00.5` becomes `09:00:01`), where
-            // PostgreSQL keeps microseconds by default - so ask for them.
-            let ty = match p.ideal_type.as_str() {
-                "NaiveDate / DateTime" if loading_into_mysql => "DATETIME(6)",
-                "NaiveTime" if loading_into_mysql => "TIME(6)",
-                other => sql_column_type(other),
-            };
-            (
-                format!("    {} {ty}{nullability}", sql_quote_ident(name)),
-                column_label_text(&p.description, &p.notes),
-            )
-        }),
-    )?;
-    // Deliberately just one trailing newline here, not a blank-line
-    // separator - see InlineRowSink::flush_batch's own doc comment on
-    // separator_written for why the blank line before the first INSERT
-    // is written lazily instead, only once real row content follows.
-    writeln!(sink, "\n);")?;
-
-    // CSV/TSV/fixed-width are the only formats in this tier with a real
-    // header row at all - every other flat format (the log formats, and
-    // every declared-type binary format joining this tier one at a time:
-    // dBase, Stata, SAS7BDAT, SPSS, ORC, NumPy) has no header concept
-    // whatsoever, every record is a data record. See `InlineRowSink::
-    // has_header`'s own doc comment. Written as a positive list rather
-    // than "everything except the log formats" specifically so adding
-    // the next headerless format here needs no change to this line at
-    // all - only its own new match arm below.
-    let has_header = matches!(
-        format,
-        InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
-    );
-    // CSV/TSV/fixed-width are also the *only* formats in this tier with
-    // no native-null concept whatsoever - every other row-source already
-    // resolves missingness precisely at the reader level (a decoded
-    // `None`, a `-`/nilvalue placeholder, a PRESENT-stream bit, or - for
-    // NumPy - simply never being missing at all) before it ever reaches
-    // `InlineRowSink::accept`, so re-guessing from the rendered text via
-    // `is_missing_sentinel` a second time can only make a correct answer
-    // wrong. See `sql_literal_for_resolved_value`'s own doc comment for
-    // the real bug this flag was added to fix. A negative list on
-    // purpose, mirroring `has_header`'s own positive one: these three
-    // are the fixed, closed set that can never gain a `None` from their
-    // own row-source, everything else already can.
-    let values_pre_resolved = !matches!(
-        format,
-        InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
-    );
-    let mut sink = InlineRowSink {
-        resolved_skip_rows,
-        has_header,
-        values_pre_resolved,
-        nrows: args.nrows,
-        header_len: profiles.len(),
-        ideal_types: &ideal_types,
-        temporal_formats: &temporal_formats,
-        quoted_table: &quoted_table,
-        insert_cols: &insert_cols,
-        record_index: 0,
-        emitted: 0,
-        batch: Vec::new(),
-        sink,
-        separator_written: false,
-        done: false,
-    };
-
-    match format {
-        InputFormat::FixedWidth => {
-            let widths = args.widths.as_deref().filter(|w| !w.is_empty()).ok_or_else(|| {
-                anyhow!(
-                    "--format fixed-width needs --widths (comma-separated character counts, e.g. --widths 10,5,20) - there's no delimiter to split fields on"
-                )
-            })?;
-            render_sql_inline_flat_fixed_width(read_path, widths, &mut sink)?;
-        }
-        InputFormat::CommonLog => render_sql_inline_flat_weblog(read_path, false, &mut sink)?,
-        InputFormat::CombinedLog => render_sql_inline_flat_weblog(read_path, true, &mut sink)?,
-        InputFormat::Syslog => render_sql_inline_flat_syslog(read_path, false, &mut sink)?,
-        InputFormat::Syslog5424 => render_sql_inline_flat_syslog(read_path, true, &mut sink)?,
-        InputFormat::Dbase => render_sql_inline_flat_dbase(read_path, &mut sink)?,
-        InputFormat::Stata => render_sql_inline_flat_stata(read_path, &mut sink)?,
-        InputFormat::Sas7bdat => render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?,
-        InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
-        InputFormat::Orc => render_sql_inline_flat_orc(read_path, profiles, args.nrows, &mut sink)?,
-        InputFormat::Npy => render_sql_inline_flat_npy(read_path, args.nrows, &mut sink)?,
-        InputFormat::Sqlite => {
-            render_sql_inline_flat_sqlite(read_path, table_name, args.nrows, &mut sink)?
-        }
-        InputFormat::Npz => {
-            render_sql_inline_flat_npz(read_path, table_name, args.nrows, &mut sink)?
-        }
-        InputFormat::Ini => render_sql_inline_flat_ini(read_path, table_name, &mut sink)?,
-        InputFormat::Xlsx => render_sql_inline_flat_xlsx(read_path, table_name, &mut sink)?,
-        InputFormat::Json => render_sql_inline_flat_json(read_path, profiles, &mut sink)?,
-        InputFormat::Yaml => render_sql_inline_flat_yaml(read_path, profiles, &mut sink)?,
-        InputFormat::Toml => render_sql_inline_flat_toml(read_path, profiles, &mut sink)?,
-        InputFormat::MsgPack => render_sql_inline_flat_msgpack(read_path, profiles, &mut sink)?,
-        InputFormat::Cbor => render_sql_inline_flat_cbor(read_path, profiles, &mut sink)?,
-        InputFormat::Avro => render_sql_inline_flat_avro(read_path, profiles, &mut sink)?,
-        InputFormat::Xml => render_sql_inline_flat_xml(read_path, profiles, &mut sink)?,
-        InputFormat::Bson => render_sql_inline_flat_bson(read_path, profiles, &mut sink)?,
-        InputFormat::Plist => render_sql_inline_flat_plist(read_path, profiles, &mut sink)?,
-        InputFormat::Json5 => render_sql_inline_flat_json5(read_path, profiles, &mut sink)?,
-        InputFormat::Har => render_sql_inline_flat_har(read_path, profiles, &mut sink)?,
-        InputFormat::GeoJson => render_sql_inline_flat_geojson(read_path, profiles, &mut sink)?,
-        InputFormat::Vcard => render_sql_inline_flat_vcard(read_path, profiles, &mut sink)?,
-        InputFormat::Ical => render_sql_inline_flat_icalendar(read_path, profiles, &mut sink)?,
-        InputFormat::Mbox => render_sql_inline_flat_mbox(read_path, profiles, &mut sink)?,
-        InputFormat::Parquet => render_sql_inline_flat_parquet(read_path, profiles, &mut sink)?,
-        InputFormat::ArrowIpc => render_sql_inline_flat_arrow_ipc(read_path, profiles, &mut sink)?,
-        InputFormat::DeltaTable => render_sql_inline_flat_delta(read_path, profiles, &mut sink)?,
-        InputFormat::Pdf => render_sql_inline_flat_pdf(read_path, table_name, profiles, &mut sink)?,
-        InputFormat::Ipynb => render_sql_inline_flat_ipynb(read_path, profiles, &mut sink)?,
-        InputFormat::IcebergTable => {
-            render_sql_inline_flat_iceberg(read_path, profiles, &mut sink)?
-        }
-        _ => {
-            // CSV/TSV - every other format `render_sql`'s own
-            // `inline_supported` check allows through to this function.
-            let delim = if matches!(format, InputFormat::Tsv) {
-                args.delimiter.unwrap_or('\t')
-            } else {
-                args.delimiter.unwrap_or(',')
-            };
-            render_sql_inline_flat_csv(read_path, delim, &mut sink)?;
-        }
-    }
-
-    sink.flush_batch()
+    Ok(())
 }
 
 /// The Common/Combined Log Format row-source for `render_sql_inline_flat`,
@@ -78223,15 +79022,22 @@ fn render_sql_inline_flat_orc(
 #[cfg(feature = "npy")]
 fn render_sql_inline_flat_npy(
     read_path: &Path,
+    profiles: &[ColumnProfile],
     nrows: Option<usize>,
     sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {
-    npy_support::stream_npy_rows_for_sql(read_path, nrows, sink)
+    if npy_support::npy_profiles_are_nd(profiles) {
+        let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+        npy_support::stream_npy_rows_for_sql(read_path, nrows, Some((&columns, records_mode)), sink)
+    } else {
+        npy_support::stream_npy_rows_for_sql(read_path, nrows, None, sink)
+    }
 }
 
 #[cfg(not(feature = "npy"))]
 fn render_sql_inline_flat_npy(
     _read_path: &Path,
+    _profiles: &[ColumnProfile],
     _nrows: Option<usize>,
     _sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {
@@ -78277,16 +79083,29 @@ fn render_sql_inline_flat_sqlite(
 fn render_sql_inline_flat_npz(
     read_path: &Path,
     array_name: &str,
+    profiles: &[ColumnProfile],
     nrows: Option<usize>,
     sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {
-    npy_support::stream_npz_array_rows_for_sql(read_path, array_name, nrows, sink)
+    if npy_support::npy_profiles_are_nd(profiles) {
+        let (columns, records_mode) = json_bridge_columns_and_mode(profiles);
+        npy_support::stream_npz_array_rows_for_sql(
+            read_path,
+            array_name,
+            nrows,
+            Some((&columns, records_mode)),
+            sink,
+        )
+    } else {
+        npy_support::stream_npz_array_rows_for_sql(read_path, array_name, nrows, None, sink)
+    }
 }
 
 #[cfg(not(feature = "npy"))]
 fn render_sql_inline_flat_npz(
     _read_path: &Path,
     _array_name: &str,
+    _profiles: &[ColumnProfile],
     _nrows: Option<usize>,
     _sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {
@@ -79086,27 +79905,6 @@ fn render_sql(
             // to actually read).
             if tables.is_empty() {
                 bail!("no table to render as SQL");
-            }
-            // Inline mode wasn't asked for by name, so a nested column
-            // with no single cell to embed (an array of objects - every
-            // real notebook's `outputs`) falls back to staging, the same
-            // way an unsupported format does, instead of failing. An
-            // explicit --sql-mode inline, or --load-into (which needs real
-            // rows), still gets the specific error.
-            if !explicit
-                && args.load_into.is_none()
-                && let Some(bad) = tables.values().find_map(|profiles| {
-                    is_json_bridge_format(format, profiles)
-                        .then(|| json_inline_blocking_column(profiles))
-                        .flatten()
-                })
-            {
-                eprintln!(
-                    "inline SQL mode can't embed field \"{bad}\" (an array of objects, or a \
-                     value that's sometimes a scalar and sometimes an object) - using \
-                     --sql-mode staging instead"
-                );
-                return render_sql_staging(file_name, format, tables, sink);
             }
             for (i, (table_name, profiles)) in tables.iter().enumerate() {
                 render_sql_inline_flat(

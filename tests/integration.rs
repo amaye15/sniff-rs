@@ -603,27 +603,33 @@ fn sql_output_inline_mode_zero_byte_csv_skips_create_table_instead_of_emitting_i
 // sibling below) should be restored, pointed at that format.
 
 #[test]
-fn sql_output_inline_mode_json_array_of_objects_needs_staging_instead() {
-    // A genuinely nested JSON file (an array-of-objects field) is a
-    // different, more specific disclosed error than the generic
-    // "format not supported yet" fallback above - JSON itself IS
-    // inline-supported (Phase 13), but this particular file's own shape
-    // isn't representable as one scalar cell per record.
-    let output = Command::new(bin())
-        .args([
-            fixture("nested_typed.jsonl").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field"));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_json_writes_child_tables_for_arrays_of_objects() {
+    // `events` is an array of objects and `deep.outer.inner_list` one
+    // nested under a plain object: each is a child table of the records.
+    // `mixed_list` holds scalars and objects, so it keeps a column of
+    // JSON text and its objects get a table too.
+    let sql = run_sql("nested_typed.jsonl", &["--sql-mode", "inline"]);
+    assert_child_table(&sql, "nested_typed", "nested_typed__events");
+    assert_child_table(&sql, "nested_typed", "nested_typed__deep_outer_inner_list");
+    assert_child_table(&sql, "nested_typed", "nested_typed__mixed_list");
+    assert_eq!(
+        insert_rows(&sql, "nested_typed__events"),
+        [
+            "(1, 1, 'alice@example.com', 50, '2024-01-15')",
+            "(1, 2, 'bob@example.com', 75, '2024-02-20')",
+            "(2, 1, 'carol@example.com', 20, '2024-03-11')",
+            "(3, 1, 'dave@example.com', 99, '2024-04-01')"
+        ]
+    );
+    assert_eq!(
+        insert_rows(&sql, "nested_typed__deep_outer_inner_list"),
+        ["(1, 1, 1)", "(1, 2, 2)", "(2, 1, 3)", "(3, 1, 4)"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "nested_typed__mixed_list"),
+        ["(1, 1, 1)", "(3, 1, 2)"]
+    );
+    assert!(sql.contains("'[1,{\"x\":1}]'"), "{sql}");
 }
 
 #[test]
@@ -1303,20 +1309,19 @@ fn sql_output_inline_mode_orc_flattens_nested_columns() {
         "{sql}"
     );
 
-    // A Map (a list of key/value entries) has no single cell to embed.
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_orc_nested.orc").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("\"attrs\""));
+    // A Map (a list of key/value entries) is a child table with one row
+    // per entry, and so is a list of structs.
+    let sql = run_sql("edge_orc_nested.orc", &["--sql-mode", "inline"]);
+    assert_child_table(&sql, "edge_orc_nested", "edge_orc_nested__attrs");
+    assert_eq!(
+        insert_rows(&sql, "edge_orc_nested__attrs"),
+        ["(1, 1, 1, 'a')", "(1, 2, 2, 'b')", "(4, 1, 3, NULL)"]
+    );
+    assert_child_table(&sql, "edge_orc_nested", "edge_orc_nested__events");
+    assert_eq!(
+        insert_rows(&sql, "edge_orc_nested__events"),
+        ["(1, 1, 'x', 1)", "(3, 1, 'y', 2)", "(3, 2, NULL, 3)"]
+    );
 }
 
 #[test]
@@ -1467,24 +1472,36 @@ fn sql_output_inline_mode_supports_sqlite_multi_table() {
 
 #[test]
 #[cfg(feature = "sqlite")]
-fn sql_output_inline_mode_sqlite_rejects_a_without_rowid_table() {
-    // A WITHOUT ROWID table has no honest literal to embed (the same
-    // "no honest literal" boundary ORC's own nested-column check already
-    // draws) - a clear, actionable error naming the table, not a guess.
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_sqlite_without_rowid.sqlite")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("WITHOUT ROWID"));
+fn sql_output_inline_mode_sqlite_reads_a_without_rowid_table() {
+    // A WITHOUT ROWID table is stored as an index b-tree (entries lead
+    // with the primary key); its rows come out in declared column order.
+    let sql = run_sql("edge_sqlite_without_rowid_multi.sqlite", &[]);
+    // PRIMARY KEY (c DESC, a): stored as (c, a, b, d), read back as (a, b, c, d).
+    assert_eq!(
+        insert_rows(&sql, "comp"),
+        [
+            "(3, NULL, 9.25, 'r')",
+            "(1, 'x', 2.5, 'p')",
+            "(1, 'z', 0.5, 's')",
+            "(2, 'y', 0.5, NULL)"
+        ]
+    );
+    // A multi-level index b-tree, with one entry whose payload spills into
+    // overflow pages.
+    let big = insert_rows(&sql, "big");
+    assert_eq!(big.len(), 1200);
+    assert!(big[0].starts_with("(1, 'n1-n1-n1-', 0.25)"), "{}", big[0]);
+    assert!(big[599].contains(&"L".repeat(5000)));
+    assert!(big[1199].starts_with("(1200, "), "{}", big[1199]);
+    assert_eq!(
+        insert_rows(&sql, "quoted name"),
+        ["('k1', 1)", "('k2', NULL)"]
+    );
+    assert_eq!(insert_rows(&sql, "plain"), ["(1, 'a')", "(2, 'b')"]);
+    // --nrows bounds an index b-tree walk too.
+    let sql = run_sql("edge_sqlite_without_rowid_multi.sqlite", &["--nrows", "3"]);
+    assert_eq!(insert_rows(&sql, "big").len(), 3);
+    assert_eq!(insert_rows(&sql, "comp").len(), 3);
 }
 
 #[test]
@@ -1546,12 +1563,11 @@ fn sql_output_inline_mode_npz_fortran_and_c_order_arrays_agree() {
 #[test]
 #[cfg(feature = "npy")]
 fn sql_output_inline_mode_npz_rejects_an_unreadable_array() {
-    // A genuinely 3-D array has no honest literal to emit at all (the
-    // same disclosed-placeholder shape --output-format json already
-    // gives it) - a clear, actionable error, not a guess.
+    // An array of pickled Python objects has no honest literal to emit -
+    // a clear, actionable error, not a guess.
     let output = Command::new(bin())
         .args([
-            fixture("edge_npz_mixed_readable_and_unreadable.npz")
+            fixture("edge_npz_object_array_and_labels.npz")
                 .to_str()
                 .unwrap(),
             "-",
@@ -1562,7 +1578,7 @@ fn sql_output_inline_mode_npz_rejects_an_unreadable_array() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("no natural row/column reading"));
+    assert!(stderr.contains("pickled 'object' dtype"));
 }
 
 #[test]
@@ -1627,23 +1643,13 @@ fn sql_output_inline_mode_ini_preserves_a_genuinely_empty_value() {
 
 #[test]
 #[cfg(feature = "ini")]
-fn sql_output_inline_mode_ini_rejects_a_section_with_a_repeated_key() {
-    // A repeated key pools into a Vec<T> column for profiling, which has
-    // no single cell to honestly embed as a literal - a clear,
-    // actionable error naming the section and the key, not a guess.
-    let output = Command::new(bin())
-        .args([
-            fixture("sample.ini").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("its \"tag\" key repeats"));
-    assert!(stderr.contains("\"database\""));
+fn sql_output_inline_mode_ini_pools_a_repeated_key_into_json_array_text() {
+    // A repeated key pools into a Vec<T> column for profiling; in SQL it
+    // is one JSON-array text cell, like a repeated vCard/MBOX property.
+    let sql = run_sql("sample.ini", &[]);
+    let rows = insert_rows(&sql, "database");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].contains("'[\""), "{rows:?}");
 }
 
 #[test]
@@ -1800,25 +1806,6 @@ fn sql_output_inline_mode_json_single_value_column_top_level_array() {
 }
 
 #[test]
-fn sql_output_inline_mode_json_rejects_an_array_of_objects_column() {
-    let output = Command::new(bin())
-        .args([
-            fixture("nested_typed.jsonl").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"events\""));
-    assert!(stderr.contains("--sql-mode staging"));
-}
-
-#[test]
 fn load_into_accepts_json() {
     let output = Command::new(bin())
         .args([
@@ -1905,24 +1892,20 @@ fn sql_output_inline_mode_supports_flat_toml_with_nested_table_and_array() {
 
 #[test]
 #[cfg(feature = "toml")]
-fn sql_output_inline_mode_toml_rejects_an_array_of_tables_column() {
-    // sample.toml's own real [[servers]] array-of-tables is exactly the
-    // one-to-many shape this tier's own upfront check exists to catch.
-    let output = Command::new(bin())
-        .args([
-            fixture("sample.toml").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"servers\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_toml_writes_a_child_table_for_an_array_of_tables() {
+    let sql = run_sql("sample.toml", &["--sql-mode", "inline"]);
+    assert_child_table(&sql, "sample", "sample__servers");
+    assert_eq!(
+        insert_rows(&sql, "sample"),
+        ["(1, 'sample config', 3, TRUE, 'Alice', '02134')"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "sample__servers"),
+        [
+            "(1, 1, 'alpha', '10.0.0.1', TRUE)",
+            "(1, 2, 'beta', '10.0.0.2', FALSE)"
+        ]
+    );
 }
 
 #[test]
@@ -2140,28 +2123,24 @@ fn sql_output_inline_mode_xml_non_homogeneous_root_is_a_single_record() {
 
 #[test]
 #[cfg(feature = "xml")]
-fn sql_output_inline_mode_xml_rejects_repeated_child_elements_as_an_array_of_objects() {
-    // A repeated same-tag child element (<order> appearing more than
-    // once under one <person>) pools into an array-of-objects column,
-    // exactly the one-to-many shape this tier's own upfront check exists
-    // to catch.
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_xml_sql_inline_array_of_objects.xml")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"order\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_xml_writes_a_child_table_for_repeated_child_elements() {
+    let sql = run_sql(
+        "edge_xml_sql_inline_array_of_objects.xml",
+        &["--sql-mode", "inline"],
+    );
+    assert_child_table(
+        &sql,
+        "edge_xml_sql_inline_array_of_objects",
+        "edge_xml_sql_inline_array_of_objects__order",
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_xml_sql_inline_array_of_objects"),
+        ["(1, 1, 'Alice')", "(2, 2, 'Bob')"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_xml_sql_inline_array_of_objects__order"),
+        ["(1, 1, 10)", "(1, 2, 20)", "(2, 1, 5)"]
+    );
 }
 
 #[test]
@@ -2221,24 +2200,24 @@ fn sql_output_inline_mode_bson_rare_element_types_render_correctly() {
 
 #[test]
 #[cfg(feature = "bson")]
-fn sql_output_inline_mode_bson_rejects_an_array_of_documents_column() {
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_bson_sql_inline_array_of_objects.bson")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"orders\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_bson_writes_a_child_table_for_an_array_of_documents() {
+    let sql = run_sql(
+        "edge_bson_sql_inline_array_of_objects.bson",
+        &["--sql-mode", "inline"],
+    );
+    assert_child_table(
+        &sql,
+        "edge_bson_sql_inline_array_of_objects",
+        "edge_bson_sql_inline_array_of_objects__orders",
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_bson_sql_inline_array_of_objects"),
+        ["(1, 1)"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_bson_sql_inline_array_of_objects__orders"),
+        ["(1, 1, 10)", "(1, 2, 20)"]
+    );
 }
 
 #[test]
@@ -2292,24 +2271,24 @@ fn sql_output_inline_mode_plist_streams_a_top_level_array_across_window_refills(
 
 #[test]
 #[cfg(feature = "plist")]
-fn sql_output_inline_mode_plist_rejects_an_array_of_dicts_column() {
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_plist_sql_inline_array_of_objects.plist")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"orders\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_plist_writes_a_child_table_for_an_array_of_dicts() {
+    let sql = run_sql(
+        "edge_plist_sql_inline_array_of_objects.plist",
+        &["--sql-mode", "inline"],
+    );
+    assert_child_table(
+        &sql,
+        "edge_plist_sql_inline_array_of_objects",
+        "edge_plist_sql_inline_array_of_objects__orders",
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_plist_sql_inline_array_of_objects"),
+        ["(1, 1)"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_plist_sql_inline_array_of_objects__orders"),
+        ["(1, 1, 10)", "(1, 2, 20)"]
+    );
 }
 
 #[test]
@@ -2364,24 +2343,24 @@ fn sql_output_inline_mode_json5_streams_a_top_level_array_with_stray_bracket_com
 
 #[test]
 #[cfg(feature = "json5")]
-fn sql_output_inline_mode_json5_rejects_an_array_of_objects_column() {
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_json5_sql_inline_array_of_objects.json5")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"orders\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_json5_writes_a_child_table_for_an_array_of_objects() {
+    let sql = run_sql(
+        "edge_json5_sql_inline_array_of_objects.json5",
+        &["--sql-mode", "inline"],
+    );
+    assert_child_table(
+        &sql,
+        "edge_json5_sql_inline_array_of_objects",
+        "edge_json5_sql_inline_array_of_objects__orders",
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_json5_sql_inline_array_of_objects"),
+        ["(1, 1)"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_json5_sql_inline_array_of_objects__orders"),
+        ["(1, 1, 10)", "(1, 2, 20)"]
+    );
 }
 
 #[test]
@@ -2436,24 +2415,24 @@ fn sql_output_inline_mode_har_missing_log_entries_gives_the_same_disclosed_error
 
 #[test]
 #[cfg(feature = "har")]
-fn sql_output_inline_mode_har_rejects_an_array_of_objects_column() {
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_har_sql_inline_array_of_objects.har")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"cookies\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_har_writes_a_child_table_for_an_array_of_objects() {
+    let sql = run_sql(
+        "edge_har_sql_inline_array_of_objects.har",
+        &["--sql-mode", "inline"],
+    );
+    assert_child_table(
+        &sql,
+        "edge_har_sql_inline_array_of_objects",
+        "edge_har_sql_inline_array_of_objects__cookies",
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_har_sql_inline_array_of_objects"),
+        ["(1, 'https://example.com/x')"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_har_sql_inline_array_of_objects__cookies"),
+        ["(1, 1, 'a')", "(1, 2, 'b')"]
+    );
 }
 
 #[test]
@@ -2527,24 +2506,24 @@ fn sql_output_inline_mode_geojson_renders_every_geometry_type_and_a_null_geometr
 
 #[test]
 #[cfg(feature = "geojson")]
-fn sql_output_inline_mode_geojson_rejects_an_array_of_objects_column() {
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_geojson_sql_inline_array_of_objects.geojson")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"tags\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_geojson_writes_a_child_table_for_an_array_of_objects() {
+    let sql = run_sql(
+        "edge_geojson_sql_inline_array_of_objects.geojson",
+        &["--sql-mode", "inline"],
+    );
+    assert_child_table(
+        &sql,
+        "edge_geojson_sql_inline_array_of_objects",
+        "edge_geojson_sql_inline_array_of_objects__tags",
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_geojson_sql_inline_array_of_objects"),
+        ["(1, 'POINT(0 0)')"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_geojson_sql_inline_array_of_objects__tags"),
+        ["(1, 1, 1)", "(1, 2, 2)"]
+    );
 }
 
 #[test]
@@ -2760,29 +2739,22 @@ fn sql_output_inline_mode_supports_parquet_flat_and_nested_columns() {
 
 #[test]
 #[cfg(feature = "parquet")]
-fn sql_output_inline_mode_parquet_rejects_a_map_column() {
-    // A Parquet Map column always reconstructs as an array of
-    // `{"key","value"}` pairs (this reader's own deliberate choice,
-    // since a Map key isn't always a string) - exactly the `Vec<struct>`
-    // shape `json_inline_blocking_column` already exists to catch, so
-    // `nested_types.parquet`'s own real Map column (`attributes`)
-    // correctly triggers the same disclosed error every other array-of-
-    // objects column in this tier already does.
-    let output = Command::new(bin())
-        .args([
-            fixture("nested_types.parquet").to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"attributes\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_parquet_writes_a_child_table_for_a_map_column() {
+    // A Map column reconstructs as an array of {"key","value"} pairs, so
+    // `nested_types.parquet`'s own `attributes` map is a child table with
+    // one row per entry.
+    let sql = run_sql("nested_types.parquet", &["--sql-mode", "inline"]);
+    assert_child_table(&sql, "nested_types", "nested_types__attributes");
+    assert_eq!(
+        insert_rows(&sql, "nested_types__attributes"),
+        [
+            "(1, 1, 'color', 'red')",
+            "(1, 2, 'size', 'M')",
+            "(2, 1, 'color', 'blue')",
+            "(4, 1, 'color', 'green')",
+            "(4, 2, 'size', 'L')"
+        ]
+    );
 }
 
 #[test]
@@ -2843,24 +2815,24 @@ fn sql_output_inline_mode_supports_arrow_ipc_flat_and_nested_columns() {
 
 #[test]
 #[cfg(feature = "parquet")]
-fn sql_output_inline_mode_arrow_ipc_rejects_an_array_of_objects_column() {
-    let output = Command::new(bin())
-        .args([
-            fixture("edge_arrow_sql_inline_array_of_objects.arrow")
-                .to_str()
-                .unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .expect("failed to run binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("can't emit real data for field \"orders\""));
-    assert!(stderr.contains("--sql-mode staging"));
+fn sql_output_inline_mode_arrow_ipc_writes_a_child_table_for_an_array_of_structs() {
+    let sql = run_sql(
+        "edge_arrow_sql_inline_array_of_objects.arrow",
+        &["--sql-mode", "inline"],
+    );
+    assert_child_table(
+        &sql,
+        "edge_arrow_sql_inline_array_of_objects",
+        "edge_arrow_sql_inline_array_of_objects__orders",
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_arrow_sql_inline_array_of_objects"),
+        ["(1, 1)"]
+    );
+    assert_eq!(
+        insert_rows(&sql, "edge_arrow_sql_inline_array_of_objects__orders"),
+        ["(1, 1, 1, 9.5)", "(1, 2, 2, 3.0)"]
+    );
 }
 
 #[test]
@@ -4094,34 +4066,81 @@ fn npz_reads_a_zip64_archive() {
     assert_eq!(scores["sample_values"][0], "1.5");
 }
 
-// Found via a real-world sweep against TensorFlow's own MNIST .npz
-// (x_train/x_test are genuine 3-D image arrays, (60000, 28, 28) and
-// (10000, 28, 28) - a real, documented boundary this tool correctly
-// refuses to guess a flattening for - but y_train/y_test in the exact
-// same archive are perfectly ordinary 1-D label arrays). One array's
-// shape not being representable used to abort the *entire* archive read,
-// costing every other array in the file its own profile too - the same
-// "one bad part shouldn't sink everything else" principle already
-// applied to a single unconvertible nested Parquet/Arrow column.
+// One array that can't be read used to abort the *entire* archive, costing
+// every other array in the file its own profile too (found via a real-world
+// sweep of TensorFlow's MNIST .npz). An array of pickled Python objects has
+// no fixed byte layout; it gets a disclosed placeholder, and the unrelated,
+// perfectly ordinary array next to it still profiles normally.
 #[cfg(feature = "npy")]
 #[test]
 fn npz_one_unreadable_array_does_not_sink_the_rest_of_the_archive() {
-    let doc = run_json("edge_npz_mixed_readable_and_unreadable.npz", &[]);
+    let doc = run_json("edge_npz_object_array_and_labels.npz", &[]);
     let tables = doc["tables"].as_object().unwrap();
     assert_eq!(tables.len(), 2, "both arrays must still appear as tables");
 
-    let images = table(&doc, "images");
+    let bad = table(&doc, "bad");
     assert!(
-        column(images, "value")["notes"]
+        column(bad, "value")["notes"]
             .as_str()
             .unwrap()
             .contains("could not be profiled"),
-        "the 3-D array's own table should disclose why, not silently vanish"
+        "the object array's own table should disclose why, not silently vanish"
     );
-
-    // The unrelated, perfectly ordinary array must still profile normally.
     let labels = table(&doc, "labels");
     assert_eq!(column(labels, "value")["ideal_type"], "i64");
+}
+
+// A plain array of 3 or more axes has no positional-column reading, so each
+// slice along the first axis is one row: its index, and the slice's values.
+// (MNIST's (60000, 28, 28) image arrays used to be refused outright.)
+#[cfg(feature = "npy")]
+#[test]
+fn a_3d_array_is_one_row_per_slice_of_the_first_axis() {
+    let doc = run_json("edge_npz_3d_images_and_labels.npz", &[]);
+    let images = table(&doc, "images");
+    assert_eq!(column(images, "index")["ideal_type"], "i64");
+    assert_eq!(column(images, "index")["row_count"], 3);
+    let value = column(images, "value");
+    assert_eq!(value["ideal_type"], "Vec<i64>");
+    assert!(
+        value["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("NumPy array of shape (3, 4, 4)"),
+        "{}",
+        value["description"]
+    );
+    assert_eq!(column(table(&doc, "labels"), "value")["ideal_type"], "i64");
+
+    // Row-major and column-major files holding the same logical array give
+    // the same rows; a 4-D float array nests one level deeper.
+    for (file, expect) in [
+        ("edge_npy_3d.npy", "(0, '[0,1,2,3,4,5,6,7,8,9,10,11]')"),
+        (
+            "edge_npy_3d_fortran.npy",
+            "(0, '[0,1,2,3,4,5,6,7,8,9,10,11]')",
+        ),
+    ] {
+        let sql = run_sql(file, &[]);
+        let name = file.trim_end_matches(".npy");
+        let rows = insert_rows(&sql, name);
+        assert_eq!(rows.len(), 2, "{file}");
+        assert_eq!(rows[0], expect, "{file}");
+        assert_eq!(
+            rows[1], "(1, '[12,13,14,15,16,17,18,19,20,21,22,23]')",
+            "{file}"
+        );
+        // The shape rides along as the column's comment.
+        assert!(sql.contains("-- NumPy array of shape (2, 3, 4)"), "{sql}");
+    }
+    let sql = run_sql("edge_npy_4d_float.npy", &["--nrows", "2"]);
+    assert_eq!(
+        insert_rows(&sql, "edge_npy_4d_float"),
+        [
+            "(0, '[0.0,0.25,0.5,0.75,1.0,1.25,1.5,1.75]')",
+            "(1, '[2.0,2.25,2.5,2.75,3.0,3.25,3.5,3.75]')"
+        ]
+    );
 }
 
 #[cfg(feature = "weblog")]
@@ -4955,25 +4974,31 @@ fn sqlite_resolves_a_table_level_primary_key_as_a_rowid_alias() {
     );
 }
 
-// WITHOUT ROWID storage uses an index b-tree rather than a table b-tree -
-// a disclosed, unsupported shape (see CLAUDE.md) - so it gets a clear
-// placeholder column rather than either a crash or silently wrong data,
-// the same "one bad part shouldn't sink everything else" treatment a
-// bad Parquet column or .npz array already gets elsewhere in this project.
-// The other, ordinary table in the same file must still profile normally.
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_without_rowid_table_is_a_disclosed_placeholder_not_a_crash() {
+fn sqlite_without_rowid_table_is_profiled_like_any_other() {
     let doc = run_json("edge_sqlite_without_rowid.sqlite", &[]);
     let kv = table(&doc, "kv");
-    assert_eq!(kv.len(), 1);
-    assert!(
-        kv[0]["notes"].as_str().unwrap().contains("WITHOUT ROWID"),
-        "expected a disclosed WITHOUT ROWID note, got {:?}",
-        kv[0]["notes"]
+    assert_eq!(
+        kv.iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["k", "v"]
     );
+    assert_eq!(column(kv, "k")["missing_pct"], 0.0);
     let normal = table(&doc, "normal");
     assert_eq!(column(normal, "id")["ideal_type"], "i64");
+    // Key-first storage order doesn't leak: columns keep declared order.
+    let doc = run_json("edge_sqlite_without_rowid_multi.sqlite", &[]);
+    let comp = table(&doc, "comp");
+    assert_eq!(
+        comp.iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c", "d"]
+    );
+    assert_eq!(column(comp, "c")["ideal_type"], "f64");
+    assert_eq!(column(table(&doc, "big"), "id")["row_count"], 1200);
 }
 
 #[test]
@@ -15499,10 +15524,9 @@ fn sql_output_inline_mode_ipynb_emits_one_row_per_cell() {
 
 #[test]
 #[cfg(feature = "ipynb")]
-fn sql_output_default_mode_falls_back_to_staging_for_an_array_of_objects() {
-    // sample.ipynb's `outputs` holds result objects: no single cell to
-    // embed. Inline wasn't asked for by name, so staging is used instead
-    // of failing; asking for it by name still gets the specific error.
+fn sql_output_default_mode_writes_child_tables_for_an_array_of_objects() {
+    // sample.ipynb's `outputs` holds result objects: one child table,
+    // keyed to the cell it belongs to - no staging fallback, no note.
     let path = fixture("sample.ipynb");
     let output = Command::new(bin())
         .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
@@ -15510,24 +15534,13 @@ fn sql_output_default_mode_falls_back_to_staging_for_an_array_of_objects() {
         .unwrap();
     assert!(output.status.success());
     let sql = String::from_utf8(output.stdout).unwrap();
-    assert!(sql.contains("\"sample_staging\""), "{sql}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("\"outputs\""));
-
-    let output = Command::new(bin())
-        .args([
-            path.to_str().unwrap(),
-            "-",
-            "--output-format",
-            "sql",
-            "--sql-mode",
-            "inline",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("can't emit real data for field \"outputs\"")
+    assert!(!sql.contains("_staging"), "{sql}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("staging"));
+    assert_child_table(&sql, "sample", "sample__outputs");
+    // Only the third cell has an output.
+    assert_eq!(
+        insert_rows(&sql, "sample__outputs"),
+        ["(3, 1, '[\"   a  b\"]', 2, 'execute_result')"]
     );
 }
 
@@ -16679,4 +16692,53 @@ fn an_extensionless_arrow_stream_is_recognized_by_content_and_loads_as_sql() {
         "{sql}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The value tuples of every INSERT statement for `table` in an inline
+/// script (a big table is written as several batched statements), one
+/// trimmed string per row (`(1, 'a')`).
+fn insert_rows(sql: &str, table: &str) -> Vec<String> {
+    let header = format!("INSERT INTO \"{table}\" (");
+    let mut rows = Vec::new();
+    let mut from = 0;
+    while let Some(at) = sql[from..].find(&header) {
+        let rest = &sql[from + at..];
+        let values = rest.find("VALUES\n").expect("an INSERT has a VALUES list") + "VALUES\n".len();
+        let end = rest[values..].find("\n;").expect("an INSERT ends with ;");
+        rows.extend(
+            rest[values..values + end]
+                .lines()
+                .map(|l| l.trim().trim_end_matches(',').to_string()),
+        );
+        from += at + values + end;
+    }
+    rows
+}
+
+/// `child` is declared as a child table of `parent`: it carries the
+/// `_parent_row_id`/`_index` keys and a foreign key to `parent`'s
+/// `_row_id`, which is `parent`'s primary key.
+fn assert_child_table(sql: &str, parent: &str, child: &str) {
+    assert!(
+        sql.contains(&format!(
+            "CREATE TABLE \"{parent}\" (\n    \"_row_id\" BIGINT NOT NULL,"
+        )),
+        "{sql}"
+    );
+    assert!(sql.contains("PRIMARY KEY (\"_row_id\")"), "{sql}");
+    let create = sql
+        .find(&format!("CREATE TABLE \"{child}\" ("))
+        .unwrap_or_else(|| panic!("no child table {child}: {sql}"));
+    let block = &sql[create..create + sql[create..].find(");").unwrap()];
+    assert!(
+        block.contains("\"_parent_row_id\" BIGINT NOT NULL"),
+        "{block}"
+    );
+    assert!(block.contains("\"_index\" BIGINT NOT NULL"), "{block}");
+    assert!(
+        block.contains(&format!(
+            "FOREIGN KEY (\"_parent_row_id\") REFERENCES \"{parent}\" (\"_row_id\")"
+        )),
+        "{block}"
+    );
 }
