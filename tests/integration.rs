@@ -7543,12 +7543,12 @@ fn extension_still_wins_and_is_never_second_guessed_by_content() {
 
 #[test]
 fn an_extensionless_file_with_no_sniffable_signal_still_gets_an_actionable_error() {
-    // Plain delimited text (TSV) has no magic number or other structural
-    // signal sniff_format looks for (see its doc comment - this is the
-    // same disclosed, deliberate gap CSV/TSV/TOML/YAML/INI all share), so
-    // this must still fail with the same actionable "pass --format"
+    // TOML has no magic number or other structural signal sniff_format
+    // looks for (see its doc comment - the same disclosed, deliberate gap
+    // TOML/YAML/INI share; delimited tables are recognized by content now),
+    // so this must still fail with the same actionable "pass --format"
     // error it always has, not a wrong guess.
-    let (_dir, dest) = copy_fixture_as("sample.tsv", "mystery_data");
+    let (_dir, dest) = copy_fixture_as("sample.toml", "mystery_data");
     let output = Command::new(bin())
         .args([dest.to_str().unwrap()])
         .output()
@@ -8466,15 +8466,19 @@ fn csv_quoted_fields_with_embedded_commas_quotes_and_newlines() {
 }
 
 #[test]
-fn csv_semicolon_delimited_requires_explicit_delimiter_flag() {
-    // Without --delimiter, the whole line is one string column (semicolons not split).
+fn csv_semicolon_delimited_is_detected_and_the_flag_still_wins() {
+    // The dialect detector finds the semicolons with no flag at all.
     let doc_default = run_json("edge_csv_semicolon.csv", &[]);
     let cols_default = table(&doc_default, "edge_csv_semicolon");
     assert_eq!(
         cols_default.len(),
-        1,
-        "without --delimiter ';' the file should collapse to one column"
+        4,
+        "the delimiter should be detected as ';'"
     );
+
+    // Forcing the comma shows what --delimiter overrides: one column.
+    let doc_comma = run_with_format("edge_csv_semicolon.csv", "json", &["--delimiter", ","]);
+    assert_eq!(table(&doc_comma, "edge_csv_semicolon").len(), 1);
 
     // With --delimiter ';' it parses correctly as 4 columns with correct types.
     let doc = run_with_format("edge_csv_semicolon.csv", "json", &["--delimiter", ";"]);
@@ -8487,6 +8491,114 @@ fn csv_semicolon_delimited_requires_explicit_delimiter_flag() {
         (score["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1,
         "empty score should be missing"
     );
+}
+
+// --- CSV dialect detection (the data consistency measure) ---
+
+fn column_names(doc: &serde_json::Value, tbl: &str) -> Vec<String> {
+    table(doc, tbl)
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn csv_dialect_decimal_commas_do_not_hide_the_semicolons() {
+    // 1,50 is a price, not two fields.
+    let doc = run_json("edge_csv_dialect_semicolon_decimal_comma.csv", &[]);
+    let tbl = "edge_csv_dialect_semicolon_decimal_comma";
+    assert_eq!(column_names(&doc, tbl), ["item", "price", "qty", "shipped"]);
+    assert_eq!(sample_names(&doc, tbl, "price"), ["1,50", "22,75", "0,99"]);
+}
+
+#[test]
+fn csv_dialect_single_quotes_and_pipes_are_found() {
+    let doc = run_json("edge_csv_dialect_pipe_single_quote.csv", &[]);
+    let tbl = "edge_csv_dialect_pipe_single_quote";
+    assert_eq!(column_names(&doc, tbl), ["id", "text", "note"]);
+    // The pipes inside the quotes stay in the cell.
+    assert_eq!(
+        sample_names(&doc, tbl, "text"),
+        ["hello | world", "plain", "a|b|c"]
+    );
+}
+
+#[test]
+fn csv_dialect_backslash_escapes_keep_the_comma() {
+    let doc = run_json("edge_csv_dialect_backslash_escape.csv", &[]);
+    let tbl = "edge_csv_dialect_backslash_escape";
+    assert_eq!(column_names(&doc, tbl), ["id", "name", "city"]);
+    assert_eq!(
+        sample_names(&doc, tbl, "name"),
+        ["Smith, John", "Doe, Jane", "Ng, Wei"]
+    );
+}
+
+#[test]
+fn csv_dialect_a_list_of_names_is_one_column_not_a_space_delimited_table() {
+    let doc = run_json("edge_csv_dialect_single_column.csv", &[]);
+    let tbl = "edge_csv_dialect_single_column";
+    assert_eq!(column_names(&doc, tbl), ["Robert Plant"]);
+}
+
+#[test]
+fn csv_dialect_the_delimiter_flag_overrides_detection() {
+    let doc = run_with_format(
+        "edge_csv_dialect_semicolon_decimal_comma.csv",
+        "json",
+        &["--delimiter", ","],
+    );
+    // Forced to commas, the decimal commas split the prices.
+    assert!(column_names(&doc, "edge_csv_dialect_semicolon_decimal_comma").len() > 1);
+    assert_ne!(
+        column_names(&doc, "edge_csv_dialect_semicolon_decimal_comma"),
+        ["item", "price", "qty", "shipped"]
+    );
+}
+
+#[test]
+fn delimited_text_under_other_extensions_is_recognized_by_content() {
+    for (file, tbl, cols) in [
+        (
+            "edge_dialect_pipe_table.txt",
+            "edge_dialect_pipe_table",
+            vec!["id", "name", "score"],
+        ),
+        (
+            "edge_dialect_semicolon_table.dat",
+            "edge_dialect_semicolon_table",
+            vec!["a", "b"],
+        ),
+        (
+            "edge_dialect_tab_table.tab",
+            "edge_dialect_tab_table",
+            vec!["x", "y", "z"],
+        ),
+        (
+            "edge_dialect_pipe_table.psv",
+            "edge_dialect_pipe_table",
+            vec!["k", "v"],
+        ),
+        // No extension at all.
+        (
+            "edge_dialect_pipe_table_noext",
+            "edge_dialect_pipe_table_noext",
+            vec!["id", "name", "score"],
+        ),
+    ] {
+        let doc = run_json(file, &[]);
+        assert_eq!(column_names(&doc, tbl), cols, "{file}");
+    }
+}
+
+#[test]
+fn prose_in_a_text_file_is_still_not_mistaken_for_a_table() {
+    let out = Command::new(bin())
+        .args([fixture("edge_dialect_prose.txt").to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("can't infer format"));
 }
 
 #[test]
@@ -9359,17 +9471,11 @@ fn content_sniffing_for_extensionless_files() {
     assert_eq!(doc["format"], "json");
     assert!(doc["tables"]["edge_sniff_json_no_ext"].as_array().is_some());
 
-    // CSV without extension is deliberately NOT sniffed -> requires --format.
-    let output = Command::new(bin())
-        .args([fixture("edge_sniff_csv_no_ext").to_str().unwrap(), "-"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--format"),
-        "CSV without extension should demand --format: {stderr}"
-    );
+    // CSV without an extension is recognized by its content: the same rows
+    // split into the same columns under a common delimiter.
+    let doc = run_json("edge_sniff_csv_no_ext", &[]);
+    assert_eq!(doc["format"], "csv");
+    assert!(doc["tables"]["edge_sniff_csv_no_ext"].as_array().is_some());
 }
 
 #[cfg(feature = "parquet")]
@@ -9616,12 +9722,20 @@ fn format_override_for_misnamed_file() {
     );
     let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(doc["tables"]["data"].as_array().is_some());
-    // Without --format it should fail (CSV not sniffed).
+    // Without --format a `.txt` that holds a consistent table is still read
+    // as one (see `looks_like_delimited_table`); prose is not.
     let output2 = Command::new(bin())
-        .args([misnamed.to_str().unwrap(), "-"])
+        .args([misnamed.to_str().unwrap(), "-", "--output-format", "json"])
         .output()
         .unwrap();
-    assert!(!output2.status.success());
+    assert!(output2.status.success());
+    let prose = dir.path().join("notes.txt");
+    std::fs::write(&prose, "A line of prose, with a comma.\nAnother, longer line, with two commas.\nAnd a third.\nFin.\n").unwrap();
+    let output3 = Command::new(bin())
+        .args([prose.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!output3.status.success());
 }
 
 #[test]
@@ -9916,7 +10030,7 @@ fn sas_copy_reads_same_as_original() {
 }
 
 #[test]
-fn csv_trailing_comma_is_ragged_error_and_tsv_via_csv_ext_needs_delimiter() {
+fn csv_trailing_comma_is_ragged_error_and_tsv_via_csv_ext_is_detected() {
     let output = Command::new(bin())
         .args([
             fixture("edge_csv_trailing_comma.csv").to_str().unwrap(),
@@ -9931,9 +10045,12 @@ fn csv_trailing_comma_is_ragged_error_and_tsv_via_csv_ext_needs_delimiter() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("record") || stderr.contains("field"));
 
-    // TSV content in .csv file without --delimiter collapses to one column.
+    // TSV content in a .csv file is detected as tab-delimited; forcing a comma
+    // collapses it to one column.
     let doc_default = run_json("edge_tsv_via_csv_ext.csv", &[]);
-    assert_eq!(table(&doc_default, "edge_tsv_via_csv_ext").len(), 1);
+    assert_eq!(table(&doc_default, "edge_tsv_via_csv_ext").len(), 3);
+    let doc_comma = run_with_format("edge_tsv_via_csv_ext.csv", "json", &["--delimiter", ","]);
+    assert_eq!(table(&doc_comma, "edge_tsv_via_csv_ext").len(), 1);
     let output2 = Command::new(bin())
         .args([
             fixture("edge_tsv_via_csv_ext.csv").to_str().unwrap(),
@@ -12474,17 +12591,26 @@ fn stdin_input_content_sniffs_json_with_no_format_flag() {
     assert_eq!(doc["tables"]["stdin"][0]["name"], "a");
 }
 
-/// A format with no fixed leading byte (CSV) still needs `--format`
+/// A format with no fixed leading byte (TOML) still needs `--format`
 /// explicitly when piped through stdin, exactly as it already would for
 /// any other extensionless input - not a stdin-specific limitation, just
-/// the same rule applied consistently.
+/// the same rule applied consistently. (A delimited table is recognized
+/// by its content, so piped CSV needs no flag.)
 #[test]
 fn stdin_input_without_format_still_needs_it_for_a_non_sniffable_format() {
-    let content = std::fs::read(fixture("sample.csv")).unwrap();
+    let content = std::fs::read(fixture("sample.toml")).unwrap();
     let output = run_with_stdin(&content, &["-", "-"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("can't infer format from extension"));
+
+    let csv = std::fs::read(fixture("sample.csv")).unwrap();
+    let output = run_with_stdin(&csv, &["-", "-", "--output-format", "json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// `sniff-rs -` alone (no OUTPUT_PATH) is a clear, actionable error - not
