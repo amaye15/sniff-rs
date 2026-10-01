@@ -4433,6 +4433,83 @@ fn sas7bdat_format_is_recognized() {
     );
 }
 
+// Checksum-validated identifiers. The fixture's values were built from
+// python-stdnum's own check-digit routines; `id_checksum_vectors.tsv` (used by
+// a unit test) holds stdnum's verdict on thousands more.
+#[test]
+fn checksum_identifiers_are_recognized_and_near_misses_are_not() {
+    let doc = run_json("type_detection_identifiers.csv", &[]);
+    let cols = table(&doc, "type_detection_identifiers");
+    for (name, ideal) in [
+        ("isin", "ISIN"),
+        ("lei", "LEI"),
+        ("figi", "FIGI"),
+        ("orcid", "ORCID / ISNI"),
+        ("issn", "ISSN"),
+        ("cas_number", "CAS Number"),
+        ("container", "Container Number"),
+        ("imo", "IMO Number"),
+        ("doi", "DOI"),
+        ("cusip", "CUSIP"),
+        ("sedol", "SEDOL"),
+        ("imo_compact", "IMO Number"),
+        ("npi", "US NPI"),
+        ("routing", "ABA Routing Number"),
+        ("ean8", "EAN-8"),
+        ("gtin14", "GTIN-14"),
+    ] {
+        assert_eq!(column(cols, name)["ideal_type"], ideal, "{name}");
+    }
+    // One wrong check character and the column is plain text / integers.
+    for name in [
+        "near_miss_isin",
+        "near_miss_lei",
+        "near_miss_figi",
+        "near_miss_cusip",
+        "near_miss_container",
+        "near_miss_cas_number",
+    ] {
+        assert_eq!(column(cols, name)["ideal_type"], "String", "{name}");
+    }
+    for name in ["near_miss_npi", "near_miss_routing"] {
+        assert_eq!(column(cols, name)["ideal_type"], "i64", "{name}");
+    }
+    // Digit-only forms look like any integer, so three values aren't
+    // enough to call them routing numbers.
+    assert_eq!(column(cols, "short_routing")["ideal_type"], "i64");
+}
+
+#[test]
+fn checksum_identifiers_get_sized_sql_columns_and_a_string_schema() {
+    let out = Command::new(bin())
+        .arg(fixture("type_detection_identifiers.csv"))
+        .args(["--output-format", "sql", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8_lossy(&out.stdout);
+    assert!(sql.contains("\"isin\" VARCHAR(12)"), "{sql}");
+    assert!(sql.contains("\"lei\" VARCHAR(20)"), "{sql}");
+    assert!(sql.contains("\"orcid\" VARCHAR(19)"), "{sql}");
+    assert!(sql.contains("\"doi\" TEXT"), "{sql}");
+    // An ABA routing number keeps its leading zeros as text.
+    assert!(sql.contains("\"routing\" VARCHAR(9)"), "{sql}");
+
+    let out = Command::new(bin())
+        .arg(fixture("type_detection_identifiers.csv"))
+        .args(["--output-format", "json-schema", "-"])
+        .output()
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let props = &doc["tables"]["type_detection_identifiers"]["properties"];
+    assert_eq!(props["isin"]["type"], "string");
+    assert_eq!(props["routing"]["type"], "string");
+}
+
 // SAS Transport (.xpt). `xport_nhanes_*.xpt` are real CDC NHANES files
 // (see tests/fixtures/xport_PROVENANCE.md); every expected value below was
 // cross-checked against pyreadstat (ReadStat) and, for the NHANES files,

@@ -17838,6 +17838,53 @@ techniques with a published, checkable answer.
   the row is the running sum of widths, as in ReadStat, not the `npos`
   field.
 
+- **Checksum-validated identifiers (`id_checksum_support`).** Fourteen more
+  standards whose last character is a check digit, so a column of them is
+  typed by evidence rather than shape: ISIN (ISO 6166: a country prefix from
+  the ISO/ANNA list, letters expanded to two digits, Luhn), CUSIP
+  (every second character doubled, digits of each product summed), SEDOL
+  (weights 1,3,1,7,3,9; no vowels), FIGI (CUSIP-style over full alphanumeric
+  values, `G` third, reserved prefixes refused), LEI (ISO 17442, mod 97-10),
+  ORCID iD / ISNI (ISO 7064 mod 11-2, `X` for ten), ISSN (mod 11), CAS
+  Registry Number (weights counting up from the check digit), IMO ship
+  number, ISO 6346 container number (letter values skip 11/22/33), US NPI
+  (Luhn with the 80840 prefix), ABA routing number (3-7-1), EAN-8 and
+  GTIN-14, and the Crossref DOI pattern (shape only - a DOI has no check
+  digit, and `10.NNNN/` is distinctive). They are a table
+  (`CHECKSUM_IDS`: name, note, check function, `min_values`, SQL type), one
+  `id_ok` flag per entry in `IdealTypeAccumulator`, so another standard is
+  one function and one row. Most specific first; the first entry every
+  value passes names the column, and it sits ahead of the credit-card check
+  but behind IBAN/ISBN/EAN-13/IMEI/VIN.
+
+  The false-positive guard is `min_values`. A column takes a type only if
+  every value passes, so ordinary numbers pass an `n`-value column with
+  probability `10^-n` - negligible for a real column, not for a three-row
+  one. Forms with letters or hyphens (`IMO 9074729`, `0378-5955`, an ISIN)
+  count from one or two values; digit-only compact forms (IMO, ISSN without
+  its hyphen, ABA, NPI, EAN-8, GTIN-14, ORCID without hyphens, CUSIP,
+  SEDOL) need five, which makes a coincidence about one in a hundred
+  thousand. Forms are canonical (upper case, standard separators): python-
+  stdnum's `compact()` also accepts lower case and stray separators, which
+  would make a column of ordinary text look like an ID, and its own
+  `casrn`/`iso6346` regexes are looser than the standards (a CAS number
+  without hyphens, a digit in a container's owner code) - found by the
+  first run of the vector test and not copied.
+
+  *Verification.* `tests/fixtures/id_checksum_vectors.tsv` holds 6,100
+  `type<TAB>value<TAB>verdict` lines: for each standard, valid values built
+  from stdnum's own `calc_check_digit`, single-character tampers of them
+  (which stdnum must and does reject), random strings of the right shape and
+  wrong lengths, plus published examples (Apple's ISIN `US0378331005`, the
+  LEI `HWUPKR0MPOU8FGXBT394`, water's CAS `7732-18-5`, Josiah Carberry's
+  ORCID `0000-0002-1825-0097`). The unit test
+  `id_checksum_tests::verdicts_match_python_stdnum` requires every verdict
+  to match, and a second test feeds hostile input (multi-byte characters
+  at every slice point, empty and 200-character strings) to every check.
+  `type_detection_identifiers.csv` runs the whole pipeline, with a near-miss
+  column per type and the three-value rule. A sweep of every other fixture
+  against the previous build changed nothing.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

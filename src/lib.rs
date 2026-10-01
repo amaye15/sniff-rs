@@ -6404,6 +6404,570 @@ fn is_vin(s: &str) -> bool {
     b[8] == expected
 }
 
+// --- Checksum-validated identifiers beyond the card/IBAN/ISBN/VIN family ---
+//
+// Each is a published standard whose last character (or last two) is a
+// check digit, so a value that passes is far stronger evidence than its
+// shape: a securities identifier (ISIN, CUSIP, SEDOL, FIGI), a legal-entity
+// or person/contributor identifier (LEI, ORCID/ISNI), a serial (ISSN), a
+// chemical (CAS Registry Number), a ship or container (IMO, ISO 6346), a
+// US provider or bank (NPI, ABA routing number) or a retail trade item
+// (EAN-8, GTIN-14). Every algorithm here was cross-checked against
+// python-stdnum on random valid, single-character-tampered and random
+// invalid values - see the tests and CLAUDE.md.
+//
+// A column takes the type only if *every* value passes, so the chance a
+// column of ordinary numbers is mistaken for one of these is `1/10^n` for
+// `n` values. The digit-only compact forms (`IMO`, `ABA`, an unhyphenated
+// ISSN) look exactly like ordinary integers, so a column must hold at
+// least `min_values` of them before they count: five values leave about
+// one false match in a hundred thousand. Forms with letters or hyphens are
+// distinctive enough to count from the first value.
+mod id_checksum_support {
+    /// `0-9` is 0-9 and `A-Z` is 10-35; anything else (including lower case,
+    /// which none of these standards use) has no value.
+    fn alnum(c: u8) -> Option<u32> {
+        match c {
+            b'0'..=b'9' => Some(u32::from(c - b'0')),
+            b'A'..=b'Z' => Some(u32::from(c - b'A') + 10),
+            _ => None,
+        }
+    }
+
+    fn digit(c: u8) -> Option<u32> {
+        c.is_ascii_digit().then(|| u32::from(c - b'0'))
+    }
+
+    fn all_digits(b: &[u8]) -> bool {
+        !b.is_empty() && b.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Digits of `v * w` summed, the CUSIP/FIGI way of folding a doubled
+    /// two-digit product back into one digit.
+    fn digit_sum(mut n: u32) -> u32 {
+        let mut sum = 0;
+        while n > 0 {
+            sum += n % 10;
+            n /= 10;
+        }
+        sum
+    }
+
+    /// ISO 6166 country prefixes plus the ISO/ANNA special ones (`XS`,
+    /// `EU`, `QS`, ...) - the list python-stdnum validates against.
+    const ISIN_PREFIXES: &[&str] = &[
+        "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AN", "AO", "AQ", "AR", "AS", "AT", "AU", "AW",
+        "AX", "AZ", "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO",
+        "BQ", "BR", "BS", "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI",
+        "CK", "CL", "CM", "CN", "CO", "CR", "CS", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ",
+        "DK", "DM", "DO", "DZ", "EC", "EE", "EG", "EH", "ER", "ES", "ET", "EU", "FI", "FJ", "FK",
+        "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF", "GG", "GH", "GI", "GL", "GM", "GN", "GP",
+        "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM", "HN", "HR", "HT", "HU", "ID", "IE",
+        "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT", "JE", "JM", "JO", "JP", "KE", "KG", "KH",
+        "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC", "LI", "LK", "LR", "LS",
+        "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK", "ML", "MM", "MN",
+        "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA", "NC", "NE",
+        "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG", "PH",
+        "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY", "QA", "QS", "QT", "RE", "RO", "RS",
+        "RU", "RW", "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN",
+        "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK",
+        "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ", "UA", "UG", "UM", "US", "UY", "UZ",
+        "VA", "VC", "VE", "VG", "VI", "VN", "VU", "WF", "WS", "XA", "XB", "XC", "XD", "XF", "XK",
+        "XS", "YE", "YT", "ZA", "ZM", "ZW",
+    ];
+
+    /// ISO 6166: country code, nine alphanumerics, a check digit. Letters
+    /// become two digits (A=10 ... Z=35) and the whole string must pass
+    /// Luhn.
+    pub fn is_isin(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 12
+            || !s.get(..2).is_some_and(|p| ISIN_PREFIXES.contains(&p))
+            || !b[..2].iter().all(u8::is_ascii_uppercase)
+            || !b[11].is_ascii_digit()
+        {
+            return false;
+        }
+        let mut digits = Vec::with_capacity(24);
+        for &c in b {
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            if v >= 10 {
+                digits.push(v / 10);
+                digits.push(v % 10);
+            } else {
+                digits.push(v);
+            }
+        }
+        super::luhn_checksum_valid(&digits)
+    }
+
+    /// CUSIP: eight characters from `0-9A-Z*@#` and a check digit; every
+    /// second character is doubled and the digits of each product summed.
+    pub fn is_cusip(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 9 || !b[8].is_ascii_digit() {
+            return false;
+        }
+        let mut sum = 0;
+        for (i, &c) in b[..8].iter().enumerate() {
+            let v = match c {
+                b'*' => 36,
+                b'@' => 37,
+                b'#' => 38,
+                _ => match alnum(c) {
+                    Some(v) => v,
+                    None => return false,
+                },
+            };
+            sum += digit_sum(v * if i % 2 == 1 { 2 } else { 1 });
+        }
+        (10 - sum % 10) % 10 == u32::from(b[8] - b'0')
+    }
+
+    /// SEDOL: six characters (digits and consonants), weights 1,3,1,7,3,9,
+    /// and a check digit. A leading digit means the whole thing is numeric
+    /// (the old style).
+    pub fn is_sedol(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 7 || !b[6].is_ascii_digit() {
+            return false;
+        }
+        let mut sum = 0;
+        for (i, &c) in b[..6].iter().enumerate() {
+            if matches!(c, b'A' | b'E' | b'I' | b'O' | b'U') {
+                return false;
+            }
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            sum += v * [1, 3, 1, 7, 3, 9][i];
+        }
+        if b[0].is_ascii_digit() && !all_digits(b) {
+            return false;
+        }
+        (10 - sum % 10) % 10 == u32::from(b[6] - b'0')
+    }
+
+    /// ISO 17442 Legal Entity Identifier: eighteen alphanumerics and two
+    /// check digits, ISO 7064 MOD 97-10 over the letters-as-numbers string.
+    pub fn is_lei(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 20 || !b[18].is_ascii_digit() || !b[19].is_ascii_digit() {
+            return false;
+        }
+        let mut rem = 0u32;
+        for &c in b {
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            rem = if v >= 10 {
+                (rem * 100 + v) % 97
+            } else {
+                (rem * 10 + v) % 97
+            };
+        }
+        rem == 1
+    }
+
+    /// OMG Financial Instrument Global Identifier: two consonants (not one
+    /// of the reserved prefixes), `G`, eight more from digits and
+    /// consonants, a check digit computed like CUSIP's over the full
+    /// alphanumeric values.
+    pub fn is_figi(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 12 || b[2] != b'G' || !b[11].is_ascii_digit() {
+            return false;
+        }
+        if b[0].is_ascii_digit() || b[1].is_ascii_digit() {
+            return false;
+        }
+        if matches!(s.get(..2), Some("BS" | "BM" | "GG" | "GB" | "VG")) {
+            return false;
+        }
+        let mut sum = 0;
+        for (i, &c) in b[..11].iter().enumerate() {
+            if matches!(c, b'A' | b'E' | b'I' | b'O' | b'U') {
+                return false;
+            }
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            sum += digit_sum(v * if i % 2 == 1 { 2 } else { 1 });
+        }
+        (10 - sum % 10) % 10 == u32::from(b[11] - b'0')
+    }
+
+    /// ISSN with its hyphen (`0378-5955`): weights 8..2 on the first seven
+    /// digits, check digit `X` for ten.
+    pub fn is_issn_hyphenated(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 9 && b[4] == b'-' && issn_body(&[&b[..4], &b[5..]].concat())
+    }
+
+    /// The same eight characters with no hyphen.
+    pub fn is_issn_compact(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 8 && issn_body(b)
+    }
+
+    fn issn_body(b: &[u8]) -> bool {
+        if !all_digits(&b[..7]) {
+            return false;
+        }
+        let sum: u32 = b[..7]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (8 - i as u32) * u32::from(c - b'0'))
+            .sum();
+        let check = (11 - sum % 11) % 11;
+        match b[7] {
+            b'X' => check == 10,
+            c if c.is_ascii_digit() => check == u32::from(c - b'0'),
+            _ => false,
+        }
+    }
+
+    /// ISO 7064 MOD 11-2 over fifteen digits: the check character of an
+    /// ISNI and so of an ORCID iD.
+    fn mod_11_2_ok(d: &[u8]) -> bool {
+        if d.len() != 16 || !all_digits(&d[..15]) {
+            return false;
+        }
+        let mut total = 0u32;
+        for &c in &d[..15] {
+            total = (total + u32::from(c - b'0')) * 2;
+        }
+        let check = (12 - total % 11) % 11;
+        match d[15] {
+            b'X' => check == 10,
+            c if c.is_ascii_digit() => check == u32::from(c - b'0'),
+            _ => false,
+        }
+    }
+
+    /// ORCID iD / ISNI in its printed form: four groups of four separated
+    /// by hyphens or spaces (`0000-0002-1825-0097`).
+    pub fn is_isni_grouped(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 19 || !matches!(b[4], b'-' | b' ') {
+            return false;
+        }
+        if b[9] != b[4] || b[14] != b[4] {
+            return false;
+        }
+        let compact: Vec<u8> = b
+            .iter()
+            .copied()
+            .filter(|c| !matches!(c, b'-' | b' '))
+            .collect();
+        mod_11_2_ok(&compact)
+    }
+
+    /// The same sixteen characters unseparated.
+    pub fn is_isni_compact(s: &str) -> bool {
+        mod_11_2_ok(s.as_bytes())
+    }
+
+    /// CAS Registry Number: `NNNNNNN-NN-N`, two to seven leading digits (no
+    /// leading zero), weights counting up from the digit left of the check
+    /// digit, sum mod 10.
+    pub fn is_cas(s: &str) -> bool {
+        let b = s.as_bytes();
+        if !(7..=12).contains(&b.len()) {
+            return false;
+        }
+        let n = b.len();
+        if b[n - 2] != b'-' || b[n - 5] != b'-' || b[0] == b'0' {
+            return false;
+        }
+        let body: Vec<u8> = b[..n - 5].iter().chain(&b[n - 4..n - 2]).copied().collect();
+        if !all_digits(&body) || !b[n - 1].is_ascii_digit() {
+            return false;
+        }
+        let sum: u32 = body
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, &c)| (i as u32 + 1) * u32::from(c - b'0'))
+            .sum();
+        sum % 10 == u32::from(b[n - 1] - b'0')
+    }
+
+    fn imo_body(d: &[u8]) -> bool {
+        if d.len() != 7 || !all_digits(d) {
+            return false;
+        }
+        let sum: u32 = d[..6]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (7 - i as u32) * u32::from(c - b'0'))
+            .sum();
+        sum % 10 == u32::from(d[6] - b'0')
+    }
+
+    /// IMO ship number written with its prefix (`IMO 9074729`).
+    pub fn is_imo_prefixed(s: &str) -> bool {
+        s.strip_prefix("IMO ")
+            .is_some_and(|rest| imo_body(rest.as_bytes()))
+    }
+
+    /// The seven digits alone.
+    pub fn is_imo_compact(s: &str) -> bool {
+        imo_body(s.as_bytes())
+    }
+
+    /// ISO 6346 freight container number: owner code (three letters), a
+    /// category letter (`U`, `J`, `Z` or `R`), six digits and a check
+    /// digit. Letter values skip the multiples of eleven.
+    pub fn is_iso6346(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 11
+            || !b[..3].iter().all(u8::is_ascii_uppercase)
+            || !matches!(b[3], b'U' | b'J' | b'Z' | b'R')
+            || !all_digits(&b[4..])
+        {
+            return false;
+        }
+        let mut sum = 0u32;
+        for (i, &c) in b[..10].iter().enumerate() {
+            let v = match c {
+                b'0'..=b'9' => u32::from(c - b'0'),
+                _ => {
+                    // A=10, then B=12: 11, 22 and 33 are skipped.
+                    let mut v = 10 + u32::from(c - b'A');
+                    if v >= 11 {
+                        v += 1;
+                    }
+                    if v >= 22 {
+                        v += 1;
+                    }
+                    if v >= 33 {
+                        v += 1;
+                    }
+                    v
+                }
+            };
+            sum += v << i;
+        }
+        sum % 11 % 10 == u32::from(b[10] - b'0')
+    }
+
+    /// US National Provider Identifier: ten digits, the first 1 or 2,
+    /// Luhn-valid once the health-industry prefix 80840 is put in front.
+    pub fn is_npi(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 10 || !all_digits(b) || !matches!(b[0], b'1' | b'2') {
+            return false;
+        }
+        let mut digits = vec![8, 0, 8, 4, 0];
+        digits.extend(b.iter().filter_map(|&c| digit(c)));
+        super::luhn_checksum_valid(&digits)
+    }
+
+    /// ABA routing transit number: nine digits, weights 3,7,1 repeating,
+    /// sum divisible by ten.
+    pub fn is_aba_routing(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 9 || !all_digits(b) {
+            return false;
+        }
+        let w = [3, 7, 1, 3, 7, 1, 3, 7, 1];
+        let sum: u32 = b.iter().zip(w).map(|(&c, w)| w * u32::from(c - b'0')).sum();
+        sum.is_multiple_of(10)
+    }
+
+    /// GS1 check digit over `n` digits: alternating weights 3 and 1 from
+    /// the right of the body, shared by EAN-8 and GTIN-14.
+    fn gs1_ok(b: &[u8], len: usize) -> bool {
+        if b.len() != len || !all_digits(b) {
+            return false;
+        }
+        let sum: u32 = b[..len - 1]
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, &c)| u32::from(c - b'0') * if i % 2 == 0 { 3 } else { 1 })
+            .sum();
+        (10 - sum % 10) % 10 == u32::from(b[len - 1] - b'0')
+    }
+
+    pub fn is_ean8(s: &str) -> bool {
+        gs1_ok(s.as_bytes(), 8)
+    }
+
+    pub fn is_gtin14(s: &str) -> bool {
+        gs1_ok(s.as_bytes(), 14)
+    }
+
+    /// Crossref's DOI pattern, which matches 74.4 of the 74.9 million DOIs
+    /// it holds: `10.`, a four to nine digit registrant code, `/`, and a
+    /// suffix of letters, digits and `-._;()/:`. A DOI has no checksum; the
+    /// `10.NNNN/` lead is distinctive enough on its own.
+    pub fn is_doi(s: &str) -> bool {
+        let Some(rest) = s.strip_prefix("10.") else {
+            return false;
+        };
+        let Some((registrant, suffix)) = rest.split_once('/') else {
+            return false;
+        };
+        (4..=9).contains(&registrant.len())
+            && all_digits(registrant.as_bytes())
+            && !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-._;()/:".contains(&c))
+    }
+
+    pub struct ChecksumId {
+        pub name: &'static str,
+        pub note: &'static str,
+        pub check: fn(&str) -> bool,
+        /// Values a column needs before this counts (see the module notes).
+        pub min_values: usize,
+        /// The SQL column type: a `VARCHAR` as long as the longest value
+        /// `check` accepts, or `TEXT` where nothing bounds it.
+        pub sql: &'static str,
+    }
+
+    /// Most distinctive first; the first entry every value of a column
+    /// passes names the column.
+    pub static CHECKSUM_IDS: &[ChecksumId] = &[
+        ChecksumId {
+            name: "LEI",
+            note: "matches the Legal Entity Identifier format (20 characters, ISO 7064 mod 97-10 check valid)",
+            check: is_lei,
+            min_values: 1,
+            sql: "VARCHAR(20)",
+        },
+        ChecksumId {
+            name: "ORCID / ISNI",
+            note: "matches an ORCID iD / ISNI (16 characters in groups of four, ISO 7064 mod 11-2 check valid)",
+            check: is_isni_grouped,
+            min_values: 1,
+            sql: "VARCHAR(19)",
+        },
+        ChecksumId {
+            name: "ISIN",
+            note: "matches an ISIN (ISO 6166 country prefix, Luhn check valid)",
+            check: is_isin,
+            min_values: 2,
+            sql: "VARCHAR(12)",
+        },
+        ChecksumId {
+            name: "FIGI",
+            note: "matches a Financial Instrument Global Identifier (check digit valid)",
+            check: is_figi,
+            min_values: 1,
+            sql: "VARCHAR(12)",
+        },
+        ChecksumId {
+            name: "Container Number",
+            note: "matches an ISO 6346 freight container number (check digit valid)",
+            check: is_iso6346,
+            min_values: 1,
+            sql: "VARCHAR(11)",
+        },
+        ChecksumId {
+            name: "CAS Number",
+            note: "matches a CAS Registry Number (check digit valid)",
+            check: is_cas,
+            min_values: 1,
+            sql: "VARCHAR(12)",
+        },
+        ChecksumId {
+            name: "ISSN",
+            note: "matches an ISSN (mod-11 check valid)",
+            check: is_issn_hyphenated,
+            min_values: 1,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "IMO Number",
+            note: "matches an IMO ship number (check digit valid)",
+            check: is_imo_prefixed,
+            min_values: 1,
+            sql: "VARCHAR(11)",
+        },
+        ChecksumId {
+            name: "DOI",
+            note: "matches the Crossref DOI pattern (10.<registrant>/<suffix>) - shape only, a DOI has no check digit",
+            check: is_doi,
+            min_values: 1,
+            sql: "TEXT",
+        },
+        ChecksumId {
+            name: "CUSIP",
+            note: "matches a CUSIP (check digit valid)",
+            check: is_cusip,
+            min_values: 5,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "SEDOL",
+            note: "matches a SEDOL (check digit valid)",
+            check: is_sedol,
+            min_values: 5,
+            sql: "VARCHAR(7)",
+        },
+        ChecksumId {
+            name: "ORCID / ISNI",
+            note: "matches an ORCID iD / ISNI (16 characters, ISO 7064 mod 11-2 check valid)",
+            check: is_isni_compact,
+            min_values: 5,
+            sql: "VARCHAR(19)",
+        },
+        ChecksumId {
+            name: "ISSN",
+            note: "matches an ISSN (mod-11 check valid)",
+            check: is_issn_compact,
+            min_values: 5,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "IMO Number",
+            note: "matches an IMO ship number (check digit valid)",
+            check: is_imo_compact,
+            min_values: 5,
+            sql: "VARCHAR(11)",
+        },
+        ChecksumId {
+            name: "US NPI",
+            note: "matches a US National Provider Identifier (Luhn check valid with the 80840 prefix)",
+            check: is_npi,
+            min_values: 5,
+            sql: "VARCHAR(10)",
+        },
+        ChecksumId {
+            name: "ABA Routing Number",
+            note: "matches an ABA routing transit number (3-7-1 checksum valid)",
+            check: is_aba_routing,
+            min_values: 5,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "EAN-8",
+            note: "matches an EAN-8 barcode (check digit valid)",
+            check: is_ean8,
+            min_values: 5,
+            sql: "VARCHAR(8)",
+        },
+        ChecksumId {
+            name: "GTIN-14",
+            note: "matches a GTIN-14 (check digit valid)",
+            check: is_gtin14,
+            min_values: 5,
+            sql: "VARCHAR(14)",
+        },
+    ];
+
+    /// The SQL type of a column named for one of `CHECKSUM_IDS`.
+    pub fn sql_type_of(name: &str) -> Option<&'static str> {
+        CHECKSUM_IDS.iter().find(|d| d.name == name).map(|d| d.sql)
+    }
+}
+
 /// An incremental, one-value-at-a-time engine backing `suggest_ideal_type`
 /// (below) - built so peak memory for type detection can eventually drop
 /// below "every value in a column held in memory at once" (see CLAUDE.md's
@@ -6438,6 +7002,8 @@ struct IdealTypeAccumulator {
     ean_upc_ok: bool,
     imei_ok: bool,
     vin_ok: bool,
+    /// One flag per entry of `id_checksum_support::CHECKSUM_IDS`.
+    id_ok: Vec<bool>,
     credit_card_ok: bool,
     uuid_ok: bool,
     ulid_ok: bool,
@@ -6499,6 +7065,7 @@ impl IdealTypeAccumulator {
             ean_upc_ok: true,
             imei_ok: true,
             vin_ok: true,
+            id_ok: vec![true; id_checksum_support::CHECKSUM_IDS.len()],
             credit_card_ok: true,
             uuid_ok: true,
             ulid_ok: true,
@@ -6562,6 +7129,14 @@ impl IdealTypeAccumulator {
         }
         if self.vin_ok {
             self.vin_ok = is_vin(v);
+        }
+        for (def, ok) in id_checksum_support::CHECKSUM_IDS
+            .iter()
+            .zip(self.id_ok.iter_mut())
+        {
+            if *ok {
+                *ok = (def.check)(v);
+            }
         }
         if self.credit_card_ok {
             self.credit_card_ok = is_credit_card_number(v);
@@ -6743,6 +7318,14 @@ impl IdealTypeAccumulator {
                 "VIN".to_string(),
                 "matches Vehicle Identification Number format (mod-11 checksum valid)".to_string(),
             );
+        }
+        if let Some(def) = id_checksum_support::CHECKSUM_IDS
+            .iter()
+            .zip(&self.id_ok)
+            .find(|(def, ok)| **ok && self.total >= def.min_values)
+            .map(|(def, _)| def)
+        {
+            return (def.name.to_string(), def.note.to_string());
         }
         if self.credit_card_ok {
             return (
@@ -78827,6 +79410,7 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "ULID"
         | "WKT Geometry"
         | "Cron Expression" => Some(("string", None)),
+        name if id_checksum_support::sql_type_of(name).is_some() => Some(("string", None)),
         _ => None,
     }
 }
@@ -79043,6 +79627,9 @@ fn sql_column_type(ideal_type: &str) -> &'static str {
         "SemVer" => "VARCHAR(32)",
         "Geographic Coordinates" => "VARCHAR(64)",
         "Cron Expression" => "VARCHAR(64)",
+        name if id_checksum_support::sql_type_of(name).is_some() => {
+            id_checksum_support::sql_type_of(name).unwrap_or("TEXT")
+        }
         // Email/URL/JWT/WKT Geometry/String/"enum / category"/
         // "mixed(...)"/Vec<T>/anything unrecognized: no format-
         // guaranteed maximum length, so TEXT rather than a VARCHAR that
@@ -116425,5 +117012,85 @@ mod tests {
         assert_eq!(e.confidence, Confidence::Probable);
         // Same edge found from the other endpoint.
         assert!(std::ptr::eq(e, rel_edge(&edges, "orders", "user_id")));
+    }
+}
+
+#[cfg(test)]
+mod id_checksum_tests {
+    use super::id_checksum_support::*;
+
+    /// `tests/fixtures/id_checksum_vectors.tsv` holds python-stdnum's verdict
+    /// on thousands of valid, single-character-tampered, random and
+    /// wrong-length values per identifier (`type<TAB>value<TAB>0|1`,
+    /// generated by a script that builds each valid value from stdnum's own
+    /// check-digit routine). Every verdict must match.
+    #[test]
+    fn verdicts_match_python_stdnum() {
+        type Check = fn(&str) -> bool;
+        let table: &[(&str, Check)] = &[
+            ("isin", is_isin),
+            ("cusip", is_cusip),
+            ("sedol", is_sedol),
+            ("lei", is_lei),
+            ("figi", is_figi),
+            ("issn_hyphen", is_issn_hyphenated),
+            ("issn_compact", is_issn_compact),
+            ("isni_grouped", is_isni_grouped),
+            ("isni_compact", is_isni_compact),
+            ("cas", is_cas),
+            ("imo_prefixed", is_imo_prefixed),
+            ("imo_compact", is_imo_compact),
+            ("container", is_iso6346),
+            ("npi", is_npi),
+            ("aba", is_aba_routing),
+            ("ean8", is_ean8),
+            ("gtin14", is_gtin14),
+            ("doi", is_doi),
+        ];
+        let vectors = include_str!("../tests/fixtures/id_checksum_vectors.tsv");
+        let mut checked = 0;
+        let mut positives = 0;
+        for line in vectors.lines() {
+            let mut parts = line.split('\t');
+            let (Some(kind), Some(value), Some(expected)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                panic!("malformed vector line {line:?}");
+            };
+            let check = table
+                .iter()
+                .find(|(name, _)| *name == kind)
+                .unwrap_or_else(|| panic!("unknown vector type {kind}"))
+                .1;
+            let expected = expected == "1";
+            assert_eq!(check(value), expected, "{kind} {value:?}");
+            checked += 1;
+            positives += usize::from(expected);
+        }
+        assert!(checked > 5000 && positives > 1000, "{checked} {positives}");
+    }
+
+    #[test]
+    fn hostile_input_never_panics() {
+        let all: Vec<fn(&str) -> bool> = CHECKSUM_IDS.iter().map(|d| d.check).collect();
+        for s in [
+            "",
+            "\u{1F4A5}",
+            "é".repeat(12).as_str(),
+            "ÀB0378331005",
+            "10.\u{e9}\u{e9}\u{e9}\u{e9}/x",
+            "IMO ",
+            "IMO \u{e9}",
+            "0000-0002-1825-009\u{e9}",
+            "7732-18-",
+            "-",
+            "--",
+            &"9".repeat(200),
+            &"A".repeat(200),
+        ] {
+            for check in &all {
+                let _ = check(s);
+            }
+        }
     }
 }
