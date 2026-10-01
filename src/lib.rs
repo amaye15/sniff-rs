@@ -6150,63 +6150,505 @@ fn is_jwt(s: &str) -> bool {
     base64url_decode(parts[2]).is_some()
 }
 
-// GEOMETRYCOLLECTION is deliberately excluded: unlike the other six, its
-// parenthesized body legitimately nests *other* geometry keywords
-// ("GEOMETRYCOLLECTION(POINT(4 6))"), not just coordinate characters - this
-// was found empirically (a real fixture value with GEOMETRYCOLLECTION
-// caused the whole test column to fail the coordinate-only character check
-// below). Properly supporting it needs actual recursive parsing, a
-// meaningfully bigger scope than "keyword + balanced coordinate body" - so
-// rather than either overclaim support that silently breaks on nesting, or
-// loosen the character check for everyone (raising false-positive risk for
-// the other six), it's just left out. A GEOMETRYCOLLECTION value falls back
-// to String, the safe direction.
-const WKT_KEYWORDS: &[&str] = &[
-    "POINT",
-    "LINESTRING",
-    "POLYGON",
-    "MULTIPOINT",
-    "MULTILINESTRING",
-    "MULTIPOLYGON",
-];
+// --- Geometry in text: WKT/EWKT, hex WKB/EWKB, GeoPackage blobs ---
+//
+// A geometry column reaches this tool three ways: as Well-Known Text
+// (`POINT(30 10)`, or PostGIS's `SRID=4326;POINT(30 10)`), as the binary
+// WKB a spatial database stores - which every reader here turns into hex
+// text (a Parquet `BYTE_ARRAY`, a SQLite `BLOB`, a PostGIS `bytea` in a CSV
+// export, usually written `\x0101000020...`) - or as a GeoPackage geometry
+// blob (a `GP` header, an optional envelope, then WKB). All three are
+// recognized by *parsing* them, not by shape: a value counts only if the
+// whole of it is exactly one well-formed geometry, which random text and
+// random hex essentially never are.
+//
+// WKT is read with the OGC grammar: `POINT`, `LINESTRING`, `POLYGON` and
+// their `MULTI` forms plus `GEOMETRYCOLLECTION`, an optional `Z`/`M`/`ZM`
+// marker, `EMPTY`, and a consistent 2, 3 or 4 numbers per coordinate. It
+// checks the grammar, not geometry validity (an unclosed ring is still
+// WKT). WKB is read in both byte orders, with EWKB's SRID/Z/M flag bits
+// and ISO's `1000`/`2000`/`3000` type offsets, for the seven types every
+// producer writes (point through geometry collection); a count that
+// promises more bytes than remain is rejected before anything is walked.
+// Curve and surface types (`CIRCULARSTRING`, `TIN`, ...) are left alone:
+// nothing here can produce a reference file for them.
+mod geometry_support {
+    const MAX_DEPTH: usize = 8;
 
-/// A Well-Known Text geometry: one of the standard OGC keywords, followed
-/// by a parenthesized, balanced coordinate group. Deliberately structural
-/// rather than a full WKT parser - it doesn't validate that the coordinate
-/// content actually forms a well-formed ring/point-count for its geometry
-/// type, just that the keyword is real and the parenthesized body is
-/// balanced and contains only characters a coordinate list could contain
-/// (digits, '.', '-', ',', space, nested parens for POLYGON's rings). Not
-/// standards-complete in the same spirit as is_email/is_url elsewhere in
-/// this file - a false negative just falls back to String.
-fn is_wkt_geometry(s: &str) -> bool {
-    let trimmed = s.trim();
-    let keyword_end = trimmed
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(trimmed.len());
-    let keyword = &trimmed[..keyword_end];
-    if !WKT_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(keyword)) {
-        return false;
+    // ----- WKT -----
+
+    struct Wkt<'a> {
+        b: &'a [u8],
+        i: usize,
     }
-    let rest = trimmed[keyword_end..].trim_start();
-    if !rest.starts_with('(') || !rest.ends_with(')') {
-        return false;
-    }
-    let mut depth = 0i32;
-    for c in rest.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth < 0 {
+
+    impl<'a> Wkt<'a> {
+        fn skip_ws(&mut self) {
+            while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+        }
+
+        fn eat(&mut self, c: u8) -> bool {
+            self.skip_ws();
+            if self.b.get(self.i) == Some(&c) {
+                self.i += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn word(&mut self) -> &'a [u8] {
+            self.skip_ws();
+            let start = self.i;
+            while self.i < self.b.len() && self.b[self.i].is_ascii_alphabetic() {
+                self.i += 1;
+            }
+            &self.b[start..self.i]
+        }
+
+        /// One number: `[+-]digits[.digits][e[+-]digits]` or `.digits`.
+        fn number(&mut self) -> bool {
+            self.skip_ws();
+            let start = self.i;
+            if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            let digits = |w: &mut Self| {
+                let s = w.i;
+                while w.i < w.b.len() && w.b[w.i].is_ascii_digit() {
+                    w.i += 1;
+                }
+                w.i - s
+            };
+            let int = digits(self);
+            let mut frac = 0;
+            if self.b.get(self.i) == Some(&b'.') {
+                self.i += 1;
+                frac = digits(self);
+            }
+            if int + frac == 0 {
+                self.i = start;
+                return false;
+            }
+            if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
+                let save = self.i;
+                self.i += 1;
+                if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                    self.i += 1;
+                }
+                if digits(self) == 0 {
+                    self.i = save;
                     return false;
                 }
             }
-            '0'..='9' | '.' | '-' | ',' | ' ' => {}
-            _ => return false,
+            // `1.5.2` and `-6.391-130.541` are not two numbers: a number
+            // ends at whitespace, a comma or a parenthesis.
+            self.i >= self.b.len()
+                || self.b[self.i].is_ascii_whitespace()
+                || matches!(self.b[self.i], b',' | b')' | b'(')
+        }
+
+        /// `x y [z [m]]`: returns the number of ordinates.
+        fn coord(&mut self) -> Option<usize> {
+            let mut n = 0;
+            while n < 4 && self.number() {
+                n += 1;
+            }
+            (n >= 2).then_some(n)
+        }
+
+        /// `coord, coord, ...` between parentheses. Every coordinate must
+        /// have `dims` ordinates (set by the first when it is `None`).
+        fn coords(&mut self, dims: &mut Option<usize>, min: usize) -> bool {
+            if !self.eat(b'(') {
+                return false;
+            }
+            let mut count = 0;
+            loop {
+                let Some(n) = self.coord() else {
+                    return false;
+                };
+                if *dims.get_or_insert(n) != n {
+                    return false;
+                }
+                count += 1;
+                if self.eat(b',') {
+                    continue;
+                }
+                break;
+            }
+            count >= min && self.eat(b')')
+        }
+
+        /// `( ring, ring, ... )` - a polygon body.
+        fn rings(&mut self, dims: &mut Option<usize>) -> bool {
+            if !self.eat(b'(') {
+                return false;
+            }
+            loop {
+                if !self.coords(dims, 1) {
+                    return false;
+                }
+                if !self.eat(b',') {
+                    break;
+                }
+            }
+            self.eat(b')')
+        }
+
+        /// `EMPTY`, or a body parsed by `body`.
+        fn empty_or(&mut self, body: impl FnOnce(&mut Self) -> bool) -> bool {
+            let save = self.i;
+            if self.word().eq_ignore_ascii_case(b"EMPTY") {
+                return true;
+            }
+            self.i = save;
+            body(self)
+        }
+
+        fn tagged(&mut self, depth: usize) -> bool {
+            if depth > MAX_DEPTH {
+                return false;
+            }
+            let kw = self.word();
+            if kw.is_empty() {
+                return false;
+            }
+            let mut kw = kw.to_ascii_uppercase();
+            // `POINTZ`, `POINTM`, `POINTZM` are written fused by PostGIS;
+            // ISO WKT puts a space (`POINT Z`).
+            let mut dims: Option<usize> = None;
+            for (suffix, n) in [(&b"ZM"[..], 4), (&b"Z"[..], 3), (&b"M"[..], 3)] {
+                if kw.ends_with(suffix) && kw.len() > suffix.len() {
+                    let stem = &kw[..kw.len() - suffix.len()];
+                    if is_keyword(stem) {
+                        kw.truncate(stem.len());
+                        dims = Some(n);
+                        break;
+                    }
+                }
+            }
+            if !is_keyword(&kw) {
+                return false;
+            }
+            if dims.is_none() {
+                let save = self.i;
+                let marker = self.word();
+                if marker.eq_ignore_ascii_case(b"Z") || marker.eq_ignore_ascii_case(b"M") {
+                    dims = Some(3);
+                } else if marker.eq_ignore_ascii_case(b"ZM") {
+                    dims = Some(4);
+                } else {
+                    self.i = save;
+                }
+            }
+            match kw.as_slice() {
+                b"POINT" => self.empty_or(|w| {
+                    w.eat(b'(')
+                        && matches!(w.coord(), Some(n) if *dims.get_or_insert(n) == n)
+                        && w.eat(b')')
+                }),
+                b"LINESTRING" => self.empty_or(|w| w.coords(&mut dims, 1)),
+                b"POLYGON" => self.empty_or(|w| w.rings(&mut dims)),
+                b"MULTIPOINT" => self.empty_or(|w| {
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        // `MULTIPOINT((1 2), (3 4))` and `MULTIPOINT(1 2, 3 4)`
+                        // are both in use.
+                        let save = w.i;
+                        let ok = if w.eat(b'(') {
+                            matches!(w.coord(), Some(n) if *dims.get_or_insert(n) == n)
+                                && w.eat(b')')
+                        } else {
+                            w.i = save;
+                            matches!(w.coord(), Some(n) if *dims.get_or_insert(n) == n)
+                        };
+                        if !ok {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+                b"MULTILINESTRING" => self.empty_or(|w| {
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        if !w.coords(&mut dims, 1) {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+                b"MULTIPOLYGON" => self.empty_or(|w| {
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        if !w.rings(&mut dims) {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+                _ => self.empty_or(|w| {
+                    // GEOMETRYCOLLECTION
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        if !w.tagged(depth + 1) {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+            }
         }
     }
-    depth == 0
+
+    fn is_keyword(k: &[u8]) -> bool {
+        matches!(
+            k,
+            b"POINT"
+                | b"LINESTRING"
+                | b"POLYGON"
+                | b"MULTIPOINT"
+                | b"MULTILINESTRING"
+                | b"MULTIPOLYGON"
+                | b"GEOMETRYCOLLECTION"
+        )
+    }
+
+    /// WKT or PostGIS EWKT (`SRID=4326;POINT(30 10)`).
+    pub fn is_wkt(s: &str) -> bool {
+        let t = s.trim();
+        let body = match t.get(..5) {
+            Some(p) if p.eq_ignore_ascii_case("SRID=") => {
+                let rest = &t[5..];
+                let Some((srid, geometry)) = rest.split_once(';') else {
+                    return false;
+                };
+                if srid.is_empty() || !srid.bytes().all(|c| c.is_ascii_digit()) {
+                    return false;
+                }
+                geometry
+            }
+            _ => t,
+        };
+        let mut w = Wkt {
+            b: body.as_bytes(),
+            i: 0,
+        };
+        if !w.tagged(0) {
+            return false;
+        }
+        w.skip_ws();
+        w.i == w.b.len()
+    }
+
+    // ----- WKB -----
+
+    struct Wkb<'a> {
+        b: &'a [u8],
+        i: usize,
+    }
+
+    impl Wkb<'_> {
+        fn left(&self) -> usize {
+            self.b.len() - self.i
+        }
+
+        fn u32(&mut self, little: bool) -> Option<u32> {
+            let raw: [u8; 4] = self.b.get(self.i..self.i + 4)?.try_into().ok()?;
+            self.i += 4;
+            Some(if little {
+                u32::from_le_bytes(raw)
+            } else {
+                u32::from_be_bytes(raw)
+            })
+        }
+
+        /// One geometry, starting at its byte-order byte.
+        fn geometry(&mut self, depth: usize) -> Option<()> {
+            if depth > MAX_DEPTH {
+                return None;
+            }
+            let little = match *self.b.get(self.i)? {
+                1 => true,
+                0 => false,
+                _ => return None,
+            };
+            self.i += 1;
+            let raw = self.u32(little)?;
+            // EWKB keeps its flags in the high bits; ISO adds 1000/2000/3000.
+            let flags = raw & 0xE000_0000;
+            let mut code = raw & 0x1FFF_FFFF;
+            let mut dims =
+                2 + usize::from(flags & 0x8000_0000 != 0) + usize::from(flags & 0x4000_0000 != 0);
+            if code >= 1000 {
+                if flags & 0xC000_0000 != 0 {
+                    return None;
+                }
+                dims = match code / 1000 {
+                    1 | 2 => 3,
+                    3 => 4,
+                    _ => return None,
+                };
+                code %= 1000;
+            }
+            // A member's flags are its own: GEOS writes an empty member of a
+            // 3D collection without the Z flag, so they are not compared
+            // with the parent's.
+            if flags & 0x2000_0000 != 0 {
+                self.u32(little)?; // SRID
+            }
+            let point = dims * 8;
+            match code {
+                1 => {
+                    self.take(point)?;
+                }
+                2 => {
+                    let n = self.count(little, point)?;
+                    self.take(n * point)?;
+                }
+                3 => {
+                    let rings = self.count(little, 4)?;
+                    for _ in 0..rings {
+                        let n = self.count(little, point)?;
+                        self.take(n * point)?;
+                    }
+                }
+                4..=7 => {
+                    let n = self.count(little, 9)?;
+                    for _ in 0..n {
+                        self.geometry(depth + 1)?;
+                    }
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+
+        fn take(&mut self, n: usize) -> Option<()> {
+            if self.left() < n {
+                return None;
+            }
+            self.i += n;
+            Some(())
+        }
+
+        /// An element count that the remaining bytes could possibly hold
+        /// (each element is at least `min` bytes).
+        fn count(&mut self, little: bool, min: usize) -> Option<usize> {
+            let n = self.u32(little)? as usize;
+            (n.checked_mul(min)? <= self.left()).then_some(n)
+        }
+    }
+
+    fn is_wkb_bytes(b: &[u8]) -> bool {
+        let mut w = Wkb { b, i: 0 };
+        w.geometry(0).is_some() && w.i == b.len()
+    }
+
+    /// Hex digits of `s` as bytes, after an optional `\x` or `0x` prefix
+    /// (PostgreSQL's `bytea` output, a SQL hex literal).
+    fn unhex(s: &str) -> Option<Vec<u8>> {
+        let s = s
+            .strip_prefix("\\x")
+            .or_else(|| s.strip_prefix("0x"))
+            .unwrap_or(s);
+        let b = s.as_bytes();
+        if b.len() < 18 || !b.len().is_multiple_of(2) {
+            return None;
+        }
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
+        b.chunks(2)
+            .map(|p| Some(nibble(p[0])? << 4 | nibble(p[1])?))
+            .collect()
+    }
+
+    /// Hex-encoded WKB or EWKB, one whole geometry.
+    pub fn is_wkb_hex(s: &str) -> bool {
+        // Cheap reject before decoding: the first byte is the byte order.
+        let t = s
+            .strip_prefix("\\x")
+            .or_else(|| s.strip_prefix("0x"))
+            .unwrap_or(s);
+        if !(t.starts_with("00") || t.starts_with("01")) {
+            return false;
+        }
+        unhex(s).is_some_and(|b| is_wkb_bytes(&b))
+    }
+
+    /// One whole geometry of raw WKB/EWKB bytes (a SQLite or GeoPackage
+    /// blob, before anything turns it into text).
+    pub fn is_wkb_blob(b: &[u8]) -> bool {
+        matches!(b.first(), Some(0 | 1)) && b.len() >= 9 && is_wkb_bytes(b)
+    }
+
+    /// Hex-encoded GeoPackage geometry; see `is_gpkg_blob`.
+    pub fn is_gpkg_hex(s: &str) -> bool {
+        let t = s
+            .strip_prefix("\\x")
+            .or_else(|| s.strip_prefix("0x"))
+            .unwrap_or(s);
+        if !t.starts_with("4750") {
+            return false;
+        }
+        unhex(s).is_some_and(|b| is_gpkg_blob(&b))
+    }
+
+    /// A GeoPackage geometry blob (`GP`, version, flags, SRS id, an
+    /// envelope sized by the flags, then WKB), per OGC 12-128r18 section
+    /// 2.1.3.
+    pub fn is_gpkg_blob(b: &[u8]) -> bool {
+        if b.len() < 8 || !b.starts_with(b"GP") || b[2] != 0 {
+            return false;
+        }
+        let flags = b[3];
+        // Bits 6-7 are reserved and must be zero; bit 5 marks an extended
+        // (non-standard) geometry type.
+        if flags & 0xC0 != 0 || flags & 0x20 != 0 {
+            return false;
+        }
+        let envelope = match (flags >> 1) & 7 {
+            0 => 0,
+            1 => 32,
+            2 | 3 => 48,
+            4 => 64,
+            _ => return false,
+        };
+        let start = 8 + envelope;
+        b.len() > start && is_wkb_bytes(&b[start..])
+    }
+}
+
+/// A Well-Known Text geometry, PostGIS EWKT included - see
+/// `geometry_support` for the grammar.
+fn is_wkt_geometry(s: &str) -> bool {
+    geometry_support::is_wkt(s)
 }
 
 /// A "lat,lon" single-cell coordinate pair. Deliberately the most
@@ -6404,6 +6846,570 @@ fn is_vin(s: &str) -> bool {
     b[8] == expected
 }
 
+// --- Checksum-validated identifiers beyond the card/IBAN/ISBN/VIN family ---
+//
+// Each is a published standard whose last character (or last two) is a
+// check digit, so a value that passes is far stronger evidence than its
+// shape: a securities identifier (ISIN, CUSIP, SEDOL, FIGI), a legal-entity
+// or person/contributor identifier (LEI, ORCID/ISNI), a serial (ISSN), a
+// chemical (CAS Registry Number), a ship or container (IMO, ISO 6346), a
+// US provider or bank (NPI, ABA routing number) or a retail trade item
+// (EAN-8, GTIN-14). Every algorithm here was cross-checked against
+// python-stdnum on random valid, single-character-tampered and random
+// invalid values - see the tests and CLAUDE.md.
+//
+// A column takes the type only if *every* value passes, so the chance a
+// column of ordinary numbers is mistaken for one of these is `1/10^n` for
+// `n` values. The digit-only compact forms (`IMO`, `ABA`, an unhyphenated
+// ISSN) look exactly like ordinary integers, so a column must hold at
+// least `min_values` of them before they count: five values leave about
+// one false match in a hundred thousand. Forms with letters or hyphens are
+// distinctive enough to count from the first value.
+mod id_checksum_support {
+    /// `0-9` is 0-9 and `A-Z` is 10-35; anything else (including lower case,
+    /// which none of these standards use) has no value.
+    fn alnum(c: u8) -> Option<u32> {
+        match c {
+            b'0'..=b'9' => Some(u32::from(c - b'0')),
+            b'A'..=b'Z' => Some(u32::from(c - b'A') + 10),
+            _ => None,
+        }
+    }
+
+    fn digit(c: u8) -> Option<u32> {
+        c.is_ascii_digit().then(|| u32::from(c - b'0'))
+    }
+
+    fn all_digits(b: &[u8]) -> bool {
+        !b.is_empty() && b.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Digits of `v * w` summed, the CUSIP/FIGI way of folding a doubled
+    /// two-digit product back into one digit.
+    fn digit_sum(mut n: u32) -> u32 {
+        let mut sum = 0;
+        while n > 0 {
+            sum += n % 10;
+            n /= 10;
+        }
+        sum
+    }
+
+    /// ISO 6166 country prefixes plus the ISO/ANNA special ones (`XS`,
+    /// `EU`, `QS`, ...) - the list python-stdnum validates against.
+    const ISIN_PREFIXES: &[&str] = &[
+        "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AN", "AO", "AQ", "AR", "AS", "AT", "AU", "AW",
+        "AX", "AZ", "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO",
+        "BQ", "BR", "BS", "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI",
+        "CK", "CL", "CM", "CN", "CO", "CR", "CS", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ",
+        "DK", "DM", "DO", "DZ", "EC", "EE", "EG", "EH", "ER", "ES", "ET", "EU", "FI", "FJ", "FK",
+        "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF", "GG", "GH", "GI", "GL", "GM", "GN", "GP",
+        "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM", "HN", "HR", "HT", "HU", "ID", "IE",
+        "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT", "JE", "JM", "JO", "JP", "KE", "KG", "KH",
+        "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC", "LI", "LK", "LR", "LS",
+        "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK", "ML", "MM", "MN",
+        "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA", "NC", "NE",
+        "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG", "PH",
+        "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY", "QA", "QS", "QT", "RE", "RO", "RS",
+        "RU", "RW", "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN",
+        "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK",
+        "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ", "UA", "UG", "UM", "US", "UY", "UZ",
+        "VA", "VC", "VE", "VG", "VI", "VN", "VU", "WF", "WS", "XA", "XB", "XC", "XD", "XF", "XK",
+        "XS", "YE", "YT", "ZA", "ZM", "ZW",
+    ];
+
+    /// ISO 6166: country code, nine alphanumerics, a check digit. Letters
+    /// become two digits (A=10 ... Z=35) and the whole string must pass
+    /// Luhn.
+    pub fn is_isin(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 12
+            || !s.get(..2).is_some_and(|p| ISIN_PREFIXES.contains(&p))
+            || !b[..2].iter().all(u8::is_ascii_uppercase)
+            || !b[11].is_ascii_digit()
+        {
+            return false;
+        }
+        let mut digits = Vec::with_capacity(24);
+        for &c in b {
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            if v >= 10 {
+                digits.push(v / 10);
+                digits.push(v % 10);
+            } else {
+                digits.push(v);
+            }
+        }
+        super::luhn_checksum_valid(&digits)
+    }
+
+    /// CUSIP: eight characters from `0-9A-Z*@#` and a check digit; every
+    /// second character is doubled and the digits of each product summed.
+    pub fn is_cusip(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 9 || !b[8].is_ascii_digit() {
+            return false;
+        }
+        let mut sum = 0;
+        for (i, &c) in b[..8].iter().enumerate() {
+            let v = match c {
+                b'*' => 36,
+                b'@' => 37,
+                b'#' => 38,
+                _ => match alnum(c) {
+                    Some(v) => v,
+                    None => return false,
+                },
+            };
+            sum += digit_sum(v * if i % 2 == 1 { 2 } else { 1 });
+        }
+        (10 - sum % 10) % 10 == u32::from(b[8] - b'0')
+    }
+
+    /// SEDOL: six characters (digits and consonants), weights 1,3,1,7,3,9,
+    /// and a check digit. A leading digit means the whole thing is numeric
+    /// (the old style).
+    pub fn is_sedol(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 7 || !b[6].is_ascii_digit() {
+            return false;
+        }
+        let mut sum = 0;
+        for (i, &c) in b[..6].iter().enumerate() {
+            if matches!(c, b'A' | b'E' | b'I' | b'O' | b'U') {
+                return false;
+            }
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            sum += v * [1, 3, 1, 7, 3, 9][i];
+        }
+        if b[0].is_ascii_digit() && !all_digits(b) {
+            return false;
+        }
+        (10 - sum % 10) % 10 == u32::from(b[6] - b'0')
+    }
+
+    /// ISO 17442 Legal Entity Identifier: eighteen alphanumerics and two
+    /// check digits, ISO 7064 MOD 97-10 over the letters-as-numbers string.
+    pub fn is_lei(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 20 || !b[18].is_ascii_digit() || !b[19].is_ascii_digit() {
+            return false;
+        }
+        let mut rem = 0u32;
+        for &c in b {
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            rem = if v >= 10 {
+                (rem * 100 + v) % 97
+            } else {
+                (rem * 10 + v) % 97
+            };
+        }
+        rem == 1
+    }
+
+    /// OMG Financial Instrument Global Identifier: two consonants (not one
+    /// of the reserved prefixes), `G`, eight more from digits and
+    /// consonants, a check digit computed like CUSIP's over the full
+    /// alphanumeric values.
+    pub fn is_figi(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 12 || b[2] != b'G' || !b[11].is_ascii_digit() {
+            return false;
+        }
+        if b[0].is_ascii_digit() || b[1].is_ascii_digit() {
+            return false;
+        }
+        if matches!(s.get(..2), Some("BS" | "BM" | "GG" | "GB" | "VG")) {
+            return false;
+        }
+        let mut sum = 0;
+        for (i, &c) in b[..11].iter().enumerate() {
+            if matches!(c, b'A' | b'E' | b'I' | b'O' | b'U') {
+                return false;
+            }
+            let Some(v) = alnum(c) else {
+                return false;
+            };
+            sum += digit_sum(v * if i % 2 == 1 { 2 } else { 1 });
+        }
+        (10 - sum % 10) % 10 == u32::from(b[11] - b'0')
+    }
+
+    /// ISSN with its hyphen (`0378-5955`): weights 8..2 on the first seven
+    /// digits, check digit `X` for ten.
+    pub fn is_issn_hyphenated(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 9 && b[4] == b'-' && issn_body(&[&b[..4], &b[5..]].concat())
+    }
+
+    /// The same eight characters with no hyphen.
+    pub fn is_issn_compact(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 8 && issn_body(b)
+    }
+
+    fn issn_body(b: &[u8]) -> bool {
+        if !all_digits(&b[..7]) {
+            return false;
+        }
+        let sum: u32 = b[..7]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (8 - i as u32) * u32::from(c - b'0'))
+            .sum();
+        let check = (11 - sum % 11) % 11;
+        match b[7] {
+            b'X' => check == 10,
+            c if c.is_ascii_digit() => check == u32::from(c - b'0'),
+            _ => false,
+        }
+    }
+
+    /// ISO 7064 MOD 11-2 over fifteen digits: the check character of an
+    /// ISNI and so of an ORCID iD.
+    fn mod_11_2_ok(d: &[u8]) -> bool {
+        if d.len() != 16 || !all_digits(&d[..15]) {
+            return false;
+        }
+        let mut total = 0u32;
+        for &c in &d[..15] {
+            total = (total + u32::from(c - b'0')) * 2;
+        }
+        let check = (12 - total % 11) % 11;
+        match d[15] {
+            b'X' => check == 10,
+            c if c.is_ascii_digit() => check == u32::from(c - b'0'),
+            _ => false,
+        }
+    }
+
+    /// ORCID iD / ISNI in its printed form: four groups of four separated
+    /// by hyphens or spaces (`0000-0002-1825-0097`).
+    pub fn is_isni_grouped(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 19 || !matches!(b[4], b'-' | b' ') {
+            return false;
+        }
+        if b[9] != b[4] || b[14] != b[4] {
+            return false;
+        }
+        let compact: Vec<u8> = b
+            .iter()
+            .copied()
+            .filter(|c| !matches!(c, b'-' | b' '))
+            .collect();
+        mod_11_2_ok(&compact)
+    }
+
+    /// The same sixteen characters unseparated.
+    pub fn is_isni_compact(s: &str) -> bool {
+        mod_11_2_ok(s.as_bytes())
+    }
+
+    /// CAS Registry Number: `NNNNNNN-NN-N`, two to seven leading digits (no
+    /// leading zero), weights counting up from the digit left of the check
+    /// digit, sum mod 10.
+    pub fn is_cas(s: &str) -> bool {
+        let b = s.as_bytes();
+        if !(7..=12).contains(&b.len()) {
+            return false;
+        }
+        let n = b.len();
+        if b[n - 2] != b'-' || b[n - 5] != b'-' || b[0] == b'0' {
+            return false;
+        }
+        let body: Vec<u8> = b[..n - 5].iter().chain(&b[n - 4..n - 2]).copied().collect();
+        if !all_digits(&body) || !b[n - 1].is_ascii_digit() {
+            return false;
+        }
+        let sum: u32 = body
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, &c)| (i as u32 + 1) * u32::from(c - b'0'))
+            .sum();
+        sum % 10 == u32::from(b[n - 1] - b'0')
+    }
+
+    fn imo_body(d: &[u8]) -> bool {
+        if d.len() != 7 || !all_digits(d) {
+            return false;
+        }
+        let sum: u32 = d[..6]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (7 - i as u32) * u32::from(c - b'0'))
+            .sum();
+        sum % 10 == u32::from(d[6] - b'0')
+    }
+
+    /// IMO ship number written with its prefix (`IMO 9074729`).
+    pub fn is_imo_prefixed(s: &str) -> bool {
+        s.strip_prefix("IMO ")
+            .is_some_and(|rest| imo_body(rest.as_bytes()))
+    }
+
+    /// The seven digits alone.
+    pub fn is_imo_compact(s: &str) -> bool {
+        imo_body(s.as_bytes())
+    }
+
+    /// ISO 6346 freight container number: owner code (three letters), a
+    /// category letter (`U`, `J`, `Z` or `R`), six digits and a check
+    /// digit. Letter values skip the multiples of eleven.
+    pub fn is_iso6346(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 11
+            || !b[..3].iter().all(u8::is_ascii_uppercase)
+            || !matches!(b[3], b'U' | b'J' | b'Z' | b'R')
+            || !all_digits(&b[4..])
+        {
+            return false;
+        }
+        let mut sum = 0u32;
+        for (i, &c) in b[..10].iter().enumerate() {
+            let v = match c {
+                b'0'..=b'9' => u32::from(c - b'0'),
+                _ => {
+                    // A=10, then B=12: 11, 22 and 33 are skipped.
+                    let mut v = 10 + u32::from(c - b'A');
+                    if v >= 11 {
+                        v += 1;
+                    }
+                    if v >= 22 {
+                        v += 1;
+                    }
+                    if v >= 33 {
+                        v += 1;
+                    }
+                    v
+                }
+            };
+            sum += v << i;
+        }
+        sum % 11 % 10 == u32::from(b[10] - b'0')
+    }
+
+    /// US National Provider Identifier: ten digits, the first 1 or 2,
+    /// Luhn-valid once the health-industry prefix 80840 is put in front.
+    pub fn is_npi(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 10 || !all_digits(b) || !matches!(b[0], b'1' | b'2') {
+            return false;
+        }
+        let mut digits = vec![8, 0, 8, 4, 0];
+        digits.extend(b.iter().filter_map(|&c| digit(c)));
+        super::luhn_checksum_valid(&digits)
+    }
+
+    /// ABA routing transit number: nine digits, weights 3,7,1 repeating,
+    /// sum divisible by ten.
+    pub fn is_aba_routing(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 9 || !all_digits(b) {
+            return false;
+        }
+        let w = [3, 7, 1, 3, 7, 1, 3, 7, 1];
+        let sum: u32 = b.iter().zip(w).map(|(&c, w)| w * u32::from(c - b'0')).sum();
+        sum.is_multiple_of(10)
+    }
+
+    /// GS1 check digit over `n` digits: alternating weights 3 and 1 from
+    /// the right of the body, shared by EAN-8 and GTIN-14.
+    fn gs1_ok(b: &[u8], len: usize) -> bool {
+        if b.len() != len || !all_digits(b) {
+            return false;
+        }
+        let sum: u32 = b[..len - 1]
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, &c)| u32::from(c - b'0') * if i % 2 == 0 { 3 } else { 1 })
+            .sum();
+        (10 - sum % 10) % 10 == u32::from(b[len - 1] - b'0')
+    }
+
+    pub fn is_ean8(s: &str) -> bool {
+        gs1_ok(s.as_bytes(), 8)
+    }
+
+    pub fn is_gtin14(s: &str) -> bool {
+        gs1_ok(s.as_bytes(), 14)
+    }
+
+    /// Crossref's DOI pattern, which matches 74.4 of the 74.9 million DOIs
+    /// it holds: `10.`, a four to nine digit registrant code, `/`, and a
+    /// suffix of letters, digits and `-._;()/:`. A DOI has no checksum; the
+    /// `10.NNNN/` lead is distinctive enough on its own.
+    pub fn is_doi(s: &str) -> bool {
+        let Some(rest) = s.strip_prefix("10.") else {
+            return false;
+        };
+        let Some((registrant, suffix)) = rest.split_once('/') else {
+            return false;
+        };
+        (4..=9).contains(&registrant.len())
+            && all_digits(registrant.as_bytes())
+            && !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-._;()/:".contains(&c))
+    }
+
+    pub struct ChecksumId {
+        pub name: &'static str,
+        pub note: &'static str,
+        pub check: fn(&str) -> bool,
+        /// Values a column needs before this counts (see the module notes).
+        pub min_values: usize,
+        /// The SQL column type: a `VARCHAR` as long as the longest value
+        /// `check` accepts, or `TEXT` where nothing bounds it.
+        pub sql: &'static str,
+    }
+
+    /// Most distinctive first; the first entry every value of a column
+    /// passes names the column.
+    pub static CHECKSUM_IDS: &[ChecksumId] = &[
+        ChecksumId {
+            name: "LEI",
+            note: "matches the Legal Entity Identifier format (20 characters, ISO 7064 mod 97-10 check valid)",
+            check: is_lei,
+            min_values: 1,
+            sql: "VARCHAR(20)",
+        },
+        ChecksumId {
+            name: "ORCID / ISNI",
+            note: "matches an ORCID iD / ISNI (16 characters in groups of four, ISO 7064 mod 11-2 check valid)",
+            check: is_isni_grouped,
+            min_values: 1,
+            sql: "VARCHAR(19)",
+        },
+        ChecksumId {
+            name: "ISIN",
+            note: "matches an ISIN (ISO 6166 country prefix, Luhn check valid)",
+            check: is_isin,
+            min_values: 2,
+            sql: "VARCHAR(12)",
+        },
+        ChecksumId {
+            name: "FIGI",
+            note: "matches a Financial Instrument Global Identifier (check digit valid)",
+            check: is_figi,
+            min_values: 1,
+            sql: "VARCHAR(12)",
+        },
+        ChecksumId {
+            name: "Container Number",
+            note: "matches an ISO 6346 freight container number (check digit valid)",
+            check: is_iso6346,
+            min_values: 1,
+            sql: "VARCHAR(11)",
+        },
+        ChecksumId {
+            name: "CAS Number",
+            note: "matches a CAS Registry Number (check digit valid)",
+            check: is_cas,
+            min_values: 1,
+            sql: "VARCHAR(12)",
+        },
+        ChecksumId {
+            name: "ISSN",
+            note: "matches an ISSN (mod-11 check valid)",
+            check: is_issn_hyphenated,
+            min_values: 1,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "IMO Number",
+            note: "matches an IMO ship number (check digit valid)",
+            check: is_imo_prefixed,
+            min_values: 1,
+            sql: "VARCHAR(11)",
+        },
+        ChecksumId {
+            name: "DOI",
+            note: "matches the Crossref DOI pattern (10.<registrant>/<suffix>) - shape only, a DOI has no check digit",
+            check: is_doi,
+            min_values: 1,
+            sql: "TEXT",
+        },
+        ChecksumId {
+            name: "CUSIP",
+            note: "matches a CUSIP (check digit valid)",
+            check: is_cusip,
+            min_values: 5,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "SEDOL",
+            note: "matches a SEDOL (check digit valid)",
+            check: is_sedol,
+            min_values: 5,
+            sql: "VARCHAR(7)",
+        },
+        ChecksumId {
+            name: "ORCID / ISNI",
+            note: "matches an ORCID iD / ISNI (16 characters, ISO 7064 mod 11-2 check valid)",
+            check: is_isni_compact,
+            min_values: 5,
+            sql: "VARCHAR(19)",
+        },
+        ChecksumId {
+            name: "ISSN",
+            note: "matches an ISSN (mod-11 check valid)",
+            check: is_issn_compact,
+            min_values: 5,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "IMO Number",
+            note: "matches an IMO ship number (check digit valid)",
+            check: is_imo_compact,
+            min_values: 5,
+            sql: "VARCHAR(11)",
+        },
+        ChecksumId {
+            name: "US NPI",
+            note: "matches a US National Provider Identifier (Luhn check valid with the 80840 prefix)",
+            check: is_npi,
+            min_values: 5,
+            sql: "VARCHAR(10)",
+        },
+        ChecksumId {
+            name: "ABA Routing Number",
+            note: "matches an ABA routing transit number (3-7-1 checksum valid)",
+            check: is_aba_routing,
+            min_values: 5,
+            sql: "VARCHAR(9)",
+        },
+        ChecksumId {
+            name: "EAN-8",
+            note: "matches an EAN-8 barcode (check digit valid)",
+            check: is_ean8,
+            min_values: 5,
+            sql: "VARCHAR(8)",
+        },
+        ChecksumId {
+            name: "GTIN-14",
+            note: "matches a GTIN-14 (check digit valid)",
+            check: is_gtin14,
+            min_values: 5,
+            sql: "VARCHAR(14)",
+        },
+    ];
+
+    /// The SQL type of a column named for one of `CHECKSUM_IDS`.
+    pub fn sql_type_of(name: &str) -> Option<&'static str> {
+        CHECKSUM_IDS.iter().find(|d| d.name == name).map(|d| d.sql)
+    }
+}
+
 /// An incremental, one-value-at-a-time engine backing `suggest_ideal_type`
 /// (below) - built so peak memory for type detection can eventually drop
 /// below "every value in a column held in memory at once" (see CLAUDE.md's
@@ -6438,6 +7444,8 @@ struct IdealTypeAccumulator {
     ean_upc_ok: bool,
     imei_ok: bool,
     vin_ok: bool,
+    /// One flag per entry of `id_checksum_support::CHECKSUM_IDS`.
+    id_ok: Vec<bool>,
     credit_card_ok: bool,
     uuid_ok: bool,
     ulid_ok: bool,
@@ -6451,6 +7459,8 @@ struct IdealTypeAccumulator {
     jwt_ok: bool,
     embedded_json_ok: bool,
     wkt_ok: bool,
+    wkb_ok: bool,
+    gpkg_ok: bool,
     lat_lon_ok: bool,
     cron_ok: bool,
 
@@ -6499,6 +7509,7 @@ impl IdealTypeAccumulator {
             ean_upc_ok: true,
             imei_ok: true,
             vin_ok: true,
+            id_ok: vec![true; id_checksum_support::CHECKSUM_IDS.len()],
             credit_card_ok: true,
             uuid_ok: true,
             ulid_ok: true,
@@ -6512,6 +7523,8 @@ impl IdealTypeAccumulator {
             jwt_ok: true,
             embedded_json_ok: true,
             wkt_ok: true,
+            wkb_ok: true,
+            gpkg_ok: true,
             lat_lon_ok: true,
             cron_ok: true,
 
@@ -6563,6 +7576,14 @@ impl IdealTypeAccumulator {
         if self.vin_ok {
             self.vin_ok = is_vin(v);
         }
+        for (def, ok) in id_checksum_support::CHECKSUM_IDS
+            .iter()
+            .zip(self.id_ok.iter_mut())
+        {
+            if *ok {
+                *ok = (def.check)(v);
+            }
+        }
         if self.credit_card_ok {
             self.credit_card_ok = is_credit_card_number(v);
         }
@@ -6601,6 +7622,12 @@ impl IdealTypeAccumulator {
         }
         if self.wkt_ok {
             self.wkt_ok = is_wkt_geometry(v);
+        }
+        if self.wkb_ok {
+            self.wkb_ok = geometry_support::is_wkb_hex(v);
+        }
+        if self.gpkg_ok {
+            self.gpkg_ok = geometry_support::is_gpkg_hex(v);
         }
         if self.lat_lon_ok {
             self.lat_lon_ok = is_lat_lon_pair(v);
@@ -6744,6 +7771,14 @@ impl IdealTypeAccumulator {
                 "matches Vehicle Identification Number format (mod-11 checksum valid)".to_string(),
             );
         }
+        if let Some(def) = id_checksum_support::CHECKSUM_IDS
+            .iter()
+            .zip(&self.id_ok)
+            .find(|(def, ok)| **ok && self.total >= def.min_values)
+            .map(|(def, _)| def)
+        {
+            return (def.name.to_string(), def.note.to_string());
+        }
         if self.credit_card_ok {
             return (
                 "Credit Card Number".to_string(),
@@ -6815,6 +7850,20 @@ impl IdealTypeAccumulator {
             return (
                 "WKT Geometry".to_string(),
                 "matches Well-Known Text geometry format".to_string(),
+            );
+        }
+        if self.wkb_ok {
+            return (
+                "WKB Geometry".to_string(),
+                "hex-encoded Well-Known Binary (or PostGIS EWKB) - every value is exactly one well-formed geometry"
+                    .to_string(),
+            );
+        }
+        if self.gpkg_ok {
+            return (
+                "GeoPackage Geometry".to_string(),
+                "hex-encoded GeoPackage geometry blob (GP header, optional envelope, WKB)"
+                    .to_string(),
             );
         }
         if self.lat_lon_ok {
@@ -55681,13 +56730,8 @@ mod geojson_support {
     /// Coordinate order is passed through unchanged (GeoJSON's own
     /// `[longitude, latitude]` order is already WKT's own `(x y)` order -
     /// no reordering is ever needed). `GeometryCollection` is rendered
-    /// too, even though this project's own `is_wkt_geometry` heuristic
-    /// deliberately never recognizes it as WKT (its body legitimately
-    /// nests other geometry keywords, not just coordinate characters -
-    /// see that check's own doc comment) - the text is still correct and
-    /// informative, it just falls back to a plain `String` ideal_type
-    /// rather than `WKT Geometry`, the same disclosed boundary that
-    /// heuristic already documents for hand-authored WKT text.
+    /// too; `is_wkt_geometry` reads the recursive collection grammar, so
+    /// the text is typed `WKT Geometry` like any other geometry.
     fn geometry_to_wkt(v: &JsonValue, depth: u32) -> Result<String> {
         if depth > MAX_GEOMETRY_DEPTH {
             bail!("GeoJSON geometry nested past {MAX_GEOMETRY_DEPTH} levels");
@@ -72344,7 +73388,94 @@ mod sqlite_support {
         Integer(i64),
         Real(f64),
         Text(String),
-        Blob(usize), // length only - all this reader ever renders is "<blob: N bytes>"
+        /// The length (all this reader ever renders is `<blob: N bytes>`) and
+        /// what the bytes are, worked out while they were still in hand.
+        Blob(usize, BlobKind),
+    }
+
+    /// What a BLOB's own bytes say it is, by a magic number or - for
+    /// geometry - by parsing the whole blob. Decided per value as it is
+    /// decoded, because the reader keeps only the length.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlobKind {
+        Other,
+        GeoPackage,
+        Wkb,
+        Png,
+        Jpeg,
+        Gif,
+        Webp,
+    }
+
+    impl BlobKind {
+        fn classify(b: &[u8]) -> BlobKind {
+            if b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+                BlobKind::Png
+            } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                BlobKind::Jpeg
+            } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+                BlobKind::Gif
+            } else if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+                BlobKind::Webp
+            } else if geometry_support::is_gpkg_blob(b) {
+                BlobKind::GeoPackage
+            } else if geometry_support::is_wkb_blob(b) {
+                BlobKind::Wkb
+            } else {
+                BlobKind::Other
+            }
+        }
+
+        /// The `ideal_type` for a column in which every value is this kind.
+        fn ideal_type(self) -> Option<&'static str> {
+            match self {
+                BlobKind::Other => None,
+                BlobKind::GeoPackage => Some("GeoPackage Geometry"),
+                BlobKind::Wkb => Some("WKB Geometry"),
+                BlobKind::Png => Some("PNG Image"),
+                BlobKind::Jpeg => Some("JPEG Image"),
+                BlobKind::Gif => Some("GIF Image"),
+                BlobKind::Webp => Some("WebP Image"),
+            }
+        }
+    }
+
+    /// Tracks whether every non-null value of a column is the same
+    /// `BlobKind` - one different value (or one non-blob) and it isn't.
+    #[derive(Clone, Copy)]
+    struct BlobColumn {
+        kind: Option<BlobKind>,
+        uniform: bool,
+        /// Whether every non-null value so far was a blob, and there was one.
+        only_blobs: bool,
+    }
+
+    impl BlobColumn {
+        const NEW: BlobColumn = BlobColumn {
+            kind: None,
+            uniform: true,
+            only_blobs: true,
+        };
+
+        fn note(&mut self, value: &Value) {
+            let this = match value {
+                Value::Null => return,
+                Value::Blob(_, kind) => Some(*kind),
+                _ => {
+                    self.only_blobs = false;
+                    None
+                }
+            };
+            match (self.kind, this) {
+                (None, Some(k)) if self.uniform => self.kind = Some(k),
+                (Some(a), Some(b)) if a == b => {}
+                _ => self.uniform = false,
+            }
+        }
+
+        fn kind(&self) -> Option<BlobKind> {
+            self.kind.filter(|_| self.uniform)
+        }
     }
 
     fn value_to_string(value: &Value, kind_counts: &mut SqlKindCounts) -> Option<String> {
@@ -72362,7 +73493,7 @@ mod sqlite_support {
                 kind_counts.increment(SqlKind::Text);
                 Some(s.clone())
             }
-            Value::Blob(len) => {
+            Value::Blob(len, _) => {
                 kind_counts.increment(SqlKind::Blob);
                 Some(format!("<blob: {len} bytes>"))
             }
@@ -73067,7 +74198,11 @@ mod sqlite_support {
             n if n >= 12 => {
                 if n % 2 == 0 {
                     let len = ((n - 12) / 2) as usize;
-                    (Value::Blob(len), len)
+                    let kind = off
+                        .checked_add(len)
+                        .and_then(|end| payload.get(off..end))
+                        .map_or(BlobKind::Other, BlobKind::classify);
+                    (Value::Blob(len, kind), len)
                 } else {
                     let len = ((n - 13) / 2) as usize;
                     let end = off
@@ -73887,6 +75022,7 @@ mod sqlite_support {
         let n_cols = parsed.columns.len();
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
         let mut kind_counts: Vec<SqlKindCounts> = vec![SqlKindCounts::default(); n_cols];
+        let mut blob_columns = vec![BlobColumn::NEW; n_cols];
 
         // Decodes and folds each row straight into the per-column
         // accumulators as the b-tree walk visits it, rather than
@@ -73897,6 +75033,7 @@ mod sqlite_support {
         let mut on_row = |rowid: i64, payload: Vec<u8>| -> Result<()> {
             let values = table_row_values(&parsed, rowid, &payload)?;
             for (i, value) in values.into_iter().enumerate() {
+                blob_columns[i].note(&value);
                 raw[i].push(value_to_string(&value, &mut kind_counts[i]));
             }
             Ok(())
@@ -73920,7 +75057,41 @@ mod sqlite_support {
                 total,
                 skip_heuristics: false,
             };
-            profiles.push(profile_column(col, n_samples));
+            let mut profile = profile_column(col, n_samples);
+            // A blob column's values print as `<blob: N bytes>`, so what they
+            // are can only come from the bytes - and the printed text is
+            // useless to the heuristics (same-length blobs look like one
+            // repeated value, a "constant column").
+            let blobs = blob_columns[i];
+            if blobs.only_blobs && blobs.kind.is_some() {
+                let (ideal, note) = match blobs.kind().and_then(|k| Some((k, k.ideal_type()?))) {
+                    Some((kind, ideal)) => {
+                        let how = match kind {
+                            BlobKind::GeoPackage | BlobKind::Wkb => {
+                                "parsing the whole blob as one geometry"
+                            }
+                            _ => "its magic number",
+                        };
+                        (
+                            ideal,
+                            format!(
+                                "every value is a {ideal} (read from {how}); shown as <blob: N bytes>"
+                            ),
+                        )
+                    }
+                    None => (
+                        "Binary",
+                        "binary data (BLOB); shown as <blob: N bytes>".to_string(),
+                    ),
+                };
+                profile.ideal_type = ideal.to_string();
+                profile.notes = if profile.missing_pct > 0.0 {
+                    format!("has missing values -> wrap in Option<T> / handle nulls; {note}")
+                } else {
+                    note
+                };
+            }
+            profiles.push(profile);
         }
         Ok(profiles)
     }
@@ -76486,6 +77657,8 @@ impl JoinBase {
                 s.as_str(),
                 "Geographic Coordinates"
                     | "WKT Geometry"
+                    | "WKB Geometry"
+                    | "GeoPackage Geometry"
                     | "Cron Expression"
                     | "Hex Color"
                     | "SemVer"
@@ -76522,6 +77695,8 @@ fn join_base(ideal_type: &str) -> Option<JoinBase> {
         | "VIN"
         | "CIDR"
         | "WKT Geometry"
+        | "WKB Geometry"
+        | "GeoPackage Geometry"
         | "Cron Expression" => Some(JoinBase::OtherSemantic(ideal_type.to_string())),
         _ => {
             let t = ideal_type.trim();
@@ -78826,7 +80001,10 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "CIDR"
         | "ULID"
         | "WKT Geometry"
+        | "WKB Geometry"
+        | "GeoPackage Geometry"
         | "Cron Expression" => Some(("string", None)),
+        name if id_checksum_support::sql_type_of(name).is_some() => Some(("string", None)),
         _ => None,
     }
 }
@@ -79043,6 +80221,9 @@ fn sql_column_type(ideal_type: &str) -> &'static str {
         "SemVer" => "VARCHAR(32)",
         "Geographic Coordinates" => "VARCHAR(64)",
         "Cron Expression" => "VARCHAR(64)",
+        name if id_checksum_support::sql_type_of(name).is_some() => {
+            id_checksum_support::sql_type_of(name).unwrap_or("TEXT")
+        }
         // Email/URL/JWT/WKT Geometry/String/"enum / category"/
         // "mixed(...)"/Vec<T>/anything unrecognized: no format-
         // guaranteed maximum length, so TEXT rather than a VARCHAR that
@@ -109223,11 +110404,11 @@ mod tests {
         assert!(!is_wkt_geometry("POINT30 10")); // missing parens entirely
         assert!(!is_wkt_geometry("POINT(30 10")); // unterminated - missing ')'
         assert!(!is_wkt_geometry("POINT(30 abc)")); // letters aren't valid coordinate content
-        // Deliberately out of scope: GEOMETRYCOLLECTION nests other
-        // geometry keywords, which this structural (non-recursive) check
-        // can't validate - found empirically, not just reasoned about (see
-        // WKT_KEYWORDS's own comment).
-        assert!(!is_wkt_geometry("GEOMETRYCOLLECTION(POINT(4 6))"));
+        // A collection nests other geometries, so it needs the recursive
+        // grammar the old character check couldn't give it.
+        assert!(is_wkt_geometry("GEOMETRYCOLLECTION(POINT(4 6))"));
+        assert!(!is_wkt_geometry("GEOMETRYCOLLECTION(POINT(4 6)"));
+        assert!(!is_wkt_geometry("GEOMETRYCOLLECTION(CIRCLE(4 6))"));
     }
 
     #[test]
@@ -116425,5 +117606,157 @@ mod tests {
         assert_eq!(e.confidence, Confidence::Probable);
         // Same edge found from the other endpoint.
         assert!(std::ptr::eq(e, rel_edge(&edges, "orders", "user_id")));
+    }
+}
+
+#[cfg(test)]
+mod id_checksum_tests {
+    use super::id_checksum_support::*;
+
+    /// `tests/fixtures/id_checksum_vectors.tsv` holds python-stdnum's verdict
+    /// on thousands of valid, single-character-tampered, random and
+    /// wrong-length values per identifier (`type<TAB>value<TAB>0|1`,
+    /// generated by a script that builds each valid value from stdnum's own
+    /// check-digit routine). Every verdict must match.
+    #[test]
+    fn verdicts_match_python_stdnum() {
+        type Check = fn(&str) -> bool;
+        let table: &[(&str, Check)] = &[
+            ("isin", is_isin),
+            ("cusip", is_cusip),
+            ("sedol", is_sedol),
+            ("lei", is_lei),
+            ("figi", is_figi),
+            ("issn_hyphen", is_issn_hyphenated),
+            ("issn_compact", is_issn_compact),
+            ("isni_grouped", is_isni_grouped),
+            ("isni_compact", is_isni_compact),
+            ("cas", is_cas),
+            ("imo_prefixed", is_imo_prefixed),
+            ("imo_compact", is_imo_compact),
+            ("container", is_iso6346),
+            ("npi", is_npi),
+            ("aba", is_aba_routing),
+            ("ean8", is_ean8),
+            ("gtin14", is_gtin14),
+            ("doi", is_doi),
+        ];
+        let vectors = include_str!("../tests/fixtures/id_checksum_vectors.tsv");
+        let mut checked = 0;
+        let mut positives = 0;
+        for line in vectors.lines() {
+            let mut parts = line.split('\t');
+            let (Some(kind), Some(value), Some(expected)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                panic!("malformed vector line {line:?}");
+            };
+            let check = table
+                .iter()
+                .find(|(name, _)| *name == kind)
+                .unwrap_or_else(|| panic!("unknown vector type {kind}"))
+                .1;
+            let expected = expected == "1";
+            assert_eq!(check(value), expected, "{kind} {value:?}");
+            checked += 1;
+            positives += usize::from(expected);
+        }
+        assert!(checked > 5000 && positives > 1000, "{checked} {positives}");
+    }
+
+    #[test]
+    fn hostile_input_never_panics() {
+        let all: Vec<fn(&str) -> bool> = CHECKSUM_IDS.iter().map(|d| d.check).collect();
+        for s in [
+            "",
+            "\u{1F4A5}",
+            "é".repeat(12).as_str(),
+            "ÀB0378331005",
+            "10.\u{e9}\u{e9}\u{e9}\u{e9}/x",
+            "IMO ",
+            "IMO \u{e9}",
+            "0000-0002-1825-009\u{e9}",
+            "7732-18-",
+            "-",
+            "--",
+            &"9".repeat(200),
+            &"A".repeat(200),
+        ] {
+            for check in &all {
+                let _ = check(s);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::geometry_support::*;
+
+    /// `tests/fixtures/geometry_vectors.tsv`: `kind<TAB>value<TAB>0|1`.
+    ///
+    /// The verdicts come from GEOS (shapely): a WKT counts when GEOS parses
+    /// it, a WKB or GeoPackage blob when GEOS reads it and writes back the
+    /// same bytes. They cover generated geometries in every form (both byte
+    /// orders, EWKB and ISO flavors, Z, empty, collections, `SRID=`, and
+    /// `\x`/`0x` prefixes) and single-edit tampers of them. The six
+    /// `gpkg_real` lines are blobs GDAL wrote into a GeoPackage.
+    #[test]
+    fn verdicts_match_geos_and_gdal() {
+        let vectors = include_str!("../tests/fixtures/geometry_vectors.tsv");
+        let mut bad = Vec::new();
+        let mut n = 0;
+        let mut positives = 0;
+        for line in vectors.lines() {
+            let mut p = line.splitn(3, '\t');
+            let (Some(kind), Some(value), Some(expected)) = (p.next(), p.next(), p.next()) else {
+                panic!("malformed vector {line:?}");
+            };
+            let got = match kind {
+                "wkt" => is_wkt(value),
+                "wkb" => is_wkb_hex(value),
+                "gpkg" | "gpkg_real" => is_gpkg_hex(value),
+                other => panic!("unknown kind {other}"),
+            };
+            n += 1;
+            positives += usize::from(expected == "1");
+            if got != (expected == "1") {
+                bad.push(format!("{kind} expected {expected}: {value}"));
+            }
+        }
+        assert!(
+            n > 8000 && positives > 5000 && n - positives > 2000,
+            "{n} {positives}"
+        );
+        assert!(
+            bad.is_empty(),
+            "{} of {n} differ, e.g.\n{}",
+            bad.len(),
+            bad.iter().take(25).cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn hostile_input_never_panics() {
+        for s in [
+            "",
+            "SRID=",
+            "SRID=\u{e9};POINT(1 2)",
+            "POINT(\u{e9})",
+            "\\x",
+            "0x",
+            "\\x0101",
+            "01070000000500000001",
+            &"(".repeat(500),
+            &format!("GEOMETRYCOLLECTION({}", "GEOMETRYCOLLECTION(".repeat(50)),
+            &format!("0107000000{}", "ffffffff".repeat(30)),
+            &"01".repeat(300),
+            "4750000000000000",
+            "\u{1F4A5}\u{1F4A5}\u{1F4A5}\u{1F4A5}\u{1F4A5}",
+        ] {
+            let _ = is_wkt(s);
+            let _ = is_wkb_hex(s);
+            let _ = is_gpkg_hex(s);
+        }
     }
 }

@@ -4433,6 +4433,147 @@ fn sas7bdat_format_is_recognized() {
     );
 }
 
+// Checksum-validated identifiers. The fixture's values were built from
+// python-stdnum's own check-digit routines; `id_checksum_vectors.tsv` (used by
+// a unit test) holds stdnum's verdict on thousands more.
+#[test]
+fn checksum_identifiers_are_recognized_and_near_misses_are_not() {
+    let doc = run_json("type_detection_identifiers.csv", &[]);
+    let cols = table(&doc, "type_detection_identifiers");
+    for (name, ideal) in [
+        ("isin", "ISIN"),
+        ("lei", "LEI"),
+        ("figi", "FIGI"),
+        ("orcid", "ORCID / ISNI"),
+        ("issn", "ISSN"),
+        ("cas_number", "CAS Number"),
+        ("container", "Container Number"),
+        ("imo", "IMO Number"),
+        ("doi", "DOI"),
+        ("cusip", "CUSIP"),
+        ("sedol", "SEDOL"),
+        ("imo_compact", "IMO Number"),
+        ("npi", "US NPI"),
+        ("routing", "ABA Routing Number"),
+        ("ean8", "EAN-8"),
+        ("gtin14", "GTIN-14"),
+    ] {
+        assert_eq!(column(cols, name)["ideal_type"], ideal, "{name}");
+    }
+    // One wrong check character and the column is plain text / integers.
+    for name in [
+        "near_miss_isin",
+        "near_miss_lei",
+        "near_miss_figi",
+        "near_miss_cusip",
+        "near_miss_container",
+        "near_miss_cas_number",
+    ] {
+        assert_eq!(column(cols, name)["ideal_type"], "String", "{name}");
+    }
+    for name in ["near_miss_npi", "near_miss_routing"] {
+        assert_eq!(column(cols, name)["ideal_type"], "i64", "{name}");
+    }
+    // Digit-only forms look like any integer, so three values aren't
+    // enough to call them routing numbers.
+    assert_eq!(column(cols, "short_routing")["ideal_type"], "i64");
+}
+
+#[test]
+fn checksum_identifiers_get_sized_sql_columns_and_a_string_schema() {
+    let out = Command::new(bin())
+        .arg(fixture("type_detection_identifiers.csv"))
+        .args(["--output-format", "sql", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8_lossy(&out.stdout);
+    assert!(sql.contains("\"isin\" VARCHAR(12)"), "{sql}");
+    assert!(sql.contains("\"lei\" VARCHAR(20)"), "{sql}");
+    assert!(sql.contains("\"orcid\" VARCHAR(19)"), "{sql}");
+    assert!(sql.contains("\"doi\" TEXT"), "{sql}");
+    // An ABA routing number keeps its leading zeros as text.
+    assert!(sql.contains("\"routing\" VARCHAR(9)"), "{sql}");
+
+    let out = Command::new(bin())
+        .arg(fixture("type_detection_identifiers.csv"))
+        .args(["--output-format", "json-schema", "-"])
+        .output()
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let props = &doc["tables"]["type_detection_identifiers"]["properties"];
+    assert_eq!(props["isin"]["type"], "string");
+    assert_eq!(props["routing"]["type"], "string");
+}
+
+// Geometry. `geometry_vectors.tsv` (a unit test) holds GEOS/GDAL verdicts on
+// thousands of values; these run whole files through the binary.
+#[test]
+fn geometry_text_columns_are_typed_by_parsing_and_near_misses_are_not() {
+    let doc = run_json("type_detection_geometry.csv", &[]);
+    let cols = table(&doc, "type_detection_geometry");
+    assert_eq!(column(cols, "wkt")["ideal_type"], "WKT Geometry");
+    // PostGIS EWKT, with its SRID prefix.
+    assert_eq!(column(cols, "ewkt")["ideal_type"], "WKT Geometry");
+    // Hex WKB, and PostGIS's `\x`-prefixed EWKB with an SRID.
+    assert_eq!(column(cols, "wkb_hex")["ideal_type"], "WKB Geometry");
+    assert_eq!(column(cols, "postgis_ewkb")["ideal_type"], "WKB Geometry");
+    // The recursive grammar: a collection used to read as plain text.
+    assert_eq!(column(cols, "collection")["ideal_type"], "WKT Geometry");
+    // A polygon with one parenthesis gone, a WKB cut short by a byte.
+    assert_eq!(column(cols, "near_miss_wkt")["ideal_type"], "String");
+    assert_eq!(column(cols, "near_miss_wkb")["ideal_type"], "String");
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn geoparquet_geometry_column_is_recognized_as_wkb() {
+    // Written by GeoPandas: the geometry column is a plain BYTE_ARRAY of WKB,
+    // which the reader renders as hex.
+    let doc = run_json("edge_geoparquet_geometry.parquet", &[]);
+    let cols = table(&doc, "edge_geoparquet_geometry");
+    assert_eq!(column(cols, "geometry")["ideal_type"], "WKB Geometry");
+    assert_eq!(column(cols, "name")["ideal_type"], "String");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_blob_columns_are_typed_from_their_bytes() {
+    // A GeoPackage written by GDAL: `geom` is a GP-header blob.
+    let doc = run_json("edge_geopackage_geometry.gpkg", &[]);
+    let places = table(&doc, "places");
+    let geom = column(places, "geom");
+    assert_eq!(geom["current_type"], "Blob");
+    assert_eq!(geom["ideal_type"], "GeoPackage Geometry");
+    assert!(
+        geom["notes"]
+            .as_str()
+            .unwrap()
+            .contains("parsing the whole blob")
+    );
+
+    let doc = run_json("edge_sqlite_blob_kinds.sqlite", &[]);
+    let media = table(&doc, "media");
+    assert_eq!(column(media, "png")["ideal_type"], "PNG Image");
+    assert_eq!(column(media, "jpeg")["ideal_type"], "JPEG Image");
+    assert_eq!(column(media, "gif")["ideal_type"], "GIF Image");
+    assert_eq!(column(media, "webp")["ideal_type"], "WebP Image");
+    assert_eq!(column(media, "wkb")["ideal_type"], "WKB Geometry");
+    // One value of another kind, or random bytes: just binary data - and
+    // not "a constant column" because every blob prints the same way.
+    for name in ["mixed", "opaque"] {
+        let c = column(media, name);
+        assert_eq!(c["ideal_type"], "Binary", "{name}");
+        assert!(!c["notes"].as_str().unwrap().contains("constant"), "{name}");
+    }
+    // Nulls don't stop a column being typed.
+    assert!((column(media, "jpeg")["missing_pct"].as_f64().unwrap() - 25.0).abs() < 0.01);
+}
+
 // SAS Transport (.xpt). `xport_nhanes_*.xpt` are real CDC NHANES files
 // (see tests/fixtures/xport_PROVENANCE.md); every expected value below was
 // cross-checked against pyreadstat (ReadStat) and, for the NHANES files,

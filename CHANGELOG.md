@@ -60,6 +60,21 @@ All notable changes to sniff-rs are documented here. Format follows
   content, and prose in a `.txt` file still isn't taken for a table. 99.6% delimiter
   accuracy on the paper's development corpus and 98.7% on its held-out test
   set (the files that are valid UTF-8).
+- Checksum-validated identifier types (the check digit is what makes them
+  evidence, not shape): ISIN, CUSIP, SEDOL, FIGI, LEI, ORCID/ISNI, ISSN, CAS
+  Registry Number, IMO ship number, ISO 6346 container number, US NPI, ABA
+  routing number, EAN-8 and GTIN-14, plus the Crossref DOI pattern. Digit-only
+  compact forms (which look like any integer) count only in a column of five
+  or more values. Each gets a sized `VARCHAR` in SQL and `string` in
+  JSON-Schema. Verified against python-stdnum on 6,000 valid, tampered and
+  random values.
+- Geometry: the WKT check is now a real grammar (collections, `Z`/`M`/`ZM`,
+  `EMPTY`, exponents, `SRID=` EWKT), and hex WKB/EWKB (PostGIS exports,
+  GeoParquet geometry columns) and GeoPackage geometry blobs are recognized
+  by parsing the whole value. SQLite blob columns are typed from their
+  bytes (GeoPackage/WKB geometry, PNG/JPEG/GIF/WebP, else `Binary`) instead
+  of reading as a "constant column" of `<blob: N bytes>`. Checked against
+  GEOS and GDAL on 8,500 values.
 
 ### Changed
 - A Delta Lake or Iceberg table inside a directory is one table in

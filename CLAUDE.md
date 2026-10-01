@@ -6201,7 +6201,9 @@ entirely:
   balanced, parenthesized body containing only coordinate-safe characters.
   Deliberately structural, not a full WKT parser - it doesn't validate a
   well-formed ring/point-count, just that the keyword is real and the body
-  is balanced. **`GEOMETRYCOLLECTION` is deliberately excluded from the
+  is balanced. *(Superseded in Gap audit 3: `geometry_support` now reads the full recursive
+grammar, collections included, so the exclusion below no longer holds.)*
+**`GEOMETRYCOLLECTION` was deliberately excluded from the
   keyword list**, and this was found empirically, not just reasoned about
   in advance: unlike the other six WKT types, its body legitimately nests
   *other* geometry keywords (`"GEOMETRYCOLLECTION(POINT(4 6))"`), which
@@ -17837,6 +17839,110 @@ techniques with a published, checkable answer.
   format) are refused with a message saying so. Each variable's offset in
   the row is the running sum of widths, as in ReadStat, not the `npos`
   field.
+
+- **Checksum-validated identifiers (`id_checksum_support`).** Fourteen more
+  standards whose last character is a check digit, so a column of them is
+  typed by evidence rather than shape: ISIN (ISO 6166: a country prefix from
+  the ISO/ANNA list, letters expanded to two digits, Luhn), CUSIP
+  (every second character doubled, digits of each product summed), SEDOL
+  (weights 1,3,1,7,3,9; no vowels), FIGI (CUSIP-style over full alphanumeric
+  values, `G` third, reserved prefixes refused), LEI (ISO 17442, mod 97-10),
+  ORCID iD / ISNI (ISO 7064 mod 11-2, `X` for ten), ISSN (mod 11), CAS
+  Registry Number (weights counting up from the check digit), IMO ship
+  number, ISO 6346 container number (letter values skip 11/22/33), US NPI
+  (Luhn with the 80840 prefix), ABA routing number (3-7-1), EAN-8 and
+  GTIN-14, and the Crossref DOI pattern (shape only - a DOI has no check
+  digit, and `10.NNNN/` is distinctive). They are a table
+  (`CHECKSUM_IDS`: name, note, check function, `min_values`, SQL type), one
+  `id_ok` flag per entry in `IdealTypeAccumulator`, so another standard is
+  one function and one row. Most specific first; the first entry every
+  value passes names the column, and it sits ahead of the credit-card check
+  but behind IBAN/ISBN/EAN-13/IMEI/VIN.
+
+  The false-positive guard is `min_values`. A column takes a type only if
+  every value passes, so ordinary numbers pass an `n`-value column with
+  probability `10^-n` - negligible for a real column, not for a three-row
+  one. Forms with letters or hyphens (`IMO 9074729`, `0378-5955`, an ISIN)
+  count from one or two values; digit-only compact forms (IMO, ISSN without
+  its hyphen, ABA, NPI, EAN-8, GTIN-14, ORCID without hyphens, CUSIP,
+  SEDOL) need five, which makes a coincidence about one in a hundred
+  thousand. Forms are canonical (upper case, standard separators): python-
+  stdnum's `compact()` also accepts lower case and stray separators, which
+  would make a column of ordinary text look like an ID, and its own
+  `casrn`/`iso6346` regexes are looser than the standards (a CAS number
+  without hyphens, a digit in a container's owner code) - found by the
+  first run of the vector test and not copied.
+
+  *Verification.* `tests/fixtures/id_checksum_vectors.tsv` holds 6,100
+  `type<TAB>value<TAB>verdict` lines: for each standard, valid values built
+  from stdnum's own `calc_check_digit`, single-character tampers of them
+  (which stdnum must and does reject), random strings of the right shape and
+  wrong lengths, plus published examples (Apple's ISIN `US0378331005`, the
+  LEI `HWUPKR0MPOU8FGXBT394`, water's CAS `7732-18-5`, Josiah Carberry's
+  ORCID `0000-0002-1825-0097`). The unit test
+  `id_checksum_tests::verdicts_match_python_stdnum` requires every verdict
+  to match, and a second test feeds hostile input (multi-byte characters
+  at every slice point, empty and 200-character strings) to every check.
+  `type_detection_identifiers.csv` runs the whole pipeline, with a near-miss
+  column per type and the three-value rule. A sweep of every other fixture
+  against the previous build changed nothing.
+
+- **Geometry in text, hex and blobs (`geometry_support`).** The old WKT
+  check was a character filter that couldn't see a `GEOMETRYCOLLECTION`.
+  It is now a grammar: the seven OGC keywords, an optional `Z`/`M`/`ZM`
+  marker (spaced `POINT Z (...)` or fused `POINTM(...)`), `EMPTY`, 2-4
+  numbers per coordinate (exponents and `.5`/`5.` accepted; `1.5.2` and
+  `-6.391-130.541` are not two numbers), `MULTIPOINT` in both its
+  `((1 2), (3 4))` and `(1 2, 3 4)` spellings, collections to a depth of
+  eight, and PostGIS's `SRID=4326;` prefix. Grammar only: an unclosed ring
+  is still WKT. Two new types come from *parsing* binary geometry: **WKB
+  Geometry** (hex text of WKB or PostGIS EWKB, optionally `\x`- or
+  `0x`-prefixed - the form a Parquet `BYTE_ARRAY`, a GeoParquet
+  `geometry` column, a PostGIS `bytea` export or any reader here renders a
+  binary column in) and **GeoPackage Geometry** (`GP` header, flags,
+  envelope sized by the flags, then WKB). The WKB walker reads both byte
+  orders, EWKB's SRID/Z/M flag bits and ISO's 1000/2000/3000 offsets for
+  point through geometry collection, and a count that promises more bytes
+  than remain is refused before anything is walked, so a value counts only
+  if the whole of it is exactly one geometry - random hex essentially
+  never is. Curve and surface types are left alone (no reference files).
+  A member's dimension flags are its own, because GEOS writes an empty
+  member of a 3D collection without the Z flag.
+
+  A SQLite `BLOB` prints as `<blob: N bytes>`, so geometry there can only
+  be found in the bytes. The reader decodes each blob's kind while the
+  bytes are in hand (it keeps only the length): GeoPackage geometry and WKB
+  by parsing, and PNG/JPEG/GIF/WebP by magic number. A column is typed only
+  if *every* non-null value is the same kind; any other all-blob column is
+  `Binary`. The old behavior called equal-length blobs "a constant column
+  (1 unique value)" - the printed text was all the heuristics saw - so
+  blob-only columns no longer reach the category check.
+
+  *Verification.* `tests/fixtures/geometry_vectors.tsv` has 8,525 verdicts
+  from GEOS (shapely 2.1) and GDAL: for WKT, GEOS writes and re-reads
+  geometries in every form (precision, trimmed, `Z`, empty, collections,
+  `SRID=`, lower case, padding) and single-edit tampers, where a GEOS
+  failure on *geometry validity* (an unclosed ring, which can pre-empt a
+  later syntax error) drops the vector and a mangled keyword is left out
+  (GEOS reads `MULTIPOINT4(...)` leniently; the standard doesn't); for WKB
+  the same geometries in both byte orders, EWKB and ISO, with SRIDs, with
+  `\x`/`0x`/upper-case forms, truncated, extended and edited, judged by
+  "GEOS reads it and writes back the same bytes" (and refused when GEOS
+  reads it but leaves bytes over - the one thing it ignores); for
+  GeoPackage, blobs built to the spec over every envelope indicator and
+  byte order plus six that GDAL wrote. `geometry_tests::verdicts_match_geos_
+  and_gdal` requires every verdict to match. Running it found four real
+  things: numbers fused without a separator (`1.5.2`) were read as two
+  numbers; GEOS writes `GEOMETRYCOLLECTION Z (POLYGON EMPTY, POINT Z ...)`
+  and then can't read it back (so a GEOS failure on its own output proves
+  nothing); empty and NaN geometries don't round-trip byte for byte
+  (payload bits, the Z flag), so a byte comparison there is skipped; and a
+  nested-dimension rule I added to be stricter turned out to reject GEOS's
+  own output, so it was removed. Whole-pipeline fixtures:
+  `type_detection_geometry.csv`, `edge_geopackage_geometry.gpkg` and
+  `edge_geoparquet_geometry.parquet` (both written by GDAL/pyarrow via
+  geopandas), and `edge_sqlite_blob_kinds.sqlite` (Pillow images, shapely
+  WKB, random bytes).
 
 ## Known limitations / roadmap
 
