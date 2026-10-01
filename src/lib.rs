@@ -92979,21 +92979,64 @@ fn profile_raw_file_as_diff_columns(
         dispatch_reader(read_path, logical_path, format, &synthetic_args)?;
     Ok(tables
         .into_iter()
-        .map(|(name, profiles)| {
-            let cols = profiles
-                .into_iter()
-                .map(|p| DiffColumn {
-                    name: p.name,
-                    current_type: p.current_type,
-                    ideal_type: p.ideal_type,
-                    missing_pct: p.missing_pct,
-                    labels: column_label_text(&p.description, &p.notes).unwrap_or_default(),
-                    sample_values: p.sample_values,
-                })
-                .collect();
-            (name, cols)
-        })
+        .map(|(name, profiles)| (name, profiles_to_diff_columns(profiles)))
         .collect())
+}
+
+fn profiles_to_diff_columns(profiles: Vec<ColumnProfile>) -> Vec<DiffColumn> {
+    profiles
+        .into_iter()
+        .map(|p| DiffColumn {
+            name: p.name,
+            current_type: p.current_type,
+            ideal_type: p.ideal_type,
+            missing_pct: p.missing_pct,
+            labels: column_label_text(&p.description, &p.notes).unwrap_or_default(),
+            sample_values: p.sample_values,
+        })
+        .collect()
+}
+
+/// A directory as one side of `sniff-rs diff`: every recognized file under
+/// it is profiled with the same defaults a bare `sniff-rs <file>` uses, and
+/// its tables are named exactly the way `--combine` names them
+/// (`<path qualifier>__<table>`), so a live directory diffs cleanly against
+/// a saved `--combine --output-format json` dictionary of an earlier
+/// snapshot. Unrecognized files and multi-file archives are skipped (the
+/// same as a walk); a file that is recognized but fails to read is an
+/// error naming it, since a silently missing table would read as a dropped
+/// one.
+fn profile_directory_as_diff_columns(dir: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
+    let mut files = Vec::new();
+    collect_files_sorted(dir, dir, &mut files, &[])?;
+    let mut namer = CombinedTableNamer::new();
+    let mut out: BTreeMap<String, Vec<DiffColumn>> = BTreeMap::new();
+    for path in &files {
+        if looks_like_own_output(path) {
+            continue;
+        }
+        let Some((read_path, logical_path, _decompressed_tmp)) = decompress_for_walk(path)
+            .with_context(|| format!("failed processing {path:?}"))?
+        else {
+            continue;
+        };
+        let Ok((format, read_path, _text_tmp)) =
+            try_detect_and_normalize(&read_path, &logical_path, &None, None)
+                .with_context(|| format!("failed processing {path:?}"))?
+        else {
+            continue;
+        };
+        let qualifier = combine_qualifier_from_path(&relative_display_path(dir, path));
+        let tables = profile_raw_file_as_diff_columns(path, &read_path, &logical_path, format)
+            .with_context(|| format!("failed processing {path:?}"))?;
+        for (table_name, columns) in tables {
+            out.insert(namer.resolve(&qualifier, &table_name), columns);
+        }
+    }
+    if out.is_empty() {
+        bail!("no recognized files found in {dir:?}");
+    }
+    Ok(out)
 }
 
 /// `sniff-rs diff`'s own per-side input resolution: `<OLD>`/`<NEW>` may
@@ -93022,11 +93065,7 @@ fn load_diff_input(
 ) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
     let is_stdin = path == Path::new("-");
     if path.is_dir() {
-        bail!(
-            "{path:?} is a directory - `sniff-rs diff` compares two files. To compare two \
-             --combine directory snapshots, run `sniff-rs <dir> --combine --output-format json \
-             <out.json>` on each one first, then diff the two resulting files"
-        );
+        return profile_directory_as_diff_columns(path);
     }
     let (stdin_path, _stdin_tmp) = resolve_stdin_input(path)?;
     let (read_path, mut logical_path, _decompressed_tmp) = decompress_if_needed(&stdin_path)?;

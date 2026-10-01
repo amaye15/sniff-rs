@@ -11369,15 +11369,48 @@ fn diff_accepts_a_mix_of_a_dictionary_and_a_raw_file() {
 // would otherwise still be silently broken by.
 
 #[test]
-fn diff_rejects_a_directory_input_with_an_actionable_error() {
+fn diff_compares_two_directories_and_a_directory_against_a_combine_dictionary() {
     let dir = TempDir::new();
-    let output = run_diff_raw(&[
-        dir.path().to_str().unwrap(),
-        fixture("diff_old.json").to_str().unwrap(),
-    ]);
+    let (old, new) = (dir.path().join("old"), dir.path().join("new"));
+    for d in [&old, &new] {
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/b.csv"), "k,v\n1,x\n").unwrap();
+    }
+    std::fs::write(old.join("a.csv"), "id,name\n1,a\n2,b\n").unwrap();
+    std::fs::write(new.join("a.csv"), "id,name,extra\n1,a,q\n2,b,r\n").unwrap();
+    std::fs::write(new.join("c.csv"), "z\n1\n").unwrap();
+
+    let output = run_diff_raw(&[old.to_str().unwrap(), new.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    // Tables are named the way --combine names them.
+    assert!(report.contains("extra") && report.contains("column added"));
+    assert!(report.contains("table added") && report.contains("c\\_\\_c"));
+    assert!(report.contains("sub_b\\_\\_b") && report.contains("unchanged"));
+
+    // The same old snapshot saved as a --combine dictionary diffs identically.
+    let saved = dir.path().join("old.json");
+    let status = std::process::Command::new(bin())
+        .args([old.to_str().unwrap(), "--combine", "--output-format", "json"])
+        .arg(&saved)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let against_saved = run_diff_raw(&[saved.to_str().unwrap(), new.to_str().unwrap()]);
+    let saved_report = String::from_utf8(against_saved.stdout).unwrap();
+    assert!(saved_report.contains("extra") && saved_report.contains("c\\_\\_c"));
+
+    // A directory with nothing recognizable is an error, not an empty diff.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let output = run_diff_raw(&[empty.to_str().unwrap(), new.to_str().unwrap()]);
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("is a directory") && stderr.contains("--combine"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no recognized files"));
 }
 
 // --- Delta Lake table awareness (--features delta) ---
