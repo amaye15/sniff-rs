@@ -4433,6 +4433,251 @@ fn sas7bdat_format_is_recognized() {
     );
 }
 
+// SAS Transport (.xpt). `xport_nhanes_*.xpt` are real CDC NHANES files
+// (see tests/fixtures/xport_PROVENANCE.md); every expected value below was
+// cross-checked against pyreadstat (ReadStat) and, for the NHANES files,
+// pandas. The other fixtures are written by pyreadstat or hand-built to the
+// published layout.
+#[cfg(feature = "xport")]
+#[test]
+fn xport_reads_a_real_nhanes_file_and_reads_zero_as_zero() {
+    let doc = run_json("xport_nhanes_paxraw_short.xpt", &[]);
+    let cols = table(&doc, "PAXRAWS");
+    let seqn = column(cols, "SEQN");
+    assert_eq!(seqn["row_count"], 100);
+    assert_eq!(seqn["description"], "Respondent sequence number");
+    assert_eq!(seqn["ideal_type"], "i64");
+    // PAXHOUR holds real zeros. pandas' XPORT reader turns each into 5.4e-79
+    // (it never special-cases a zero mantissa); the format and ReadStat say 0.
+    let hour = column(cols, "PAXHOUR");
+    assert_eq!(hour["numeric_stats"]["min"].as_f64().unwrap(), 0.0);
+    assert_eq!(hour["numeric_stats"]["max"].as_f64().unwrap(), 1.0);
+    assert!((hour["numeric_stats"]["mean"].as_f64().unwrap() - 0.4).abs() < 1e-12);
+    let inten = column(cols, "PAXINTEN");
+    assert_eq!(inten["numeric_stats"]["max"].as_f64().unwrap(), 780.0);
+    assert!((inten["numeric_stats"]["mean"].as_f64().unwrap() - 56.07).abs() < 1e-9);
+
+    let doc = run_json("xport_nhanes_sshsv1_a.xpt", &[]);
+    let cols = table(&doc, "SSHSV1_A");
+    assert_eq!(column(cols, "SEQN")["row_count"], 1426);
+    assert_eq!(column(cols, "SSXHE1")["description"], "Herpes I");
+    let seqn = &column(cols, "SEQN")["numeric_stats"];
+    assert_eq!(seqn["min"].as_f64().unwrap(), 3.0);
+    assert_eq!(seqn["max"].as_f64().unwrap(), 9964.0);
+    assert!((seqn["mean"].as_f64().unwrap() - 5032.651473).abs() < 1e-6);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.xpt", &[]);
+    let cols = table(&doc, "TYPES");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    // A SAS date is a double with a DATE9. format: stored numeric, so the
+    // declared type is "Date" only because the format name says so.
+    assert_eq!(column(cols, "signup_date")["current_type"], "Date");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(column(cols, "signup_date")["description"], "Signup date");
+    assert_eq!(column(cols, "id")["current_type"], "f64");
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_v8_carries_long_labels_dates_and_missing_values() {
+    let doc = run_json("sample.xpt", &[]);
+    let cols = table(&doc, "CUSTOMERS");
+    assert_eq!(
+        column(cols, "balance")["description"],
+        "Account balance (USD)"
+    );
+    assert_eq!(
+        column(cols, "customer_id")["description"],
+        "Customer identifier"
+    );
+    // Blank text is SAS's missing value; a missing number is `.`.
+    assert!((column(cols, "name")["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    assert!((column(cols, "age")["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    assert!((column(cols, "balance")["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    let joined = column(cols, "joined");
+    assert_eq!(joined["current_type"], "Date");
+    assert!((joined["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    let samples: Vec<&str> = joined["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(samples, ["2021-03-14", "2019-11-02", "2022-07-30"]);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_labelv9_record_gives_long_names_labels_and_formats() {
+    // Hand-assembled from ReadStat's reader (no available writer emits a
+    // LABELV9 record); pyreadstat reads it back with the same names, labels
+    // and formats. `MMDDYY10.` is a full format specification, so the width
+    // digits must not stop it reading as a date.
+    let doc = run_json("edge_xport_labelv9.xpt", &[]);
+    let cols = table(&doc, "LAB");
+    let long = column(cols, "a_long_variable_name_here");
+    assert_eq!(long["description"], "Numeric with a long name and label");
+    assert_eq!(long["current_type"], "f64");
+    let when = column(cols, "when");
+    assert_eq!(when["current_type"], "Date");
+    assert_eq!(when["description"], "Visit date");
+    assert_eq!(when["sample_values"][0], "2020-01-01");
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_short_numerics_tagged_missing_and_cp1252_text() {
+    // Hand-built: numerics stored in 8, 4 and 3 bytes (a short field is the
+    // leading bytes of the 8-byte IBM float), `.A` and `._` tagged missing
+    // values, a DATE-formatted day count (negative and zero included), and
+    // a Windows-1252 `\xe9` in a text field. The first six rows read
+    // identically in pyreadstat.
+    let doc = run_json("edge_xport_truncated_numerics_tagged_missing.xpt", &[]);
+    let cols = table(&doc, "SHORTS");
+    for name in ["REAL8", "SHORT4", "TINY3"] {
+        let c = column(cols, name);
+        assert_eq!(c["row_count"], 6, "{name}");
+        assert!(
+            (c["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01,
+            "{name}"
+        );
+    }
+    let real = &column(cols, "REAL8")["numeric_stats"];
+    assert_eq!(real["min"].as_f64().unwrap(), -0.1);
+    assert_eq!(real["max"].as_f64().unwrap(), 3.141592653589793);
+    let short = &column(cols, "SHORT4")["numeric_stats"];
+    assert_eq!(short["count"], 4);
+    assert_eq!(short["min"].as_f64().unwrap(), -7.5);
+    assert_eq!(short["max"].as_f64().unwrap(), 1e8);
+    let tiny = &column(cols, "TINY3")["numeric_stats"];
+    assert_eq!(tiny["max"].as_f64().unwrap(), 65535.0);
+    let day = column(cols, "DAY");
+    assert_eq!(day["current_type"], "Date");
+    let days: Vec<&str> = day["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(days, ["1960-01-01", "2020-01-01", "1959-12-31"]);
+    let note = column(cols, "NOTE");
+    assert!(
+        note["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "caf\u{e9} au lait"),
+        "{note}"
+    );
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_members_are_tables_and_nrows_bounds_each() {
+    let doc = run_json("edge_xport_multi_member.xpt", &[]);
+    assert_eq!(column(table(&doc, "PEOPLE"), "id")["row_count"], 5);
+    assert_eq!(column(table(&doc, "STOCK"), "sku")["row_count"], 3);
+    assert_eq!(table(&doc, "STOCK").len(), 2);
+
+    // --nrows bounds each member, and the second is still found after the
+    // first is cut short.
+    let doc = run_json("edge_xport_multi_member.xpt", &["--nrows", "2"]);
+    assert_eq!(column(table(&doc, "PEOPLE"), "id")["row_count"], 2);
+    assert_eq!(column(table(&doc, "STOCK"), "sku")["row_count"], 2);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_v8_declared_observation_count_keeps_trailing_blank_rows() {
+    // OBSV8 states 4 observations; the last two are genuinely blank. A v5
+    // file can't say, so it drops a trailing run of blank rows as padding.
+    let doc = run_json("edge_xport_v8_trailing_blank_rows.xpt", &[]);
+    let code = column(table(&doc, "BLANKS"), "code");
+    assert_eq!(code["row_count"], 4);
+    assert!((code["missing_pct"].as_f64().unwrap() - 50.0).abs() < 0.01);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_inline_sql_loads_every_member_with_iso_dates() {
+    let out = Command::new(bin())
+        .arg(fixture("sample.xpt"))
+        .args(["--output-format", "sql", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8_lossy(&out.stdout);
+    assert!(sql.contains("CREATE TABLE \"CUSTOMERS\""), "{sql}");
+    assert!(sql.contains("'2021-03-14'"), "{sql}");
+    assert!(sql.contains("'Alice Smith'"), "{sql}");
+    assert!(sql.contains("NULL"), "{sql}");
+
+    let out = Command::new(bin())
+        .arg(fixture("edge_xport_multi_member.xpt"))
+        .args(["--output-format", "sql", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8_lossy(&out.stdout);
+    assert!(sql.contains("CREATE TABLE \"PEOPLE\""), "{sql}");
+    assert!(sql.contains("CREATE TABLE \"STOCK\""), "{sql}");
+    assert!(sql.contains("'A1'") && sql.contains("'C3'"), "{sql}");
+    assert!(sql.contains("'Carol White'"), "{sql}");
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_is_found_by_content_when_the_name_says_nothing() {
+    let dir = TempDir::new();
+    let copy = dir.path().join("exported_dataset");
+    std::fs::copy(fixture("sample.xpt"), &copy).unwrap();
+    let out = Command::new(bin())
+        .arg(&copy)
+        .args(["-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["format"], "xport");
+    assert!(doc["tables"]["CUSTOMERS"].is_array());
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn malformed_xport_fails_cleanly() {
+    for name in ["malformed_garbage.xpt", "malformed_xport_truncated.xpt"] {
+        let out = Command::new(bin())
+            .arg(fixture(name))
+            .args(["-", "--output-format", "json"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{name} should be refused");
+        assert!(!stderr.contains("panicked"), "{name}: {stderr}");
+    }
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {

@@ -3430,7 +3430,7 @@ Generate a data dictionary from a CSV, TSV, JSON, JSON Lines, Parquet,
 Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML, CBOR,
 INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
-(.dta), SAS7BDAT, SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
+(.dta), SAS7BDAT, SAS Transport (.xpt), SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
 HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
 text, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
@@ -3509,7 +3509,7 @@ OPTIONS:
                                 arrow, avro, xlsx, sqlite, msgpack, toml, yaml, cbor,
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
-                                 sas7bdat, spss, orc, bson, plist, json5, har, geojson,
+                                 sas7bdat, xport, spss, orc, bson, plist, json5, har, geojson,
                                  mbox, vcard, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
@@ -3523,7 +3523,10 @@ OPTIONS:
                                 euc-kr, gbk, gb18030, big5).
                                 Without it a UTF-8/UTF-16/UTF-32 byte-order mark
                                 decides and everything else is read as UTF-8.
-        --delimiter <CHAR>      Override the field delimiter for csv/tsv (single character)
+        --delimiter <CHAR>      Override the delimiter for csv/tsv (single character). Without
+                                it the delimiter, quote and escape characters are
+                                detected from the data (comma, semicolon, tab, pipe,
+                                ...), including for .txt/.dat/.tab/.psv files.
         --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
         --widths <N,N,...>      Column widths for --format fixed-width, comma-separated -
                                 single-file mode only
@@ -5079,10 +5082,20 @@ struct ColumnProfile {
 
 /// The most value labels written into a column's notes; a column with
 /// hundreds (a country or occupation code) gets the first few and a count.
-#[cfg(any(feature = "stata", feature = "sas7bdat", feature = "spss"))]
+#[cfg(any(
+    feature = "stata",
+    feature = "sas7bdat",
+    feature = "spss",
+    feature = "xport"
+))]
 const MAX_VALUE_LABELS_NOTED: usize = 20;
 /// A single value label is cut to this many characters in the notes.
-#[cfg(any(feature = "stata", feature = "sas7bdat", feature = "spss"))]
+#[cfg(any(
+    feature = "stata",
+    feature = "sas7bdat",
+    feature = "spss",
+    feature = "xport"
+))]
 const MAX_VALUE_LABEL_CHARS: usize = 60;
 
 /// Attaches what a statistical-package file says about a variable:
@@ -5092,7 +5105,12 @@ const MAX_VALUE_LABEL_CHARS: usize = 60;
 /// detection, and the labels are the only place the file says what they
 /// mean. Both are the file's own words, never a guess: an empty label
 /// leaves `description` empty, no value labels adds no note.
-#[cfg(any(feature = "stata", feature = "sas7bdat", feature = "spss"))]
+#[cfg(any(
+    feature = "stata",
+    feature = "sas7bdat",
+    feature = "spss",
+    feature = "xport"
+))]
 fn apply_variable_labels(
     profile: &mut ColumnProfile,
     variable_label: &str,
@@ -13127,6 +13145,153 @@ fn columns_from_stata(
 // labels live in a separate `.sas7bcat` catalog file, not in this one,
 // so there are none to surface.
 
+// --- SAS numeric values: formats and rendering, shared by SAS7BDAT and XPORT ---
+//
+// A SAS numeric variable is always a double; whether it's a number, a date,
+// a datetime or a time of day is decided by its *format name* alone. Both
+// SAS file formats this tool reads (the SAS7BDAT data set and the XPORT
+// transport file) carry that name, so the classification and the epoch
+// arithmetic live here once.
+#[cfg(any(feature = "sas7bdat", feature = "xport"))]
+mod sas_value_support {
+    use super::*;
+
+    // --- Format-name-driven logical type, for date/datetime/time columns ---
+    // Ported directly from the reference crate's own `layout.rs` - see
+    // that file's extensive comment for why membership must be *exact*
+    // (a substring test like `contains("MON")` swept up real user-defined
+    // format names on real government survey files) and grouped by the
+    // *scale of the stored value* rather than by what the format prints
+    // (`DTDATE` prints a date but stores a datetime).
+
+    static DATE_FORMATS: &[&str] = &[
+        "B8601DA", "DATE", "DAY", "DDMMYY", "DDMMYYB", "DDMMYYC", "DDMMYYD", "DDMMYYN", "DDMMYYP",
+        "DDMMYYS", "DOWNAME", "E8601DA", "IS8601DA", "JULDAY", "JULIAN", "MINGUO", "MMDDYY",
+        "MMDDYYB", "MMDDYYC", "MMDDYYD", "MMDDYYN", "MMDDYYP", "MMDDYYS", "MMYY", "MMYYC", "MMYYD",
+        "MMYYN", "MMYYP", "MMYYS", "MONNAME", "MONTH", "MONYY", "NENGO", "PDJULG", "PDJULI", "QTR",
+        "QTRR", "WEEKDATE", "WEEKDATX", "WEEKDAY", "WEEKU", "WEEKV", "WEEKW", "WORDDATE",
+        "WORDDATX", "YEAR", "YYMM", "YYMMC", "YYMMD", "YYMMDD", "YYMMDDB", "YYMMDDC", "YYMMDDD",
+        "YYMMDDN", "YYMMDDP", "YYMMDDS", "YYMMN", "YYMMP", "YYMMS", "YYMON", "YYQ", "YYQC", "YYQD",
+        "YYQN", "YYQP", "YYQR", "YYQRC", "YYQRD", "YYQRN", "YYQRP", "YYQRS", "YYQS",
+    ];
+    static DATETIME_FORMATS: &[&str] = &[
+        "B8601DN", "B8601DT", "B8601DZ", "DATEAMPM", "DATETIME", "DTDATE", "DTMONYY", "DTWKDATX",
+        "DTYEAR", "DTYYQC", "E8601DN", "E8601DT", "E8601DZ", "IS8601DT", "IS8601DZ", "MDYAMPM",
+    ];
+    static TIME_FORMATS: &[&str] = &[
+        "B8601LZ", "B8601TM", "B8601TZ", "E8601LZ", "E8601TM", "E8601TZ", "HHMM", "HOUR",
+        "IS8601TM", "IS8601TZ", "MMSS", "TIME", "TIMEAMPM",
+    ];
+
+    /// What a SAS numeric variable holds, from its format name.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum NumericKind {
+        Float,
+        Date,
+        DateTime,
+        Time,
+    }
+
+    /// Classifies a bare format name (`DATE`, `mmddyy`, `E8601DA`): the
+    /// name is trimmed, upper-cased and stripped of its dots, then looked
+    /// up exactly - never by substring or after dropping digits, since a
+    /// user-defined format (`MONTH2`) must not read as a date.
+    pub(crate) fn classify_format_name(name: &str) -> NumericKind {
+        let cleaned = name.trim().trim_matches('.').to_ascii_uppercase();
+        let cleaned = cleaned.as_str();
+        if DATETIME_FORMATS.contains(&cleaned) {
+            NumericKind::DateTime
+        } else if DATE_FORMATS.contains(&cleaned) {
+            NumericKind::Date
+        } else if TIME_FORMATS.contains(&cleaned) {
+            NumericKind::Time
+        } else {
+            NumericKind::Float
+        }
+    }
+
+    /// The name part of a format *as written in code* (`MMDDYY10.`,
+    /// `DATE9.`, `COMMA12.2`): everything before the width and decimals.
+    /// A trailing digit run is the width here, because this form is only
+    /// ever a full format specification, never a bare name.
+    pub(crate) fn format_spec_name(spec: &str) -> &str {
+        spec.trim()
+            .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
+    }
+
+    pub(crate) fn kind_label(kind: NumericKind) -> &'static str {
+        match kind {
+            NumericKind::Float => "f64",
+            NumericKind::Date => "Date",
+            NumericKind::DateTime => "Timestamp",
+            NumericKind::Time => "Time",
+        }
+    }
+
+    /// Days/seconds between the SAS epoch (1960-01-01) and the Unix epoch
+    /// (1970-01-01) - verified independently against Python's own
+    /// `datetime` module (`date(1970,1,1) - date(1960,1,1)` = 3653 days)
+    /// before trusting it, the same discipline this project's other
+    /// epoch-conversion constants already get. SAS's own epoch is
+    /// *earlier* than Unix's, so a SAS day/second count converts to Unix
+    /// terms by *subtracting* this offset, not adding it.
+    const SAS_TO_UNIX_DAYS: i64 = 3653;
+    const SAS_TO_UNIX_SECONDS: i64 = 3653 * 86_400;
+
+    /// A SAS date/datetime/time value only converts to a real date if
+    /// it's a whole number within the target integer's range - ported
+    /// directly from the reference crate's own `try_i64_from_f64`
+    /// (`scan/numeric.rs`), since `SasDate`/`SasTime` store their offset
+    /// as `i32` and `SasDateTime` as `i64`. A value that fails this check
+    /// (a genuinely fractional value, or one too extreme to represent)
+    /// falls back to rendering as a plain number instead of a date - the
+    /// reference crate does the same, confirmed by an oracle mismatch on
+    /// a real fixture (`dates_null.sas7bdat`'s `datetimecol`, whose
+    /// out-of-range test value renders as `"253717747199.999"`, not a
+    /// formatted datetime) caught before this fallback was added.
+    fn try_i64_from_f64(number: f64) -> Option<i64> {
+        const I64_MIN_F64: f64 = i64::MIN as f64;
+        const I64_MAX_F64: f64 = i64::MAX as f64;
+        if !number.is_finite() || !(I64_MIN_F64..=I64_MAX_F64).contains(&number) {
+            return None;
+        }
+        let value = number as i64;
+        if (value as f64 - number).abs() < f64::EPSILON {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    fn try_i32_from_f64(number: f64) -> Option<i32> {
+        i32::try_from(try_i64_from_f64(number)?).ok()
+    }
+
+    /// Renders a numeric cell: a plain number, or - when the format says
+    /// date/datetime/time and the value is a whole number in range - an
+    /// ISO string; anything else falls back to the number itself.
+    pub(crate) fn render_numeric(kind: NumericKind, v: f64) -> String {
+        let rendered = match kind {
+            NumericKind::Float => None,
+            NumericKind::Date => try_i32_from_f64(v).and_then(|days| {
+                EpochDate::from_days(i64::from(days) - SAS_TO_UNIX_DAYS).map(|d| d.format_ymd())
+            }),
+            NumericKind::DateTime => try_i64_from_f64(v)
+                .and_then(|secs| secs.checked_sub(SAS_TO_UNIX_SECONDS))
+                .and_then(|secs| {
+                    EpochDateTime::from_unix_seconds(secs, 0).map(|dt| dt.format_space())
+                }),
+            NumericKind::Time => try_i32_from_f64(v).and_then(|secs| {
+                u32::try_from(secs)
+                    .ok()
+                    .and_then(|s| EpochTime::from_seconds_since_midnight(s, 0))
+                    .map(|t| t.format_hms())
+            }),
+        };
+        rendered.unwrap_or_else(|| v.to_string())
+    }
+}
+
 #[cfg(feature = "sas7bdat")]
 mod sas7bdat_support {
     use super::*;
@@ -14466,32 +14631,8 @@ mod sas7bdat_support {
         }
     }
 
-    // --- Format-name-driven logical type, for date/datetime/time columns ---
-    // Ported directly from the reference crate's own `layout.rs` - see
-    // that file's extensive comment for why membership must be *exact*
-    // (a substring test like `contains("MON")` swept up real user-defined
-    // format names on real government survey files) and grouped by the
-    // *scale of the stored value* rather than by what the format prints
-    // (`DTDATE` prints a date but stores a datetime).
-    static DATE_FORMATS: &[&str] = &[
-        "B8601DA", "DATE", "DAY", "DDMMYY", "DDMMYYB", "DDMMYYC", "DDMMYYD", "DDMMYYN", "DDMMYYP",
-        "DDMMYYS", "DOWNAME", "E8601DA", "IS8601DA", "JULDAY", "JULIAN", "MINGUO", "MMDDYY",
-        "MMDDYYB", "MMDDYYC", "MMDDYYD", "MMDDYYN", "MMDDYYP", "MMDDYYS", "MMYY", "MMYYC", "MMYYD",
-        "MMYYN", "MMYYP", "MMYYS", "MONNAME", "MONTH", "MONYY", "NENGO", "PDJULG", "PDJULI", "QTR",
-        "QTRR", "WEEKDATE", "WEEKDATX", "WEEKDAY", "WEEKU", "WEEKV", "WEEKW", "WORDDATE",
-        "WORDDATX", "YEAR", "YYMM", "YYMMC", "YYMMD", "YYMMDD", "YYMMDDB", "YYMMDDC", "YYMMDDD",
-        "YYMMDDN", "YYMMDDP", "YYMMDDS", "YYMMN", "YYMMP", "YYMMS", "YYMON", "YYQ", "YYQC", "YYQD",
-        "YYQN", "YYQP", "YYQR", "YYQRC", "YYQRD", "YYQRN", "YYQRP", "YYQRS", "YYQS",
-    ];
-    static DATETIME_FORMATS: &[&str] = &[
-        "B8601DN", "B8601DT", "B8601DZ", "DATEAMPM", "DATETIME", "DTDATE", "DTMONYY", "DTWKDATX",
-        "DTYEAR", "DTYYQC", "E8601DN", "E8601DT", "E8601DZ", "IS8601DT", "IS8601DZ", "MDYAMPM",
-    ];
-    static TIME_FORMATS: &[&str] = &[
-        "B8601LZ", "B8601TM", "B8601TZ", "E8601LZ", "E8601TM", "E8601TZ", "HHMM", "HOUR",
-        "IS8601TM", "IS8601TZ", "MMSS", "TIME", "TIMEAMPM",
-    ];
-
+    // Date/datetime/time classification and rendering live in
+    // `sas_value_support`, shared with the XPORT reader.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum LogicalType {
         Float,
@@ -14502,27 +14643,15 @@ mod sas7bdat_support {
         Time,
     }
 
-    fn classify_numeric_format(name: &str) -> LogicalType {
-        if DATETIME_FORMATS.contains(&name) {
-            LogicalType::DateTime
-        } else if DATE_FORMATS.contains(&name) {
-            LogicalType::Date
-        } else if TIME_FORMATS.contains(&name) {
-            LogicalType::Time
-        } else {
-            LogicalType::Float
-        }
-    }
-
     fn infer_logical_type(type_code: u8, format_name: Option<&str>) -> LogicalType {
+        use super::sas_value_support::{NumericKind, classify_format_name};
         match type_code {
             0x02 => LogicalType::String,
-            0x01 => match format_name {
-                None => LogicalType::Float,
-                Some(name) => {
-                    let cleaned = name.trim().trim_matches('.').to_ascii_uppercase();
-                    classify_numeric_format(&cleaned)
-                }
+            0x01 => match format_name.map(classify_format_name) {
+                None | Some(NumericKind::Float) => LogicalType::Float,
+                Some(NumericKind::Date) => LogicalType::Date,
+                Some(NumericKind::DateTime) => LogicalType::DateTime,
+                Some(NumericKind::Time) => LogicalType::Time,
             },
             _ => LogicalType::Bytes,
         }
@@ -14536,45 +14665,6 @@ mod sas7bdat_support {
             LogicalType::DateTime => "Timestamp",
             LogicalType::Time => "Time",
         }
-    }
-
-    /// Days/seconds between the SAS epoch (1960-01-01) and the Unix epoch
-    /// (1970-01-01) - verified independently against Python's own
-    /// `datetime` module (`date(1970,1,1) - date(1960,1,1)` = 3653 days)
-    /// before trusting it, the same discipline this project's other
-    /// epoch-conversion constants already get. SAS's own epoch is
-    /// *earlier* than Unix's, so a SAS day/second count converts to Unix
-    /// terms by *subtracting* this offset, not adding it.
-    const SAS_TO_UNIX_DAYS: i64 = 3653;
-    const SAS_TO_UNIX_SECONDS: i64 = 3653 * 86_400;
-
-    /// A SAS date/datetime/time value only converts to a real date if
-    /// it's a whole number within the target integer's range - ported
-    /// directly from the reference crate's own `try_i64_from_f64`
-    /// (`scan/numeric.rs`), since `SasDate`/`SasTime` store their offset
-    /// as `i32` and `SasDateTime` as `i64`. A value that fails this check
-    /// (a genuinely fractional value, or one too extreme to represent)
-    /// falls back to rendering as a plain number instead of a date - the
-    /// reference crate does the same, confirmed by an oracle mismatch on
-    /// a real fixture (`dates_null.sas7bdat`'s `datetimecol`, whose
-    /// out-of-range test value renders as `"253717747199.999"`, not a
-    /// formatted datetime) caught before this fallback was added.
-    fn try_i64_from_f64(number: f64) -> Option<i64> {
-        const I64_MIN_F64: f64 = i64::MIN as f64;
-        const I64_MAX_F64: f64 = i64::MAX as f64;
-        if !number.is_finite() || !(I64_MIN_F64..=I64_MAX_F64).contains(&number) {
-            return None;
-        }
-        let value = number as i64;
-        if (value as f64 - number).abs() < f64::EPSILON {
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    fn try_i32_from_f64(number: f64) -> Option<i32> {
-        i32::try_from(try_i64_from_f64(number)?).ok()
     }
 
     fn cell_to_string(
@@ -14596,32 +14686,17 @@ mod sas7bdat_support {
         Ok(match logical_type {
             LogicalType::String => decode_text(slice, decoder),
             LogicalType::Bytes => Some(slice.iter().map(|b| format!("{b:02x}")).collect()),
-            LogicalType::Float => decode_numeric(slice, endianness).map(|v| v.to_string()),
+            LogicalType::Float => decode_numeric(slice, endianness).map(|v| {
+                sas_value_support::render_numeric(sas_value_support::NumericKind::Float, v)
+            }),
             LogicalType::Date => decode_numeric(slice, endianness).map(|v| {
-                try_i32_from_f64(v)
-                    .and_then(|days| {
-                        EpochDate::from_days(i64::from(days) - SAS_TO_UNIX_DAYS)
-                            .map(|d| d.format_ymd())
-                    })
-                    .unwrap_or_else(|| v.to_string())
+                sas_value_support::render_numeric(sas_value_support::NumericKind::Date, v)
             }),
             LogicalType::DateTime => decode_numeric(slice, endianness).map(|v| {
-                try_i64_from_f64(v)
-                    .and_then(|secs| secs.checked_sub(SAS_TO_UNIX_SECONDS))
-                    .and_then(|secs| {
-                        EpochDateTime::from_unix_seconds(secs, 0).map(|dt| dt.format_space())
-                    })
-                    .unwrap_or_else(|| v.to_string())
+                sas_value_support::render_numeric(sas_value_support::NumericKind::DateTime, v)
             }),
             LogicalType::Time => decode_numeric(slice, endianness).map(|v| {
-                try_i32_from_f64(v)
-                    .and_then(|secs| {
-                        u32::try_from(secs)
-                            .ok()
-                            .and_then(|s| EpochTime::from_seconds_since_midnight(s, 0))
-                            .map(|t| t.format_hms())
-                    })
-                    .unwrap_or_else(|| v.to_string())
+                sas_value_support::render_numeric(sas_value_support::NumericKind::Time, v)
             }),
         })
     }
@@ -14892,6 +14967,714 @@ fn columns_from_sas7bdat(
 ) -> Result<Vec<ColumnProfile>> {
     bail!(
         "SAS7BDAT support isn't compiled in - rebuild with `cargo build --release --features sas7bdat` (or --features full)"
+    )
+}
+
+// --- SAS Transport (XPORT, `.xpt`) ---
+//
+// The SAS Transport Format is the file FDA submissions and NHANES-style
+// public-health releases are published in: a stream of 80-byte records -
+// a library header, then one *member* (data set) after another, each with
+// a descriptor, one 140-byte `NAMESTR` per variable and the observations
+// as fixed-width rows. Everything is big-endian and numbers are IBM
+// System/360 hexadecimal floating point. Version 5 limits names to 8
+// characters and labels to 40; version 8/9 (`LIBV8`) carries long names
+// in the `NAMESTR` and long labels/formats in an extra `LABELV8`/`LABELV9`
+// record, and states the observation count in its `OBSV8` header.
+//
+// The layout and the missing-value rules (`.`, `._` and `.A`-`.Z` are
+// missing numerics) follow the published SAS technical note TS-140 and
+// were checked against ReadStat's reader and pyreadstat/pandas. Where
+// they disagree - pandas turns a stored zero into 5.4e-79 - the format
+// and ReadStat win. Date, datetime and time columns are recognised from
+// the variable's format name through `sas_value_support`, exactly as for
+// SAS7BDAT.
+//
+// A member is read through a bounded buffer one row at a time, so memory
+// is one row plus the per-column accumulators however large the file is.
+// A file of several members is several tables, named by member. Version 5
+// doesn't say how many observations a member holds, so its data ends at
+// the next member header or the end of the file, and a trailing run of
+// all-blank rows is padding (a data set whose last observations are
+// genuinely blank loses them - a limit of the format, which SAS shares).
+#[cfg(feature = "xport")]
+mod xport_support {
+    use super::sas_value_support::{
+        NumericKind, classify_format_name, format_spec_name, kind_label, render_numeric,
+    };
+    use super::*;
+    use std::io::Read;
+
+    const REC: usize = 80;
+    const NAMESTR_LEN: usize = 140;
+    /// Refuse a row wider than this rather than allocate for a corrupt width.
+    const MAX_ROW_LEN: usize = 64 << 20;
+    const MEMBER_PREFIX: &[u8] = b"HEADER RECORD*******MEMB";
+    const READ_CHUNK: usize = 256 << 10;
+
+    /// A byte stream with look-ahead, tracking the absolute position (every
+    /// record boundary in the format is a multiple of 80 from byte 0).
+    struct Bytes<R: Read> {
+        inner: R,
+        buf: Vec<u8>,
+        start: usize,
+        pos: u64,
+        eof: bool,
+    }
+
+    impl<R: Read> Bytes<R> {
+        fn new(inner: R) -> Self {
+            Bytes {
+                inner,
+                buf: Vec::new(),
+                start: 0,
+                pos: 0,
+                eof: false,
+            }
+        }
+
+        fn avail(&self) -> usize {
+            self.buf.len() - self.start
+        }
+
+        fn fill(&mut self, n: usize) -> Result<()> {
+            while self.avail() < n && !self.eof {
+                if self.start >= READ_CHUNK {
+                    self.buf.drain(..self.start);
+                    self.start = 0;
+                }
+                let old = self.buf.len();
+                self.buf.resize(old + READ_CHUNK, 0);
+                let got = self.inner.read(&mut self.buf[old..])?;
+                self.buf.truncate(old + got);
+                if got == 0 {
+                    self.eof = true;
+                }
+            }
+            Ok(())
+        }
+
+        /// Up to `n` bytes from here, fewer only at the end of the file.
+        fn peek(&mut self, n: usize) -> Result<&[u8]> {
+            self.fill(n)?;
+            let end = (self.start + n).min(self.buf.len());
+            Ok(&self.buf[self.start..end])
+        }
+
+        fn consume(&mut self, n: usize) {
+            let n = n.min(self.avail());
+            self.start += n;
+            self.pos += n as u64;
+        }
+
+        /// Exactly `n` bytes, or an error naming what was being read.
+        fn take(&mut self, n: usize, what: &str) -> Result<Vec<u8>> {
+            let got = self.peek(n)?.to_vec();
+            if got.len() < n {
+                bail!(
+                    "XPORT file ends inside {what} (needed {n} bytes, {} left)",
+                    got.len()
+                );
+            }
+            self.consume(n);
+            Ok(got)
+        }
+
+        /// Skips to the next 80-byte record boundary.
+        fn align(&mut self) {
+            let rem = (self.pos % REC as u64) as usize;
+            if rem != 0 {
+                self.consume(REC - rem);
+            }
+        }
+
+        /// Whether a member header starts `offset` bytes from here.
+        fn member_header_at(&mut self, offset: usize) -> Result<bool> {
+            self.fill(offset + MEMBER_PREFIX.len())?;
+            Ok(self.buf[self.start..]
+                .get(offset..)
+                .is_some_and(|rest| rest.starts_with(MEMBER_PREFIX)))
+        }
+    }
+
+    struct Header {
+        name: String,
+        /// The six five-digit fields after `HEADER RECORD!!!!!!!`.
+        nums: [u64; 6],
+        /// The same 30 columns as one number: `OBSV8` keeps the
+        /// observation count there, right-aligned in 15 columns.
+        wide: u64,
+    }
+
+    fn parse_header(line: &[u8]) -> Option<Header> {
+        if line.len() < REC
+            || !line.starts_with(b"HEADER RECORD*******")
+            || &line[28..48] != b"HEADER RECORD!!!!!!!"
+        {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&line[20..28]).trim().to_string();
+        let field = |a: usize, b: usize| -> u64 {
+            std::str::from_utf8(&line[a..b])
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mut nums = [0u64; 6];
+        for (i, n) in nums.iter_mut().enumerate() {
+            *n = field(48 + i * 5, 53 + i * 5);
+        }
+        Some(Header {
+            name,
+            nums,
+            wide: field(48, 63),
+        })
+    }
+
+    pub(super) struct Var {
+        name: String,
+        label: String,
+        is_char: bool,
+        width: usize,
+        kind: NumericKind,
+    }
+
+    pub(super) struct Member {
+        name: String,
+        vars: Vec<Var>,
+        row_len: usize,
+        /// `OBSV8`'s own count; `None` for version 5 or an unstated count.
+        obs: Option<u64>,
+    }
+
+    pub(super) struct XptFile<R: Read> {
+        rd: Bytes<R>,
+        version: u8,
+    }
+
+    fn text(bytes: &[u8]) -> String {
+        let mut end = bytes.len();
+        while end > 0 && (bytes[end - 1] == b' ' || bytes[end - 1] == 0) {
+            end -= 1;
+        }
+        let t = &bytes[..end];
+        match std::str::from_utf8(t) {
+            Ok(s) => s.to_string(),
+            Err(_) => codepage_support::decode(
+                codepage_support::table("WINDOWS-1252").expect("windows-1252 has a table"),
+                t,
+            ),
+        }
+    }
+
+    fn be16(b: &[u8]) -> usize {
+        usize::from(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    impl<R: Read> XptFile<R> {
+        pub(super) fn open(inner: R) -> Result<Self> {
+            let mut rd = Bytes::new(inner);
+            let first = rd.take(REC, "the library header")?;
+            let h = parse_header(&first).context("not an XPORT file (no library header)")?;
+            let version = match h.name.as_str() {
+                "LIBRARY" => 5,
+                "LIBV8" => 8,
+                other => bail!(
+                    "unsupported XPORT library header {other:?} (expected LIBRARY or LIBV8) - a PROC CPORT file isn't a transport file; convert it with PROC CIMPORT first"
+                ),
+            };
+            // The real SAS header and the modified timestamp: nothing in them
+            // describes the data.
+            rd.take(2 * REC, "the library description")?;
+            Ok(XptFile { rd, version })
+        }
+
+        fn expect(&mut self, v5: &str, v8: &str, what: &str) -> Result<Header> {
+            let line = self.rd.take(REC, what)?;
+            let h = parse_header(&line).with_context(|| format!("expected the {what} record"))?;
+            let want = if self.version == 5 { v5 } else { v8 };
+            if h.name != want {
+                bail!("expected the {what} record ({want}), found {:?}", h.name);
+            }
+            Ok(h)
+        }
+
+        /// Reads the next member's descriptor up to the start of its data,
+        /// or `None` at the end of the file.
+        pub(super) fn next_member(&mut self) -> Result<Option<Member>> {
+            self.rd.align();
+            let head = self.rd.peek(REC)?;
+            if head.is_empty() || head.iter().all(|&b| b == b' ' || b == 0) {
+                return Ok(None);
+            }
+            let h = self.expect("MEMBER", "MEMBV8", "member header")?;
+            let namestr_len = match h.nums[5] {
+                0 | 140 => NAMESTR_LEN,
+                136 => bail!(
+                    "this XPORT file uses 136-byte NAMESTR records (VAX/VMS); only the standard 140-byte layout is supported"
+                ),
+                other => bail!("unsupported XPORT NAMESTR length {other}"),
+            };
+            self.expect("DSCRPTR", "DSCPTV8", "descriptor header")?;
+            let line1 = self.rd.take(REC, "the member descriptor")?;
+            let name = if self.version == 5 {
+                text(&line1[8..16])
+            } else {
+                text(&line1[8..40])
+            };
+            // The second descriptor record: modification time and the
+            // data set's own label, which the dictionary has no place for.
+            self.rd.take(REC, "the member descriptor")?;
+            let nh = self.expect("NAMESTR", "NAMSTV8", "variable header")?;
+            let var_count = nh.nums[1] as usize;
+            let raw = self
+                .rd
+                .take(var_count * namestr_len, "the variable table")?;
+            self.rd.align();
+
+            let mut vars = Vec::with_capacity(var_count);
+            for i in 0..var_count {
+                let n = &raw[i * namestr_len..(i + 1) * namestr_len];
+                let ntype = be16(&n[0..2]);
+                let width = be16(&n[4..6]);
+                let short = text(&n[8..16]);
+                let long = text(&n[88..120]);
+                let name = if self.version != 5 && !long.is_empty() {
+                    long
+                } else {
+                    short
+                };
+                let kind = if ntype == 2 {
+                    NumericKind::Float
+                } else {
+                    classify_format_name(&text(&n[56..64]))
+                };
+                vars.push(Var {
+                    name: if name.is_empty() {
+                        format!("VAR{}", i + 1)
+                    } else {
+                        name
+                    },
+                    label: text(&n[16..56]),
+                    is_char: ntype == 2,
+                    width,
+                    kind,
+                });
+            }
+
+            // What follows the variable table: `OBS` in version 5; in
+            // version 8/9 optionally a label record before `OBSV8`.
+            let line = self.rd.take(REC, "the observation header")?;
+            let mut oh = parse_header(&line).context("expected the observation header")?;
+            if self.version != 5 && (oh.name == "LABELV8" || oh.name == "LABELV9") {
+                self.read_labels(&mut vars, oh.nums[0] as usize, oh.name == "LABELV9")?;
+                oh = self.expect("OBS", "OBSV8", "observation header")?;
+            } else if oh.name != if self.version == 5 { "OBS" } else { "OBSV8" } {
+                bail!("expected the observation header, found {:?}", oh.name);
+            }
+
+            let mut row_len = 0usize;
+            for v in &vars {
+                if !v.is_char && !(2..=8).contains(&v.width) {
+                    bail!(
+                        "numeric variable {:?} is stored in {} bytes; SAS transport numerics are 2-8",
+                        v.name,
+                        v.width
+                    );
+                }
+                row_len = row_len.saturating_add(v.width);
+            }
+            if row_len > MAX_ROW_LEN {
+                bail!("XPORT observation length {row_len} is implausible");
+            }
+            let obs = (self.version != 5 && oh.wide > 0).then_some(oh.wide);
+            Ok(Some(Member {
+                name,
+                vars,
+                row_len,
+                obs,
+            }))
+        }
+
+        fn read_labels(&mut self, vars: &mut [Var], count: usize, v9: bool) -> Result<()> {
+            let fixed = if v9 { 10 } else { 6 };
+            for _ in 0..count {
+                let h = self.rd.take(fixed, "a label entry")?;
+                let index = be16(&h[0..2]);
+                let name_len = be16(&h[2..4]);
+                let label_len = be16(&h[4..6]);
+                let (format_len, informat_len) = if v9 {
+                    (be16(&h[6..8]), be16(&h[8..10]))
+                } else {
+                    (0, 0)
+                };
+                if index == 0 || index > vars.len() {
+                    bail!(
+                        "label entry names variable {index}, but the file has {}",
+                        vars.len()
+                    );
+                }
+                let name = self.rd.take(name_len, "a label entry")?;
+                let label = self.rd.take(label_len, "a label entry")?;
+                let format = self.rd.take(format_len, "a label entry")?;
+                self.rd.take(informat_len, "a label entry")?;
+                let var = &mut vars[index - 1];
+                let name = text(&name);
+                if !name.is_empty() {
+                    var.name = name;
+                }
+                var.label = text(&label);
+                if v9 && !var.is_char {
+                    let spec = text(&format);
+                    if !spec.is_empty() {
+                        var.kind = classify_format_name(format_spec_name(&spec));
+                    }
+                }
+            }
+            self.rd.align();
+            Ok(())
+        }
+
+        /// Hands each observation to `on_row` (the first `limit` of them)
+        /// and leaves the stream at the start of the next member. Returns
+        /// the number of rows delivered.
+        pub(super) fn read_rows(
+            &mut self,
+            m: &Member,
+            limit: Option<u64>,
+            mut on_row: impl FnMut(&[u8]) -> Result<()>,
+        ) -> Result<u64> {
+            let row_len = m.row_len;
+            let mut delivered = 0u64;
+            if row_len == 0 {
+                self.skip_to_next_member()?;
+                return Ok(0);
+            }
+            let mut row = vec![0u8; row_len];
+            if let Some(count) = m.obs {
+                for done in 0..count {
+                    if limit.is_some_and(|l| delivered >= l) {
+                        // Past what was asked for: skip the rest in one move.
+                        let rest = (count - done).saturating_mul(row_len as u64);
+                        self.skip_bytes(rest)?;
+                        break;
+                    }
+                    let got = self.rd.peek(row_len)?;
+                    if got.len() < row_len {
+                        bail!(
+                            "the data of member {:?} ends after {done} of the {count} observations it declares",
+                            m.name
+                        );
+                    }
+                    row.copy_from_slice(got);
+                    self.rd.consume(row_len);
+                    on_row(&row)?;
+                    delivered += 1;
+                }
+                self.rd.align();
+                return Ok(delivered);
+            }
+
+            let blank = vec![b' '; row_len];
+            let mut pending_blank = 0u64;
+            loop {
+                if limit.is_some_and(|l| delivered >= l) {
+                    self.skip_to_next_member()?;
+                    break;
+                }
+                // A member header can sit inside the span of the next row
+                // when padding is shorter than a row.
+                let mut off = (REC - (self.rd.pos % REC as u64) as usize) % REC;
+                let mut boundary = None;
+                while off < row_len {
+                    if self.rd.member_header_at(off)? {
+                        boundary = Some(off);
+                        break;
+                    }
+                    off += REC;
+                }
+                if let Some(off) = boundary {
+                    self.rd.consume(off);
+                    break;
+                }
+                let got = self.rd.peek(row_len)?;
+                if got.len() < row_len {
+                    // What's left is either blank padding or the front of a
+                    // row the file was cut in the middle of.
+                    let cut = got.iter().any(|&b| b != b' ' && b != 0);
+                    let n = got.len();
+                    self.rd.consume(n);
+                    if cut {
+                        bail!(
+                            "the data of member {:?} ends in the middle of an observation - the file looks truncated",
+                            m.name
+                        );
+                    }
+                    break;
+                }
+                row.copy_from_slice(got);
+                self.rd.consume(row_len);
+                if row.iter().all(|&b| b == b' ') {
+                    pending_blank += 1;
+                    continue;
+                }
+                while pending_blank > 0 {
+                    if limit.is_some_and(|l| delivered >= l) {
+                        break;
+                    }
+                    on_row(&blank)?;
+                    delivered += 1;
+                    pending_blank -= 1;
+                }
+                if limit.is_some_and(|l| delivered >= l) {
+                    continue;
+                }
+                on_row(&row)?;
+                delivered += 1;
+            }
+            Ok(delivered)
+        }
+
+        fn skip_bytes(&mut self, mut n: u64) -> Result<()> {
+            while n > 0 {
+                let step = n.min(READ_CHUNK as u64) as usize;
+                let got = self.rd.peek(step)?.len();
+                if got == 0 {
+                    break;
+                }
+                self.rd.consume(got);
+                n -= got as u64;
+            }
+            Ok(())
+        }
+
+        /// Scans record by record to the next member header (or the end).
+        fn skip_to_next_member(&mut self) -> Result<()> {
+            self.rd.align();
+            loop {
+                if self.rd.peek(REC)?.len() < REC || self.rd.member_header_at(0)? {
+                    return Ok(());
+                }
+                self.rd.consume(REC);
+            }
+        }
+    }
+
+    /// One cell as text, `None` for a missing value.
+    fn cell(var: &Var, bytes: &[u8]) -> Option<String> {
+        if var.is_char {
+            let s = text(bytes);
+            let s = s.trim();
+            return (!s.is_empty()).then(|| s.to_string());
+        }
+        if bytes.iter().all(|&b| b == b' ') {
+            return None;
+        }
+        // `.`, `._` and `.A`-`.Z` followed by zeros are SAS's missing values.
+        let b0 = bytes[0];
+        if bytes[1..].iter().all(|&b| b == 0)
+            && (b0 == b'.' || b0 == b'_' || b0.is_ascii_uppercase())
+        {
+            return None;
+        }
+        Some(render_numeric(var.kind, ibm_to_f64(bytes)))
+    }
+
+    /// IBM System/360 hexadecimal float (1 sign bit, 7-bit excess-64
+    /// base-16 exponent, 24 or 56 fraction bits; a shorter field is the
+    /// leading bytes of the 8-byte form) to the nearest `f64`.
+    fn ibm_to_f64(field: &[u8]) -> f64 {
+        let mut b = [0u8; 8];
+        let n = field.len().min(8);
+        b[..n].copy_from_slice(&field[..n]);
+        let mantissa = u64::from_be_bytes([0, b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        if mantissa == 0 {
+            return 0.0;
+        }
+        let exponent = i32::from(b[0] & 0x7f) - 64;
+        // The fraction is `mantissa / 2^56` and the scale `16^exponent`; the
+        // power of two is exact, so the only rounding is mantissa -> f64.
+        let value = mantissa as f64 * 2f64.powi(4 * exponent - 56);
+        if b[0] & 0x80 != 0 { -value } else { value }
+    }
+
+    fn unique_name(used: &mut Vec<String>, raw: &str, index: usize) -> String {
+        let base = if raw.trim().is_empty() {
+            format!("member{}", index + 1)
+        } else {
+            raw.trim().to_string()
+        };
+        let mut name = base.clone();
+        let mut n = 2;
+        while used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+            name = format!("{base}_{n}");
+            n += 1;
+        }
+        used.push(name.clone());
+        name
+    }
+
+    pub(crate) fn columns_from_xport(
+        path: &Path,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut xpt = XptFile::open(file).with_context(|| format!("failed reading {path:?}"))?;
+        let mut used: Vec<String> = Vec::new();
+        let mut tables = Vec::new();
+        while let Some(member) = xpt
+            .next_member()
+            .with_context(|| format!("failed reading {path:?}"))?
+        {
+            let name = unique_name(&mut used, &member.name, tables.len());
+            let mut states: Vec<ColumnAccumulatorState> = member
+                .vars
+                .iter()
+                .map(|_| ColumnAccumulatorState::new())
+                .collect();
+            let mut offsets = Vec::with_capacity(member.vars.len());
+            let mut at = 0usize;
+            for v in &member.vars {
+                offsets.push(at);
+                at += v.width;
+            }
+            let total =
+                xpt.read_rows(&member, nrows.map(|n| n as u64), |row| {
+                    for (i, v) in member.vars.iter().enumerate() {
+                        if let Some(s) = cell(v, &row[offsets[i]..offsets[i] + v.width]) {
+                            states[i].push(s, n_samples);
+                        }
+                    }
+                    Ok(())
+                })
+                .with_context(|| format!("failed reading {path:?}"))? as usize;
+            let profiles = member
+                .vars
+                .iter()
+                .zip(states)
+                .map(|(v, state)| {
+                    let current = if v.is_char {
+                        "String"
+                    } else {
+                        kind_label(v.kind)
+                    };
+                    let mut profile = state.into_profile_with_declared_type(
+                        v.name.clone(),
+                        total,
+                        current.to_string(),
+                    );
+                    apply_variable_labels(&mut profile, &v.label, &[]);
+                    profile
+                })
+                .collect();
+            tables.push((name, profiles));
+        }
+        if tables.is_empty() {
+            bail!("{path:?} is an XPORT file with no data sets in it");
+        }
+        Ok(tables)
+    }
+
+    /// The `--sql-mode inline` second pass for one member (`table_name` as
+    /// `columns_from_xport` named it).
+    pub(crate) fn stream_xport_rows_for_sql(
+        path: &Path,
+        table_name: &str,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut xpt = XptFile::open(file)?;
+        let mut used: Vec<String> = Vec::new();
+        let mut index = 0usize;
+        while let Some(member) = xpt.next_member()? {
+            let name = unique_name(&mut used, &member.name, index);
+            index += 1;
+            if name != table_name {
+                xpt.read_rows(&member, Some(0), |_| Ok(()))?;
+                continue;
+            }
+            let mut offsets = Vec::with_capacity(member.vars.len());
+            let mut at = 0usize;
+            for v in &member.vars {
+                offsets.push(at);
+                at += v.width;
+            }
+            xpt.read_rows(&member, nrows.map(|n| n as u64), |row| {
+                let values = member
+                    .vars
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| cell(v, &row[offsets[i]..offsets[i] + v.width]))
+                    .collect();
+                sink.accept(values)
+            })?;
+            return Ok(());
+        }
+        bail!("{path:?} has no XPORT member named {table_name:?}")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ibm_floats_match_known_encodings() {
+            // 1.0, -2.5, 100.0, 0.1 and the largest / smallest exponents.
+            assert_eq!(ibm_to_f64(&[0x41, 0x10, 0, 0, 0, 0, 0, 0]), 1.0);
+            assert_eq!(ibm_to_f64(&[0xC1, 0x28, 0, 0, 0, 0, 0, 0]), -2.5);
+            assert_eq!(ibm_to_f64(&[0x42, 0x64, 0, 0, 0, 0, 0, 0]), 100.0);
+            assert_eq!(
+                ibm_to_f64(&[0x40, 0x19, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9A]),
+                0.1
+            );
+            assert_eq!(ibm_to_f64(&[0, 0, 0, 0, 0, 0, 0, 0]), 0.0);
+            // A 4-byte field is the leading bytes of the 8-byte form.
+            assert_eq!(ibm_to_f64(&[0x41, 0x10, 0, 0]), 1.0);
+        }
+    }
+}
+
+#[cfg(feature = "xport")]
+fn columns_from_xport(
+    path: &Path,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    xport_support::columns_from_xport(path, nrows, n_samples)
+}
+
+#[cfg(not(feature = "xport"))]
+fn columns_from_xport(
+    _path: &Path,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "SAS Transport (XPORT) support isn't compiled in - rebuild with `cargo build --release --features xport` (or --features full)"
+    )
+}
+
+#[cfg(feature = "xport")]
+fn render_sql_inline_flat_xport(
+    read_path: &Path,
+    table_name: &str,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    xport_support::stream_xport_rows_for_sql(read_path, table_name, nrows, sink)
+}
+
+#[cfg(not(feature = "xport"))]
+fn render_sql_inline_flat_xport(
+    _read_path: &Path,
+    _table_name: &str,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "SAS Transport (XPORT) support isn't compiled in - rebuild with `cargo build --release --features xport` (or --features full)"
     )
 }
 
@@ -73492,6 +74275,7 @@ enum InputFormat {
     Dbase,
     Stata,
     Sas7bdat,
+    Xport,
     Spss,
     Orc,
     Bson,
@@ -73573,6 +74357,7 @@ impl InputFormat {
             InputFormat::Dbase => "dbase",
             InputFormat::Stata => "stata",
             InputFormat::Sas7bdat => "sas7bdat",
+            InputFormat::Xport => "xport",
             InputFormat::Spss => "spss",
             InputFormat::Orc => "orc",
             InputFormat::Bson => "bson",
@@ -73818,6 +74603,13 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
         extensions: &["sas7bdat"],
         feature: Some("sas7bdat"),
         compiled_in: cfg!(feature = "sas7bdat"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "xport",
+        extensions: &["xpt", "xport"],
+        feature: Some("xport"),
+        compiled_in: cfg!(feature = "xport"),
         directory: false,
     },
     FormatInfo {
@@ -74325,6 +75117,11 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
         // signature found".
         return Some(InputFormat::Plist);
     }
+    if head.starts_with(b"HEADER RECORD*******LIBRARY HEADER RECORD!!!!!!!")
+        || head.starts_with(b"HEADER RECORD*******LIBV8   HEADER RECORD!!!!!!!")
+    {
+        return Some(InputFormat::Xport);
+    }
     if head.len() >= 32 && head[..32] == SAS7BDAT_MAGIC[..] {
         return Some(InputFormat::Sas7bdat);
     }
@@ -74535,6 +75332,7 @@ fn detect_format(
             "dbase" | "dbf" => Ok(InputFormat::Dbase),
             "stata" | "dta" => Ok(InputFormat::Stata),
             "sas7bdat" | "sas" => Ok(InputFormat::Sas7bdat),
+            "xport" | "xpt" | "sas-xport" | "sasxport" => Ok(InputFormat::Xport),
             "spss" | "sav" | "zsav" => Ok(InputFormat::Spss),
             "orc" => Ok(InputFormat::Orc),
             "bson" => Ok(InputFormat::Bson),
@@ -74614,6 +75412,7 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "dbf" => InputFormat::Dbase,
         "dta" => InputFormat::Stata,
         "sas7bdat" => InputFormat::Sas7bdat,
+        "xpt" | "xport" => InputFormat::Xport,
         "sav" | "zsav" => InputFormat::Spss,
         "orc" => InputFormat::Orc,
         "bson" => InputFormat::Bson,
@@ -79429,6 +80228,9 @@ fn render_sql_inline_flat(
             InputFormat::Sas7bdat => {
                 render_sql_inline_flat_sas7bdat(read_path, args.nrows, &mut sink)?
             }
+            InputFormat::Xport => {
+                render_sql_inline_flat_xport(read_path, table_name, args.nrows, &mut sink)?
+            }
             InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
             InputFormat::Orc => {
                 render_sql_inline_flat_orc(read_path, source_profiles, args.nrows, &mut sink)?
@@ -80493,6 +81295,7 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::Dbase
             | InputFormat::Stata
             | InputFormat::Sas7bdat
+            | InputFormat::Xport
             | InputFormat::Spss
             | InputFormat::Orc
             | InputFormat::Npy
@@ -93457,13 +94260,18 @@ fn dispatch_reader(
 
     let tables: BTreeMap<String, Vec<ColumnProfile>> = if matches!(
         format,
-        InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz
+        InputFormat::Sqlite
+            | InputFormat::Xlsx
+            | InputFormat::Ini
+            | InputFormat::Npz
+            | InputFormat::Xport
     ) {
         match format {
             InputFormat::Sqlite => columns_from_sqlite(read_path, args.nrows, args.samples)?,
             InputFormat::Xlsx => columns_from_xlsx(read_path, args.nrows, args.samples)?,
             InputFormat::Ini => columns_from_ini(read_path, args.samples)?,
             InputFormat::Npz => columns_from_npz(read_path, args.nrows, args.samples)?,
+            InputFormat::Xport => columns_from_xport(read_path, args.nrows, args.samples)?,
             _ => unreachable!("handled by the outer matches! guard"),
         }
         .into_iter()
@@ -93525,7 +94333,11 @@ fn dispatch_reader(
             InputFormat::Ical => columns_from_ical(read_path, args.nrows, args.samples)?,
             InputFormat::Ipynb => columns_from_ipynb(read_path, args.nrows, args.samples)?,
             InputFormat::Pdf => columns_from_pdf(read_path, args.nrows, args.samples)?,
-            InputFormat::Sqlite | InputFormat::Xlsx | InputFormat::Ini | InputFormat::Npz => {
+            InputFormat::Sqlite
+            | InputFormat::Xlsx
+            | InputFormat::Ini
+            | InputFormat::Npz
+            | InputFormat::Xport => {
                 unreachable!("handled above")
             }
             InputFormat::DeltaTable | InputFormat::IcebergTable => {
