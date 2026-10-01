@@ -16673,22 +16673,104 @@ fn a_single_file_archive_is_read_as_the_file_inside_it() {
 }
 
 #[test]
-fn an_archive_of_several_files_is_refused_and_says_what_it_holds() {
+fn an_archive_of_several_files_is_profiled_as_one_combined_dictionary() {
     for file in [
         "edge_container_two_files.zip",
         "edge_container_two_files.tar",
     ] {
         let out = Command::new(bin())
-            .args([fixture(file).to_str().unwrap(), "-"])
+            .args([
+                fixture(file).to_str().unwrap(),
+                "-",
+                "--output-format",
+                "json",
+            ])
             .output()
             .unwrap();
-        assert!(!out.status.success(), "{file}");
-        let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("holds 2 files (a.csv, b.csv)"),
-            "{file}: {err}"
+            out.status.success(),
+            "{file}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        // Named for the archive, tables qualified like --combine's.
+        assert_eq!(doc["directory"], "edge_container_two_files", "{file}");
+        let tables = doc["tables"].as_object().unwrap();
+        let mut names: Vec<&str> = tables.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["a__a", "b__b"], "{file}");
     }
+}
+
+#[test]
+fn a_multi_file_archive_writes_its_dictionary_next_to_the_archive() {
+    let dir = TempDir::new();
+    let archive = dir.path().join("bundle.zip");
+    std::fs::copy(fixture("edge_container_two_files.zip"), &archive).unwrap();
+    let out = Command::new(bin())
+        .args([archive.to_str().unwrap(), "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written = std::fs::read_to_string(dir.path().join("bundle.dictionary.json")).unwrap();
+    assert!(written.contains("\"a__a\"") && written.contains("\"b__b\""));
+    // A dictionary left beside the archive is never mistaken for input.
+    let again = Command::new(bin())
+        .args([archive.to_str().unwrap(), "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(again.status.success());
+}
+
+#[test]
+fn archive_members_that_would_escape_the_extraction_directory_are_skipped() {
+    let dir = TempDir::new();
+    let nested = dir.path().join("inner");
+    std::fs::create_dir_all(&nested).unwrap();
+    let archive = nested.join("slip.zip");
+    std::fs::copy(fixture("edge_container_zip_slip.zip"), &archive).unwrap();
+    let out = Command::new(bin())
+        .args([archive.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut names: Vec<&str> = doc["tables"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort();
+    // Only the two honest members (and not the macOS resource fork).
+    assert_eq!(names, ["a__a", "sub_b__b"]);
+    // Nothing was written outside the scratch directory.
+    assert!(!dir.path().join("evil.csv").exists());
+    assert!(!nested.join("evil.csv").exists());
+}
+
+#[test]
+fn an_empty_archive_is_still_refused() {
+    let dir = TempDir::new();
+    let archive = dir.path().join("empty.zip");
+    // An end-of-central-directory record with zero entries.
+    let mut eocd = vec![0x50, 0x4B, 0x05, 0x06];
+    eocd.extend_from_slice(&[0u8; 18]);
+    std::fs::write(&archive, eocd).unwrap();
+    let out = Command::new(bin())
+        .args([archive.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("empty zip archive"));
 }
 
 #[test]

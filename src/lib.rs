@@ -3289,6 +3289,7 @@ mod json_support {
 /// available; zstd needs --features zstd). Every optional format needs its
 /// own --features flag (see the Supported formats table in CLAUDE.md), or
 /// use --features full for everything.
+#[derive(Clone)]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
@@ -3459,6 +3460,11 @@ USAGE:
     run (pass --continue-on-error to record failures in the index and keep
     going instead); a file whose format can't be identified at all is skipped and
     noted, not treated as a failure.
+
+    A zip or tar archive holding several files is a dataset: it is
+    extracted to a scratch directory and profiled like --combine on a
+    directory - one dictionary, tables named <path>__<table> - written
+    next to the archive unless OUTPUT_PATH says otherwise.
 
     `sniff-rs diff` compares two --output-format json dictionaries, or
     two raw data files (profiled fresh), or a mix of the two, and flags
@@ -90197,6 +90203,140 @@ impl Drop for TempFile {
     }
 }
 
+/// A scratch directory, created fresh (`create_dir` fails if the name
+/// exists) and removed with everything in it on drop - where a multi-file
+/// archive is extracted to be profiled as a directory.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("sniff-rs-dir-{pid}-{nanos}-{n}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(TempDir { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).context("failed to create a temporary directory for an archive");
+                }
+            }
+        }
+        bail!("failed to create a temporary directory for an archive after several attempts")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// An archive member's name as a path under the extraction root, or `None`
+/// for one that would land outside it (an absolute path, a `..`, a Windows
+/// drive or backslash path) - skipped rather than followed ("zip slip").
+fn safe_member_path(name: &str) -> Option<PathBuf> {
+    if name.contains('\\') || name.contains(':') || name.starts_with('/') {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p => out.push(p),
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+/// The most members a multi-file archive may hold before being refused.
+const MAX_ARCHIVE_MEMBERS: usize = 100_000;
+
+/// Extracts every regular file of a zip or tar archive under `dest`
+/// (junk like `__MACOSX` skipped, unsafe names skipped), returning how
+/// many were written.
+fn extract_archive(container: Container, archive_path: &Path, dest: &Path) -> Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut written = 0usize;
+    let place = |name: &str| -> Result<Option<PathBuf>> {
+        let Some(rel) = safe_member_path(name) else {
+            return Ok(None);
+        };
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("failed to create {parent:?}"))?;
+        }
+        Ok(Some(target))
+    };
+    match container {
+        Container::Zip => {
+            let mut archive = zip_support::ZipArchive::open(archive_path)?;
+            let names: Vec<String> = archive
+                .names()
+                .filter(|n| !n.ends_with('/') && !is_archive_junk(n))
+                .map(str::to_string)
+                .collect();
+            if names.len() > MAX_ARCHIVE_MEMBERS {
+                bail!(
+                    "{archive_path:?} holds {} files - more than the {MAX_ARCHIVE_MEMBERS} sniff-rs extracts",
+                    names.len()
+                );
+            }
+            for name in names {
+                let Some(target) = place(&name)? else {
+                    continue;
+                };
+                let tmp = archive.read_to_temp(&name)?;
+                fs::copy(tmp.path(), &target)
+                    .with_context(|| format!("failed to extract {name:?} from {archive_path:?}"))?;
+                written += 1;
+            }
+        }
+        Container::Tar => {
+            let entries: Vec<TarEntry> = tar_list_files(archive_path)?
+                .into_iter()
+                .filter(|e| !is_archive_junk(&e.name))
+                .collect();
+            if entries.len() > MAX_ARCHIVE_MEMBERS {
+                bail!(
+                    "{archive_path:?} holds {} files - more than the {MAX_ARCHIVE_MEMBERS} sniff-rs extracts",
+                    entries.len()
+                );
+            }
+            let mut input = fs::File::open(archive_path)
+                .with_context(|| format!("failed to open {archive_path:?}"))?;
+            for entry in entries {
+                let Some(target) = place(&entry.name)? else {
+                    continue;
+                };
+                input.seek(SeekFrom::Start(entry.offset))?;
+                let mut out = fs::File::create(&target)
+                    .with_context(|| format!("failed to create {target:?}"))?;
+                let copied = std::io::copy(&mut (&mut input).take(entry.size), &mut out)
+                    .with_context(|| format!("failed to read {archive_path:?}"))?;
+                if copied != entry.size {
+                    bail!(
+                        "{archive_path:?} is truncated inside the file {:?}",
+                        entry.name
+                    );
+                }
+                written += 1;
+            }
+        }
+        other => bail!("{} isn't an archive", other.name()),
+    }
+    Ok(written)
+}
+
 /// If `input_path` is literally `-` (the same sentinel this tool's own
 /// `OUTPUT_PATH` already uses for stdout), materializes the *entire*
 /// contents of stdin into a real, seekable temporary file and returns its
@@ -90442,6 +90582,11 @@ enum Layer {
     /// zero or several files), with why. A directory walk skips it like
     /// any unrecognized file; a single-file run reports it.
     Skip(String),
+    /// An archive holding several files: not one file to profile, but a
+    /// whole dataset - a single-file run extracts it and profiles it the
+    /// way `--combine` profiles a directory. The text is why a directory
+    /// walk (which skips it) can't read it.
+    Many(String),
 }
 
 fn describe_archive_files(names: &[String]) -> String {
@@ -90500,9 +90645,10 @@ fn unwrap_layer(container: Container, read_path: &Path) -> Result<Layer> {
                         .map(|n| n.to_string_lossy().into_owned());
                     Ok(Layer::Unwrapped(tmp, name))
                 }
-                many => Ok(Layer::Skip(format!(
-                    "the zip archive {read_path:?} holds {} files ({}) - sniff-rs reads one \
-                     file per archive, so extract it and point sniff-rs at the directory",
+                many => Ok(Layer::Many(format!(
+                    "the zip archive {read_path:?} holds {} files ({}) - a directory walk reads \
+                     one file per archive, so point sniff-rs at the archive itself (it profiles \
+                     the whole archive as one combined dictionary) or extract it first",
                     many.len(),
                     describe_archive_files(many)
                 ))),
@@ -90535,9 +90681,11 @@ fn unwrap_layer(container: Container, read_path: &Path) -> Result<Layer> {
                 }
                 many => {
                     let names: Vec<String> = many.iter().map(|e| e.name.clone()).collect();
-                    Ok(Layer::Skip(format!(
-                        "the tar archive {read_path:?} holds {} files ({}) - sniff-rs reads one \
-                         file per archive, so extract it and point sniff-rs at the directory",
+                    Ok(Layer::Many(format!(
+                        "the tar archive {read_path:?} holds {} files ({}) - a directory walk \
+                         reads one file per archive, so point sniff-rs at the archive itself (it \
+                         profiles the whole archive as one combined dictionary) or extract it \
+                         first",
                         names.len(),
                         describe_archive_files(&names)
                     )))
@@ -90623,9 +90771,38 @@ const MAX_CONTAINER_LAYERS: usize = 8;
 /// the last temporary copy on drop - or `None` when the file is an
 /// archive that can't be read as one file (see `Layer::Skip`).
 fn unwrap_containers(path: &Path) -> Result<std::result::Result<UnwrappedInput, String>> {
+    Ok(match unwrap_containers_inner(path)? {
+        Unwrapping::Done(input) => Ok(input),
+        Unwrapping::Skip(reason) | Unwrapping::MultiFile { reason, .. } => Err(reason),
+    })
+}
+
+/// The outcome of peeling every wrapper off a path.
+enum Unwrapping {
+    Done(UnwrappedInput),
+    /// An empty archive.
+    Skip(String),
+    /// An archive of several files, ready to extract.
+    MultiFile {
+        container: Container,
+        /// The archive's own bytes (a temporary copy when it was itself
+        /// wrapped, as in `.tar.gz`).
+        archive_path: PathBuf,
+        /// The wrapper-stripped name, which names the combined dataset.
+        name: PathBuf,
+        reason: String,
+        _guard: Option<TempFile>,
+    },
+}
+
+fn unwrap_containers_inner(path: &Path) -> Result<Unwrapping> {
     // A lakehouse table directory met during a directory walk.
     if path.is_dir() {
-        return Ok(Ok((path.to_path_buf(), path.to_path_buf(), None)));
+        return Ok(Unwrapping::Done((
+            path.to_path_buf(),
+            path.to_path_buf(),
+            None,
+        )));
     }
     let mut read_path = path.to_path_buf();
     let mut logical = path.to_path_buf();
@@ -90639,13 +90816,22 @@ fn unwrap_containers(path: &Path) -> Result<std::result::Result<UnwrappedInput, 
             // plain file.
             None => match container_from_magic(&read_path) {
                 Some(c) => (c, logical.clone()),
-                None => return Ok(Ok((read_path, logical, guard))),
+                None => return Ok(Unwrapping::Done((read_path, logical, guard))),
             },
         };
         match unwrap_layer(container, &read_path)
             .with_context(|| format!("while reading the {} layer of {path:?}", container.name()))?
         {
-            Layer::Skip(reason) => return Ok(Err(reason)),
+            Layer::Skip(reason) => return Ok(Unwrapping::Skip(reason)),
+            Layer::Many(reason) => {
+                return Ok(Unwrapping::MultiFile {
+                    container,
+                    archive_path: read_path,
+                    name: stripped,
+                    reason,
+                    _guard: guard,
+                });
+            }
             Layer::Unwrapped(tmp, member) => {
                 logical = match member {
                     Some(name) => logical.with_file_name(name),
@@ -91749,6 +91935,49 @@ fn single_input_load_target(
     Ok(Some(LoadTarget::parse(load_into)?))
 }
 
+/// A multi-file archive profiled as one combined dictionary: its files are
+/// extracted into a scratch directory named for the archive (so the
+/// combined output and table qualifiers carry that name) and
+/// `run_directory_combined` does the rest, exactly as for `--combine` on a
+/// real directory. Unless an output path, `--output-dir` or `--load-into`
+/// says otherwise, the result lands next to the archive.
+fn run_archive(
+    args: &Args,
+    output_format: &OutputFormat,
+    container: Container,
+    archive_path: &Path,
+    name: &Path,
+) -> Result<()> {
+    let stem = name
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "archive".to_string());
+    let scratch = TempDir::new()?;
+    let dir = scratch.path.join(&stem);
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;
+    let members = extract_archive(container, archive_path, &dir)?;
+    eprintln!(
+        "{}: {members} files extracted for profiling as one combined dictionary",
+        args.input_path.display()
+    );
+    let mut combined = args.clone();
+    combined.combine = true;
+    if combined.output_dir.is_none()
+        && combined.output_path.is_none()
+        && combined.load_into.is_none()
+        && args.input_path != Path::new("-")
+    {
+        let parent = args
+            .input_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        combined.output_dir = Some(parent.to_path_buf());
+    }
+    run_directory_combined(&combined, output_format, &dir)
+}
+
 fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if args.output_dir.is_some() {
         bail!("--output-dir only applies when the input path is a directory");
@@ -91796,7 +92025,21 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     // at the real (decompressed) bytes every reader below opens, logical_path
     // is the compression-stripped name used for format detection and default
     // output naming, and _decompressed_tmp just needs to outlive the reads.
-    let (read_path, mut logical_path, _decompressed_tmp) = decompress_if_needed(&stdin_input_path)?;
+    let (read_path, mut logical_path, _decompressed_tmp) =
+        match unwrap_containers_inner(&stdin_input_path)? {
+            Unwrapping::Done(input) => input,
+            Unwrapping::Skip(reason) => bail!("{reason}"),
+            // An archive of several files is a dataset: extract it and
+            // profile it the way `--combine` profiles a directory.
+            Unwrapping::MultiFile {
+                container,
+                archive_path,
+                name,
+                ..
+            } => {
+                return run_archive(args, output_format, container, &archive_path, &name);
+            }
+        };
     if args.input_path == Path::new("-") {
         // `logical_path` would otherwise be `resolve_stdin_input`'s own
         // randomly-named scratch file (e.g. `sniff-rs-1234-...-0.tmp`) -
