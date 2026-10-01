@@ -3289,6 +3289,7 @@ mod json_support {
 /// available; zstd needs --features zstd). Every optional format needs its
 /// own --features flag (see the Supported formats table in CLAUDE.md), or
 /// use --features full for everything.
+#[derive(Clone)]
 struct Args {
     /// Path to the input file (.csv, .tsv, .json, .jsonl/.ndjson, .parquet,
     /// .arrow/.feather, .avro, .xlsx/.xls/.xlsb/.ods, .db/.sqlite/.sqlite3,
@@ -3460,6 +3461,11 @@ USAGE:
     going instead); a file whose format can't be identified at all is skipped and
     noted, not treated as a failure.
 
+    A zip or tar archive holding several files is a dataset: it is
+    extracted to a scratch directory and profiled like --combine on a
+    directory - one dictionary, tables named <path>__<table> - written
+    next to the archive unless OUTPUT_PATH says otherwise.
+
     `sniff-rs diff` compares two --output-format json dictionaries, or
     two raw data files (profiled fresh), or a mix of the two, and flags
     schema drift (added/removed/renamed columns, type changes, missing-%
@@ -3512,10 +3518,11 @@ OPTIONS:
         --encoding <NAME>       Source text encoding for a text format (csv, json,
                                 xml, yaml, ...): utf-8, utf-16le/-be, utf-32le/-be, or
                                 a single-byte code page (windows-1252, latin1,
-                                iso-8859-15, cp437, cp866, koi8-r, macintosh, ...).
+                                iso-8859-15, cp437, cp866, koi8-r, macintosh, ...),
+                                or an East Asian one (shift_jis, euc-jp, iso-2022-jp,
+                                euc-kr, gbk, gb18030, big5).
                                 Without it a UTF-8/UTF-16/UTF-32 byte-order mark
                                 decides and everything else is read as UTF-8.
-                                Shift-JIS, GBK, Big5 and EUC-* aren't supported.
         --delimiter <CHAR>      Override the field delimiter for csv/tsv (single character)
         --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
         --widths <N,N,...>      Column widths for --format fixed-width, comma-separated -
@@ -10706,6 +10713,8 @@ mod dbase_support {
         StrictUtf8,
         LossyUtf8,
         CodePage(&'static [u16; 256]),
+        #[cfg(feature = "cjk")]
+        Cjk(CjkEncoding),
     }
 
     /// How a dBase file's text fields decode, from its header's code page
@@ -10720,9 +10729,9 @@ mod dbase_support {
     /// default build - this project's oracle - refuses every named code
     /// page; its optional `yore` feature decodes the same single-byte set
     /// decoded here.) The four double-byte East Asian code pages (932,
-    /// 936, 949, 950) and the two Eastern European DOS code pages with no
-    /// public mapping table (895 Kamenicky, 620 Mazovia) stay disclosed
-    /// errors.
+    /// 936, 949, 950) decode through `cjk_support` (`--features cjk`); the
+    /// two Eastern European DOS code pages with no public mapping table
+    /// (895 Kamenicky, 620 Mazovia) stay disclosed errors.
     fn resolve_text_mode(code_page_mark: u8) -> Result<TextMode> {
         let name = match code_page_mark {
             0xf0 => return Ok(TextMode::StrictUtf8),
@@ -10750,9 +10759,20 @@ mod dbase_support {
             0xCA => "WINDOWS-1254",
             0xCB => "WINDOWS-1253",
             0xCC => "WINDOWS-1257",
-            0x13 | 0x7B | 0x4D | 0x7A | 0x4E | 0x79 | 0x4F | 0x78 => bail!(
-                "dBase code page marker {code_page_mark:#04x} names a double-byte East Asian code page (932/936/949/950), which this reader doesn't decode"
-            ),
+            // The four double-byte East Asian code pages: 932 (Shift-JIS),
+            // 936 (GBK), 949 (Korean, the EUC-KR superset) and 950 (Big5).
+            0x13 | 0x7B | 0x4D | 0x7A | 0x4E | 0x79 | 0x4F | 0x78 => {
+                let enc = match code_page_mark {
+                    0x13 | 0x7B => CjkEncoding::ShiftJis,
+                    0x4D | 0x7A => CjkEncoding::Gb18030,
+                    0x4E | 0x79 => CjkEncoding::EucKr,
+                    _ => CjkEncoding::Big5,
+                };
+                #[cfg(feature = "cjk")]
+                return Ok(TextMode::Cjk(enc));
+                #[cfg(not(feature = "cjk"))]
+                return Err(cjk_not_compiled_in(enc));
+            }
             0x68 | 0x69 => bail!(
                 "dBase code page marker {code_page_mark:#04x} names code page {} (no public mapping table), which this reader doesn't decode",
                 if code_page_mark == 0x68 {
@@ -10775,6 +10795,8 @@ mod dbase_support {
                 .context("dBase field content is not valid UTF-8"),
             TextMode::LossyUtf8 => Ok(String::from_utf8_lossy(bytes).into_owned()),
             TextMode::CodePage(table) => Ok(codepage_support::decode(table, bytes)),
+            #[cfg(feature = "cjk")]
+            TextMode::Cjk(enc) => Ok(cjk_support::decode(enc, bytes)),
         }
     }
 
@@ -13978,6 +14000,31 @@ mod sas7bdat_support {
         MAP.iter().find(|&&(c, _)| c == code).map(|&(_, n)| n)
     }
 
+    #[cfg(all(test, feature = "cjk"))]
+    mod cjk_tests {
+        use super::*;
+
+        /// SAS names its East Asian encodings (134 is EUC-JP, 123 BIG-5);
+        /// a column of padded values decodes as that encoding.
+        #[test]
+        fn east_asian_encoding_codes_resolve_to_decoders() {
+            let path = Path::new("x.sas7bdat");
+            let euc = resolve_text_decoder(134, path).unwrap();
+            assert_eq!(
+                decode_text(b"\xc6\xfc\xcb\xdc\xb8\xec  \0", euc).as_deref(),
+                Some("日本語")
+            );
+            let big5 = resolve_text_decoder(123, path).unwrap();
+            assert_eq!(
+                decode_text(b"\xa4\xa4\xa4\xe5 ", big5).as_deref(),
+                Some("中文")
+            );
+            // The stateful ISO-2022 pages SAS lists for Korean/Chinese have no
+            // WHATWG decoder and stay a disclosed refusal.
+            assert!(resolve_text_decoder(168, path).is_err());
+        }
+    }
+
     const WINDOWS_1252_HIGH: [u16; 128] = [
         0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
         0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
@@ -14012,6 +14059,8 @@ mod sas7bdat_support {
         Utf8,
         Windows1252,
         CodePage(&'static [u16; 256]),
+        #[cfg(feature = "cjk")]
+        Cjk(CjkEncoding),
     }
 
     /// `resolve_encoding` in the reference crate delegates label
@@ -14041,8 +14090,22 @@ mod sas7bdat_support {
             Some(name) if sas_single_byte_table(name).is_some() => {
                 Ok(TextDecoder::CodePage(sas_single_byte_table(name).unwrap()))
             }
+            // The East Asian encodings SAS names that have a WHATWG
+            // decoder: Shift-JIS (CP932), EUC-JP, EUC-KR, CP949, CP950,
+            // BIG-5, GB18030, WINDOWS-936.
+            Some(name)
+                if cjk_encoding_from_label(&name.to_ascii_lowercase().replace('_', "-"))
+                    .is_some() =>
+            {
+                let enc =
+                    cjk_encoding_from_label(&name.to_ascii_lowercase().replace('_', "-")).unwrap();
+                #[cfg(feature = "cjk")]
+                return Ok(TextDecoder::Cjk(enc));
+                #[cfg(not(feature = "cjk"))]
+                return Err(cjk_not_compiled_in(enc));
+            }
             Some(other) => bail!(
-                "{path:?} uses SAS7BDAT text encoding {other:?}, which isn't supported by this reader (multi-byte East Asian encodings and a few rare single-byte ones aren't)"
+                "{path:?} uses SAS7BDAT text encoding {other:?}, which isn't supported by this reader (the stateful ISO-2022 encodings, EUC-TW, CP942/CP1381/Shift_JISX0213, and a few rare single-byte ones aren't)"
             ),
             None => {
                 bail!("{path:?} uses an unrecognized SAS7BDAT text encoding code {encoding_code}")
@@ -14076,6 +14139,8 @@ mod sas7bdat_support {
             TextDecoder::Utf8 => String::from_utf8_lossy(trimmed).into_owned(),
             TextDecoder::Windows1252 => decode_windows_1252(trimmed),
             TextDecoder::CodePage(table) => codepage_support::decode(table, trimmed),
+            #[cfg(feature = "cjk")]
+            TextDecoder::Cjk(enc) => cjk_support::decode(enc, trimmed),
         };
         let decoded = decoded.trim();
         if decoded.is_empty() {
@@ -47309,18 +47374,14 @@ mod avro_support {
                     .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(9)))
             }
             Schema::Duration => {
-                // Best-effort, matching this project's old apache-avro-based
-                // bridge exactly: Duration (months, days, milliseconds - each
-                // a raw u32 LE) has no single natural string form, so this
-                // renders a disclosed placeholder rather than guessing at
-                // one. See CLAUDE.md's "Not covered, and out of scope" note.
+                // Months, days and milliseconds - three little-endian u32s
+                // - rendered as an ISO 8601 duration, the same standard
+                // text the Arrow Duration columns use (`P1M2DT3.5S`).
                 let bytes = read_exact_vec(r, 12)?;
                 let months = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
                 let days = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                 let millis = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-                JsonValue::String(format!(
-                    "Duration {{ months: {months}, days: {days}, millis: {millis} }}"
-                ))
+                JsonValue::String(avro_duration_iso(months, days, millis))
             }
             Schema::Ref(name) => {
                 let resolved = names
@@ -47329,6 +47390,34 @@ mod avro_support {
                 decode_to_json(r, resolved, names)?
             }
         })
+    }
+
+    /// An Avro `duration` (months, days, milliseconds) as ISO 8601:
+    /// `P{months}M{days}DT{seconds}S`, leaving out zero parts and writing
+    /// the milliseconds as a trimmed decimal fraction of the seconds. All
+    /// zero is `P0D`. Months and days stay separate because neither has a
+    /// fixed length in seconds.
+    fn avro_duration_iso(months: u32, days: u32, millis: u32) -> String {
+        let mut out = String::from("P");
+        if months != 0 {
+            out.push_str(&format!("{months}M"));
+        }
+        if days != 0 {
+            out.push_str(&format!("{days}D"));
+        }
+        if millis != 0 {
+            out.push('T');
+            out.push_str(&(millis / 1000).to_string());
+            let frac = millis % 1000;
+            if frac != 0 {
+                out.push_str(format!(".{frac:03}").trim_end_matches('0'));
+            }
+            out.push('S');
+        }
+        if out == "P" {
+            out.push_str("0D");
+        }
+        out
     }
 
     fn decompress_codec(codec: &str, data: Vec<u8>) -> Result<Vec<u8>> {
@@ -49988,6 +50077,20 @@ mod yaml_support {
         if content.is_empty() {
             *pos += 1;
             return Ok(JsonValue::Null);
+        }
+        // An anchor alone on its line names the block node on the lines
+        // below it (`&root` then a mapping) - at this level or deeper.
+        if let Some(name) = anchor_name(content)
+            && strip_anchor_prefix(content).0.is_empty()
+        {
+            *pos += 1;
+            skip_blank_and_comment_lines(lines, pos);
+            let value = match lines.get(*pos).map(|l| l.indent) {
+                Some(next) if next >= indent => parse_block_node(lines, pos, next, parent_indent)?,
+                _ => JsonValue::Null,
+            };
+            record_anchor(Some(name), &value);
+            return Ok(value);
         }
         if is_sequence_item_line(content) {
             parse_block_sequence(lines, pos, indent)
@@ -55604,7 +55707,7 @@ fn columns_from_ipynb(
 // ASCIIHex/RunLength, stacked), WinAnsi/MacRoman/Differences/ToUnicode-
 // backed text (with `uniXXXX` and subset-suffixed glyph names), and the
 // showing/positioning operators. Everything else is a clear, disclosed
-// refusal rather than a guess: encrypted files, LZWDecode, Standard/
+// refusal rather than a guess: encrypted files, Standard/
 // Symbol/custom base encodings without ToUnicode (no machine-checkable
 // oracle for a from-memory table exists in this environment),
 // composite/CID fonts with no usable mapping, and image-only pages (a
@@ -58789,9 +58892,8 @@ mod pdf_support {
         /// Decodes a stream's payload through its `/Filter` chain (a bare
         /// name or an array, applied in order, each with its own optional
         /// `DecodeParms` entry): ASCIIHex, ASCII85, Flate (zlib-framed or,
-        /// leniently, raw DEFLATE - see below), and RunLength. Anything
-        /// else is a clean, specific error: LZW is genuinely unimplemented
-        /// (rare in text-bearing streams), and the image-only codecs
+        /// leniently, raw DEFLATE - see below), LZW, and RunLength. Anything
+        /// else is a clean, specific error: the image-only codecs
         /// (DCT/CCITT/JBIG2) on a content stream mean the file, not this
         /// reader, is confused.
         fn decode_stream(
@@ -58839,10 +58941,7 @@ mod pdf_support {
                     b"ASCII85Decode" => Self::ascii85_decode(&bytes, path)?,
                     b"FlateDecode" => Self::flate_decode(&bytes, parm.as_ref(), path)?,
                     b"RunLengthDecode" => Self::run_length_decode(&bytes, path)?,
-                    b"LZWDecode" => bail!(
-                        "{path:?} uses LZWDecode, which this reader doesn't implement - \
-                         re-save with FlateDecode"
-                    ),
+                    b"LZWDecode" => Self::lzw_decode(&bytes, parm.as_ref(), path)?,
                     b"DCTDecode" | b"CCITTFaxDecode" | b"JBIG2Decode" | b"JPXDecode" => {
                         bail!("{path:?} applies an image codec outside a content stream context")
                     }
@@ -58854,6 +58953,120 @@ mod pdf_support {
                 };
             }
             Ok(bytes)
+        }
+
+        /// LZWDecode (ISO 32000-1 7.4.4): variable-width codes packed
+        /// most-significant-bit first, starting at 9 bits, with 256 = clear
+        /// the table and 257 = end of data; the code width grows when the
+        /// table reaches 511 entries (one entry early, `/EarlyChange` 1, the
+        /// default) or 512 (`/EarlyChange` 0), up to 12 bits. A full table
+        /// keeps decoding without adding entries until the next clear code.
+        /// A stream cut short, or one with a code beyond the table, keeps
+        /// everything decoded before the break (the same salvage the Flate
+        /// decoder gives a truncated stream) and is an error only when
+        /// nothing was decoded. `/Predictor` unfiltering applies afterwards,
+        /// exactly as for Flate.
+        fn lzw_decode(
+            data: &[u8],
+            parms: Option<&BTreeMap<Vec<u8>, PdfObj>>,
+            path: &Path,
+        ) -> Result<Vec<u8>> {
+            const MAX_OUTPUT: usize = 1 << 30;
+            let early: usize = match parms
+                .and_then(|p| p.get(b"EarlyChange".as_slice()))
+                .and_then(PdfObj::as_int)
+            {
+                Some(0) => 0,
+                _ => 1,
+            };
+            // Each table entry is (previous code, last byte); a string is
+            // read back by walking the chain, then reversed.
+            let mut prefix = [0u16; 4096];
+            let mut suffix = [0u8; 4096];
+            let mut out: Vec<u8> = Vec::new();
+            let mut next: usize = 258;
+            let mut width: u32 = 9;
+            let mut prev: Option<usize> = None;
+            let (mut acc, mut nbits) = (0u32, 0u32);
+            let mut pos = 0usize;
+            let mut chain: Vec<u8> = Vec::new();
+            let mut failure: Option<&'static str> = None;
+            'codes: loop {
+                while nbits < width {
+                    let Some(&b) = data.get(pos) else {
+                        break 'codes;
+                    };
+                    pos += 1;
+                    acc = (acc << 8) | u32::from(b);
+                    nbits += 8;
+                }
+                let code = ((acc >> (nbits - width)) & ((1 << width) - 1)) as usize;
+                nbits -= width;
+                acc &= (1u32 << nbits) - 1;
+                if code == 256 {
+                    next = 258;
+                    width = 9;
+                    prev = None;
+                    continue;
+                }
+                if code == 257 {
+                    break;
+                }
+                let Some(p) = prev else {
+                    if code > 255 {
+                        failure = Some("starts with a code that isn't a literal");
+                        break;
+                    };
+                    out.push(code as u8);
+                    prev = Some(code);
+                    continue;
+                };
+                // The string for `code`: a table entry, or - for the one
+                // code not yet in the table - the previous string plus its
+                // own first byte.
+                chain.clear();
+                let mut cur = if code < next {
+                    code
+                } else if code == next && next < 4096 {
+                    p
+                } else {
+                    failure = Some("uses a code beyond its table");
+                    break;
+                };
+                while cur >= 258 {
+                    chain.push(suffix[cur]);
+                    cur = usize::from(prefix[cur]);
+                }
+                chain.push(cur as u8);
+                chain.reverse();
+                let entry_first = chain[0];
+                if code == next {
+                    chain.push(entry_first);
+                }
+                if out.len() + chain.len() > MAX_OUTPUT {
+                    failure = Some("decodes to an unreasonable size");
+                    break;
+                }
+                out.extend_from_slice(&chain);
+                if next < 4096 {
+                    prefix[next] = p as u16;
+                    suffix[next] = chain[0];
+                    next += 1;
+                    width = match next + early {
+                        0..=511 => 9,
+                        512..=1023 => 10,
+                        1024..=2047 => 11,
+                        _ => 12,
+                    };
+                }
+                prev = Some(code);
+            }
+            if let Some(why) = failure
+                && out.is_empty()
+            {
+                bail!("{path:?} has an LZWDecode stream that {why}");
+            }
+            Self::finish_flate_decode(out, parms, path)
         }
 
         /// ASCIIHexDecode: hex pairs, whitespace ignored, terminated by
@@ -66789,6 +67002,32 @@ mod pdf_support {
         }
 
         #[test]
+        fn lzw_decode_matches_the_specs_worked_example_and_salvages_a_cut_stream() {
+            // ISO 32000-1 7.4.4.2's example: 45 45 45 45 45 65 45 45 45 66.
+            let encoded = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
+            let plain = [45u8, 45, 45, 45, 45, 65, 45, 45, 45, 66];
+            assert_eq!(
+                PdfReader::lzw_decode(&encoded, None, tpath()).unwrap(),
+                plain
+            );
+            // Without the end-of-data code the decode simply ends with the input.
+            assert_eq!(
+                PdfReader::lzw_decode(&encoded[..8], None, tpath()).unwrap()[..9],
+                plain[..9]
+            );
+            // A first code that isn't a literal can't start a stream; a code past
+            // the table breaks it, keeping what came before.
+            assert!(PdfReader::lzw_decode(&[0xFF, 0xFF, 0x80], None, tpath()).is_err());
+            let mut broken = encoded[..4].to_vec();
+            broken.extend_from_slice(&[0xFF, 0xFF]);
+            assert!(
+                !PdfReader::lzw_decode(&broken, None, tpath())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
         fn flate_decode_salvages_a_stream_truncated_before_the_trailer() {
             // Same "Hello, PDF!" bytes as the round-trip test above, cut at
             // several real points before the 4-byte Adler-32 trailer -
@@ -67559,6 +67798,10 @@ mod mbox_support {
             } else {
                 key.to_string()
             };
+            #[cfg(feature = "cjk")]
+            if let Some(enc) = cjk_encoding_from_label(&key.to_ascii_lowercase()) {
+                return cjk_support::decode(enc, bytes);
+            }
             match codepage_support::table(&key) {
                 Some(t) => codepage_support::decode(t, bytes),
                 None => String::from_utf8_lossy(bytes).into_owned(),
@@ -71073,29 +71316,170 @@ mod sqlite_support {
         }
     }
 
-    /// SQLite's own write-ahead log holds committed changes not yet
-    /// merged back into the base file - the real SQLite C library
-    /// reconciles it transparently on every open, which this hand-rolled
-    /// reader deliberately does not reimplement. Rather than silently
-    /// serve stale data (a real, disclosed scope boundary, not a silent
-    /// gap - the same "clean error over a wrong answer" choice every
-    /// other hand-roll in this project makes for its own out-of-scope
-    /// corner), a WAL file carrying more than just its own 32-byte header
-    /// (i.e. at least one real frame) is a hard, actionable error.
-    fn check_no_pending_wal(path: &Path) -> Result<()> {
-        let mut wal_name = path.as_os_str().to_os_string();
-        wal_name.push("-wal");
-        let wal_path = PathBuf::from(wal_name);
-        if let Ok(meta) = fs::metadata(&wal_path)
-            && meta.len() > 32
-        {
-            bail!(
-                "{path:?} has a write-ahead log ({wal_path:?}) with pending, uncheckpointed \
-                 changes - run `PRAGMA wal_checkpoint(TRUNCATE);` (or close every connection \
-                 cleanly) before reading it with this tool"
-            );
+    /// A SQLite database as the C library sees it: the main file plus the
+    /// committed, not-yet-checkpointed pages of its write-ahead log
+    /// (`<db>-wal`), if it has one. A WAL-mode database that was copied
+    /// while a connection was open, or whose writer crashed, keeps its
+    /// newest data only in the log; reading the main file alone would
+    /// silently serve stale rows (or none at all - a brand-new database
+    /// can be an empty file plus a log), so every page read goes through
+    /// `read_page`, which prefers the log's newest committed copy.
+    pub(crate) struct DbFile {
+        file: fs::File,
+        wal: Option<WalOverlay>,
+    }
+
+    /// Where each page's newest committed copy lives in the log.
+    struct WalOverlay {
+        file: fs::File,
+        page_size: u32,
+        /// page number -> byte offset of that frame's page data in the log.
+        frames: HashMap<u32, u64>,
+    }
+
+    const WAL_MAGIC_LE: u32 = 0x377f_0682;
+    const WAL_MAGIC_BE: u32 = 0x377f_0683;
+    const WAL_HEADER_LEN: usize = 32;
+    const WAL_FRAME_HEADER_LEN: usize = 24;
+
+    /// SQLite's WAL checksum: the words of `data` (two at a time, in the
+    /// byte order the log's magic number declares) folded into a running
+    /// pair, per sqlite.org/fileformat2.html "Checksum Algorithm".
+    fn wal_checksum(data: &[u8], big_endian: bool, mut s0: u32, mut s1: u32) -> (u32, u32) {
+        let (pairs, _) = data.as_chunks::<8>();
+        for pair in pairs {
+            let a: [u8; 4] = [pair[0], pair[1], pair[2], pair[3]];
+            let b: [u8; 4] = [pair[4], pair[5], pair[6], pair[7]];
+            let (x0, x1) = if big_endian {
+                (u32::from_be_bytes(a), u32::from_be_bytes(b))
+            } else {
+                (u32::from_le_bytes(a), u32::from_le_bytes(b))
+            };
+            s0 = s0.wrapping_add(x0).wrapping_add(s1);
+            s1 = s1.wrapping_add(x1).wrapping_add(s0);
         }
-        Ok(())
+        (s0, s1)
+    }
+
+    impl WalOverlay {
+        /// Scans the log once and indexes the newest committed copy of
+        /// every page. A frame counts only if its salts match the log
+        /// header's (a reset log leaves older frames behind with the old
+        /// salts) and its checksum extends the chain from the previous
+        /// frame; the scan stops at the first frame that fails either, and
+        /// frames after the last commit frame (a nonzero "database size
+        /// after commit") are an unfinished transaction and are ignored.
+        fn open(wal_path: &Path) -> Result<Option<WalOverlay>> {
+            let Ok(mut file) = fs::File::open(wal_path) else {
+                return Ok(None);
+            };
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if len < WAL_HEADER_LEN as u64 {
+                return Ok(None);
+            }
+            let mut head = [0u8; WAL_HEADER_LEN];
+            file.read_exact(&mut head)
+                .with_context(|| format!("failed reading the WAL header in {wal_path:?}"))?;
+            let word = |at: usize| {
+                u32::from_be_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]])
+            };
+            let magic = word(0);
+            if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+                // Not a log this reader understands - SQLite itself would
+                // treat it as empty, so the main file is all there is.
+                return Ok(None);
+            }
+            let big_endian = magic == WAL_MAGIC_BE;
+            let page_size = word(8);
+            if !(512..=65536).contains(&page_size) || (page_size & (page_size - 1)) != 0 {
+                bail!("{wal_path:?} declares an invalid WAL page size ({page_size})");
+            }
+            let (salt1, salt2) = (word(16), word(20));
+            let (c0, c1) = wal_checksum(&head[..24], big_endian, 0, 0);
+            if (c0, c1) != (word(24), word(28)) {
+                // A header whose checksum doesn't verify is an unusable log.
+                return Ok(None);
+            }
+            let frame_len = WAL_FRAME_HEADER_LEN as u64 + page_size as u64;
+            let mut frames: HashMap<u32, u64> = HashMap::new();
+            let mut pending: Vec<(u32, u64)> = Vec::new();
+            let (mut s0, mut s1) = (c0, c1);
+            let mut buf = vec![0u8; page_size as usize];
+            let mut offset = WAL_HEADER_LEN as u64;
+            while offset + frame_len <= len {
+                let mut fh = [0u8; WAL_FRAME_HEADER_LEN];
+                file.seek(SeekFrom::Start(offset))
+                    .with_context(|| format!("failed seeking in {wal_path:?}"))?;
+                file.read_exact(&mut fh)
+                    .with_context(|| format!("failed reading a WAL frame in {wal_path:?}"))?;
+                file.read_exact(&mut buf)
+                    .with_context(|| format!("failed reading a WAL frame in {wal_path:?}"))?;
+                let fw =
+                    |at: usize| u32::from_be_bytes([fh[at], fh[at + 1], fh[at + 2], fh[at + 3]]);
+                if fw(8) != salt1 || fw(12) != salt2 {
+                    break;
+                }
+                let (n0, n1) = wal_checksum(&fh[..8], big_endian, s0, s1);
+                let (n0, n1) = wal_checksum(&buf, big_endian, n0, n1);
+                if (n0, n1) != (fw(16), fw(20)) {
+                    break;
+                }
+                (s0, s1) = (n0, n1);
+                let page = fw(0);
+                if page == 0 {
+                    break;
+                }
+                pending.push((page, offset + WAL_FRAME_HEADER_LEN as u64));
+                if fw(4) != 0 {
+                    for (p, at) in pending.drain(..) {
+                        frames.insert(p, at);
+                    }
+                }
+                offset += frame_len;
+            }
+            if frames.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(WalOverlay {
+                file,
+                page_size,
+                frames,
+            }))
+        }
+    }
+
+    impl DbFile {
+        pub(crate) fn open(path: &Path) -> Result<DbFile> {
+            let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+            let mut wal_name = path.as_os_str().to_os_string();
+            wal_name.push("-wal");
+            let wal = WalOverlay::open(&PathBuf::from(wal_name))?;
+            Ok(DbFile { file, wal })
+        }
+
+        /// The database's first 100 bytes - from the log when it holds a
+        /// newer page 1, else from the main file.
+        fn header_bytes(&mut self, path: &Path) -> Result<[u8; 100]> {
+            let mut buf = [0u8; 100];
+            if let Some(wal) = self.wal.as_mut()
+                && let Some(&at) = wal.frames.get(&1)
+            {
+                wal.file
+                    .seek(SeekFrom::Start(at))
+                    .with_context(|| format!("failed seeking in the WAL of {path:?}"))?;
+                wal.file
+                    .read_exact(&mut buf)
+                    .with_context(|| format!("failed reading the WAL of {path:?}"))?;
+                return Ok(buf);
+            }
+            self.file
+                .seek(SeekFrom::Start(0))
+                .with_context(|| format!("failed seeking in {path:?}"))?;
+            self.file
+                .read_exact(&mut buf)
+                .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+            Ok(buf)
+        }
     }
 
     fn read_header(data: &[u8], path: &Path) -> Result<DbHeader> {
@@ -71154,20 +71538,33 @@ mod sqlite_support {
     /// access to individual pages the *natural* access pattern, not an
     /// added complication a streaming rewrite has to invent from
     /// scratch.
-    fn read_page(
-        file: &mut fs::File,
-        page_num: u32,
-        page_size: u32,
-        path: &Path,
-    ) -> Result<Vec<u8>> {
+    fn read_page(db: &mut DbFile, page_num: u32, page_size: u32, path: &Path) -> Result<Vec<u8>> {
         if page_num == 0 {
             bail!("invalid SQLite page number 0 in {path:?}");
         }
-        let offset = (page_num as u64 - 1) * page_size as u64;
-        file.seek(SeekFrom::Start(offset))
-            .with_context(|| format!("failed seeking to SQLite page {page_num} in {path:?}"))?;
         let mut buf = vec![0u8; page_size as usize];
-        file.read_exact(&mut buf).with_context(|| {
+        if let Some(wal) = db.wal.as_mut()
+            && let Some(&at) = wal.frames.get(&page_num)
+        {
+            if wal.page_size != page_size {
+                bail!(
+                    "the write-ahead log of {path:?} uses {}-byte pages but the database uses {page_size}",
+                    wal.page_size
+                );
+            }
+            wal.file.seek(SeekFrom::Start(at)).with_context(|| {
+                format!("failed seeking to SQLite page {page_num} in the WAL of {path:?}")
+            })?;
+            wal.file.read_exact(&mut buf).with_context(|| {
+                format!("SQLite page {page_num} is truncated in the WAL of {path:?}")
+            })?;
+            return Ok(buf);
+        }
+        let offset = (page_num as u64 - 1) * page_size as u64;
+        db.file
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed seeking to SQLite page {page_num} in {path:?}"))?;
+        db.file.read_exact(&mut buf).with_context(|| {
             format!(
                 "SQLite page {page_num} is out of range in {path:?} (file truncated or corrupt)"
             )
@@ -71188,7 +71585,7 @@ mod sqlite_support {
     /// payload at a time.
     #[allow(clippy::too_many_arguments)]
     fn collect_table_rows(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page_num: u32,
         page_size: u32,
         usable_size: u32,
@@ -71296,7 +71693,7 @@ mod sqlite_support {
     /// `X` - `U - 35` against `((U - 12) * 64 / 255) - 23`.
     #[allow(clippy::too_many_arguments)]
     fn assemble_payload(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page: &[u8],
         body_off: usize,
         payload_size: i64,
@@ -71370,7 +71767,7 @@ mod sqlite_support {
     /// varint] [payload] [4-byte overflow pointer, if the payload spills]`.
     #[allow(clippy::too_many_arguments)]
     fn collect_index_entries(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page_num: u32,
         page_size: u32,
         usable_size: u32,
@@ -71494,7 +71891,7 @@ mod sqlite_support {
     /// verified directly against its file-format documentation rather
     /// than recalled from memory.
     fn parse_leaf_cell(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page: &[u8],
         cell_off: usize,
         page_size: u32,
@@ -71643,11 +72040,7 @@ mod sqlite_support {
 
     /// `sqlite_master`'s root page is always page 1 by construction - one
     /// more fixed fact of the file format, not something to look up.
-    fn read_schema(
-        file: &mut fs::File,
-        header: &DbHeader,
-        path: &Path,
-    ) -> Result<Vec<SchemaEntry>> {
+    fn read_schema(file: &mut DbFile, header: &DbHeader, path: &Path) -> Result<Vec<SchemaEntry>> {
         let mut entries = Vec::new();
         let mut count = 0usize;
         let mut on_row = |_rowid: i64, payload: Vec<u8>| -> Result<()> {
@@ -72392,7 +72785,7 @@ mod sqlite_support {
     /// for an ordinary table, the index b-tree for a `WITHOUT ROWID` one
     /// (the rowid handed to `on_row` is 0 there; there is none).
     fn walk_table_rows(
-        file: &mut fs::File,
+        file: &mut DbFile,
         header: &DbHeader,
         entry: &SchemaEntry,
         parsed: &ParsedTable,
@@ -72429,7 +72822,7 @@ mod sqlite_support {
     }
 
     fn profile_table(
-        file: &mut fs::File,
+        file: &mut DbFile,
         header: &DbHeader,
         entry: &SchemaEntry,
         nrows: Option<usize>,
@@ -72505,11 +72898,8 @@ mod sqlite_support {
         nrows: Option<usize>,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
-        check_no_pending_wal(path)?;
-        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-        let mut header_buf = [0u8; 100];
-        file.read_exact(&mut header_buf)
-            .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+        let mut file = DbFile::open(path)?;
+        let header_buf = file.header_bytes(path)?;
         let header = read_header(&header_buf, path)?;
 
         let entries = read_schema(&mut file, &header, path)?;
@@ -72614,16 +73004,13 @@ mod sqlite_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-        check_no_pending_wal(path)?;
-        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut file = DbFile::open(path)?;
         // Only the fixed 100-byte file header is ever needed up front -
         // everything past it (the schema, every table's own rows) is
         // read one page at a time via `read_page` as the b-tree walk
         // actually needs it, rather than loading the whole database into
         // memory before a single row is decoded.
-        let mut header_buf = [0u8; 100];
-        file.read_exact(&mut header_buf)
-            .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+        let header_buf = file.header_bytes(path)?;
         let header = read_header(&header_buf, path)?;
         if header.text_encoding != 0 && header.text_encoding != 1 {
             bail!(
@@ -83721,10 +84108,29 @@ mod xlsx_support {
     struct XlsText {
         biff: u8,
         table: Option<&'static [u16; 256]>,
+        /// The East Asian code page (932/936/949/950) the BIFF3-5 strings
+        /// are in, when the CODEPAGE record names one (`--features cjk`).
+        #[cfg_attr(not(feature = "cjk"), allow(dead_code))]
+        cjk: Option<CjkEncoding>,
+    }
+
+    /// An East Asian CODEPAGE value as the encoding that decodes it.
+    fn xls_codepage_cjk(cp: Option<u16>) -> Option<CjkEncoding> {
+        match cp? {
+            932 => Some(CjkEncoding::ShiftJis),
+            936 => Some(CjkEncoding::Gb18030),
+            949 => Some(CjkEncoding::EucKr),
+            950 => Some(CjkEncoding::Big5),
+            _ => None,
+        }
     }
 
     impl XlsText {
         fn decode(&self, bytes: &[u8]) -> String {
+            #[cfg(feature = "cjk")]
+            if let Some(enc) = self.cjk {
+                return cjk_support::decode(enc, bytes);
+            }
             match self.table {
                 Some(t) => codepage_support::decode(t, bytes),
                 None => bytes.iter().map(|&b| b as char).collect(),
@@ -83750,10 +84156,38 @@ mod xlsx_support {
         }
     }
 
+    #[cfg(all(test, feature = "cjk"))]
+    mod xls_cjk_tests {
+        use super::*;
+
+        /// BIFF3-5 strings are bytes in the file's CODEPAGE; the East Asian
+        /// ones (no writer here produces them, so the bytes are Python's
+        /// `'日本語'.encode('cp932')` and friends) decode as that page.
+        #[test]
+        fn biff5_strings_in_an_east_asian_code_page_decode() {
+            for (cp, bytes, want) in [
+                (932u16, &b"\x93\xfa\x96\x7b\x8c\xea"[..], "日本語"),
+                (936, b"\xd6\xd0\xce\xc4", "中文"),
+                (949, b"\xc7\xd1\xb1\xdb", "한글"),
+                (950, b"\xa4\xa4\xa4\xe5", "中文"),
+            ] {
+                let text = XlsText {
+                    biff: 5,
+                    table: Some(xls_codepage_table(cp)),
+                    cjk: xls_codepage_cjk(Some(cp)),
+                };
+                assert_eq!(text.decode(bytes), want, "code page {cp}");
+            }
+            assert_eq!(xls_codepage_cjk(Some(1252)), None);
+            assert_eq!(xls_codepage_cjk(None), None);
+        }
+    }
+
     /// A CODEPAGE record's value as a single-byte table: Windows code
     /// pages by number, the DOS ones, and Excel's own aliases (32768 is
     /// Mac Roman, 32769 Windows-1252, per xlrd's and OpenOffice's maps).
-    /// 367 (ASCII) and anything unknown fall back to Windows-1252.
+    /// 367 (ASCII) and anything unknown fall back to Windows-1252; the East
+    /// Asian pages (932/936/949/950) are `xls_codepage_cjk`'s.
     fn xls_codepage_table(cp: u16) -> &'static [u16; 256] {
         let name = match cp {
             437 | 737 | 775 | 850 | 852 | 855 | 857 | 858 | 860 | 861 | 862 | 863 | 864 | 865
@@ -83805,6 +84239,7 @@ mod xlsx_support {
             let text = XlsText {
                 biff: biff.unwrap_or(8),
                 table: codepage.map(xls_codepage_table),
+                cjk: xls_codepage_cjk(codepage),
             };
             match r.typ {
                 // BOF [MS-XLS 2.4.21]: BIFF5/7/8 use 0x0809 with the
@@ -83919,6 +84354,11 @@ mod xlsx_support {
             text: XlsText {
                 biff,
                 table: (biff < 8).then(|| xls_codepage_table(codepage.unwrap_or(1252))),
+                cjk: if biff < 8 {
+                    xls_codepage_cjk(codepage)
+                } else {
+                    None
+                },
             },
         })
     }
@@ -88170,6 +88610,727 @@ mod xz_support {
     }
 }
 
+// --- East Asian encodings ---
+// Shift_JIS, EUC-JP, EUC-KR, GBK/GB18030 and Big5 decode exactly as the
+// WHATWG Encoding Standard defines them (the same decoders browsers use),
+// so `--encoding shift_jis` on a file means what a browser would make of
+// it. The state machines below follow the standard's pseudocode; the index
+// tables are generated by `tools/gen_cjk_tables` (it decodes every legal
+// byte sequence with `encoding_rs`) into `src/cjk/*.bin`, and the tests
+// check the whole decoder against `encoding_rs` - every two-, three- and
+// four-byte sequence, and random byte streams split at random points.
+
+/// The East Asian encodings this build can read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CjkEncoding {
+    ShiftJis,
+    EucJp,
+    EucKr,
+    /// GBK and GB18030 share one decoder in the standard (GBK is the
+    /// two-byte subset of GB18030, and every GBK file is a GB18030 file).
+    Gb18030,
+    Big5,
+    /// The stateful 7-bit encoding Japanese email uses (JIS X 0208 behind
+    /// escape sequences).
+    Iso2022Jp,
+}
+
+/// Resolves a label (already lowercased, `_` turned into `-`) to an East
+/// Asian encoding, using the WHATWG label set plus the Windows code page
+/// spellings (`cp932`, `cp936`, `cp949`, `cp950`).
+fn cjk_encoding_from_label(label: &str) -> Option<CjkEncoding> {
+    Some(match label {
+        "shift-jis" | "shiftjis" | "sjis" | "x-sjis" | "ms-kanji" | "ms932" | "ms-932"
+        | "windows-31j" | "csshiftjis" | "cp932" | "windows-932" => CjkEncoding::ShiftJis,
+        "euc-jp" | "eucjp" | "x-euc-jp" | "cseucpkdfmtjapanese" | "ujis" => CjkEncoding::EucJp,
+        "iso-2022-jp" | "csiso2022jp" | "iso2022jp" | "jis" => CjkEncoding::Iso2022Jp,
+        "euc-kr" | "euckr" | "cp949" | "windows-949" | "x-windows-949" | "uhc" | "korean"
+        | "ks-c-5601-1987" | "ks-c-5601-1989" | "ksc5601" | "ksc-5601" | "iso-ir-149"
+        | "csksc56011987" => CjkEncoding::EucKr,
+        "gbk" | "gb2312" | "gb-2312" | "gb-2312-80" | "gb18030" | "cp936" | "windows-936"
+        | "x-gbk" | "euc-cn" | "chinese" | "csgb2312" | "iso-ir-58" | "csiso58gb231280" => {
+            CjkEncoding::Gb18030
+        }
+        "big5" | "big-5" | "big5-hkscs" | "cn-big5" | "csbig5" | "x-x-big5" | "cp950"
+        | "windows-950" => CjkEncoding::Big5,
+        _ => return None,
+    })
+}
+
+/// The error for an East Asian encoding in a build without `--features cjk`.
+#[cfg(not(feature = "cjk"))]
+fn cjk_not_compiled_in(enc: CjkEncoding) -> Error {
+    anyhow!("{enc:?} (an East Asian encoding) isn't compiled in - rebuild with --features cjk")
+}
+
+#[cfg(feature = "cjk")]
+mod cjk_support {
+    use super::CjkEncoding;
+
+    static SJIS: &[u8] = include_bytes!("cjk/sjis.bin");
+    static EUCJP_0208: &[u8] = include_bytes!("cjk/eucjp0208.bin");
+    static EUCJP_0212: &[u8] = include_bytes!("cjk/eucjp0212.bin");
+    static EUCKR: &[u8] = include_bytes!("cjk/euckr.bin");
+    static GBK: &[u8] = include_bytes!("cjk/gbk.bin");
+    static BIG5: &[u8] = include_bytes!("cjk/big5.bin");
+    static GB18030_RUNS: &[u8] = include_bytes!("cjk/gb18030_runs.bin");
+
+    // Entry counts of the two-byte tables (rows x columns); the bytes after
+    // them are the "extras" - code points above U+FFFE and the two-character
+    // Big5 sequences, which don't fit a u16 entry.
+    const SJIS_ENTRIES: usize = 60 * 189;
+    const JIS_ENTRIES: usize = 94 * 94;
+    const EUCKR_ENTRIES: usize = 126 * 190;
+    const GBK_ENTRIES: usize = 126 * 191;
+    const BIG5_ENTRIES: usize = 126 * 191;
+
+    /// The characters (one or two code points) a table gives for an entry.
+    fn lookup(table: &'static [u8], entries: usize, idx: usize) -> Option<(u32, u32)> {
+        let v = u16::from_le_bytes([table[idx * 2], table[idx * 2 + 1]]);
+        match v {
+            0 => None,
+            0xFFFF => {
+                let extras = &table[entries * 2..];
+                let n = extras.len() / 12;
+                let (mut lo, mut hi) = (0usize, n);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let rec = &extras[mid * 12..mid * 12 + 12];
+                    let at = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+                    if at == idx {
+                        let a = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+                        let b = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                        return Some((a, b));
+                    }
+                    if at < idx {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                None
+            }
+            cp => Some((u32::from(cp), 0)),
+        }
+    }
+
+    /// GB18030's four-byte sequences: the code point for a pointer, from
+    /// the table of runs (consecutive pointers with consecutive code points).
+    fn gb18030_four_byte(pointer: u32) -> Option<u32> {
+        let n = GB18030_RUNS.len() / 12;
+        let field = |i: usize, k: usize| {
+            let o = i * 12 + k * 4;
+            u32::from_le_bytes([
+                GB18030_RUNS[o],
+                GB18030_RUNS[o + 1],
+                GB18030_RUNS[o + 2],
+                GB18030_RUNS[o + 3],
+            ])
+        };
+        // The last run starting at or before `pointer`.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if field(mid, 0) <= pointer {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let run = lo.checked_sub(1)?;
+        let offset = pointer - field(run, 0);
+        (offset < field(run, 2)).then(|| field(run, 1) + offset)
+    }
+
+    fn push_cp(out: &mut String, cp: u32) {
+        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+    }
+
+    fn push_pair(out: &mut String, (a, b): (u32, u32)) {
+        push_cp(out, a);
+        if b != 0 {
+            push_cp(out, b);
+        }
+    }
+
+    /// A streaming decoder: feed it bytes in any chunking, then `finish`.
+    /// Anything the standard calls an error becomes one U+FFFD, and a byte
+    /// the standard says to "restore" is read again afterwards.
+    pub(crate) struct Decoder {
+        enc: CjkEncoding,
+        /// A pending lead byte (GB18030's `first`).
+        lead: u8,
+        second: u8,
+        third: u8,
+        /// EUC-JP: the pending sequence began with 0x8F (JIS X 0212).
+        jis0212: bool,
+        /// ISO-2022-JP: the current state, the state escape sequences
+        /// return to after an error, and whether the last token was an
+        /// escape sequence (two in a row make the second an error).
+        iso_state: u8,
+        iso_output_state: u8,
+        iso_escaped: bool,
+    }
+
+    const ISO_ASCII: u8 = 0;
+    const ISO_ROMAN: u8 = 1;
+    const ISO_KATAKANA: u8 = 2;
+    const ISO_LEAD: u8 = 3;
+    const ISO_TRAIL: u8 = 4;
+    const ISO_ESC_START: u8 = 5;
+    const ISO_ESC: u8 = 6;
+
+    /// Bytes to read again before the next input byte.
+    type Restore = ([u8; 3], usize);
+    const NONE: Restore = ([0; 3], 0);
+
+    fn one(b: u8) -> Restore {
+        ([b, 0, 0], 1)
+    }
+
+    impl Decoder {
+        pub(crate) fn new(enc: CjkEncoding) -> Self {
+            Decoder {
+                enc,
+                lead: 0,
+                second: 0,
+                third: 0,
+                jis0212: false,
+                iso_state: ISO_ASCII,
+                iso_output_state: ISO_ASCII,
+                iso_escaped: false,
+            }
+        }
+
+        pub(crate) fn push(&mut self, bytes: &[u8], out: &mut String) {
+            for &b in bytes {
+                self.feed(b, out);
+            }
+        }
+
+        /// Ends the stream: a half-finished sequence is one error.
+        pub(crate) fn finish(&mut self, out: &mut String) {
+            if self.enc == CjkEncoding::Iso2022Jp {
+                match self.iso_state {
+                    ISO_TRAIL => out.push('\u{FFFD}'),
+                    ISO_ESC_START => out.push('\u{FFFD}'),
+                    ISO_ESC => {
+                        // The half-read escape sequence is an error, and its
+                        // first byte is then read again in the output state.
+                        out.push('\u{FFFD}');
+                        let lead = self.lead;
+                        self.lead = 0;
+                        self.iso_state = self.iso_output_state;
+                        self.feed(lead, out);
+                        self.finish(out);
+                    }
+                    _ => {}
+                }
+                self.iso_state = ISO_ASCII;
+                self.iso_output_state = ISO_ASCII;
+                self.iso_escaped = false;
+                self.lead = 0;
+                return;
+            }
+            if self.lead != 0 || self.second != 0 || self.third != 0 {
+                out.push('\u{FFFD}');
+            }
+            self.lead = 0;
+            self.second = 0;
+            self.third = 0;
+            self.jis0212 = false;
+        }
+
+        fn feed(&mut self, b: u8, out: &mut String) {
+            let (bytes, n) = match self.enc {
+                CjkEncoding::ShiftJis => self.shift_jis(b, out),
+                CjkEncoding::EucJp => self.euc_jp(b, out),
+                CjkEncoding::EucKr => self.euc_kr(b, out),
+                CjkEncoding::Gb18030 => self.gb18030(b, out),
+                CjkEncoding::Big5 => self.big5(b, out),
+                CjkEncoding::Iso2022Jp => self.iso_2022_jp(b, out),
+            };
+            for &again in &bytes[..n] {
+                self.feed(again, out);
+            }
+        }
+
+        fn shift_jis(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x40..=0xFC) {
+                    let row = if lead <= 0x9F {
+                        lead - 0x81
+                    } else {
+                        lead - 0xC1
+                    } as usize;
+                    if let Some(pair) = lookup(SJIS, SJIS_ENTRIES, row * 189 + (b - 0x40) as usize)
+                    {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x80 => out.push(b as char),
+                0xA1..=0xDF => push_cp(out, 0xFF61 + u32::from(b) - 0xA1),
+                0x81..=0x9F | 0xE0..=0xFC => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn euc_jp(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead == 0x8E && matches!(b, 0xA1..=0xDF) {
+                self.lead = 0;
+                push_cp(out, 0xFF61 + u32::from(b) - 0xA1);
+                return NONE;
+            }
+            if self.lead == 0x8F && matches!(b, 0xA1..=0xFE) {
+                self.jis0212 = true;
+                self.lead = b;
+                return NONE;
+            }
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                let jis0212 = std::mem::take(&mut self.jis0212);
+                if matches!(lead, 0xA1..=0xFE) && matches!(b, 0xA1..=0xFE) {
+                    let idx = (lead - 0xA1) as usize * 94 + (b - 0xA1) as usize;
+                    let table = if jis0212 { EUCJP_0212 } else { EUCJP_0208 };
+                    if let Some(pair) = lookup(table, JIS_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x8E | 0x8F | 0xA1..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn euc_kr(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x41..=0xFE) {
+                    let idx = (lead - 0x81) as usize * 190 + (b - 0x41) as usize;
+                    if let Some(pair) = lookup(EUCKR, EUCKR_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x81..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn big5(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x40..=0x7E | 0xA1..=0xFE) {
+                    let idx = (lead - 0x81) as usize * 191 + (b - 0x40) as usize;
+                    if let Some(pair) = lookup(BIG5, BIG5_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x81..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn iso_2022_jp(&mut self, b: u8, out: &mut String) -> Restore {
+            // `Some(Restore)` ends the byte; the escape states fall through
+            // to the shared error path below.
+            match self.iso_state {
+                ISO_ASCII | ISO_ROMAN | ISO_KATAKANA | ISO_LEAD if b == 0x1B => {
+                    self.iso_state = ISO_ESC_START;
+                    NONE
+                }
+                ISO_ASCII => {
+                    self.iso_escaped = false;
+                    if b <= 0x7F && b != 0x0E && b != 0x0F {
+                        out.push(b as char);
+                    } else {
+                        out.push('\u{FFFD}');
+                    }
+                    NONE
+                }
+                ISO_ROMAN => {
+                    self.iso_escaped = false;
+                    match b {
+                        0x5C => out.push('\u{A5}'),
+                        0x7E => out.push('\u{203E}'),
+                        0x0E | 0x0F => out.push('\u{FFFD}'),
+                        0x00..=0x7F => out.push(b as char),
+                        _ => out.push('\u{FFFD}'),
+                    }
+                    NONE
+                }
+                ISO_KATAKANA => {
+                    self.iso_escaped = false;
+                    match b {
+                        0x21..=0x5F => push_cp(out, 0xFF61 - 0x21 + u32::from(b)),
+                        _ => out.push('\u{FFFD}'),
+                    }
+                    NONE
+                }
+                ISO_LEAD => {
+                    self.iso_escaped = false;
+                    if matches!(b, 0x21..=0x7E) {
+                        self.lead = b;
+                        self.iso_state = ISO_TRAIL;
+                    } else {
+                        out.push('\u{FFFD}');
+                    }
+                    NONE
+                }
+                ISO_TRAIL => {
+                    if b == 0x1B {
+                        self.iso_state = ISO_ESC_START;
+                        out.push('\u{FFFD}');
+                        return NONE;
+                    }
+                    let lead = self.lead;
+                    self.lead = 0;
+                    self.iso_state = ISO_LEAD;
+                    if matches!(b, 0x21..=0x7E) {
+                        let idx = (lead - 0x21) as usize * 94 + (b - 0x21) as usize;
+                        if let Some(pair) = lookup(EUCJP_0208, JIS_ENTRIES, idx) {
+                            push_pair(out, pair);
+                            return NONE;
+                        }
+                    }
+                    out.push('\u{FFFD}');
+                    NONE
+                }
+                ISO_ESC_START => {
+                    if b == 0x24 || b == 0x28 {
+                        self.lead = b;
+                        self.iso_state = ISO_ESC;
+                        return NONE;
+                    }
+                    self.iso_escaped = false;
+                    self.iso_state = self.iso_output_state;
+                    out.push('\u{FFFD}');
+                    one(b)
+                }
+                _ => {
+                    // ISO_ESC: the second byte of an escape sequence.
+                    let lead = self.lead;
+                    self.lead = 0;
+                    let new_state = match (lead, b) {
+                        (0x28, 0x42) => Some(ISO_ASCII),
+                        (0x28, 0x4A) => Some(ISO_ROMAN),
+                        (0x28, 0x49) => Some(ISO_KATAKANA),
+                        (0x24, 0x40 | 0x42) => Some(ISO_LEAD),
+                        _ => None,
+                    };
+                    if let Some(state) = new_state {
+                        self.iso_state = state;
+                        self.iso_output_state = state;
+                        let was_escaped = std::mem::replace(&mut self.iso_escaped, true);
+                        if was_escaped {
+                            out.push('\u{FFFD}');
+                        }
+                        return NONE;
+                    }
+                    self.iso_escaped = false;
+                    self.iso_state = self.iso_output_state;
+                    out.push('\u{FFFD}');
+                    ([lead, b, 0], 2)
+                }
+            }
+        }
+
+        fn gb18030(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.third != 0 {
+                let (first, second, third) = (self.lead, self.second, self.third);
+                self.lead = 0;
+                self.second = 0;
+                self.third = 0;
+                if !matches!(b, 0x30..=0x39) {
+                    out.push('\u{FFFD}');
+                    return ([second, third, b], 3);
+                }
+                let pointer = ((u32::from(first) - 0x81) * 10 + (u32::from(second) - 0x30)) * 1260
+                    + (u32::from(third) - 0x81) * 10
+                    + (u32::from(b) - 0x30);
+                match gb18030_four_byte(pointer) {
+                    Some(cp) => push_cp(out, cp),
+                    None => out.push('\u{FFFD}'),
+                }
+                return NONE;
+            }
+            if self.second != 0 {
+                if matches!(b, 0x81..=0xFE) {
+                    self.third = b;
+                    return NONE;
+                }
+                let second = self.second;
+                self.lead = 0;
+                self.second = 0;
+                out.push('\u{FFFD}');
+                return ([second, b, 0], 2);
+            }
+            if self.lead != 0 {
+                if matches!(b, 0x30..=0x39) {
+                    self.second = b;
+                    return NONE;
+                }
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x40..=0x7E | 0x80..=0xFE) {
+                    let idx = (lead - 0x81) as usize * 191 + (b - 0x40) as usize;
+                    if let Some(pair) = lookup(GBK, GBK_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x80 => out.push('\u{20AC}'),
+                0x81..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+    }
+
+    /// Decodes a whole byte string.
+    pub(crate) fn decode(enc: CjkEncoding, bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        let mut d = Decoder::new(enc);
+        d.push(bytes, &mut out);
+        d.finish(&mut out);
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn rs(enc: CjkEncoding) -> &'static encoding_rs::Encoding {
+            match enc {
+                CjkEncoding::ShiftJis => encoding_rs::SHIFT_JIS,
+                CjkEncoding::EucJp => encoding_rs::EUC_JP,
+                CjkEncoding::EucKr => encoding_rs::EUC_KR,
+                CjkEncoding::Gb18030 => encoding_rs::GB18030,
+                CjkEncoding::Big5 => encoding_rs::BIG5,
+                CjkEncoding::Iso2022Jp => encoding_rs::ISO_2022_JP,
+            }
+        }
+
+        fn oracle(enc: CjkEncoding, bytes: &[u8]) -> String {
+            rs(enc).decode_without_bom_handling(bytes).0.into_owned()
+        }
+
+        const ALL: [CjkEncoding; 6] = [
+            CjkEncoding::ShiftJis,
+            CjkEncoding::EucJp,
+            CjkEncoding::EucKr,
+            CjkEncoding::Gb18030,
+            CjkEncoding::Big5,
+            CjkEncoding::Iso2022Jp,
+        ];
+
+        #[test]
+        fn table_sizes_match_their_geometry() {
+            for (table, entries) in [
+                (SJIS, SJIS_ENTRIES),
+                (EUCJP_0208, JIS_ENTRIES),
+                (EUCJP_0212, JIS_ENTRIES),
+                (EUCKR, EUCKR_ENTRIES),
+                (GBK, GBK_ENTRIES),
+                (BIG5, BIG5_ENTRIES),
+            ] {
+                assert!(table.len() >= entries * 2);
+                assert_eq!((table.len() - entries * 2) % 12, 0);
+            }
+            assert_eq!(GB18030_RUNS.len() % 12, 0);
+        }
+
+        /// Every one- and two-byte sequence (and EUC-JP's three-byte ones),
+        /// alone and between ASCII, against encoding_rs.
+        #[test]
+        fn every_short_sequence_matches_encoding_rs() {
+            for enc in ALL {
+                for a in 0u16..=255 {
+                    let one = [a as u8];
+                    assert_eq!(decode(enc, &one), oracle(enc, &one), "{enc:?} {one:02x?}");
+                    for b in 0u16..=255 {
+                        let two = [a as u8, b as u8];
+                        assert_eq!(decode(enc, &two), oracle(enc, &two), "{enc:?} {two:02x?}");
+                        let framed = [b'x', a as u8, b as u8, b'y'];
+                        assert_eq!(
+                            decode(enc, &framed),
+                            oracle(enc, &framed),
+                            "{enc:?} {framed:02x?}"
+                        );
+                    }
+                }
+            }
+            for a in 0xA1u8..=0xFE {
+                for b in 0xA1u8..=0xFE {
+                    let three = [0x8F, a, b];
+                    assert_eq!(
+                        decode(CjkEncoding::EucJp, &three),
+                        oracle(CjkEncoding::EucJp, &three),
+                        "{three:02x?}"
+                    );
+                }
+            }
+        }
+
+        /// All 1.59 million GB18030 four-byte sequences.
+        #[test]
+        fn every_gb18030_four_byte_sequence_matches_encoding_rs() {
+            for p in 0u32..126 * 10 * 126 * 10 {
+                let seq = [
+                    (p / 12600) as u8 + 0x81,
+                    ((p / 1260) % 10) as u8 + 0x30,
+                    ((p / 10) % 126) as u8 + 0x81,
+                    (p % 10) as u8 + 0x30,
+                ];
+                assert_eq!(
+                    decode(CjkEncoding::Gb18030, &seq),
+                    oracle(CjkEncoding::Gb18030, &seq),
+                    "{seq:02x?}"
+                );
+            }
+        }
+
+        /// Random byte streams, biased towards lead and trail bytes, fed in
+        /// random chunks - a chunk boundary must never change the result.
+        #[test]
+        fn random_streams_match_encoding_rs_at_any_chunking() {
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut rand = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for enc in ALL {
+                for _ in 0..40_000 {
+                    let len = (rand() % 40) as usize;
+                    let bytes: Vec<u8> = (0..len)
+                        .map(|_| match rand() % 8 {
+                            0 => (rand() % 0x80) as u8,
+                            1 => 0x30 + (rand() % 10) as u8,
+                            2 => 0x8E + (rand() % 2) as u8,
+                            3..=5 => 0x81 + (rand() % 0x7E) as u8,
+                            6 => 0x40 + (rand() % 0xBF) as u8,
+                            7 if rand() % 2 == 0 => {
+                                [0x1B, 0x24, 0x28, 0x42, 0x4A, 0x49, 0x40][(rand() % 7) as usize]
+                            }
+                            _ => rand() as u8,
+                        })
+                        .collect();
+                    let expected = oracle(enc, &bytes);
+                    assert_eq!(decode(enc, &bytes), expected, "{enc:?} {bytes:02x?}");
+                    let mut d = Decoder::new(enc);
+                    let mut out = String::new();
+                    let mut at = 0;
+                    while at < bytes.len() {
+                        let step = 1 + (rand() % 5) as usize;
+                        let end = (at + step).min(bytes.len());
+                        d.push(&bytes[at..end], &mut out);
+                        at = end;
+                    }
+                    d.finish(&mut out);
+                    assert_eq!(out, expected, "{enc:?} chunked {bytes:02x?}");
+                }
+            }
+        }
+
+        /// ISO-2022-JP needs real escape sequences to get anywhere, which
+        /// random bytes almost never form: build streams out of them.
+        #[test]
+        fn iso_2022_jp_structured_streams_match_encoding_rs() {
+            const PIECES: [&[u8]; 14] = [
+                b"\x1b(B", b"\x1b(J", b"\x1b(I", b"\x1b$@", b"\x1b$B", b"\x1b", b"\x1b$", b"\x1b(",
+                b"\x1b(X", b"\x0e", b"\x0f", b"\\~", b"\n", b"\xa4",
+            ];
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut rand = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let (mut kanji, mut errors) = (0, 0);
+            for _ in 0..60_000 {
+                let mut bytes = Vec::new();
+                for _ in 0..(rand() % 12) {
+                    if rand() % 3 == 0 {
+                        bytes.extend_from_slice(PIECES[(rand() % PIECES.len() as u64) as usize]);
+                    } else {
+                        for _ in 0..(1 + rand() % 6) {
+                            bytes.push(0x21 + (rand() % 0x5E) as u8);
+                        }
+                    }
+                }
+                let expected = oracle(CjkEncoding::Iso2022Jp, &bytes);
+                kanji += expected.chars().filter(|c| *c > '\u{2FFF}').count();
+                errors += expected.matches('\u{FFFD}').count();
+                assert_eq!(
+                    decode(CjkEncoding::Iso2022Jp, &bytes),
+                    expected,
+                    "{bytes:02x?}"
+                );
+                let mut d = Decoder::new(CjkEncoding::Iso2022Jp);
+                let mut out = String::new();
+                for chunk in bytes.chunks(1 + (rand() % 4) as usize) {
+                    d.push(chunk, &mut out);
+                }
+                d.finish(&mut out);
+                assert_eq!(out, expected, "chunked {bytes:02x?}");
+            }
+            // The streams really do reach kanji and every error path.
+            assert!(kanji > 10_000 && errors > 10_000, "{kanji} {errors}");
+        }
+
+        #[test]
+        fn labels_resolve_to_the_standards_encodings() {
+            use super::super::cjk_encoding_from_label as label;
+            assert_eq!(label("shift-jis"), Some(CjkEncoding::ShiftJis));
+            assert_eq!(label("cp932"), Some(CjkEncoding::ShiftJis));
+            assert_eq!(label("euc-jp"), Some(CjkEncoding::EucJp));
+            assert_eq!(label("cp949"), Some(CjkEncoding::EucKr));
+            assert_eq!(label("gb2312"), Some(CjkEncoding::Gb18030));
+            assert_eq!(label("gbk"), Some(CjkEncoding::Gb18030));
+            assert_eq!(label("big5-hkscs"), Some(CjkEncoding::Big5));
+            assert_eq!(label("windows-1252"), None);
+        }
+    }
+}
+
 // --- Text encoding normalisation ---
 // Every text reader here reads UTF-8, and most of them fail (or, worse,
 // quietly keep a U+FEFF inside the first key) on a byte-order mark. Rather
@@ -88195,6 +89356,8 @@ enum TextEncoding {
     Utf32Be,
     /// A legacy single-byte code page (`codepage_support`'s tables).
     SingleByte(&'static [u16; 256]),
+    /// Shift_JIS, EUC-JP, EUC-KR, GBK/GB18030 or Big5 (`--features cjk`).
+    Cjk(CjkEncoding),
 }
 
 /// Parses an `--encoding` value. `latin1`/`iso-8859-1`/`ascii` follow the
@@ -88224,6 +89387,9 @@ fn parse_text_encoding(name: &str) -> Result<TextEncoding> {
         "cp1257" => "windows-1257",
         "cp1258" => "windows-1258",
         other => {
+            if let Some(cjk) = cjk_encoding_from_label(other) {
+                return Ok(TextEncoding::Cjk(cjk));
+            }
             let ibm = other.strip_prefix("ibm").map(|n| format!("cp{n}"));
             return codepage_support::table(ibm.as_deref().unwrap_or(other))
                 .map(TextEncoding::SingleByte)
@@ -88232,8 +89398,7 @@ fn parse_text_encoding(name: &str) -> Result<TextEncoding> {
                         "unrecognized --encoding {name:?} (expected utf-8, utf-16, utf-16le, \
                          utf-16be, utf-32, utf-32le, utf-32be, or a single-byte code page such \
                          as windows-1252, latin1, iso-8859-15, cp437, cp866, koi8-r, or \
-                         macintosh; multi-byte East Asian encodings (Shift-JIS, GBK, Big5, \
-                         EUC-*) aren't supported)"
+                         macintosh, or shift_jis, euc-jp, iso-2022-jp, euc-kr, gbk, gb18030, or big5)"
                     )
                 });
         }
@@ -88417,6 +89582,7 @@ fn normalize_text_bytes(
         Utf8,
         Wide(usize, bool),
         Single(&'static [u16; 256]),
+        Cjk(CjkEncoding),
     }
     let mismatch = |asked: &str| {
         anyhow!(
@@ -88449,6 +89615,8 @@ fn normalize_text_bytes(
         ),
         (Some(TextEncoding::SingleByte(t)), Bom::None | Bom::Utf8) => (Source::Single(t), 0),
         (Some(TextEncoding::SingleByte(_)), _) => return Err(mismatch("<code page>")),
+        (Some(TextEncoding::Cjk(c)), Bom::None | Bom::Utf8) => (Source::Cjk(c), 0),
+        (Some(TextEncoding::Cjk(_)), _) => return Err(mismatch("<East Asian encoding>")),
         (Some(TextEncoding::Utf8), _) => return Err(mismatch("utf-8")),
         (Some(TextEncoding::Utf16 | TextEncoding::Utf16Le | TextEncoding::Utf16Be), _) => {
             return Err(mismatch("utf-16"));
@@ -88484,6 +89652,30 @@ fn normalize_text_bytes(
                     }
                     out.write_all(codepage_support::decode(table, &buf[..n]).as_bytes())?;
                 }
+            }
+            Source::Cjk(enc) => {
+                #[cfg(feature = "cjk")]
+                {
+                    let mut decoder = cjk_support::Decoder::new(enc);
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut text = String::new();
+                    loop {
+                        let n = input
+                            .read(&mut buf)
+                            .with_context(|| format!("failed to read {path:?}"))?;
+                        if n == 0 {
+                            break;
+                        }
+                        text.clear();
+                        decoder.push(&buf[..n], &mut text);
+                        out.write_all(text.as_bytes())?;
+                    }
+                    text.clear();
+                    decoder.finish(&mut text);
+                    out.write_all(text.as_bytes())?;
+                }
+                #[cfg(not(feature = "cjk"))]
+                return Err(cjk_not_compiled_in(enc));
             }
         }
         out.flush()?;
@@ -88561,7 +89753,7 @@ fn with_encoding_hint<T>(result: Result<T>, format: &InputFormat) -> Result<T> {
             if text.contains("invalid UTF-8") || text.contains("not valid UTF-8") {
                 Err(Error {
                     message: format!(
-                        "{} - if the file isn't UTF-8, pass --encoding <name> (for example windows-1252, latin1, utf-16le)",
+                        "{} - if the file isn't UTF-8, pass --encoding <name> (for example windows-1252, latin1, utf-16le, shift_jis, gbk)",
                         err.message
                     ),
                     source: err.source,
@@ -88674,7 +89866,23 @@ mod text_encoding_tests {
         ] {
             assert!(parse_text_encoding(ok).is_ok(), "{ok}");
         }
-        for bad in ["shift_jis", "gbk", "big5", "nonsense", ""] {
+        for east_asian in [
+            "shift_jis",
+            "Shift-JIS",
+            "cp932",
+            "euc-jp",
+            "iso-2022-jp",
+            "euc-kr",
+            "cp949",
+            "gbk",
+            "gb2312",
+            "gb18030",
+            "big5",
+        ] {
+            assert!(parse_text_encoding(east_asian).is_ok(), "{east_asian}");
+        }
+        // No WHATWG decoder (or no table) for these.
+        for bad in ["iso-2022-kr", "euc-tw", "nonsense", ""] {
             assert!(parse_text_encoding(bad).is_err(), "{bad}");
         }
     }
@@ -88995,6 +90203,140 @@ impl Drop for TempFile {
     }
 }
 
+/// A scratch directory, created fresh (`create_dir` fails if the name
+/// exists) and removed with everything in it on drop - where a multi-file
+/// archive is extracted to be profiled as a directory.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("sniff-rs-dir-{pid}-{nanos}-{n}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(TempDir { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).context("failed to create a temporary directory for an archive");
+                }
+            }
+        }
+        bail!("failed to create a temporary directory for an archive after several attempts")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// An archive member's name as a path under the extraction root, or `None`
+/// for one that would land outside it (an absolute path, a `..`, a Windows
+/// drive or backslash path) - skipped rather than followed ("zip slip").
+fn safe_member_path(name: &str) -> Option<PathBuf> {
+    if name.contains('\\') || name.contains(':') || name.starts_with('/') {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p => out.push(p),
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+/// The most members a multi-file archive may hold before being refused.
+const MAX_ARCHIVE_MEMBERS: usize = 100_000;
+
+/// Extracts every regular file of a zip or tar archive under `dest`
+/// (junk like `__MACOSX` skipped, unsafe names skipped), returning how
+/// many were written.
+fn extract_archive(container: Container, archive_path: &Path, dest: &Path) -> Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut written = 0usize;
+    let place = |name: &str| -> Result<Option<PathBuf>> {
+        let Some(rel) = safe_member_path(name) else {
+            return Ok(None);
+        };
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("failed to create {parent:?}"))?;
+        }
+        Ok(Some(target))
+    };
+    match container {
+        Container::Zip => {
+            let mut archive = zip_support::ZipArchive::open(archive_path)?;
+            let names: Vec<String> = archive
+                .names()
+                .filter(|n| !n.ends_with('/') && !is_archive_junk(n))
+                .map(str::to_string)
+                .collect();
+            if names.len() > MAX_ARCHIVE_MEMBERS {
+                bail!(
+                    "{archive_path:?} holds {} files - more than the {MAX_ARCHIVE_MEMBERS} sniff-rs extracts",
+                    names.len()
+                );
+            }
+            for name in names {
+                let Some(target) = place(&name)? else {
+                    continue;
+                };
+                let tmp = archive.read_to_temp(&name)?;
+                fs::copy(tmp.path(), &target)
+                    .with_context(|| format!("failed to extract {name:?} from {archive_path:?}"))?;
+                written += 1;
+            }
+        }
+        Container::Tar => {
+            let entries: Vec<TarEntry> = tar_list_files(archive_path)?
+                .into_iter()
+                .filter(|e| !is_archive_junk(&e.name))
+                .collect();
+            if entries.len() > MAX_ARCHIVE_MEMBERS {
+                bail!(
+                    "{archive_path:?} holds {} files - more than the {MAX_ARCHIVE_MEMBERS} sniff-rs extracts",
+                    entries.len()
+                );
+            }
+            let mut input = fs::File::open(archive_path)
+                .with_context(|| format!("failed to open {archive_path:?}"))?;
+            for entry in entries {
+                let Some(target) = place(&entry.name)? else {
+                    continue;
+                };
+                input.seek(SeekFrom::Start(entry.offset))?;
+                let mut out = fs::File::create(&target)
+                    .with_context(|| format!("failed to create {target:?}"))?;
+                let copied = std::io::copy(&mut (&mut input).take(entry.size), &mut out)
+                    .with_context(|| format!("failed to read {archive_path:?}"))?;
+                if copied != entry.size {
+                    bail!(
+                        "{archive_path:?} is truncated inside the file {:?}",
+                        entry.name
+                    );
+                }
+                written += 1;
+            }
+        }
+        other => bail!("{} isn't an archive", other.name()),
+    }
+    Ok(written)
+}
+
 /// If `input_path` is literally `-` (the same sentinel this tool's own
 /// `OUTPUT_PATH` already uses for stdout), materializes the *entire*
 /// contents of stdin into a real, seekable temporary file and returns its
@@ -89240,6 +90582,11 @@ enum Layer {
     /// zero or several files), with why. A directory walk skips it like
     /// any unrecognized file; a single-file run reports it.
     Skip(String),
+    /// An archive holding several files: not one file to profile, but a
+    /// whole dataset - a single-file run extracts it and profiles it the
+    /// way `--combine` profiles a directory. The text is why a directory
+    /// walk (which skips it) can't read it.
+    Many(String),
 }
 
 fn describe_archive_files(names: &[String]) -> String {
@@ -89298,9 +90645,10 @@ fn unwrap_layer(container: Container, read_path: &Path) -> Result<Layer> {
                         .map(|n| n.to_string_lossy().into_owned());
                     Ok(Layer::Unwrapped(tmp, name))
                 }
-                many => Ok(Layer::Skip(format!(
-                    "the zip archive {read_path:?} holds {} files ({}) - sniff-rs reads one \
-                     file per archive, so extract it and point sniff-rs at the directory",
+                many => Ok(Layer::Many(format!(
+                    "the zip archive {read_path:?} holds {} files ({}) - a directory walk reads \
+                     one file per archive, so point sniff-rs at the archive itself (it profiles \
+                     the whole archive as one combined dictionary) or extract it first",
                     many.len(),
                     describe_archive_files(many)
                 ))),
@@ -89333,9 +90681,11 @@ fn unwrap_layer(container: Container, read_path: &Path) -> Result<Layer> {
                 }
                 many => {
                     let names: Vec<String> = many.iter().map(|e| e.name.clone()).collect();
-                    Ok(Layer::Skip(format!(
-                        "the tar archive {read_path:?} holds {} files ({}) - sniff-rs reads one \
-                         file per archive, so extract it and point sniff-rs at the directory",
+                    Ok(Layer::Many(format!(
+                        "the tar archive {read_path:?} holds {} files ({}) - a directory walk \
+                         reads one file per archive, so point sniff-rs at the archive itself (it \
+                         profiles the whole archive as one combined dictionary) or extract it \
+                         first",
                         names.len(),
                         describe_archive_files(&names)
                     )))
@@ -89421,9 +90771,38 @@ const MAX_CONTAINER_LAYERS: usize = 8;
 /// the last temporary copy on drop - or `None` when the file is an
 /// archive that can't be read as one file (see `Layer::Skip`).
 fn unwrap_containers(path: &Path) -> Result<std::result::Result<UnwrappedInput, String>> {
+    Ok(match unwrap_containers_inner(path)? {
+        Unwrapping::Done(input) => Ok(input),
+        Unwrapping::Skip(reason) | Unwrapping::MultiFile { reason, .. } => Err(reason),
+    })
+}
+
+/// The outcome of peeling every wrapper off a path.
+enum Unwrapping {
+    Done(UnwrappedInput),
+    /// An empty archive.
+    Skip(String),
+    /// An archive of several files, ready to extract.
+    MultiFile {
+        container: Container,
+        /// The archive's own bytes (a temporary copy when it was itself
+        /// wrapped, as in `.tar.gz`).
+        archive_path: PathBuf,
+        /// The wrapper-stripped name, which names the combined dataset.
+        name: PathBuf,
+        reason: String,
+        _guard: Option<TempFile>,
+    },
+}
+
+fn unwrap_containers_inner(path: &Path) -> Result<Unwrapping> {
     // A lakehouse table directory met during a directory walk.
     if path.is_dir() {
-        return Ok(Ok((path.to_path_buf(), path.to_path_buf(), None)));
+        return Ok(Unwrapping::Done((
+            path.to_path_buf(),
+            path.to_path_buf(),
+            None,
+        )));
     }
     let mut read_path = path.to_path_buf();
     let mut logical = path.to_path_buf();
@@ -89437,13 +90816,22 @@ fn unwrap_containers(path: &Path) -> Result<std::result::Result<UnwrappedInput, 
             // plain file.
             None => match container_from_magic(&read_path) {
                 Some(c) => (c, logical.clone()),
-                None => return Ok(Ok((read_path, logical, guard))),
+                None => return Ok(Unwrapping::Done((read_path, logical, guard))),
             },
         };
         match unwrap_layer(container, &read_path)
             .with_context(|| format!("while reading the {} layer of {path:?}", container.name()))?
         {
-            Layer::Skip(reason) => return Ok(Err(reason)),
+            Layer::Skip(reason) => return Ok(Unwrapping::Skip(reason)),
+            Layer::Many(reason) => {
+                return Ok(Unwrapping::MultiFile {
+                    container,
+                    archive_path: read_path,
+                    name: stripped,
+                    reason,
+                    _guard: guard,
+                });
+            }
             Layer::Unwrapped(tmp, member) => {
                 logical = match member {
                     Some(name) => logical.with_file_name(name),
@@ -90547,6 +91935,53 @@ fn single_input_load_target(
     Ok(Some(LoadTarget::parse(load_into)?))
 }
 
+/// A multi-file archive profiled as one combined dictionary: its files are
+/// extracted into a scratch directory named for the archive (so the
+/// combined output and table qualifiers carry that name) and
+/// `run_directory_combined` does the rest, exactly as for `--combine` on a
+/// real directory. Unless an output path, `--output-dir` or `--load-into`
+/// says otherwise, the result lands next to the archive.
+fn run_archive(
+    args: &Args,
+    output_format: &OutputFormat,
+    container: Container,
+    archive_path: &Path,
+    name: &Path,
+) -> Result<()> {
+    // Piped input has no name of its own (its scratch file's would leak).
+    let stem = if args.input_path == Path::new("-") {
+        "stdin".to_string()
+    } else {
+        name.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "archive".to_string())
+    };
+    let scratch = TempDir::new()?;
+    let dir = scratch.path.join(&stem);
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;
+    let members = extract_archive(container, archive_path, &dir)?;
+    eprintln!(
+        "{}: {members} files extracted for profiling as one combined dictionary",
+        args.input_path.display()
+    );
+    let mut combined = args.clone();
+    combined.combine = true;
+    if combined.output_dir.is_none()
+        && combined.output_path.is_none()
+        && combined.load_into.is_none()
+        && args.input_path != Path::new("-")
+    {
+        let parent = args
+            .input_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        combined.output_dir = Some(parent.to_path_buf());
+    }
+    run_directory_combined(&combined, output_format, &dir)
+}
+
 fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     if args.output_dir.is_some() {
         bail!("--output-dir only applies when the input path is a directory");
@@ -90594,7 +92029,21 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
     // at the real (decompressed) bytes every reader below opens, logical_path
     // is the compression-stripped name used for format detection and default
     // output naming, and _decompressed_tmp just needs to outlive the reads.
-    let (read_path, mut logical_path, _decompressed_tmp) = decompress_if_needed(&stdin_input_path)?;
+    let (read_path, mut logical_path, _decompressed_tmp) =
+        match unwrap_containers_inner(&stdin_input_path)? {
+            Unwrapping::Done(input) => input,
+            Unwrapping::Skip(reason) => bail!("{reason}"),
+            // An archive of several files is a dataset: extract it and
+            // profile it the way `--combine` profiles a directory.
+            Unwrapping::MultiFile {
+                container,
+                archive_path,
+                name,
+                ..
+            } => {
+                return run_archive(args, output_format, container, &archive_path, &name);
+            }
+        };
     if args.input_path == Path::new("-") {
         // `logical_path` would otherwise be `resolve_stdin_input`'s own
         // randomly-named scratch file (e.g. `sniff-rs-1234-...-0.tmp`) -
@@ -92659,21 +94108,64 @@ fn profile_raw_file_as_diff_columns(
         dispatch_reader(read_path, logical_path, format, &synthetic_args)?;
     Ok(tables
         .into_iter()
-        .map(|(name, profiles)| {
-            let cols = profiles
-                .into_iter()
-                .map(|p| DiffColumn {
-                    name: p.name,
-                    current_type: p.current_type,
-                    ideal_type: p.ideal_type,
-                    missing_pct: p.missing_pct,
-                    labels: column_label_text(&p.description, &p.notes).unwrap_or_default(),
-                    sample_values: p.sample_values,
-                })
-                .collect();
-            (name, cols)
-        })
+        .map(|(name, profiles)| (name, profiles_to_diff_columns(profiles)))
         .collect())
+}
+
+fn profiles_to_diff_columns(profiles: Vec<ColumnProfile>) -> Vec<DiffColumn> {
+    profiles
+        .into_iter()
+        .map(|p| DiffColumn {
+            name: p.name,
+            current_type: p.current_type,
+            ideal_type: p.ideal_type,
+            missing_pct: p.missing_pct,
+            labels: column_label_text(&p.description, &p.notes).unwrap_or_default(),
+            sample_values: p.sample_values,
+        })
+        .collect()
+}
+
+/// A directory as one side of `sniff-rs diff`: every recognized file under
+/// it is profiled with the same defaults a bare `sniff-rs <file>` uses, and
+/// its tables are named exactly the way `--combine` names them
+/// (`<path qualifier>__<table>`), so a live directory diffs cleanly against
+/// a saved `--combine --output-format json` dictionary of an earlier
+/// snapshot. Unrecognized files and multi-file archives are skipped (the
+/// same as a walk); a file that is recognized but fails to read is an
+/// error naming it, since a silently missing table would read as a dropped
+/// one.
+fn profile_directory_as_diff_columns(dir: &Path) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
+    let mut files = Vec::new();
+    collect_files_sorted(dir, dir, &mut files, &[])?;
+    let mut namer = CombinedTableNamer::new();
+    let mut out: BTreeMap<String, Vec<DiffColumn>> = BTreeMap::new();
+    for path in &files {
+        if looks_like_own_output(path) {
+            continue;
+        }
+        let Some((read_path, logical_path, _decompressed_tmp)) =
+            decompress_for_walk(path).with_context(|| format!("failed processing {path:?}"))?
+        else {
+            continue;
+        };
+        let Ok((format, read_path, _text_tmp)) =
+            try_detect_and_normalize(&read_path, &logical_path, &None, None)
+                .with_context(|| format!("failed processing {path:?}"))?
+        else {
+            continue;
+        };
+        let qualifier = combine_qualifier_from_path(&relative_display_path(dir, path));
+        let tables = profile_raw_file_as_diff_columns(path, &read_path, &logical_path, format)
+            .with_context(|| format!("failed processing {path:?}"))?;
+        for (table_name, columns) in tables {
+            out.insert(namer.resolve(&qualifier, &table_name), columns);
+        }
+    }
+    if out.is_empty() {
+        bail!("no recognized files found in {dir:?}");
+    }
+    Ok(out)
 }
 
 /// `sniff-rs diff`'s own per-side input resolution: `<OLD>`/`<NEW>` may
@@ -92702,11 +94194,7 @@ fn load_diff_input(
 ) -> Result<BTreeMap<String, Vec<DiffColumn>>> {
     let is_stdin = path == Path::new("-");
     if path.is_dir() {
-        bail!(
-            "{path:?} is a directory - `sniff-rs diff` compares two files. To compare two \
-             --combine directory snapshots, run `sniff-rs <dir> --combine --output-format json \
-             <out.json>` on each one first, then diff the two resulting files"
-        );
+        return profile_directory_as_diff_columns(path);
     }
     let (stdin_path, _stdin_tmp) = resolve_stdin_input(path)?;
     let (read_path, mut logical_path, _decompressed_tmp) = decompress_if_needed(&stdin_path)?;
@@ -94164,7 +95652,9 @@ USAGE:
     sqlite, ... - anything sniff-rs already reads), profiled fresh with
     default settings (--samples 3, no --nrows limit, auto-detected
     format). Mixing the two - an old saved dictionary against today's
-    live data file - works too. A raw file needing --nrows/--delimiter/
+    live data file - works too. A directory is profiled file by file
+    and its tables named the way --combine names them, so a live folder
+    diffs against a saved --combine dictionary. A raw file needing --nrows/--delimiter/
     --format control should be pre-profiled explicitly with those flags
     first; hand the resulting --output-format json file to diff instead.
     One side may be "-" to read it from stdin (gzip/zstd recognized by

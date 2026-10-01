@@ -6997,10 +6997,18 @@ fn dbase_decodes_text_through_its_marked_code_page() {
     assert!(!table(&doc, "edge_dbase_cp1252_marked_ascii").is_empty());
 }
 
-// The double-byte East Asian code pages stay a disclosed error.
-#[cfg(feature = "dbase")]
+// A double-byte East Asian code page (0x7B is Shift-JIS) reads with
+// `--features cjk`, and is a disclosed error naming the feature without it.
+#[cfg(all(feature = "dbase", feature = "cjk"))]
 #[test]
-fn dbase_double_byte_code_page_is_a_clear_disclosed_error() {
+fn dbase_double_byte_code_page_reads_with_the_cjk_feature() {
+    let doc = run_json("malformed_dbase_double_byte_codepage.dbf", &[]);
+    assert!(!table(&doc, "malformed_dbase_double_byte_codepage").is_empty());
+}
+
+#[cfg(all(feature = "dbase", not(feature = "cjk")))]
+#[test]
+fn dbase_double_byte_code_page_without_cjk_names_the_feature() {
     let output = Command::new(bin())
         .args([
             fixture("malformed_dbase_double_byte_codepage.dbf")
@@ -7012,10 +7020,7 @@ fn dbase_double_byte_code_page_is_a_clear_disclosed_error() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("0x7b") && stderr.contains("double-byte"),
-        "got: {stderr}"
-    );
+    assert!(stderr.contains("--features cjk"), "got: {stderr}");
 }
 
 // A memo field whose .dbt/.fpt file is missing is a clear error naming
@@ -9879,6 +9884,17 @@ fn yaml_merge_keys_resolve_through_aliases() {
     );
 }
 
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_anchor_alone_on_its_line_names_the_block_below() {
+    // PyYAML reads this as {name, base: {x, y}, copy: {x, y}}.
+    let doc = run_json("edge_yaml_root_anchor.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_root_anchor");
+    assert_eq!(column(cols, "name")["sample_values"][0], "top");
+    assert_eq!(column(cols, "base.x")["sample_values"][0], "1");
+    assert_eq!(column(cols, "copy.y")["sample_values"][0], "two");
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_array_of_tables_edge_with_missing_field() {
@@ -11358,15 +11374,53 @@ fn diff_accepts_a_mix_of_a_dictionary_and_a_raw_file() {
 // would otherwise still be silently broken by.
 
 #[test]
-fn diff_rejects_a_directory_input_with_an_actionable_error() {
+fn diff_compares_two_directories_and_a_directory_against_a_combine_dictionary() {
     let dir = TempDir::new();
-    let output = run_diff_raw(&[
-        dir.path().to_str().unwrap(),
-        fixture("diff_old.json").to_str().unwrap(),
-    ]);
+    let (old, new) = (dir.path().join("old"), dir.path().join("new"));
+    for d in [&old, &new] {
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/b.csv"), "k,v\n1,x\n").unwrap();
+    }
+    std::fs::write(old.join("a.csv"), "id,name\n1,a\n2,b\n").unwrap();
+    std::fs::write(new.join("a.csv"), "id,name,extra\n1,a,q\n2,b,r\n").unwrap();
+    std::fs::write(new.join("c.csv"), "z\n1\n").unwrap();
+
+    let output = run_diff_raw(&[old.to_str().unwrap(), new.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    // Tables are named the way --combine names them.
+    assert!(report.contains("extra") && report.contains("column added"));
+    assert!(report.contains("table added") && report.contains("c\\_\\_c"));
+    assert!(report.contains("sub_b\\_\\_b") && report.contains("unchanged"));
+
+    // The same old snapshot saved as a --combine dictionary diffs identically.
+    let saved = dir.path().join("old.json");
+    let status = std::process::Command::new(bin())
+        .args([
+            old.to_str().unwrap(),
+            "--combine",
+            "--output-format",
+            "json",
+        ])
+        .arg(&saved)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let against_saved = run_diff_raw(&[saved.to_str().unwrap(), new.to_str().unwrap()]);
+    let saved_report = String::from_utf8(against_saved.stdout).unwrap();
+    assert!(saved_report.contains("extra") && saved_report.contains("c\\_\\_c"));
+
+    // A directory with nothing recognizable is an error, not an empty diff.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let output = run_diff_raw(&[empty.to_str().unwrap(), new.to_str().unwrap()]);
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("is a directory") && stderr.contains("--combine"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no recognized files"));
 }
 
 // --- Delta Lake table awareness (--features delta) ---
@@ -14676,14 +14730,16 @@ fn pdf_with_a_real_user_password_refuses_distinctly_from_a_malformed_encrypt_dic
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_lzw_is_a_clean_refusal() {
+fn pdf_lzw_stream_that_is_not_lzw_fails_cleanly() {
+    // The stream says LZWDecode but holds plain text: decoding it yields
+    // garbage, which the content parser rejects - a clean error, no panic.
     let output = Command::new(bin())
-        .args([fixture("edge_pdf_lzw.pdf").to_str().unwrap(), "-"])
+        .args([fixture("edge_pdf_lzw_garbage.pdf").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("LZWDecode"), "got: {stderr}");
+    assert!(!stderr.contains("panicked"), "got: {stderr}");
 }
 
 #[test]
@@ -15970,6 +16026,135 @@ fn single_byte_encodings_decode_through_the_code_page_tables() {
     );
 }
 
+// Expected text from Python's own codecs (the files were written with them
+// and round-trip there); the decoder itself is differentially tested
+// against encoding_rs in `cjk_support`.
+#[cfg(feature = "cjk")]
+#[test]
+fn east_asian_encodings_decode_with_the_encoding_flag() {
+    let cases: [(&str, &str, &str, [&str; 3], [&str; 3]); 6] = [
+        (
+            "shift_jis",
+            "shift_jis",
+            "edge_encoding_shift_jis",
+            ["山田太郎", "ﾖｼﾀﾞ", "佐藤花子"],
+            ["東京", "大阪", "①京都"],
+        ),
+        (
+            "euc_jp",
+            "euc-jp",
+            "edge_encoding_euc_jp",
+            ["山田太郎", "ﾖｼﾀﾞ", "佐藤花子"],
+            ["東京", "大阪", "京都"],
+        ),
+        (
+            "euc_kr",
+            "cp949",
+            "edge_encoding_euc_kr",
+            ["김철수", "이영희", "박민수"],
+            ["서울", "부산", "똠방각하"],
+        ),
+        (
+            "gbk",
+            "gb2312",
+            "edge_encoding_gbk",
+            ["张伟", "王芳", "李娜"],
+            ["北京", "上海", "广州"],
+        ),
+        (
+            "gb18030",
+            "gb18030",
+            "edge_encoding_gb18030",
+            ["张伟", "𠀀𠀁", "€"],
+            ["北京", "上海", "😀"],
+        ),
+        (
+            "big5",
+            "big5",
+            "edge_encoding_big5",
+            ["陳大文", "林小明", "黃美玲"],
+            ["台北", "高雄", "台中"],
+        ),
+    ];
+    for (file, label, tbl, names, cities) in cases {
+        let doc = run_json(&format!("edge_encoding_{file}.csv"), &["--encoding", label]);
+        assert_eq!(sample_names(&doc, tbl, "name"), names, "{label}");
+        assert_eq!(sample_names(&doc, tbl, "city"), cities, "{label}");
+    }
+    // Without the flag these aren't UTF-8, and the error says what to do.
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_encoding_shift_jis.csv").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("shift_jis"));
+}
+
+#[cfg(all(feature = "cjk", feature = "dbase"))]
+#[test]
+fn dbase_decodes_the_east_asian_code_pages() {
+    for (file, names) in [
+        ("cp932", ["山田太郎", "ﾖｼﾀﾞ"]),
+        ("cp936", ["张伟", "王芳"]),
+        ("cp949", ["김철수", "이영희"]),
+        ("cp950", ["陳大文", "林小明"]),
+    ] {
+        let doc = run_json(&format!("edge_dbase_{file}.dbf"), &[]);
+        assert_eq!(
+            sample_names(&doc, &format!("edge_dbase_{file}"), "NAME"),
+            names,
+            "{file}"
+        );
+    }
+}
+
+#[cfg(all(feature = "cjk", feature = "mbox"))]
+#[test]
+fn mbox_decodes_east_asian_charsets_in_headers_and_bodies() {
+    let doc = run_json("edge_mbox_cjk_charsets.mbox", &["--samples", "5"]);
+    let tbl = "edge_mbox_cjk_charsets";
+    // gb2312, iso-2022-jp, euc-kr, big5, and a Shift_JIS message.
+    assert_eq!(
+        sample_names(&doc, tbl, "Subject"),
+        [
+            "你好，世界",
+            "日本語の件名",
+            "한국어 제목",
+            "繁體中文標題",
+            "東京の天気"
+        ]
+    );
+    assert_eq!(
+        sample_names(&doc, tbl, "body"),
+        [
+            "这是一封测试邮件。\n",
+            "こんにちは、世界。\n",
+            "안녕하세요 세계\n",
+            "你好，世界。這是測試。\n",
+            "今日は晴れです。ﾊﾛｰ\n"
+        ]
+    );
+}
+
+#[cfg(not(feature = "cjk"))]
+#[test]
+fn east_asian_encoding_without_the_cjk_feature_names_it() {
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_encoding_shift_jis.csv").to_str().unwrap(),
+            "-",
+            "--encoding",
+            "shift_jis",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--features cjk"));
+}
+
 #[test]
 fn encoding_flag_errors_are_specific() {
     let run = |args: &[&str]| {
@@ -16488,22 +16673,127 @@ fn a_single_file_archive_is_read_as_the_file_inside_it() {
 }
 
 #[test]
-fn an_archive_of_several_files_is_refused_and_says_what_it_holds() {
+fn an_archive_of_several_files_is_profiled_as_one_combined_dictionary() {
     for file in [
         "edge_container_two_files.zip",
         "edge_container_two_files.tar",
     ] {
         let out = Command::new(bin())
-            .args([fixture(file).to_str().unwrap(), "-"])
+            .args([
+                fixture(file).to_str().unwrap(),
+                "-",
+                "--output-format",
+                "json",
+            ])
             .output()
             .unwrap();
-        assert!(!out.status.success(), "{file}");
-        let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("holds 2 files (a.csv, b.csv)"),
-            "{file}: {err}"
+            out.status.success(),
+            "{file}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        // Named for the archive, tables qualified like --combine's.
+        assert_eq!(doc["directory"], "edge_container_two_files", "{file}");
+        let tables = doc["tables"].as_object().unwrap();
+        let mut names: Vec<&str> = tables.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["a__a", "b__b"], "{file}");
     }
+}
+
+#[test]
+fn a_piped_multi_file_archive_is_named_stdin() {
+    use std::io::Write;
+    let mut child = Command::new(bin())
+        .args(["-", "-", "--output-format", "json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&std::fs::read(fixture("edge_container_two_files.tar")).unwrap())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["directory"], "stdin");
+    assert!(doc["tables"]["a__a"].is_array());
+}
+
+#[test]
+fn a_multi_file_archive_writes_its_dictionary_next_to_the_archive() {
+    let dir = TempDir::new();
+    let archive = dir.path().join("bundle.zip");
+    std::fs::copy(fixture("edge_container_two_files.zip"), &archive).unwrap();
+    let out = Command::new(bin())
+        .args([archive.to_str().unwrap(), "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written = std::fs::read_to_string(dir.path().join("bundle.dictionary.json")).unwrap();
+    assert!(written.contains("\"a__a\"") && written.contains("\"b__b\""));
+    // A dictionary left beside the archive is never mistaken for input.
+    let again = Command::new(bin())
+        .args([archive.to_str().unwrap(), "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(again.status.success());
+}
+
+#[test]
+fn archive_members_that_would_escape_the_extraction_directory_are_skipped() {
+    let dir = TempDir::new();
+    let nested = dir.path().join("inner");
+    std::fs::create_dir_all(&nested).unwrap();
+    let archive = nested.join("slip.zip");
+    std::fs::copy(fixture("edge_container_zip_slip.zip"), &archive).unwrap();
+    let out = Command::new(bin())
+        .args([archive.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut names: Vec<&str> = doc["tables"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort();
+    // Only the two honest members (and not the macOS resource fork).
+    assert_eq!(names, ["a__a", "sub_b__b"]);
+    // Nothing was written outside the scratch directory.
+    assert!(!dir.path().join("evil.csv").exists());
+    assert!(!nested.join("evil.csv").exists());
+}
+
+#[test]
+fn an_empty_archive_is_still_refused() {
+    let dir = TempDir::new();
+    let archive = dir.path().join("empty.zip");
+    // An end-of-central-directory record with zero entries.
+    let mut eocd = vec![0x50, 0x4B, 0x05, 0x06];
+    eocd.extend_from_slice(&[0u8; 18]);
+    std::fs::write(&archive, eocd).unwrap();
+    let out = Command::new(bin())
+        .args([archive.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("empty zip archive"));
 }
 
 #[test]
@@ -16797,4 +17087,113 @@ fn a_corrupt_bzip2_or_xz_file_is_an_error_not_garbage() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A WAL-mode database that was copied while a connection was open keeps its
+// newest data only in the `-wal` file. The main file here holds 20 `people`
+// rows and nothing else; the log adds 12 more, an update to row 1, a whole
+// new table, and an unfinished transaction (150 rows that spilled into the
+// log without a commit frame) that must not show up.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_reads_committed_rows_from_a_write_ahead_log() {
+    let doc = run_json("edge_sqlite_wal_pending.db", &[]);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 32);
+    let extra = table(&doc, "extra");
+    assert_eq!(column(extra, "k")["row_count"], 5);
+    assert_eq!(column(extra, "v")["ideal_type"], "f64");
+    let sql = run_sql("edge_sqlite_wal_pending.db", &[]);
+    let people = insert_rows(&sql, "people");
+    assert_eq!(people.len(), 32);
+    assert!(
+        people.iter().any(|r| r.contains("'CHANGED'")),
+        "the update in the log is applied"
+    );
+    assert!(
+        !people.iter().any(|r| r.contains("uncommitted")),
+        "an unfinished transaction is ignored"
+    );
+    assert!(
+        !people.iter().any(|r| r.contains("'p0'")),
+        "row 1 was renamed in the log"
+    );
+}
+
+// An empty main file plus a log is a complete database (a new database that
+// was never checkpointed), including its header.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_reads_a_database_that_exists_only_in_its_log() {
+    let doc = run_json("edge_sqlite_wal_logonly.db", &[]);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 12);
+    assert_eq!(column(table(&doc, "extra"), "k")["row_count"], 5);
+    assert!(
+        insert_rows(&run_sql("edge_sqlite_wal_logonly.db", &[]), "people")
+            .iter()
+            .any(|r| r.contains("'CHANGED'"))
+    );
+}
+
+// A log whose frames are cut short or whose checksums stop matching ends the
+// valid log there - what came before still counts, what comes after doesn't.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_ignores_a_truncated_or_corrupt_write_ahead_log_tail() {
+    let dir = TempDir::new();
+    let db = dir.path().join("app.db");
+    std::fs::copy(fixture("edge_sqlite_wal_pending.db"), &db).unwrap();
+    let wal = std::fs::read(fixture("edge_sqlite_wal_pending.db-wal")).unwrap();
+    // Cut mid-frame near the end: the last complete commit survives.
+    std::fs::write(dir.path().join("app.db-wal"), &wal[..wal.len() - 5000]).unwrap();
+    let doc = run_json_at(&db);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 32);
+    // Flip a byte in the middle of the first frame's page: that frame's
+    // checksum fails, so no log frame is valid and only the main file shows.
+    let mut bad = wal.clone();
+    bad[32 + 24 + 100] ^= 0xff;
+    std::fs::write(dir.path().join("app.db-wal"), &bad).unwrap();
+    let doc = run_json_at(&db);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 20);
+}
+
+// LZWDecode, with both /EarlyChange settings. Each fixture's content stream
+// is ~60 KB of text LZW-compressed to ~36 KB by an independent encoder (and
+// checked to decode identically in qpdf), long enough to cross every code
+// width (9 to 12 bits) and to hit the table-full clear code several times.
+#[cfg(feature = "pdf")]
+#[test]
+fn pdf_lzw_streams_decode_with_either_early_change_setting() {
+    for name in ["edge_pdf_lzw.pdf", "edge_pdf_lzw_early0.pdf"] {
+        let sql = run_sql(name, &[]);
+        for line in [
+            "gfeyczzug euana cfomrienr upzdk ugmxmga sjr yindoy sbqgbcn oikuhp",
+            "aburlt seh tfl shekou zdqppye fbilb dnpwo he mkthm",
+            "qkpqsg mb xqr nbwb imlselk luo emubcrd kwjes rrgxcbxn",
+        ] {
+            assert!(sql.contains(line), "{name} lost the line {line:?}");
+        }
+        assert!(
+            !sql.contains('\u{FFFD}'),
+            "{name} decoded to replacement characters"
+        );
+    }
+}
+
+// An Avro `duration` (months, days, milliseconds in 12 bytes) reads as an
+// ISO 8601 duration instead of a debug-formatted struct.
+#[cfg(feature = "avro")]
+#[test]
+fn avro_duration_logical_type_renders_as_an_iso_8601_duration() {
+    let sql = run_sql("edge_avro_duration.avro", &[]);
+    let rows = insert_rows(&sql, "edge_avro_duration");
+    assert_eq!(
+        rows,
+        [
+            "(1, 'P1M2DT3.5S')",
+            "(2, 'P0D')",
+            "(3, 'P14M')",
+            "(4, 'PT0.25S')",
+            "(5, 'P30DT86400S')"
+        ]
+    );
 }

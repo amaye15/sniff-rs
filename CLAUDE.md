@@ -3414,10 +3414,8 @@ confirmed via a manual test against a real `.json.gz` dictionary
 (a compressed dictionary input has no automated test, deliberately - see
 below).
 
-Directory inputs are rejected with an actionable error naming the
-`--combine`-based workaround (profile each directory to its own JSON
-first, then diff those) rather than attempting `decompress_if_needed` on
-a directory and failing confusingly.
+A directory is accepted too (see "Gap audit 2" below): it is profiled
+file by file and named the way `--combine` names it.
 
 Verified with new integration tests: two raw CSV files diffed directly
 with zero pre-generated JSON, a real dictionary mixed with a raw file on
@@ -11413,12 +11411,9 @@ test files (`apache-avro`'s `snappy` feature wasn't enabled); zstd-
 compressed Avro had the identical gap. Both are now enabled - see the
 design philosophy section above for the exact dependency-cost check.
 
-**Not covered, and out of scope for this pass:** Avro's `Duration` logical
-type (months/days/milliseconds, a compound value with no single natural
-string form) still falls through to the same best-effort Debug-formatted
-fallback every truly-unhandled `Value` variant gets - genuinely rare in
-practice compared to decimal/timestamp, and left as a disclosed gap rather
-than guessed at. `BigDecimal` (Avro's newer, unscaled-in-the-schema
+**Not covered, and out of scope for this pass:** (Avro's `Duration`
+logical type was left as a Debug-formatted fallback here; it now renders
+as an ISO 8601 duration - see "Gap audit 2" below.) `BigDecimal` (Avro's newer, unscaled-in-the-schema
 decimal variant) delegates to the `bigdecimal` crate's own `Display` impl,
 which should already be correct since (unlike the fixed-scale `Decimal`)
 it carries its own scale - but this specific path has lower verification
@@ -13425,8 +13420,9 @@ this project could just implement directly rather than depend on:
        converted back (a well-known asymmetry, and the reason "declare
        REAL if you want floats back" is common SQLite advice).
 
-  **WAL (write-ahead log) reconciliation is a deliberate, disclosed scope
-  boundary, not a silent gap.** The real SQLite C library transparently
+  **WAL (write-ahead log) reconciliation was a disclosed scope boundary
+  here, and is read now - see "Gap audit 2" below; the paragraph that
+  follows is the original reasoning, kept for history.** The real SQLite C library transparently
   merges a `-wal` sibling file's committed-but-not-yet-checkpointed
   frames into what a reader sees on every open; reimplementing that would
   mean parsing a second file format and its own frame/checksum layout for
@@ -17443,9 +17439,10 @@ single-byte code page `codepage_support` has a table for (windows-125x,
 cp437/cp866/..., ISO-8859-x, koi8-r/u, macintosh; `latin1`, `iso-8859-1`
 and `ascii` mean windows-1252, per the WHATWG standard, like the MBOX and
 Stata readers already did). The 50 tables were already there for dBase and
-SAS7BDAT; the module is simply no longer feature-gated. Shift-JIS, GBK,
-Big5 and EUC-* are not supported, and a name that isn't recognized says so
-and lists what is. UTF-16/32 are transcoded with `char::decode_utf16` (a
+SAS7BDAT; the module is simply no longer feature-gated. The East Asian
+encodings (Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, GBK/GB18030, Big5) came
+later, behind `--features cjk` - see "Gap audit 2" below. A name that isn't
+recognized says so and lists what is. UTF-16/32 are transcoded with `char::decode_utf16` (a
 lone surrogate becomes U+FFFD, a trailing high surrogate is held back
 until its partner arrives in the next chunk); a file cut in the middle of
 a code unit is an error. A byte-order mark that contradicts `--encoding`
@@ -17485,15 +17482,15 @@ by the file's own leading bytes.
 | brotli | `.br` | no magic | `--features parquet` (where the decoder lives); the whole file is held in memory |
 | LZ4 | `.lz4` | `04 22 4D 18` | `--features parquet` or `orc`; frame format, linked blocks, concatenated and skippable frames; held in memory |
 
-An archive holding zero or several files can't be one profile: a single
-file run says what it holds (`holds 2 files (a.csv, b.csv) - sniff-rs
-reads one file per archive`), while a directory walk, `--combine` and
-`graph` skip it like any unrecognized file (`decompress_for_walk`).
+An empty archive is refused. An archive holding several files is a
+dataset: a single-file run extracts it and profiles it like `--combine`
+on a directory (see "Gap audit 2" below), while a directory walk,
+`--combine` and `graph` skip it like any unrecognized file
+(`decompress_for_walk`).
 macOS litter (`__MACOSX/`, `._name`, `.DS_Store`, `Thumbs.db`) doesn't
 count as a file. The archive member's name becomes the logical name, so
 the table is named for it (`people`, not `data.tar`). Not wrapped, by
-choice: snappy (no standard extension or framing convention), and a zip
-of a whole dataset folder (it would need to be profiled as a directory).
+choice: snappy (no standard extension or framing convention).
 
 The bzip2 and xz decoders were checked byte for byte against CPython's
 `bz2`/`lzma` and the `xz` command: 12 bzip2 inputs (empty, one byte, every
@@ -17630,6 +17627,105 @@ is unwrapped (it is). Both are corrected, `--encoding` and the wrappers
 are in `--help` and `--list-formats`, and the format tables here match
 the code.
 
+## Gap audit 2: write-ahead logs, LZW, durations, directories, East Asian encodings, archives
+
+A second "find solutions for the remaining gaps" pass over the known
+limitations, fixing every one that has a real oracle to verify against.
+Each is also a line in `CHANGELOG.md`'s `[Unreleased]`.
+
+- **SQLite write-ahead logs are read.** A database with an uncheckpointed
+  `-wal` sibling used to be refused. `DbFile` pairs the main file with an
+  optional `WalOverlay`: the WAL's 32-byte header (magic `0x377f0682`/
+  `0x377f0683`, page size, salts) and each 24-byte frame header are
+  validated, the cumulative checksum chain (little- or big-endian word
+  order per the magic) is verified, a frame counts only when its salts
+  match the header's, and only frames up to the last *commit* frame (a
+  nonzero database-size field) apply - so a torn or corrupt tail, or a
+  transaction that was rolled back after spilling, is ignored exactly as
+  SQLite ignores it. `read_page` prefers the newest frame for a page and
+  falls back to the main file; a zero-byte `.db` with only a log reads
+  too. Verified against a live WAL database written by SQLite with
+  checkpointing disabled (`edge_sqlite_wal_pending`, `_logonly`), against
+  Python's `sqlite3` reading the same pair, and with truncated/corrupted
+  log tails.
+- **PDF `LZWDecode`.** MSB-first variable-width codes (9-12 bits), clear
+  256 / end 257, the `/EarlyChange` switch (default 1, `0` supported), a
+  4096-entry cap, then the same `/Predictor` post-processing Flate uses.
+  A stream cut short salvages its valid prefix, like Flate. Checked
+  against the spec's own worked example and against qpdf (via pikepdf)
+  decoding the committed fixtures to identical bytes for both settings.
+  A pitfall worth recording: `pikepdf.Pdf.save()` *re-encodes* LZW streams
+  to Flate by default, so the first fixtures silently weren't LZW at all
+  and the integration test passed against the old binary too; they were
+  rebuilt with `stream_decode_level=none, compress_streams=False`, and the
+  check that a baseline binary *refuses* the fixture is what caught it.
+- **Avro `duration`** (fixed(12): months, days, milliseconds as three
+  little-endian u32) renders as an ISO 8601 duration (`P1M2DT3.5S`,
+  `P0D`, `P14M`), not a debug-formatted struct.
+- **YAML: an anchor alone on its line** (`&root` then a block mapping or
+  sequence) names the block below it, at the same or a deeper indent,
+  instead of producing zero columns. Checked against PyYAML. Still not
+  supported: explicit `? key` complex keys.
+- **`sniff-rs diff` accepts directories.** `profile_directory_as_diff_columns`
+  profiles every recognized file with bare-CLI defaults and names tables
+  `<path qualifier>__<table>` through `combine_qualifier_from_path`/
+  `CombinedTableNamer`, so a live folder diffs cleanly against a saved
+  `--combine --output-format json` dictionary of an earlier snapshot. An
+  unreadable recognized file is an error naming it (a silently missing
+  table would read as a dropped one); a directory with nothing
+  recognizable is an error, not an empty diff.
+- **East Asian encodings (`--features cjk`, in `full`).** Shift_JIS,
+  EUC-JP, ISO-2022-JP, EUC-KR (= WHATWG's, a CP949 superset), GBK/GB18030
+  (one decoder, as in the standard) and Big5 (with HKSCS). `cjk_support`
+  implements the WHATWG decoders' state machines directly (including the
+  "restore the byte" rule, GB18030's four-byte ranges and ISO-2022-JP's
+  escape states); the index tables are `src/cjk/*.bin`, ~225 KB, generated
+  by `tools/gen_cjk_tables` (not part of the build - run `cargo run
+  --release -- ../../src/cjk` there) by decoding every legal byte sequence
+  with `encoding_rs`. Table format: little-endian u16 per (lead, trail)
+  cell, `0` = no character, `0xFFFF` = look in the sorted 12-byte extras
+  that follow (code points above U+FFFE and Big5's two-character
+  sequences). Verified against `encoding_rs` (a dev-dependency) by
+  exhaustion - every one-, two-, framed two-, and EUC-JP three-byte
+  sequence, all 1.59 million GB18030 four-byte sequences - plus random
+  byte streams (biased to lead/trail ranges and ESC sequences) fed in
+  random chunk sizes, and a structured ISO-2022-JP generator that asserts
+  it really reaches kanji and every error path (random bytes almost never
+  form an escape sequence, so unguided fuzzing would pass vacuously).
+  A deliberately broken rule fails the suite. Wired into `--encoding`
+  (streamed, 64 KiB at a time, state carried across chunks), dBase marks
+  `0x13/0x7B` (932), `0x4D/0x7A` (936), `0x4E/0x79` (949), `0x4F/0x78`
+  (950), SAS7BDAT's EUC-JP/EUC-KR/CP949/CP950/BIG-5/GB18030/WINDOWS-936/
+  CP932 names, MBOX/RFC 2047 charsets (including the usual `gb2312`,
+  `iso-2022-jp`, `shift_jis`, `euc-kr`, `big5`), and BIFF3-5's CODEPAGE
+  932/936/949/950. Fixtures were written with Python's own codecs
+  (`edge_encoding_{shift_jis,euc_jp,euc_kr,gbk,gb18030,big5}.csv`,
+  `edge_dbase_cp{932,936,949,950}.dbf` via the `dbf` package,
+  `edge_mbox_cjk_charsets.mbox` from `email`, with Python's non-standard
+  charset aliases `eucgb2312_cn`/`big5_tw` rewritten to what real mail
+  writes) and every expected string round-trips there first. Without the
+  feature each name is an error that says to rebuild with `--features cjk`.
+- **A zip or tar archive of several files is a dataset.** `sniff-rs
+  bundle.zip` (also `.tar`, `.tar.gz`, an extensionless tar.gz or tar.xz,
+  and piped tar streams) extracts every regular file into a scratch
+  directory named for the archive (`TempDir`, removed on drop) and runs
+  `run_directory_combined` on it - one dictionary, tables named
+  `<path>__<table>`, written next to the archive unless an output path or
+  `--output-dir` says otherwise (and `--load-into` still loads one shared
+  database). `safe_member_path` skips any member whose name would escape
+  the directory (`..`, absolute, a drive letter, a backslash) and
+  `__MACOSX`-style junk; more than 100,000 members is refused. An empty
+  archive is still refused, and a directory walk still skips a multi-file
+  archive. Disclosed: a piped zip needs `--format`-free sniffing it can't
+  have (zip has no magic of its own), so stdin zip isn't recognized; and
+  the progress lines name the scratch paths.
+
+Checked by a fixture x output-mode matrix (every fixture in
+`tests/fixtures` through md, json, json-schema, sql inline and staging)
+against a build of `main`: the only differences are the intended ones -
+new fixtures, the encoding hint text in "invalid UTF-8" errors, and the
+files whose behaviour these changes deliberately alter.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike
@@ -17682,16 +17778,19 @@ the code.
   catalog file that isn't read, and Stata releases 102-107 (an older
   value-label layout) get variable labels only. Stata's value-label
   tables are read after the data, so a label section that won't parse
-  costs the notes but never the profile. Labels are not part of
-  `--output-format json-schema` or SQL output - only `description` and
-  `notes`.
-- **SAS7BDAT and dBase don't decode multi-byte East Asian encodings**
-  (Shift-JIS, EUC-JP/KR, Big5, GB18030, ISO-2022-\*, and dBase's code
-  pages 932/936/949/950), nor a few rare single-byte ones with no
-  available table (SAS's CP921/CP922/CP1129/MACHEBREW/MACTHAI, dBase's
-  895/620). A file declaring one is a clear, disclosed error. Every other
-  single-byte code page decodes through `codepage_support` - see the
-  Dependency footprint section.
+  costs the notes but never the profile. A label is also the JSON-Schema
+  `description` and a SQL column comment, and `diff` compares it (see the
+  normalisation pass above).
+- **East Asian encodings: the WHATWG set only.** Shift_JIS (CP932),
+  EUC-JP, ISO-2022-JP, EUC-KR (CP949), GBK/GB18030 and Big5 decode with
+  `--features cjk` (on in `full`) everywhere an encoding applies: `--encoding`,
+  dBase code pages 932/936/949/950, SAS7BDAT, MBOX charsets, BIFF3-5
+  CODEPAGE. Not decoded, and a clear error where they're named: ISO-2022-KR/CN,
+  EUC-TW, Shift_JISX0213, CP942, CP1381, SAS's CP921/CP922/CP1129/
+  MACHEBREW/MACTHAI, dBase's 895/620, and BIFF's Johab (1361). Big5 means
+  the WHATWG Big5 (HKSCS included), which differs from Python's `big5`
+  codec on a few hundred rows. Without the feature each of these is an
+  error naming `--features cjk`.
 - **PDF text decoding covers WinAnsi/MacRoman/Differences/ToUnicode
   fonts plus each font's implicit built-in encoding** - an embedded Type 1
   or CFF program's own vector, the published encoding of an unembedded
@@ -17709,8 +17808,8 @@ the code.
   resolves - subset-gid (`/g0`) and subset-renamed (`/H9024`) names, and
   the few Private Use Area names with no real Unicode counterpart
   (`radicalex`, the `Asmall` small caps) - reads as U+FFFD unless
-  ToUnicode covers it. LZWDecode streams
-  (a whole-file refusal), and image-only scanned pages (present record,
+  ToUnicode covers it. (LZWDecode streams are decoded now - see "Gap audit 2"
+  below.) Image-only scanned pages (present record,
   missing text - OCR is out of scope) round out the same
   disclosed-boundary set. Annotation `/Contents` (not widget, link, or
   pop-up annotations) and AcroForm field values are surfaced
@@ -17784,12 +17883,12 @@ the code.
   wrong, misleading answer - see the design philosophy section above for
   the worked example.
 - **Content-based format sniffing doesn't cover CSV, TSV, TOML, YAML, or
-  INI**, and doesn't extend to detecting gzip/zstd compression on an
-  extensionless file - see "Content-based format auto-detection" above for
-  why both are deliberate, not oversights. The first is the same
-  irreducible-ambiguity tradeoff as IPv4-vs-version-string; the second is a
-  separate concern (transport encoding, not data format) that was out of
-  scope for what this feature was asked to solve.
+  INI** - see "Content-based format auto-detection" above for why that is
+  deliberate: the same irreducible-ambiguity tradeoff as
+  IPv4-vs-version-string. (Compression, by contrast, is sniffed by magic
+  bytes for extensionless input - see the wrappers section.) Zip and
+  brotli are the two wrappers with no usable magic, so they need their
+  extension.
 - **Preamble-row auto-detection (`detect_preamble_rows`) is capped at
   `MAX_PREAMBLE_SCAN` (5) leading rows for both of its signals**, and only
   ever fires on the two specific structural patterns described in the

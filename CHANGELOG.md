@@ -14,8 +14,8 @@ All notable changes to sniff-rs are documented here. Format follows
   front of every reader, through a temporary UTF-8 copy.
 - Archive and compression wrappers beyond gzip/zstd: `.bz2`, `.xz`,
   `.zip`, `.tar`, `.tgz`/`.tar.gz`/`.tbz2`/`.txz`, `.br`, `.lz4`, peeled
-  off in any nesting. An archive must hold exactly one file (a directory
-  walk skips one that holds several). bzip2 and xz/LZMA2 are hand-rolled
+  off in any nesting. An archive holding one file reads as that file (a
+  directory walk skips one that holds several). bzip2 and xz/LZMA2 are hand-rolled
   and checked against CPython and the `xz` command. `--list-formats` lists
   the wrappers.
 - Arrow IPC streams (`.arrows`), profiled and loadable like Feather files.
@@ -28,6 +28,22 @@ All notable changes to sniff-rs are documented here. Format follows
 - NumPy arrays of three or more axes: one row per slice of the first axis.
 - Variable and value labels appear in JSON-Schema (`description`), as SQL
   column comments, and in `diff` (`labels changed`).
+- East Asian encodings behind `--features cjk` (on in `full`): Shift_JIS,
+  EUC-JP, ISO-2022-JP, EUC-KR, GBK/GB18030 and Big5, as the WHATWG standard
+  defines them (tables generated from `encoding_rs`, which also checks the
+  decoder exhaustively in the test suite). Usable with `--encoding`, and
+  read automatically from dBase code pages 932/936/949/950, SAS7BDAT,
+  MBOX charsets and BIFF3-5 workbooks.
+- A zip or tar archive holding several files is profiled as one combined
+  dictionary (extracted to a scratch directory, tables named
+  `<path>__<table>`), written next to the archive.
+- `sniff-rs diff` accepts directories, naming tables the way `--combine`
+  does, so a live folder diffs against a saved `--combine` dictionary.
+- SQLite databases with an uncheckpointed write-ahead log are read
+  (committed frames only, checksum-verified; a torn tail is ignored).
+- PDF `LZWDecode` streams (both `/EarlyChange` settings) are decoded.
+- Avro `duration` values render as ISO 8601 durations.
+- YAML: an anchor alone on its line names the block below it.
 
 ### Changed
 - A Delta Lake or Iceberg table inside a directory is one table in
