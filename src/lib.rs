@@ -91948,11 +91948,15 @@ fn run_archive(
     archive_path: &Path,
     name: &Path,
 ) -> Result<()> {
-    let stem = name
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "archive".to_string());
+    // Piped input has no name of its own (its scratch file's would leak).
+    let stem = if args.input_path == Path::new("-") {
+        "stdin".to_string()
+    } else {
+        name.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "archive".to_string())
+    };
     let scratch = TempDir::new()?;
     let dir = scratch.path.join(&stem);
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;

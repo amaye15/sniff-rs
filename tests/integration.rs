@@ -16703,6 +16703,29 @@ fn an_archive_of_several_files_is_profiled_as_one_combined_dictionary() {
 }
 
 #[test]
+fn a_piped_multi_file_archive_is_named_stdin() {
+    use std::io::Write;
+    let mut child = Command::new(bin())
+        .args(["-", "-", "--output-format", "json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&std::fs::read(fixture("edge_container_two_files.tar")).unwrap())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["directory"], "stdin");
+    assert!(doc["tables"]["a__a"].is_array());
+}
+
+#[test]
 fn a_multi_file_archive_writes_its_dictionary_next_to_the_archive() {
     let dir = TempDir::new();
     let archive = dir.path().join("bundle.zip");
