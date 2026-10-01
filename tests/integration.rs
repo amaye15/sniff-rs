@@ -4433,6 +4433,251 @@ fn sas7bdat_format_is_recognized() {
     );
 }
 
+// SAS Transport (.xpt). `xport_nhanes_*.xpt` are real CDC NHANES files
+// (see tests/fixtures/xport_PROVENANCE.md); every expected value below was
+// cross-checked against pyreadstat (ReadStat) and, for the NHANES files,
+// pandas. The other fixtures are written by pyreadstat or hand-built to the
+// published layout.
+#[cfg(feature = "xport")]
+#[test]
+fn xport_reads_a_real_nhanes_file_and_reads_zero_as_zero() {
+    let doc = run_json("xport_nhanes_paxraw_short.xpt", &[]);
+    let cols = table(&doc, "PAXRAWS");
+    let seqn = column(cols, "SEQN");
+    assert_eq!(seqn["row_count"], 100);
+    assert_eq!(seqn["description"], "Respondent sequence number");
+    assert_eq!(seqn["ideal_type"], "i64");
+    // PAXHOUR holds real zeros. pandas' XPORT reader turns each into 5.4e-79
+    // (it never special-cases a zero mantissa); the format and ReadStat say 0.
+    let hour = column(cols, "PAXHOUR");
+    assert_eq!(hour["numeric_stats"]["min"].as_f64().unwrap(), 0.0);
+    assert_eq!(hour["numeric_stats"]["max"].as_f64().unwrap(), 1.0);
+    assert!((hour["numeric_stats"]["mean"].as_f64().unwrap() - 0.4).abs() < 1e-12);
+    let inten = column(cols, "PAXINTEN");
+    assert_eq!(inten["numeric_stats"]["max"].as_f64().unwrap(), 780.0);
+    assert!((inten["numeric_stats"]["mean"].as_f64().unwrap() - 56.07).abs() < 1e-9);
+
+    let doc = run_json("xport_nhanes_sshsv1_a.xpt", &[]);
+    let cols = table(&doc, "SSHSV1_A");
+    assert_eq!(column(cols, "SEQN")["row_count"], 1426);
+    assert_eq!(column(cols, "SSXHE1")["description"], "Herpes I");
+    let seqn = &column(cols, "SEQN")["numeric_stats"];
+    assert_eq!(seqn["min"].as_f64().unwrap(), 3.0);
+    assert_eq!(seqn["max"].as_f64().unwrap(), 9964.0);
+    assert!((seqn["mean"].as_f64().unwrap() - 5032.651473).abs() < 1e-6);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_recognizes_uuid_email_ipv4_and_date_columns() {
+    let doc = run_json("type_detection.xpt", &[]);
+    let cols = table(&doc, "TYPES");
+    assert_eq!(column(cols, "user_uuid")["ideal_type"], "UUID");
+    assert_eq!(column(cols, "contact_email")["ideal_type"], "Email");
+    assert_eq!(column(cols, "ip_address")["ideal_type"], "IPv4");
+    // A SAS date is a double with a DATE9. format: stored numeric, so the
+    // declared type is "Date" only because the format name says so.
+    assert_eq!(column(cols, "signup_date")["current_type"], "Date");
+    assert_eq!(
+        column(cols, "signup_date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    assert_eq!(column(cols, "signup_date")["description"], "Signup date");
+    assert_eq!(column(cols, "id")["current_type"], "f64");
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_v8_carries_long_labels_dates_and_missing_values() {
+    let doc = run_json("sample.xpt", &[]);
+    let cols = table(&doc, "CUSTOMERS");
+    assert_eq!(
+        column(cols, "balance")["description"],
+        "Account balance (USD)"
+    );
+    assert_eq!(
+        column(cols, "customer_id")["description"],
+        "Customer identifier"
+    );
+    // Blank text is SAS's missing value; a missing number is `.`.
+    assert!((column(cols, "name")["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    assert!((column(cols, "age")["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    assert!((column(cols, "balance")["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    let joined = column(cols, "joined");
+    assert_eq!(joined["current_type"], "Date");
+    assert!((joined["missing_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    let samples: Vec<&str> = joined["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(samples, ["2021-03-14", "2019-11-02", "2022-07-30"]);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_labelv9_record_gives_long_names_labels_and_formats() {
+    // Hand-assembled from ReadStat's reader (no available writer emits a
+    // LABELV9 record); pyreadstat reads it back with the same names, labels
+    // and formats. `MMDDYY10.` is a full format specification, so the width
+    // digits must not stop it reading as a date.
+    let doc = run_json("edge_xport_labelv9.xpt", &[]);
+    let cols = table(&doc, "LAB");
+    let long = column(cols, "a_long_variable_name_here");
+    assert_eq!(long["description"], "Numeric with a long name and label");
+    assert_eq!(long["current_type"], "f64");
+    let when = column(cols, "when");
+    assert_eq!(when["current_type"], "Date");
+    assert_eq!(when["description"], "Visit date");
+    assert_eq!(when["sample_values"][0], "2020-01-01");
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_short_numerics_tagged_missing_and_cp1252_text() {
+    // Hand-built: numerics stored in 8, 4 and 3 bytes (a short field is the
+    // leading bytes of the 8-byte IBM float), `.A` and `._` tagged missing
+    // values, a DATE-formatted day count (negative and zero included), and
+    // a Windows-1252 `\xe9` in a text field. The first six rows read
+    // identically in pyreadstat.
+    let doc = run_json("edge_xport_truncated_numerics_tagged_missing.xpt", &[]);
+    let cols = table(&doc, "SHORTS");
+    for name in ["REAL8", "SHORT4", "TINY3"] {
+        let c = column(cols, name);
+        assert_eq!(c["row_count"], 6, "{name}");
+        assert!(
+            (c["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.01,
+            "{name}"
+        );
+    }
+    let real = &column(cols, "REAL8")["numeric_stats"];
+    assert_eq!(real["min"].as_f64().unwrap(), -0.1);
+    assert_eq!(real["max"].as_f64().unwrap(), 3.141592653589793);
+    let short = &column(cols, "SHORT4")["numeric_stats"];
+    assert_eq!(short["count"], 4);
+    assert_eq!(short["min"].as_f64().unwrap(), -7.5);
+    assert_eq!(short["max"].as_f64().unwrap(), 1e8);
+    let tiny = &column(cols, "TINY3")["numeric_stats"];
+    assert_eq!(tiny["max"].as_f64().unwrap(), 65535.0);
+    let day = column(cols, "DAY");
+    assert_eq!(day["current_type"], "Date");
+    let days: Vec<&str> = day["sample_values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(days, ["1960-01-01", "2020-01-01", "1959-12-31"]);
+    let note = column(cols, "NOTE");
+    assert!(
+        note["sample_values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "caf\u{e9} au lait"),
+        "{note}"
+    );
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_members_are_tables_and_nrows_bounds_each() {
+    let doc = run_json("edge_xport_multi_member.xpt", &[]);
+    assert_eq!(column(table(&doc, "PEOPLE"), "id")["row_count"], 5);
+    assert_eq!(column(table(&doc, "STOCK"), "sku")["row_count"], 3);
+    assert_eq!(table(&doc, "STOCK").len(), 2);
+
+    // --nrows bounds each member, and the second is still found after the
+    // first is cut short.
+    let doc = run_json("edge_xport_multi_member.xpt", &["--nrows", "2"]);
+    assert_eq!(column(table(&doc, "PEOPLE"), "id")["row_count"], 2);
+    assert_eq!(column(table(&doc, "STOCK"), "sku")["row_count"], 2);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_v8_declared_observation_count_keeps_trailing_blank_rows() {
+    // OBSV8 states 4 observations; the last two are genuinely blank. A v5
+    // file can't say, so it drops a trailing run of blank rows as padding.
+    let doc = run_json("edge_xport_v8_trailing_blank_rows.xpt", &[]);
+    let code = column(table(&doc, "BLANKS"), "code");
+    assert_eq!(code["row_count"], 4);
+    assert!((code["missing_pct"].as_f64().unwrap() - 50.0).abs() < 0.01);
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_inline_sql_loads_every_member_with_iso_dates() {
+    let out = Command::new(bin())
+        .arg(fixture("sample.xpt"))
+        .args(["--output-format", "sql", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8_lossy(&out.stdout);
+    assert!(sql.contains("CREATE TABLE \"CUSTOMERS\""), "{sql}");
+    assert!(sql.contains("'2021-03-14'"), "{sql}");
+    assert!(sql.contains("'Alice Smith'"), "{sql}");
+    assert!(sql.contains("NULL"), "{sql}");
+
+    let out = Command::new(bin())
+        .arg(fixture("edge_xport_multi_member.xpt"))
+        .args(["--output-format", "sql", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sql = String::from_utf8_lossy(&out.stdout);
+    assert!(sql.contains("CREATE TABLE \"PEOPLE\""), "{sql}");
+    assert!(sql.contains("CREATE TABLE \"STOCK\""), "{sql}");
+    assert!(sql.contains("'A1'") && sql.contains("'C3'"), "{sql}");
+    assert!(sql.contains("'Carol White'"), "{sql}");
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn xport_is_found_by_content_when_the_name_says_nothing() {
+    let dir = TempDir::new();
+    let copy = dir.path().join("exported_dataset");
+    std::fs::copy(fixture("sample.xpt"), &copy).unwrap();
+    let out = Command::new(bin())
+        .arg(&copy)
+        .args(["-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["format"], "xport");
+    assert!(doc["tables"]["CUSTOMERS"].is_array());
+}
+
+#[cfg(feature = "xport")]
+#[test]
+fn malformed_xport_fails_cleanly() {
+    for name in ["malformed_garbage.xpt", "malformed_xport_truncated.xpt"] {
+        let out = Command::new(bin())
+            .arg(fixture(name))
+            .args(["-", "--output-format", "json"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{name} should be refused");
+        assert!(!stderr.contains("panicked"), "{name}: {stderr}");
+    }
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_profiles_the_whole_document_as_one_row_and_flattens_array_of_tables() {
@@ -7543,12 +7788,12 @@ fn extension_still_wins_and_is_never_second_guessed_by_content() {
 
 #[test]
 fn an_extensionless_file_with_no_sniffable_signal_still_gets_an_actionable_error() {
-    // Plain delimited text (TSV) has no magic number or other structural
-    // signal sniff_format looks for (see its doc comment - this is the
-    // same disclosed, deliberate gap CSV/TSV/TOML/YAML/INI all share), so
-    // this must still fail with the same actionable "pass --format"
+    // TOML has no magic number or other structural signal sniff_format
+    // looks for (see its doc comment - the same disclosed, deliberate gap
+    // TOML/YAML/INI share; delimited tables are recognized by content now),
+    // so this must still fail with the same actionable "pass --format"
     // error it always has, not a wrong guess.
-    let (_dir, dest) = copy_fixture_as("sample.tsv", "mystery_data");
+    let (_dir, dest) = copy_fixture_as("sample.toml", "mystery_data");
     let output = Command::new(bin())
         .args([dest.to_str().unwrap()])
         .output()
@@ -8466,15 +8711,19 @@ fn csv_quoted_fields_with_embedded_commas_quotes_and_newlines() {
 }
 
 #[test]
-fn csv_semicolon_delimited_requires_explicit_delimiter_flag() {
-    // Without --delimiter, the whole line is one string column (semicolons not split).
+fn csv_semicolon_delimited_is_detected_and_the_flag_still_wins() {
+    // The dialect detector finds the semicolons with no flag at all.
     let doc_default = run_json("edge_csv_semicolon.csv", &[]);
     let cols_default = table(&doc_default, "edge_csv_semicolon");
     assert_eq!(
         cols_default.len(),
-        1,
-        "without --delimiter ';' the file should collapse to one column"
+        4,
+        "the delimiter should be detected as ';'"
     );
+
+    // Forcing the comma shows what --delimiter overrides: one column.
+    let doc_comma = run_with_format("edge_csv_semicolon.csv", "json", &["--delimiter", ","]);
+    assert_eq!(table(&doc_comma, "edge_csv_semicolon").len(), 1);
 
     // With --delimiter ';' it parses correctly as 4 columns with correct types.
     let doc = run_with_format("edge_csv_semicolon.csv", "json", &["--delimiter", ";"]);
@@ -8487,6 +8736,114 @@ fn csv_semicolon_delimited_requires_explicit_delimiter_flag() {
         (score["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.1,
         "empty score should be missing"
     );
+}
+
+// --- CSV dialect detection (the data consistency measure) ---
+
+fn column_names(doc: &serde_json::Value, tbl: &str) -> Vec<String> {
+    table(doc, tbl)
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn csv_dialect_decimal_commas_do_not_hide_the_semicolons() {
+    // 1,50 is a price, not two fields.
+    let doc = run_json("edge_csv_dialect_semicolon_decimal_comma.csv", &[]);
+    let tbl = "edge_csv_dialect_semicolon_decimal_comma";
+    assert_eq!(column_names(&doc, tbl), ["item", "price", "qty", "shipped"]);
+    assert_eq!(sample_names(&doc, tbl, "price"), ["1,50", "22,75", "0,99"]);
+}
+
+#[test]
+fn csv_dialect_single_quotes_and_pipes_are_found() {
+    let doc = run_json("edge_csv_dialect_pipe_single_quote.csv", &[]);
+    let tbl = "edge_csv_dialect_pipe_single_quote";
+    assert_eq!(column_names(&doc, tbl), ["id", "text", "note"]);
+    // The pipes inside the quotes stay in the cell.
+    assert_eq!(
+        sample_names(&doc, tbl, "text"),
+        ["hello | world", "plain", "a|b|c"]
+    );
+}
+
+#[test]
+fn csv_dialect_backslash_escapes_keep_the_comma() {
+    let doc = run_json("edge_csv_dialect_backslash_escape.csv", &[]);
+    let tbl = "edge_csv_dialect_backslash_escape";
+    assert_eq!(column_names(&doc, tbl), ["id", "name", "city"]);
+    assert_eq!(
+        sample_names(&doc, tbl, "name"),
+        ["Smith, John", "Doe, Jane", "Ng, Wei"]
+    );
+}
+
+#[test]
+fn csv_dialect_a_list_of_names_is_one_column_not_a_space_delimited_table() {
+    let doc = run_json("edge_csv_dialect_single_column.csv", &[]);
+    let tbl = "edge_csv_dialect_single_column";
+    assert_eq!(column_names(&doc, tbl), ["Robert Plant"]);
+}
+
+#[test]
+fn csv_dialect_the_delimiter_flag_overrides_detection() {
+    let doc = run_with_format(
+        "edge_csv_dialect_semicolon_decimal_comma.csv",
+        "json",
+        &["--delimiter", ","],
+    );
+    // Forced to commas, the decimal commas split the prices.
+    assert!(column_names(&doc, "edge_csv_dialect_semicolon_decimal_comma").len() > 1);
+    assert_ne!(
+        column_names(&doc, "edge_csv_dialect_semicolon_decimal_comma"),
+        ["item", "price", "qty", "shipped"]
+    );
+}
+
+#[test]
+fn delimited_text_under_other_extensions_is_recognized_by_content() {
+    for (file, tbl, cols) in [
+        (
+            "edge_dialect_pipe_table.txt",
+            "edge_dialect_pipe_table",
+            vec!["id", "name", "score"],
+        ),
+        (
+            "edge_dialect_semicolon_table.dat",
+            "edge_dialect_semicolon_table",
+            vec!["a", "b"],
+        ),
+        (
+            "edge_dialect_tab_table.tab",
+            "edge_dialect_tab_table",
+            vec!["x", "y", "z"],
+        ),
+        (
+            "edge_dialect_pipe_table.psv",
+            "edge_dialect_pipe_table",
+            vec!["k", "v"],
+        ),
+        // No extension at all.
+        (
+            "edge_dialect_pipe_table_noext",
+            "edge_dialect_pipe_table_noext",
+            vec!["id", "name", "score"],
+        ),
+    ] {
+        let doc = run_json(file, &[]);
+        assert_eq!(column_names(&doc, tbl), cols, "{file}");
+    }
+}
+
+#[test]
+fn prose_in_a_text_file_is_still_not_mistaken_for_a_table() {
+    let out = Command::new(bin())
+        .args([fixture("edge_dialect_prose.txt").to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("can't infer format"));
 }
 
 #[test]
@@ -9359,17 +9716,11 @@ fn content_sniffing_for_extensionless_files() {
     assert_eq!(doc["format"], "json");
     assert!(doc["tables"]["edge_sniff_json_no_ext"].as_array().is_some());
 
-    // CSV without extension is deliberately NOT sniffed -> requires --format.
-    let output = Command::new(bin())
-        .args([fixture("edge_sniff_csv_no_ext").to_str().unwrap(), "-"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--format"),
-        "CSV without extension should demand --format: {stderr}"
-    );
+    // CSV without an extension is recognized by its content: the same rows
+    // split into the same columns under a common delimiter.
+    let doc = run_json("edge_sniff_csv_no_ext", &[]);
+    assert_eq!(doc["format"], "csv");
+    assert!(doc["tables"]["edge_sniff_csv_no_ext"].as_array().is_some());
 }
 
 #[cfg(feature = "parquet")]
@@ -9616,12 +9967,20 @@ fn format_override_for_misnamed_file() {
     );
     let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(doc["tables"]["data"].as_array().is_some());
-    // Without --format it should fail (CSV not sniffed).
+    // Without --format a `.txt` that holds a consistent table is still read
+    // as one (see `looks_like_delimited_table`); prose is not.
     let output2 = Command::new(bin())
-        .args([misnamed.to_str().unwrap(), "-"])
+        .args([misnamed.to_str().unwrap(), "-", "--output-format", "json"])
         .output()
         .unwrap();
-    assert!(!output2.status.success());
+    assert!(output2.status.success());
+    let prose = dir.path().join("notes.txt");
+    std::fs::write(&prose, "A line of prose, with a comma.\nAnother, longer line, with two commas.\nAnd a third.\nFin.\n").unwrap();
+    let output3 = Command::new(bin())
+        .args([prose.to_str().unwrap(), "-"])
+        .output()
+        .unwrap();
+    assert!(!output3.status.success());
 }
 
 #[test]
@@ -9916,7 +10275,7 @@ fn sas_copy_reads_same_as_original() {
 }
 
 #[test]
-fn csv_trailing_comma_is_ragged_error_and_tsv_via_csv_ext_needs_delimiter() {
+fn csv_trailing_comma_is_ragged_error_and_tsv_via_csv_ext_is_detected() {
     let output = Command::new(bin())
         .args([
             fixture("edge_csv_trailing_comma.csv").to_str().unwrap(),
@@ -9931,9 +10290,12 @@ fn csv_trailing_comma_is_ragged_error_and_tsv_via_csv_ext_needs_delimiter() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("record") || stderr.contains("field"));
 
-    // TSV content in .csv file without --delimiter collapses to one column.
+    // TSV content in a .csv file is detected as tab-delimited; forcing a comma
+    // collapses it to one column.
     let doc_default = run_json("edge_tsv_via_csv_ext.csv", &[]);
-    assert_eq!(table(&doc_default, "edge_tsv_via_csv_ext").len(), 1);
+    assert_eq!(table(&doc_default, "edge_tsv_via_csv_ext").len(), 3);
+    let doc_comma = run_with_format("edge_tsv_via_csv_ext.csv", "json", &["--delimiter", ","]);
+    assert_eq!(table(&doc_comma, "edge_tsv_via_csv_ext").len(), 1);
     let output2 = Command::new(bin())
         .args([
             fixture("edge_tsv_via_csv_ext.csv").to_str().unwrap(),
@@ -12474,17 +12836,26 @@ fn stdin_input_content_sniffs_json_with_no_format_flag() {
     assert_eq!(doc["tables"]["stdin"][0]["name"], "a");
 }
 
-/// A format with no fixed leading byte (CSV) still needs `--format`
+/// A format with no fixed leading byte (TOML) still needs `--format`
 /// explicitly when piped through stdin, exactly as it already would for
 /// any other extensionless input - not a stdin-specific limitation, just
-/// the same rule applied consistently.
+/// the same rule applied consistently. (A delimited table is recognized
+/// by its content, so piped CSV needs no flag.)
 #[test]
 fn stdin_input_without_format_still_needs_it_for_a_non_sniffable_format() {
-    let content = std::fs::read(fixture("sample.csv")).unwrap();
+    let content = std::fs::read(fixture("sample.toml")).unwrap();
     let output = run_with_stdin(&content, &["-", "-"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("can't infer format from extension"));
+
+    let csv = std::fs::read(fixture("sample.csv")).unwrap();
+    let output = run_with_stdin(&csv, &["-", "-", "--output-format", "json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// `sniff-rs -` alone (no OUTPUT_PATH) is a clear, actionable error - not

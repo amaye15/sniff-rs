@@ -5,7 +5,7 @@ per column, with what type the data actually is, what type it *should* be,
 missing %, sample values, and why. It reads CSV, TSV, JSON, JSON Lines,
 Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
-logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SPSS, ORC, BSON,
+logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SAS Transport (XPORT), SPSS, ORC, BSON,
 Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
 vCard, iCalendar, Jupyter notebooks (.ipynb), and PDF page text — any of
 them gzip- or zstd-compressed too — plus
@@ -73,7 +73,7 @@ full, honest numbers.
 
 | Format | Extensions | Needs | Notes |
 |---|---|---|---|
-| CSV / TSV | `.csv`, `.tsv` | *(default)* | `--delimiter` overrides the separator; `--skip-rows` skips N leading rows before the header (auto-detected when not given - see below) |
+| CSV / TSV | `.csv`, `.tsv`, `.psv`, `.tab` (and `.txt`/`.dat`/no extension, by content) | *(default)* | the delimiter, quote and escape character are detected from the data (see "Gap audit 3"); `--delimiter` overrides the delimiter; `--skip-rows` skips N leading rows before the header (auto-detected when not given - see below) |
 | JSON | `.json` | *(default)* | array-of-objects, a single (optionally pretty-printed) object, or JSON Lines, auto-detected by content; a top-level array/stream of non-object values profiles as one `value` column |
 | JSON Lines / NDJSON | `.jsonl`, `.ndjson` | *(default)* | same reader as JSON |
 | Parquet | `.parquet`, `.pqt` | `--features parquet` | full schema, recurses into Struct/List/Map |
@@ -98,6 +98,7 @@ full, honest numbers.
 | dBase | `.dbf` | `--features dbase` | soft-deleted records skipped (dBase's own convention); `current_type` can reveal a Numeric field that's really an integer |
 | Stata | `.dta` | `--features stata` | every DTA release (102-119); Stata's own missing markers become missing values, not literal strings |
 | SAS7BDAT | `.sas7bdat` | `--features sas7bdat` | `current_type` from the file's own declared type; SAS stores nearly all numerics as doubles, so `ideal_type` often narrows further |
+| SAS Transport | `.xpt`, `.xport` | `--features xport` | versions 5 and 8/9; one table per member; numerics are IBM floats and `.`/`.A`-`.Z`/`._` are missing; a format name makes a column a date/datetime/time, as in SAS7BDAT; a v5 member doesn't state its row count, so it ends at the next member header or end of file - see "Gap audit 3" |
 | SPSS | `.sav`, `.zsav` | `--features spss` | a native SPSS date/time/datetime variable is stored as a plain numeric offset, so `current_type` stays `f64` while `ideal_type` narrows to a real date once it's rendered; `.zsav` (zlib-block-compressed) is fully supported - see below |
 | ORC | `.orc` | `--features orc` | one section per top-level column; Struct/List/Map/Union columns flatten into dotted sub-columns like any nested format (see below); NONE/ZLIB/SNAPPY/ZSTD/LZ4 compression all supported, LZO is a disclosed gap - see below |
 | BSON | `.bson` | `--features bson` | stream of concatenated top-level documents (MongoDB's own on-disk/dump convention); always object-at-top-level, so there's no scalar/array top-level fallback the way MessagePack/CBOR need |
@@ -233,12 +234,15 @@ strong enough to be confident rather than a guess, are attempted:
   followed by a PRI digit (`"<34>Oct 11 ..."`) — a digit is never a legal
   XML tag-name start.
 
-**CSV, TSV, TOML, YAML, and INI are deliberately left un-sniffed.** Plain
-delimited or key-value text carries no fixed magic number or unambiguous
-leading character, so guessing between them would mean guessing at intent —
-exactly what this project's heuristics never do (see "Design philosophy"
-below). This is the same category of disclosed, irreducible ambiguity as a
-dotted-quad value being valid as both IPv4 and a version string. Fixed-width
+**TOML, YAML, and INI are deliberately left un-sniffed.** Plain key-value
+text carries no fixed magic number or unambiguous leading character, so
+guessing between them would mean guessing at intent — exactly what this
+project's heuristics never do (see "Design philosophy" below). This is the
+same category of disclosed, irreducible ambiguity as a dotted-quad value
+being valid as both IPv4 and a version string. **Delimited tables are now
+the exception**: a file nothing else claims is read as a table when the
+data-consistency measure (see "Gap audit 3") finds a delimiter that makes its
+rows agree on a shape - measured, not guessed, and prose still fails it. Fixed-width
 text and the four log formats aren't attempted either, for the reason
 already stated above: no delimiter or magic number distinguishes them from
 generic text at all, which is exactly why they're `--format`-only in the
@@ -7014,8 +7018,9 @@ no panic" as good enough, is what led to the second preamble-detection
 signal documented above. Pollock's 21 unique whole-file pollution variants
 also produced zero crashes on every pass - delimiter/quote/escape
 mismatches correctly surface as a clean ragged-row error rather than a
-silent misparse, exactly as documented above (this tool doesn't auto-sniff
-CSV dialect; `--delimiter` is the escape hatch).
+silent misparse, exactly as documented above (this was written before
+CSV dialect detection existed - see "Gap audit 3"; `--delimiter` is still the
+explicit override).
 
 This pass is what found all three real bugs described in the preamble-
 detection entries above (the previously-undetected header-swallowed-by-
@@ -17726,6 +17731,113 @@ against a build of `main`: the only differences are the intended ones -
 new fixtures, the encoding hint text in "invalid UTF-8" errors, and the
 files whose behaviour these changes deliberately alter.
 
+## Gap audit 3: CSV dialects and SAS Transport
+
+A third "no gaps" pass, this time searching outside the codebase for
+techniques with a published, checkable answer.
+
+- **CSV dialect detection (`csv_dialect_support`).** The reader used to
+  assume a comma (a tab for `.tsv`), a `"` quote and no escape character,
+  so a semicolon, pipe or colon file, a `'`-quoted file, or a
+  backslash-escaped one needed `--delimiter` or failed. The detector is the
+  *data consistency measure* of van den Burg, Nazabal and Sutton,
+  "Wrangling Messy CSV Files by Detecting Row and Type Patterns" (2019,
+  MIT-licensed reference implementation CleverCSV). For each candidate
+  dialect it reduces every row to a pattern (`CDCDC`: cell, delimiter,
+  cell...), scores how much the rows agree on a shape - `P = (1/K) Σ
+  N_k * max(eps, L_k-1) / L_k` over the K distinct row patterns, N_k rows
+  of length L_k - multiplies that by the share of cells that parse as a
+  known type (number, date, URL, e-mail, ...), and takes the best product.
+  Candidates are delimiter in the characters that occur (plus none) x quote
+  in `"`, `'`, none x escape in none, `\`; a normal-form check
+  decides the obvious files without scoring, and ties go to the simpler
+  dialect. The sample is the first 192 KiB.
+
+  Two additions to the paper's method, found by measuring it rather than
+  assumed: a delimiter outside `, ; \t |` has to beat the usual ones by a
+  factor of ten (prior 0.1) - a space or a letter can "explain" a text
+  table, and the paper's own data shows it - and a file whose most common
+  row pattern covers under 90% of its rows reads as a single column, since
+  ragged rows are a sign the delimiter is wrong, not that the file has no
+  structure. Both were tuned on the paper's 7,266-file development corpus
+  and checked once on its held-out 8,000-file test corpus: delimiter
+  accuracy 99.6% on the development set and 98.7% on the test set (counting
+  only files that are valid UTF-8; the rest need `--encoding`, which is a
+  different gap).
+
+  The CSV reader became dialect-aware: `CsvDialect` (delimiter, quote,
+  escape; NUL means none) drives `csv_feed_chunk`, which keeps the existing
+  ASCII byte-scan fast path unless the dialect needs an escape character or
+  a non-ASCII delimiter, where `csv_feed_chunk_generic` takes over (two
+  extra states for an escape inside and outside a quoted field). The same
+  dialect feeds `--sql-mode inline`'s second pass, so the two passes can't
+  disagree, and `--delimiter` still wins. Content detection extends to
+  files with no usable extension: after the magic-number sniffing fails,
+  `looks_like_delimited_table` reads the first rows and accepts a file only
+  when the detected dialect gives at least two columns, at least three rows
+  of the same width, and mostly typed or short cells - an essay in a
+  `.txt` file doesn't pass. `.psv` and `.tab` are CSV extensions;
+  `.txt`/`.dat` and no extension go through content detection.
+
+- **SAS Transport (`xport_support`, `--features xport`).** FDA
+  submissions and the NHANES public-use files are published as `.xpt`.
+  The format is a stream of 80-byte records: a library header, then per
+  member (data set) a descriptor, one 140-byte `NAMESTR` per variable
+  (big-endian: type, width, 8-byte name, 40-byte label, format name and
+  width) and fixed-width observations, numbers as IBM System/360 hex
+  floats. Version 8/9 (`LIBV8`) keeps long names in the `NAMESTR`, adds a
+  `LABELV8`/`LABELV9` record for long labels and formats, and states the
+  observation count in its `OBSV8` header. The reader is a bounded buffer
+  (`Bytes`) that reads one row at a time, so a 147 MB file with 1.5 million
+  rows profiles in 3.7 MB of memory in 1.9 s; a v8 file with a stated count
+  skips straight over rows `--nrows` doesn't need.
+
+  *Missing values.* A numeric is missing when its first byte is `.`, `_` or
+  `A`-`Z` and every other byte is zero (shorter fields count only the bytes
+  they have); blank text is missing, as everywhere else in SAS. *IBM
+  floats.* sign, 7-bit excess-64 base-16 exponent, 56 fraction bits (a short
+  field is the leading bytes of the 8-byte form): `mantissa as f64 *
+  2^(4e - 56)`, whose only rounding is the integer-to-double conversion.
+  *Dates.* SAS7BDAT and XPORT share `sas_value_support`: the format name
+  decides whether a double is a number, date, datetime or time (exact name
+  match - `MONTH2` is not a date - with the width digits stripped only from
+  a `LABELV9` format *specification* like `MMDDYY10.`), then the 1960 epoch
+  is converted. *Members.* Each member is a table named for it; a v5
+  member doesn't say how many observations it holds, so its rows end at the
+  next member header (detected at 80-byte boundaries, also inside a row's
+  span when padding is shorter than a row) or the end of the file, and a
+  trailing run of blank rows is padding (a v8 count, when stated, is
+  trusted instead and keeps genuinely blank trailing rows). A file cut in
+  the middle of a row is refused; one cut exactly at a row boundary can't
+  be told from a shorter data set.
+
+  *Verification.* ReadStat is the reference; pyreadstat (which wraps it)
+  and pandas were both run on real NHANES files and agree on every
+  non-zero number across 380,000 cells. They disagree on zeros: pandas'
+  `read_sas` returns 5.4e-79 for a stored zero (its bit-shift conversion
+  never special-cases a zero mantissa), ReadStat and the format give 0.0,
+  and this reader follows ReadStat (`xport_reads_a_real_nhanes_file_and_
+  reads_zero_as_zero` pins it). Every generated and real file was loaded
+  through `--output-format sql --load-into sqlite:` and compared cell by
+  cell with pyreadstat: DEMO_G (468,288 cells), DRXFCD_G, SSHSV1_A,
+  paxraw, and 400 random v5/v8 files (strings of 1-50 bytes including
+  non-ASCII, numbers incl. 1e15 and 1e-5, dates, datetimes, all-missing
+  columns, 1-250 rows so padding falls on and off row boundaries), plus
+  multi-member files assembled from the random files and compared member by
+  member - zero mismatches. A bit-flip/truncation fuzz (3,000 runs) found
+  no panic. `LABELV9`, which no writer produces, was hand-built from
+  ReadStat's reader and read back by pyreadstat; short numerics and tagged
+  missing values were hand-built the same way. Details and fixtures:
+  `tests/fixtures/xport_PROVENANCE.md`.
+
+  *Disclosed gaps.* Text decodes as UTF-8 when it is valid, else as
+  Windows-1252 per cell - the format declares no encoding, and `--encoding`
+  (which transcodes a whole text file) can't apply to binary floats. The
+  VAX/VMS 136-byte `NAMESTR` layout and `PROC CPORT` files (a different
+  format) are refused with a message saying so. Each variable's offset in
+  the row is the running sum of widths, as in ReadStat, not the `npos`
+  field.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike
@@ -17882,10 +17994,10 @@ files whose behaviour these changes deliberately alter.
   ordering is the only thing standing between a 2-digit year value and a
   wrong, misleading answer - see the design philosophy section above for
   the worked example.
-- **Content-based format sniffing doesn't cover CSV, TSV, TOML, YAML, or
-  INI** - see "Content-based format auto-detection" above for why that is
-  deliberate: the same irreducible-ambiguity tradeoff as
-  IPv4-vs-version-string. (Compression, by contrast, is sniffed by magic
+- **Content-based format sniffing doesn't cover TOML, YAML, or INI** - see
+  "Content-based format auto-detection" above for why that is deliberate:
+  the same irreducible-ambiguity tradeoff as IPv4-vs-version-string.
+  Delimited tables are recognized by content (see "Gap audit 3"). (Compression, by contrast, is sniffed by magic
   bytes for extensionless input - see the wrappers section.) Zip and
   brotli are the two wrappers with no usable magic, so they need their
   extension.

@@ -44,6 +44,22 @@ All notable changes to sniff-rs are documented here. Format follows
 - PDF `LZWDecode` streams (both `/EarlyChange` settings) are decoded.
 - Avro `duration` values render as ISO 8601 durations.
 - YAML: an anchor alone on its line names the block below it.
+- SAS Transport (`.xpt`, `--features xport`): versions 5 and 8/9 (long
+  names, labels and formats), IBM floating point, `.`/`.A`-`.Z`/`._`
+  missing values, SAS date/datetime/time formats, one table per member, and
+  inline SQL. Read through a bounded buffer, so a 150 MB file profiles in
+  under 4 MB of memory. Checked cell by cell against ReadStat/pyreadstat
+  (and pandas, which turns a stored zero into 5.4e-79) on real NHANES files
+  and 400 generated ones.
+- CSV and TSV dialects are detected from the data (the data-consistency
+  measure of van den Burg et al., "Wrangling Messy CSV Files by Detecting
+  Row and Type Patterns", 2019): delimiter, quote and escape character, so a
+  semicolon, pipe, colon or caret file, a `'`-quoted file or a
+  backslash-escaped one reads without flags. `.psv` and `.tab` are CSV
+  extensions now, `.txt`, `.dat` and extensionless tables are recognized by
+  content, and prose in a `.txt` file still isn't taken for a table. 99.6% delimiter
+  accuracy on the paper's development corpus and 98.7% on its held-out test
+  set (the files that are valid UTF-8).
 
 ### Changed
 - A Delta Lake or Iceberg table inside a directory is one table in
