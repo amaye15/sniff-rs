@@ -4510,6 +4510,70 @@ fn checksum_identifiers_get_sized_sql_columns_and_a_string_schema() {
     assert_eq!(props["routing"]["type"], "string");
 }
 
+// Geometry. `geometry_vectors.tsv` (a unit test) holds GEOS/GDAL verdicts on
+// thousands of values; these run whole files through the binary.
+#[test]
+fn geometry_text_columns_are_typed_by_parsing_and_near_misses_are_not() {
+    let doc = run_json("type_detection_geometry.csv", &[]);
+    let cols = table(&doc, "type_detection_geometry");
+    assert_eq!(column(cols, "wkt")["ideal_type"], "WKT Geometry");
+    // PostGIS EWKT, with its SRID prefix.
+    assert_eq!(column(cols, "ewkt")["ideal_type"], "WKT Geometry");
+    // Hex WKB, and PostGIS's `\x`-prefixed EWKB with an SRID.
+    assert_eq!(column(cols, "wkb_hex")["ideal_type"], "WKB Geometry");
+    assert_eq!(column(cols, "postgis_ewkb")["ideal_type"], "WKB Geometry");
+    // The recursive grammar: a collection used to read as plain text.
+    assert_eq!(column(cols, "collection")["ideal_type"], "WKT Geometry");
+    // A polygon with one parenthesis gone, a WKB cut short by a byte.
+    assert_eq!(column(cols, "near_miss_wkt")["ideal_type"], "String");
+    assert_eq!(column(cols, "near_miss_wkb")["ideal_type"], "String");
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn geoparquet_geometry_column_is_recognized_as_wkb() {
+    // Written by GeoPandas: the geometry column is a plain BYTE_ARRAY of WKB,
+    // which the reader renders as hex.
+    let doc = run_json("edge_geoparquet_geometry.parquet", &[]);
+    let cols = table(&doc, "edge_geoparquet_geometry");
+    assert_eq!(column(cols, "geometry")["ideal_type"], "WKB Geometry");
+    assert_eq!(column(cols, "name")["ideal_type"], "String");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_blob_columns_are_typed_from_their_bytes() {
+    // A GeoPackage written by GDAL: `geom` is a GP-header blob.
+    let doc = run_json("edge_geopackage_geometry.gpkg", &[]);
+    let places = table(&doc, "places");
+    let geom = column(places, "geom");
+    assert_eq!(geom["current_type"], "Blob");
+    assert_eq!(geom["ideal_type"], "GeoPackage Geometry");
+    assert!(
+        geom["notes"]
+            .as_str()
+            .unwrap()
+            .contains("parsing the whole blob")
+    );
+
+    let doc = run_json("edge_sqlite_blob_kinds.sqlite", &[]);
+    let media = table(&doc, "media");
+    assert_eq!(column(media, "png")["ideal_type"], "PNG Image");
+    assert_eq!(column(media, "jpeg")["ideal_type"], "JPEG Image");
+    assert_eq!(column(media, "gif")["ideal_type"], "GIF Image");
+    assert_eq!(column(media, "webp")["ideal_type"], "WebP Image");
+    assert_eq!(column(media, "wkb")["ideal_type"], "WKB Geometry");
+    // One value of another kind, or random bytes: just binary data - and
+    // not "a constant column" because every blob prints the same way.
+    for name in ["mixed", "opaque"] {
+        let c = column(media, name);
+        assert_eq!(c["ideal_type"], "Binary", "{name}");
+        assert!(!c["notes"].as_str().unwrap().contains("constant"), "{name}");
+    }
+    // Nulls don't stop a column being typed.
+    assert!((column(media, "jpeg")["missing_pct"].as_f64().unwrap() - 25.0).abs() < 0.01);
+}
+
 // SAS Transport (.xpt). `xport_nhanes_*.xpt` are real CDC NHANES files
 // (see tests/fixtures/xport_PROVENANCE.md); every expected value below was
 // cross-checked against pyreadstat (ReadStat) and, for the NHANES files,

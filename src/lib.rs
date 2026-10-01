@@ -6150,63 +6150,505 @@ fn is_jwt(s: &str) -> bool {
     base64url_decode(parts[2]).is_some()
 }
 
-// GEOMETRYCOLLECTION is deliberately excluded: unlike the other six, its
-// parenthesized body legitimately nests *other* geometry keywords
-// ("GEOMETRYCOLLECTION(POINT(4 6))"), not just coordinate characters - this
-// was found empirically (a real fixture value with GEOMETRYCOLLECTION
-// caused the whole test column to fail the coordinate-only character check
-// below). Properly supporting it needs actual recursive parsing, a
-// meaningfully bigger scope than "keyword + balanced coordinate body" - so
-// rather than either overclaim support that silently breaks on nesting, or
-// loosen the character check for everyone (raising false-positive risk for
-// the other six), it's just left out. A GEOMETRYCOLLECTION value falls back
-// to String, the safe direction.
-const WKT_KEYWORDS: &[&str] = &[
-    "POINT",
-    "LINESTRING",
-    "POLYGON",
-    "MULTIPOINT",
-    "MULTILINESTRING",
-    "MULTIPOLYGON",
-];
+// --- Geometry in text: WKT/EWKT, hex WKB/EWKB, GeoPackage blobs ---
+//
+// A geometry column reaches this tool three ways: as Well-Known Text
+// (`POINT(30 10)`, or PostGIS's `SRID=4326;POINT(30 10)`), as the binary
+// WKB a spatial database stores - which every reader here turns into hex
+// text (a Parquet `BYTE_ARRAY`, a SQLite `BLOB`, a PostGIS `bytea` in a CSV
+// export, usually written `\x0101000020...`) - or as a GeoPackage geometry
+// blob (a `GP` header, an optional envelope, then WKB). All three are
+// recognized by *parsing* them, not by shape: a value counts only if the
+// whole of it is exactly one well-formed geometry, which random text and
+// random hex essentially never are.
+//
+// WKT is read with the OGC grammar: `POINT`, `LINESTRING`, `POLYGON` and
+// their `MULTI` forms plus `GEOMETRYCOLLECTION`, an optional `Z`/`M`/`ZM`
+// marker, `EMPTY`, and a consistent 2, 3 or 4 numbers per coordinate. It
+// checks the grammar, not geometry validity (an unclosed ring is still
+// WKT). WKB is read in both byte orders, with EWKB's SRID/Z/M flag bits
+// and ISO's `1000`/`2000`/`3000` type offsets, for the seven types every
+// producer writes (point through geometry collection); a count that
+// promises more bytes than remain is rejected before anything is walked.
+// Curve and surface types (`CIRCULARSTRING`, `TIN`, ...) are left alone:
+// nothing here can produce a reference file for them.
+mod geometry_support {
+    const MAX_DEPTH: usize = 8;
 
-/// A Well-Known Text geometry: one of the standard OGC keywords, followed
-/// by a parenthesized, balanced coordinate group. Deliberately structural
-/// rather than a full WKT parser - it doesn't validate that the coordinate
-/// content actually forms a well-formed ring/point-count for its geometry
-/// type, just that the keyword is real and the parenthesized body is
-/// balanced and contains only characters a coordinate list could contain
-/// (digits, '.', '-', ',', space, nested parens for POLYGON's rings). Not
-/// standards-complete in the same spirit as is_email/is_url elsewhere in
-/// this file - a false negative just falls back to String.
-fn is_wkt_geometry(s: &str) -> bool {
-    let trimmed = s.trim();
-    let keyword_end = trimmed
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(trimmed.len());
-    let keyword = &trimmed[..keyword_end];
-    if !WKT_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(keyword)) {
-        return false;
+    // ----- WKT -----
+
+    struct Wkt<'a> {
+        b: &'a [u8],
+        i: usize,
     }
-    let rest = trimmed[keyword_end..].trim_start();
-    if !rest.starts_with('(') || !rest.ends_with(')') {
-        return false;
-    }
-    let mut depth = 0i32;
-    for c in rest.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth < 0 {
+
+    impl<'a> Wkt<'a> {
+        fn skip_ws(&mut self) {
+            while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+        }
+
+        fn eat(&mut self, c: u8) -> bool {
+            self.skip_ws();
+            if self.b.get(self.i) == Some(&c) {
+                self.i += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn word(&mut self) -> &'a [u8] {
+            self.skip_ws();
+            let start = self.i;
+            while self.i < self.b.len() && self.b[self.i].is_ascii_alphabetic() {
+                self.i += 1;
+            }
+            &self.b[start..self.i]
+        }
+
+        /// One number: `[+-]digits[.digits][e[+-]digits]` or `.digits`.
+        fn number(&mut self) -> bool {
+            self.skip_ws();
+            let start = self.i;
+            if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            let digits = |w: &mut Self| {
+                let s = w.i;
+                while w.i < w.b.len() && w.b[w.i].is_ascii_digit() {
+                    w.i += 1;
+                }
+                w.i - s
+            };
+            let int = digits(self);
+            let mut frac = 0;
+            if self.b.get(self.i) == Some(&b'.') {
+                self.i += 1;
+                frac = digits(self);
+            }
+            if int + frac == 0 {
+                self.i = start;
+                return false;
+            }
+            if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
+                let save = self.i;
+                self.i += 1;
+                if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                    self.i += 1;
+                }
+                if digits(self) == 0 {
+                    self.i = save;
                     return false;
                 }
             }
-            '0'..='9' | '.' | '-' | ',' | ' ' => {}
-            _ => return false,
+            // `1.5.2` and `-6.391-130.541` are not two numbers: a number
+            // ends at whitespace, a comma or a parenthesis.
+            self.i >= self.b.len()
+                || self.b[self.i].is_ascii_whitespace()
+                || matches!(self.b[self.i], b',' | b')' | b'(')
+        }
+
+        /// `x y [z [m]]`: returns the number of ordinates.
+        fn coord(&mut self) -> Option<usize> {
+            let mut n = 0;
+            while n < 4 && self.number() {
+                n += 1;
+            }
+            (n >= 2).then_some(n)
+        }
+
+        /// `coord, coord, ...` between parentheses. Every coordinate must
+        /// have `dims` ordinates (set by the first when it is `None`).
+        fn coords(&mut self, dims: &mut Option<usize>, min: usize) -> bool {
+            if !self.eat(b'(') {
+                return false;
+            }
+            let mut count = 0;
+            loop {
+                let Some(n) = self.coord() else {
+                    return false;
+                };
+                if *dims.get_or_insert(n) != n {
+                    return false;
+                }
+                count += 1;
+                if self.eat(b',') {
+                    continue;
+                }
+                break;
+            }
+            count >= min && self.eat(b')')
+        }
+
+        /// `( ring, ring, ... )` - a polygon body.
+        fn rings(&mut self, dims: &mut Option<usize>) -> bool {
+            if !self.eat(b'(') {
+                return false;
+            }
+            loop {
+                if !self.coords(dims, 1) {
+                    return false;
+                }
+                if !self.eat(b',') {
+                    break;
+                }
+            }
+            self.eat(b')')
+        }
+
+        /// `EMPTY`, or a body parsed by `body`.
+        fn empty_or(&mut self, body: impl FnOnce(&mut Self) -> bool) -> bool {
+            let save = self.i;
+            if self.word().eq_ignore_ascii_case(b"EMPTY") {
+                return true;
+            }
+            self.i = save;
+            body(self)
+        }
+
+        fn tagged(&mut self, depth: usize) -> bool {
+            if depth > MAX_DEPTH {
+                return false;
+            }
+            let kw = self.word();
+            if kw.is_empty() {
+                return false;
+            }
+            let mut kw = kw.to_ascii_uppercase();
+            // `POINTZ`, `POINTM`, `POINTZM` are written fused by PostGIS;
+            // ISO WKT puts a space (`POINT Z`).
+            let mut dims: Option<usize> = None;
+            for (suffix, n) in [(&b"ZM"[..], 4), (&b"Z"[..], 3), (&b"M"[..], 3)] {
+                if kw.ends_with(suffix) && kw.len() > suffix.len() {
+                    let stem = &kw[..kw.len() - suffix.len()];
+                    if is_keyword(stem) {
+                        kw.truncate(stem.len());
+                        dims = Some(n);
+                        break;
+                    }
+                }
+            }
+            if !is_keyword(&kw) {
+                return false;
+            }
+            if dims.is_none() {
+                let save = self.i;
+                let marker = self.word();
+                if marker.eq_ignore_ascii_case(b"Z") || marker.eq_ignore_ascii_case(b"M") {
+                    dims = Some(3);
+                } else if marker.eq_ignore_ascii_case(b"ZM") {
+                    dims = Some(4);
+                } else {
+                    self.i = save;
+                }
+            }
+            match kw.as_slice() {
+                b"POINT" => self.empty_or(|w| {
+                    w.eat(b'(')
+                        && matches!(w.coord(), Some(n) if *dims.get_or_insert(n) == n)
+                        && w.eat(b')')
+                }),
+                b"LINESTRING" => self.empty_or(|w| w.coords(&mut dims, 1)),
+                b"POLYGON" => self.empty_or(|w| w.rings(&mut dims)),
+                b"MULTIPOINT" => self.empty_or(|w| {
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        // `MULTIPOINT((1 2), (3 4))` and `MULTIPOINT(1 2, 3 4)`
+                        // are both in use.
+                        let save = w.i;
+                        let ok = if w.eat(b'(') {
+                            matches!(w.coord(), Some(n) if *dims.get_or_insert(n) == n)
+                                && w.eat(b')')
+                        } else {
+                            w.i = save;
+                            matches!(w.coord(), Some(n) if *dims.get_or_insert(n) == n)
+                        };
+                        if !ok {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+                b"MULTILINESTRING" => self.empty_or(|w| {
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        if !w.coords(&mut dims, 1) {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+                b"MULTIPOLYGON" => self.empty_or(|w| {
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        if !w.rings(&mut dims) {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+                _ => self.empty_or(|w| {
+                    // GEOMETRYCOLLECTION
+                    if !w.eat(b'(') {
+                        return false;
+                    }
+                    loop {
+                        if !w.tagged(depth + 1) {
+                            return false;
+                        }
+                        if !w.eat(b',') {
+                            break;
+                        }
+                    }
+                    w.eat(b')')
+                }),
+            }
         }
     }
-    depth == 0
+
+    fn is_keyword(k: &[u8]) -> bool {
+        matches!(
+            k,
+            b"POINT"
+                | b"LINESTRING"
+                | b"POLYGON"
+                | b"MULTIPOINT"
+                | b"MULTILINESTRING"
+                | b"MULTIPOLYGON"
+                | b"GEOMETRYCOLLECTION"
+        )
+    }
+
+    /// WKT or PostGIS EWKT (`SRID=4326;POINT(30 10)`).
+    pub fn is_wkt(s: &str) -> bool {
+        let t = s.trim();
+        let body = match t.get(..5) {
+            Some(p) if p.eq_ignore_ascii_case("SRID=") => {
+                let rest = &t[5..];
+                let Some((srid, geometry)) = rest.split_once(';') else {
+                    return false;
+                };
+                if srid.is_empty() || !srid.bytes().all(|c| c.is_ascii_digit()) {
+                    return false;
+                }
+                geometry
+            }
+            _ => t,
+        };
+        let mut w = Wkt {
+            b: body.as_bytes(),
+            i: 0,
+        };
+        if !w.tagged(0) {
+            return false;
+        }
+        w.skip_ws();
+        w.i == w.b.len()
+    }
+
+    // ----- WKB -----
+
+    struct Wkb<'a> {
+        b: &'a [u8],
+        i: usize,
+    }
+
+    impl Wkb<'_> {
+        fn left(&self) -> usize {
+            self.b.len() - self.i
+        }
+
+        fn u32(&mut self, little: bool) -> Option<u32> {
+            let raw: [u8; 4] = self.b.get(self.i..self.i + 4)?.try_into().ok()?;
+            self.i += 4;
+            Some(if little {
+                u32::from_le_bytes(raw)
+            } else {
+                u32::from_be_bytes(raw)
+            })
+        }
+
+        /// One geometry, starting at its byte-order byte.
+        fn geometry(&mut self, depth: usize) -> Option<()> {
+            if depth > MAX_DEPTH {
+                return None;
+            }
+            let little = match *self.b.get(self.i)? {
+                1 => true,
+                0 => false,
+                _ => return None,
+            };
+            self.i += 1;
+            let raw = self.u32(little)?;
+            // EWKB keeps its flags in the high bits; ISO adds 1000/2000/3000.
+            let flags = raw & 0xE000_0000;
+            let mut code = raw & 0x1FFF_FFFF;
+            let mut dims =
+                2 + usize::from(flags & 0x8000_0000 != 0) + usize::from(flags & 0x4000_0000 != 0);
+            if code >= 1000 {
+                if flags & 0xC000_0000 != 0 {
+                    return None;
+                }
+                dims = match code / 1000 {
+                    1 | 2 => 3,
+                    3 => 4,
+                    _ => return None,
+                };
+                code %= 1000;
+            }
+            // A member's flags are its own: GEOS writes an empty member of a
+            // 3D collection without the Z flag, so they are not compared
+            // with the parent's.
+            if flags & 0x2000_0000 != 0 {
+                self.u32(little)?; // SRID
+            }
+            let point = dims * 8;
+            match code {
+                1 => {
+                    self.take(point)?;
+                }
+                2 => {
+                    let n = self.count(little, point)?;
+                    self.take(n * point)?;
+                }
+                3 => {
+                    let rings = self.count(little, 4)?;
+                    for _ in 0..rings {
+                        let n = self.count(little, point)?;
+                        self.take(n * point)?;
+                    }
+                }
+                4..=7 => {
+                    let n = self.count(little, 9)?;
+                    for _ in 0..n {
+                        self.geometry(depth + 1)?;
+                    }
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+
+        fn take(&mut self, n: usize) -> Option<()> {
+            if self.left() < n {
+                return None;
+            }
+            self.i += n;
+            Some(())
+        }
+
+        /// An element count that the remaining bytes could possibly hold
+        /// (each element is at least `min` bytes).
+        fn count(&mut self, little: bool, min: usize) -> Option<usize> {
+            let n = self.u32(little)? as usize;
+            (n.checked_mul(min)? <= self.left()).then_some(n)
+        }
+    }
+
+    fn is_wkb_bytes(b: &[u8]) -> bool {
+        let mut w = Wkb { b, i: 0 };
+        w.geometry(0).is_some() && w.i == b.len()
+    }
+
+    /// Hex digits of `s` as bytes, after an optional `\x` or `0x` prefix
+    /// (PostgreSQL's `bytea` output, a SQL hex literal).
+    fn unhex(s: &str) -> Option<Vec<u8>> {
+        let s = s
+            .strip_prefix("\\x")
+            .or_else(|| s.strip_prefix("0x"))
+            .unwrap_or(s);
+        let b = s.as_bytes();
+        if b.len() < 18 || !b.len().is_multiple_of(2) {
+            return None;
+        }
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
+        b.chunks(2)
+            .map(|p| Some(nibble(p[0])? << 4 | nibble(p[1])?))
+            .collect()
+    }
+
+    /// Hex-encoded WKB or EWKB, one whole geometry.
+    pub fn is_wkb_hex(s: &str) -> bool {
+        // Cheap reject before decoding: the first byte is the byte order.
+        let t = s
+            .strip_prefix("\\x")
+            .or_else(|| s.strip_prefix("0x"))
+            .unwrap_or(s);
+        if !(t.starts_with("00") || t.starts_with("01")) {
+            return false;
+        }
+        unhex(s).is_some_and(|b| is_wkb_bytes(&b))
+    }
+
+    /// One whole geometry of raw WKB/EWKB bytes (a SQLite or GeoPackage
+    /// blob, before anything turns it into text).
+    pub fn is_wkb_blob(b: &[u8]) -> bool {
+        matches!(b.first(), Some(0 | 1)) && b.len() >= 9 && is_wkb_bytes(b)
+    }
+
+    /// Hex-encoded GeoPackage geometry; see `is_gpkg_blob`.
+    pub fn is_gpkg_hex(s: &str) -> bool {
+        let t = s
+            .strip_prefix("\\x")
+            .or_else(|| s.strip_prefix("0x"))
+            .unwrap_or(s);
+        if !t.starts_with("4750") {
+            return false;
+        }
+        unhex(s).is_some_and(|b| is_gpkg_blob(&b))
+    }
+
+    /// A GeoPackage geometry blob (`GP`, version, flags, SRS id, an
+    /// envelope sized by the flags, then WKB), per OGC 12-128r18 section
+    /// 2.1.3.
+    pub fn is_gpkg_blob(b: &[u8]) -> bool {
+        if b.len() < 8 || !b.starts_with(b"GP") || b[2] != 0 {
+            return false;
+        }
+        let flags = b[3];
+        // Bits 6-7 are reserved and must be zero; bit 5 marks an extended
+        // (non-standard) geometry type.
+        if flags & 0xC0 != 0 || flags & 0x20 != 0 {
+            return false;
+        }
+        let envelope = match (flags >> 1) & 7 {
+            0 => 0,
+            1 => 32,
+            2 | 3 => 48,
+            4 => 64,
+            _ => return false,
+        };
+        let start = 8 + envelope;
+        b.len() > start && is_wkb_bytes(&b[start..])
+    }
+}
+
+/// A Well-Known Text geometry, PostGIS EWKT included - see
+/// `geometry_support` for the grammar.
+fn is_wkt_geometry(s: &str) -> bool {
+    geometry_support::is_wkt(s)
 }
 
 /// A "lat,lon" single-cell coordinate pair. Deliberately the most
@@ -7017,6 +7459,8 @@ struct IdealTypeAccumulator {
     jwt_ok: bool,
     embedded_json_ok: bool,
     wkt_ok: bool,
+    wkb_ok: bool,
+    gpkg_ok: bool,
     lat_lon_ok: bool,
     cron_ok: bool,
 
@@ -7079,6 +7523,8 @@ impl IdealTypeAccumulator {
             jwt_ok: true,
             embedded_json_ok: true,
             wkt_ok: true,
+            wkb_ok: true,
+            gpkg_ok: true,
             lat_lon_ok: true,
             cron_ok: true,
 
@@ -7176,6 +7622,12 @@ impl IdealTypeAccumulator {
         }
         if self.wkt_ok {
             self.wkt_ok = is_wkt_geometry(v);
+        }
+        if self.wkb_ok {
+            self.wkb_ok = geometry_support::is_wkb_hex(v);
+        }
+        if self.gpkg_ok {
+            self.gpkg_ok = geometry_support::is_gpkg_hex(v);
         }
         if self.lat_lon_ok {
             self.lat_lon_ok = is_lat_lon_pair(v);
@@ -7398,6 +7850,20 @@ impl IdealTypeAccumulator {
             return (
                 "WKT Geometry".to_string(),
                 "matches Well-Known Text geometry format".to_string(),
+            );
+        }
+        if self.wkb_ok {
+            return (
+                "WKB Geometry".to_string(),
+                "hex-encoded Well-Known Binary (or PostGIS EWKB) - every value is exactly one well-formed geometry"
+                    .to_string(),
+            );
+        }
+        if self.gpkg_ok {
+            return (
+                "GeoPackage Geometry".to_string(),
+                "hex-encoded GeoPackage geometry blob (GP header, optional envelope, WKB)"
+                    .to_string(),
             );
         }
         if self.lat_lon_ok {
@@ -56264,13 +56730,8 @@ mod geojson_support {
     /// Coordinate order is passed through unchanged (GeoJSON's own
     /// `[longitude, latitude]` order is already WKT's own `(x y)` order -
     /// no reordering is ever needed). `GeometryCollection` is rendered
-    /// too, even though this project's own `is_wkt_geometry` heuristic
-    /// deliberately never recognizes it as WKT (its body legitimately
-    /// nests other geometry keywords, not just coordinate characters -
-    /// see that check's own doc comment) - the text is still correct and
-    /// informative, it just falls back to a plain `String` ideal_type
-    /// rather than `WKT Geometry`, the same disclosed boundary that
-    /// heuristic already documents for hand-authored WKT text.
+    /// too; `is_wkt_geometry` reads the recursive collection grammar, so
+    /// the text is typed `WKT Geometry` like any other geometry.
     fn geometry_to_wkt(v: &JsonValue, depth: u32) -> Result<String> {
         if depth > MAX_GEOMETRY_DEPTH {
             bail!("GeoJSON geometry nested past {MAX_GEOMETRY_DEPTH} levels");
@@ -72927,7 +73388,94 @@ mod sqlite_support {
         Integer(i64),
         Real(f64),
         Text(String),
-        Blob(usize), // length only - all this reader ever renders is "<blob: N bytes>"
+        /// The length (all this reader ever renders is `<blob: N bytes>`) and
+        /// what the bytes are, worked out while they were still in hand.
+        Blob(usize, BlobKind),
+    }
+
+    /// What a BLOB's own bytes say it is, by a magic number or - for
+    /// geometry - by parsing the whole blob. Decided per value as it is
+    /// decoded, because the reader keeps only the length.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlobKind {
+        Other,
+        GeoPackage,
+        Wkb,
+        Png,
+        Jpeg,
+        Gif,
+        Webp,
+    }
+
+    impl BlobKind {
+        fn classify(b: &[u8]) -> BlobKind {
+            if b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+                BlobKind::Png
+            } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                BlobKind::Jpeg
+            } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+                BlobKind::Gif
+            } else if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+                BlobKind::Webp
+            } else if geometry_support::is_gpkg_blob(b) {
+                BlobKind::GeoPackage
+            } else if geometry_support::is_wkb_blob(b) {
+                BlobKind::Wkb
+            } else {
+                BlobKind::Other
+            }
+        }
+
+        /// The `ideal_type` for a column in which every value is this kind.
+        fn ideal_type(self) -> Option<&'static str> {
+            match self {
+                BlobKind::Other => None,
+                BlobKind::GeoPackage => Some("GeoPackage Geometry"),
+                BlobKind::Wkb => Some("WKB Geometry"),
+                BlobKind::Png => Some("PNG Image"),
+                BlobKind::Jpeg => Some("JPEG Image"),
+                BlobKind::Gif => Some("GIF Image"),
+                BlobKind::Webp => Some("WebP Image"),
+            }
+        }
+    }
+
+    /// Tracks whether every non-null value of a column is the same
+    /// `BlobKind` - one different value (or one non-blob) and it isn't.
+    #[derive(Clone, Copy)]
+    struct BlobColumn {
+        kind: Option<BlobKind>,
+        uniform: bool,
+        /// Whether every non-null value so far was a blob, and there was one.
+        only_blobs: bool,
+    }
+
+    impl BlobColumn {
+        const NEW: BlobColumn = BlobColumn {
+            kind: None,
+            uniform: true,
+            only_blobs: true,
+        };
+
+        fn note(&mut self, value: &Value) {
+            let this = match value {
+                Value::Null => return,
+                Value::Blob(_, kind) => Some(*kind),
+                _ => {
+                    self.only_blobs = false;
+                    None
+                }
+            };
+            match (self.kind, this) {
+                (None, Some(k)) if self.uniform => self.kind = Some(k),
+                (Some(a), Some(b)) if a == b => {}
+                _ => self.uniform = false,
+            }
+        }
+
+        fn kind(&self) -> Option<BlobKind> {
+            self.kind.filter(|_| self.uniform)
+        }
     }
 
     fn value_to_string(value: &Value, kind_counts: &mut SqlKindCounts) -> Option<String> {
@@ -72945,7 +73493,7 @@ mod sqlite_support {
                 kind_counts.increment(SqlKind::Text);
                 Some(s.clone())
             }
-            Value::Blob(len) => {
+            Value::Blob(len, _) => {
                 kind_counts.increment(SqlKind::Blob);
                 Some(format!("<blob: {len} bytes>"))
             }
@@ -73650,7 +74198,11 @@ mod sqlite_support {
             n if n >= 12 => {
                 if n % 2 == 0 {
                     let len = ((n - 12) / 2) as usize;
-                    (Value::Blob(len), len)
+                    let kind = off
+                        .checked_add(len)
+                        .and_then(|end| payload.get(off..end))
+                        .map_or(BlobKind::Other, BlobKind::classify);
+                    (Value::Blob(len, kind), len)
                 } else {
                     let len = ((n - 13) / 2) as usize;
                     let end = off
@@ -74470,6 +75022,7 @@ mod sqlite_support {
         let n_cols = parsed.columns.len();
         let mut raw: Vec<Vec<Option<String>>> = vec![Vec::new(); n_cols];
         let mut kind_counts: Vec<SqlKindCounts> = vec![SqlKindCounts::default(); n_cols];
+        let mut blob_columns = vec![BlobColumn::NEW; n_cols];
 
         // Decodes and folds each row straight into the per-column
         // accumulators as the b-tree walk visits it, rather than
@@ -74480,6 +75033,7 @@ mod sqlite_support {
         let mut on_row = |rowid: i64, payload: Vec<u8>| -> Result<()> {
             let values = table_row_values(&parsed, rowid, &payload)?;
             for (i, value) in values.into_iter().enumerate() {
+                blob_columns[i].note(&value);
                 raw[i].push(value_to_string(&value, &mut kind_counts[i]));
             }
             Ok(())
@@ -74503,7 +75057,41 @@ mod sqlite_support {
                 total,
                 skip_heuristics: false,
             };
-            profiles.push(profile_column(col, n_samples));
+            let mut profile = profile_column(col, n_samples);
+            // A blob column's values print as `<blob: N bytes>`, so what they
+            // are can only come from the bytes - and the printed text is
+            // useless to the heuristics (same-length blobs look like one
+            // repeated value, a "constant column").
+            let blobs = blob_columns[i];
+            if blobs.only_blobs && blobs.kind.is_some() {
+                let (ideal, note) = match blobs.kind().and_then(|k| Some((k, k.ideal_type()?))) {
+                    Some((kind, ideal)) => {
+                        let how = match kind {
+                            BlobKind::GeoPackage | BlobKind::Wkb => {
+                                "parsing the whole blob as one geometry"
+                            }
+                            _ => "its magic number",
+                        };
+                        (
+                            ideal,
+                            format!(
+                                "every value is a {ideal} (read from {how}); shown as <blob: N bytes>"
+                            ),
+                        )
+                    }
+                    None => (
+                        "Binary",
+                        "binary data (BLOB); shown as <blob: N bytes>".to_string(),
+                    ),
+                };
+                profile.ideal_type = ideal.to_string();
+                profile.notes = if profile.missing_pct > 0.0 {
+                    format!("has missing values -> wrap in Option<T> / handle nulls; {note}")
+                } else {
+                    note
+                };
+            }
+            profiles.push(profile);
         }
         Ok(profiles)
     }
@@ -77069,6 +77657,8 @@ impl JoinBase {
                 s.as_str(),
                 "Geographic Coordinates"
                     | "WKT Geometry"
+                    | "WKB Geometry"
+                    | "GeoPackage Geometry"
                     | "Cron Expression"
                     | "Hex Color"
                     | "SemVer"
@@ -77105,6 +77695,8 @@ fn join_base(ideal_type: &str) -> Option<JoinBase> {
         | "VIN"
         | "CIDR"
         | "WKT Geometry"
+        | "WKB Geometry"
+        | "GeoPackage Geometry"
         | "Cron Expression" => Some(JoinBase::OtherSemantic(ideal_type.to_string())),
         _ => {
             let t = ideal_type.trim();
@@ -79409,6 +80001,8 @@ fn json_schema_scalar_type(ideal_type: &str) -> Option<(&'static str, Option<&'s
         | "CIDR"
         | "ULID"
         | "WKT Geometry"
+        | "WKB Geometry"
+        | "GeoPackage Geometry"
         | "Cron Expression" => Some(("string", None)),
         name if id_checksum_support::sql_type_of(name).is_some() => Some(("string", None)),
         _ => None,
@@ -109810,11 +110404,11 @@ mod tests {
         assert!(!is_wkt_geometry("POINT30 10")); // missing parens entirely
         assert!(!is_wkt_geometry("POINT(30 10")); // unterminated - missing ')'
         assert!(!is_wkt_geometry("POINT(30 abc)")); // letters aren't valid coordinate content
-        // Deliberately out of scope: GEOMETRYCOLLECTION nests other
-        // geometry keywords, which this structural (non-recursive) check
-        // can't validate - found empirically, not just reasoned about (see
-        // WKT_KEYWORDS's own comment).
-        assert!(!is_wkt_geometry("GEOMETRYCOLLECTION(POINT(4 6))"));
+        // A collection nests other geometries, so it needs the recursive
+        // grammar the old character check couldn't give it.
+        assert!(is_wkt_geometry("GEOMETRYCOLLECTION(POINT(4 6))"));
+        assert!(!is_wkt_geometry("GEOMETRYCOLLECTION(POINT(4 6)"));
+        assert!(!is_wkt_geometry("GEOMETRYCOLLECTION(CIRCLE(4 6))"));
     }
 
     #[test]
@@ -117091,6 +117685,78 @@ mod id_checksum_tests {
             for check in &all {
                 let _ = check(s);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::geometry_support::*;
+
+    /// `tests/fixtures/geometry_vectors.tsv`: `kind<TAB>value<TAB>0|1`.
+    ///
+    /// The verdicts come from GEOS (shapely): a WKT counts when GEOS parses
+    /// it, a WKB or GeoPackage blob when GEOS reads it and writes back the
+    /// same bytes. They cover generated geometries in every form (both byte
+    /// orders, EWKB and ISO flavors, Z, empty, collections, `SRID=`, and
+    /// `\x`/`0x` prefixes) and single-edit tampers of them. The six
+    /// `gpkg_real` lines are blobs GDAL wrote into a GeoPackage.
+    #[test]
+    fn verdicts_match_geos_and_gdal() {
+        let vectors = include_str!("../tests/fixtures/geometry_vectors.tsv");
+        let mut bad = Vec::new();
+        let mut n = 0;
+        let mut positives = 0;
+        for line in vectors.lines() {
+            let mut p = line.splitn(3, '\t');
+            let (Some(kind), Some(value), Some(expected)) = (p.next(), p.next(), p.next()) else {
+                panic!("malformed vector {line:?}");
+            };
+            let got = match kind {
+                "wkt" => is_wkt(value),
+                "wkb" => is_wkb_hex(value),
+                "gpkg" | "gpkg_real" => is_gpkg_hex(value),
+                other => panic!("unknown kind {other}"),
+            };
+            n += 1;
+            positives += usize::from(expected == "1");
+            if got != (expected == "1") {
+                bad.push(format!("{kind} expected {expected}: {value}"));
+            }
+        }
+        assert!(
+            n > 8000 && positives > 5000 && n - positives > 2000,
+            "{n} {positives}"
+        );
+        assert!(
+            bad.is_empty(),
+            "{} of {n} differ, e.g.\n{}",
+            bad.len(),
+            bad.iter().take(25).cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn hostile_input_never_panics() {
+        for s in [
+            "",
+            "SRID=",
+            "SRID=\u{e9};POINT(1 2)",
+            "POINT(\u{e9})",
+            "\\x",
+            "0x",
+            "\\x0101",
+            "01070000000500000001",
+            &"(".repeat(500),
+            &format!("GEOMETRYCOLLECTION({}", "GEOMETRYCOLLECTION(".repeat(50)),
+            &format!("0107000000{}", "ffffffff".repeat(30)),
+            &"01".repeat(300),
+            "4750000000000000",
+            "\u{1F4A5}\u{1F4A5}\u{1F4A5}\u{1F4A5}\u{1F4A5}",
+        ] {
+            let _ = is_wkt(s);
+            let _ = is_wkb_hex(s);
+            let _ = is_gpkg_hex(s);
         }
     }
 }
