@@ -1,0 +1,55 @@
+From a@example.com Mon Jan 15 10:00:00 2024
+Content-Type: text/plain; charset="gb2312"
+MIME-Version: 1.0
+Content-Transfer-Encoding: base64
+From: a@example.com
+To: b@example.com
+Date: Mon, 15 Jan 2024 10:00:00 +0000
+Subject: =?gb2312?b?xOO6w6OsysC95w==?=
+
+1eLKx9K7t+Ky4srU08q8/qGjCg==
+
+From a@example.com Mon Jan 15 10:00:00 2024
+Content-Type: text/plain; charset="iso-2022-jp"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+From: a@example.com
+To: b@example.com
+Date: Mon, 15 Jan 2024 10:00:00 +0000
+Subject: =?iso-2022-jp?b?GyRCRnxLXDhsJE43b0w+GyhC?=
+
+こんにちは、世界。
+
+From a@example.com Mon Jan 15 10:00:00 2024
+Content-Type: text/plain; charset="euc-kr"
+MIME-Version: 1.0
+Content-Transfer-Encoding: base64
+From: a@example.com
+To: b@example.com
+Date: Mon, 15 Jan 2024 10:00:00 +0000
+Subject: =?euc-kr?b?x9Gxub7uIMGmuPE=?=
+
+vsiz58fPvLy/5CC8vLDoCg==
+
+From a@example.com Mon Jan 15 10:00:00 2024
+Content-Type: text/plain; charset="big5"
+MIME-Version: 1.0
+Content-Transfer-Encoding: base64
+From: a@example.com
+To: b@example.com
+Date: Mon, 15 Jan 2024 10:00:00 +0000
+Subject: =?big5?b?wWPF6aSkpOW80MNE?=
+
+p0GmbqFBpUCsyaFDs2+sT7T6uNWhQwo=
+
+From a@example.com Mon Jan 15 10:00:00 2024
+From: a@example.com
+To: b@example.com
+Date: Mon, 15 Jan 2024 10:00:00 +0000
+Subject: =?Shift_JIS?B?k4yLnoLMk1aLQw==?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset="Shift_JIS"
+Content-Transfer-Encoding: base64
+
+jaGT+oLNkLCC6oLFgreBQsrbsAo=
+

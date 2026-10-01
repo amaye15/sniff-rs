@@ -6997,10 +6997,18 @@ fn dbase_decodes_text_through_its_marked_code_page() {
     assert!(!table(&doc, "edge_dbase_cp1252_marked_ascii").is_empty());
 }
 
-// The double-byte East Asian code pages stay a disclosed error.
-#[cfg(feature = "dbase")]
+// A double-byte East Asian code page (0x7B is Shift-JIS) reads with
+// `--features cjk`, and is a disclosed error naming the feature without it.
+#[cfg(all(feature = "dbase", feature = "cjk"))]
 #[test]
-fn dbase_double_byte_code_page_is_a_clear_disclosed_error() {
+fn dbase_double_byte_code_page_reads_with_the_cjk_feature() {
+    let doc = run_json("malformed_dbase_double_byte_codepage.dbf", &[]);
+    assert!(!table(&doc, "malformed_dbase_double_byte_codepage").is_empty());
+}
+
+#[cfg(all(feature = "dbase", not(feature = "cjk")))]
+#[test]
+fn dbase_double_byte_code_page_without_cjk_names_the_feature() {
     let output = Command::new(bin())
         .args([
             fixture("malformed_dbase_double_byte_codepage.dbf")
@@ -7012,10 +7020,7 @@ fn dbase_double_byte_code_page_is_a_clear_disclosed_error() {
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("0x7b") && stderr.contains("double-byte"),
-        "got: {stderr}"
-    );
+    assert!(stderr.contains("--features cjk"), "got: {stderr}");
 }
 
 // A memo field whose .dbt/.fpt file is missing is a clear error naming
@@ -11395,7 +11400,12 @@ fn diff_compares_two_directories_and_a_directory_against_a_combine_dictionary() 
     // The same old snapshot saved as a --combine dictionary diffs identically.
     let saved = dir.path().join("old.json");
     let status = std::process::Command::new(bin())
-        .args([old.to_str().unwrap(), "--combine", "--output-format", "json"])
+        .args([
+            old.to_str().unwrap(),
+            "--combine",
+            "--output-format",
+            "json",
+        ])
         .arg(&saved)
         .stderr(std::process::Stdio::null())
         .status()
@@ -16014,6 +16024,135 @@ fn single_byte_encodings_decode_through_the_code_page_tables() {
         sample_names(&doc, "edge_encoding_cp866", "word"),
         ["Привет", "мир"]
     );
+}
+
+// Expected text from Python's own codecs (the files were written with them
+// and round-trip there); the decoder itself is differentially tested
+// against encoding_rs in `cjk_support`.
+#[cfg(feature = "cjk")]
+#[test]
+fn east_asian_encodings_decode_with_the_encoding_flag() {
+    let cases: [(&str, &str, &str, [&str; 3], [&str; 3]); 6] = [
+        (
+            "shift_jis",
+            "shift_jis",
+            "edge_encoding_shift_jis",
+            ["山田太郎", "ﾖｼﾀﾞ", "佐藤花子"],
+            ["東京", "大阪", "①京都"],
+        ),
+        (
+            "euc_jp",
+            "euc-jp",
+            "edge_encoding_euc_jp",
+            ["山田太郎", "ﾖｼﾀﾞ", "佐藤花子"],
+            ["東京", "大阪", "京都"],
+        ),
+        (
+            "euc_kr",
+            "cp949",
+            "edge_encoding_euc_kr",
+            ["김철수", "이영희", "박민수"],
+            ["서울", "부산", "똠방각하"],
+        ),
+        (
+            "gbk",
+            "gb2312",
+            "edge_encoding_gbk",
+            ["张伟", "王芳", "李娜"],
+            ["北京", "上海", "广州"],
+        ),
+        (
+            "gb18030",
+            "gb18030",
+            "edge_encoding_gb18030",
+            ["张伟", "𠀀𠀁", "€"],
+            ["北京", "上海", "😀"],
+        ),
+        (
+            "big5",
+            "big5",
+            "edge_encoding_big5",
+            ["陳大文", "林小明", "黃美玲"],
+            ["台北", "高雄", "台中"],
+        ),
+    ];
+    for (file, label, tbl, names, cities) in cases {
+        let doc = run_json(&format!("edge_encoding_{file}.csv"), &["--encoding", label]);
+        assert_eq!(sample_names(&doc, tbl, "name"), names, "{label}");
+        assert_eq!(sample_names(&doc, tbl, "city"), cities, "{label}");
+    }
+    // Without the flag these aren't UTF-8, and the error says what to do.
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_encoding_shift_jis.csv").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("shift_jis"));
+}
+
+#[cfg(all(feature = "cjk", feature = "dbase"))]
+#[test]
+fn dbase_decodes_the_east_asian_code_pages() {
+    for (file, names) in [
+        ("cp932", ["山田太郎", "ﾖｼﾀﾞ"]),
+        ("cp936", ["张伟", "王芳"]),
+        ("cp949", ["김철수", "이영희"]),
+        ("cp950", ["陳大文", "林小明"]),
+    ] {
+        let doc = run_json(&format!("edge_dbase_{file}.dbf"), &[]);
+        assert_eq!(
+            sample_names(&doc, &format!("edge_dbase_{file}"), "NAME"),
+            names,
+            "{file}"
+        );
+    }
+}
+
+#[cfg(all(feature = "cjk", feature = "mbox"))]
+#[test]
+fn mbox_decodes_east_asian_charsets_in_headers_and_bodies() {
+    let doc = run_json("edge_mbox_cjk_charsets.mbox", &["--samples", "5"]);
+    let tbl = "edge_mbox_cjk_charsets";
+    // gb2312, iso-2022-jp, euc-kr, big5, and a Shift_JIS message.
+    assert_eq!(
+        sample_names(&doc, tbl, "Subject"),
+        [
+            "你好，世界",
+            "日本語の件名",
+            "한국어 제목",
+            "繁體中文標題",
+            "東京の天気"
+        ]
+    );
+    assert_eq!(
+        sample_names(&doc, tbl, "body"),
+        [
+            "这是一封测试邮件。\n",
+            "こんにちは、世界。\n",
+            "안녕하세요 세계\n",
+            "你好，世界。這是測試。\n",
+            "今日は晴れです。ﾊﾛｰ\n"
+        ]
+    );
+}
+
+#[cfg(not(feature = "cjk"))]
+#[test]
+fn east_asian_encoding_without_the_cjk_feature_names_it() {
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_encoding_shift_jis.csv").to_str().unwrap(),
+            "-",
+            "--encoding",
+            "shift_jis",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--features cjk"));
 }
 
 #[test]

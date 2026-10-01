@@ -3512,10 +3512,11 @@ OPTIONS:
         --encoding <NAME>       Source text encoding for a text format (csv, json,
                                 xml, yaml, ...): utf-8, utf-16le/-be, utf-32le/-be, or
                                 a single-byte code page (windows-1252, latin1,
-                                iso-8859-15, cp437, cp866, koi8-r, macintosh, ...).
+                                iso-8859-15, cp437, cp866, koi8-r, macintosh, ...),
+                                or an East Asian one (shift_jis, euc-jp, iso-2022-jp,
+                                euc-kr, gbk, gb18030, big5).
                                 Without it a UTF-8/UTF-16/UTF-32 byte-order mark
                                 decides and everything else is read as UTF-8.
-                                Shift-JIS, GBK, Big5 and EUC-* aren't supported.
         --delimiter <CHAR>      Override the field delimiter for csv/tsv (single character)
         --skip-rows <N>         Skip N leading rows before the header (csv/tsv only)
         --widths <N,N,...>      Column widths for --format fixed-width, comma-separated -
@@ -10706,6 +10707,8 @@ mod dbase_support {
         StrictUtf8,
         LossyUtf8,
         CodePage(&'static [u16; 256]),
+        #[cfg(feature = "cjk")]
+        Cjk(CjkEncoding),
     }
 
     /// How a dBase file's text fields decode, from its header's code page
@@ -10720,9 +10723,9 @@ mod dbase_support {
     /// default build - this project's oracle - refuses every named code
     /// page; its optional `yore` feature decodes the same single-byte set
     /// decoded here.) The four double-byte East Asian code pages (932,
-    /// 936, 949, 950) and the two Eastern European DOS code pages with no
-    /// public mapping table (895 Kamenicky, 620 Mazovia) stay disclosed
-    /// errors.
+    /// 936, 949, 950) decode through `cjk_support` (`--features cjk`); the
+    /// two Eastern European DOS code pages with no public mapping table
+    /// (895 Kamenicky, 620 Mazovia) stay disclosed errors.
     fn resolve_text_mode(code_page_mark: u8) -> Result<TextMode> {
         let name = match code_page_mark {
             0xf0 => return Ok(TextMode::StrictUtf8),
@@ -10750,9 +10753,20 @@ mod dbase_support {
             0xCA => "WINDOWS-1254",
             0xCB => "WINDOWS-1253",
             0xCC => "WINDOWS-1257",
-            0x13 | 0x7B | 0x4D | 0x7A | 0x4E | 0x79 | 0x4F | 0x78 => bail!(
-                "dBase code page marker {code_page_mark:#04x} names a double-byte East Asian code page (932/936/949/950), which this reader doesn't decode"
-            ),
+            // The four double-byte East Asian code pages: 932 (Shift-JIS),
+            // 936 (GBK), 949 (Korean, the EUC-KR superset) and 950 (Big5).
+            0x13 | 0x7B | 0x4D | 0x7A | 0x4E | 0x79 | 0x4F | 0x78 => {
+                let enc = match code_page_mark {
+                    0x13 | 0x7B => CjkEncoding::ShiftJis,
+                    0x4D | 0x7A => CjkEncoding::Gb18030,
+                    0x4E | 0x79 => CjkEncoding::EucKr,
+                    _ => CjkEncoding::Big5,
+                };
+                #[cfg(feature = "cjk")]
+                return Ok(TextMode::Cjk(enc));
+                #[cfg(not(feature = "cjk"))]
+                return Err(cjk_not_compiled_in(enc));
+            }
             0x68 | 0x69 => bail!(
                 "dBase code page marker {code_page_mark:#04x} names code page {} (no public mapping table), which this reader doesn't decode",
                 if code_page_mark == 0x68 {
@@ -10775,6 +10789,8 @@ mod dbase_support {
                 .context("dBase field content is not valid UTF-8"),
             TextMode::LossyUtf8 => Ok(String::from_utf8_lossy(bytes).into_owned()),
             TextMode::CodePage(table) => Ok(codepage_support::decode(table, bytes)),
+            #[cfg(feature = "cjk")]
+            TextMode::Cjk(enc) => Ok(cjk_support::decode(enc, bytes)),
         }
     }
 
@@ -13978,6 +13994,31 @@ mod sas7bdat_support {
         MAP.iter().find(|&&(c, _)| c == code).map(|&(_, n)| n)
     }
 
+    #[cfg(all(test, feature = "cjk"))]
+    mod cjk_tests {
+        use super::*;
+
+        /// SAS names its East Asian encodings (134 is EUC-JP, 123 BIG-5);
+        /// a column of padded values decodes as that encoding.
+        #[test]
+        fn east_asian_encoding_codes_resolve_to_decoders() {
+            let path = Path::new("x.sas7bdat");
+            let euc = resolve_text_decoder(134, path).unwrap();
+            assert_eq!(
+                decode_text(b"\xc6\xfc\xcb\xdc\xb8\xec  \0", euc).as_deref(),
+                Some("日本語")
+            );
+            let big5 = resolve_text_decoder(123, path).unwrap();
+            assert_eq!(
+                decode_text(b"\xa4\xa4\xa4\xe5 ", big5).as_deref(),
+                Some("中文")
+            );
+            // The stateful ISO-2022 pages SAS lists for Korean/Chinese have no
+            // WHATWG decoder and stay a disclosed refusal.
+            assert!(resolve_text_decoder(168, path).is_err());
+        }
+    }
+
     const WINDOWS_1252_HIGH: [u16; 128] = [
         0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
         0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
@@ -14012,6 +14053,8 @@ mod sas7bdat_support {
         Utf8,
         Windows1252,
         CodePage(&'static [u16; 256]),
+        #[cfg(feature = "cjk")]
+        Cjk(CjkEncoding),
     }
 
     /// `resolve_encoding` in the reference crate delegates label
@@ -14041,8 +14084,22 @@ mod sas7bdat_support {
             Some(name) if sas_single_byte_table(name).is_some() => {
                 Ok(TextDecoder::CodePage(sas_single_byte_table(name).unwrap()))
             }
+            // The East Asian encodings SAS names that have a WHATWG
+            // decoder: Shift-JIS (CP932), EUC-JP, EUC-KR, CP949, CP950,
+            // BIG-5, GB18030, WINDOWS-936.
+            Some(name)
+                if cjk_encoding_from_label(&name.to_ascii_lowercase().replace('_', "-"))
+                    .is_some() =>
+            {
+                let enc =
+                    cjk_encoding_from_label(&name.to_ascii_lowercase().replace('_', "-")).unwrap();
+                #[cfg(feature = "cjk")]
+                return Ok(TextDecoder::Cjk(enc));
+                #[cfg(not(feature = "cjk"))]
+                return Err(cjk_not_compiled_in(enc));
+            }
             Some(other) => bail!(
-                "{path:?} uses SAS7BDAT text encoding {other:?}, which isn't supported by this reader (multi-byte East Asian encodings and a few rare single-byte ones aren't)"
+                "{path:?} uses SAS7BDAT text encoding {other:?}, which isn't supported by this reader (the stateful ISO-2022 encodings, EUC-TW, CP942/CP1381/Shift_JISX0213, and a few rare single-byte ones aren't)"
             ),
             None => {
                 bail!("{path:?} uses an unrecognized SAS7BDAT text encoding code {encoding_code}")
@@ -14076,6 +14133,8 @@ mod sas7bdat_support {
             TextDecoder::Utf8 => String::from_utf8_lossy(trimmed).into_owned(),
             TextDecoder::Windows1252 => decode_windows_1252(trimmed),
             TextDecoder::CodePage(table) => codepage_support::decode(table, trimmed),
+            #[cfg(feature = "cjk")]
+            TextDecoder::Cjk(enc) => cjk_support::decode(enc, trimmed),
         };
         let decoded = decoded.trim();
         if decoded.is_empty() {
@@ -50015,19 +50074,17 @@ mod yaml_support {
         }
         // An anchor alone on its line names the block node on the lines
         // below it (`&root` then a mapping) - at this level or deeper.
-        if let Some(name) = anchor_name(content) {
-            if strip_anchor_prefix(content).0.is_empty() {
-                *pos += 1;
-                skip_blank_and_comment_lines(lines, pos);
-                let value = match lines.get(*pos).map(|l| l.indent) {
-                    Some(next) if next >= indent => {
-                        parse_block_node(lines, pos, next, parent_indent)?
-                    }
-                    _ => JsonValue::Null,
-                };
-                record_anchor(Some(name), &value);
-                return Ok(value);
-            }
+        if let Some(name) = anchor_name(content)
+            && strip_anchor_prefix(content).0.is_empty()
+        {
+            *pos += 1;
+            skip_blank_and_comment_lines(lines, pos);
+            let value = match lines.get(*pos).map(|l| l.indent) {
+                Some(next) if next >= indent => parse_block_node(lines, pos, next, parent_indent)?,
+                _ => JsonValue::Null,
+            };
+            record_anchor(Some(name), &value);
+            return Ok(value);
         }
         if is_sequence_item_line(content) {
             parse_block_sequence(lines, pos, indent)
@@ -67735,6 +67792,10 @@ mod mbox_support {
             } else {
                 key.to_string()
             };
+            #[cfg(feature = "cjk")]
+            if let Some(enc) = cjk_encoding_from_label(&key.to_ascii_lowercase()) {
+                return cjk_support::decode(enc, bytes);
+            }
             match codepage_support::table(&key) {
                 Some(t) => codepage_support::decode(t, bytes),
                 None => String::from_utf8_lossy(bytes).into_owned(),
@@ -84041,10 +84102,29 @@ mod xlsx_support {
     struct XlsText {
         biff: u8,
         table: Option<&'static [u16; 256]>,
+        /// The East Asian code page (932/936/949/950) the BIFF3-5 strings
+        /// are in, when the CODEPAGE record names one (`--features cjk`).
+        #[cfg_attr(not(feature = "cjk"), allow(dead_code))]
+        cjk: Option<CjkEncoding>,
+    }
+
+    /// An East Asian CODEPAGE value as the encoding that decodes it.
+    fn xls_codepage_cjk(cp: Option<u16>) -> Option<CjkEncoding> {
+        match cp? {
+            932 => Some(CjkEncoding::ShiftJis),
+            936 => Some(CjkEncoding::Gb18030),
+            949 => Some(CjkEncoding::EucKr),
+            950 => Some(CjkEncoding::Big5),
+            _ => None,
+        }
     }
 
     impl XlsText {
         fn decode(&self, bytes: &[u8]) -> String {
+            #[cfg(feature = "cjk")]
+            if let Some(enc) = self.cjk {
+                return cjk_support::decode(enc, bytes);
+            }
             match self.table {
                 Some(t) => codepage_support::decode(t, bytes),
                 None => bytes.iter().map(|&b| b as char).collect(),
@@ -84070,10 +84150,38 @@ mod xlsx_support {
         }
     }
 
+    #[cfg(all(test, feature = "cjk"))]
+    mod xls_cjk_tests {
+        use super::*;
+
+        /// BIFF3-5 strings are bytes in the file's CODEPAGE; the East Asian
+        /// ones (no writer here produces them, so the bytes are Python's
+        /// `'日本語'.encode('cp932')` and friends) decode as that page.
+        #[test]
+        fn biff5_strings_in_an_east_asian_code_page_decode() {
+            for (cp, bytes, want) in [
+                (932u16, &b"\x93\xfa\x96\x7b\x8c\xea"[..], "日本語"),
+                (936, b"\xd6\xd0\xce\xc4", "中文"),
+                (949, b"\xc7\xd1\xb1\xdb", "한글"),
+                (950, b"\xa4\xa4\xa4\xe5", "中文"),
+            ] {
+                let text = XlsText {
+                    biff: 5,
+                    table: Some(xls_codepage_table(cp)),
+                    cjk: xls_codepage_cjk(Some(cp)),
+                };
+                assert_eq!(text.decode(bytes), want, "code page {cp}");
+            }
+            assert_eq!(xls_codepage_cjk(Some(1252)), None);
+            assert_eq!(xls_codepage_cjk(None), None);
+        }
+    }
+
     /// A CODEPAGE record's value as a single-byte table: Windows code
     /// pages by number, the DOS ones, and Excel's own aliases (32768 is
     /// Mac Roman, 32769 Windows-1252, per xlrd's and OpenOffice's maps).
-    /// 367 (ASCII) and anything unknown fall back to Windows-1252.
+    /// 367 (ASCII) and anything unknown fall back to Windows-1252; the East
+    /// Asian pages (932/936/949/950) are `xls_codepage_cjk`'s.
     fn xls_codepage_table(cp: u16) -> &'static [u16; 256] {
         let name = match cp {
             437 | 737 | 775 | 850 | 852 | 855 | 857 | 858 | 860 | 861 | 862 | 863 | 864 | 865
@@ -84125,6 +84233,7 @@ mod xlsx_support {
             let text = XlsText {
                 biff: biff.unwrap_or(8),
                 table: codepage.map(xls_codepage_table),
+                cjk: xls_codepage_cjk(codepage),
             };
             match r.typ {
                 // BOF [MS-XLS 2.4.21]: BIFF5/7/8 use 0x0809 with the
@@ -84239,6 +84348,11 @@ mod xlsx_support {
             text: XlsText {
                 biff,
                 table: (biff < 8).then(|| xls_codepage_table(codepage.unwrap_or(1252))),
+                cjk: if biff < 8 {
+                    xls_codepage_cjk(codepage)
+                } else {
+                    None
+                },
             },
         })
     }
@@ -88490,6 +88604,727 @@ mod xz_support {
     }
 }
 
+// --- East Asian encodings ---
+// Shift_JIS, EUC-JP, EUC-KR, GBK/GB18030 and Big5 decode exactly as the
+// WHATWG Encoding Standard defines them (the same decoders browsers use),
+// so `--encoding shift_jis` on a file means what a browser would make of
+// it. The state machines below follow the standard's pseudocode; the index
+// tables are generated by `tools/gen_cjk_tables` (it decodes every legal
+// byte sequence with `encoding_rs`) into `src/cjk/*.bin`, and the tests
+// check the whole decoder against `encoding_rs` - every two-, three- and
+// four-byte sequence, and random byte streams split at random points.
+
+/// The East Asian encodings this build can read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CjkEncoding {
+    ShiftJis,
+    EucJp,
+    EucKr,
+    /// GBK and GB18030 share one decoder in the standard (GBK is the
+    /// two-byte subset of GB18030, and every GBK file is a GB18030 file).
+    Gb18030,
+    Big5,
+    /// The stateful 7-bit encoding Japanese email uses (JIS X 0208 behind
+    /// escape sequences).
+    Iso2022Jp,
+}
+
+/// Resolves a label (already lowercased, `_` turned into `-`) to an East
+/// Asian encoding, using the WHATWG label set plus the Windows code page
+/// spellings (`cp932`, `cp936`, `cp949`, `cp950`).
+fn cjk_encoding_from_label(label: &str) -> Option<CjkEncoding> {
+    Some(match label {
+        "shift-jis" | "shiftjis" | "sjis" | "x-sjis" | "ms-kanji" | "ms932" | "ms-932"
+        | "windows-31j" | "csshiftjis" | "cp932" | "windows-932" => CjkEncoding::ShiftJis,
+        "euc-jp" | "eucjp" | "x-euc-jp" | "cseucpkdfmtjapanese" | "ujis" => CjkEncoding::EucJp,
+        "iso-2022-jp" | "csiso2022jp" | "iso2022jp" | "jis" => CjkEncoding::Iso2022Jp,
+        "euc-kr" | "euckr" | "cp949" | "windows-949" | "x-windows-949" | "uhc" | "korean"
+        | "ks-c-5601-1987" | "ks-c-5601-1989" | "ksc5601" | "ksc-5601" | "iso-ir-149"
+        | "csksc56011987" => CjkEncoding::EucKr,
+        "gbk" | "gb2312" | "gb-2312" | "gb-2312-80" | "gb18030" | "cp936" | "windows-936"
+        | "x-gbk" | "euc-cn" | "chinese" | "csgb2312" | "iso-ir-58" | "csiso58gb231280" => {
+            CjkEncoding::Gb18030
+        }
+        "big5" | "big-5" | "big5-hkscs" | "cn-big5" | "csbig5" | "x-x-big5" | "cp950"
+        | "windows-950" => CjkEncoding::Big5,
+        _ => return None,
+    })
+}
+
+/// The error for an East Asian encoding in a build without `--features cjk`.
+#[cfg(not(feature = "cjk"))]
+fn cjk_not_compiled_in(enc: CjkEncoding) -> Error {
+    anyhow!("{enc:?} (an East Asian encoding) isn't compiled in - rebuild with --features cjk")
+}
+
+#[cfg(feature = "cjk")]
+mod cjk_support {
+    use super::CjkEncoding;
+
+    static SJIS: &[u8] = include_bytes!("cjk/sjis.bin");
+    static EUCJP_0208: &[u8] = include_bytes!("cjk/eucjp0208.bin");
+    static EUCJP_0212: &[u8] = include_bytes!("cjk/eucjp0212.bin");
+    static EUCKR: &[u8] = include_bytes!("cjk/euckr.bin");
+    static GBK: &[u8] = include_bytes!("cjk/gbk.bin");
+    static BIG5: &[u8] = include_bytes!("cjk/big5.bin");
+    static GB18030_RUNS: &[u8] = include_bytes!("cjk/gb18030_runs.bin");
+
+    // Entry counts of the two-byte tables (rows x columns); the bytes after
+    // them are the "extras" - code points above U+FFFE and the two-character
+    // Big5 sequences, which don't fit a u16 entry.
+    const SJIS_ENTRIES: usize = 60 * 189;
+    const JIS_ENTRIES: usize = 94 * 94;
+    const EUCKR_ENTRIES: usize = 126 * 190;
+    const GBK_ENTRIES: usize = 126 * 191;
+    const BIG5_ENTRIES: usize = 126 * 191;
+
+    /// The characters (one or two code points) a table gives for an entry.
+    fn lookup(table: &'static [u8], entries: usize, idx: usize) -> Option<(u32, u32)> {
+        let v = u16::from_le_bytes([table[idx * 2], table[idx * 2 + 1]]);
+        match v {
+            0 => None,
+            0xFFFF => {
+                let extras = &table[entries * 2..];
+                let n = extras.len() / 12;
+                let (mut lo, mut hi) = (0usize, n);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let rec = &extras[mid * 12..mid * 12 + 12];
+                    let at = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+                    if at == idx {
+                        let a = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+                        let b = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                        return Some((a, b));
+                    }
+                    if at < idx {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                None
+            }
+            cp => Some((u32::from(cp), 0)),
+        }
+    }
+
+    /// GB18030's four-byte sequences: the code point for a pointer, from
+    /// the table of runs (consecutive pointers with consecutive code points).
+    fn gb18030_four_byte(pointer: u32) -> Option<u32> {
+        let n = GB18030_RUNS.len() / 12;
+        let field = |i: usize, k: usize| {
+            let o = i * 12 + k * 4;
+            u32::from_le_bytes([
+                GB18030_RUNS[o],
+                GB18030_RUNS[o + 1],
+                GB18030_RUNS[o + 2],
+                GB18030_RUNS[o + 3],
+            ])
+        };
+        // The last run starting at or before `pointer`.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if field(mid, 0) <= pointer {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let run = lo.checked_sub(1)?;
+        let offset = pointer - field(run, 0);
+        (offset < field(run, 2)).then(|| field(run, 1) + offset)
+    }
+
+    fn push_cp(out: &mut String, cp: u32) {
+        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+    }
+
+    fn push_pair(out: &mut String, (a, b): (u32, u32)) {
+        push_cp(out, a);
+        if b != 0 {
+            push_cp(out, b);
+        }
+    }
+
+    /// A streaming decoder: feed it bytes in any chunking, then `finish`.
+    /// Anything the standard calls an error becomes one U+FFFD, and a byte
+    /// the standard says to "restore" is read again afterwards.
+    pub(crate) struct Decoder {
+        enc: CjkEncoding,
+        /// A pending lead byte (GB18030's `first`).
+        lead: u8,
+        second: u8,
+        third: u8,
+        /// EUC-JP: the pending sequence began with 0x8F (JIS X 0212).
+        jis0212: bool,
+        /// ISO-2022-JP: the current state, the state escape sequences
+        /// return to after an error, and whether the last token was an
+        /// escape sequence (two in a row make the second an error).
+        iso_state: u8,
+        iso_output_state: u8,
+        iso_escaped: bool,
+    }
+
+    const ISO_ASCII: u8 = 0;
+    const ISO_ROMAN: u8 = 1;
+    const ISO_KATAKANA: u8 = 2;
+    const ISO_LEAD: u8 = 3;
+    const ISO_TRAIL: u8 = 4;
+    const ISO_ESC_START: u8 = 5;
+    const ISO_ESC: u8 = 6;
+
+    /// Bytes to read again before the next input byte.
+    type Restore = ([u8; 3], usize);
+    const NONE: Restore = ([0; 3], 0);
+
+    fn one(b: u8) -> Restore {
+        ([b, 0, 0], 1)
+    }
+
+    impl Decoder {
+        pub(crate) fn new(enc: CjkEncoding) -> Self {
+            Decoder {
+                enc,
+                lead: 0,
+                second: 0,
+                third: 0,
+                jis0212: false,
+                iso_state: ISO_ASCII,
+                iso_output_state: ISO_ASCII,
+                iso_escaped: false,
+            }
+        }
+
+        pub(crate) fn push(&mut self, bytes: &[u8], out: &mut String) {
+            for &b in bytes {
+                self.feed(b, out);
+            }
+        }
+
+        /// Ends the stream: a half-finished sequence is one error.
+        pub(crate) fn finish(&mut self, out: &mut String) {
+            if self.enc == CjkEncoding::Iso2022Jp {
+                match self.iso_state {
+                    ISO_TRAIL => out.push('\u{FFFD}'),
+                    ISO_ESC_START => out.push('\u{FFFD}'),
+                    ISO_ESC => {
+                        // The half-read escape sequence is an error, and its
+                        // first byte is then read again in the output state.
+                        out.push('\u{FFFD}');
+                        let lead = self.lead;
+                        self.lead = 0;
+                        self.iso_state = self.iso_output_state;
+                        self.feed(lead, out);
+                        self.finish(out);
+                    }
+                    _ => {}
+                }
+                self.iso_state = ISO_ASCII;
+                self.iso_output_state = ISO_ASCII;
+                self.iso_escaped = false;
+                self.lead = 0;
+                return;
+            }
+            if self.lead != 0 || self.second != 0 || self.third != 0 {
+                out.push('\u{FFFD}');
+            }
+            self.lead = 0;
+            self.second = 0;
+            self.third = 0;
+            self.jis0212 = false;
+        }
+
+        fn feed(&mut self, b: u8, out: &mut String) {
+            let (bytes, n) = match self.enc {
+                CjkEncoding::ShiftJis => self.shift_jis(b, out),
+                CjkEncoding::EucJp => self.euc_jp(b, out),
+                CjkEncoding::EucKr => self.euc_kr(b, out),
+                CjkEncoding::Gb18030 => self.gb18030(b, out),
+                CjkEncoding::Big5 => self.big5(b, out),
+                CjkEncoding::Iso2022Jp => self.iso_2022_jp(b, out),
+            };
+            for &again in &bytes[..n] {
+                self.feed(again, out);
+            }
+        }
+
+        fn shift_jis(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x40..=0xFC) {
+                    let row = if lead <= 0x9F {
+                        lead - 0x81
+                    } else {
+                        lead - 0xC1
+                    } as usize;
+                    if let Some(pair) = lookup(SJIS, SJIS_ENTRIES, row * 189 + (b - 0x40) as usize)
+                    {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x80 => out.push(b as char),
+                0xA1..=0xDF => push_cp(out, 0xFF61 + u32::from(b) - 0xA1),
+                0x81..=0x9F | 0xE0..=0xFC => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn euc_jp(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead == 0x8E && matches!(b, 0xA1..=0xDF) {
+                self.lead = 0;
+                push_cp(out, 0xFF61 + u32::from(b) - 0xA1);
+                return NONE;
+            }
+            if self.lead == 0x8F && matches!(b, 0xA1..=0xFE) {
+                self.jis0212 = true;
+                self.lead = b;
+                return NONE;
+            }
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                let jis0212 = std::mem::take(&mut self.jis0212);
+                if matches!(lead, 0xA1..=0xFE) && matches!(b, 0xA1..=0xFE) {
+                    let idx = (lead - 0xA1) as usize * 94 + (b - 0xA1) as usize;
+                    let table = if jis0212 { EUCJP_0212 } else { EUCJP_0208 };
+                    if let Some(pair) = lookup(table, JIS_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x8E | 0x8F | 0xA1..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn euc_kr(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x41..=0xFE) {
+                    let idx = (lead - 0x81) as usize * 190 + (b - 0x41) as usize;
+                    if let Some(pair) = lookup(EUCKR, EUCKR_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x81..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn big5(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.lead != 0 {
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x40..=0x7E | 0xA1..=0xFE) {
+                    let idx = (lead - 0x81) as usize * 191 + (b - 0x40) as usize;
+                    if let Some(pair) = lookup(BIG5, BIG5_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x81..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+
+        fn iso_2022_jp(&mut self, b: u8, out: &mut String) -> Restore {
+            // `Some(Restore)` ends the byte; the escape states fall through
+            // to the shared error path below.
+            match self.iso_state {
+                ISO_ASCII | ISO_ROMAN | ISO_KATAKANA | ISO_LEAD if b == 0x1B => {
+                    self.iso_state = ISO_ESC_START;
+                    NONE
+                }
+                ISO_ASCII => {
+                    self.iso_escaped = false;
+                    if b <= 0x7F && b != 0x0E && b != 0x0F {
+                        out.push(b as char);
+                    } else {
+                        out.push('\u{FFFD}');
+                    }
+                    NONE
+                }
+                ISO_ROMAN => {
+                    self.iso_escaped = false;
+                    match b {
+                        0x5C => out.push('\u{A5}'),
+                        0x7E => out.push('\u{203E}'),
+                        0x0E | 0x0F => out.push('\u{FFFD}'),
+                        0x00..=0x7F => out.push(b as char),
+                        _ => out.push('\u{FFFD}'),
+                    }
+                    NONE
+                }
+                ISO_KATAKANA => {
+                    self.iso_escaped = false;
+                    match b {
+                        0x21..=0x5F => push_cp(out, 0xFF61 - 0x21 + u32::from(b)),
+                        _ => out.push('\u{FFFD}'),
+                    }
+                    NONE
+                }
+                ISO_LEAD => {
+                    self.iso_escaped = false;
+                    if matches!(b, 0x21..=0x7E) {
+                        self.lead = b;
+                        self.iso_state = ISO_TRAIL;
+                    } else {
+                        out.push('\u{FFFD}');
+                    }
+                    NONE
+                }
+                ISO_TRAIL => {
+                    if b == 0x1B {
+                        self.iso_state = ISO_ESC_START;
+                        out.push('\u{FFFD}');
+                        return NONE;
+                    }
+                    let lead = self.lead;
+                    self.lead = 0;
+                    self.iso_state = ISO_LEAD;
+                    if matches!(b, 0x21..=0x7E) {
+                        let idx = (lead - 0x21) as usize * 94 + (b - 0x21) as usize;
+                        if let Some(pair) = lookup(EUCJP_0208, JIS_ENTRIES, idx) {
+                            push_pair(out, pair);
+                            return NONE;
+                        }
+                    }
+                    out.push('\u{FFFD}');
+                    NONE
+                }
+                ISO_ESC_START => {
+                    if b == 0x24 || b == 0x28 {
+                        self.lead = b;
+                        self.iso_state = ISO_ESC;
+                        return NONE;
+                    }
+                    self.iso_escaped = false;
+                    self.iso_state = self.iso_output_state;
+                    out.push('\u{FFFD}');
+                    one(b)
+                }
+                _ => {
+                    // ISO_ESC: the second byte of an escape sequence.
+                    let lead = self.lead;
+                    self.lead = 0;
+                    let new_state = match (lead, b) {
+                        (0x28, 0x42) => Some(ISO_ASCII),
+                        (0x28, 0x4A) => Some(ISO_ROMAN),
+                        (0x28, 0x49) => Some(ISO_KATAKANA),
+                        (0x24, 0x40 | 0x42) => Some(ISO_LEAD),
+                        _ => None,
+                    };
+                    if let Some(state) = new_state {
+                        self.iso_state = state;
+                        self.iso_output_state = state;
+                        let was_escaped = std::mem::replace(&mut self.iso_escaped, true);
+                        if was_escaped {
+                            out.push('\u{FFFD}');
+                        }
+                        return NONE;
+                    }
+                    self.iso_escaped = false;
+                    self.iso_state = self.iso_output_state;
+                    out.push('\u{FFFD}');
+                    ([lead, b, 0], 2)
+                }
+            }
+        }
+
+        fn gb18030(&mut self, b: u8, out: &mut String) -> Restore {
+            if self.third != 0 {
+                let (first, second, third) = (self.lead, self.second, self.third);
+                self.lead = 0;
+                self.second = 0;
+                self.third = 0;
+                if !matches!(b, 0x30..=0x39) {
+                    out.push('\u{FFFD}');
+                    return ([second, third, b], 3);
+                }
+                let pointer = ((u32::from(first) - 0x81) * 10 + (u32::from(second) - 0x30)) * 1260
+                    + (u32::from(third) - 0x81) * 10
+                    + (u32::from(b) - 0x30);
+                match gb18030_four_byte(pointer) {
+                    Some(cp) => push_cp(out, cp),
+                    None => out.push('\u{FFFD}'),
+                }
+                return NONE;
+            }
+            if self.second != 0 {
+                if matches!(b, 0x81..=0xFE) {
+                    self.third = b;
+                    return NONE;
+                }
+                let second = self.second;
+                self.lead = 0;
+                self.second = 0;
+                out.push('\u{FFFD}');
+                return ([second, b, 0], 2);
+            }
+            if self.lead != 0 {
+                if matches!(b, 0x30..=0x39) {
+                    self.second = b;
+                    return NONE;
+                }
+                let lead = self.lead;
+                self.lead = 0;
+                if matches!(b, 0x40..=0x7E | 0x80..=0xFE) {
+                    let idx = (lead - 0x81) as usize * 191 + (b - 0x40) as usize;
+                    if let Some(pair) = lookup(GBK, GBK_ENTRIES, idx) {
+                        push_pair(out, pair);
+                        return NONE;
+                    }
+                }
+                out.push('\u{FFFD}');
+                return if b < 0x80 { one(b) } else { NONE };
+            }
+            match b {
+                0x00..=0x7F => out.push(b as char),
+                0x80 => out.push('\u{20AC}'),
+                0x81..=0xFE => self.lead = b,
+                _ => out.push('\u{FFFD}'),
+            }
+            NONE
+        }
+    }
+
+    /// Decodes a whole byte string.
+    pub(crate) fn decode(enc: CjkEncoding, bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        let mut d = Decoder::new(enc);
+        d.push(bytes, &mut out);
+        d.finish(&mut out);
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn rs(enc: CjkEncoding) -> &'static encoding_rs::Encoding {
+            match enc {
+                CjkEncoding::ShiftJis => encoding_rs::SHIFT_JIS,
+                CjkEncoding::EucJp => encoding_rs::EUC_JP,
+                CjkEncoding::EucKr => encoding_rs::EUC_KR,
+                CjkEncoding::Gb18030 => encoding_rs::GB18030,
+                CjkEncoding::Big5 => encoding_rs::BIG5,
+                CjkEncoding::Iso2022Jp => encoding_rs::ISO_2022_JP,
+            }
+        }
+
+        fn oracle(enc: CjkEncoding, bytes: &[u8]) -> String {
+            rs(enc).decode_without_bom_handling(bytes).0.into_owned()
+        }
+
+        const ALL: [CjkEncoding; 6] = [
+            CjkEncoding::ShiftJis,
+            CjkEncoding::EucJp,
+            CjkEncoding::EucKr,
+            CjkEncoding::Gb18030,
+            CjkEncoding::Big5,
+            CjkEncoding::Iso2022Jp,
+        ];
+
+        #[test]
+        fn table_sizes_match_their_geometry() {
+            for (table, entries) in [
+                (SJIS, SJIS_ENTRIES),
+                (EUCJP_0208, JIS_ENTRIES),
+                (EUCJP_0212, JIS_ENTRIES),
+                (EUCKR, EUCKR_ENTRIES),
+                (GBK, GBK_ENTRIES),
+                (BIG5, BIG5_ENTRIES),
+            ] {
+                assert!(table.len() >= entries * 2);
+                assert_eq!((table.len() - entries * 2) % 12, 0);
+            }
+            assert_eq!(GB18030_RUNS.len() % 12, 0);
+        }
+
+        /// Every one- and two-byte sequence (and EUC-JP's three-byte ones),
+        /// alone and between ASCII, against encoding_rs.
+        #[test]
+        fn every_short_sequence_matches_encoding_rs() {
+            for enc in ALL {
+                for a in 0u16..=255 {
+                    let one = [a as u8];
+                    assert_eq!(decode(enc, &one), oracle(enc, &one), "{enc:?} {one:02x?}");
+                    for b in 0u16..=255 {
+                        let two = [a as u8, b as u8];
+                        assert_eq!(decode(enc, &two), oracle(enc, &two), "{enc:?} {two:02x?}");
+                        let framed = [b'x', a as u8, b as u8, b'y'];
+                        assert_eq!(
+                            decode(enc, &framed),
+                            oracle(enc, &framed),
+                            "{enc:?} {framed:02x?}"
+                        );
+                    }
+                }
+            }
+            for a in 0xA1u8..=0xFE {
+                for b in 0xA1u8..=0xFE {
+                    let three = [0x8F, a, b];
+                    assert_eq!(
+                        decode(CjkEncoding::EucJp, &three),
+                        oracle(CjkEncoding::EucJp, &three),
+                        "{three:02x?}"
+                    );
+                }
+            }
+        }
+
+        /// All 1.59 million GB18030 four-byte sequences.
+        #[test]
+        fn every_gb18030_four_byte_sequence_matches_encoding_rs() {
+            for p in 0u32..126 * 10 * 126 * 10 {
+                let seq = [
+                    (p / 12600) as u8 + 0x81,
+                    ((p / 1260) % 10) as u8 + 0x30,
+                    ((p / 10) % 126) as u8 + 0x81,
+                    (p % 10) as u8 + 0x30,
+                ];
+                assert_eq!(
+                    decode(CjkEncoding::Gb18030, &seq),
+                    oracle(CjkEncoding::Gb18030, &seq),
+                    "{seq:02x?}"
+                );
+            }
+        }
+
+        /// Random byte streams, biased towards lead and trail bytes, fed in
+        /// random chunks - a chunk boundary must never change the result.
+        #[test]
+        fn random_streams_match_encoding_rs_at_any_chunking() {
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut rand = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for enc in ALL {
+                for _ in 0..40_000 {
+                    let len = (rand() % 40) as usize;
+                    let bytes: Vec<u8> = (0..len)
+                        .map(|_| match rand() % 8 {
+                            0 => (rand() % 0x80) as u8,
+                            1 => 0x30 + (rand() % 10) as u8,
+                            2 => 0x8E + (rand() % 2) as u8,
+                            3..=5 => 0x81 + (rand() % 0x7E) as u8,
+                            6 => 0x40 + (rand() % 0xBF) as u8,
+                            7 if rand() % 2 == 0 => {
+                                [0x1B, 0x24, 0x28, 0x42, 0x4A, 0x49, 0x40][(rand() % 7) as usize]
+                            }
+                            _ => rand() as u8,
+                        })
+                        .collect();
+                    let expected = oracle(enc, &bytes);
+                    assert_eq!(decode(enc, &bytes), expected, "{enc:?} {bytes:02x?}");
+                    let mut d = Decoder::new(enc);
+                    let mut out = String::new();
+                    let mut at = 0;
+                    while at < bytes.len() {
+                        let step = 1 + (rand() % 5) as usize;
+                        let end = (at + step).min(bytes.len());
+                        d.push(&bytes[at..end], &mut out);
+                        at = end;
+                    }
+                    d.finish(&mut out);
+                    assert_eq!(out, expected, "{enc:?} chunked {bytes:02x?}");
+                }
+            }
+        }
+
+        /// ISO-2022-JP needs real escape sequences to get anywhere, which
+        /// random bytes almost never form: build streams out of them.
+        #[test]
+        fn iso_2022_jp_structured_streams_match_encoding_rs() {
+            const PIECES: [&[u8]; 14] = [
+                b"\x1b(B", b"\x1b(J", b"\x1b(I", b"\x1b$@", b"\x1b$B", b"\x1b", b"\x1b$", b"\x1b(",
+                b"\x1b(X", b"\x0e", b"\x0f", b"\\~", b"\n", b"\xa4",
+            ];
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut rand = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let (mut kanji, mut errors) = (0, 0);
+            for _ in 0..60_000 {
+                let mut bytes = Vec::new();
+                for _ in 0..(rand() % 12) {
+                    if rand() % 3 == 0 {
+                        bytes.extend_from_slice(PIECES[(rand() % PIECES.len() as u64) as usize]);
+                    } else {
+                        for _ in 0..(1 + rand() % 6) {
+                            bytes.push(0x21 + (rand() % 0x5E) as u8);
+                        }
+                    }
+                }
+                let expected = oracle(CjkEncoding::Iso2022Jp, &bytes);
+                kanji += expected.chars().filter(|c| *c > '\u{2FFF}').count();
+                errors += expected.matches('\u{FFFD}').count();
+                assert_eq!(
+                    decode(CjkEncoding::Iso2022Jp, &bytes),
+                    expected,
+                    "{bytes:02x?}"
+                );
+                let mut d = Decoder::new(CjkEncoding::Iso2022Jp);
+                let mut out = String::new();
+                for chunk in bytes.chunks(1 + (rand() % 4) as usize) {
+                    d.push(chunk, &mut out);
+                }
+                d.finish(&mut out);
+                assert_eq!(out, expected, "chunked {bytes:02x?}");
+            }
+            // The streams really do reach kanji and every error path.
+            assert!(kanji > 10_000 && errors > 10_000, "{kanji} {errors}");
+        }
+
+        #[test]
+        fn labels_resolve_to_the_standards_encodings() {
+            use super::super::cjk_encoding_from_label as label;
+            assert_eq!(label("shift-jis"), Some(CjkEncoding::ShiftJis));
+            assert_eq!(label("cp932"), Some(CjkEncoding::ShiftJis));
+            assert_eq!(label("euc-jp"), Some(CjkEncoding::EucJp));
+            assert_eq!(label("cp949"), Some(CjkEncoding::EucKr));
+            assert_eq!(label("gb2312"), Some(CjkEncoding::Gb18030));
+            assert_eq!(label("gbk"), Some(CjkEncoding::Gb18030));
+            assert_eq!(label("big5-hkscs"), Some(CjkEncoding::Big5));
+            assert_eq!(label("windows-1252"), None);
+        }
+    }
+}
+
 // --- Text encoding normalisation ---
 // Every text reader here reads UTF-8, and most of them fail (or, worse,
 // quietly keep a U+FEFF inside the first key) on a byte-order mark. Rather
@@ -88515,6 +89350,8 @@ enum TextEncoding {
     Utf32Be,
     /// A legacy single-byte code page (`codepage_support`'s tables).
     SingleByte(&'static [u16; 256]),
+    /// Shift_JIS, EUC-JP, EUC-KR, GBK/GB18030 or Big5 (`--features cjk`).
+    Cjk(CjkEncoding),
 }
 
 /// Parses an `--encoding` value. `latin1`/`iso-8859-1`/`ascii` follow the
@@ -88544,6 +89381,9 @@ fn parse_text_encoding(name: &str) -> Result<TextEncoding> {
         "cp1257" => "windows-1257",
         "cp1258" => "windows-1258",
         other => {
+            if let Some(cjk) = cjk_encoding_from_label(other) {
+                return Ok(TextEncoding::Cjk(cjk));
+            }
             let ibm = other.strip_prefix("ibm").map(|n| format!("cp{n}"));
             return codepage_support::table(ibm.as_deref().unwrap_or(other))
                 .map(TextEncoding::SingleByte)
@@ -88552,8 +89392,7 @@ fn parse_text_encoding(name: &str) -> Result<TextEncoding> {
                         "unrecognized --encoding {name:?} (expected utf-8, utf-16, utf-16le, \
                          utf-16be, utf-32, utf-32le, utf-32be, or a single-byte code page such \
                          as windows-1252, latin1, iso-8859-15, cp437, cp866, koi8-r, or \
-                         macintosh; multi-byte East Asian encodings (Shift-JIS, GBK, Big5, \
-                         EUC-*) aren't supported)"
+                         macintosh, or shift_jis, euc-jp, iso-2022-jp, euc-kr, gbk, gb18030, or big5)"
                     )
                 });
         }
@@ -88737,6 +89576,7 @@ fn normalize_text_bytes(
         Utf8,
         Wide(usize, bool),
         Single(&'static [u16; 256]),
+        Cjk(CjkEncoding),
     }
     let mismatch = |asked: &str| {
         anyhow!(
@@ -88769,6 +89609,8 @@ fn normalize_text_bytes(
         ),
         (Some(TextEncoding::SingleByte(t)), Bom::None | Bom::Utf8) => (Source::Single(t), 0),
         (Some(TextEncoding::SingleByte(_)), _) => return Err(mismatch("<code page>")),
+        (Some(TextEncoding::Cjk(c)), Bom::None | Bom::Utf8) => (Source::Cjk(c), 0),
+        (Some(TextEncoding::Cjk(_)), _) => return Err(mismatch("<East Asian encoding>")),
         (Some(TextEncoding::Utf8), _) => return Err(mismatch("utf-8")),
         (Some(TextEncoding::Utf16 | TextEncoding::Utf16Le | TextEncoding::Utf16Be), _) => {
             return Err(mismatch("utf-16"));
@@ -88804,6 +89646,30 @@ fn normalize_text_bytes(
                     }
                     out.write_all(codepage_support::decode(table, &buf[..n]).as_bytes())?;
                 }
+            }
+            Source::Cjk(enc) => {
+                #[cfg(feature = "cjk")]
+                {
+                    let mut decoder = cjk_support::Decoder::new(enc);
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut text = String::new();
+                    loop {
+                        let n = input
+                            .read(&mut buf)
+                            .with_context(|| format!("failed to read {path:?}"))?;
+                        if n == 0 {
+                            break;
+                        }
+                        text.clear();
+                        decoder.push(&buf[..n], &mut text);
+                        out.write_all(text.as_bytes())?;
+                    }
+                    text.clear();
+                    decoder.finish(&mut text);
+                    out.write_all(text.as_bytes())?;
+                }
+                #[cfg(not(feature = "cjk"))]
+                return Err(cjk_not_compiled_in(enc));
             }
         }
         out.flush()?;
@@ -88881,7 +89747,7 @@ fn with_encoding_hint<T>(result: Result<T>, format: &InputFormat) -> Result<T> {
             if text.contains("invalid UTF-8") || text.contains("not valid UTF-8") {
                 Err(Error {
                     message: format!(
-                        "{} - if the file isn't UTF-8, pass --encoding <name> (for example windows-1252, latin1, utf-16le)",
+                        "{} - if the file isn't UTF-8, pass --encoding <name> (for example windows-1252, latin1, utf-16le, shift_jis, gbk)",
                         err.message
                     ),
                     source: err.source,
@@ -88994,7 +89860,23 @@ mod text_encoding_tests {
         ] {
             assert!(parse_text_encoding(ok).is_ok(), "{ok}");
         }
-        for bad in ["shift_jis", "gbk", "big5", "nonsense", ""] {
+        for east_asian in [
+            "shift_jis",
+            "Shift-JIS",
+            "cp932",
+            "euc-jp",
+            "iso-2022-jp",
+            "euc-kr",
+            "cp949",
+            "gbk",
+            "gb2312",
+            "gb18030",
+            "big5",
+        ] {
+            assert!(parse_text_encoding(east_asian).is_ok(), "{east_asian}");
+        }
+        // No WHATWG decoder (or no table) for these.
+        for bad in ["iso-2022-kr", "euc-tw", "nonsense", ""] {
             assert!(parse_text_encoding(bad).is_err(), "{bad}");
         }
     }
@@ -93015,8 +93897,8 @@ fn profile_directory_as_diff_columns(dir: &Path) -> Result<BTreeMap<String, Vec<
         if looks_like_own_output(path) {
             continue;
         }
-        let Some((read_path, logical_path, _decompressed_tmp)) = decompress_for_walk(path)
-            .with_context(|| format!("failed processing {path:?}"))?
+        let Some((read_path, logical_path, _decompressed_tmp)) =
+            decompress_for_walk(path).with_context(|| format!("failed processing {path:?}"))?
         else {
             continue;
         };
@@ -94523,7 +95405,9 @@ USAGE:
     sqlite, ... - anything sniff-rs already reads), profiled fresh with
     default settings (--samples 3, no --nrows limit, auto-detected
     format). Mixing the two - an old saved dictionary against today's
-    live data file - works too. A raw file needing --nrows/--delimiter/
+    live data file - works too. A directory is profiled file by file
+    and its tables named the way --combine names them, so a live folder
+    diffs against a saved --combine dictionary. A raw file needing --nrows/--delimiter/
     --format control should be pre-profiled explicitly with those flags
     first; hand the resulting --output-format json file to diff instead.
     One side may be "-" to read it from stdin (gzip/zstd recognized by

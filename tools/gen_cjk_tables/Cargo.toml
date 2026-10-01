@@ -1,0 +1,15 @@
+[package]
+name = "gen_cjk_tables"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Not part of the sniff-rs build: a one-off generator for src/cjk/*.bin, run
+# as `cargo run --release -- <out dir>` from this directory. encoding_rs is
+# used only as the source of the WHATWG index tables (by brute-force
+# decoding every legal byte sequence), the same way it is the oracle in
+# sniff-rs's own tests.
+[dependencies]
+encoding_rs = "0.8"
+
+[workspace]
