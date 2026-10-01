@@ -9879,6 +9879,17 @@ fn yaml_merge_keys_resolve_through_aliases() {
     );
 }
 
+#[cfg(feature = "yaml")]
+#[test]
+fn yaml_anchor_alone_on_its_line_names_the_block_below() {
+    // PyYAML reads this as {name, base: {x, y}, copy: {x, y}}.
+    let doc = run_json("edge_yaml_root_anchor.yaml", &[]);
+    let cols = table(&doc, "edge_yaml_root_anchor");
+    assert_eq!(column(cols, "name")["sample_values"][0], "top");
+    assert_eq!(column(cols, "base.x")["sample_values"][0], "1");
+    assert_eq!(column(cols, "copy.y")["sample_values"][0], "two");
+}
+
 #[cfg(feature = "toml")]
 #[test]
 fn toml_array_of_tables_edge_with_missing_field() {
@@ -16889,4 +16900,23 @@ fn pdf_lzw_streams_decode_with_either_early_change_setting() {
             "{name} decoded to replacement characters"
         );
     }
+}
+
+// An Avro `duration` (months, days, milliseconds in 12 bytes) reads as an
+// ISO 8601 duration instead of a debug-formatted struct.
+#[cfg(feature = "avro")]
+#[test]
+fn avro_duration_logical_type_renders_as_an_iso_8601_duration() {
+    let sql = run_sql("edge_avro_duration.avro", &[]);
+    let rows = insert_rows(&sql, "edge_avro_duration");
+    assert_eq!(
+        rows,
+        [
+            "(1, 'P1M2DT3.5S')",
+            "(2, 'P0D')",
+            "(3, 'P14M')",
+            "(4, 'PT0.25S')",
+            "(5, 'P30DT86400S')"
+        ]
+    );
 }

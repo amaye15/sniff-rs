@@ -47309,18 +47309,14 @@ mod avro_support {
                     .map_or(JsonValue::Null, |dt| JsonValue::String(dt.format_t_frac(9)))
             }
             Schema::Duration => {
-                // Best-effort, matching this project's old apache-avro-based
-                // bridge exactly: Duration (months, days, milliseconds - each
-                // a raw u32 LE) has no single natural string form, so this
-                // renders a disclosed placeholder rather than guessing at
-                // one. See CLAUDE.md's "Not covered, and out of scope" note.
+                // Months, days and milliseconds - three little-endian u32s
+                // - rendered as an ISO 8601 duration, the same standard
+                // text the Arrow Duration columns use (`P1M2DT3.5S`).
                 let bytes = read_exact_vec(r, 12)?;
                 let months = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
                 let days = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                 let millis = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-                JsonValue::String(format!(
-                    "Duration {{ months: {months}, days: {days}, millis: {millis} }}"
-                ))
+                JsonValue::String(avro_duration_iso(months, days, millis))
             }
             Schema::Ref(name) => {
                 let resolved = names
@@ -47329,6 +47325,34 @@ mod avro_support {
                 decode_to_json(r, resolved, names)?
             }
         })
+    }
+
+    /// An Avro `duration` (months, days, milliseconds) as ISO 8601:
+    /// `P{months}M{days}DT{seconds}S`, leaving out zero parts and writing
+    /// the milliseconds as a trimmed decimal fraction of the seconds. All
+    /// zero is `P0D`. Months and days stay separate because neither has a
+    /// fixed length in seconds.
+    fn avro_duration_iso(months: u32, days: u32, millis: u32) -> String {
+        let mut out = String::from("P");
+        if months != 0 {
+            out.push_str(&format!("{months}M"));
+        }
+        if days != 0 {
+            out.push_str(&format!("{days}D"));
+        }
+        if millis != 0 {
+            out.push('T');
+            out.push_str(&(millis / 1000).to_string());
+            let frac = millis % 1000;
+            if frac != 0 {
+                out.push_str(format!(".{frac:03}").trim_end_matches('0'));
+            }
+            out.push('S');
+        }
+        if out == "P" {
+            out.push_str("0D");
+        }
+        out
     }
 
     fn decompress_codec(codec: &str, data: Vec<u8>) -> Result<Vec<u8>> {
@@ -49988,6 +50012,22 @@ mod yaml_support {
         if content.is_empty() {
             *pos += 1;
             return Ok(JsonValue::Null);
+        }
+        // An anchor alone on its line names the block node on the lines
+        // below it (`&root` then a mapping) - at this level or deeper.
+        if let Some(name) = anchor_name(content) {
+            if strip_anchor_prefix(content).0.is_empty() {
+                *pos += 1;
+                skip_blank_and_comment_lines(lines, pos);
+                let value = match lines.get(*pos).map(|l| l.indent) {
+                    Some(next) if next >= indent => {
+                        parse_block_node(lines, pos, next, parent_indent)?
+                    }
+                    _ => JsonValue::Null,
+                };
+                record_anchor(Some(name), &value);
+                return Ok(value);
+            }
         }
         if is_sequence_item_line(content) {
             parse_block_sequence(lines, pos, indent)

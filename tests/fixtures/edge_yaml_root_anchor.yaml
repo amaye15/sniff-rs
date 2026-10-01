@@ -1,0 +1,6 @@
+&root
+name: top
+base: &b
+  x: 1
+  y: two
+copy: *b
