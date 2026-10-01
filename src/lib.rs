@@ -55604,7 +55604,7 @@ fn columns_from_ipynb(
 // ASCIIHex/RunLength, stacked), WinAnsi/MacRoman/Differences/ToUnicode-
 // backed text (with `uniXXXX` and subset-suffixed glyph names), and the
 // showing/positioning operators. Everything else is a clear, disclosed
-// refusal rather than a guess: encrypted files, LZWDecode, Standard/
+// refusal rather than a guess: encrypted files, Standard/
 // Symbol/custom base encodings without ToUnicode (no machine-checkable
 // oracle for a from-memory table exists in this environment),
 // composite/CID fonts with no usable mapping, and image-only pages (a
@@ -58789,9 +58789,8 @@ mod pdf_support {
         /// Decodes a stream's payload through its `/Filter` chain (a bare
         /// name or an array, applied in order, each with its own optional
         /// `DecodeParms` entry): ASCIIHex, ASCII85, Flate (zlib-framed or,
-        /// leniently, raw DEFLATE - see below), and RunLength. Anything
-        /// else is a clean, specific error: LZW is genuinely unimplemented
-        /// (rare in text-bearing streams), and the image-only codecs
+        /// leniently, raw DEFLATE - see below), LZW, and RunLength. Anything
+        /// else is a clean, specific error: the image-only codecs
         /// (DCT/CCITT/JBIG2) on a content stream mean the file, not this
         /// reader, is confused.
         fn decode_stream(
@@ -58839,10 +58838,7 @@ mod pdf_support {
                     b"ASCII85Decode" => Self::ascii85_decode(&bytes, path)?,
                     b"FlateDecode" => Self::flate_decode(&bytes, parm.as_ref(), path)?,
                     b"RunLengthDecode" => Self::run_length_decode(&bytes, path)?,
-                    b"LZWDecode" => bail!(
-                        "{path:?} uses LZWDecode, which this reader doesn't implement - \
-                         re-save with FlateDecode"
-                    ),
+                    b"LZWDecode" => Self::lzw_decode(&bytes, parm.as_ref(), path)?,
                     b"DCTDecode" | b"CCITTFaxDecode" | b"JBIG2Decode" | b"JPXDecode" => {
                         bail!("{path:?} applies an image codec outside a content stream context")
                     }
@@ -58854,6 +58850,120 @@ mod pdf_support {
                 };
             }
             Ok(bytes)
+        }
+
+        /// LZWDecode (ISO 32000-1 7.4.4): variable-width codes packed
+        /// most-significant-bit first, starting at 9 bits, with 256 = clear
+        /// the table and 257 = end of data; the code width grows when the
+        /// table reaches 511 entries (one entry early, `/EarlyChange` 1, the
+        /// default) or 512 (`/EarlyChange` 0), up to 12 bits. A full table
+        /// keeps decoding without adding entries until the next clear code.
+        /// A stream cut short, or one with a code beyond the table, keeps
+        /// everything decoded before the break (the same salvage the Flate
+        /// decoder gives a truncated stream) and is an error only when
+        /// nothing was decoded. `/Predictor` unfiltering applies afterwards,
+        /// exactly as for Flate.
+        fn lzw_decode(
+            data: &[u8],
+            parms: Option<&BTreeMap<Vec<u8>, PdfObj>>,
+            path: &Path,
+        ) -> Result<Vec<u8>> {
+            const MAX_OUTPUT: usize = 1 << 30;
+            let early: usize = match parms
+                .and_then(|p| p.get(b"EarlyChange".as_slice()))
+                .and_then(PdfObj::as_int)
+            {
+                Some(0) => 0,
+                _ => 1,
+            };
+            // Each table entry is (previous code, last byte); a string is
+            // read back by walking the chain, then reversed.
+            let mut prefix = [0u16; 4096];
+            let mut suffix = [0u8; 4096];
+            let mut out: Vec<u8> = Vec::new();
+            let mut next: usize = 258;
+            let mut width: u32 = 9;
+            let mut prev: Option<usize> = None;
+            let (mut acc, mut nbits) = (0u32, 0u32);
+            let mut pos = 0usize;
+            let mut chain: Vec<u8> = Vec::new();
+            let mut failure: Option<&'static str> = None;
+            'codes: loop {
+                while nbits < width {
+                    let Some(&b) = data.get(pos) else {
+                        break 'codes;
+                    };
+                    pos += 1;
+                    acc = (acc << 8) | u32::from(b);
+                    nbits += 8;
+                }
+                let code = ((acc >> (nbits - width)) & ((1 << width) - 1)) as usize;
+                nbits -= width;
+                acc &= (1u32 << nbits) - 1;
+                if code == 256 {
+                    next = 258;
+                    width = 9;
+                    prev = None;
+                    continue;
+                }
+                if code == 257 {
+                    break;
+                }
+                let Some(p) = prev else {
+                    if code > 255 {
+                        failure = Some("starts with a code that isn't a literal");
+                        break;
+                    };
+                    out.push(code as u8);
+                    prev = Some(code);
+                    continue;
+                };
+                // The string for `code`: a table entry, or - for the one
+                // code not yet in the table - the previous string plus its
+                // own first byte.
+                chain.clear();
+                let mut cur = if code < next {
+                    code
+                } else if code == next && next < 4096 {
+                    p
+                } else {
+                    failure = Some("uses a code beyond its table");
+                    break;
+                };
+                while cur >= 258 {
+                    chain.push(suffix[cur]);
+                    cur = usize::from(prefix[cur]);
+                }
+                chain.push(cur as u8);
+                chain.reverse();
+                let entry_first = chain[0];
+                if code == next {
+                    chain.push(entry_first);
+                }
+                if out.len() + chain.len() > MAX_OUTPUT {
+                    failure = Some("decodes to an unreasonable size");
+                    break;
+                }
+                out.extend_from_slice(&chain);
+                if next < 4096 {
+                    prefix[next] = p as u16;
+                    suffix[next] = chain[0];
+                    next += 1;
+                    width = match next + early {
+                        0..=511 => 9,
+                        512..=1023 => 10,
+                        1024..=2047 => 11,
+                        _ => 12,
+                    };
+                }
+                prev = Some(code);
+            }
+            if let Some(why) = failure
+                && out.is_empty()
+            {
+                bail!("{path:?} has an LZWDecode stream that {why}");
+            }
+            Self::finish_flate_decode(out, parms, path)
         }
 
         /// ASCIIHexDecode: hex pairs, whitespace ignored, terminated by
@@ -66789,6 +66899,32 @@ mod pdf_support {
         }
 
         #[test]
+        fn lzw_decode_matches_the_specs_worked_example_and_salvages_a_cut_stream() {
+            // ISO 32000-1 7.4.4.2's example: 45 45 45 45 45 65 45 45 45 66.
+            let encoded = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
+            let plain = [45u8, 45, 45, 45, 45, 65, 45, 45, 45, 66];
+            assert_eq!(
+                PdfReader::lzw_decode(&encoded, None, tpath()).unwrap(),
+                plain
+            );
+            // Without the end-of-data code the decode simply ends with the input.
+            assert_eq!(
+                PdfReader::lzw_decode(&encoded[..8], None, tpath()).unwrap()[..9],
+                plain[..9]
+            );
+            // A first code that isn't a literal can't start a stream; a code past
+            // the table breaks it, keeping what came before.
+            assert!(PdfReader::lzw_decode(&[0xFF, 0xFF, 0x80], None, tpath()).is_err());
+            let mut broken = encoded[..4].to_vec();
+            broken.extend_from_slice(&[0xFF, 0xFF]);
+            assert!(
+                !PdfReader::lzw_decode(&broken, None, tpath())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[test]
         fn flate_decode_salvages_a_stream_truncated_before_the_trailer() {
             // Same "Hello, PDF!" bytes as the round-trip test above, cut at
             // several real points before the 4-byte Adler-32 trailer -
@@ -71073,29 +71209,170 @@ mod sqlite_support {
         }
     }
 
-    /// SQLite's own write-ahead log holds committed changes not yet
-    /// merged back into the base file - the real SQLite C library
-    /// reconciles it transparently on every open, which this hand-rolled
-    /// reader deliberately does not reimplement. Rather than silently
-    /// serve stale data (a real, disclosed scope boundary, not a silent
-    /// gap - the same "clean error over a wrong answer" choice every
-    /// other hand-roll in this project makes for its own out-of-scope
-    /// corner), a WAL file carrying more than just its own 32-byte header
-    /// (i.e. at least one real frame) is a hard, actionable error.
-    fn check_no_pending_wal(path: &Path) -> Result<()> {
-        let mut wal_name = path.as_os_str().to_os_string();
-        wal_name.push("-wal");
-        let wal_path = PathBuf::from(wal_name);
-        if let Ok(meta) = fs::metadata(&wal_path)
-            && meta.len() > 32
-        {
-            bail!(
-                "{path:?} has a write-ahead log ({wal_path:?}) with pending, uncheckpointed \
-                 changes - run `PRAGMA wal_checkpoint(TRUNCATE);` (or close every connection \
-                 cleanly) before reading it with this tool"
-            );
+    /// A SQLite database as the C library sees it: the main file plus the
+    /// committed, not-yet-checkpointed pages of its write-ahead log
+    /// (`<db>-wal`), if it has one. A WAL-mode database that was copied
+    /// while a connection was open, or whose writer crashed, keeps its
+    /// newest data only in the log; reading the main file alone would
+    /// silently serve stale rows (or none at all - a brand-new database
+    /// can be an empty file plus a log), so every page read goes through
+    /// `read_page`, which prefers the log's newest committed copy.
+    pub(crate) struct DbFile {
+        file: fs::File,
+        wal: Option<WalOverlay>,
+    }
+
+    /// Where each page's newest committed copy lives in the log.
+    struct WalOverlay {
+        file: fs::File,
+        page_size: u32,
+        /// page number -> byte offset of that frame's page data in the log.
+        frames: HashMap<u32, u64>,
+    }
+
+    const WAL_MAGIC_LE: u32 = 0x377f_0682;
+    const WAL_MAGIC_BE: u32 = 0x377f_0683;
+    const WAL_HEADER_LEN: usize = 32;
+    const WAL_FRAME_HEADER_LEN: usize = 24;
+
+    /// SQLite's WAL checksum: the words of `data` (two at a time, in the
+    /// byte order the log's magic number declares) folded into a running
+    /// pair, per sqlite.org/fileformat2.html "Checksum Algorithm".
+    fn wal_checksum(data: &[u8], big_endian: bool, mut s0: u32, mut s1: u32) -> (u32, u32) {
+        let (pairs, _) = data.as_chunks::<8>();
+        for pair in pairs {
+            let a: [u8; 4] = [pair[0], pair[1], pair[2], pair[3]];
+            let b: [u8; 4] = [pair[4], pair[5], pair[6], pair[7]];
+            let (x0, x1) = if big_endian {
+                (u32::from_be_bytes(a), u32::from_be_bytes(b))
+            } else {
+                (u32::from_le_bytes(a), u32::from_le_bytes(b))
+            };
+            s0 = s0.wrapping_add(x0).wrapping_add(s1);
+            s1 = s1.wrapping_add(x1).wrapping_add(s0);
         }
-        Ok(())
+        (s0, s1)
+    }
+
+    impl WalOverlay {
+        /// Scans the log once and indexes the newest committed copy of
+        /// every page. A frame counts only if its salts match the log
+        /// header's (a reset log leaves older frames behind with the old
+        /// salts) and its checksum extends the chain from the previous
+        /// frame; the scan stops at the first frame that fails either, and
+        /// frames after the last commit frame (a nonzero "database size
+        /// after commit") are an unfinished transaction and are ignored.
+        fn open(wal_path: &Path) -> Result<Option<WalOverlay>> {
+            let Ok(mut file) = fs::File::open(wal_path) else {
+                return Ok(None);
+            };
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if len < WAL_HEADER_LEN as u64 {
+                return Ok(None);
+            }
+            let mut head = [0u8; WAL_HEADER_LEN];
+            file.read_exact(&mut head)
+                .with_context(|| format!("failed reading the WAL header in {wal_path:?}"))?;
+            let word = |at: usize| {
+                u32::from_be_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]])
+            };
+            let magic = word(0);
+            if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+                // Not a log this reader understands - SQLite itself would
+                // treat it as empty, so the main file is all there is.
+                return Ok(None);
+            }
+            let big_endian = magic == WAL_MAGIC_BE;
+            let page_size = word(8);
+            if !(512..=65536).contains(&page_size) || (page_size & (page_size - 1)) != 0 {
+                bail!("{wal_path:?} declares an invalid WAL page size ({page_size})");
+            }
+            let (salt1, salt2) = (word(16), word(20));
+            let (c0, c1) = wal_checksum(&head[..24], big_endian, 0, 0);
+            if (c0, c1) != (word(24), word(28)) {
+                // A header whose checksum doesn't verify is an unusable log.
+                return Ok(None);
+            }
+            let frame_len = WAL_FRAME_HEADER_LEN as u64 + page_size as u64;
+            let mut frames: HashMap<u32, u64> = HashMap::new();
+            let mut pending: Vec<(u32, u64)> = Vec::new();
+            let (mut s0, mut s1) = (c0, c1);
+            let mut buf = vec![0u8; page_size as usize];
+            let mut offset = WAL_HEADER_LEN as u64;
+            while offset + frame_len <= len {
+                let mut fh = [0u8; WAL_FRAME_HEADER_LEN];
+                file.seek(SeekFrom::Start(offset))
+                    .with_context(|| format!("failed seeking in {wal_path:?}"))?;
+                file.read_exact(&mut fh)
+                    .with_context(|| format!("failed reading a WAL frame in {wal_path:?}"))?;
+                file.read_exact(&mut buf)
+                    .with_context(|| format!("failed reading a WAL frame in {wal_path:?}"))?;
+                let fw =
+                    |at: usize| u32::from_be_bytes([fh[at], fh[at + 1], fh[at + 2], fh[at + 3]]);
+                if fw(8) != salt1 || fw(12) != salt2 {
+                    break;
+                }
+                let (n0, n1) = wal_checksum(&fh[..8], big_endian, s0, s1);
+                let (n0, n1) = wal_checksum(&buf, big_endian, n0, n1);
+                if (n0, n1) != (fw(16), fw(20)) {
+                    break;
+                }
+                (s0, s1) = (n0, n1);
+                let page = fw(0);
+                if page == 0 {
+                    break;
+                }
+                pending.push((page, offset + WAL_FRAME_HEADER_LEN as u64));
+                if fw(4) != 0 {
+                    for (p, at) in pending.drain(..) {
+                        frames.insert(p, at);
+                    }
+                }
+                offset += frame_len;
+            }
+            if frames.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(WalOverlay {
+                file,
+                page_size,
+                frames,
+            }))
+        }
+    }
+
+    impl DbFile {
+        pub(crate) fn open(path: &Path) -> Result<DbFile> {
+            let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+            let mut wal_name = path.as_os_str().to_os_string();
+            wal_name.push("-wal");
+            let wal = WalOverlay::open(&PathBuf::from(wal_name))?;
+            Ok(DbFile { file, wal })
+        }
+
+        /// The database's first 100 bytes - from the log when it holds a
+        /// newer page 1, else from the main file.
+        fn header_bytes(&mut self, path: &Path) -> Result<[u8; 100]> {
+            let mut buf = [0u8; 100];
+            if let Some(wal) = self.wal.as_mut()
+                && let Some(&at) = wal.frames.get(&1)
+            {
+                wal.file
+                    .seek(SeekFrom::Start(at))
+                    .with_context(|| format!("failed seeking in the WAL of {path:?}"))?;
+                wal.file
+                    .read_exact(&mut buf)
+                    .with_context(|| format!("failed reading the WAL of {path:?}"))?;
+                return Ok(buf);
+            }
+            self.file
+                .seek(SeekFrom::Start(0))
+                .with_context(|| format!("failed seeking in {path:?}"))?;
+            self.file
+                .read_exact(&mut buf)
+                .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+            Ok(buf)
+        }
     }
 
     fn read_header(data: &[u8], path: &Path) -> Result<DbHeader> {
@@ -71154,20 +71431,33 @@ mod sqlite_support {
     /// access to individual pages the *natural* access pattern, not an
     /// added complication a streaming rewrite has to invent from
     /// scratch.
-    fn read_page(
-        file: &mut fs::File,
-        page_num: u32,
-        page_size: u32,
-        path: &Path,
-    ) -> Result<Vec<u8>> {
+    fn read_page(db: &mut DbFile, page_num: u32, page_size: u32, path: &Path) -> Result<Vec<u8>> {
         if page_num == 0 {
             bail!("invalid SQLite page number 0 in {path:?}");
         }
-        let offset = (page_num as u64 - 1) * page_size as u64;
-        file.seek(SeekFrom::Start(offset))
-            .with_context(|| format!("failed seeking to SQLite page {page_num} in {path:?}"))?;
         let mut buf = vec![0u8; page_size as usize];
-        file.read_exact(&mut buf).with_context(|| {
+        if let Some(wal) = db.wal.as_mut()
+            && let Some(&at) = wal.frames.get(&page_num)
+        {
+            if wal.page_size != page_size {
+                bail!(
+                    "the write-ahead log of {path:?} uses {}-byte pages but the database uses {page_size}",
+                    wal.page_size
+                );
+            }
+            wal.file.seek(SeekFrom::Start(at)).with_context(|| {
+                format!("failed seeking to SQLite page {page_num} in the WAL of {path:?}")
+            })?;
+            wal.file.read_exact(&mut buf).with_context(|| {
+                format!("SQLite page {page_num} is truncated in the WAL of {path:?}")
+            })?;
+            return Ok(buf);
+        }
+        let offset = (page_num as u64 - 1) * page_size as u64;
+        db.file
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("failed seeking to SQLite page {page_num} in {path:?}"))?;
+        db.file.read_exact(&mut buf).with_context(|| {
             format!(
                 "SQLite page {page_num} is out of range in {path:?} (file truncated or corrupt)"
             )
@@ -71188,7 +71478,7 @@ mod sqlite_support {
     /// payload at a time.
     #[allow(clippy::too_many_arguments)]
     fn collect_table_rows(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page_num: u32,
         page_size: u32,
         usable_size: u32,
@@ -71296,7 +71586,7 @@ mod sqlite_support {
     /// `X` - `U - 35` against `((U - 12) * 64 / 255) - 23`.
     #[allow(clippy::too_many_arguments)]
     fn assemble_payload(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page: &[u8],
         body_off: usize,
         payload_size: i64,
@@ -71370,7 +71660,7 @@ mod sqlite_support {
     /// varint] [payload] [4-byte overflow pointer, if the payload spills]`.
     #[allow(clippy::too_many_arguments)]
     fn collect_index_entries(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page_num: u32,
         page_size: u32,
         usable_size: u32,
@@ -71494,7 +71784,7 @@ mod sqlite_support {
     /// verified directly against its file-format documentation rather
     /// than recalled from memory.
     fn parse_leaf_cell(
-        file: &mut fs::File,
+        file: &mut DbFile,
         page: &[u8],
         cell_off: usize,
         page_size: u32,
@@ -71643,11 +71933,7 @@ mod sqlite_support {
 
     /// `sqlite_master`'s root page is always page 1 by construction - one
     /// more fixed fact of the file format, not something to look up.
-    fn read_schema(
-        file: &mut fs::File,
-        header: &DbHeader,
-        path: &Path,
-    ) -> Result<Vec<SchemaEntry>> {
+    fn read_schema(file: &mut DbFile, header: &DbHeader, path: &Path) -> Result<Vec<SchemaEntry>> {
         let mut entries = Vec::new();
         let mut count = 0usize;
         let mut on_row = |_rowid: i64, payload: Vec<u8>| -> Result<()> {
@@ -72392,7 +72678,7 @@ mod sqlite_support {
     /// for an ordinary table, the index b-tree for a `WITHOUT ROWID` one
     /// (the rowid handed to `on_row` is 0 there; there is none).
     fn walk_table_rows(
-        file: &mut fs::File,
+        file: &mut DbFile,
         header: &DbHeader,
         entry: &SchemaEntry,
         parsed: &ParsedTable,
@@ -72429,7 +72715,7 @@ mod sqlite_support {
     }
 
     fn profile_table(
-        file: &mut fs::File,
+        file: &mut DbFile,
         header: &DbHeader,
         entry: &SchemaEntry,
         nrows: Option<usize>,
@@ -72505,11 +72791,8 @@ mod sqlite_support {
         nrows: Option<usize>,
         sink: &mut InlineRowSink<'_>,
     ) -> Result<()> {
-        check_no_pending_wal(path)?;
-        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
-        let mut header_buf = [0u8; 100];
-        file.read_exact(&mut header_buf)
-            .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+        let mut file = DbFile::open(path)?;
+        let header_buf = file.header_bytes(path)?;
         let header = read_header(&header_buf, path)?;
 
         let entries = read_schema(&mut file, &header, path)?;
@@ -72614,16 +72897,13 @@ mod sqlite_support {
         nrows: Option<usize>,
         n_samples: usize,
     ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
-        check_no_pending_wal(path)?;
-        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut file = DbFile::open(path)?;
         // Only the fixed 100-byte file header is ever needed up front -
         // everything past it (the schema, every table's own rows) is
         // read one page at a time via `read_page` as the b-tree walk
         // actually needs it, rather than loading the whole database into
         // memory before a single row is decoded.
-        let mut header_buf = [0u8; 100];
-        file.read_exact(&mut header_buf)
-            .with_context(|| format!("failed reading the SQLite header in {path:?}"))?;
+        let header_buf = file.header_bytes(path)?;
         let header = read_header(&header_buf, path)?;
         if header.text_encoding != 0 && header.text_encoding != 1 {
             bail!(

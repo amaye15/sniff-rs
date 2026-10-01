@@ -14676,14 +14676,16 @@ fn pdf_with_a_real_user_password_refuses_distinctly_from_a_malformed_encrypt_dic
 
 #[test]
 #[cfg(feature = "pdf")]
-fn pdf_lzw_is_a_clean_refusal() {
+fn pdf_lzw_stream_that_is_not_lzw_fails_cleanly() {
+    // The stream says LZWDecode but holds plain text: decoding it yields
+    // garbage, which the content parser rejects - a clean error, no panic.
     let output = Command::new(bin())
-        .args([fixture("edge_pdf_lzw.pdf").to_str().unwrap(), "-"])
+        .args([fixture("edge_pdf_lzw_garbage.pdf").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("LZWDecode"), "got: {stderr}");
+    assert!(!stderr.contains("panicked"), "got: {stderr}");
 }
 
 #[test]
@@ -16797,4 +16799,94 @@ fn a_corrupt_bzip2_or_xz_file_is_an_error_not_garbage() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A WAL-mode database that was copied while a connection was open keeps its
+// newest data only in the `-wal` file. The main file here holds 20 `people`
+// rows and nothing else; the log adds 12 more, an update to row 1, a whole
+// new table, and an unfinished transaction (150 rows that spilled into the
+// log without a commit frame) that must not show up.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_reads_committed_rows_from_a_write_ahead_log() {
+    let doc = run_json("edge_sqlite_wal_pending.db", &[]);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 32);
+    let extra = table(&doc, "extra");
+    assert_eq!(column(extra, "k")["row_count"], 5);
+    assert_eq!(column(extra, "v")["ideal_type"], "f64");
+    let sql = run_sql("edge_sqlite_wal_pending.db", &[]);
+    let people = insert_rows(&sql, "people");
+    assert_eq!(people.len(), 32);
+    assert!(
+        people.iter().any(|r| r.contains("'CHANGED'")),
+        "the update in the log is applied"
+    );
+    assert!(
+        !people.iter().any(|r| r.contains("uncommitted")),
+        "an unfinished transaction is ignored"
+    );
+    assert!(
+        !people.iter().any(|r| r.contains("'p0'")),
+        "row 1 was renamed in the log"
+    );
+}
+
+// An empty main file plus a log is a complete database (a new database that
+// was never checkpointed), including its header.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_reads_a_database_that_exists_only_in_its_log() {
+    let doc = run_json("edge_sqlite_wal_logonly.db", &[]);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 12);
+    assert_eq!(column(table(&doc, "extra"), "k")["row_count"], 5);
+    assert!(
+        insert_rows(&run_sql("edge_sqlite_wal_logonly.db", &[]), "people")
+            .iter()
+            .any(|r| r.contains("'CHANGED'"))
+    );
+}
+
+// A log whose frames are cut short or whose checksums stop matching ends the
+// valid log there - what came before still counts, what comes after doesn't.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_ignores_a_truncated_or_corrupt_write_ahead_log_tail() {
+    let dir = TempDir::new();
+    let db = dir.path().join("app.db");
+    std::fs::copy(fixture("edge_sqlite_wal_pending.db"), &db).unwrap();
+    let wal = std::fs::read(fixture("edge_sqlite_wal_pending.db-wal")).unwrap();
+    // Cut mid-frame near the end: the last complete commit survives.
+    std::fs::write(dir.path().join("app.db-wal"), &wal[..wal.len() - 5000]).unwrap();
+    let doc = run_json_at(&db);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 32);
+    // Flip a byte in the middle of the first frame's page: that frame's
+    // checksum fails, so no log frame is valid and only the main file shows.
+    let mut bad = wal.clone();
+    bad[32 + 24 + 100] ^= 0xff;
+    std::fs::write(dir.path().join("app.db-wal"), &bad).unwrap();
+    let doc = run_json_at(&db);
+    assert_eq!(column(table(&doc, "people"), "id")["row_count"], 20);
+}
+
+// LZWDecode, with both /EarlyChange settings. Each fixture's content stream
+// is ~60 KB of text LZW-compressed to ~36 KB by an independent encoder (and
+// checked to decode identically in qpdf), long enough to cross every code
+// width (9 to 12 bits) and to hit the table-full clear code several times.
+#[cfg(feature = "pdf")]
+#[test]
+fn pdf_lzw_streams_decode_with_either_early_change_setting() {
+    for name in ["edge_pdf_lzw.pdf", "edge_pdf_lzw_early0.pdf"] {
+        let sql = run_sql(name, &[]);
+        for line in [
+            "gfeyczzug euana cfomrienr upzdk ugmxmga sjr yindoy sbqgbcn oikuhp",
+            "aburlt seh tfl shekou zdqppye fbilb dnpwo he mkthm",
+            "qkpqsg mb xqr nbwb imlselk luo emubcrd kwjes rrgxcbxn",
+        ] {
+            assert!(sql.contains(line), "{name} lost the line {line:?}");
+        }
+        assert!(
+            !sql.contains('\u{FFFD}'),
+            "{name} decoded to replacement characters"
+        );
+    }
 }
