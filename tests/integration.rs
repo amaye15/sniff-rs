@@ -17877,3 +17877,136 @@ fn a_directory_run_discloses_the_fallback_per_file() {
     assert_eq!(stderr.matches("isn't valid UTF-8").count(), 1, "{stderr}");
     assert!(stderr.contains("a.csv isn't valid UTF-8"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// `#`-commented tables and genomics formats (VCF, BED, GFF/GTF)
+// ---------------------------------------------------------------------------
+
+fn col_names(doc: &serde_json::Value, tbl: &str) -> Vec<String> {
+    table(doc, tbl)
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_vcf_takes_its_header_from_the_chrom_line_and_reads_dot_as_missing() {
+    let doc = run_json("edge_vcf_missing_dots.vcf", &[]);
+    assert_eq!(doc["format"], "vcf-variants");
+    let t = "edge_vcf_missing_dots";
+    assert_eq!(
+        col_names(&doc, t),
+        [
+            "CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT", "NA00001",
+            "NA00002"
+        ]
+    );
+    let id = column(table(&doc, t), "ID");
+    assert!((id["missing_pct"].as_f64().unwrap() - 33.3).abs() < 0.05);
+    assert_eq!(column(table(&doc, t), "POS")["ideal_type"], "i64");
+}
+
+#[test]
+fn a_vcf_with_meta_lines_matches_pysam_row_for_row() {
+    // example_comments.vcf is pysam's own test file: 5 records after a block
+    // of ## lines, with the #CHROM header last.
+    let doc = run_json("edge_vcf_pysam_comments.vcf", &[]);
+    let t = "edge_vcf_pysam_comments";
+    assert_eq!(table(&doc, t)[0]["row_count"], 5);
+    assert_eq!(col_names(&doc, t)[..3], ["CHROM", "POS", "ID"]);
+}
+
+#[test]
+fn bed_has_no_header_so_the_format_names_the_columns() {
+    let doc = run_json("edge_bed_five_columns.bed", &[]);
+    assert_eq!(doc["format"], "bed");
+    assert_eq!(
+        col_names(&doc, "edge_bed_five_columns"),
+        ["chrom", "chromStart", "chromEnd", "name", "score"]
+    );
+    assert_eq!(table(&doc, "edge_bed_five_columns")[0]["row_count"], 4);
+}
+
+#[test]
+fn a_bed_minus_strand_is_a_value_not_a_missing_marker() {
+    let doc = run_json("edge_bed_track_and_minus_strand.bed", &[]);
+    let t = "edge_bed_track_and_minus_strand";
+    let strand = column(table(&doc, t), "strand");
+    assert_eq!(strand["missing_pct"].as_f64().unwrap(), 0.0);
+    assert_eq!(sample_names(&doc, t, "strand"), ["+", "-"]);
+    // The track line isn't a row.
+    assert_eq!(table(&doc, t)[0]["row_count"], 3);
+    let sql = run_sql("edge_bed_track_and_minus_strand.bed", &[]);
+    assert!(sql.contains("'Neg1', 0, '-')"), "{sql}");
+}
+
+#[test]
+fn gff3_skips_triple_hash_lines_and_stops_at_the_fasta_trailer() {
+    let doc = run_json("edge_gff3_fasta_trailer.gff3", &[]);
+    let t = "edge_gff3_fasta_trailer";
+    assert_eq!(doc["format"], "gff");
+    assert_eq!(table(&doc, t)[0]["row_count"], 3);
+    assert_eq!(col_names(&doc, t)[..3], ["seqid", "source", "type"]);
+    // `.` is GFF's missing marker.
+    assert_eq!(column(table(&doc, t), "score")["missing_pct"], 100.0);
+    let sql = run_sql("edge_gff3_fasta_trailer.gff3", &["--nrows", "2"]);
+    assert_eq!(sql.matches("'ctg123'").count(), 2, "{sql}");
+    let sql = run_sql("edge_gff3_fasta_trailer.gff3", &[]);
+    assert!(!sql.contains("cttctggg"), "the FASTA trailer must not load");
+}
+
+#[test]
+fn gtf_quoted_attributes_are_one_column_and_pysam_comments_are_skipped() {
+    let doc = run_json("edge_gtf_pysam_comments.gtf", &[]);
+    let t = "edge_gtf_pysam_comments";
+    assert_eq!(table(&doc, t).len(), 9);
+    assert_eq!(table(&doc, t)[0]["row_count"], 39);
+}
+
+#[test]
+fn a_gff_is_recognized_by_its_version_line_without_an_extension() {
+    let doc = run_json("edge_gff3_no_extension", &[]);
+    assert_eq!(doc["format"], "gff");
+}
+
+#[test]
+fn a_tsv_with_a_comment_block_and_a_commented_header_reads_cleanly() {
+    let path = fixture("edge_tsv_comment_header.tsv");
+    let (doc, stderr) = run_with_stderr(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("2 leading comment line(s)"), "{stderr}");
+    assert_eq!(
+        col_names(&doc, "edge_tsv_comment_header"),
+        ["chr", "pos", "pval"]
+    );
+    assert_eq!(table(&doc, "edge_tsv_comment_header")[0]["row_count"], 3);
+}
+
+#[test]
+fn a_comment_block_followed_by_a_plain_header_row() {
+    let doc = run_json("edge_tsv_comment_block.tsv", &[]);
+    assert_eq!(col_names(&doc, "edge_tsv_comment_block"), ["id", "score"]);
+    assert_eq!(table(&doc, "edge_tsv_comment_block")[0]["row_count"], 2);
+}
+
+#[test]
+fn a_header_whose_first_column_is_just_a_hash_stays_a_header() {
+    let doc = run_json("edge_csv_hash_first_column.csv", &[]);
+    assert_eq!(
+        col_names(&doc, "edge_csv_hash_first_column"),
+        ["#", "Name", "Price"]
+    );
+}
+
+#[cfg(feature = "vcard")]
+#[test]
+fn a_vcard_vcf_is_still_a_vcard() {
+    let doc = run_json("sample.vcf", &[]);
+    assert_eq!(doc["format"], "vcard");
+}
+
+#[test]
+fn explicit_skip_rows_overrides_the_comment_layout() {
+    let doc = run_json("edge_tsv_comment_block.tsv", &["--skip-rows", "3"]);
+    // Row 3 (the first data row) becomes the header.
+    assert_eq!(col_names(&doc, "edge_tsv_comment_block"), ["1", "0.5"]);
+}

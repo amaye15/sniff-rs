@@ -17998,6 +17998,64 @@ on invalid UTF-8 and now succeed, in all three output modes. Full suite
 unchanged (the minimal build's one dead-code error on `is_wkb_blob`, left
 over from gap audit 4, is fixed by gating it on `sqlite`, its only caller).
 
+## Gap audit 6: `#`-commented tables and genomics text formats
+
+Bioinformatics tables are tab-separated text with a block of `#` lines in
+front (and sometimes no header at all), so the CSV reader either failed on
+them (`##` metadata, ragged rows) or took the first comment for the header.
+One mechanism now covers them and any CSV/TSV that starts with `#` lines.
+
+- **`comment_layout`** reads the first 256 KiB, collects the leading `#`
+  lines (blank lines aren't records, so they don't count), and finds the
+  header: the last `#` line when it has the same number of fields as the
+  first data row (`#CHROM...`, a GWAS export's `# chr pos pval`), else the
+  first data row. A header whose first field is only `#` (`#,Name,Price`)
+  stays a header and keeps its name; otherwise the `#` is stripped.
+  `--skip-rows` still overrides everything. A table with no leading `#`
+  line reads exactly as before (the layout returns `None`), and
+  `read_csv_sniff_sample` drops the leading `#` block before dialect
+  detection, since VCF metadata says nothing about the delimiter.
+- **`CsvExtras`** carries what the reader needs beyond a skip count:
+  `names` (no header row), `strip_hash`, `skip_comments` (a single-field
+  `#` record among the data is not a row - GFF3's `###`, never in a
+  one-column table), `stop_at` (GFF3's `##FASTA` trailer), and `missing`
+  (the format's own missing tokens). The profiling pass
+  (`CsvColumnAccumulator`) and the inline-SQL pass (`accept_csv_record`)
+  apply the same rules, so the two can't disagree.
+- **Three formats on top**: `vcf-variants` (`##fileformat=VCF` meta lines,
+  `#CHROM` header, missing is `.`), `bed` (UCSC BED, no header: the twelve
+  standard names for as many columns as the file has, `track`/`browser`
+  lines skipped, missing is only an empty field so a `-` strand stays a
+  value), and `gff` (GFF3, GTF, GFF2: nine standard names, missing is `.`,
+  `##FASTA` ends the table). All read tab-separated with no quote
+  character - a GTF attribute is `gene_id "ENSG..."`, quotes that are data.
+  `.vcf` is vCard or Variant Call Format: the content decides (the
+  `##fileformat=VCF` line), `--format vcf` does the same, and
+  `--format vcf-variants` forces it. `.bed`, `.gff`, `.gff3`, `.gtf` are
+  extensions; `##gff-version` and `##fileformat=VCF` also sniff an
+  extensionless file. `.vcf.gz` and bgzipped files read through the gzip
+  wrapper (multi-member gzip). These formats have format-fixed schemas, so
+  the knowledge graph doesn't link two of them for sharing columns.
+
+Verified against pysam and a plain parser on real files: pysam's own test
+data (`ex1.vcf.gz` 165 records, the commented VCF/BED/GTF variants,
+`example.gtf` 237 records, the unicode VCF, five-column BED). Every VCF's
+columns and row count match pysam's header and records, every VCF cell
+(chrom, pos, id, ref, alt, qual) matches pysam's record through the
+inline-SQL path loaded into SQLite, and every GTF cell matches the raw
+line (the one difference is a leading space the SQL literal trims). BED
+and GTF have no independent Python reader installed here, so those are
+checked against a plain split of the file. Fixtures are under
+`tests/fixtures/edge_{vcf,bed,gtf,gff3,tsv,csv}_*`, two of them
+(`edge_vcf_pysam_comments.vcf`, `edge_bed_pysam_comments.bed`) taken
+verbatim from pysam's tests.
+
+Disclosed: SAM text (`@` header lines, a variable number of optional tag
+columns) isn't read; BED whose columns are space-separated needs
+`--delimiter ' '`; BED `thickStart`.. names are positional, so a BED10 or a
+narrowPeak file gets the BED names for its columns rather than its own;
+VCF `INFO`/`FORMAT` fields stay text columns.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

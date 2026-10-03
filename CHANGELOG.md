@@ -51,6 +51,15 @@ All notable changes to sniff-rs are documented here. Format follows
   under 4 MB of memory. Checked cell by cell against ReadStat/pyreadstat
   (and pandas, which turns a stored zero into 5.4e-79) on real NHANES files
   and 400 generated ones.
+- Genomics text formats: VCF variant calls (`vcf-variants`), BED and
+  GFF3/GTF/GFF2 (`bed`, `gff`). The `#CHROM` line is the VCF header, BED and
+  GFF get their standard column names, `.` is missing in VCF and GFF while a
+  BED `-` strand stays a value, GFF3 `###` lines and the `##FASTA` trailer
+  are skipped, and `.vcf` is told from vCard by its `##fileformat=VCF` line.
+  Checked against pysam on its own test files.
+- Any CSV/TSV that starts with `#` lines: the block is skipped, and a last
+  `#` line shaped like the header (`# chr pos pval`) becomes the header.
+  Dialect detection ignores the block.
 - Text that isn't valid UTF-8 and names no encoding is no longer a hard
   error: it is read as windows-1252 with a note on stderr saying so (`--encoding`
   still wins; UTF-16/32 without a BOM and binary files still refuse).

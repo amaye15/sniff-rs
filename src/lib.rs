@@ -3432,7 +3432,7 @@ INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SAS Transport (.xpt), SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
 HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
-text, or a Delta Lake/Apache Iceberg
+text, VCF variant calls, BED and GFF/GTF genomic tables, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3510,7 +3510,7 @@ OPTIONS:
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
                                  sas7bdat, xport, spss, orc, bson, plist, json5, har, geojson,
-                                 mbox, vcard, icalendar, ipynb, or pdf - single-file mode only. Run
+                                 mbox, vcard, vcf-variants, bed, gff, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -9141,10 +9141,11 @@ struct CsvColumnAccumulator {
     col_states: Vec<ColumnAccumulatorState>,
     total: usize,
     done: bool,
+    extras: CsvExtras,
 }
 
 impl CsvColumnAccumulator {
-    fn new(skip_rows: usize, nrows: Option<usize>, n_samples: usize) -> Self {
+    fn new(skip_rows: usize, nrows: Option<usize>, n_samples: usize, extras: CsvExtras) -> Self {
         CsvColumnAccumulator {
             skip_rows,
             nrows,
@@ -9154,6 +9155,7 @@ impl CsvColumnAccumulator {
             col_states: Vec::new(),
             total: 0,
             done: false,
+            extras,
         }
     }
 
@@ -9161,14 +9163,44 @@ impl CsvColumnAccumulator {
         if self.done {
             return Ok(());
         }
+        if self.extras.stops_at(&record) {
+            self.done = true;
+            return Ok(());
+        }
+        if self.extras.is_comment_record(
+            &record,
+            self.record_index,
+            self.skip_rows,
+            self.headers.len(),
+        ) {
+            // A `#` line inside the data (GFF3's `###`): not a record, and
+            // not counted as one.
+            return Ok(());
+        }
+        if self.record_index >= self.skip_rows
+            && self.headers.is_empty()
+            && let Some(names) = &self.extras.names
+        {
+            // No header row in this format: the standard column names
+            // stand in for it, sized to the first data record.
+            self.headers = extend_names(names, record.len());
+            self.col_states = (0..record.len())
+                .map(|_| ColumnAccumulatorState::new())
+                .collect();
+        }
         if self.record_index < self.skip_rows {
             // A skipped leading row - discarded, never even reaching a
             // header or column concept.
-        } else if self.record_index == self.skip_rows {
+        } else if self.record_index == self.skip_rows && self.extras.names.is_none() {
             self.col_states = (0..record.len())
                 .map(|_| ColumnAccumulatorState::new())
                 .collect();
             self.headers = record;
+            if self.extras.strip_hash
+                && let Some(first) = self.headers.first_mut()
+            {
+                *first = first.trim_start_matches('#').trim_start().to_string();
+            }
         } else if self.nrows.is_some_and(|limit| self.total >= limit) {
             self.done = true;
         } else {
@@ -9180,8 +9212,7 @@ impl CsvColumnAccumulator {
                 );
             }
             for (col_idx, field) in record.into_iter().enumerate() {
-                let trimmed = field.trim();
-                if !(trimmed.is_empty() || is_missing_sentinel(trimmed)) {
+                if !self.extras.is_missing(&field) {
                     self.col_states[col_idx].push(field, self.n_samples);
                 }
             }
@@ -9215,6 +9246,7 @@ impl CsvColumnAccumulator {
 /// still used by every other reader) - building `ColumnProfile`s directly
 /// from each column's already-reduced state via `ColumnAccumulatorState::
 /// into_profile`.
+#[cfg(test)]
 fn columns_from_csv(
     path: &Path,
     nrows: Option<usize>,
@@ -9222,10 +9254,28 @@ fn columns_from_csv(
     skip_rows: usize,
     n_samples: usize,
 ) -> Result<Vec<ColumnProfile>> {
+    columns_from_csv_layout(
+        path,
+        nrows,
+        dialect,
+        skip_rows,
+        n_samples,
+        CsvExtras::default(),
+    )
+}
+
+fn columns_from_csv_layout(
+    path: &Path,
+    nrows: Option<usize>,
+    dialect: CsvDialect,
+    skip_rows: usize,
+    n_samples: usize,
+    extras: CsvExtras,
+) -> Result<Vec<ColumnProfile>> {
     let mut csv_state = CsvState::StartRecord;
     let mut field = String::new();
     let mut record: Vec<String> = Vec::new();
-    let mut acc = CsvColumnAccumulator::new(skip_rows, nrows, n_samples);
+    let mut acc = CsvColumnAccumulator::new(skip_rows, nrows, n_samples, extras);
     let mut first_chunk = true;
 
     stream_utf8_chunks(path, |chunk| {
@@ -9427,6 +9477,270 @@ fn resolve_skip_rows(explicit: Option<usize>, path: &Path, dialect: CsvDialect) 
     }
 }
 
+/// What a `#`-commented or headerless table needs on top of the plain CSV
+/// reader: a block of `#` lines before the data (VCF's `##` metadata, a
+/// GWAS export's provenance notes), a header written as the last of them
+/// (`#CHROM`), no header at all (BED, GFF/GTF - the format fixes the column
+/// names), `#` lines between records (GFF3's `###`), and a trailer that
+/// isn't a table (GFF3's `##FASTA`).
+#[derive(Clone, Default)]
+struct CsvExtras {
+    /// Column names for a file with no header row.
+    names: Option<Vec<String>>,
+    /// The header record is a `#`-prefixed line; the `#` isn't part of the name.
+    strip_hash: bool,
+    /// A single-field record starting with `#` among the data is a comment.
+    skip_comments: bool,
+    /// A single-field record starting with this ends the table.
+    stop_at: Option<&'static str>,
+    /// The format's own missing-value tokens, replacing the CSV guess list
+    /// (`NA`, `-`, `?`, ...): in VCF and GFF a lone `.`, in BED nothing but
+    /// an empty field - `-` is a strand there, `NA` can be a gene name.
+    missing: Option<&'static [&'static str]>,
+}
+
+impl CsvExtras {
+    /// Whether `field` is a missing value under this table's own rule.
+    fn is_missing(&self, field: &str) -> bool {
+        let t = field.trim();
+        match self.missing {
+            Some(tokens) => t.is_empty() || tokens.contains(&t),
+            None => t.is_empty() || is_missing_sentinel(t),
+        }
+    }
+
+    fn stops_at(&self, record: &[String]) -> bool {
+        self.stop_at
+            .is_some_and(|p| record.len() == 1 && record[0].starts_with(p))
+    }
+
+    /// Whether `record` is a `#` line to drop. `ncols` is the table width
+    /// once known (0 before the first data record): a one-column table's
+    /// own values can start with `#`, so nothing is dropped there.
+    fn is_comment_record(
+        &self,
+        record: &[String],
+        record_index: usize,
+        skip_rows: usize,
+        ncols: usize,
+    ) -> bool {
+        self.skip_comments
+            && record_index >= skip_rows
+            && ncols != 1
+            && record.len() == 1
+            && record[0].starts_with('#')
+    }
+}
+
+/// The columns a format fixes by name, extended with `<prefix>N` for any
+/// further column the file has.
+fn extend_names(base: &[String], n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            base.get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("extra_{}", i + 1))
+        })
+        .collect()
+}
+
+/// Which family of `#`-commented table a format is (`Generic` is any CSV/TSV).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableKind {
+    Generic,
+    Vcf,
+    Bed,
+    Gff,
+}
+
+fn table_kind(format: InputFormat) -> TableKind {
+    match format {
+        InputFormat::Vcf => TableKind::Vcf,
+        InputFormat::Bed => TableKind::Bed,
+        InputFormat::Gff => TableKind::Gff,
+        _ => TableKind::Generic,
+    }
+}
+
+/// UCSC BED's twelve columns, in order (BED3 is the first three).
+const BED_COLUMNS: [&str; 12] = [
+    "chrom",
+    "chromStart",
+    "chromEnd",
+    "name",
+    "score",
+    "strand",
+    "thickStart",
+    "thickEnd",
+    "itemRgb",
+    "blockCount",
+    "blockSizes",
+    "blockStarts",
+];
+
+/// GFF3 / GTF / GFF2: nine tab-separated columns.
+const GFF_COLUMNS: [&str; 9] = [
+    "seqid",
+    "source",
+    "type",
+    "start",
+    "end",
+    "score",
+    "strand",
+    "phase",
+    "attributes",
+];
+
+/// VCF's eight fixed columns, then `FORMAT`; the samples follow.
+const VCF_COLUMNS: [&str; 9] = [
+    "CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT",
+];
+
+struct CommentLayout {
+    skip_rows: usize,
+    extras: CsvExtras,
+}
+
+/// Reads the head of `path` for a block of `#` lines (and, for BED,
+/// `track`/`browser` lines) in front of the table, and works out where the
+/// header is: the last `#` line when it has the same number of fields as
+/// the first data row (VCF's `#CHROM`, a GWAS export's `#chr pos ...`),
+/// otherwise the first data row - or, for BED and GFF/GTF, nowhere, since
+/// the format fixes the names. `None` for a plain table with no leading
+/// `#` lines, which then reads exactly as it always did.
+fn comment_layout(path: &Path, dialect: CsvDialect, kind: TableKind) -> Option<CommentLayout> {
+    const PREFIX_BUDGET: usize = 256 * 1024;
+    let (content, capped) = read_text_prefix(path, PREFIX_BUDGET).ok()?;
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+    let mut lines: Vec<&str> = content.lines().collect();
+    if capped {
+        lines.pop(); // the last line may have been cut by the budget
+    }
+    let is_comment = |l: &str| {
+        l.starts_with('#')
+            || (kind == TableKind::Bed && (l.starts_with("track ") || l.starts_with("browser ")))
+    };
+    let mut lead: Vec<&str> = Vec::new();
+    let mut first_data: Option<&str> = None;
+    for l in lines {
+        if l.trim().is_empty() {
+            continue; // the reader drops blank lines, so they aren't records
+        }
+        if is_comment(l) {
+            lead.push(l);
+        } else {
+            first_data = Some(l);
+            break;
+        }
+    }
+    if kind == TableKind::Generic && lead.is_empty() {
+        return None;
+    }
+    let width = |line: &str| parse_csv_dialect(line, dialect).first().map_or(0, Vec::len);
+    let n_data = first_data.map_or(0, width);
+    // The last `#` line is the header when it is shaped like one. `strip` is
+    // false when its first field is nothing but `#` (`#,Name,Price`): that
+    // `#` is a column name, not a comment marker.
+    let header_comment: Option<(&str, bool)> = lead
+        .last()
+        .copied()
+        .filter(|l| l.starts_with('#') && !l.starts_with("##"))
+        .and_then(|l| {
+            let first = l.split(dialect.delimiter).next().unwrap_or("");
+            let strip = !first.trim_start_matches('#').trim().is_empty();
+            match kind {
+                TableKind::Vcf => l.starts_with("#CHROM").then_some((l, true)),
+                TableKind::Generic => {
+                    let fields = width(&l[1..]);
+                    (fields >= 2 && fields == n_data).then_some((l, strip))
+                }
+                _ => None,
+            }
+        });
+    let skip_rows = lead.len() - usize::from(header_comment.is_some());
+    let mut extras = CsvExtras {
+        skip_comments: true,
+        strip_hash: header_comment.is_some_and(|(_, strip)| strip),
+        ..CsvExtras::default()
+    };
+    let named = |base: &[&str]| -> Option<Vec<String>> {
+        (n_data > 0).then(|| base.iter().map(|s| (*s).to_string()).collect())
+    };
+    match kind {
+        TableKind::Bed => {
+            extras.names = named(&BED_COLUMNS);
+            extras.missing = Some(&[]);
+        }
+        TableKind::Gff => {
+            extras.names = named(&GFF_COLUMNS);
+            extras.stop_at = Some("##FASTA");
+            extras.missing = Some(&["."]);
+        }
+        TableKind::Vcf => {
+            extras.missing = Some(&["."]);
+            if header_comment.is_none() {
+                extras.names = (n_data > 0).then(|| {
+                    (0..n_data)
+                        .map(|i| {
+                            VCF_COLUMNS.get(i).map_or_else(
+                                || format!("sample_{}", i - VCF_COLUMNS.len() + 1),
+                                |c| (*c).to_string(),
+                            )
+                        })
+                        .collect()
+                });
+            }
+        }
+        _ => {}
+    }
+    Some(CommentLayout { skip_rows, extras })
+}
+
+/// The skip count and extras to read `path` with: `--skip-rows` when given,
+/// else the `#`-comment layout, else the older preamble-row detection.
+fn resolve_table_layout(
+    path: &Path,
+    args: &Args,
+    format: InputFormat,
+    dialect: CsvDialect,
+) -> (usize, CsvExtras) {
+    let kind = table_kind(format);
+    let layout = comment_layout(path, dialect, kind);
+    let mut extras = layout
+        .as_ref()
+        .map(|l| l.extras.clone())
+        .unwrap_or_default();
+    if args.skip_rows.is_some() {
+        extras.strip_hash = false;
+    }
+    let skip = match (args.skip_rows, &layout) {
+        (Some(n), _) => n,
+        (None, Some(l)) => {
+            if l.skip_rows > 0 && kind == TableKind::Generic {
+                eprintln!(
+                    "detected {} leading comment line(s) before the table - skipping (pass --skip-rows to override)",
+                    l.skip_rows
+                );
+            }
+            l.skip_rows
+        }
+        (None, None) => resolve_skip_rows(None, path, dialect),
+    };
+    (skip, extras)
+}
+
+/// Just the extras of `resolve_table_layout` - what the inline-SQL second
+/// pass needs, since the skip count comes from the profiling pass.
+fn table_extras(path: &Path, args: &Args, format: InputFormat, dialect: CsvDialect) -> CsvExtras {
+    let mut extras = comment_layout(path, dialect, table_kind(format))
+        .map(|l| l.extras)
+        .unwrap_or_default();
+    if args.skip_rows.is_some() {
+        extras.strip_hash = false;
+    }
+    extras
+}
+
 /// How much of a delimited file the dialect detector looks at. The measure
 /// is evaluated per candidate dialect, so a bounded, line-aligned prefix
 /// keeps big files cheap without changing what real files look like.
@@ -9454,6 +9768,15 @@ fn read_csv_sniff_sample(path: &Path) -> Option<String> {
     if capped && let Some(newline) = sample.rfind('\n') {
         sample.truncate(newline + 1);
     }
+    // A block of `#` lines in front (VCF metadata, provenance notes) says
+    // nothing about the table's delimiter and can hide it.
+    if sample.starts_with('#') {
+        let rest = sample
+            .split_inclusive('\n')
+            .skip_while(|l| l.starts_with('#') || l.trim().is_empty())
+            .collect::<String>();
+        sample = rest;
+    }
     (!sample.contains('\0')).then_some(sample)
 }
 
@@ -9479,6 +9802,18 @@ fn resolve_csv_dialect(
         return CsvDialect {
             delimiter: '\t',
             ..CsvDialect::DEFAULT
+        };
+    }
+    if matches!(
+        format,
+        InputFormat::Vcf | InputFormat::Bed | InputFormat::Gff
+    ) {
+        // Tab-separated by definition, and no quoting: a GTF attribute is
+        // `gene_id "ENSG..."`, quotes that are data.
+        return CsvDialect {
+            delimiter: '\t',
+            quote: '\0',
+            escape: '\0',
         };
     }
     let Some(sample) = read_csv_sniff_sample(path) else {
@@ -75460,6 +75795,12 @@ enum InputFormat {
     Ical,
     Ipynb,
     Pdf,
+    /// Variant Call Format (`##` metadata, a `#CHROM` header, tab-separated).
+    Vcf,
+    /// UCSC BED: tab-separated genomic intervals, no header row.
+    Bed,
+    /// GFF3 / GTF / GFF2: nine tab-separated columns, no header row.
+    Gff,
     /// A Delta Lake table directory (`_delta_log/` present) - detected
     /// directly from the input path being such a directory, never from an
     /// extension or `--format` (a Delta table has no file extension of its
@@ -75538,6 +75879,9 @@ impl InputFormat {
             InputFormat::Har => "har",
             InputFormat::GeoJson => "geojson",
             InputFormat::Mbox => "mbox",
+            InputFormat::Vcf => "vcf-variants",
+            InputFormat::Bed => "bed",
+            InputFormat::Gff => "gff",
             InputFormat::Vcard => "vcard",
             InputFormat::Ical => "icalendar",
             InputFormat::Ipynb => "ipynb",
@@ -75848,6 +76192,27 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
         extensions: &["vcf"],
         feature: Some("vcard"),
         compiled_in: cfg!(feature = "vcard"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "vcf-variants",
+        extensions: &[],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "bed",
+        extensions: &["bed"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "gff",
+        extensions: &["gff", "gff3", "gtf"],
+        feature: None,
+        compiled_in: true,
         directory: false,
     },
     FormatInfo {
@@ -76237,6 +76602,20 @@ fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// extension or `--format`. Fixed-width text and the four log formats are
 /// skipped for the same reason they're already `--format`-only: no
 /// delimiter or magic number distinguishes them from generic text either.
+/// Whether `path` opens with a Variant Call Format meta line
+/// (`##fileformat=VCFv4.x`) - what tells a genomics `.vcf` from a vCard one.
+fn sniff_variant_calls(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 64];
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let n = f.read(&mut head).unwrap_or(0);
+    let head = &head[..n];
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    head.starts_with(b"##fileformat=VCF")
+}
+
 fn sniff_format(path: &Path) -> Option<InputFormat> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -76249,6 +76628,17 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
         .ok()?;
     if head.is_empty() {
         return None;
+    }
+
+    // Genomics text formats open with a fixed meta line.
+    {
+        let text = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&head);
+        if text.starts_with(b"##fileformat=VCF") {
+            return Some(InputFormat::Vcf);
+        }
+        if text.starts_with(b"##gff-version") {
+            return Some(InputFormat::Gff);
+        }
     }
 
     // --- Fixed magic numbers - each verified against the reader crate's
@@ -76516,7 +76906,11 @@ fn detect_format(
             "har" => Ok(InputFormat::Har),
             "geojson" => Ok(InputFormat::GeoJson),
             "mbox" => Ok(InputFormat::Mbox),
+            "vcf" if sniff_variant_calls(read_path) => Ok(InputFormat::Vcf),
             "vcard" | "vcf" => Ok(InputFormat::Vcard),
+            "vcf-variants" | "variants" => Ok(InputFormat::Vcf),
+            "bed" => Ok(InputFormat::Bed),
+            "gff" | "gff3" | "gtf" => Ok(InputFormat::Gff),
             "icalendar" | "ical" | "ics" => Ok(InputFormat::Ical),
             "ipynb" => Ok(InputFormat::Ipynb),
             "pdf" => Ok(InputFormat::Pdf),
@@ -76534,6 +76928,10 @@ fn detect_format(
         .unwrap_or("")
         .to_lowercase();
     if let Some(format) = format_from_extension(&ext) {
+        // `.vcf` is vCard contacts or Variant Call Format; the content says which.
+        if matches!(format, InputFormat::Vcard) && sniff_variant_calls(read_path) {
+            return Ok(InputFormat::Vcf);
+        }
         return Ok(format);
     }
     // The extension alone doesn't tell us - either there isn't one, or
@@ -76598,6 +76996,8 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "geojson" => InputFormat::GeoJson,
         "mbox" => InputFormat::Mbox,
         "vcf" => InputFormat::Vcard,
+        "bed" => InputFormat::Bed,
+        "gff" | "gff3" | "gtf" => InputFormat::Gff,
         "ics" => InputFormat::Ical,
         "ipynb" => InputFormat::Ipynb,
         "pdf" => InputFormat::Pdf,
@@ -80351,7 +80751,11 @@ fn sql_load_hint(
          -- SQL and runs unmodified on every engine.\n"
     );
     match format {
-        InputFormat::Csv | InputFormat::Tsv => {
+        InputFormat::Csv
+        | InputFormat::Tsv
+        | InputFormat::Vcf
+        | InputFormat::Bed
+        | InputFormat::Gff => {
             s.push_str(&format!(
                 "--\n\
                  -- DuckDB:\n\
@@ -80587,7 +80991,10 @@ fn render_sql_staging(
         fmt = format.as_str(),
     )?;
 
-    let delim = if matches!(format, InputFormat::Tsv) {
+    let delim = if matches!(
+        format,
+        InputFormat::Tsv | InputFormat::Vcf | InputFormat::Bed | InputFormat::Gff
+    ) {
         '\t'
     } else {
         ','
@@ -81357,10 +81764,28 @@ fn render_sql_inline_flat(
         // than "everything except the log formats" specifically so adding
         // the next headerless format here needs no change to this line at
         // all - only its own new match arm below.
+        let csv_extras = if matches!(
+            format,
+            InputFormat::Csv
+                | InputFormat::Tsv
+                | InputFormat::Vcf
+                | InputFormat::Bed
+                | InputFormat::Gff
+        ) {
+            let dialect = resolve_csv_dialect(read_path, args, *format, false);
+            table_extras(read_path, args, *format, dialect)
+        } else {
+            CsvExtras::default()
+        };
         let has_header = matches!(
             format,
-            InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
-        );
+            InputFormat::Csv
+                | InputFormat::Tsv
+                | InputFormat::Vcf
+                | InputFormat::Bed
+                | InputFormat::Gff
+                | InputFormat::FixedWidth
+        ) && csv_extras.names.is_none();
         // CSV/TSV/fixed-width are also the *only* formats in this tier with
         // no native-null concept whatsoever - every other row-source already
         // resolves missingness precisely at the reader level (a decoded
@@ -81373,10 +81798,16 @@ fn render_sql_inline_flat(
         // purpose, mirroring `has_header`'s own positive one: these three
         // are the fixed, closed set that can never gain a `None` from their
         // own row-source, everything else already can.
-        let values_pre_resolved = !matches!(
-            format,
-            InputFormat::Csv | InputFormat::Tsv | InputFormat::FixedWidth
-        );
+        let values_pre_resolved = csv_extras.missing.is_some()
+            || !matches!(
+                format,
+                InputFormat::Csv
+                    | InputFormat::Tsv
+                    | InputFormat::Vcf
+                    | InputFormat::Bed
+                    | InputFormat::Gff
+                    | InputFormat::FixedWidth
+            );
         let mut sink = InlineRowSink {
             resolved_skip_rows,
             has_header,
@@ -81499,7 +81930,7 @@ fn render_sql_inline_flat(
                 // CSV/TSV - every other format `render_sql`'s own
                 // `inline_supported` check allows through to this function.
                 let dialect = resolve_csv_dialect(read_path, args, *format, false);
-                render_sql_inline_flat_csv(read_path, dialect, &mut sink)?;
+                render_sql_inline_flat_csv(read_path, dialect, &csv_extras, &mut sink)?;
             }
         }
 
@@ -82368,6 +82799,7 @@ fn render_sql_inline_flat_arrow_ipc(
 fn render_sql_inline_flat_csv(
     read_path: &Path,
     dialect: CsvDialect,
+    extras: &CsvExtras,
     sink: &mut InlineRowSink<'_>,
 ) -> Result<()> {
     let mut csv_state = CsvState::StartRecord;
@@ -82393,7 +82825,7 @@ fn render_sql_inline_flat_csv(
             &mut csv_state,
             &mut field,
             &mut record,
-            &mut |r| sink.accept(r.into_iter().map(Some).collect()),
+            &mut |r| accept_csv_record(extras, sink, r),
         )?;
         Ok(!sink.done)
     })?;
@@ -82403,10 +82835,44 @@ fn render_sql_inline_flat_csv(
     // pending" check `columns_from_csv` itself uses.
     if !sink.done && csv_state != CsvState::StartRecord {
         record.push(std::mem::take(&mut field));
-        sink.accept(std::mem::take(&mut record).into_iter().map(Some).collect())?;
+        accept_csv_record(extras, sink, std::mem::take(&mut record))?;
     }
 
     Ok(())
+}
+
+/// One CSV record for the inline-SQL sink, after the same `#`-line and
+/// trailer handling the profiling pass applies (`CsvColumnAccumulator::accept`).
+fn accept_csv_record(
+    extras: &CsvExtras,
+    sink: &mut InlineRowSink<'_>,
+    record: Vec<String>,
+) -> Result<()> {
+    if sink.done || extras.stops_at(&record) {
+        sink.done = true;
+        return Ok(());
+    }
+    if extras.is_comment_record(
+        &record,
+        sink.record_index,
+        sink.resolved_skip_rows,
+        sink.header_len,
+    ) {
+        return Ok(());
+    }
+    // A format with its own missing-value tokens (VCF/GFF `.`, BED nothing
+    // but empty) resolves them here, so a BED `-` strand stays a value.
+    let values = record
+        .into_iter()
+        .map(|f| {
+            if extras.missing.is_some() && extras.is_missing(&f) {
+                None
+            } else {
+                Some(f)
+            }
+        })
+        .collect();
+    sink.accept(values)
 }
 
 /// The fixed-width row-source for `render_sql_inline_flat`: re-streams
@@ -82473,6 +82939,9 @@ fn inline_supported_format(format: &InputFormat) -> bool {
         format,
         InputFormat::Csv
             | InputFormat::Tsv
+            | InputFormat::Vcf
+            | InputFormat::Bed
+            | InputFormat::Gff
             | InputFormat::FixedWidth
             | InputFormat::CommonLog
             | InputFormat::CombinedLog
@@ -93529,6 +93998,9 @@ fn is_text_format(format: &InputFormat) -> bool {
         format,
         InputFormat::Csv
             | InputFormat::Tsv
+            | InputFormat::Vcf
+            | InputFormat::Bed
+            | InputFormat::Gff
             | InputFormat::Json
             | InputFormat::Toml
             | InputFormat::Yaml
@@ -93554,7 +94026,13 @@ fn is_text_format(format: &InputFormat) -> bool {
 fn reader_skips_utf8_bom(format: &InputFormat) -> bool {
     matches!(
         format,
-        InputFormat::Csv | InputFormat::Tsv | InputFormat::Toml | InputFormat::Json5
+        InputFormat::Csv
+            | InputFormat::Tsv
+            | InputFormat::Vcf
+            | InputFormat::Bed
+            | InputFormat::Gff
+            | InputFormat::Toml
+            | InputFormat::Json5
     )
 }
 
@@ -95630,11 +96108,22 @@ fn dispatch_reader(
         .collect()
     } else {
         let profiles: Vec<ColumnProfile> = match format {
-            InputFormat::Csv | InputFormat::Tsv => {
+            InputFormat::Csv
+            | InputFormat::Tsv
+            | InputFormat::Vcf
+            | InputFormat::Bed
+            | InputFormat::Gff => {
                 let dialect = resolve_csv_dialect(read_path, args, format, true);
-                let skip_rows = resolve_skip_rows(args.skip_rows, read_path, dialect);
+                let (skip_rows, extras) = resolve_table_layout(read_path, args, format, dialect);
                 resolved_skip_rows = skip_rows;
-                columns_from_csv(read_path, args.nrows, dialect, skip_rows, args.samples)?
+                columns_from_csv_layout(
+                    read_path,
+                    args.nrows,
+                    dialect,
+                    skip_rows,
+                    args.samples,
+                    extras,
+                )?
             }
             InputFormat::Json => columns_from_json(read_path, args.nrows, args.samples)?,
             InputFormat::Parquet => columns_from_parquet(read_path, args.nrows, args.samples)?,
@@ -97876,7 +98365,10 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                 // per-engine load commands need to point at the real,
                 // distinguishable file a combined script's own reader
                 // would actually have to load from disk.
-                let delim = if matches!(format, InputFormat::Tsv) {
+                let delim = if matches!(
+                    format,
+                    InputFormat::Tsv | InputFormat::Vcf | InputFormat::Bed | InputFormat::Gff
+                ) {
                     '\t'
                 } else {
                     ','
@@ -102933,6 +103425,9 @@ mod knowledge_graph {
             InputFormat::Pdf
                 | InputFormat::Ipynb
                 | InputFormat::Mbox
+                | InputFormat::Vcf
+                | InputFormat::Bed
+                | InputFormat::Gff
                 | InputFormat::Vcard
                 | InputFormat::Ical
                 | InputFormat::Har
