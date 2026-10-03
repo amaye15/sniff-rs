@@ -51,6 +51,13 @@ All notable changes to sniff-rs are documented here. Format follows
   under 4 MB of memory. Checked cell by cell against ReadStat/pyreadstat
   (and pandas, which turns a stored zero into 5.4e-79) on real NHANES files
   and 400 generated ones.
+- Text that isn't valid UTF-8 and names no encoding is no longer a hard
+  error: it is read as windows-1252 with a note on stderr saying so (`--encoding`
+  still wins; UTF-16/32 without a BOM and binary files still refuse).
+- XML's own `<?xml encoding="...">` declaration is honored, so a
+  `windows-1251` or `iso-8859-1` file reads without a flag. `.rss`,
+  `.atom`, `.gpx`, `.kml`, `.tcx`, `.xsd`, `.xslt`, `.wsdl`, `.rdf`,
+  `.opml` and `.xliff` are recognized as XML.
 - CSV and TSV dialects are detected from the data (the data-consistency
   measure of van den Burg et al., "Wrangling Messy CSV Files by Detecting
   Row and Type Patterns", 2019): delimiter, quote and escape character, so a

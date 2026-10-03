@@ -135,8 +135,8 @@ fn csv_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
     // Proves --nrows bounds real disk I/O for the streaming CSV reader,
     // not just how many rows get profiled afterward: a file with
     // deliberately invalid UTF-8 bytes appended well past the --nrows
-    // cutoff must still succeed with --nrows, and fail without it, on
-    // the identical file.
+    // cutoff must succeed with --nrows without ever noticing them, and
+    // without it reach them and disclose the windows-1252 fallback.
     // The valid prefix must exceed stream_utf8_chunks' own 256 KiB read
     // buffer, or the garbage bytes below would land in the *same* first
     // chunk as row 0 - failing UTF-8 validation before --nrows ever gets
@@ -149,8 +149,8 @@ fn csv_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
     }
     assert!(content.len() > 256 * 1024, "test fixture too small");
     let mut bytes = content.into_bytes();
-    bytes.extend_from_slice(&[0xFF, 0xFE]);
-    bytes.extend_from_slice(b" garbage not valid utf8\n");
+    // A well-formed final row whose name holds a Latin-1 byte (not UTF-8).
+    bytes.extend_from_slice(b"99999,caf\xe9\n");
     std::fs::write(&path, &bytes).unwrap();
 
     let with_nrows = Command::new(bin())
@@ -162,12 +162,20 @@ fn csv_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
         "{}",
         String::from_utf8_lossy(&with_nrows.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&with_nrows.stderr).contains("isn't valid UTF-8"),
+        "--nrows should stop before the invalid bytes are ever read"
+    );
 
     let without_nrows = Command::new(bin())
         .args([path.to_str().unwrap(), "-"])
         .output()
         .unwrap();
-    assert!(!without_nrows.status.success());
+    assert!(
+        without_nrows.status.success()
+            && String::from_utf8_lossy(&without_nrows.stderr).contains("isn't valid UTF-8"),
+        "without --nrows the invalid bytes are reached and the fallback is disclosed"
+    );
 }
 
 #[test]
@@ -186,8 +194,7 @@ fn jsonl_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
         content.push_str(&format!("{{\"id\": {i}, \"name\": \"user_{i}\"}}\n"));
     }
     let mut bytes = content.into_bytes();
-    bytes.extend_from_slice(&[0xFF, 0xFE]);
-    bytes.extend_from_slice(b" garbage not valid utf8\n");
+    bytes.extend_from_slice(b"{\"id\": 9999, \"name\": \"caf\xe9\"}\n");
     std::fs::write(&path, &bytes).unwrap();
 
     let with_nrows = Command::new(bin())
@@ -199,12 +206,20 @@ fn jsonl_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
         "{}",
         String::from_utf8_lossy(&with_nrows.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&with_nrows.stderr).contains("isn't valid UTF-8"),
+        "--nrows should stop before the invalid bytes are ever read"
+    );
 
     let without_nrows = Command::new(bin())
         .args([path.to_str().unwrap(), "-"])
         .output()
         .unwrap();
-    assert!(!without_nrows.status.success());
+    assert!(
+        without_nrows.status.success()
+            && String::from_utf8_lossy(&without_nrows.stderr).contains("isn't valid UTF-8"),
+        "without --nrows the invalid bytes are reached and the fallback is disclosed"
+    );
 }
 
 #[cfg(feature = "weblog")]
@@ -3041,6 +3056,10 @@ fn fixed_width_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
         "{}",
         String::from_utf8_lossy(&with_nrows.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&with_nrows.stderr).contains("isn't valid UTF-8"),
+        "--nrows should stop before the invalid bytes are ever read"
+    );
 
     let without_nrows = Command::new(bin())
         .args([
@@ -3053,7 +3072,11 @@ fn fixed_width_nrows_stops_reading_before_invalid_utf8_past_the_cutoff() {
         ])
         .output()
         .unwrap();
-    assert!(!without_nrows.status.success());
+    assert!(
+        without_nrows.status.success()
+            && String::from_utf8_lossy(&without_nrows.stderr).contains("isn't valid UTF-8"),
+        "without --nrows the invalid bytes are reached and the fallback is disclosed"
+    );
 }
 
 #[test]
@@ -5953,16 +5976,16 @@ fn ragged_csv_rows_produce_an_actionable_error_not_a_panic() {
 }
 
 #[test]
-fn invalid_utf8_csv_produces_an_actionable_error_not_a_panic() {
+fn invalid_utf8_csv_is_read_as_windows_1252_with_a_note_not_a_panic() {
     let output = Command::new(bin())
         .args([fixture("malformed_invalid_utf8.csv").to_str().unwrap(), "-"])
         .output()
         .expect("failed to run binary");
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("utf-8") || stderr.contains("UTF-8"),
-        "expected an actionable UTF-8 error, got: {stderr}"
+        stderr.contains("isn't valid UTF-8") && stderr.contains("windows-1252"),
+        "expected the fallback to be disclosed, got: {stderr}"
     );
 }
 
@@ -16593,7 +16616,8 @@ fn east_asian_encodings_decode_with_the_encoding_flag() {
         assert_eq!(sample_names(&doc, tbl, "name"), names, "{label}");
         assert_eq!(sample_names(&doc, tbl, "city"), cities, "{label}");
     }
-    // Without the flag these aren't UTF-8, and the error says what to do.
+    // Without the flag these aren't UTF-8: the file is still read (as
+    // windows-1252) and the note says which encodings to try.
     let out = Command::new(bin())
         .args([
             fixture("edge_encoding_shift_jis.csv").to_str().unwrap(),
@@ -16601,8 +16625,12 @@ fn east_asian_encodings_decode_with_the_encoding_flag() {
         ])
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("shift_jis"));
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("isn't valid UTF-8") && err.contains("shift_jis"),
+        "{err}"
+    );
 }
 
 #[cfg(all(feature = "cjk", feature = "dbase"))]
@@ -17708,4 +17736,144 @@ fn avro_duration_logical_type_renders_as_an_iso_8601_duration() {
             "(5, 'P30DT86400S')"
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Undeclared and declared encodings
+// ---------------------------------------------------------------------------
+
+fn run_with_stderr(args: &[&str]) -> (serde_json::Value, String) {
+    let output = Command::new(bin()).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        serde_json::from_slice(&output.stdout).expect("stdout was not JSON"),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn undeclared_latin1_text_is_read_as_windows_1252_and_says_so() {
+    let path = fixture("edge_encoding_undeclared_latin1.csv");
+    let (doc, stderr) = run_with_stderr(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(
+        stderr.contains("isn't valid UTF-8 - read as windows-1252")
+            && !stderr.contains("come in runs"),
+        "{stderr}"
+    );
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_undeclared_latin1", "city"),
+        ["Zürich", "Malmö", "Besançon"]
+    );
+    // An explicit --encoding wins and no guess is disclosed.
+    let (doc, stderr) = run_with_stderr(&[
+        path.to_str().unwrap(),
+        "-",
+        "--output-format",
+        "json",
+        "--encoding",
+        "latin1",
+    ]);
+    assert!(!stderr.contains("isn't valid UTF-8"), "{stderr}");
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_undeclared_latin1", "city"),
+        ["Zürich", "Malmö", "Besançon"]
+    );
+}
+
+#[test]
+fn undeclared_non_western_text_gets_a_pointed_hint_and_the_right_encoding_fixes_it() {
+    let path = fixture("edge_encoding_undeclared_cp1251.csv");
+    let (_, stderr) = run_with_stderr(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(
+        stderr.contains("come in runs") && stderr.contains("windows-1251"),
+        "{stderr}"
+    );
+    let (doc, stderr) = run_with_stderr(&[
+        path.to_str().unwrap(),
+        "-",
+        "--output-format",
+        "json",
+        "--encoding",
+        "windows-1251",
+    ]);
+    assert!(!stderr.contains("isn't valid UTF-8"), "{stderr}");
+    assert_eq!(
+        sample_names(&doc, "edge_encoding_undeclared_cp1251", "город"),
+        ["Москва", "Санкт-Петербург", "Казань"]
+    );
+}
+
+#[test]
+fn undeclared_latin1_jsonl_falls_back_too() {
+    let path = fixture("edge_encoding_undeclared_latin1.jsonl");
+    let (doc, stderr) = run_with_stderr(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("read as windows-1252"), "{stderr}");
+    assert!(
+        sample_names(&doc, "edge_encoding_undeclared_latin1", "a").contains(&"café".to_string())
+    );
+}
+
+#[cfg(feature = "xml")]
+#[test]
+fn an_xml_declaration_names_the_encoding_so_nothing_is_guessed() {
+    for (file, tbl, want) in [
+        (
+            "edge_xml_declared_latin1.xml",
+            "edge_xml_declared_latin1",
+            ["Café", "Zoë"],
+        ),
+        (
+            "edge_xml_declared_windows1251.xml",
+            "edge_xml_declared_windows1251",
+            ["Привет", "Мир"],
+        ),
+    ] {
+        let path = fixture(file);
+        let (doc, stderr) =
+            run_with_stderr(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+        assert!(!stderr.contains("isn't valid UTF-8"), "{file}: {stderr}");
+        assert_eq!(sample_names(&doc, tbl, "name"), want, "{file}");
+    }
+}
+
+#[test]
+fn nul_riddled_text_is_still_refused_rather_than_read_as_windows_1252() {
+    // UTF-16 without a byte-order mark: every other byte is NUL.
+    let out = Command::new(bin())
+        .args([
+            fixture("edge_encoding_utf16le_nobom.csv").to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("read as windows-1252"));
+}
+
+#[test]
+fn a_directory_run_discloses_the_fallback_per_file() {
+    let dir = TempDir::new();
+    std::fs::copy(
+        fixture("edge_encoding_undeclared_latin1.csv"),
+        dir.path().join("a.csv"),
+    )
+    .unwrap();
+    std::fs::copy(fixture("sample.csv"), dir.path().join("b.csv")).unwrap();
+    let out = dir.path().join("out");
+    let output = Command::new(bin())
+        .args([
+            dir.path().to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("isn't valid UTF-8").count(), 1, "{stderr}");
+    assert!(stderr.contains("a.csv isn't valid UTF-8"), "{stderr}");
 }

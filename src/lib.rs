@@ -6604,6 +6604,7 @@ mod geometry_support {
 
     /// One whole geometry of raw WKB/EWKB bytes (a SQLite or GeoPackage
     /// blob, before anything turns it into text).
+    #[cfg(feature = "sqlite")]
     pub fn is_wkb_blob(b: &[u8]) -> bool {
         matches!(b.first(), Some(0 | 1)) && b.len() >= 9 && is_wkb_bytes(b)
     }
@@ -75697,7 +75698,10 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
     },
     FormatInfo {
         name: "xml",
-        extensions: &["xml"],
+        extensions: &[
+            "xml", "rss", "atom", "gpx", "kml", "tcx", "xsd", "xslt", "wsdl", "rdf", "opml",
+            "xliff",
+        ],
         feature: Some("xml"),
         compiled_in: cfg!(feature = "xml"),
         directory: false,
@@ -76577,7 +76581,8 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "yaml" | "yml" => InputFormat::Yaml,
         "cbor" => InputFormat::Cbor,
         "ini" => InputFormat::Ini,
-        "xml" => InputFormat::Xml,
+        "xml" | "rss" | "atom" | "gpx" | "kml" | "tcx" | "xsd" | "xslt" | "wsdl" | "rdf"
+        | "opml" | "xliff" => InputFormat::Xml,
         "npy" => InputFormat::Npy,
         "npz" => InputFormat::Npz,
         "dbf" => InputFormat::Dbase,
@@ -93814,6 +93819,7 @@ fn try_detect_and_normalize(
     match detect_format(read_path, logical_path, format_override) {
         Ok(format) => {
             let tmp = if is_text_format(&format) {
+                let encoding = encoding.or_else(|| declared_text_encoding(&format, read_path));
                 normalize_text_bytes(read_path, encoding, reader_skips_utf8_bom(&format))?
             } else {
                 None
@@ -93858,7 +93864,7 @@ fn with_encoding_hint<T>(result: Result<T>, format: &InputFormat) -> Result<T> {
     match result {
         Err(err) if is_text_format(format) => {
             let text = format!("{err:?}");
-            if text.contains("invalid UTF-8") || text.contains("not valid UTF-8") {
+            if is_invalid_utf8_failure(&text) {
                 Err(Error {
                     message: format!(
                         "{} - if the file isn't UTF-8, pass --encoding <name> (for example windows-1252, latin1, utf-16le, shift_jis, gbk)",
@@ -93871,6 +93877,171 @@ fn with_encoding_hint<T>(result: Result<T>, format: &InputFormat) -> Result<T> {
             }
         }
         other => other,
+    }
+}
+
+/// Whether an error chain's text says the input wasn't valid UTF-8 - the
+/// phrasing differs by reader ("invalid UTF-8", "stream did not contain
+/// valid UTF-8"), and all of them contain this.
+fn is_invalid_utf8_failure(text: &str) -> bool {
+    text.contains("valid UTF-8")
+}
+
+/// Whether the start of a file looks like text in some single-byte code
+/// page: no NUL byte. UTF-16/32 without a byte-order mark and binary data
+/// are full of NULs, and reading those as windows-1252 would produce
+/// confident nonsense instead of a refusal.
+fn has_no_nul_in_head(path: &Path) -> bool {
+    let mut head = vec![0u8; 64 * 1024];
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut n = 0;
+    while n < head.len() {
+        match std::io::Read::read(&mut f, &mut head[n..]) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => n += k,
+        }
+    }
+    !head[..n].contains(&0)
+}
+
+/// The encoding a text file declares for itself, where the format has a
+/// place to say so. Unlike a guess this is authoritative: an XML document's
+/// `<?xml version="1.0" encoding="ISO-8859-1"?>` is what the producer wrote
+/// the bytes in. Only a file with no byte-order mark is consulted (a BOM
+/// already settles the matter), and only for an encoding other than UTF-8.
+fn declared_text_encoding(format: &InputFormat, path: &Path) -> Option<TextEncoding> {
+    if !matches!(format, InputFormat::Xml) {
+        return None;
+    }
+    if !matches!(sniff_bom(path), Ok(Bom::None)) {
+        return None;
+    }
+    let mut head = [0u8; 256];
+    let n = std::io::Read::read(&mut fs::File::open(path).ok()?, &mut head).ok()?;
+    let head = &head[..n];
+    let text = String::from_utf8_lossy(head);
+    let decl = text.trim_start().strip_prefix("<?xml")?;
+    let decl = &decl[..decl.find("?>")?];
+    let at = decl.find("encoding")?;
+    let rest = decl[at + "encoding".len()..]
+        .trim_start()
+        .strip_prefix('=')?;
+    let rest = rest.trim_start();
+    let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let name = rest[1..].split(quote).next()?;
+    match parse_text_encoding(name).ok()? {
+        // UTF-8 is what the readers assume; a BOM-less UTF-16/32 declaration
+        // can't be acted on without knowing the byte order.
+        TextEncoding::Utf8
+        | TextEncoding::Utf16
+        | TextEncoding::Utf16Le
+        | TextEncoding::Utf16Be
+        | TextEncoding::Utf32
+        | TextEncoding::Utf32Le
+        | TextEncoding::Utf32Be => None,
+        other => Some(other),
+    }
+}
+
+/// Whether the non-ASCII bytes of a file's first 256 KiB mostly sit next to
+/// other non-ASCII bytes. In Western European text an accented letter is
+/// almost always surrounded by ASCII (`Zürich`, `señor`); in Cyrillic,
+/// Greek, Hebrew, Arabic, Thai and every East Asian encoding nearly every
+/// letter is a high byte, so more than half have a high neighbour.
+fn high_bytes_come_in_runs(path: &Path) -> bool {
+    let mut head = vec![0u8; 256 * 1024];
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut n = 0;
+    while n < head.len() {
+        match std::io::Read::read(&mut f, &mut head[n..]) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => n += k,
+        }
+    }
+    let b = &head[..n];
+    let mut high = 0usize;
+    let mut adjacent = 0usize;
+    for (i, &c) in b.iter().enumerate() {
+        if c < 0x80 {
+            continue;
+        }
+        high += 1;
+        let before = i > 0 && b[i - 1] >= 0x80;
+        let after = b.get(i + 1).is_some_and(|&d| d >= 0x80);
+        if before || after {
+            adjacent += 1;
+        }
+    }
+    high >= 8 && adjacent * 2 > high
+}
+
+/// Runs a reader; when a text file turns out not to be UTF-8 (and no
+/// encoding was asked for), reads it again as windows-1252 and says so on
+/// stderr. Windows-1252 maps every byte, so this cannot fail on encoding
+/// grounds, and it is by far the most common reason for the failure (an
+/// Excel or database export). It is a guess: for text in another code page
+/// the accented characters in sample values will be wrong, while types,
+/// missing percentages and everything numeric are unaffected - so reading
+/// with a disclosure beats refusing the file. `--encoding` picks the right
+/// one. `read_path` and `text_tmp` are replaced by the transcoded copy, so
+/// a second pass (inline SQL) reads the same text.
+fn dispatch_reader_with_fallback(
+    read_path: &mut PathBuf,
+    text_tmp: &mut Option<TempFile>,
+    logical_path: &Path,
+    format: InputFormat,
+    args: &Args,
+) -> Result<(BTreeMap<String, Vec<ColumnProfile>>, usize)> {
+    let first = dispatch_reader(read_path, logical_path, format, args);
+    let Err(err) = first else {
+        return first;
+    };
+    let invalid_utf8 = is_invalid_utf8_failure(&format!("{err:?}"));
+    if !(is_text_format(&format)
+        && args.encoding.is_none()
+        && invalid_utf8
+        && has_no_nul_in_head(read_path))
+    {
+        return with_encoding_hint(Err(err), &format);
+    }
+    let Some(table) = codepage_support::table("windows-1252") else {
+        return with_encoding_hint(Err(err), &format);
+    };
+    let copy = match normalize_text_bytes(read_path, Some(TextEncoding::SingleByte(table)), false) {
+        Ok(Some(copy)) => copy,
+        _ => return with_encoding_hint(Err(err), &format),
+    };
+    let retried = dispatch_reader(copy.path(), logical_path, format, args);
+    match retried {
+        Ok(read) => {
+            if high_bytes_come_in_runs(read_path) {
+                eprintln!(
+                    "note: {} isn't valid UTF-8 and its non-ASCII bytes come in runs, which Western European text doesn't - it is probably Cyrillic, Greek, Hebrew, Arabic, Thai or East Asian. Read as windows-1252, so the text of string values is garbled (types and counts are fine); pass --encoding <name> (windows-1251, koi8-r, windows-1253, windows-1255, windows-1256, shift_jis, gbk, euc-kr, ...)",
+                    logical_path.display()
+                );
+            } else {
+                eprintln!(
+                    "note: {} isn't valid UTF-8 - read as windows-1252 (a guess; pass --encoding <name> if accented text looks wrong)",
+                    logical_path.display()
+                );
+            }
+            *read_path = copy.path().to_path_buf();
+            *text_tmp = Some(copy);
+            Ok(read)
+        }
+        // Not an encoding problem after all (or not only one): say what the
+        // file's content, read as windows-1252, got wrong.
+        Err(e2) => Err(Error::wrap(
+            format!(
+                "{} isn't valid UTF-8, and read as windows-1252 it fails too",
+                logical_path.display()
+            ),
+            e2,
+        )),
     }
 }
 
@@ -96172,7 +96343,7 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         logical_path = PathBuf::from("stdin");
     }
 
-    let (format, read_path, _text_tmp) =
+    let (format, mut read_path, mut text_tmp) =
         detect_and_normalize(&read_path, &logical_path, &args.format, args.encoding)?;
     if args.encoding.is_some() && !is_text_format(&format) {
         bail!(
@@ -96195,10 +96366,8 @@ fn run_single_file(args: &Args, output_format: &OutputFormat) -> Result<()> {
         );
     }
 
-    let (tables, resolved_skip_rows) = with_encoding_hint(
-        dispatch_reader(&read_path, &logical_path, format, args),
-        &format,
-    )?;
+    let (tables, resolved_skip_rows) =
+        dispatch_reader_with_fallback(&mut read_path, &mut text_tmp, &logical_path, format, args)?;
     // A reader yielding zero tables (an Excel-family workbook with no
     // non-empty sheets - the only shape that reaches here, since every
     // other empty input is still a hard error inside its own reader, the
@@ -97038,7 +97207,7 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
             Ok(None) => return BatchOutcome::Unrecognized,
             Err(err) => return BatchOutcome::PrepareFailed(err),
         };
-        let (format, read_path, _text_tmp) =
+        let (format, mut read_path, mut text_tmp) =
             match try_detect_and_normalize(&read_path, &logical_path, &None, args.encoding) {
                 Ok(Ok(detected)) => detected,
                 Ok(Err(_)) => return BatchOutcome::Unrecognized,
@@ -97050,9 +97219,12 @@ fn run_directory(args: &Args, output_format: &OutputFormat) -> Result<()> {
                 }
             };
         let outcome = (|| -> Result<Option<(usize, usize, PathBuf)>> {
-            let (tables, resolved_skip_rows) = with_encoding_hint(
-                dispatch_reader(&read_path, &logical_path, format, args),
-                &format,
+            let (tables, resolved_skip_rows) = dispatch_reader_with_fallback(
+                &mut read_path,
+                &mut text_tmp,
+                &logical_path,
+                format,
+                args,
             )?;
             // A reader yielding zero tables (an Excel-family workbook with
             // no non-empty sheets - the only shape that reaches here) is
@@ -97648,7 +97820,7 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
             }
         };
 
-        let (format, read_path, _text_tmp) =
+        let (format, mut read_path, mut text_tmp) =
             match try_detect_and_normalize(&read_path, &logical_path, &None, args.encoding) {
                 Ok(Ok(detected)) => detected,
                 Ok(Err(_)) => {
@@ -97675,9 +97847,12 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
         let qualifier = combine_qualifier_from_path(&relative_path);
 
         let counted: Result<bool> = (|| -> Result<bool> {
-            let (tables, resolved_skip_rows) = with_encoding_hint(
-                dispatch_reader(&read_path, &logical_path, format, args),
-                &format,
+            let (tables, resolved_skip_rows) = dispatch_reader_with_fallback(
+                &mut read_path,
+                &mut text_tmp,
+                &logical_path,
+                format,
+                args,
             )?;
             // Zero tables (an Excel-family workbook with no non-empty
             // sheets) skips with a note here too - same reasoning as the
