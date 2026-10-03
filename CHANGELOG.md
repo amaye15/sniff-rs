@@ -51,6 +51,11 @@ All notable changes to sniff-rs are documented here. Format follows
   under 4 MB of memory. Checked cell by cell against ReadStat/pyreadstat
   (and pandas, which turns a stored zero into 5.4e-79) on real NHANES files
   and 400 generated ones.
+- FASTA, FASTQ and text SAM: one row per record (`id`, `description`,
+  `sequence`, `length`; FASTQ adds `quality` and reads wrapped records; SAM
+  has the eleven fields plus `tags`, `*` is missing). Streamed through a
+  temporary TSV, recognized by extension or content, and checked against
+  Biopython and pysam on their own test files.
 - Genomics text formats: VCF variant calls (`vcf-variants`), BED and
   GFF3/GTF/GFF2 (`bed`, `gff`). The `#CHROM` line is the VCF header, BED and
   GFF get their standard column names, `.` is missing in VCF and GFF while a

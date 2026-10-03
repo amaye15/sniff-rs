@@ -18010,3 +18010,151 @@ fn explicit_skip_rows_overrides_the_comment_layout() {
     // Row 3 (the first data row) becomes the header.
     assert_eq!(col_names(&doc, "edge_tsv_comment_block"), ["1", "0.5"]);
 }
+
+// ---------------------------------------------------------------------------
+// FASTA, FASTQ and SAM
+// ---------------------------------------------------------------------------
+
+fn run_fails(args: &[&str]) -> String {
+    let output = Command::new(bin()).args(args).output().unwrap();
+    assert!(!output.status.success(), "expected a failure");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn fasta_is_one_row_per_record_with_the_wrapped_lines_joined() {
+    // Biopython's own Tests/Fasta/f002: three records, wrapped sequences.
+    let doc = run_json("edge_fasta_biopython_wrapped.fasta", &[]);
+    assert_eq!(doc["format"], "fasta");
+    let t = "edge_fasta_biopython_wrapped";
+    assert_eq!(
+        col_names(&doc, t),
+        ["id", "description", "sequence", "length"]
+    );
+    assert_eq!(table(&doc, t)[0]["row_count"], 3);
+    assert_eq!(column(table(&doc, t), "length")["ideal_type"], "i64");
+}
+
+#[test]
+fn fasta_ids_and_descriptions_split_at_the_first_whitespace() {
+    let doc = run_json("edge_fasta_biopython_protein.fa", &[]);
+    let t = "edge_fasta_biopython_protein";
+    let ids = sample_names(&doc, t, "id");
+    assert!(ids.iter().all(|i| !i.contains(' ')), "{ids:?}");
+    assert_eq!(table(&doc, t)[0]["row_count"], 12);
+}
+
+#[test]
+fn a_fasta_without_an_extension_is_recognized_by_its_content() {
+    let doc = run_json("edge_fasta_sniffed_no_extension", &[]);
+    assert_eq!(doc["format"], "fasta");
+    assert_eq!(
+        table(&doc, "edge_fasta_sniffed_no_extension")[0]["row_count"],
+        2
+    );
+}
+
+#[test]
+fn fasta_text_before_the_first_header_is_refused() {
+    let path = fixture("malformed_fasta_no_header.fasta");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("starts with a '>' header line"), "{stderr}");
+}
+
+#[test]
+fn fastq_has_sequence_quality_and_length() {
+    let doc = run_json("edge_fastq_biopython_example.fastq", &[]);
+    assert_eq!(doc["format"], "fastq");
+    let t = "edge_fastq_biopython_example";
+    assert_eq!(
+        col_names(&doc, t),
+        ["id", "description", "sequence", "quality", "length"]
+    );
+    assert_eq!(table(&doc, t)[0]["row_count"], 3);
+}
+
+#[test]
+fn fastq_records_may_wrap_and_a_quality_may_start_with_at_or_plus() {
+    // Biopython's tricky.fastq: wrapped lines, quality lines beginning '@'/'+'.
+    let doc = run_json("edge_fastq_biopython_wrapped_tricky.fastq", &[]);
+    assert_eq!(
+        table(&doc, "edge_fastq_biopython_wrapped_tricky")[0]["row_count"],
+        4
+    );
+    let sql = run_sql("edge_fastq_biopython_wrapped_tricky.fastq", &[]);
+    assert!(sql.contains("071113_EAS56_0053:1:1:998:236"), "{sql}");
+}
+
+#[test]
+fn fastq_with_crlf_line_endings_reads_the_same() {
+    let doc = run_json("edge_fastq_biopython_crlf.fastq", &[]);
+    assert_eq!(table(&doc, "edge_fastq_biopython_crlf")[0]["row_count"], 3);
+    assert!(
+        sample_names(&doc, "edge_fastq_biopython_crlf", "sequence")
+            .iter()
+            .all(|s| !s.contains('\r'))
+    );
+}
+
+#[test]
+fn a_fastq_quality_shorter_than_its_sequence_is_refused() {
+    let path = fixture("malformed_fastq_short_quality.fastq");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    // The short quality line makes the reader take the next record's lines
+    // as more quality, so the count that's reported is larger - but it is
+    // refused, naming the record.
+    assert!(
+        stderr.contains("FASTQ record 3") && stderr.contains("25 bases but"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn sam_has_the_eleven_fields_and_a_tags_column_and_star_is_missing() {
+    let doc = run_json("edge_sam_biopython_subset.sam", &[]);
+    assert_eq!(doc["format"], "sam");
+    let t = "edge_sam_biopython_subset";
+    let names = col_names(&doc, t);
+    assert_eq!(names.len(), 12);
+    assert_eq!(names[0], "QNAME");
+    assert_eq!(names[11], "tags");
+    // `*` in RNAME is SAM's "unavailable" (most of these reads are unmapped).
+    let rname = column(table(&doc, t), "RNAME");
+    assert!(rname["missing_pct"].as_f64().unwrap() > 90.0);
+    assert_eq!(rname["ideal_type"], "i64");
+    assert_eq!(column(table(&doc, t), "FLAG")["ideal_type"], "i64");
+}
+
+#[test]
+fn sam_loads_into_sql_with_star_as_null() {
+    let sql = run_sql("edge_sam_biopython_subset.sam", &["--nrows", "2"]);
+    assert!(sql.contains("NULL"), "{sql}");
+    assert!(!sql.contains("'*'"), "{sql}");
+}
+
+#[test]
+fn fastq_gz_reads_through_the_wrapper() {
+    // The same file compressed: a gzip wrapper in front of the converter.
+    let dir = std::env::temp_dir().join(format!("sniff-rs-fq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gz = dir.join("reads.fastq.gz");
+    let status = Command::new("gzip")
+        .arg("-c")
+        .arg(fixture("edge_fastq_biopython_example.fastq"))
+        .stdout(std::fs::File::create(&gz).unwrap())
+        .status();
+    if status.is_ok_and(|s| s.success()) {
+        let out = Command::new(bin())
+            .args([gz.to_str().unwrap(), "-", "--output-format", "json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["format"], "fastq");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

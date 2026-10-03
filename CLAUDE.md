@@ -18056,6 +18056,54 @@ columns) isn't read; BED whose columns are space-separated needs
 narrowPeak file gets the BED names for its columns rather than its own;
 VCF `INFO`/`FORMAT` fields stay text columns.
 
+## Gap audit 7: FASTA, FASTQ and SAM
+
+Sequence formats aren't tables, but each record is one row, so they are
+rewritten as a tab-separated table and read like one. `convert_sequence_text`
+runs after the encoding step in `try_detect_and_normalize` and streams the
+file (bytes, not text - the table reader is what validates UTF-8, so the
+encoding hint and windows-1252 fallback still apply) into a temporary TSV
+with a header row; `read_path` becomes that file for both the profiling and
+the inline-SQL pass, and `format` stays `fasta`/`fastq`/`sam`. They read
+with a tab, no quote character, and `CsvExtras.missing` set per format.
+
+- **FASTA** (`.fa .fasta .fna .faa .ffn .frn .fas .fsa`): `id` (header up to
+  the first whitespace), `description`, `sequence` (wrapped lines joined),
+  `length`. The sequence is written as it streams past, so the converter
+  holds nothing; the table reader then holds one record. Text before the
+  first `>` is refused, a `;` comment line before it is skipped. Missing is
+  only an empty field - `NA` or `-` is a sequence.
+- **FASTQ** (`.fq .fastq`): `id`, `description`, `sequence`, `quality`,
+  `length`. Records may wrap: the sequence runs to the line starting with
+  `+`, the quality until it is as long as the sequence (so a quality that
+  starts with `@` or `+` is read correctly). A sequence and quality of
+  different lengths, or a truncated record, is refused. Not validated: the
+  quality alphabet and that the `+` line repeats the id (Biopython checks
+  both; a profiler reports the data).
+- **SAM** (`.sam`, text only - BAM is a binary container): the eleven
+  mandatory fields by name plus `tags`, the optional fields joined with
+  spaces (their number varies per record); `@` header lines are dropped.
+  `*` is missing.
+- All three are also recognized without an extension by a strict content
+  check (`sniff_sequence_text`: `@HD\t`/`@SQ\t`... for SAM, `>` followed by a
+  residue line for FASTA, `@`/residues/`+`/equal-length quality for FASTQ),
+  and `.gz`/`.bgz` come through the wrapper. A format-fixed schema, so the
+  knowledge graph doesn't link two FASTA files for sharing columns.
+
+Verified against Biopython (`SeqIO`) and pysam on their own test files: all
+the FASTA files compared (ids, descriptions, sequences, lengths), every
+well-formed FASTQ (including `tricky.fastq` and the wrapped long reads),
+the CRLF file, `ex1.sam` (3,270 alignments) and `sam1.sam` through pysam
+(name, flag, position, mapping quality, CIGAR, sequence). On 17 malformed
+FASTQ files the two agree on rejecting every structural fault; Biopython
+also rejects bad quality characters and mismatched captions, which sniff-rs
+accepts. Fixtures: `edge_{fasta,fastq,sam}_biopython_*`,
+`malformed_{fasta_no_header,fastq_short_quality}`.
+
+Disclosed: a FASTA chromosome becomes one row holding the whole sequence
+(250 MB for human chr1) - the table reader keeps that record in memory;
+SAM `tags` stay one text column; protein vs DNA isn't told apart.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

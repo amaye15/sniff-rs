@@ -3432,7 +3432,7 @@ INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SAS Transport (.xpt), SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
 HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
-text, VCF variant calls, BED and GFF/GTF genomic tables, or a Delta Lake/Apache Iceberg
+text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3510,7 +3510,7 @@ OPTIONS:
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
                                  sas7bdat, xport, spss, orc, bson, plist, json5, har, geojson,
-                                 mbox, vcard, vcf-variants, bed, gff, icalendar, ipynb, or pdf - single-file mode only. Run
+                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -9713,6 +9713,9 @@ fn resolve_table_layout(
     if args.skip_rows.is_some() {
         extras.strip_hash = false;
     }
+    if let Some(m) = format_missing_tokens(format) {
+        extras.missing = Some(m);
+    }
     let skip = match (args.skip_rows, &layout) {
         (Some(n), _) => n,
         (None, Some(l)) => {
@@ -9724,6 +9727,8 @@ fn resolve_table_layout(
             }
             l.skip_rows
         }
+        // A converted sequence file starts with the header row written for it.
+        (None, None) if is_sequence_format(format) => 0,
         (None, None) => resolve_skip_rows(None, path, dialect),
     };
     (skip, extras)
@@ -9738,7 +9743,28 @@ fn table_extras(path: &Path, args: &Args, format: InputFormat, dialect: CsvDiale
     if args.skip_rows.is_some() {
         extras.strip_hash = false;
     }
+    if let Some(m) = format_missing_tokens(format) {
+        extras.missing = Some(m);
+    }
     extras
+}
+
+fn is_sequence_format(format: InputFormat) -> bool {
+    matches!(
+        format,
+        InputFormat::Fasta | InputFormat::Fastq | InputFormat::Sam
+    )
+}
+
+/// The missing-value tokens a converted sequence format fixes for itself:
+/// SAM's `*`, and nothing at all for FASTA/FASTQ (a sequence or quality
+/// string like `NA` or `?` is data).
+fn format_missing_tokens(format: InputFormat) -> Option<&'static [&'static str]> {
+    match format {
+        InputFormat::Fasta | InputFormat::Fastq => Some(&[]),
+        InputFormat::Sam => Some(&["*"]),
+        _ => None,
+    }
 }
 
 /// How much of a delimited file the dialect detector looks at. The measure
@@ -9806,7 +9832,12 @@ fn resolve_csv_dialect(
     }
     if matches!(
         format,
-        InputFormat::Vcf | InputFormat::Bed | InputFormat::Gff
+        InputFormat::Vcf
+            | InputFormat::Bed
+            | InputFormat::Fasta
+            | InputFormat::Fastq
+            | InputFormat::Sam
+            | InputFormat::Gff
     ) {
         // Tab-separated by definition, and no quoting: a GTF attribute is
         // `gene_id "ENSG..."`, quotes that are data.
@@ -75801,6 +75832,12 @@ enum InputFormat {
     Bed,
     /// GFF3 / GTF / GFF2: nine tab-separated columns, no header row.
     Gff,
+    /// FASTA sequences: one row per `>` record (converted to a temporary TSV).
+    Fasta,
+    /// FASTQ reads: one row per four-line record (converted likewise).
+    Fastq,
+    /// Text SAM alignments: eleven fixed columns plus the optional tags.
+    Sam,
     /// A Delta Lake table directory (`_delta_log/` present) - detected
     /// directly from the input path being such a directory, never from an
     /// extension or `--format` (a Delta table has no file extension of its
@@ -75882,6 +75919,9 @@ impl InputFormat {
             InputFormat::Vcf => "vcf-variants",
             InputFormat::Bed => "bed",
             InputFormat::Gff => "gff",
+            InputFormat::Fasta => "fasta",
+            InputFormat::Fastq => "fastq",
+            InputFormat::Sam => "sam",
             InputFormat::Vcard => "vcard",
             InputFormat::Ical => "icalendar",
             InputFormat::Ipynb => "ipynb",
@@ -76211,6 +76251,27 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
     FormatInfo {
         name: "gff",
         extensions: &["gff", "gff3", "gtf"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "fasta",
+        extensions: &["fa", "fasta", "fna", "faa", "ffn", "frn", "fas", "fsa"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "fastq",
+        extensions: &["fq", "fastq"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "sam",
+        extensions: &["sam"],
         feature: None,
         compiled_in: true,
         directory: false,
@@ -76602,6 +76663,42 @@ fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// extension or `--format`. Fixed-width text and the four log formats are
 /// skipped for the same reason they're already `--format`-only: no
 /// delimiter or magic number distinguishes them from generic text either.
+/// FASTA, FASTQ or SAM recognized from the first bytes of a file with no
+/// telling extension. Deliberately strict - a `>` or `@` first line is
+/// common in plain text - so the follow-up lines have to look right too.
+fn sniff_sequence_text(head: &[u8]) -> Option<InputFormat> {
+    let text = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    for tag in [&b"@HD\t"[..], b"@SQ\t", b"@RG\t", b"@PG\t", b"@CO\t"] {
+        if text.starts_with(tag) {
+            return Some(InputFormat::Sam);
+        }
+    }
+    let lines: Vec<&[u8]> = text
+        .split(|&c| c == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .collect();
+    let is_residues = |l: &[u8]| {
+        !l.is_empty()
+            && l.iter()
+                .all(|&c| c.is_ascii_alphabetic() || matches!(c, b'-' | b'*' | b'.'))
+    };
+    // The first line may be cut by the sniff budget; two complete lines
+    // after it are what's checked.
+    if lines.len() >= 3 && lines[0].len() > 1 {
+        if lines[0][0] == b'>' && is_residues(lines[1]) {
+            return Some(InputFormat::Fasta);
+        }
+        if lines[0][0] == b'@'
+            && is_residues(lines[1])
+            && lines[2].first() == Some(&b'+')
+            && lines.get(3).is_some_and(|q| q.len() == lines[1].len())
+        {
+            return Some(InputFormat::Fastq);
+        }
+    }
+    None
+}
+
 /// Whether `path` opens with a Variant Call Format meta line
 /// (`##fileformat=VCFv4.x`) - what tells a genomics `.vcf` from a vCard one.
 fn sniff_variant_calls(path: &Path) -> bool {
@@ -76638,6 +76735,9 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
         }
         if text.starts_with(b"##gff-version") {
             return Some(InputFormat::Gff);
+        }
+        if let Some(f) = sniff_sequence_text(text) {
+            return Some(f);
         }
     }
 
@@ -76911,6 +77011,9 @@ fn detect_format(
             "vcf-variants" | "variants" => Ok(InputFormat::Vcf),
             "bed" => Ok(InputFormat::Bed),
             "gff" | "gff3" | "gtf" => Ok(InputFormat::Gff),
+            "fasta" | "fa" => Ok(InputFormat::Fasta),
+            "fastq" | "fq" => Ok(InputFormat::Fastq),
+            "sam" => Ok(InputFormat::Sam),
             "icalendar" | "ical" | "ics" => Ok(InputFormat::Ical),
             "ipynb" => Ok(InputFormat::Ipynb),
             "pdf" => Ok(InputFormat::Pdf),
@@ -76998,6 +77101,9 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "vcf" => InputFormat::Vcard,
         "bed" => InputFormat::Bed,
         "gff" | "gff3" | "gtf" => InputFormat::Gff,
+        "fa" | "fasta" | "fna" | "faa" | "ffn" | "frn" | "fas" | "fsa" => InputFormat::Fasta,
+        "fq" | "fastq" => InputFormat::Fastq,
+        "sam" => InputFormat::Sam,
         "ics" => InputFormat::Ical,
         "ipynb" => InputFormat::Ipynb,
         "pdf" => InputFormat::Pdf,
@@ -80755,6 +80861,9 @@ fn sql_load_hint(
         | InputFormat::Tsv
         | InputFormat::Vcf
         | InputFormat::Bed
+        | InputFormat::Fasta
+        | InputFormat::Fastq
+        | InputFormat::Sam
         | InputFormat::Gff => {
             s.push_str(&format!(
                 "--\n\
@@ -80993,7 +81102,13 @@ fn render_sql_staging(
 
     let delim = if matches!(
         format,
-        InputFormat::Tsv | InputFormat::Vcf | InputFormat::Bed | InputFormat::Gff
+        InputFormat::Tsv
+            | InputFormat::Vcf
+            | InputFormat::Bed
+            | InputFormat::Fasta
+            | InputFormat::Fastq
+            | InputFormat::Sam
+            | InputFormat::Gff
     ) {
         '\t'
     } else {
@@ -81770,6 +81885,9 @@ fn render_sql_inline_flat(
                 | InputFormat::Tsv
                 | InputFormat::Vcf
                 | InputFormat::Bed
+                | InputFormat::Fasta
+                | InputFormat::Fastq
+                | InputFormat::Sam
                 | InputFormat::Gff
         ) {
             let dialect = resolve_csv_dialect(read_path, args, *format, false);
@@ -81783,6 +81901,9 @@ fn render_sql_inline_flat(
                 | InputFormat::Tsv
                 | InputFormat::Vcf
                 | InputFormat::Bed
+                | InputFormat::Fasta
+                | InputFormat::Fastq
+                | InputFormat::Sam
                 | InputFormat::Gff
                 | InputFormat::FixedWidth
         ) && csv_extras.names.is_none();
@@ -81805,6 +81926,9 @@ fn render_sql_inline_flat(
                     | InputFormat::Tsv
                     | InputFormat::Vcf
                     | InputFormat::Bed
+                    | InputFormat::Fasta
+                    | InputFormat::Fastq
+                    | InputFormat::Sam
                     | InputFormat::Gff
                     | InputFormat::FixedWidth
             );
@@ -82941,6 +83065,9 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::Tsv
             | InputFormat::Vcf
             | InputFormat::Bed
+            | InputFormat::Fasta
+            | InputFormat::Fastq
+            | InputFormat::Sam
             | InputFormat::Gff
             | InputFormat::FixedWidth
             | InputFormat::CommonLog
@@ -94000,6 +94127,9 @@ fn is_text_format(format: &InputFormat) -> bool {
             | InputFormat::Tsv
             | InputFormat::Vcf
             | InputFormat::Bed
+            | InputFormat::Fasta
+            | InputFormat::Fastq
+            | InputFormat::Sam
             | InputFormat::Gff
             | InputFormat::Json
             | InputFormat::Toml
@@ -94305,6 +94435,12 @@ fn try_detect_and_normalize(
             let path = tmp
                 .as_ref()
                 .map_or_else(|| read_path.to_path_buf(), |t| t.path().to_path_buf());
+            // FASTA/FASTQ/SAM read as the tab-separated table made from them.
+            if is_sequence_format(format) {
+                let converted = convert_sequence_text(format, &path)?;
+                let path = converted.path().to_path_buf();
+                return Ok(Ok((format, path, Some(converted))));
+            }
             Ok(Ok((format, path, tmp)))
         }
         Err(err) => {
@@ -94323,6 +94459,220 @@ fn try_detect_and_normalize(
             }
         }
     }
+}
+
+/// Rewrites a FASTA, FASTQ or text SAM file as a tab-separated table with a
+/// header row, streaming, so the CSV reader (and the inline-SQL second pass)
+/// handle it like any other table. Works on bytes - the table reader is what
+/// validates UTF-8, so a non-UTF-8 file gets the same encoding hint and
+/// fallback as any other text.
+///
+/// - FASTA: `id` (the header up to the first whitespace), `description` (the
+///   rest), `sequence` (the record's lines joined) and `length`.
+/// - FASTQ: `id`, `description`, `sequence`, `quality`, `length`; records are
+///   four lines, and a sequence and quality of different lengths is refused.
+/// - SAM: the eleven mandatory fields by name and `tags` (the optional
+///   fields joined with spaces, since their number varies); `@` header lines
+///   are dropped.
+fn convert_sequence_text(format: InputFormat, src: &Path) -> Result<TempFile> {
+    use std::io::{BufRead, Write};
+
+    fn trim_eol(mut line: &[u8]) -> &[u8] {
+        while let [rest @ .., b'\n' | b'\r'] = line {
+            line = rest;
+        }
+        line
+    }
+    fn trim_ws(line: &[u8]) -> &[u8] {
+        line.trim_ascii()
+    }
+    // A header line split into (id, description), both free of tabs.
+    fn split_header(h: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let h = trim_ws(h);
+        let cut = h
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(h.len());
+        let clean = |b: &[u8]| -> Vec<u8> {
+            trim_ws(b)
+                .iter()
+                .map(|&c| if c == b'\t' { b' ' } else { c })
+                .collect()
+        };
+        (clean(&h[..cut]), clean(&h[cut..]))
+    }
+
+    let input = fs::File::open(src).with_context(|| format!("failed to open {src:?}"))?;
+    let mut input = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, input);
+    let mut tmp = TempFile::new()?;
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, tmp.as_file_mut());
+    let mut line: Vec<u8> = Vec::new();
+    let mut line_no = 0usize;
+    let next = |input: &mut std::io::BufReader<fs::File>,
+                line: &mut Vec<u8>,
+                line_no: &mut usize|
+     -> Result<bool> {
+        line.clear();
+        let n = input
+            .read_until(b'\n', line)
+            .with_context(|| format!("failed to read {src:?}"))?;
+        *line_no += usize::from(n > 0);
+        Ok(n > 0)
+    };
+    // A leading UTF-8 byte-order mark would sit in front of the first `>`/`@`.
+    let strip_bom = |l: &[u8]| -> Vec<u8> { l.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(l).to_vec() };
+
+    match format {
+        InputFormat::Fasta => {
+            out.write_all(b"id\tdescription\tsequence\tlength\n")?;
+            let (mut in_record, mut residues) = (false, 0usize);
+            while next(&mut input, &mut line, &mut line_no)? {
+                let l = if line_no == 1 {
+                    strip_bom(&line)
+                } else {
+                    line.clone()
+                };
+                let l = trim_eol(&l);
+                if l.is_empty() {
+                    continue;
+                }
+                if l[0] == b'>' {
+                    if in_record {
+                        writeln!(out, "\t{residues}")?;
+                    }
+                    let (id, desc) = split_header(&l[1..]);
+                    out.write_all(&id)?;
+                    out.write_all(b"\t")?;
+                    out.write_all(&desc)?;
+                    out.write_all(b"\t")?;
+                    in_record = true;
+                    residues = 0;
+                } else if !in_record && l[0] == b';' {
+                    continue; // an old-style comment before the first record
+                } else if !in_record {
+                    bail!(
+                        "line {line_no} of {src:?} isn't part of a FASTA record - a record starts with a '>' header line"
+                    );
+                } else {
+                    let seq = trim_ws(l);
+                    out.write_all(seq)?;
+                    residues += seq.len();
+                }
+            }
+            if in_record {
+                writeln!(out, "\t{residues}")?;
+            }
+        }
+        InputFormat::Fastq => {
+            out.write_all(b"id\tdescription\tsequence\tquality\tlength\n")?;
+            let mut record = 0usize;
+            let (mut seq, mut qual) = (Vec::<u8>::new(), Vec::<u8>::new());
+            let mut first = true;
+            loop {
+                if !next(&mut input, &mut line, &mut line_no)? {
+                    break;
+                }
+                let head = if first {
+                    strip_bom(&line)
+                } else {
+                    line.clone()
+                };
+                first = false;
+                let head = trim_eol(&head).to_vec();
+                if head.is_empty() {
+                    continue; // blank lines between records (or at the end)
+                }
+                record += 1;
+                if head[0] != b'@' {
+                    bail!(
+                        "line {line_no} of {src:?} should start a FASTQ record with '@' (record {record})"
+                    );
+                }
+                // The sequence may wrap over several lines, up to the line that
+                // starts with '+' (a base never does); the quality then runs
+                // until it is as long as the sequence - it can start with '@'
+                // or '+', so only its length ends it.
+                seq.clear();
+                qual.clear();
+                loop {
+                    if !next(&mut input, &mut line, &mut line_no)? {
+                        bail!(
+                            "{src:?} ends inside FASTQ record {record}: no '+' line follows the sequence"
+                        );
+                    }
+                    let l = trim_eol(&line);
+                    if l.first() == Some(&b'+') {
+                        break;
+                    }
+                    seq.extend_from_slice(l);
+                }
+                while qual.len() < seq.len() {
+                    if !next(&mut input, &mut line, &mut line_no)? {
+                        bail!(
+                            "{src:?} ends inside FASTQ record {record}: {} bases but only {} quality characters",
+                            seq.len(),
+                            qual.len()
+                        );
+                    }
+                    qual.extend_from_slice(trim_eol(&line));
+                }
+                if seq.len() != qual.len() {
+                    bail!(
+                        "FASTQ record {record} of {src:?}: {} bases but {} quality characters (a quality line that is too short or too long shifts every record after it)",
+                        seq.len(),
+                        qual.len()
+                    );
+                }
+                let (id, desc) = split_header(&head[1..]);
+                out.write_all(&id)?;
+                out.write_all(b"\t")?;
+                out.write_all(&desc)?;
+                out.write_all(b"\t")?;
+                out.write_all(&seq)?;
+                out.write_all(b"\t")?;
+                out.write_all(&qual)?;
+                writeln!(out, "\t{}", seq.len())?;
+            }
+        }
+        InputFormat::Sam => {
+            out.write_all(
+                b"QNAME\tFLAG\tRNAME\tPOS\tMAPQ\tCIGAR\tRNEXT\tPNEXT\tTLEN\tSEQ\tQUAL\ttags\n",
+            )?;
+            while next(&mut input, &mut line, &mut line_no)? {
+                let l = if line_no == 1 {
+                    strip_bom(&line)
+                } else {
+                    line.clone()
+                };
+                let l = trim_eol(&l);
+                if l.is_empty() || l[0] == b'@' {
+                    continue;
+                }
+                let fields: Vec<&[u8]> = l.split(|&c| c == b'\t').collect();
+                if fields.len() < 11 {
+                    bail!(
+                        "line {line_no} of {src:?} has {} tab-separated fields, but a SAM alignment has at least 11",
+                        fields.len()
+                    );
+                }
+                for f in &fields[..11] {
+                    out.write_all(f)?;
+                    out.write_all(b"\t")?;
+                }
+                for (i, tag) in fields[11..].iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b" ")?;
+                    }
+                    out.write_all(tag)?;
+                }
+                out.write_all(b"\n")?;
+            }
+        }
+        _ => unreachable!("only sequence formats are converted"),
+    }
+    out.flush()?;
+    drop(out);
+    Ok(tmp)
 }
 
 /// `try_detect_and_normalize` for a caller where "unrecognized" is just
@@ -96112,6 +96462,9 @@ fn dispatch_reader(
             | InputFormat::Tsv
             | InputFormat::Vcf
             | InputFormat::Bed
+            | InputFormat::Fasta
+            | InputFormat::Fastq
+            | InputFormat::Sam
             | InputFormat::Gff => {
                 let dialect = resolve_csv_dialect(read_path, args, format, true);
                 let (skip_rows, extras) = resolve_table_layout(read_path, args, format, dialect);
@@ -98367,7 +98720,7 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                 // would actually have to load from disk.
                 let delim = if matches!(
                     format,
-                    InputFormat::Tsv | InputFormat::Vcf | InputFormat::Bed | InputFormat::Gff
+                    InputFormat::Tsv | InputFormat::Vcf | InputFormat::Bed | InputFormat::Fasta | InputFormat::Fastq | InputFormat::Sam | InputFormat::Gff
                 ) {
                     '\t'
                 } else {
@@ -103427,6 +103780,9 @@ mod knowledge_graph {
                 | InputFormat::Mbox
                 | InputFormat::Vcf
                 | InputFormat::Bed
+                | InputFormat::Fasta
+                | InputFormat::Fastq
+                | InputFormat::Sam
                 | InputFormat::Gff
                 | InputFormat::Vcard
                 | InputFormat::Ical
