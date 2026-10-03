@@ -1,0 +1,4 @@
+track name=pairedReads description="Clone Paired Reads" useScore=1
+chr7	127471196	127472363	Pos1	0	+
+chr7	127472363	127473530	Pos2	0	+
+chr9	127472363	127473530	Neg1	0	-
