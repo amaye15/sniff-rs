@@ -96,7 +96,7 @@ sniff-rs events.jsonl out.md --samples 5
 sniff-rs warehouse.db - --output-format json | jq .
 sniff-rs data.csv.gz                  # or .tar.gz, .zip, .xz, .bz2, ...
 sniff-rs bundle.zip                   # an archive of several files: one combined dictionary
-sniff-rs legacy.csv --encoding windows-1252   # or shift_jis, gbk, euc-kr, big5, ...
+sniff-rs legacy.csv --encoding windows-1252   # or shift_jis, gbk, euc-kr, big5, ... (unnamed non-UTF-8 reads as windows-1252, with a note)
 sniff-rs ./data/ --output-dir ./dictionaries/
 sniff-rs diff old.json new.json
 ```

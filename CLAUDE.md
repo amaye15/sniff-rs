@@ -17457,9 +17457,11 @@ is refused rather than resolved by guessing; `--encoding utf-16` with no
 BOM is refused too (it can't tell the byte order). `--encoding` on a
 binary format is an error naming the format it was read as.
 
-A text reader's own "contains invalid UTF-8" failure gets the hint
-appended - `if the file isn't UTF-8, pass --encoding <name> (for example
-windows-1252, latin1, utf-16le)` - through `with_encoding_hint`. A BOM also
+A text reader's own "contains invalid UTF-8" failure used to be a hard
+error with a hint; it is now retried as windows-1252 (see "Gap audit 5"),
+and only a failure the retry can't fix keeps the hint - `if the file isn't
+UTF-8, pass --encoding <name> (for example windows-1252, latin1,
+utf-16le)` - through `with_encoding_hint`. A BOM also
 comes before content sniffing: an extensionless UTF-16 JSON file is
 transcoded first and then sniffed.
 
@@ -17943,6 +17945,58 @@ techniques with a published, checkable answer.
   `edge_geoparquet_geometry.parquet` (both written by GDAL/pyarrow via
   geopandas), and `edge_sqlite_blob_kinds.sqlite` (Pillow images, shapely
   WKB, random bytes).
+
+## Gap audit 5: files that don't say what encoding they are
+
+A text file that isn't UTF-8, has no BOM and wasn't given `--encoding` used
+to fail with "contains invalid UTF-8". Real exports (a Latin-1 CSV, a
+Windows-1251 feed) are exactly that, and the failure left the user to guess
+a name. Two changes, neither of which guesses silently.
+
+- **Retry as windows-1252, and say so.** `dispatch_reader_with_fallback`
+  (used by single-file, directory-batch and `--combine` runs) runs the
+  reader as before; if it fails with a "valid UTF-8" error (every text
+  reader's wording contains that phrase: CSV, JSON/JSONL, TOML, INI, YAML,
+  ...), it transcodes the file through `normalize_text_bytes` as
+  windows-1252 (WHATWG: the latin1/ascii alias) into a temporary copy and
+  reads that. The profile is real; stderr carries a note naming the
+  assumption and `--encoding`. There is deliberately no JSON/Markdown field
+  for it. Single-byte text can never be *wrong enough to fail* the way
+  invalid UTF-8 can, so the note is the only honest signal. An explicit
+  `--encoding` always wins and is never second-guessed. If the second read
+  fails too, the error says the file isn't UTF-8 *and* fails as
+  windows-1252 (the retry's own error attached), not the original message.
+- **Where it refuses.** A file whose first 64 KiB holds a NUL byte is left
+  alone (`has_no_nul_in_head`): UTF-16/32 without a BOM and binary files
+  contain NULs, and reading them as windows-1252 would produce confident
+  garbage. A note about the encoding also gets a stronger hint when the
+  high bytes arrive in runs (`high_bytes_come_in_runs`: adjacent high
+  bytes are rare in Western text and the rule in Cyrillic, Greek, Hebrew,
+  Arabic, Thai and East Asian text), suggesting those code pages instead
+  of Latin ones.
+- **XML says what it is.** `<?xml ... encoding="...">` is authoritative:
+  `declared_text_encoding` reads it from the first 256 bytes (only when
+  there's no BOM, and not for UTF-8/16/32) and `try_detect_and_normalize`
+  applies it as if `--encoding` had been given - a declared `windows-1251`
+  or `iso-8859-1` file now just reads, with no guess and no note. Any
+  encoding `--encoding` knows is accepted. The XML family's extensions
+  (`.rss .atom .gpx .kml .tcx .xsd .xslt .wsdl .rdf .opml .xliff`) detect
+  as XML.
+
+Considered and rejected: statistical encoding detection (a uchardet /
+charset-normalizer style character-frequency detector). A prototype built
+from charset-normalizer's frequency tables and scored on uchardet's corpus
+identified about 52 of 85 samples, wrong more often than a reader should be
+trusted to be, and a wrong answer that looks confident is worse than a
+disclosed windows-1252 read the user can override. The runs-of-high-bytes
+check above is the only heuristic, and it only changes the hint wording.
+
+Checked by a fixture x output-mode sweep against a build of `main`
+(1,881 runs): the only differences are the 14 fixtures that used to exit 1
+on invalid UTF-8 and now succeed, in all three output modes. Full suite
+730 unit + 790 integration, minimal build 442 + 275; clippy baselines
+unchanged (the minimal build's one dead-code error on `is_wkb_blob`, left
+over from gap audit 4, is fixed by gating it on `sqlite`, its only caller).
 
 ## Known limitations / roadmap
 
