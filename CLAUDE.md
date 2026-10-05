@@ -18354,6 +18354,70 @@ they produced.
   zero-row table. A 2,500-column matrix costs about 400 KB of statistics
   per column, as a 2,500-column CSV does.
 
+## Graph improvements: speed, cache, new links, exports, queries
+
+An audit of `sniff-rs graph` on the real 1,340-file corpus and on synthetic
+sets found it slow (87 s cold, 1.6 GB), blind to declared keys, noisy on
+name-only joins, and hard to inspect. Each item below was measured against
+a baseline `graph.json` (`cmpgraph.py` in the session scratchpad compared
+nodes, links and communities) and only the intended differences remained.
+
+- **Worker pool and cache.** `collect` reads files through
+  `run_batch_jobs` (`--jobs`, default all cores); results merge in walk
+  order, so `graph.json` is byte-identical at any job count. A per-file
+  result is cached in `OUTPUT_DIR/.sniff-rs-cache` (`CACHE_DIR`), keyed by
+  path, size and modified time. Adding, removing or renaming any file
+  re-reads all, because a text may name another file. `--no-cache` and
+  `--cache-dir` together are an error. Progress lines do not mark cache
+  hits. Cold run on the corpus 87 s to 24 s; warm run 2.35 s and 100 MB.
+- **Join engine.** The all-pairs scan became candidate generation:
+  `near_duplicate_groups` (tables with the same columns count once),
+  `join_candidates` (shared value hashes through a posting list),
+  `name_candidates` (shared column names) and `evaluate_joins`.
+  `relabel_shared_keys` turns a link between two spokes of one owner into
+  `shares_key`; declared SQLite foreign keys join through the same path.
+  A name-only candidate with no value overlap is dropped (35 of 479 fixture
+  joins, all weak). 2,000 synthetic tables 52 s to about 0.6 s; 10,000 in
+  3.3 s and 537 MB. **Approximations, disclosed:** a value in more than
+  `MAX_HASH_POSTING` (64) columns proposes no pair, and a name shared by
+  more than `MAX_NAME_GROUP` (512) tables proposes none by name alone.
+- **New links.** `duplicate_of` (content hash of byte-identical files, 100
+  copies link as a star), `metadata` (author and organization two or more
+  files name in their own properties; INFERRED), `in_folder` (with
+  `--folders`, a `Folder` node per directory; communities 254 to 77 on the
+  corpus). Relations are now twelve.
+- **Communities.** Louvain takes a resolution (`gain = neigh[c] -
+  resolution * tot[c] * k[i] / m2`); `--resolution <X>` is a positive
+  number, 1.0 the default. `community_label` weights each word by
+  `ln(1 + C / c_df)` (C communities, c_df how many contain it) and
+  prefixes the fullest folder's name.
+- **Exports.** `--export graphml,dot,cypher,html` writes beside
+  `graph.json`; with output `-`, `--output-format` takes the same names.
+  The HTML viewer is one file with no external script (checked in headless
+  Chrome).
+- **Diff.** `sniff-rs diff a/graph.json b/graph.json` reports nodes and
+  links added, removed and changed (confidence or score), link counts per
+  relation, files that moved group, and the community count. It refuses
+  `--fail-on-breaking` and `--resolution-sql`.
+- **Queries.** `--relation`, `--confidence` (a minimum: extracted,
+  inferred, any) and `--min-score` filter the links a query sees; `explain
+  --depth 1-6` adds a neighborhood, `path --paths 1-20` prints Yen's k
+  best routes, `rank --top N --sort degree|importance` limits and orders
+  the table. `rank` also reports weighted PageRank importance and cut
+  nodes (articulation points). A dictionary or data file refuses these
+  options rather than ignoring them (`reject_graph_only_options`).
+
+Verified by 9 new integration tests (`graph_links_joins_key_columns_...`
+through `graph_turns_declared_foreign_keys_into_joins`), the unit tests on
+Louvain, label and diff logic, a fixture sweep against the baseline graph,
+and the corpus runs above.
+
+**Not done, disclosed.** EXIF and other image metadata do not feed
+`metadata` links. Julian-calendar CF time stays raw (an earlier item).
+`detect_relationships_scored`, the dictionary-mode path behind
+`explain`/`path`/`rank` on a plain dictionary, still compares table pairs,
+so it is not on the fast path.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

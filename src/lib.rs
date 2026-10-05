@@ -109198,6 +109198,11 @@ USAGE:
     One side may be "-" to read it from stdin (gzip/zstd recognized by
     content); pass --format if its format can't be sniffed (e.g. CSV).
 
+    Two graph.json files from `sniff-rs graph` are compared as graphs:
+    nodes added and removed, links added, removed and changed (confidence
+    or score), link counts per relation, and files that moved to another
+    group. --fail-on-breaking and --resolution-sql are refused for them.
+
 ARGS:
     <OLD>                   The earlier dictionary or data file
     <NEW>                   The later dictionary or data file
@@ -109463,6 +109468,12 @@ OPTIONS:
                                 raw data file (default: 3) - deeper samples
                                 strengthen overlap evidence. Dictionaries
                                 already carry their own samples.
+        --relation <LIST>       Only these relations (comma-separated; the
+                                option may repeat), for example joins,references
+        --confidence <LEVEL>    Minimum confidence: extracted, inferred or any
+        --min-score <X>         Only links scoring at least X
+        --depth <N>             Also show the neighborhood N hops out (1-6,
+                                default 1)
     -h, --help                  Print this help
 "#;
 
@@ -109499,6 +109510,10 @@ OPTIONS:
                                 raw data file (default: 3) - deeper samples
                                 strengthen overlap evidence. Dictionaries
                                 already carry their own samples.
+        --relation <LIST>       Only follow these relations (comma-separated)
+        --confidence <LEVEL>    Minimum confidence: extracted, inferred or any
+        --min-score <X>         Only follow links scoring at least X
+        --paths <N>             Print the N best routes instead of one (1-20)
     -h, --help                  Print this help
 "#;
 
@@ -109546,6 +109561,11 @@ OPTIONS:
                                 raw data file (default: 3) - deeper samples
                                 strengthen overlap evidence. Dictionaries
                                 already carry their own samples.
+        --relation <LIST>       Only count these relations (comma-separated)
+        --confidence <LEVEL>    Minimum confidence: extracted, inferred or any
+        --min-score <X>         Only count links scoring at least X
+        --top <N>               List only the N highest-ranked nodes
+        --sort <KEY>            degree (default) or importance (PageRank)
     -h, --help                  Print this help
 "#;
 
@@ -119663,7 +119683,12 @@ USAGE:
     file) and links files by what they share, not just by schema:
 
       joins        tables whose columns line up by name and/or by values
-                   (EXTRACTED when the value sets measurably overlap)
+                   (EXTRACTED when the value sets measurably overlap), and
+                   foreign keys a database declares (SQLite)
+      shares_key   two tables that both point at one owner through the
+                   same key (orders.customer_id and invoices.customer_id
+                   into customers) - kept, weighted low, so a star schema
+                   is a star and not a clique
       has_schema   tables sharing (nearly) the same columns - versioned
                    exports, monthly sheets (never PDFs or notebooks, whose
                    columns are fixed by the format)
@@ -119677,6 +119702,10 @@ USAGE:
                    read_csv("sales.csv"), a page's <img src="plot.png">)
       similar_to   files whose wording overlaps (TF-IDF cosine, INFERRED)
       same_name    files sharing a name stem (report.pdf / report.docx)
+      duplicate_of byte-identical files (EXTRACTED, found by content hash)
+      metadata     an author or organization two or more files name in
+                   their own properties (INFERRED)
+      in_folder    with --folders: a file and the folder it is kept in
 
     Every data format sniff-rs reads is profiled; any other text file (txt,
     md, html, source code) is scanned for the same links; binary files
@@ -119696,7 +119725,14 @@ USAGE:
                         every link, graph view colored by data type
 
     Query it afterwards: sniff-rs explain|path|rank <OUTPUT_DIR>/graph.json
-    (they also accept a directory directly).
+    (they also accept a directory directly), or compare two runs with
+    sniff-rs diff <OLD>/graph.json <NEW>/graph.json.
+
+    Candidate join pairs are found through value and name indexes, not by
+    comparing every pair, so thousands of tables take seconds. Two caps
+    bound that work and are approximations: a value shared by more than 64
+    columns is too common to propose a pair, and a name shared by more
+    than 512 tables proposes none by name alone.
 
 ARGS:
     <INPUT>                 Directory or file to graph

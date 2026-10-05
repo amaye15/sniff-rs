@@ -7,6 +7,26 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- Knowledge graph (`sniff-rs graph`), faster and richer. Files are read on a
+  worker pool (`--jobs`), and each file's result is cached in
+  `OUTPUT_DIR/.sniff-rs-cache` (`--no-cache`, `--cache-dir`), so a re-run
+  reads only changed files; the graph is byte-identical at any job count
+  and cold or warm. Candidate join pairs come from value and name indexes,
+  not all pairs (2,000 tables: 52 s to 0.6 s). New relations: `duplicate_of`
+  (byte-identical files), `shares_key` (two tables pointing at one owner),
+  `metadata` (a shared author or organization) and, with `--folders`,
+  `in_folder`. A SQLite database's declared foreign keys become joins.
+  Communities get distinctive labels (folder plus the words that set them
+  apart) and `--resolution` sets how fine they are.
+- Graph exports (`--export graphml,dot,cypher,html`, or `--output-format`
+  with output `-`): GraphML, Graphviz DOT, Neo4j Cypher and a
+  self-contained HTML viewer.
+- `sniff-rs diff` compares two `graph.json` files: nodes and links added,
+  removed or changed, link counts per relation, files that changed group.
+- Graph queries take `--relation`, `--confidence`, `--min-score`;
+  `explain` takes `--depth`, `path` takes `--paths` (the N best routes),
+  and `rank` takes `--top` and `--sort degree|importance` and reports
+  PageRank importance and cut nodes.
 - NetCDF (`--features netcdf` for classic CDF-1/2/5; `--features hdf5` for
   NetCDF-4, and HDF5 and MATLAB v7.3 `.mat` files): variables become tidy
   tables, one row per grid cell, with fill values missing, packed values

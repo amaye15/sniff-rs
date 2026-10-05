@@ -15835,6 +15835,396 @@ fn kg_link_any(doc: &serde_json::Value, relation: &str, source: &str, target: &s
         .any(|l| l["relation"] == relation && l["source"] == source && l["target"] == target)
 }
 
+// --- Graph improvements: cache, jobs, new relations, exports, queries ---
+
+/// A small tree: `accounts.csv` and `sub/txns.csv` share a `code` key,
+/// `other/accounts_copy.csv` is a byte-identical copy of `accounts.csv`,
+/// and two text files name a file and an e-mail address.
+fn graph_scratch_tree(root: &std::path::Path) -> std::path::PathBuf {
+    let data = root.join("data");
+    std::fs::create_dir_all(data.join("sub")).unwrap();
+    std::fs::create_dir_all(data.join("other")).unwrap();
+    let accounts = "code,name\nAC-0001,a\nAC-0002,b\nAC-0003,c\nAC-0004,d\nAC-0005,e\nAC-0006,f\n";
+    std::fs::write(data.join("accounts.csv"), accounts).unwrap();
+    std::fs::write(data.join("other/accounts_copy.csv"), accounts).unwrap();
+    std::fs::write(
+        data.join("sub/txns.csv"),
+        "tx,code,amt\n1,AC-0001,5\n2,AC-0002,6\n3,AC-0003,7\n4,AC-0004,8\n5,AC-0005,9\n6,AC-0006,1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("notes.txt"),
+        "See accounts.csv and mail bob@example.org\n",
+    )
+    .unwrap();
+    std::fs::write(data.join("sub/memo.txt"), "mail bob@example.org\n").unwrap();
+    data
+}
+
+fn graph_json_of(out: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(out.join("graph.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn graph_links_joins_key_columns_and_byte_identical_copies() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    let out = tmp.path().join("out");
+    let run = run_graph(&["graph", data.to_str().unwrap(), out.to_str().unwrap()]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let doc = graph_json_of(&out);
+    assert!(kg_link_any(&doc, "joins", "accounts.csv", "sub/txns.csv"));
+    assert!(kg_link_any(
+        &doc,
+        "duplicate_of",
+        "other/accounts_copy.csv",
+        "accounts.csv"
+    ));
+    assert!(kg_link_any(&doc, "references", "notes.txt", "accounts.csv"));
+    // Folders are off unless asked for.
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "in_folder")
+    );
+}
+
+#[test]
+fn graph_folders_flag_adds_folder_nodes_and_in_folder_links() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    let out = tmp.path().join("out");
+    let run = run_graph(&[
+        "graph",
+        data.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "--folders",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let doc = graph_json_of(&out);
+    assert!(
+        doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == "folder:sub" && n["type"] == "folder")
+    );
+    assert!(kg_link_any(&doc, "in_folder", "sub/txns.csv", "folder:sub"));
+}
+
+#[test]
+fn graph_cache_is_written_reused_and_invalidated_by_a_change() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    let out = tmp.path().join("out");
+    let args = [
+        "graph",
+        data.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "--jobs",
+        "2",
+    ];
+    assert!(run_graph(&args).status.success());
+    let cache = out.join(".sniff-rs-cache");
+    assert!(cache.is_dir() && std::fs::read_dir(&cache).unwrap().count() > 0);
+    let cold = std::fs::read(out.join("graph.json")).unwrap();
+
+    // A warm run reads the cache and writes the same graph.
+    assert!(run_graph(&args).status.success());
+    assert_eq!(cold, std::fs::read(out.join("graph.json")).unwrap());
+
+    // A changed file is read again and the graph follows it.
+    std::fs::write(
+        data.join("sub/txns.csv"),
+        "tx,code,amt\n1,ZZ-1,5\n2,ZZ-2,6\n",
+    )
+    .unwrap();
+    assert!(run_graph(&args).status.success());
+    let doc = graph_json_of(&out);
+    assert!(!kg_link_any(&doc, "joins", "accounts.csv", "sub/txns.csv"));
+
+    // --no-cache leaves no cache behind, and conflicts with --cache-dir.
+    let fresh = tmp.path().join("fresh");
+    assert!(
+        run_graph(&[
+            "graph",
+            data.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+            "--no-cache"
+        ])
+        .status
+        .success()
+    );
+    assert!(!fresh.join(".sniff-rs-cache").exists());
+    let both = run_graph(&[
+        "graph",
+        data.to_str().unwrap(),
+        fresh.to_str().unwrap(),
+        "--no-cache",
+        "--cache-dir",
+        tmp.path().join("c").to_str().unwrap(),
+    ]);
+    assert!(!both.status.success());
+}
+
+#[test]
+fn graph_job_count_never_changes_the_graph() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    let one = run_graph(&[
+        "graph",
+        data.to_str().unwrap(),
+        "-",
+        "--no-cache",
+        "--jobs",
+        "1",
+    ]);
+    let many = run_graph(&[
+        "graph",
+        data.to_str().unwrap(),
+        "-",
+        "--no-cache",
+        "--jobs",
+        "4",
+    ]);
+    assert!(one.status.success() && many.status.success());
+    assert_eq!(one.stdout, many.stdout);
+    let bad = run_graph(&["graph", data.to_str().unwrap(), "-", "--jobs", "0"]);
+    assert!(!bad.status.success());
+}
+
+#[test]
+fn graph_exports_every_requested_format() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    let out = tmp.path().join("out");
+    let run = run_graph(&[
+        "graph",
+        data.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "--export",
+        "graphml,dot,cypher,html",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let graphml = std::fs::read_to_string(out.join("graph.graphml")).unwrap();
+    assert!(graphml.contains("<graphml") && graphml.contains("accounts.csv"));
+    let dot = std::fs::read_to_string(out.join("graph.dot")).unwrap();
+    assert!(dot.starts_with("graph knowledge {"));
+    let cypher = std::fs::read_to_string(out.join("graph.cypher")).unwrap();
+    assert!(cypher.contains("CREATE (n0:File"));
+    let html = std::fs::read_to_string(out.join("graph.html")).unwrap();
+    assert!(html.starts_with("<!doctype html>") && html.contains("accounts.csv"));
+
+    // The same formats print to stdout, and an unknown one is refused.
+    for (format, start) in [
+        ("graphml", "<?xml"),
+        ("dot", "graph knowledge"),
+        ("cypher", "// Generated by sniff-rs graph"),
+        ("html", "<!doctype html>"),
+    ] {
+        let text = run_graph(&[
+            "graph",
+            data.to_str().unwrap(),
+            "-",
+            "--output-format",
+            format,
+        ]);
+        assert!(text.status.success(), "{format}");
+        assert!(
+            String::from_utf8_lossy(&text.stdout).starts_with(start),
+            "{format}"
+        );
+    }
+    let bad = run_graph(&["graph", data.to_str().unwrap(), "-", "--export", "pdf"]);
+    assert!(!bad.status.success());
+}
+
+#[test]
+fn graph_resolution_flag_is_validated_and_changes_only_grouping() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    for bad in ["0", "-1", "abc"] {
+        let run = run_graph(&["graph", data.to_str().unwrap(), "-", "--resolution", bad]);
+        assert!(!run.status.success(), "{bad}");
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("--resolution must be a positive number")
+        );
+    }
+    let standard = run_graph(&["graph", data.to_str().unwrap(), "-", "--resolution", "1.0"]);
+    let default = run_graph(&["graph", data.to_str().unwrap(), "-"]);
+    assert_eq!(standard.stdout, default.stdout);
+    let fine = run_graph(&["graph", data.to_str().unwrap(), "-", "--resolution", "3"]);
+    assert!(fine.status.success());
+    let (a, b): (serde_json::Value, serde_json::Value) = (
+        serde_json::from_slice(&default.stdout).unwrap(),
+        serde_json::from_slice(&fine.stdout).unwrap(),
+    );
+    assert_eq!(a["links"], b["links"]);
+}
+
+#[test]
+fn graph_query_filters_limit_what_explain_path_and_rank_show() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    let out = tmp.path().join("out");
+    assert!(
+        run_graph(&["graph", data.to_str().unwrap(), out.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let g = out.join("graph.json");
+    let g = g.to_str().unwrap();
+
+    let joins = run_graph(&[
+        "explain",
+        g,
+        "accounts.csv",
+        "--relation",
+        "joins",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        joins.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joins.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&joins.stdout).unwrap();
+    let connections = doc["connections"].as_array().unwrap();
+    assert!(!connections.is_empty());
+    assert!(connections.iter().all(|c| c["relation"] == "joins"));
+
+    // --confidence is a minimum: extracted drops the inferred links.
+    let strong = run_graph(&[
+        "explain",
+        g,
+        "accounts.csv",
+        "--confidence",
+        "extracted",
+        "--output-format",
+        "json",
+    ]);
+    assert!(strong.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&strong.stdout).unwrap();
+    let connections = doc["connections"].as_array().unwrap();
+    assert!(!connections.is_empty());
+    assert!(connections.iter().all(|c| c["confidence"] == "EXTRACTED"));
+
+    let scored = run_graph(&[
+        "explain",
+        g,
+        "accounts.csv",
+        "--min-score",
+        "99",
+        "--output-format",
+        "json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&scored.stdout).unwrap();
+    assert!(doc["connections"].as_array().unwrap().is_empty());
+
+    let wide = run_graph(&[
+        "explain",
+        g,
+        "notes.txt",
+        "--depth",
+        "2",
+        "--output-format",
+        "json",
+    ]);
+    assert!(wide.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&wide.stdout).unwrap();
+    assert!(doc["neighborhood"].is_array() || doc["neighborhood"].is_object());
+    let too_deep = run_graph(&["explain", g, "notes.txt", "--depth", "9"]);
+    assert!(!too_deep.status.success());
+
+    let routes = run_graph(&["path", g, "notes.txt", "sub/txns.csv", "--paths", "2"]);
+    assert!(routes.status.success());
+    let text = String::from_utf8_lossy(&routes.stdout);
+    assert!(text.contains("## Route 1") && text.contains("## Route 2"));
+
+    let top = run_graph(&["rank", g, "--top", "1"]);
+    assert!(top.status.success());
+    assert!(String::from_utf8_lossy(&top.stdout).contains("…and"));
+    let bad = run_graph(&["rank", g, "--sort", "nonsense"]);
+    assert!(!bad.status.success());
+}
+
+#[test]
+fn graph_diff_compares_two_graph_files() {
+    let tmp = TempDir::new();
+    let data = graph_scratch_tree(tmp.path());
+    let old = tmp.path().join("old");
+    assert!(
+        run_graph(&["graph", data.to_str().unwrap(), old.to_str().unwrap()])
+            .status
+            .success()
+    );
+    std::fs::write(data.join("sub/txns.csv"), "tx,code,amt\n1,ZZ-1,5\n").unwrap();
+    std::fs::write(data.join("added.txt"), "a new note\n").unwrap();
+    let new = tmp.path().join("new");
+    assert!(
+        run_graph(&["graph", data.to_str().unwrap(), new.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let (a, b) = (old.join("graph.json"), new.join("graph.json"));
+    let report = run_graph(&["diff", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let text = String::from_utf8_lossy(&report.stdout);
+    assert!(text.starts_with("# Knowledge graph drift"));
+    assert!(text.contains("`added.txt`"));
+    assert!(text.contains("joins"));
+    let same = run_graph(&["diff", a.to_str().unwrap(), a.to_str().unwrap()]);
+    assert!(same.status.success());
+    assert!(String::from_utf8_lossy(&same.stdout).contains("No differences"));
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn graph_turns_declared_foreign_keys_into_joins() {
+    let tmp = TempDir::new();
+    let data = tmp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::copy(
+        fixture("edge_graph_declared_keys.sqlite"),
+        data.join("shop.sqlite"),
+    )
+    .unwrap();
+    let run = run_graph(&["graph", data.to_str().unwrap(), "-", "--no-cache"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    let declared = doc["links"].as_array().unwrap().iter().any(|l| {
+        l["relation"] == "joins"
+            && l["evidence"]
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("declared")
+    });
+    assert!(declared, "{}", doc["links"]);
+}
+
 // --- Compressed input recognized by content, and `diff` reading stdin ---
 
 /// A gzip-compressed CSV with no extension at all is decompressed from
