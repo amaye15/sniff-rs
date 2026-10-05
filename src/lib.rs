@@ -3432,7 +3432,7 @@ INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SAS Transport (.xpt), SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
 HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
-text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, Weka ARFF, R data (.rds/.RData), NetCDF, the tables in an HTML or Markdown document, or a Delta Lake/Apache Iceberg
+text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, Weka ARFF, R data (.rds/.RData), NetCDF, HDF5, the tables in an HTML or Markdown document, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3510,7 +3510,7 @@ OPTIONS:
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
                                  sas7bdat, xport, spss, orc, bson, plist, json5, har, geojson,
-                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, arff, rdata, netcdf, html, markdown, icalendar, ipynb, or pdf - single-file mode only. Run
+                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, arff, rdata, netcdf, hdf5, html, markdown, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -5087,7 +5087,9 @@ struct ColumnProfile {
     feature = "sas7bdat",
     feature = "spss",
     feature = "xport",
-    feature = "rdata"
+    feature = "rdata",
+    feature = "netcdf",
+    feature = "hdf5"
 ))]
 const MAX_VALUE_LABELS_NOTED: usize = 20;
 /// A single value label is cut to this many characters in the notes.
@@ -5096,7 +5098,9 @@ const MAX_VALUE_LABELS_NOTED: usize = 20;
     feature = "sas7bdat",
     feature = "spss",
     feature = "xport",
-    feature = "rdata"
+    feature = "rdata",
+    feature = "netcdf",
+    feature = "hdf5"
 ))]
 const MAX_VALUE_LABEL_CHARS: usize = 60;
 
@@ -5112,7 +5116,9 @@ const MAX_VALUE_LABEL_CHARS: usize = 60;
     feature = "sas7bdat",
     feature = "spss",
     feature = "xport",
-    feature = "rdata"
+    feature = "rdata",
+    feature = "netcdf",
+    feature = "hdf5"
 ))]
 fn apply_variable_labels(
     profile: &mut ColumnProfile,
@@ -18986,11 +18992,20 @@ mod rdata_support {
 
         #[test]
         fn nesting_deeper_than_the_limit_is_refused() {
-            let mut w = W(Vec::new());
-            for _ in 0..(MAX_DEPTH + 5) {
-                w.int(VECSXP).int(1);
-            }
-            assert!(parse(w.0, Wire::Xdr).is_err());
+            // The binary reads on an 8 MiB stack; a debug build's frames are
+            // too big for a test thread's default 2 MiB.
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(|| {
+                    let mut w = W(Vec::new());
+                    for _ in 0..(MAX_DEPTH + 5) {
+                        w.int(VECSXP).int(1);
+                    }
+                    assert!(parse(w.0, Wire::Xdr).is_err());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
         }
 
         #[test]
@@ -20428,6 +20443,11 @@ mod scidata_support {
     /// memory flat for a wide table.
     const BLOCK_ROWS: usize = 16 * 1024;
 
+    /// One table's worth of variables: an explicit table name (MATLAB and
+    /// HDF5 datasets), the shared dimensions (name and length), and the
+    /// indexes of the variables in it.
+    type DimGroup = (Option<String>, Vec<(String, u64)>, Vec<usize>);
+
     /// A block of one variable's elements, in row-major order.
     pub(crate) enum Cells {
         I64(Vec<i64>),
@@ -20467,6 +20487,13 @@ mod scidata_support {
         pub(crate) type_name: &'static str,
         /// Reads `count` elements from element `start`, row-major.
         pub(crate) read: Reader,
+        /// An explicit table this variable belongs to (HDF5: a dataset's own
+        /// name, shared by the members of a compound type); `None` groups by
+        /// dimensions.
+        pub(crate) table: Option<String>,
+        /// The dimensions have no names of their own (plain HDF5): a table
+        /// of one such dimension has no index column.
+        pub(crate) anon: bool,
     }
 
     impl Var {
@@ -20505,21 +20532,29 @@ mod scidata_support {
     struct TimeAxis {
         /// Seconds per unit.
         unit_secs: f64,
-        /// The origin, in seconds since the Unix epoch.
+        /// The origin, in seconds since the Unix epoch (or, for a fixed-length
+        /// calendar, since year 0 of that calendar).
         origin: f64,
         digits: u32,
+        /// Month lengths of a fixed-length calendar (`noleap`, `all_leap`,
+        /// `360_day`); `None` is the Gregorian calendar.
+        months: Option<[u32; 12]>,
     }
 
-    /// `days since 1970-01-01 00:00:00` and friends (standard calendars).
+    const NOLEAP_MONTHS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    const ALL_LEAP_MONTHS: [u32; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    const DAY360_MONTHS: [u32; 12] = [30; 12];
+
+    /// `days since 1970-01-01 00:00:00` and friends (the standard calendars,
+    /// and the fixed-length ones climate models use).
     fn parse_time_units(units: &str, calendar: Option<&str>) -> Option<TimeAxis> {
-        if let Some(c) = calendar
-            && !matches!(
-                c.to_ascii_lowercase().as_str(),
-                "standard" | "gregorian" | "proleptic_gregorian"
-            )
-        {
-            return None;
-        }
+        let months = match calendar.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("standard" | "gregorian" | "proleptic_gregorian") => None,
+            Some("noleap" | "365_day") => Some(NOLEAP_MONTHS),
+            Some("all_leap" | "366_day") => Some(ALL_LEAP_MONTHS),
+            Some("360_day") => Some(DAY360_MONTHS),
+            Some(_) => return None,
+        };
         let lower = units.trim().to_ascii_lowercase();
         let (unit, origin) = lower.split_once(" since ")?;
         let unit_secs = match unit.trim() {
@@ -20568,11 +20603,22 @@ mod scidata_support {
                 tz = sign * (zh.parse::<f64>().ok()? * 3600.0 + zm.parse::<f64>().ok()? * 60.0);
             }
         }
-        let days = days_from_civil(y, m, d);
+        let days = match months {
+            None => days_from_civil(y, m, d),
+            Some(ml) => {
+                let year_len: u32 = ml.iter().sum();
+                if d > ml[m as usize - 1] {
+                    return None;
+                }
+                let before: u32 = ml[..m as usize - 1].iter().sum();
+                y * i64::from(year_len) + i64::from(before) + i64::from(d) - 1
+            }
+        };
         Some(TimeAxis {
             unit_secs,
             origin: days as f64 * 86400.0 + secs - tz,
             digits: 0,
+            months,
         })
     }
 
@@ -20583,14 +20629,22 @@ mod scidata_support {
         format!("{x:.13e}").parse().unwrap_or(x)
     }
 
+    /// A double exactly as stored (the shortest text that reads back the
+    /// same).
     fn push_f64(out: &mut String, x: f64) {
         use std::fmt::Write;
-        let x = round_sig(x);
         if x == 0.0 || (1e-5..1e15).contains(&x.abs()) {
             let _ = write!(out, "{x}");
         } else {
             let _ = write!(out, "{x:e}");
         }
+    }
+
+    /// A computed double with the arithmetic noise rounded off (14
+    /// significant digits): an unpacked value is `raw * scale + offset`, whose
+    /// last digits are floating-point residue.
+    fn push_f64_rounded(out: &mut String, x: f64) {
+        push_f64(out, round_sig(x));
     }
 
     fn push_f32(out: &mut String, x: f32) {
@@ -20613,6 +20667,33 @@ mod scidata_support {
         if micros >= 1_000_000 {
             whole += 1.0;
             micros -= 1_000_000;
+        }
+        if let Some(ml) = t.months {
+            // A fixed-length calendar: count whole days and name them by
+            // walking the month lengths.
+            let whole = whole as i64;
+            let year_len = i64::from(ml.iter().sum::<u32>());
+            let (day, sod) = (whole.div_euclid(86_400), whole.rem_euclid(86_400) as u32);
+            let (year, mut doy) = (day.div_euclid(year_len), day.rem_euclid(year_len) as u32);
+            if !(1..=9999).contains(&year) {
+                return false;
+            }
+            let mut month = 0usize;
+            while doy >= ml[month] {
+                doy -= ml[month];
+                month += 1;
+            }
+            let Some(time) = EpochTime::from_seconds_since_midnight(sod, (micros * 1000) as u32)
+            else {
+                return false;
+            };
+            let clock = if t.digits == 0 {
+                time.format_hms()
+            } else {
+                time.format_hms_frac(t.digits)
+            };
+            let _ = write!(out, "{year:04}-{:02}-{:02} {clock}", month + 1, doy + 1);
+            return true;
         }
         match EpochDateTime::from_unix_seconds(whole as i64, (micros * 1000) as u32) {
             Some(dt) => {
@@ -20657,7 +20738,7 @@ mod scidata_support {
                     for &x in v {
                         s.clear();
                         let f = x as f64;
-                        let ok = if self.fills.iter().any(|&fl| fl == f) {
+                        let ok = if self.fills.contains(&f) {
                             false
                         } else if plain_float {
                             let _ = write!(s, "{x}");
@@ -20672,7 +20753,7 @@ mod scidata_support {
                     for &x in v {
                         s.clear();
                         let f = x as f64;
-                        let ok = if self.fills.iter().any(|&fl| fl == f) {
+                        let ok = if self.fills.contains(&f) {
                             false
                         } else if plain_float {
                             let _ = write!(s, "{x}");
@@ -20721,7 +20802,7 @@ mod scidata_support {
             match &self.time {
                 Some(t) => time_text(t, value, out),
                 None => {
-                    push_f64(out, value);
+                    push_f64_rounded(out, value);
                     true
                 }
             }
@@ -20752,7 +20833,12 @@ mod scidata_support {
         if let Some(units) = var.attr_text("units")
             && let Some(t) = parse_time_units(units, var.attr_text("calendar"))
         {
-            notes.push(format!("decoded from CF time units {units:?} (UTC)"));
+            notes.push(match var.attr_text("calendar") {
+                Some(cal) if t.months.is_some() => {
+                    format!("decoded from CF time units {units:?} in the {cal} calendar")
+                }
+                _ => format!("decoded from CF time units {units:?} (UTC)"),
+            });
             d.time = Some(t);
         } else if var
             .attr_text("units")
@@ -20760,7 +20846,7 @@ mod scidata_support {
             && let Some(cal) = var.attr_text("calendar")
         {
             notes.push(format!(
-                "CF time with calendar {cal:?} isn't decoded (only standard calendars are)"
+                "CF time with calendar {cal:?} isn't decoded (the standard, noleap, all_leap and 360_day calendars are)"
             ));
         }
         (d, notes)
@@ -20843,39 +20929,54 @@ mod scidata_support {
                 .position(|v| v.name == dim && v.dims.len() == 1 && v.dims[0].0 == dim)
         };
         // Group by dimension signature, in file order.
-        let mut groups: Vec<(Vec<(String, u64)>, Vec<usize>)> = Vec::new();
+        let mut groups: Vec<DimGroup> = Vec::new();
         for (i, v) in vars.iter().enumerate() {
-            let is_coord = v.dims.len() == 1 && v.dims[0].0 == v.name;
+            let is_coord =
+                !v.anon && v.table.is_none() && v.dims.len() == 1 && v.dims[0].0 == v.name;
             if is_coord {
                 continue;
             }
-            match groups.iter_mut().find(|(d, _)| *d == v.dims) {
-                Some((_, members)) => members.push(i),
-                None => groups.push((v.dims.clone(), vec![i])),
+            match groups
+                .iter_mut()
+                .find(|(t, d, _)| *t == v.table && (v.table.is_some() || *d == v.dims))
+            {
+                Some((_, _, members)) => members.push(i),
+                None => groups.push((v.table.clone(), v.dims.clone(), vec![i])),
             }
         }
         // A coordinate variable no data variable uses is data itself.
         for (i, v) in vars.iter().enumerate() {
-            if v.dims.len() == 1 && v.dims[0].0 == v.name {
+            if !v.anon && v.table.is_none() && v.dims.len() == 1 && v.dims[0].0 == v.name {
                 let used = groups
                     .iter()
-                    .any(|(d, _)| d.iter().any(|(n, _)| *n == v.name));
+                    .any(|(_, d, _)| d.iter().any(|(n, _)| *n == v.name));
                 if !used {
-                    groups.push((v.dims.clone(), vec![i]));
+                    groups.push((None, v.dims.clone(), vec![i]));
                 }
             }
         }
         let mut tables = Vec::new();
-        for (dims, members) in &groups {
+        for (explicit, dims, members) in &groups {
             // A coordinate-only group is the coordinate variable itself, so
             // its dimension column would repeat it.
             let coord_only = members.len() == 1
+                && !vars[members[0]].anon
+                && vars[members[0]].table.is_none()
                 && vars[members[0]].dims.len() == 1
                 && vars[members[0]].dims[0].0 == vars[members[0]].name;
+            // Anonymous dimensions get an index column only when there are
+            // several (an array of three axes); a lone one is just the rows.
+            let anon_group = members.iter().all(|&m| vars[m].anon);
+            let skip_dim_cols = coord_only || (anon_group && dims.len() < 2);
             let mut columns: Vec<Column> = Vec::new();
-            if !coord_only {
+            if !skip_dim_cols {
                 for (k, (dname, len)) in dims.iter().enumerate() {
-                    let (labels, description, notes, ty) = match coord_of(vars, dname) {
+                    let found = if anon_group {
+                        None
+                    } else {
+                        coord_of(vars, dname)
+                    };
+                    let (labels, description, notes, ty) = match found {
                         Some(ci) => {
                             let (decode, mut notes) = decode_for(&vars[ci]);
                             let n = vars[ci].count().unwrap_or(0);
@@ -20932,7 +21033,9 @@ mod scidata_support {
                 .iter()
                 .try_fold(1u64, |a, &l| a.checked_mul(l))
                 .unwrap_or(0);
-            let name = if dims.is_empty() {
+            let name = if let Some(t) = explicit {
+                t.clone()
+            } else if dims.is_empty() {
                 "scalars".to_string()
             } else {
                 dims.iter()
@@ -21471,6 +21574,8 @@ mod netcdf_support {
                 attrs: raw.attrs,
                 type_name: if strlen.is_some() { "char" } else { ty.name() },
                 read: reader,
+                table: None,
+                anon: false,
             });
         }
         Ok(out)
@@ -21640,6 +21745,3155 @@ fn render_sql_inline_flat_netcdf(
 ) -> Result<()> {
     bail!(
         "NetCDF support isn't compiled in - rebuild with `cargo build --release --features netcdf` (or --features full)"
+    )
+}
+
+// --- HDF5 (`.h5`, `.hdf5`, NetCDF-4 `.nc`, MATLAB v7.3 `.mat`) ---
+//
+// A hand-rolled reader of the HDF5 file format (the HDF Group's File Format
+// Specification, versions 0-3 of the superblock): the superblock; object
+// headers, both the version 1 and the version 2 (`OHDR`) layout, with their
+// continuation chunks; groups, old-style (a symbol table: v1 B-tree, local
+// heap, `SNOD` nodes) and new-style (link messages, with dense storage in a
+// fractal heap indexed by a v2 B-tree); datasets with compact, contiguous and
+// chunked storage - chunks found through a v1 B-tree or any of the layout 4
+// indexes (single chunk, implicit, fixed array, extensible array, v2 B-tree)
+// - and the deflate, shuffle and Fletcher-32 filters; attributes, compact and
+// dense; and the datatypes real files use: integers, floats (half, single,
+// double), fixed and variable-length strings, enums, arrays, compounds,
+// object references and opaque/bitfield bytes. Variable-length data comes
+// from the global heap.
+//
+// A dataset becomes a table: a compound dataset one column per field; a 1-D
+// dataset a `value` column; a 2-D numeric dataset one column per column (as a
+// NumPy array does); an array of three or more axes one row per cell with its
+// indices. A NetCDF-4 file's dimension scales give its variables named
+// dimensions, and then it reads exactly like classic NetCDF - tidy tables of
+// coordinates and variables - through the same layer. Attributes become the
+// column's description (`long_name`, `description`, `title`) and notes
+// (`units`); `_FillValue` and NaN are missing, as for NetCDF. MATLAB v7.3 files are HDF5 with
+// transposed (column-major) arrays; the `MATLAB_class` attribute says so and the
+// arrays are turned the right way round.
+//
+// Every address, length and count comes from the file, so each is checked
+// against the file's size before anything is allocated, and walks are bounded
+// (nesting depth, objects visited, chunks), so a damaged or hostile file is an
+// error and not a hang or a panic.
+#[cfg(feature = "hdf5")]
+mod hdf5_support {
+    use super::scidata_support::*;
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::rc::Rc;
+
+    const SIGNATURE: [u8; 8] = [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a];
+    const UNDEF: u64 = u64::MAX;
+    /// Reads from the file larger than this are damage, not data.
+    const MAX_READ: u64 = 1 << 31;
+    const MAX_OBJECTS: usize = 200_000;
+    const MAX_DEPTH: usize = 64;
+
+    // ---- bytes ----
+
+    fn damaged() -> Error {
+        anyhow!("the HDF5 file is damaged or cut short")
+    }
+
+    struct Cur<'a> {
+        b: &'a [u8],
+        p: usize,
+    }
+
+    impl<'a> Cur<'a> {
+        fn new(b: &'a [u8]) -> Self {
+            Cur { b, p: 0 }
+        }
+        fn left(&self) -> usize {
+            self.b.len().saturating_sub(self.p)
+        }
+        fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+            if self.left() < n {
+                return Err(damaged());
+            }
+            let s = &self.b[self.p..self.p + n];
+            self.p += n;
+            Ok(s)
+        }
+        fn skip(&mut self, n: usize) -> Result<()> {
+            self.take(n).map(|_| ())
+        }
+        fn u8(&mut self) -> Result<u8> {
+            Ok(self.take(1)?[0])
+        }
+        fn u16(&mut self) -> Result<u16> {
+            let b = self.take(2)?;
+            Ok(u16::from_le_bytes([b[0], b[1]]))
+        }
+        fn u32(&mut self) -> Result<u32> {
+            let b = self.take(4)?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }
+        fn u64(&mut self) -> Result<u64> {
+            let b = self.take(8)?;
+            Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+        }
+        /// An `n`-byte little-endian unsigned integer (1..=8 bytes).
+        fn uint(&mut self, n: usize) -> Result<u64> {
+            if n > 8 {
+                return Err(damaged());
+            }
+            let b = self.take(n)?;
+            Ok(b.iter().rev().fold(0u64, |a, &x| (a << 8) | u64::from(x)))
+        }
+        /// A file address: all ones is "undefined".
+        fn addr(&mut self, so: usize) -> Result<u64> {
+            let b = self.take(so)?;
+            if b.iter().all(|&x| x == 0xFF) {
+                return Ok(UNDEF);
+            }
+            Ok(b.iter().rev().fold(0u64, |a, &x| (a << 8) | u64::from(x)))
+        }
+        fn cstr(&mut self) -> Result<String> {
+            let rest = &self.b[self.p.min(self.b.len())..];
+            let end = rest.iter().position(|&c| c == 0).ok_or_else(damaged)?;
+            let s = String::from_utf8_lossy(&rest[..end]).into_owned();
+            self.p += end + 1;
+            Ok(s)
+        }
+        fn align(&mut self, to: usize, from: usize) -> Result<()> {
+            let used = self.p - from;
+            let pad = (to - used % to) % to;
+            self.skip(pad)
+        }
+    }
+
+    fn uint_at(b: &[u8], n: usize) -> u64 {
+        b.iter()
+            .take(n)
+            .rev()
+            .fold(0u64, |a, &x| (a << 8) | u64::from(x))
+    }
+
+    /// Bytes needed to hold any value up to `limit`.
+    fn enc_size(limit: u64) -> usize {
+        let bits = 64 - limit.leading_zeros() as usize;
+        bits.div_ceil(8).max(1)
+    }
+
+    pub(crate) struct H5File {
+        f: RefCell<fs::File>,
+        len: u64,
+        /// Where the superblock sits; every address is relative to it.
+        base: u64,
+        so: usize,
+        sl: usize,
+    }
+
+    impl H5File {
+        fn read(&self, addr: u64, n: usize) -> Result<Vec<u8>> {
+            if addr == UNDEF || n as u64 > MAX_READ {
+                return Err(damaged());
+            }
+            let at = self.base.checked_add(addr).ok_or_else(damaged)?;
+            if at.checked_add(n as u64).is_none_or(|end| end > self.len) {
+                return Err(damaged());
+            }
+            let mut f = self.f.borrow_mut();
+            f.seek(SeekFrom::Start(at)).map_err(|_| damaged())?;
+            let mut buf = vec![0u8; n];
+            f.read_exact(&mut buf).map_err(|_| damaged())?;
+            Ok(buf)
+        }
+    }
+
+    struct Super {
+        file: Rc<H5File>,
+        root: u64,
+    }
+
+    fn open_file(path: &Path) -> Result<Super> {
+        let mut f = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        // The signature sits at 0, or at 512, 1024, 2048, ... after a user block.
+        let mut base = None;
+        let mut at = 0u64;
+        while at + 8 <= len {
+            let mut sig = [0u8; 8];
+            f.seek(SeekFrom::Start(at))?;
+            f.read_exact(&mut sig)?;
+            if sig == SIGNATURE {
+                base = Some(at);
+                break;
+            }
+            at = if at == 0 { 512 } else { at * 2 };
+        }
+        let base = base.with_context(|| format!("{path:?} has no HDF5 signature"))?;
+        let mut head = vec![0u8; 128.min((len - base) as usize)];
+        f.seek(SeekFrom::Start(base))?;
+        f.read_exact(&mut head)?;
+        let mut c = Cur::new(&head);
+        c.skip(8)?;
+        let version = c.u8()?;
+        let (so, sl, root);
+        match version {
+            0 | 1 => {
+                c.skip(3)?; // free-space, root-entry and shared-header versions
+                c.skip(1)?;
+                so = c.u8()? as usize;
+                sl = c.u8()? as usize;
+                c.skip(1)?;
+                c.skip(4)?; // group leaf and internal node K
+                c.skip(4)?; // file consistency flags
+                if version == 1 {
+                    c.skip(4)?; // indexed storage K and reserved
+                }
+                if !(1..=8).contains(&so) || !(1..=8).contains(&sl) {
+                    bail!("{path:?} has an HDF5 superblock with sizes of {so} and {sl} bytes");
+                }
+                c.skip(so * 4)?; // base, free space, end of file, driver block
+                // the root group's symbol table entry
+                c.skip(so)?; // link name offset
+                root = c.addr(so)?;
+            }
+            2 | 3 => {
+                so = c.u8()? as usize;
+                sl = c.u8()? as usize;
+                c.skip(1)?; // file consistency flags
+                if !(1..=8).contains(&so) || !(1..=8).contains(&sl) {
+                    bail!("{path:?} has an HDF5 superblock with sizes of {so} and {sl} bytes");
+                }
+                c.skip(so * 3)?; // base, extension, end of file
+                root = c.addr(so)?;
+            }
+            other => bail!("{path:?} has HDF5 superblock version {other}, which isn't supported"),
+        }
+        Ok(Super {
+            file: Rc::new(H5File {
+                f: RefCell::new(f),
+                len,
+                base,
+                so,
+                sl,
+            }),
+            root,
+        })
+    }
+
+    // ---- object headers ----
+
+    #[derive(Clone)]
+    struct Msg {
+        ty: u16,
+        data: Vec<u8>,
+    }
+
+    const MSG_DATASPACE: u16 = 0x0001;
+    const MSG_LINK_INFO: u16 = 0x0002;
+    const MSG_DATATYPE: u16 = 0x0003;
+    const MSG_FILL_OLD: u16 = 0x0004;
+    const MSG_FILL: u16 = 0x0005;
+    const MSG_LINK: u16 = 0x0006;
+    const MSG_LAYOUT: u16 = 0x0008;
+    const MSG_FILTERS: u16 = 0x000B;
+    const MSG_ATTRIBUTE: u16 = 0x000C;
+    const MSG_CONTINUATION: u16 = 0x0010;
+    const MSG_SYMTAB: u16 = 0x0011;
+    const MSG_ATTR_INFO: u16 = 0x0015;
+
+    /// Reads every message of an object header (following continuations).
+    fn read_header(h: &H5File, addr: u64) -> Result<Vec<Msg>> {
+        let avail = h.len.saturating_sub(h.base).saturating_sub(addr) as usize;
+        let first = h.read(addr, 16.min(avail))?;
+        let mut out: Vec<Msg> = Vec::new();
+        let mut chunks: Vec<(u64, usize, bool)> = Vec::new(); // (address, length, v2 chunk)
+        if first.starts_with(b"OHDR") {
+            let mut c = Cur::new(&first);
+            c.skip(4)?;
+            let version = c.u8()?;
+            if version != 2 {
+                bail!("an HDF5 object header has version {version}");
+            }
+            let flags = c.u8()?;
+            let mut prefix = 6usize;
+            if flags & 0x20 != 0 {
+                prefix += 16;
+            }
+            if flags & 0x10 != 0 {
+                prefix += 4;
+            }
+            let size_len = 1usize << (flags & 3);
+            let raw = h.read(addr + 6, prefix - 6 + size_len)?;
+            let mut c = Cur::new(&raw);
+            c.skip(prefix - 6)?;
+            let size0 = c.uint(size_len)? as usize;
+            chunks.push((addr + (prefix + size_len) as u64, size0, true));
+            let track_order = flags & 0x04 != 0;
+            let mut seen = 0usize;
+            let mut i = 0;
+            while i < chunks.len() {
+                let (a, len, is_v2) = chunks[i];
+                i += 1;
+                if i > 1000 {
+                    bail!("an HDF5 object header has too many continuation chunks");
+                }
+                let mut data = h.read(a, len)?;
+                // A continuation chunk starts with `OCHK`; each chunk ends with a checksum.
+                let (start, end) = if i > 1 {
+                    if !data.starts_with(b"OCHK") {
+                        return Err(damaged());
+                    }
+                    (4, data.len().saturating_sub(4))
+                } else {
+                    (0, data.len())
+                };
+                let _ = is_v2;
+                let mut c = Cur::new(&data[..end]);
+                c.skip(start)?;
+                let hdr = if track_order { 6 } else { 4 };
+                while c.left() >= hdr {
+                    let ty = u16::from(c.u8()?);
+                    let size = c.u16()? as usize;
+                    let mflags = c.u8()?;
+                    if track_order {
+                        c.skip(2)?;
+                    }
+                    let body = c.take(size)?.to_vec();
+                    seen += 1;
+                    if seen > 100_000 {
+                        bail!("an HDF5 object header has too many messages");
+                    }
+                    push_message(h, &mut out, &mut chunks, ty, mflags, body)?;
+                }
+                data.clear();
+            }
+        } else {
+            let mut c = Cur::new(&first);
+            let version = c.u8()?;
+            if version != 1 {
+                bail!("an HDF5 object header has version {version}");
+            }
+            c.skip(1)?;
+            let _nmsgs = c.u16()?;
+            c.skip(4)?; // reference count
+            let hsize = c.u32()? as usize;
+            chunks.push((addr + 16, hsize, false));
+            let mut i = 0;
+            let mut seen = 0usize;
+            while i < chunks.len() {
+                let (a, len, _) = chunks[i];
+                i += 1;
+                if i > 1000 {
+                    bail!("an HDF5 object header has too many continuation chunks");
+                }
+                let data = h.read(a, len)?;
+                let mut c = Cur::new(&data);
+                while c.left() >= 8 {
+                    let ty = c.u16()?;
+                    let size = c.u16()? as usize;
+                    let mflags = c.u8()?;
+                    c.skip(3)?;
+                    let body = c.take(size)?.to_vec();
+                    seen += 1;
+                    if seen > 100_000 {
+                        bail!("an HDF5 object header has too many messages");
+                    }
+                    push_message(h, &mut out, &mut chunks, ty, mflags, body)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn push_message(
+        h: &H5File,
+        out: &mut Vec<Msg>,
+        chunks: &mut Vec<(u64, usize, bool)>,
+        ty: u16,
+        flags: u8,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        if ty == MSG_CONTINUATION {
+            let mut c = Cur::new(&body);
+            let at = c.addr(h.so)?;
+            let len = c.uint(h.sl)? as usize;
+            chunks.push((at, len, true));
+            return Ok(());
+        }
+        if ty == 0 {
+            return Ok(());
+        }
+        // A shared message: the body is a reference to the real one.
+        if flags & 0x02 != 0 {
+            let mut c = Cur::new(&body);
+            let version = c.u8()?;
+            let kind = c.u8()?;
+            let target = match version {
+                1 => {
+                    c.skip(6)?;
+                    Some(c.addr(h.so)?)
+                }
+                2 if kind == 0 => Some(c.addr(h.so)?),
+                3 if kind == 2 => Some(c.addr(h.so)?),
+                _ => None,
+            };
+            let Some(target) = target else {
+                bail!(
+                    "an HDF5 object uses a shared message in the file's shared-message table, which isn't supported"
+                );
+            };
+            let msgs = read_header(h, target)?;
+            let real = msgs.into_iter().find(|m| m.ty == ty);
+            out.push(real.ok_or_else(damaged)?);
+            return Ok(());
+        }
+        out.push(Msg { ty, data: body });
+        Ok(())
+    }
+
+    // ---- datatypes ----
+
+    #[derive(Clone, Debug)]
+    enum Dt {
+        Int {
+            size: usize,
+            signed: bool,
+            big: bool,
+        },
+        Float {
+            size: usize,
+            big: bool,
+        },
+        Str {
+            size: usize,
+            utf8: bool,
+        },
+        Enum {
+            base: Box<Dt>,
+            members: Vec<(String, i64)>,
+        },
+        Compound {
+            size: usize,
+            members: Vec<(String, usize, Dt)>,
+        },
+        Array {
+            dims: Vec<u64>,
+            base: Box<Dt>,
+        },
+        VlenStr {
+            size: usize,
+            utf8: bool,
+        },
+        VlenSeq {
+            size: usize,
+            base: Box<Dt>,
+        },
+        Reference {
+            size: usize,
+        },
+        Opaque {
+            size: usize,
+        },
+    }
+
+    impl Dt {
+        fn size(&self) -> usize {
+            match self {
+                Dt::Int { size, .. }
+                | Dt::Float { size, .. }
+                | Dt::Str { size, .. }
+                | Dt::Compound { size, .. }
+                | Dt::VlenStr { size, .. }
+                | Dt::VlenSeq { size, .. }
+                | Dt::Reference { size }
+                | Dt::Opaque { size } => *size,
+                Dt::Enum { base, .. } => base.size(),
+                Dt::Array { dims, base } => dims
+                    .iter()
+                    .fold(1usize, |a, &d| a.saturating_mul(d as usize))
+                    .saturating_mul(base.size()),
+            }
+        }
+    }
+
+    fn parse_dt(c: &mut Cur<'_>, depth: usize) -> Result<Dt> {
+        if depth > 16 {
+            bail!("an HDF5 datatype nests too deeply");
+        }
+        let start = c.p;
+        let cv = c.u8()?;
+        let class = cv & 0x0F;
+        let version = cv >> 4;
+        let bits = c.take(3)?;
+        let (b0, b1) = (bits[0], bits[1]);
+        let size = c.u32()? as usize;
+        let _ = start;
+        Ok(match class {
+            0 => {
+                c.skip(4)?; // bit offset, precision
+                Dt::Int {
+                    size,
+                    signed: b0 & 0x08 != 0,
+                    big: b0 & 0x01 != 0,
+                }
+            }
+            1 => {
+                c.skip(12)?;
+                Dt::Float {
+                    size,
+                    big: b0 & 0x01 != 0,
+                }
+            }
+            3 => Dt::Str {
+                size,
+                utf8: (b0 >> 4) & 0x0F == 1,
+            },
+            4 => {
+                c.skip(4)?;
+                Dt::Opaque { size }
+            }
+            5 => {
+                // opaque: a tag, padded to 8
+                let n = b0 as usize;
+                c.skip(n)?;
+                Dt::Opaque { size }
+            }
+            6 => {
+                let n = (usize::from(b1) << 8) | usize::from(b0);
+                let mut members = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    let name_start = c.p;
+                    let name = c.cstr()?;
+                    if version < 3 {
+                        c.align(8, name_start)?;
+                    }
+                    let offset = if version >= 3 {
+                        c.uint(enc_size(size as u64))? as usize
+                    } else {
+                        c.u32()? as usize
+                    };
+                    let mut array_dims = Vec::new();
+                    if version == 1 {
+                        let dimensionality = c.u8()? as usize;
+                        c.skip(3)?;
+                        c.skip(4)?; // permutation
+                        c.skip(4)?; // reserved
+                        let mut dims = [0u32; 4];
+                        for d in &mut dims {
+                            *d = c.u32()?;
+                        }
+                        array_dims = dims
+                            .iter()
+                            .take(dimensionality.min(4))
+                            .map(|&d| u64::from(d))
+                            .collect();
+                    }
+                    let mut m = parse_dt(c, depth + 1)?;
+                    if !array_dims.is_empty() {
+                        m = Dt::Array {
+                            dims: array_dims,
+                            base: Box::new(m),
+                        };
+                    }
+                    members.push((name, offset, m));
+                }
+                Dt::Compound { size, members }
+            }
+            7 => Dt::Reference { size },
+            8 => {
+                let n = (usize::from(b1) << 8) | usize::from(b0);
+                let base = parse_dt(c, depth + 1)?;
+                let mut names = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    let name_start = c.p;
+                    names.push(c.cstr()?);
+                    if version < 3 {
+                        c.align(8, name_start)?;
+                    }
+                }
+                let bs = base.size();
+                let mut members = Vec::new();
+                let signed = matches!(base, Dt::Int { signed: true, .. });
+                for name in names {
+                    let raw = c.take(bs)?;
+                    let mut v = uint_at(raw, bs);
+                    if signed && bs < 8 && bs > 0 && v >> (bs * 8 - 1) == 1 {
+                        v |= u64::MAX << (bs * 8);
+                    }
+                    members.push((name, v as i64));
+                }
+                Dt::Enum {
+                    base: Box::new(base),
+                    members,
+                }
+            }
+            9 => {
+                let is_str = b0 & 0x0F == 1;
+                let utf8 = (b1 & 0x0F) == 1;
+                let base = parse_dt(c, depth + 1)?;
+                if is_str {
+                    Dt::VlenStr { size, utf8 }
+                } else {
+                    Dt::VlenSeq {
+                        size,
+                        base: Box::new(base),
+                    }
+                }
+            }
+            10 => {
+                let rank = c.u8()? as usize;
+                if version < 3 {
+                    c.skip(3)?;
+                }
+                let mut dims = Vec::with_capacity(rank.min(32));
+                for _ in 0..rank {
+                    dims.push(u64::from(c.u32()?));
+                }
+                if version < 3 {
+                    c.skip(4 * rank)?; // permutation
+                }
+                let base = parse_dt(c, depth + 1)?;
+                Dt::Array {
+                    dims,
+                    base: Box::new(base),
+                }
+            }
+            other => bail!("an HDF5 datatype of class {other} isn't supported"),
+        })
+    }
+
+    fn parse_datatype_msg(data: &[u8]) -> Result<Dt> {
+        parse_dt(&mut Cur::new(data), 0)
+    }
+
+    // ---- dataspace ----
+
+    /// A dataspace message's dimension sizes (empty for a scalar).
+    fn parse_dataspace(data: &[u8], sl: usize) -> Result<(Vec<u64>, bool)> {
+        let mut c = Cur::new(data);
+        let version = c.u8()?;
+        let rank = c.u8()? as usize;
+        let flags = c.u8()?;
+        let kind = if version >= 2 {
+            c.u8()?
+        } else {
+            c.skip(1)?;
+            1
+        };
+        if version == 1 {
+            c.skip(4)?;
+        }
+        if rank > 32 {
+            bail!("an HDF5 dataspace has {rank} dimensions");
+        }
+        let mut dims = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            dims.push(c.uint(sl)?);
+        }
+        let _ = flags;
+        // kind 2 is a null dataspace: no elements at all
+        Ok((dims, kind == 2))
+    }
+
+    // ---- global heap (variable-length data) ----
+
+    struct GlobalHeaps {
+        cache: HashMap<u64, HashMap<u16, Vec<u8>>>,
+    }
+
+    impl GlobalHeaps {
+        fn new() -> Self {
+            GlobalHeaps {
+                cache: HashMap::new(),
+            }
+        }
+
+        fn object(&mut self, h: &H5File, addr: u64, index: u16) -> Result<Vec<u8>> {
+            if !self.cache.contains_key(&addr) {
+                let head = h.read(addr, 8 + h.sl)?;
+                if !head.starts_with(b"GCOL") {
+                    return Err(damaged());
+                }
+                let mut c = Cur::new(&head[8..]);
+                let size = c.uint(h.sl)? as usize;
+                let body = h.read(addr, size.max(8 + h.sl))?;
+                let mut c = Cur::new(&body);
+                c.skip(8 + h.sl)?;
+                let mut objs = HashMap::new();
+                while c.left() >= 8 + h.sl {
+                    let idx = c.u16()?;
+                    c.skip(2)?; // reference count
+                    c.skip(4)?;
+                    let len = c.uint(h.sl)? as usize;
+                    if idx == 0 {
+                        break;
+                    }
+                    let data = c.take(len)?.to_vec();
+                    let pad = (8 - len % 8) % 8;
+                    c.skip(pad.min(c.left()))?;
+                    objs.insert(idx, data);
+                }
+                if self.cache.len() > 256 {
+                    self.cache.clear();
+                }
+                self.cache.insert(addr, objs);
+            }
+            self.cache
+                .get(&addr)
+                .and_then(|o| o.get(&index))
+                .cloned()
+                .ok_or_else(damaged)
+        }
+    }
+
+    // ---- v2 B-tree ----
+
+    /// Every record of a v2 B-tree, with its type.
+    fn btree2_records(h: &H5File, addr: u64) -> Result<(u8, usize, Vec<Vec<u8>>)> {
+        let head = h.read(addr, 22 + h.so + h.sl)?;
+        if !head.starts_with(b"BTHD") {
+            return Err(damaged());
+        }
+        let mut c = Cur::new(&head);
+        c.skip(4)?;
+        let _version = c.u8()?;
+        let ty = c.u8()?;
+        let node_size = c.u32()? as usize;
+        let rec_size = c.u16()? as usize;
+        let depth = c.u16()? as usize;
+        c.skip(2)?; // split and merge percent
+        let root = c.addr(h.so)?;
+        let root_n = c.u16()? as usize;
+        let _total = c.uint(h.sl)?;
+        if rec_size == 0 || node_size < 16 || depth > 16 {
+            return Err(damaged());
+        }
+        if root == UNDEF || root_n == 0 {
+            return Ok((ty, rec_size, Vec::new()));
+        }
+        // How big the "number of records" fields in child pointers are.
+        let leaf_max = (node_size - 10) / rec_size;
+        let nrec_size = enc_size(leaf_max as u64);
+        let mut max_nrec = vec![leaf_max as u64];
+        let mut cum_max = vec![leaf_max as u64];
+        let mut cum_size = vec![0usize];
+        for d in 1..=depth {
+            let ptr = h.so + nrec_size + cum_size[d - 1];
+            let m = ((node_size - 10) as u64).saturating_sub(ptr as u64) / (rec_size + ptr) as u64;
+            max_nrec.push(m);
+            let cum = (m + 1).saturating_mul(cum_max[d - 1]).saturating_add(m);
+            cum_max.push(cum);
+            cum_size.push(enc_size(cum));
+        }
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut stack: Vec<(u64, usize, usize)> = vec![(root, root_n, depth)];
+        let mut visited = 0usize;
+        while let Some((a, n, d)) = stack.pop() {
+            visited += 1;
+            if visited > 1_000_000 {
+                bail!("an HDF5 B-tree is implausibly large");
+            }
+            let ptr = h.so + nrec_size + if d >= 1 { cum_size[d - 1] } else { 0 };
+            let len = 6 + n * rec_size + if d > 0 { (n + 1) * ptr } else { 0 } + 4;
+            let node = h.read(a, len)?;
+            let want = if d == 0 { b"BTLF" } else { b"BTIN" };
+            if !node.starts_with(want) {
+                return Err(damaged());
+            }
+            for i in 0..n {
+                let s = 6 + i * rec_size;
+                out.push(node[s..s + rec_size].to_vec());
+            }
+            if d > 0 {
+                let mut c = Cur::new(&node);
+                c.skip(6 + n * rec_size)?;
+                for _ in 0..=n {
+                    let child = c.addr(h.so)?;
+                    let cn = c.uint(nrec_size)? as usize;
+                    if d > 1 {
+                        c.skip(cum_size[d - 1])?;
+                    }
+                    if child != UNDEF {
+                        stack.push((child, cn, d - 1));
+                    }
+                }
+            }
+            if out.len() > 50_000_000 {
+                bail!("an HDF5 B-tree is implausibly large");
+            }
+        }
+        Ok((ty, rec_size, out))
+    }
+
+    // ---- fractal heap ----
+
+    struct FractalHeap {
+        id_len: usize,
+        max_managed: u64,
+        table_width: usize,
+        start_block: u64,
+        max_direct: u64,
+        root: u64,
+        root_rows: usize,
+        filtered: bool,
+        checksum_direct: bool,
+        /// The heap-offset field's size in IDs and block headers, and the
+        /// object length's size in IDs.
+        offset_bytes: usize,
+        length_bytes: usize,
+    }
+
+    impl FractalHeap {
+        fn open(h: &H5File, addr: u64) -> Result<FractalHeap> {
+            let head = h.read(addr, 256)?;
+            if !head.starts_with(b"FRHP") {
+                return Err(damaged());
+            }
+            let mut c = Cur::new(&head);
+            c.skip(4)?;
+            let _version = c.u8()?;
+            let id_len = c.u16()? as usize;
+            let filter_len = c.u16()? as usize;
+            let flags = c.u8()?;
+            let max_managed = u64::from(c.u32()?);
+            // Skipped: next huge id (L), huge-object B-tree (O), free space (L),
+            // free-space manager (O), managed space (L), allocated space (L),
+            // iterator offset (L), managed count (L), huge size (L), huge
+            // count (L), tiny size (L), tiny count (L).
+            c.skip(h.sl * 10 + h.so * 2)?;
+            let table_width = c.u16()? as usize;
+            let start_block = c.uint(h.sl)?;
+            let max_direct = c.uint(h.sl)?;
+            let max_heap_bits = c.u16()? as usize;
+            let _start_rows = c.u16()?;
+            let root = c.addr(h.so)?;
+            let root_rows = c.u16()? as usize;
+            if table_width == 0
+                || start_block == 0
+                || !start_block.is_power_of_two()
+                || !max_direct.is_power_of_two()
+                || max_heap_bits == 0
+                || max_heap_bits > 64
+            {
+                return Err(damaged());
+            }
+            let offset_bytes = max_heap_bits.div_ceil(8);
+            let length_bytes = enc_size(max_managed.min(max_direct));
+            Ok(FractalHeap {
+                id_len,
+                max_managed,
+                table_width,
+                start_block,
+                max_direct,
+                root,
+                root_rows,
+                filtered: filter_len > 0,
+                checksum_direct: flags & 0x02 != 0,
+                offset_bytes,
+                length_bytes,
+            })
+        }
+
+        fn row_block_size(&self, row: usize) -> u64 {
+            if row == 0 {
+                self.start_block
+            } else {
+                self.start_block << (row - 1)
+            }
+        }
+
+        fn first_row_bits(&self) -> u32 {
+            self.start_block.trailing_zeros() + (self.table_width as u64).trailing_zeros()
+        }
+
+        /// The row and column of a heap offset in the doubling table.
+        fn locate(&self, off: u64) -> (usize, usize) {
+            let w = self.table_width as u64;
+            if off < self.start_block * w {
+                return (0, (off / self.start_block) as usize);
+            }
+            let row = (63 - off.leading_zeros()) as usize - self.first_row_bits() as usize + 1;
+            let row_start = (self.start_block * w) << (row - 1);
+            let col = ((off - row_start) / self.row_block_size(row)) as usize;
+            (row, col)
+        }
+
+        fn max_direct_rows(&self) -> usize {
+            (self.max_direct.trailing_zeros() - self.start_block.trailing_zeros()) as usize + 2
+        }
+
+        /// The bytes of the object a heap ID names.
+        fn get(&self, h: &H5File, id: &[u8]) -> Result<Vec<u8>> {
+            if id.is_empty() {
+                return Err(damaged());
+            }
+            match (id[0] >> 4) & 3 {
+                0 => {
+                    let off = uint_at(&id[1..], self.offset_bytes);
+                    let len = uint_at(&id[1 + self.offset_bytes..], self.length_bytes) as usize;
+                    self.managed(h, off, len)
+                }
+                2 => {
+                    // tiny: the object is in the ID itself
+                    let n = (id[0] & 0x0F) as usize + 1;
+                    if id.len() < 1 + n {
+                        return Err(damaged());
+                    }
+                    Ok(id[1..1 + n].to_vec())
+                }
+                _ => bail!("an HDF5 fractal heap holds a huge object, which isn't supported"),
+            }
+        }
+
+        fn managed(&self, h: &H5File, off: u64, len: usize) -> Result<Vec<u8>> {
+            if self.root == UNDEF || len as u64 > self.max_managed.max(1 << 20) {
+                return Err(damaged());
+            }
+            if self.filtered {
+                bail!("an HDF5 fractal heap with filtered blocks isn't supported");
+            }
+            if self.root_rows == 0 {
+                // the root is a single direct block
+                return self.in_direct(h, self.root, 0, off, len);
+            }
+            self.in_indirect(h, self.root, self.root_rows, 0, off, len, 0)
+        }
+
+        fn in_direct(
+            &self,
+            h: &H5File,
+            block: u64,
+            block_off: u64,
+            off: u64,
+            len: usize,
+        ) -> Result<Vec<u8>> {
+            let rel = off.checked_sub(block_off).ok_or_else(damaged)?;
+            let hdr = 5 + h.so + self.offset_bytes + if self.checksum_direct { 4 } else { 0 };
+            let _ = hdr;
+            h.read(block + rel, len)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn in_indirect(
+            &self,
+            h: &H5File,
+            block: u64,
+            nrows: usize,
+            block_off: u64,
+            off: u64,
+            len: usize,
+            depth: usize,
+        ) -> Result<Vec<u8>> {
+            if depth > 16 {
+                return Err(damaged());
+            }
+            let (row, col) = self.locate(off - block_off);
+            if row >= nrows {
+                return Err(damaged());
+            }
+            let entry_index = row * self.table_width + col;
+            let direct_rows = self.max_direct_rows();
+            // Entries before this one: direct entries are so (+ filtered extras) each.
+            let entry_size = h.so;
+            let header = 5 + h.so + self.offset_bytes;
+            let at = block + header as u64 + (entry_index * entry_size) as u64;
+            let raw = h.read(at, h.so)?;
+            let child = Cur::new(&raw).addr(h.so)?;
+            if child == UNDEF {
+                return Err(damaged());
+            }
+            let row_start = if row == 0 {
+                0
+            } else {
+                (self.start_block * self.table_width as u64) << (row - 1)
+            };
+            let child_off = block_off + row_start + col as u64 * self.row_block_size(row);
+            if row < direct_rows {
+                self.in_direct(h, child, child_off, off, len)
+            } else {
+                // an indirect child: its rows follow from its size
+                let size = self.row_block_size(row);
+                let rows = (size.trailing_zeros() as usize)
+                    .saturating_sub(self.first_row_bits() as usize)
+                    + 1;
+                self.in_indirect(h, child, rows, child_off, off, len, depth + 1)
+            }
+        }
+    }
+
+    // ---- links, attributes, groups ----
+
+    struct Link {
+        name: String,
+        /// The object a hard link points at.
+        target: Option<u64>,
+        /// Where the link came in the order they were made, when the group
+        /// records that (NetCDF-4 does, so its variables keep their order).
+        order: Option<u64>,
+    }
+
+    fn parse_link(h: &H5File, body: &[u8]) -> Result<Link> {
+        let mut c = Cur::new(body);
+        let version = c.u8()?;
+        if version != 1 {
+            return Err(damaged());
+        }
+        let flags = c.u8()?;
+        let ty = if flags & 0x08 != 0 { c.u8()? } else { 0 };
+        let order = if flags & 0x04 != 0 {
+            Some(c.uint(8)?)
+        } else {
+            None
+        };
+        if flags & 0x10 != 0 {
+            c.skip(1)?;
+        }
+        let len = c.uint(1usize << (flags & 3))? as usize;
+        let name = String::from_utf8_lossy(c.take(len)?).into_owned();
+        let target = if ty == 0 { Some(c.addr(h.so)?) } else { None };
+        Ok(Link {
+            name,
+            target,
+            order,
+        })
+    }
+
+    /// The hard links of a group.
+    fn group_links(h: &H5File, msgs: &[Msg]) -> Result<Vec<Link>> {
+        let mut out = Vec::new();
+        for m in msgs {
+            if m.ty == MSG_LINK
+                && let Ok(l) = parse_link(h, &m.data)
+            {
+                out.push(l);
+            }
+        }
+        if let Some(m) = msgs.iter().find(|m| m.ty == MSG_LINK_INFO) {
+            let mut c = Cur::new(&m.data);
+            let _version = c.u8()?;
+            let flags = c.u8()?;
+            if flags & 1 != 0 {
+                c.skip(8)?;
+            }
+            let heap = c.addr(h.so)?;
+            let name_index = c.addr(h.so)?;
+            if heap != UNDEF && name_index != UNDEF {
+                let fh = FractalHeap::open(h, heap)?;
+                let (ty, _, recs) = btree2_records(h, name_index)?;
+                for rec in recs {
+                    let id_at = if ty == 5 { 4 } else { 8 };
+                    if rec.len() <= id_at {
+                        continue;
+                    }
+                    let id = &rec[id_at..rec.len().min(id_at + fh.id_len)];
+                    if let Ok(body) = fh.get(h, id)
+                        && let Ok(l) = parse_link(h, &body)
+                    {
+                        out.push(l);
+                    }
+                }
+            }
+        }
+        if let Some(m) = msgs.iter().find(|m| m.ty == MSG_SYMTAB) {
+            let mut c = Cur::new(&m.data);
+            let tree = c.addr(h.so)?;
+            let heap = c.addr(h.so)?;
+            old_group(h, tree, heap, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn old_group(h: &H5File, tree: u64, heap: u64, out: &mut Vec<Link>) -> Result<()> {
+        // The local heap's name segment.
+        let hh = h.read(heap, 8 + h.sl * 2 + h.so)?;
+        if !hh.starts_with(b"HEAP") {
+            return Err(damaged());
+        }
+        let mut c = Cur::new(&hh);
+        c.skip(8)?;
+        let size = c.uint(h.sl)? as usize;
+        c.skip(h.sl)?;
+        let data_addr = c.addr(h.so)?;
+        let names = h.read(data_addr, size)?;
+        let mut stack = vec![(tree, 0usize)];
+        let mut visited = 0usize;
+        while let Some((node, depth)) = stack.pop() {
+            visited += 1;
+            if visited > 1_000_000 || depth > 32 {
+                bail!("an HDF5 group B-tree is implausibly large");
+            }
+            let head = h.read(node, 8 + h.so * 2)?;
+            if !head.starts_with(b"TREE") {
+                return Err(damaged());
+            }
+            let level = head[5];
+            let n = u16::from_le_bytes([head[6], head[7]]) as usize;
+            let body = h.read(node + (8 + h.so * 2) as u64, h.sl + n * (h.sl + h.so))?;
+            let mut c = Cur::new(&body);
+            c.skip(h.sl)?; // key 0
+            for _ in 0..n {
+                let child = c.addr(h.so)?;
+                c.skip(h.sl)?; // the next key
+                if level > 0 {
+                    stack.push((child, depth + 1));
+                } else {
+                    let snod = h.read(child, 8)?;
+                    if !snod.starts_with(b"SNOD") {
+                        return Err(damaged());
+                    }
+                    let nsyms = u16::from_le_bytes([snod[6], snod[7]]) as usize;
+                    let ents = h.read(child + 8, nsyms * (2 * h.so + 24))?;
+                    let mut e = Cur::new(&ents);
+                    for _ in 0..nsyms {
+                        let name_off = e.uint(h.so)? as usize;
+                        let obj = e.addr(h.so)?;
+                        let cache = e.u32()?;
+                        e.skip(4 + 16)?;
+                        let mut nc = Cur::new(names.get(name_off..).ok_or_else(damaged)?);
+                        let name = nc.cstr()?;
+                        // cache type 2 is a soft link
+                        out.push(Link {
+                            name,
+                            target: (cache != 2).then_some(obj),
+                            order: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---- attributes ----
+
+    #[derive(Clone, Debug)]
+    enum AttrVal {
+        Text(String),
+        Num(Vec<f64>),
+        /// Object references (dimension scales).
+        Refs(Vec<Vec<u64>>),
+        Other,
+    }
+
+    struct Attribute {
+        name: String,
+        value: AttrVal,
+    }
+
+    fn parse_attribute(h: &H5File, heaps: &mut GlobalHeaps, body: &[u8]) -> Result<Attribute> {
+        let mut c = Cur::new(body);
+        let version = c.u8()?;
+        let (name_len, dt_len, ds_len);
+        match version {
+            1 => {
+                c.skip(1)?;
+                name_len = c.u16()? as usize;
+                dt_len = c.u16()? as usize;
+                ds_len = c.u16()? as usize;
+            }
+            2 | 3 => {
+                c.skip(1)?; // flags
+                name_len = c.u16()? as usize;
+                dt_len = c.u16()? as usize;
+                ds_len = c.u16()? as usize;
+                if version == 3 {
+                    c.skip(1)?;
+                }
+            }
+            _ => return Err(damaged()),
+        }
+        let pad = version == 1;
+        let take = |c: &mut Cur<'_>, n: usize| -> Result<Vec<u8>> {
+            let v = c.take(n)?.to_vec();
+            if pad {
+                c.skip(((8 - n % 8) % 8).min(c.left()))?;
+            }
+            Ok(v)
+        };
+        let name_raw = take(&mut c, name_len)?;
+        let name = String::from_utf8_lossy(&name_raw)
+            .trim_end_matches('\0')
+            .to_string();
+        let dt_raw = take(&mut c, dt_len)?;
+        let ds_raw = take(&mut c, ds_len)?;
+        let dt = parse_datatype_msg(&dt_raw)?;
+        let (dims, null) = parse_dataspace(&ds_raw, h.sl)?;
+        let count = if null {
+            0
+        } else {
+            dims.iter().fold(1u64, |a, &d| a.saturating_mul(d)) as usize
+        };
+        let data = c.take(c.left())?;
+        let value = decode_attr(h, heaps, &dt, count, data)?;
+        Ok(Attribute { name, value })
+    }
+
+    fn decode_attr(
+        h: &H5File,
+        heaps: &mut GlobalHeaps,
+        dt: &Dt,
+        count: usize,
+        data: &[u8],
+    ) -> Result<AttrVal> {
+        let es = dt.size().max(1);
+        if count.saturating_mul(es) > data.len() {
+            return Ok(AttrVal::Other);
+        }
+        Ok(match dt {
+            Dt::Str { size, .. } => {
+                let mut parts = Vec::new();
+                for i in 0..count.min(1 << 16) {
+                    let chunk = &data[i * size..(i + 1) * size];
+                    let end = chunk.iter().position(|&c| c == 0).unwrap_or(*size);
+                    parts.push(
+                        String::from_utf8_lossy(&chunk[..end])
+                            .trim_end()
+                            .to_string(),
+                    );
+                }
+                AttrVal::Text(parts.join(", "))
+            }
+            Dt::VlenStr { size, .. } => {
+                let mut parts = Vec::new();
+                for i in 0..count.min(1 << 16) {
+                    let mut c = Cur::new(&data[i * size..(i + 1) * size]);
+                    let len = c.u32()? as usize;
+                    let addr = c.addr(h.so)?;
+                    let idx = c.u32()? as u16;
+                    if len == 0 || addr == UNDEF {
+                        parts.push(String::new());
+                        continue;
+                    }
+                    let obj = heaps.object(h, addr, idx)?;
+                    parts.push(String::from_utf8_lossy(&obj[..len.min(obj.len())]).into_owned());
+                }
+                AttrVal::Text(parts.join(", "))
+            }
+            Dt::VlenSeq { size, base } if matches!(**base, Dt::Reference { .. }) => {
+                let rs = base.size();
+                let mut all = Vec::new();
+                for i in 0..count.min(1 << 16) {
+                    let mut c = Cur::new(&data[i * size..(i + 1) * size]);
+                    let len = c.u32()? as usize;
+                    let addr = c.addr(h.so)?;
+                    let idx = c.u32()? as u16;
+                    let mut refs = Vec::new();
+                    if len > 0 && addr != UNDEF {
+                        let obj = heaps.object(h, addr, idx)?;
+                        for k in 0..len.min(obj.len() / rs.max(1)) {
+                            refs.push(uint_at(&obj[k * rs..], h.so));
+                        }
+                    }
+                    all.push(refs);
+                }
+                AttrVal::Refs(all)
+            }
+            Dt::Int { .. } | Dt::Float { .. } | Dt::Enum { .. } => {
+                let mut v = Vec::new();
+                for i in 0..count.min(1 << 20) {
+                    v.push(scalar_f64(dt, &data[i * es..(i + 1) * es]));
+                }
+                AttrVal::Num(v)
+            }
+            _ => AttrVal::Other,
+        })
+    }
+
+    fn scalar_f64(dt: &Dt, b: &[u8]) -> f64 {
+        match dt {
+            Dt::Int { size, signed, big } => {
+                let mut raw = b[..(*size).min(8)].to_vec();
+                if *big {
+                    raw.reverse();
+                }
+                let u = uint_at(&raw, raw.len());
+                if *signed && !raw.is_empty() && u >> (raw.len() * 8 - 1) == 1 && raw.len() < 8 {
+                    (u | (u64::MAX << (raw.len() * 8))) as i64 as f64
+                } else if *signed {
+                    u as i64 as f64
+                } else {
+                    u as f64
+                }
+            }
+            Dt::Float { size, big } => {
+                let mut raw = b[..*size].to_vec();
+                if *big {
+                    raw.reverse();
+                }
+                match size {
+                    2 => half_to_f32(u16::from_le_bytes([raw[0], raw[1]])).into(),
+                    4 => f64::from(f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
+                    8 => f64::from_le_bytes(raw[..8].try_into().expect("8 bytes")),
+                    _ => f64::NAN,
+                }
+            }
+            Dt::Enum { base, .. } => scalar_f64(base, b),
+            _ => f64::NAN,
+        }
+    }
+
+    fn half_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+        let exp = i32::from((h >> 10) & 0x1F);
+        let frac = f32::from(h & 0x03FF);
+        if exp == 0 {
+            sign * frac * 2f32.powi(-24)
+        } else if exp == 31 {
+            if h & 0x03FF == 0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        } else {
+            sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15)
+        }
+    }
+
+    /// An object's attributes, compact and dense.
+    fn attributes(h: &H5File, heaps: &mut GlobalHeaps, msgs: &[Msg]) -> Vec<Attribute> {
+        let mut out = Vec::new();
+        for m in msgs {
+            if m.ty == MSG_ATTRIBUTE
+                && let Ok(a) = parse_attribute(h, heaps, &m.data)
+            {
+                out.push(a);
+            }
+        }
+        if let Some(m) = msgs.iter().find(|m| m.ty == MSG_ATTR_INFO) {
+            let dense = (|| -> Result<Vec<Attribute>> {
+                let mut c = Cur::new(&m.data);
+                let _version = c.u8()?;
+                let flags = c.u8()?;
+                if flags & 1 != 0 {
+                    c.skip(2)?;
+                }
+                let heap = c.addr(h.so)?;
+                let name_index = c.addr(h.so)?;
+                let mut found = Vec::new();
+                if heap == UNDEF || name_index == UNDEF {
+                    return Ok(found);
+                }
+                let fh = FractalHeap::open(h, heap)?;
+                let (_, _, recs) = btree2_records(h, name_index)?;
+                for rec in recs {
+                    let id = &rec[..fh.id_len.min(rec.len())];
+                    if let Ok(body) = fh.get(h, id)
+                        && let Ok(a) = parse_attribute(h, heaps, &body)
+                    {
+                        found.push(a);
+                    }
+                }
+                Ok(found)
+            })();
+            if let Ok(more) = dense {
+                out.extend(more);
+            }
+        }
+        out
+    }
+
+    // ---- datasets ----
+
+    #[derive(Clone)]
+    struct Filter {
+        id: u16,
+        client: Vec<u32>,
+    }
+
+    fn parse_filters(data: &[u8]) -> Result<Vec<Filter>> {
+        let mut c = Cur::new(data);
+        let version = c.u8()?;
+        let n = c.u8()? as usize;
+        if version == 1 {
+            c.skip(6)?;
+        }
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let id = c.u16()?;
+            let name_len = if version == 1 || id >= 256 {
+                c.u16()? as usize
+            } else {
+                0
+            };
+            let _flags = c.u16()?;
+            let nvals = c.u16()? as usize;
+            if name_len > 0 {
+                let padded = if version == 1 {
+                    name_len.div_ceil(8) * 8
+                } else {
+                    name_len
+                };
+                c.skip(padded)?;
+            }
+            let mut client = Vec::with_capacity(nvals.min(64));
+            for _ in 0..nvals {
+                client.push(c.u32()?);
+            }
+            if version == 1 && nvals % 2 == 1 {
+                c.skip(4)?;
+            }
+            out.push(Filter { id, client });
+        }
+        Ok(out)
+    }
+
+    fn apply_filters(filters: &[Filter], mask: u32, mut data: Vec<u8>) -> Result<Vec<u8>> {
+        for (i, f) in filters.iter().enumerate().rev() {
+            if mask & (1 << i) != 0 {
+                continue;
+            }
+            data = match f.id {
+                1 => {
+                    if data.len() < 2 {
+                        return Err(damaged());
+                    }
+                    inflate(&data[2..]).context("an HDF5 deflate chunk is damaged")?
+                }
+                2 => {
+                    let es = f.client.first().copied().unwrap_or(1).max(1) as usize;
+                    let n = data.len() / es;
+                    let mut out = vec![0u8; data.len()];
+                    // (an element size past the data leaves nothing to shuffle)
+                    if n > 0 {
+                        for j in 0..es {
+                            for k in 0..n {
+                                out[k * es + j] = data[j * n + k];
+                            }
+                        }
+                    }
+                    out[n * es..].copy_from_slice(&data[n * es..]);
+                    out
+                }
+                3 => {
+                    if data.len() < 4 {
+                        return Err(damaged());
+                    }
+                    data.truncate(data.len() - 4);
+                    data
+                }
+                4 => bail!("an HDF5 dataset uses the SZIP filter, which isn't supported"),
+                5 | 6 => bail!(
+                    "an HDF5 dataset uses the N-bit or scale-offset filter, which isn't supported"
+                ),
+                32000 => bail!("an HDF5 dataset is compressed with LZF, which isn't supported"),
+                32001 => bail!("an HDF5 dataset is compressed with Blosc, which isn't supported"),
+                32015 => {
+                    bail!("an HDF5 dataset is compressed with Zstandard, which isn't supported")
+                }
+                other => bail!("an HDF5 dataset uses filter {other}, which isn't supported"),
+            };
+        }
+        Ok(data)
+    }
+
+    #[derive(Clone, Copy)]
+    struct ChunkRef {
+        addr: u64,
+        size: u64,
+        mask: u32,
+    }
+
+    #[derive(Clone)]
+    enum Layout {
+        Compact(Vec<u8>),
+        Contiguous { addr: u64 },
+        Chunked { cdims: Vec<u64>, index: ChunkIndex },
+    }
+
+    #[derive(Clone)]
+    enum ChunkIndex {
+        V1Btree(u64),
+        Single { addr: u64, size: u64, mask: u32 },
+        Implicit(u64),
+        FixedArray(u64),
+        ExtArray(u64),
+        Btree2(u64),
+    }
+
+    fn parse_layout(h: &H5File, data: &[u8]) -> Result<Layout> {
+        let mut c = Cur::new(data);
+        let version = c.u8()?;
+        match version {
+            1 | 2 => {
+                let dimensionality = c.u8()? as usize;
+                let class = c.u8()?;
+                c.skip(5)?;
+                match class {
+                    0 => {
+                        let size = c.u32()? as usize;
+                        Ok(Layout::Compact(c.take(size)?.to_vec()))
+                    }
+                    1 => Ok(Layout::Contiguous {
+                        addr: c.addr(h.so)?,
+                    }),
+                    2 => {
+                        let addr = c.addr(h.so)?;
+                        let mut dims = Vec::new();
+                        for _ in 0..dimensionality.saturating_sub(1) {
+                            dims.push(u64::from(c.u32()?));
+                        }
+                        Ok(Layout::Chunked {
+                            cdims: dims,
+                            index: ChunkIndex::V1Btree(addr),
+                        })
+                    }
+                    other => bail!("an HDF5 dataset has storage layout class {other}"),
+                }
+            }
+            3 => {
+                let class = c.u8()?;
+                match class {
+                    0 => {
+                        let size = c.u16()? as usize;
+                        Ok(Layout::Compact(c.take(size)?.to_vec()))
+                    }
+                    1 => Ok(Layout::Contiguous {
+                        addr: c.addr(h.so)?,
+                    }),
+                    2 => {
+                        let dimensionality = c.u8()? as usize;
+                        let addr = c.addr(h.so)?;
+                        let mut dims = Vec::new();
+                        for _ in 0..dimensionality.saturating_sub(1) {
+                            dims.push(u64::from(c.u32()?));
+                        }
+                        Ok(Layout::Chunked {
+                            cdims: dims,
+                            index: ChunkIndex::V1Btree(addr),
+                        })
+                    }
+                    other => bail!("an HDF5 dataset has storage layout class {other}"),
+                }
+            }
+            4 | 5 => {
+                let class = c.u8()?;
+                match class {
+                    0 => {
+                        let size = c.u16()? as usize;
+                        Ok(Layout::Compact(c.take(size)?.to_vec()))
+                    }
+                    1 => Ok(Layout::Contiguous {
+                        addr: c.addr(h.so)?,
+                    }),
+                    2 => {
+                        let flags = c.u8()?;
+                        let dimensionality = c.u8()? as usize;
+                        let enc = c.u8()? as usize;
+                        let mut dims = Vec::new();
+                        for _ in 0..dimensionality.saturating_sub(1) {
+                            dims.push(c.uint(enc)?);
+                        }
+                        c.skip(enc)?; // the element size, as the last dimension
+                        let kind = c.u8()?;
+                        let index = match kind {
+                            1 => {
+                                let (mut size, mut mask) = (0u64, 0u32);
+                                if flags & 0x02 != 0 {
+                                    size = c.uint(h.sl)?;
+                                    mask = c.u32()?;
+                                }
+                                ChunkIndex::Single {
+                                    addr: c.addr(h.so)?,
+                                    size,
+                                    mask,
+                                }
+                            }
+                            2 => ChunkIndex::Implicit(c.addr(h.so)?),
+                            3 => {
+                                c.skip(1)?; // page bits
+                                ChunkIndex::FixedArray(c.addr(h.so)?)
+                            }
+                            4 => {
+                                c.skip(5)?;
+                                ChunkIndex::ExtArray(c.addr(h.so)?)
+                            }
+                            5 => {
+                                c.skip(6)?; // node size, split, merge
+                                ChunkIndex::Btree2(c.addr(h.so)?)
+                            }
+                            other => bail!("an HDF5 dataset has chunk index type {other}"),
+                        };
+                        Ok(Layout::Chunked { cdims: dims, index })
+                    }
+                    3 => bail!("an HDF5 virtual dataset isn't supported"),
+                    other => bail!("an HDF5 dataset has storage layout class {other}"),
+                }
+            }
+            other => bail!("an HDF5 dataset has layout version {other}"),
+        }
+    }
+
+    /// The chunks of a dataset, keyed by the element coordinates of their
+    /// first element.
+    fn build_chunk_map(
+        h: &H5File,
+        index: &ChunkIndex,
+        dims: &[u64],
+        cdims: &[u64],
+        es: usize,
+        filtered: bool,
+    ) -> Result<HashMap<Vec<u64>, ChunkRef>> {
+        let rank = dims.len();
+        let mut map: HashMap<Vec<u64>, ChunkRef> = HashMap::new();
+        let grid: Vec<u64> = dims
+            .iter()
+            .zip(cdims)
+            .map(|(&d, &c)| d.div_ceil(c.max(1)))
+            .collect();
+        let nchunks = grid.iter().fold(1u64, |a, &g| a.saturating_mul(g));
+        if nchunks > 50_000_000 {
+            bail!("an HDF5 dataset has {nchunks} chunks, which is implausible");
+        }
+        let chunk_bytes = cdims.iter().fold(es as u64, |a, &c| a.saturating_mul(c));
+        let coords_of = |linear: u64| -> Vec<u64> {
+            let mut rem = linear;
+            let mut idx = vec![0u64; rank];
+            for k in (0..rank).rev() {
+                idx[k] = rem % grid[k].max(1);
+                rem /= grid[k].max(1);
+            }
+            idx.iter().zip(cdims).map(|(&i, &c)| i * c).collect()
+        };
+        match index {
+            ChunkIndex::Single { addr, size, mask } => {
+                map.insert(
+                    vec![0; rank],
+                    ChunkRef {
+                        addr: *addr,
+                        size: if filtered { *size } else { chunk_bytes },
+                        mask: *mask,
+                    },
+                );
+            }
+            ChunkIndex::Implicit(addr) => {
+                for i in 0..nchunks {
+                    map.insert(
+                        coords_of(i),
+                        ChunkRef {
+                            addr: addr.saturating_add(i * chunk_bytes),
+                            size: chunk_bytes,
+                            mask: 0,
+                        },
+                    );
+                }
+            }
+            ChunkIndex::V1Btree(root) => {
+                if *root == UNDEF {
+                    return Ok(map);
+                }
+                let key_size = 8 + 8 * (rank + 1);
+                let mut stack = vec![(*root, 0usize)];
+                let mut visited = 0usize;
+                while let Some((node, depth)) = stack.pop() {
+                    visited += 1;
+                    if visited > 2_000_000 || depth > 32 {
+                        bail!("an HDF5 chunk B-tree is implausibly large");
+                    }
+                    let head = h.read(node, 8 + 2 * h.so)?;
+                    if !head.starts_with(b"TREE") {
+                        return Err(damaged());
+                    }
+                    let level = head[5];
+                    let n = u16::from_le_bytes([head[6], head[7]]) as usize;
+                    let body =
+                        h.read(node + (8 + 2 * h.so) as u64, (n + 1) * key_size + n * h.so)?;
+                    let mut c = Cur::new(&body);
+                    for _ in 0..n {
+                        let size = u64::from(c.u32()?);
+                        let mask = c.u32()?;
+                        let mut offs = Vec::with_capacity(rank);
+                        for _ in 0..rank {
+                            offs.push(c.u64()?);
+                        }
+                        c.skip(8)?; // the element-size dimension's offset
+                        let child = c.addr(h.so)?;
+                        // the next key sits after this child; read it at the
+                        // loop top - keys and children alternate
+                        if level > 0 {
+                            stack.push((child, depth + 1));
+                        } else if child != UNDEF {
+                            map.insert(
+                                offs,
+                                ChunkRef {
+                                    addr: child,
+                                    size,
+                                    mask,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            ChunkIndex::FixedArray(addr) => fixed_array(
+                h,
+                *addr,
+                nchunks,
+                filtered,
+                chunk_bytes,
+                &coords_of,
+                &mut map,
+            )?,
+            ChunkIndex::ExtArray(addr) => ext_array(
+                h,
+                *addr,
+                nchunks,
+                filtered,
+                chunk_bytes,
+                &coords_of,
+                &mut map,
+            )?,
+            ChunkIndex::Btree2(addr) => {
+                let (ty, _, recs) = btree2_records(h, *addr)?;
+                let size_bytes = enc_size(chunk_bytes);
+                for rec in recs {
+                    let mut c = Cur::new(&rec);
+                    let a = c.addr(h.so)?;
+                    let (size, mask) = if ty == 11 {
+                        (c.uint(size_bytes)?, c.u32()?)
+                    } else {
+                        (chunk_bytes, 0)
+                    };
+                    let mut key = Vec::with_capacity(rank);
+                    for &cd in cdims.iter().take(rank) {
+                        key.push(c.u64()?.checked_mul(cd).ok_or_else(damaged)?);
+                    }
+                    if a != UNDEF {
+                        map.insert(
+                            key,
+                            ChunkRef {
+                                addr: a,
+                                size,
+                                mask,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// One fixed/extensible-array element: an address, plus a size and mask
+    /// when the chunks are filtered.
+    fn array_element(
+        c: &mut Cur<'_>,
+        so: usize,
+        filtered: bool,
+        size_bytes: usize,
+        chunk_bytes: u64,
+    ) -> Result<Option<ChunkRef>> {
+        let addr = c.addr(so)?;
+        let (size, mask) = if filtered {
+            (c.uint(size_bytes)?, c.u32()?)
+        } else {
+            (chunk_bytes, 0)
+        };
+        Ok((addr != UNDEF).then_some(ChunkRef { addr, size, mask }))
+    }
+
+    fn fixed_array(
+        h: &H5File,
+        addr: u64,
+        nchunks: u64,
+        filtered: bool,
+        chunk_bytes: u64,
+        coords_of: &dyn Fn(u64) -> Vec<u64>,
+        map: &mut HashMap<Vec<u64>, ChunkRef>,
+    ) -> Result<()> {
+        let head = h.read(addr, 12 + h.sl + h.so + 4)?;
+        if !head.starts_with(b"FAHD") {
+            return Err(damaged());
+        }
+        let mut c = Cur::new(&head);
+        c.skip(6)?;
+        let entry_size = c.u8()? as usize;
+        let page_bits = c.u8()? as usize;
+        let max_entries = c.uint(h.sl)?;
+        let db = c.addr(h.so)?;
+        if db == UNDEF || max_entries == 0 {
+            return Ok(());
+        }
+        let size_bytes = entry_size.saturating_sub(h.so + 4).max(1);
+        let n = max_entries.min(nchunks) as usize;
+        let page_entries = 1usize << page_bits.min(30);
+        let prefix = 6 + h.so;
+        if (max_entries as usize) <= page_entries {
+            let data = h.read(db, prefix + n * entry_size + 4)?;
+            if !data.starts_with(b"FADB") {
+                return Err(damaged());
+            }
+            let mut c = Cur::new(&data[prefix..]);
+            for i in 0..n {
+                if let Some(r) = array_element(&mut c, h.so, filtered, size_bytes, chunk_bytes)? {
+                    map.insert(coords_of(i as u64), r);
+                }
+            }
+        } else {
+            let npages = (max_entries as usize).div_ceil(page_entries);
+            let bitmap = npages.div_ceil(8);
+            let head = h.read(db, prefix + bitmap + 4)?;
+            if !head.starts_with(b"FADB") {
+                return Err(damaged());
+            }
+            let init = &head[prefix..prefix + bitmap];
+            let page_bytes = page_entries * entry_size + 4;
+            for p in 0..npages {
+                if init[p / 8] & (0x80 >> (p % 8)) == 0 {
+                    continue;
+                }
+                let first = p * page_entries;
+                let cnt = page_entries.min(max_entries as usize - first);
+                let page = h.read(
+                    db + (prefix + bitmap + 4 + p * page_bytes) as u64,
+                    cnt * entry_size,
+                )?;
+                let mut c = Cur::new(&page);
+                for i in 0..cnt {
+                    if first + i >= n {
+                        break;
+                    }
+                    if let Some(r) = array_element(&mut c, h.so, filtered, size_bytes, chunk_bytes)?
+                    {
+                        map.insert(coords_of((first + i) as u64), r);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ext_array(
+        h: &H5File,
+        addr: u64,
+        nchunks: u64,
+        filtered: bool,
+        chunk_bytes: u64,
+        coords_of: &dyn Fn(u64) -> Vec<u64>,
+        map: &mut HashMap<Vec<u64>, ChunkRef>,
+    ) -> Result<()> {
+        let head = h.read(addr, 12 + h.sl * 6 + h.so + 4)?;
+        if !head.starts_with(b"EAHD") {
+            return Err(damaged());
+        }
+        let mut c = Cur::new(&head);
+        c.skip(6)?;
+        let entry_size = c.u8()? as usize;
+        let max_bits = c.u8()? as usize;
+        let idx_elmts = c.u8()? as usize;
+        let data_min = c.u8()? as usize;
+        let sup_min_ptrs = c.u8()? as usize;
+        let page_bits = c.u8()? as usize;
+        // Six counts (secondary blocks and their size, data blocks and their
+        // size, the maximum index set, the element count), then the index
+        // block's address.
+        c.skip(h.sl * 6)?;
+        let ib = c.addr(h.so)?;
+        if ib == UNDEF || data_min == 0 || sup_min_ptrs == 0 {
+            return Ok(());
+        }
+        let size_bytes = entry_size.saturating_sub(h.so + 4).max(1);
+        let off_bytes = max_bits.div_ceil(8);
+        // Super block s holds 2^(s/2) data blocks of data_min * 2^((s+1)/2)
+        // elements each.
+        let sblk_ndblks = |s: usize| -> usize { 1usize << (s / 2) };
+        let dblk_nelmts = |s: usize| -> usize { data_min << s.div_ceil(2) };
+        // The index block: its own elements, then data block addresses for
+        // the first super blocks, then addresses of the remaining super blocks.
+        let nblks_direct: usize = 2 * (sup_min_ptrs - 1);
+        // Super blocks whose data blocks the index block addresses directly.
+        let direct_sblks = {
+            let mut s = 0usize;
+            let mut left = nblks_direct;
+            while left > 0 && s < 64 {
+                left = left.saturating_sub(sblk_ndblks(s));
+                s += 1;
+            }
+            s
+        };
+        let max_sblks = (max_bits + 1)
+            .saturating_sub(data_min.trailing_zeros() as usize)
+            .min(64);
+        let n_sblk_addrs = max_sblks.saturating_sub(direct_sblks);
+        let ib_len =
+            6 + h.so + idx_elmts * entry_size + nblks_direct * h.so + n_sblk_addrs * h.so + 4;
+        let ibd = h.read(ib, ib_len)?;
+        if !ibd.starts_with(b"EAIB") {
+            return Err(damaged());
+        }
+        let mut c = Cur::new(&ibd);
+        c.skip(6 + h.so)?;
+        let mut next = 0u64; // the element index
+        for _ in 0..idx_elmts {
+            if let Some(r) = array_element(&mut c, h.so, filtered, size_bytes, chunk_bytes)?
+                && next < nchunks
+            {
+                map.insert(coords_of(next), r);
+            }
+            next += 1;
+        }
+        let mut dblk_addrs = Vec::new();
+        for _ in 0..nblks_direct {
+            dblk_addrs.push(c.addr(h.so)?);
+        }
+        let mut sblk_addrs = Vec::new();
+        for _ in 0..n_sblk_addrs {
+            sblk_addrs.push(c.addr(h.so)?);
+        }
+        // Read one data block of `n` elements at `addr`.
+        // `init` is the secondary block's page flags and the first flag of
+        // this data block; a data block the index block addresses has none.
+        let mut read_dblock =
+            |addr: u64, n: usize, next: &mut u64, init: Option<(&[u8], usize)>| -> Result<()> {
+                if addr == UNDEF {
+                    *next += n as u64;
+                    return Ok(());
+                }
+                let page_elems = 1usize << page_bits.min(30);
+                let hdr = 6 + h.so + off_bytes;
+                if n <= page_elems {
+                    let data = h.read(addr, hdr + n * entry_size + 4)?;
+                    if !data.starts_with(b"EADB") {
+                        return Err(damaged());
+                    }
+                    let mut c = Cur::new(&data[hdr..]);
+                    for _ in 0..n {
+                        if let Some(r) =
+                            array_element(&mut c, h.so, filtered, size_bytes, chunk_bytes)?
+                            && *next < nchunks
+                        {
+                            map.insert(coords_of(*next), r);
+                        }
+                        *next += 1;
+                    }
+                } else {
+                    // paged: the pages follow the header and its checksum, each
+                    // with a checksum of its own; the secondary block says which
+                    // pages were ever written (most-significant bit first)
+                    let npages = n.div_ceil(page_elems);
+                    let page_bytes = page_elems * entry_size + 4;
+                    let head = h.read(addr, hdr + 4)?;
+                    if !head.starts_with(b"EADB") {
+                        return Err(damaged());
+                    }
+                    for p in 0..npages {
+                        let cnt = page_elems.min(n - p * page_elems);
+                        let written = match init {
+                            Some((flags, base)) => {
+                                let bit = base + p;
+                                flags
+                                    .get(bit / 8)
+                                    .is_some_and(|b| b & (0x80 >> (bit % 8)) != 0)
+                            }
+                            None => true,
+                        };
+                        if written {
+                            let page =
+                                h.read(addr + (hdr + 4 + p * page_bytes) as u64, cnt * entry_size)?;
+                            let mut c = Cur::new(&page);
+                            for i in 0..cnt {
+                                if let Some(r) =
+                                    array_element(&mut c, h.so, filtered, size_bytes, chunk_bytes)?
+                                {
+                                    let at = *next + i as u64;
+                                    if at < nchunks {
+                                        map.insert(coords_of(at), r);
+                                    }
+                                }
+                            }
+                        }
+                        *next += cnt as u64;
+                    }
+                }
+                Ok(())
+            };
+        // Data blocks addressed from the index block, super block by super block.
+        let mut s = 0usize;
+        let mut di = 0usize;
+        while di < dblk_addrs.len() && next < nchunks {
+            let nd = sblk_ndblks(s);
+            for _ in 0..nd {
+                if di >= dblk_addrs.len() {
+                    break;
+                }
+                read_dblock(dblk_addrs[di], dblk_nelmts(s), &mut next, None)?;
+                di += 1;
+            }
+            s += 1;
+        }
+        // The rest through super blocks.
+        for (k, &sb) in sblk_addrs.iter().enumerate() {
+            if next >= nchunks {
+                break;
+            }
+            let s = direct_sblks + k;
+            let nd = sblk_ndblks(s);
+            let elems = dblk_nelmts(s);
+            if sb == UNDEF {
+                next += (nd * elems) as u64;
+                continue;
+            }
+            let page_elems = 1usize << page_bits.min(30);
+            let pages_per = if elems > page_elems {
+                elems.div_ceil(page_elems)
+            } else {
+                0
+            };
+            // The flags are one bit per page, data block by data block; the
+            // space is rounded up to a whole number of bytes per data block.
+            let bitmap_bytes = pages_per.div_ceil(8) * nd;
+            let sb_len = 6 + h.so + off_bytes + bitmap_bytes + nd * h.so + 4;
+            let sbd = h.read(sb, sb_len)?;
+            if !sbd.starts_with(b"EASB") {
+                return Err(damaged());
+            }
+            let mut c = Cur::new(&sbd);
+            c.skip(6 + h.so + off_bytes)?;
+            let flags = c.take(bitmap_bytes)?.to_vec();
+            for d in 0..nd {
+                let da = c.addr(h.so)?;
+                read_dblock(da, elems, &mut next, Some((&flags, d * pages_per)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The last row block read for a dataset: first row, row count, bytes.
+    type RowBlockCache = Rc<RefCell<Option<(u64, usize, Rc<Vec<u8>>)>>>;
+
+    /// A dataset: its shape, type, storage, and a reader of raw elements.
+    struct Dataset {
+        h: Rc<H5File>,
+        dims: Vec<u64>,
+        null: bool,
+        dt: Dt,
+        layout: Layout,
+        filters: Vec<Filter>,
+        fill: Option<Vec<u8>>,
+        chunks: Option<HashMap<Vec<u64>, ChunkRef>>,
+        /// Decoded chunks by their first element's coordinates, and the order
+        /// they came in (the oldest goes first when the cache is full).
+        cache: HashMap<Vec<u64>, Rc<Vec<u8>>>,
+        cache_order: VecDeque<Vec<u64>>,
+        cache_bytes: usize,
+    }
+
+    const CHUNK_CACHE: usize = 256 << 20;
+    /// Tiny chunks cost more in bookkeeping than in bytes.
+    const CHUNK_CACHE_ENTRIES: usize = 1 << 16;
+
+    impl Dataset {
+        fn elems(&self) -> u64 {
+            if self.null {
+                return 0;
+            }
+            self.dims.iter().fold(1u64, |a, &d| a.saturating_mul(d))
+        }
+
+        fn fill_bytes(&self, n: usize) -> Vec<u8> {
+            let es = self.dt.size().max(1);
+            match &self.fill {
+                Some(f) if f.len() == es => f.iter().cycle().take(n * es).copied().collect(),
+                _ => vec![0u8; n * es],
+            }
+        }
+
+        /// `count` elements from element `start`, as the file stores them.
+        fn read_raw(&mut self, start: u64, count: usize) -> Result<Vec<u8>> {
+            let es = self.dt.size().max(1);
+            let total = self.elems();
+            if start + count as u64 > total {
+                return Err(damaged());
+            }
+            match self.layout.clone() {
+                Layout::Compact(data) => {
+                    let a = (start as usize) * es;
+                    data.get(a..a + count * es)
+                        .map(<[u8]>::to_vec)
+                        .ok_or_else(damaged)
+                }
+                Layout::Contiguous { addr } => {
+                    if addr == UNDEF {
+                        return Ok(self.fill_bytes(count));
+                    }
+                    self.h.read(addr + start * es as u64, count * es)
+                }
+                Layout::Chunked { cdims, index } => {
+                    if self.chunks.is_none() {
+                        let m = build_chunk_map(
+                            &self.h,
+                            &index,
+                            &self.dims,
+                            &cdims,
+                            es,
+                            !self.filters.is_empty(),
+                        )?;
+                        self.chunks = Some(m);
+                    }
+                    let rank = self.dims.len();
+                    if cdims.len() != rank || cdims.contains(&0) {
+                        return Err(damaged());
+                    }
+                    let mut out = vec![0u8; count * es];
+                    let mut e = start;
+                    let mut done = 0usize;
+                    while done < count {
+                        // multi-index of element e
+                        let mut idx = vec![0u64; rank];
+                        let mut rem = e;
+                        for k in (0..rank).rev() {
+                            idx[k] = rem % self.dims[k];
+                            rem /= self.dims[k];
+                        }
+                        let last = rank - 1;
+                        let in_chunk_last = idx[last] % cdims[last];
+                        let run = (count - done)
+                            .min((self.dims[last] - idx[last]) as usize)
+                            .min((cdims[last] - in_chunk_last) as usize);
+                        let key: Vec<u64> =
+                            idx.iter().zip(&cdims).map(|(&i, &c)| i / c * c).collect();
+                        let chunk = self.chunk_data(&key, &cdims)?;
+                        let mut off = 0u64;
+                        for k in 0..rank {
+                            off = off * cdims[k] + (idx[k] - key[k]);
+                        }
+                        let a = off as usize * es;
+                        let src = chunk.get(a..a + run * es).ok_or_else(damaged)?;
+                        out[done * es..(done + run) * es].copy_from_slice(src);
+                        done += run;
+                        e += run as u64;
+                    }
+                    Ok(out)
+                }
+            }
+        }
+
+        fn chunk_data(&mut self, key: &[u64], cdims: &[u64]) -> Result<Rc<Vec<u8>>> {
+            if let Some(hit) = self.cache.get(key) {
+                return Ok(Rc::clone(hit));
+            }
+            let es = self.dt.size().max(1);
+            let nelems = cdims
+                .iter()
+                .fold(1usize, |a, &c| a.saturating_mul(c as usize));
+            let bytes = nelems
+                .checked_mul(es)
+                .filter(|&b| b <= 1 << 30)
+                .ok_or_else(damaged)?;
+            let data = match self.chunks.as_ref().and_then(|m| m.get(key)).copied() {
+                None => self.fill_bytes(nelems),
+                Some(r) => {
+                    if r.size > MAX_READ {
+                        return Err(damaged());
+                    }
+                    let raw = self.h.read(r.addr, r.size as usize)?;
+                    let d = apply_filters(&self.filters, r.mask, raw)?;
+                    if d.len() < bytes {
+                        return Err(damaged());
+                    }
+                    d
+                }
+            };
+            let data = Rc::new(data);
+            self.cache_bytes += data.len();
+            self.cache.insert(key.to_vec(), Rc::clone(&data));
+            self.cache_order.push_back(key.to_vec());
+            while (self.cache_bytes > CHUNK_CACHE || self.cache.len() > CHUNK_CACHE_ENTRIES)
+                && self.cache.len() > 1
+            {
+                let Some(old_key) = self.cache_order.pop_front() else {
+                    break;
+                };
+                if let Some(old) = self.cache.remove(&old_key) {
+                    self.cache_bytes -= old.len();
+                }
+            }
+            Ok(data)
+        }
+    }
+
+    // ---- walking a file ----
+
+    struct Found {
+        path: String,
+        addr: u64,
+        msgs: Vec<Msg>,
+    }
+
+    /// Every dataset reachable by hard links, in file order, and a map from
+    /// object address to path (for resolving references).
+    fn walk(f: &Super) -> Result<(Vec<Found>, HashMap<u64, String>)> {
+        let h = &f.file;
+        let mut datasets = Vec::new();
+        let mut paths: HashMap<u64, String> = HashMap::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut stack: Vec<(String, u64, usize)> = vec![(String::new(), f.root, 0)];
+        let mut order: Vec<(String, u64, usize)> = Vec::new();
+        while let Some((path, addr, depth)) = stack.pop() {
+            order.push((path.clone(), addr, depth));
+            if !seen.insert(addr) {
+                continue;
+            }
+            if seen.len() > MAX_OBJECTS || depth > MAX_DEPTH {
+                bail!("the HDF5 file has more objects or deeper nesting than this reader follows");
+            }
+            let msgs = match read_header(h, addr) {
+                Ok(m) => m,
+                Err(e) if depth > 0 => {
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            paths.entry(addr).or_insert_with(|| path.clone());
+            let is_dataset = msgs.iter().any(|m| m.ty == MSG_LAYOUT)
+                && msgs.iter().any(|m| m.ty == MSG_DATATYPE);
+            if is_dataset {
+                datasets.push(Found {
+                    path: path.clone(),
+                    addr,
+                    msgs,
+                });
+                continue;
+            }
+            let is_group = msgs
+                .iter()
+                .any(|m| matches!(m.ty, MSG_SYMTAB | MSG_LINK | MSG_LINK_INFO));
+            if is_group {
+                // A group named with a leading `#` is bookkeeping (MATLAB's
+                // `#refs#`), not data.
+                let mut links = group_links(h, &msgs)?;
+                // In the order they were made if the group says so, else
+                // alphabetical, so that an object reachable by two names is
+                // always called by the same one.
+                if links.iter().all(|l| l.order.is_some()) {
+                    links.sort_by_key(|l| l.order);
+                } else {
+                    links.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                links.reverse();
+                for l in links {
+                    let Some(t) = l.target else { continue };
+                    if l.name.starts_with('#') {
+                        continue;
+                    }
+                    let p = if path.is_empty() {
+                        l.name.clone()
+                    } else {
+                        format!("{path}/{}", l.name)
+                    };
+                    if !seen.contains(&t) {
+                        stack.push((p, t, depth + 1));
+                    }
+                }
+            }
+        }
+        let _ = order;
+        Ok((datasets, paths))
+    }
+
+    fn open_dataset(f: &Super, found: &Found) -> Result<Dataset> {
+        let h = &f.file;
+        let msg = |ty: u16| found.msgs.iter().find(|m| m.ty == ty);
+        let (dims, null) = parse_dataspace(&msg(MSG_DATASPACE).ok_or_else(damaged)?.data, h.sl)?;
+        let dt = parse_datatype_msg(&msg(MSG_DATATYPE).ok_or_else(damaged)?.data)?;
+        let layout = parse_layout(h, &msg(MSG_LAYOUT).ok_or_else(damaged)?.data)?;
+        let filters = match msg(MSG_FILTERS) {
+            Some(m) => parse_filters(&m.data)?,
+            None => Vec::new(),
+        };
+        let fill = if let Some(m) = msg(MSG_FILL) {
+            parse_fill(&m.data, false)
+        } else {
+            msg(MSG_FILL_OLD).and_then(|m| parse_fill(&m.data, true))
+        };
+        Ok(Dataset {
+            h: Rc::clone(h),
+            dims,
+            null,
+            dt,
+            layout,
+            filters,
+            fill,
+            chunks: None,
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            cache_bytes: 0,
+        })
+    }
+
+    fn parse_fill(data: &[u8], old: bool) -> Option<Vec<u8>> {
+        let mut c = Cur::new(data);
+        if old {
+            let n = c.u32().ok()? as usize;
+            return c.take(n).ok().map(<[u8]>::to_vec);
+        }
+        let version = c.u8().ok()?;
+        match version {
+            1 | 2 => {
+                c.skip(2).ok()?;
+                let defined = c.u8().ok()?;
+                if defined == 0 {
+                    return None;
+                }
+                let n = c.u32().ok()? as usize;
+                c.take(n).ok().map(<[u8]>::to_vec)
+            }
+            3 => {
+                let flags = c.u8().ok()?;
+                if flags & 0x20 == 0 {
+                    return None;
+                }
+                let n = c.u32().ok()? as usize;
+                c.take(n).ok().map(<[u8]>::to_vec)
+            }
+            _ => None,
+        }
+    }
+
+    // ---- turning raw elements into cells ----
+
+    struct Ctx {
+        h: Rc<H5File>,
+        heaps: Rc<RefCell<GlobalHeaps>>,
+        paths: Rc<HashMap<u64, String>>,
+    }
+
+    fn type_label(dt: &Dt) -> &'static str {
+        match dt {
+            Dt::Int {
+                size: 1,
+                signed: true,
+                ..
+            } => "int8",
+            Dt::Int { size: 1, .. } => "uint8",
+            Dt::Int {
+                size: 2,
+                signed: true,
+                ..
+            } => "int16",
+            Dt::Int { size: 2, .. } => "uint16",
+            Dt::Int {
+                size: 4,
+                signed: true,
+                ..
+            } => "int32",
+            Dt::Int { size: 4, .. } => "uint32",
+            Dt::Int { signed: true, .. } => "int64",
+            Dt::Int { .. } => "uint64",
+            Dt::Float { size: 2, .. } => "float16",
+            Dt::Float { size: 4, .. } => "float32",
+            Dt::Float { .. } => "float64",
+            Dt::Str { .. } | Dt::VlenStr { .. } => "string",
+            Dt::Enum { .. } => "enum",
+            Dt::Compound { .. } => "compound",
+            Dt::Array { .. } | Dt::VlenSeq { .. } => "array",
+            Dt::Reference { .. } => "reference",
+            Dt::Opaque { .. } => "opaque",
+        }
+    }
+
+    fn int_value(dt: &Dt, b: &[u8]) -> Option<(i64, u64, bool)> {
+        let Dt::Int { size, signed, big } = dt else {
+            return None;
+        };
+        let size = (*size).min(8);
+        if b.len() < size || size == 0 {
+            return None;
+        }
+        let mut raw = b[..size].to_vec();
+        if *big {
+            raw.reverse();
+        }
+        let u = uint_at(&raw, size);
+        let s = if *signed && size < 8 && u >> (size * 8 - 1) == 1 {
+            (u | (u64::MAX << (size * 8))) as i64
+        } else {
+            u as i64
+        };
+        Some((s, u, *signed))
+    }
+
+    fn fixed_text(b: &[u8], utf8: bool) -> Option<String> {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        let t = if utf8 || b.is_ascii() {
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        } else {
+            b[..end].iter().map(|&c| c as char).collect()
+        };
+        let t = t.trim_end().to_string();
+        (!t.is_empty()).then_some(t)
+    }
+
+    /// One element as a JSON value (for arrays, sequences and compounds that
+    /// can't be a plain cell).
+    fn json_elem(ctx: &Ctx, dt: &Dt, b: &[u8], out: &mut String, depth: usize) -> Result<()> {
+        use std::fmt::Write;
+        if depth > 8 {
+            out.push_str("null");
+            return Ok(());
+        }
+        match dt {
+            Dt::Int { .. } => {
+                let (s, u, signed) = int_value(dt, b).ok_or_else(damaged)?;
+                if signed {
+                    let _ = write!(out, "{s}");
+                } else {
+                    let _ = write!(out, "{u}");
+                }
+            }
+            Dt::Float { .. } => {
+                let x = scalar_f64(dt, b);
+                if x.is_finite() {
+                    let _ = write!(out, "{x}");
+                } else {
+                    out.push_str("null");
+                }
+            }
+            Dt::Str { size, utf8 } => json_string(
+                &fixed_text(&b[..(*size).min(b.len())], *utf8).unwrap_or_default(),
+                out,
+            ),
+            Dt::Enum { base, members } => {
+                let (s, _, _) = int_value(base, b).ok_or_else(damaged)?;
+                match members.iter().find(|(_, v)| *v == s) {
+                    Some((n, _)) => json_string(n, out),
+                    None => {
+                        let _ = write!(out, "{s}");
+                    }
+                }
+            }
+            Dt::Array { dims, base } => {
+                let n = dims
+                    .iter()
+                    .fold(1usize, |a, &d| a.saturating_mul(d as usize));
+                let es = base.size().max(1);
+                out.push('[');
+                for i in 0..n.min(1 << 16) {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    json_elem(
+                        ctx,
+                        base,
+                        b.get(i * es..).ok_or_else(damaged)?,
+                        out,
+                        depth + 1,
+                    )?;
+                }
+                out.push(']');
+            }
+            Dt::VlenStr { utf8, .. } => {
+                let s = vlen_bytes(ctx, b)?;
+                json_string(&String::from_utf8_lossy(&s), out);
+                let _ = utf8;
+            }
+            Dt::VlenSeq { base, .. } => {
+                let (len, bytes) = vlen_items(ctx, b, base.size())?;
+                let es = base.size().max(1);
+                out.push('[');
+                for i in 0..len.min(1 << 16) {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    json_elem(
+                        ctx,
+                        base,
+                        bytes.get(i * es..).ok_or_else(damaged)?,
+                        out,
+                        depth + 1,
+                    )?;
+                }
+                out.push(']');
+            }
+            Dt::Compound { members, .. } => {
+                out.push('{');
+                for (i, (name, off, m)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    json_string(name, out);
+                    out.push(':');
+                    json_elem(ctx, m, b.get(*off..).ok_or_else(damaged)?, out, depth + 1)?;
+                }
+                out.push('}');
+            }
+            Dt::Reference { size } => {
+                let a = uint_at(b, (*size).min(8).min(ctx.h.so));
+                match ctx.paths.get(&a) {
+                    Some(p) => json_string(p, out),
+                    None => out.push_str("null"),
+                }
+            }
+            Dt::Opaque { size } => {
+                let mut s = String::new();
+                for byte in &b[..(*size).min(b.len())] {
+                    let _ = write!(s, "{byte:02x}");
+                }
+                json_string(&s, out);
+            }
+        }
+        Ok(())
+    }
+
+    fn json_string(s: &str, out: &mut String) {
+        use std::fmt::Write;
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+
+    /// A variable-length element's (length, global heap address, index).
+    fn vlen_ref(ctx: &Ctx, b: &[u8]) -> Result<(usize, u64, u16)> {
+        let mut c = Cur::new(b);
+        let len = c.u32()? as usize;
+        let addr = c.addr(ctx.h.so)?;
+        let idx = c.u32()? as u16;
+        Ok((len, addr, idx))
+    }
+
+    fn vlen_bytes(ctx: &Ctx, b: &[u8]) -> Result<Vec<u8>> {
+        let (len, addr, idx) = vlen_ref(ctx, b)?;
+        if len == 0 || addr == UNDEF {
+            return Ok(Vec::new());
+        }
+        let obj = ctx.heaps.borrow_mut().object(&ctx.h, addr, idx)?;
+        Ok(obj[..len.min(obj.len())].to_vec())
+    }
+
+    fn vlen_items(ctx: &Ctx, b: &[u8], es: usize) -> Result<(usize, Vec<u8>)> {
+        let (len, addr, idx) = vlen_ref(ctx, b)?;
+        if len == 0 || addr == UNDEF {
+            return Ok((0, Vec::new()));
+        }
+        let obj = ctx.heaps.borrow_mut().object(&ctx.h, addr, idx)?;
+        Ok((len.min(obj.len() / es.max(1)), obj))
+    }
+
+    /// `count` elements of type `dt` from `raw`, element `i` starting at
+    /// `i * stride + offset`.
+    fn decode_elems(
+        ctx: &Ctx,
+        dt: &Dt,
+        raw: &[u8],
+        count: usize,
+        stride: usize,
+        offset: usize,
+    ) -> Result<Cells> {
+        let es = dt.size();
+        let at = |i: usize| -> Result<&[u8]> {
+            let s = i * stride + offset;
+            raw.get(s..s + es.max(1)).ok_or_else(damaged)
+        };
+        Ok(match dt {
+            Dt::Int { size, signed, .. } => {
+                if *size == 8 && !*signed {
+                    let mut v = Vec::with_capacity(count);
+                    for i in 0..count {
+                        v.push(int_value(dt, at(i)?).map(|x| x.1).ok_or_else(damaged)?);
+                    }
+                    Cells::U64(v)
+                } else {
+                    let mut v = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let (s, u, signed) = int_value(dt, at(i)?).ok_or_else(damaged)?;
+                        v.push(if signed { s } else { u as i64 });
+                    }
+                    Cells::I64(v)
+                }
+            }
+            Dt::Float { size, .. } => {
+                if *size == 8 {
+                    let mut v = Vec::with_capacity(count);
+                    for i in 0..count {
+                        v.push(scalar_f64(dt, at(i)?));
+                    }
+                    Cells::F64(v)
+                } else {
+                    let mut v = Vec::with_capacity(count);
+                    for i in 0..count {
+                        v.push(scalar_f64(dt, at(i)?) as f32);
+                    }
+                    Cells::F32(v)
+                }
+            }
+            Dt::Str { size, utf8 } => {
+                let mut v = Vec::with_capacity(count);
+                for i in 0..count {
+                    let s = i * stride + offset;
+                    v.push(fixed_text(raw.get(s..s + size).ok_or_else(damaged)?, *utf8));
+                }
+                Cells::Text(v)
+            }
+            Dt::VlenStr { .. } => {
+                let mut v = Vec::with_capacity(count);
+                for i in 0..count {
+                    let bytes = vlen_bytes(ctx, at(i)?)?;
+                    let t = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                    v.push((!t.is_empty()).then_some(t));
+                }
+                Cells::Text(v)
+            }
+            Dt::Enum { base, members } => {
+                let mut v = Vec::with_capacity(count);
+                for i in 0..count {
+                    let (s, _, _) = int_value(base, at(i)?).ok_or_else(damaged)?;
+                    v.push(Some(match members.iter().find(|(_, x)| *x == s) {
+                        Some((n, _)) => n.clone(),
+                        None => s.to_string(),
+                    }));
+                }
+                Cells::Text(v)
+            }
+            Dt::Reference { size } => {
+                let mut v = Vec::with_capacity(count);
+                for i in 0..count {
+                    let a = uint_at(at(i)?, (*size).min(8).min(ctx.h.so));
+                    v.push(ctx.paths.get(&a).cloned());
+                }
+                Cells::Text(v)
+            }
+            Dt::Opaque { size } => {
+                let mut v = Vec::with_capacity(count);
+                for i in 0..count {
+                    let s = i * stride + offset;
+                    let b = raw.get(s..s + size).ok_or_else(damaged)?;
+                    v.push(Some(b.iter().map(|x| format!("{x:02x}")).collect()));
+                }
+                Cells::Text(v)
+            }
+            Dt::Array { .. } | Dt::VlenSeq { .. } | Dt::Compound { .. } => {
+                let mut v = Vec::with_capacity(count);
+                for i in 0..count {
+                    let mut s = String::new();
+                    json_elem(ctx, dt, at(i)?, &mut s, 0)?;
+                    v.push(Some(s));
+                }
+                Cells::Text(v)
+            }
+        })
+    }
+
+    // ---- variables ----
+
+    fn to_attrs(list: &[Attribute]) -> Vec<(String, Attr)> {
+        const HIDDEN: [&str; 9] = [
+            "DIMENSION_LIST",
+            "REFERENCE_LIST",
+            "CLASS",
+            "NAME",
+            "_Netcdf4Dimid",
+            "_Netcdf4Coordinates",
+            "_NCProperties",
+            "_nc3_strict",
+            "MATLAB_class",
+        ];
+        list.iter()
+            .filter(|a| !HIDDEN.contains(&a.name.as_str()))
+            .filter_map(|a| match &a.value {
+                AttrVal::Text(t) => Some((a.name.clone(), Attr::Text(t.clone()))),
+                AttrVal::Num(n) => Some((a.name.clone(), Attr::Num(n.clone()))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn attr_text<'a>(list: &'a [Attribute], name: &str) -> Option<&'a str> {
+        list.iter()
+            .find(|a| a.name == name)
+            .and_then(|a| match &a.value {
+                AttrVal::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+    }
+
+    fn make_reader(
+        ctx: Rc<Ctx>,
+        ds: Rc<RefCell<Dataset>>,
+        dt: Dt,
+        stride: usize,
+        offset: usize,
+        path: String,
+    ) -> Reader {
+        Box::new(move |start: u64, count: usize| -> Result<Cells> {
+            let raw = ds
+                .borrow_mut()
+                .read_raw(start, count)
+                .with_context(|| format!("dataset {path:?}"))?;
+            decode_elems(&ctx, &dt, &raw, count, stride, offset)
+                .with_context(|| format!("dataset {path:?}"))
+        })
+    }
+
+    /// Variables for one dataset (several for a compound or a 2-D matrix).
+    #[allow(clippy::too_many_arguments)]
+    fn dataset_vars(
+        ctx: &Rc<Ctx>,
+        ds: Rc<RefCell<Dataset>>,
+        path: &str,
+        attrs: Vec<(String, Attr)>,
+        named_dims: Option<Vec<String>>,
+        matlab: bool,
+        matlab_char: bool,
+        out: &mut Vec<Var>,
+    ) -> Result<()> {
+        let (mut dims, dt) = {
+            let d = ds.borrow();
+            (d.dims.clone(), d.dt.clone())
+        };
+        // A null dataspace holds no elements at all.
+        if ds.borrow().null {
+            dims = vec![0];
+        }
+        let leaf = path.rsplit('/').next().unwrap_or(path).to_string();
+        let anon = named_dims.is_none();
+        // A MATLAB vector too long to be a row of columns is a column of values.
+        if matlab
+            && anon
+            && dims.len() == 2
+            && (dims[0] == 1 || dims[1] == 1)
+            && dims[0] * dims[1] > 4096
+        {
+            dims = vec![dims[0] * dims[1]];
+        }
+        let dim_list: Vec<(String, u64)> = match &named_dims {
+            Some(names) => names.iter().cloned().zip(dims.iter().copied()).collect(),
+            None => dims
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| (format!("dim_{i}"), d))
+                .collect(),
+        };
+        // A compound is a table of its fields.
+        if let Dt::Compound { members, size } = &dt {
+            // MATLAB's complex numbers: a row or column vector is just rows
+            let cdims: Vec<(String, u64)> = if matlab {
+                dim_list.iter().filter(|(_, n)| *n != 1).cloned().collect()
+            } else {
+                dim_list.clone()
+            };
+            let mut flat: Vec<(String, usize, Dt)> = Vec::new();
+            fn flatten(
+                prefix: &str,
+                base: usize,
+                members: &[(String, usize, Dt)],
+                out: &mut Vec<(String, usize, Dt)>,
+                depth: usize,
+            ) {
+                for (n, o, d) in members {
+                    let name = if prefix.is_empty() {
+                        n.clone()
+                    } else {
+                        format!("{prefix}.{n}")
+                    };
+                    match d {
+                        Dt::Compound { members: inner, .. } if depth < 6 => {
+                            flatten(&name, base + o, inner, out, depth + 1)
+                        }
+                        _ => out.push((name, base + o, d.clone())),
+                    }
+                }
+            }
+            flatten("", 0, members, &mut flat, 0);
+            for (name, off, mdt) in flat {
+                out.push(Var {
+                    name,
+                    dims: cdims.clone(),
+                    attrs: Vec::new(),
+                    type_name: type_label(&mdt),
+                    read: make_reader(
+                        Rc::clone(ctx),
+                        Rc::clone(&ds),
+                        mdt,
+                        *size,
+                        off,
+                        path.to_string(),
+                    ),
+                    table: Some(path.to_string()),
+                    anon: true,
+                });
+            }
+            return Ok(());
+        }
+        // A MATLAB char array: each row of the matrix is one string. MATLAB
+        // writes column-major, so the file's dimensions are the matrix's
+        // reversed and character j of row i is file element j * rows + i.
+        if matlab_char {
+            let (nchars, nrows) = match dims.as_slice() {
+                [n, r] => (*n, *r),
+                _ => return Ok(()),
+            };
+            if nchars == 0 || nrows == 0 || nchars.saturating_mul(nrows) > (1 << 28) {
+                return Ok(());
+            }
+            let width = dt.size().clamp(1, 2);
+            let ds2 = Rc::clone(&ds);
+            let all: Rc<RefCell<Option<Vec<Option<String>>>>> = Rc::new(RefCell::new(None));
+            let reader: Reader = Box::new(move |start: u64, count: usize| -> Result<Cells> {
+                if all.borrow().is_none() {
+                    let raw = ds2.borrow_mut().read_raw(0, (nchars * nrows) as usize)?;
+                    let unit = |k: usize| -> u16 {
+                        match width {
+                            1 => u16::from(raw[k]),
+                            _ => u16::from_le_bytes([raw[k * 2], raw[k * 2 + 1]]),
+                        }
+                    };
+                    let mut rows = Vec::with_capacity(nrows as usize);
+                    for i in 0..nrows as usize {
+                        let units: Vec<u16> = (0..nchars as usize)
+                            .map(|j| unit(j * nrows as usize + i))
+                            .collect();
+                        let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+                        let text: String = char::decode_utf16(units[..end].iter().copied())
+                            .map(|r| r.unwrap_or('\u{FFFD}'))
+                            .collect();
+                        let text = text.trim_end().to_string();
+                        rows.push((!text.is_empty()).then_some(text));
+                    }
+                    *all.borrow_mut() = Some(rows);
+                }
+                let rows = all.borrow();
+                let rows = rows.as_ref().ok_or_else(damaged)?;
+                let from = (start as usize).min(rows.len());
+                let to = (from + count).min(rows.len());
+                Ok(Cells::Text(rows[from..to].to_vec()))
+            });
+            out.push(Var {
+                name: "value".to_string(),
+                dims: vec![("dim_0".to_string(), nrows)],
+                attrs,
+                type_name: "char",
+                read: reader,
+                table: Some(path.to_string()),
+                anon: true,
+            });
+            return Ok(());
+        }
+        // A netCDF `char` variable: its last dimension is the string length,
+        // as in a classic file, so each row of the rest is one string.
+        if !anon
+            && let Dt::Str { size: 1, utf8 } = &dt
+            && let Some(&strlen) = dims.last()
+            && strlen > 0
+        {
+            let utf8 = *utf8;
+            let sl = strlen as usize;
+            let outer = dim_list[..dim_list.len() - 1].to_vec();
+            let ds2 = Rc::clone(&ds);
+            let reader: Reader = Box::new(move |start: u64, count: usize| -> Result<Cells> {
+                let raw = ds2.borrow_mut().read_raw(start * strlen, count * sl)?;
+                let mut v = Vec::with_capacity(count);
+                for i in 0..count {
+                    v.push(fixed_text(
+                        raw.get(i * sl..(i + 1) * sl).ok_or_else(damaged)?,
+                        utf8,
+                    ));
+                }
+                Ok(Cells::Text(v))
+            });
+            out.push(Var {
+                name: leaf,
+                dims: outer,
+                attrs,
+                type_name: "char",
+                read: reader,
+                table: None,
+                anon: false,
+            });
+            return Ok(());
+        }
+        let es = dt.size();
+        let simple_2d = anon && dims.len() == 2 && dims[0] > 0 && dims[1] > 0;
+        if simple_2d && (matlab || dims[1] <= 4096) && !matches!(dt, Dt::Array { .. }) {
+            // A matrix is columns. MATLAB writes arrays column-major, so a
+            // file row is a MATLAB column.
+            let (nrows, ncols) = if matlab {
+                (dims[1], dims[0])
+            } else {
+                (dims[0], dims[1])
+            };
+            if ncols <= 4096 {
+                let cache: RowBlockCache = Rc::new(RefCell::new(None));
+                for j in 0..ncols {
+                    let ctx = Rc::clone(ctx);
+                    let ds2 = Rc::clone(&ds);
+                    let dt2 = dt.clone();
+                    let cache = Rc::clone(&cache);
+                    let reader: Reader = if matlab {
+                        Box::new(move |start: u64, count: usize| -> Result<Cells> {
+                            let raw = ds2.borrow_mut().read_raw(j * nrows + start, count)?;
+                            decode_elems(&ctx, &dt2, &raw, count, es, 0)
+                        })
+                    } else {
+                        Box::new(move |start: u64, count: usize| -> Result<Cells> {
+                            let hit = {
+                                let c = cache.borrow();
+                                c.as_ref()
+                                    .filter(|(s, n, _)| *s == start && *n == count)
+                                    .map(|(_, _, r)| Rc::clone(r))
+                            };
+                            let raw = match hit {
+                                Some(r) => r,
+                                None => {
+                                    let r = Rc::new(
+                                        ds2.borrow_mut()
+                                            .read_raw(start * ncols, count * ncols as usize)?,
+                                    );
+                                    *cache.borrow_mut() = Some((start, count, Rc::clone(&r)));
+                                    r
+                                }
+                            };
+                            decode_elems(
+                                &ctx,
+                                &dt2,
+                                &raw,
+                                count,
+                                es * ncols as usize,
+                                j as usize * es,
+                            )
+                        })
+                    };
+                    out.push(Var {
+                        name: format!("col_{j}"),
+                        dims: vec![("dim_0".to_string(), nrows)],
+                        attrs: attrs.clone(),
+                        type_name: type_label(&dt),
+                        read: reader,
+                        table: Some(path.to_string()),
+                        anon: true,
+                    });
+                }
+                return Ok(());
+            }
+        }
+        let name = if anon { "value".to_string() } else { leaf };
+        // A netCDF variable has a netCDF type, as in a classic file.
+        let type_name = match (anon, type_label(&dt)) {
+            (false, "int8") => "byte",
+            (false, "int16") => "short",
+            (false, "int32") => "int",
+            (false, "uint8") => "ubyte",
+            (false, "uint16") => "ushort",
+            (false, "uint32") => "uint",
+            (false, "float32") => "float",
+            (false, "float64") => "double",
+            (_, other) => other,
+        };
+        out.push(Var {
+            name,
+            dims: dim_list,
+            attrs,
+            type_name,
+            read: make_reader(Rc::clone(ctx), ds, dt, es, 0, path.to_string()),
+            table: anon.then(|| path.to_string()),
+            anon,
+        });
+        Ok(())
+    }
+
+    /// All variables of a file.
+    pub(crate) fn open(path: &Path) -> Result<Vec<Var>> {
+        let f = open_file(path)?;
+        let (found, paths) = walk(&f)?;
+        let ctx = Rc::new(Ctx {
+            h: Rc::clone(&f.file),
+            heaps: Rc::new(RefCell::new(GlobalHeaps::new())),
+            paths: Rc::new(paths),
+        });
+        let mut heaps = GlobalHeaps::new();
+        // Attributes of every dataset, and which are dimension scales.
+        let attrs: Vec<Vec<Attribute>> = found
+            .iter()
+            .map(|d| attributes(&f.file, &mut heaps, &d.msgs))
+            .collect();
+        let is_scale = |i: usize| attr_text(&attrs[i], "CLASS") == Some("DIMENSION_SCALE");
+        let scale_name: HashMap<u64, String> = found
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| is_scale(*i))
+            .map(|(_, d)| {
+                (
+                    d.addr,
+                    d.path.rsplit('/').next().unwrap_or(&d.path).to_string(),
+                )
+            })
+            .collect();
+        let netcdf4 = found
+            .iter()
+            .enumerate()
+            .any(|(i, _)| attrs[i].iter().any(|a| a.name == "DIMENSION_LIST"));
+        let mut vars: Vec<Var> = Vec::new();
+        for (i, d) in found.iter().enumerate() {
+            let ds = Rc::new(RefCell::new(open_dataset(&f, d)?));
+            let list = &attrs[i];
+            // A netCDF dimension that isn't also a variable.
+            if netcdf4
+                && is_scale(i)
+                && attr_text(list, "NAME").is_some_and(|n| {
+                    n.starts_with("This is a netCDF dimension but not a netCDF variable")
+                })
+            {
+                continue;
+            }
+            let rank = ds.borrow().dims.len();
+            let named: Option<Vec<String>> = if netcdf4 {
+                match list.iter().find(|a| a.name == "DIMENSION_LIST") {
+                    Some(Attribute {
+                        value: AttrVal::Refs(refs),
+                        ..
+                    }) if refs.len() == rank => Some(
+                        refs.iter()
+                            .enumerate()
+                            .map(|(k, r)| {
+                                r.first()
+                                    .and_then(|a| scale_name.get(a))
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("dim_{k}"))
+                            })
+                            .collect(),
+                    ),
+                    // A scale that is also a variable carries its own name.
+                    _ if is_scale(i) && rank == 1 => Some(vec![
+                        d.path.rsplit('/').next().unwrap_or(&d.path).to_string(),
+                    ]),
+                    _ if rank == 0 => Some(Vec::new()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let matlab = attr_text(list, "MATLAB_class").is_some();
+            // MATLAB writes an empty array as its dimensions.
+            if matlab && list.iter().any(|a| a.name == "MATLAB_empty") {
+                continue;
+            }
+            if let Some(class) = attr_text(list, "MATLAB_class")
+                && !matches!(
+                    class,
+                    "double"
+                        | "single"
+                        | "int8"
+                        | "uint8"
+                        | "int16"
+                        | "uint16"
+                        | "int32"
+                        | "uint32"
+                        | "int64"
+                        | "uint64"
+                        | "logical"
+                )
+            {
+                // struct, cell, sparse, table...: not a plain matrix (a char
+                // array is read as strings)
+                if class != "char" {
+                    continue;
+                }
+            }
+            let matlab_char = attr_text(list, "MATLAB_class") == Some("char");
+            dataset_vars(
+                &ctx,
+                ds,
+                &d.path,
+                to_attrs(list),
+                named,
+                matlab,
+                matlab_char,
+                &mut vars,
+            )?;
+        }
+        Ok(vars)
+    }
+
+    pub(crate) fn columns_from_hdf5(
+        path: &Path,
+        stem: &str,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let mut vars = open(path)?;
+        let tables = plan(&mut vars, stem)?;
+        if tables.is_empty() {
+            bail!("{path:?} is an HDF5 file with no datasets in it");
+        }
+        let mut out = Vec::new();
+        for t in &tables {
+            let profiles = t.profile(&mut vars, nrows, n_samples)?;
+            out.push((t.name.clone(), profiles));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn stream_hdf5_rows_for_sql(
+        path: &Path,
+        table_name: &str,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut vars = open(path)?;
+        let tables = plan(&mut vars, table_name)?;
+        let single = tables.len() == 1;
+        for t in &tables {
+            if single || t.name == table_name {
+                return t.emit(&mut vars, nrows, sink);
+            }
+        }
+        bail!("{path:?} has no table named {table_name:?}")
+    }
+}
+
+#[cfg(feature = "hdf5")]
+fn columns_from_hdf5(
+    path: &Path,
+    stem: &str,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    hdf5_support::columns_from_hdf5(path, stem, nrows, n_samples)
+}
+
+#[cfg(not(feature = "hdf5"))]
+fn columns_from_hdf5(
+    _path: &Path,
+    _stem: &str,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "HDF5 support isn't compiled in - rebuild with `cargo build --release --features hdf5` (or --features full)"
+    )
+}
+
+#[cfg(feature = "hdf5")]
+fn render_sql_inline_flat_hdf5(
+    read_path: &Path,
+    table_name: &str,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    hdf5_support::stream_hdf5_rows_for_sql(read_path, table_name, nrows, sink)
+}
+
+#[cfg(not(feature = "hdf5"))]
+fn render_sql_inline_flat_hdf5(
+    _read_path: &Path,
+    _table_name: &str,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "HDF5 support isn't compiled in - rebuild with `cargo build --release --features hdf5` (or --features full)"
     )
 }
 
@@ -80367,6 +83621,8 @@ enum InputFormat {
     Markdown,
     /// NetCDF classic (CDF-1/2/5).
     NetCdf,
+    /// HDF5, including NetCDF-4 and MATLAB v7.3.
+    Hdf5,
     Spss,
     Orc,
     Bson,
@@ -80468,6 +83724,7 @@ impl InputFormat {
             InputFormat::Html => "html",
             InputFormat::Markdown => "markdown",
             InputFormat::NetCdf => "netcdf",
+            InputFormat::Hdf5 => "hdf5",
             InputFormat::Spss => "spss",
             InputFormat::Orc => "orc",
             InputFormat::Bson => "bson",
@@ -80856,6 +84113,13 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
         extensions: &["nc", "cdf", "netcdf"],
         feature: Some("netcdf"),
         compiled_in: cfg!(feature = "netcdf"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "hdf5",
+        extensions: &["h5", "hdf5", "hdf", "he5", "mat"],
+        feature: Some("hdf5"),
+        compiled_in: cfg!(feature = "hdf5"),
         directory: false,
     },
     FormatInfo {
@@ -81419,6 +84683,9 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
     if head.len() >= 4 && &head[..3] == b"CDF" && matches!(head[3], 1 | 2 | 5) {
         return Some(InputFormat::NetCdf);
     }
+    if head.starts_with(&[0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some(InputFormat::Hdf5);
+    }
     if head.len() >= 32 && head[..32] == SAS7BDAT_MAGIC[..] {
         return Some(InputFormat::Sas7bdat);
     }
@@ -81648,6 +84915,7 @@ fn detect_format(
             "html" | "htm" | "xhtml" => Ok(InputFormat::Html),
             "markdown" | "md" => Ok(InputFormat::Markdown),
             "netcdf" | "nc" | "cdf" => Ok(InputFormat::NetCdf),
+            "hdf5" | "h5" | "hdf" | "he5" | "mat" => Ok(InputFormat::Hdf5),
             "spss" | "sav" | "zsav" => Ok(InputFormat::Spss),
             "orc" => Ok(InputFormat::Orc),
             "bson" => Ok(InputFormat::Bson),
@@ -81685,6 +84953,10 @@ fn detect_format(
         // `.vcf` is vCard contacts or Variant Call Format; the content says which.
         if matches!(format, InputFormat::Vcard) && sniff_variant_calls(read_path) {
             return Ok(InputFormat::Vcf);
+        }
+        // A NetCDF-4 file is HDF5 underneath, and the signature says so.
+        if matches!(format, InputFormat::NetCdf) && file_starts_with_hdf5_signature(read_path) {
+            return Ok(InputFormat::Hdf5);
         }
         // A web page or a README is a document first: only one that holds a
         // table is data (`--format html`/`markdown` skips this check).
@@ -81759,6 +85031,7 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "html" | "htm" | "xhtml" => InputFormat::Html,
         "md" | "markdown" | "mdown" | "mkd" => InputFormat::Markdown,
         "nc" | "cdf" | "netcdf" => InputFormat::NetCdf,
+        "h5" | "hdf5" | "hdf" | "he5" | "mat" => InputFormat::Hdf5,
         "sav" | "zsav" => InputFormat::Spss,
         "orc" => InputFormat::Orc,
         "bson" => InputFormat::Bson,
@@ -86655,6 +89928,9 @@ fn render_sql_inline_flat(
             InputFormat::NetCdf => {
                 render_sql_inline_flat_netcdf(read_path, table_name, args.nrows, &mut sink)?
             }
+            InputFormat::Hdf5 => {
+                render_sql_inline_flat_hdf5(read_path, table_name, args.nrows, &mut sink)?
+            }
             InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
             InputFormat::Orc => {
                 render_sql_inline_flat_orc(read_path, source_profiles, args.nrows, &mut sink)?
@@ -87766,6 +91042,7 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::Html
             | InputFormat::Markdown
             | InputFormat::NetCdf
+            | InputFormat::Hdf5
             | InputFormat::Spss
             | InputFormat::Orc
             | InputFormat::Npy
@@ -99785,6 +103062,15 @@ fn declared_text_encoding(format: &InputFormat, path: &Path) -> Option<TextEncod
     }
 }
 
+/// Whether a file begins with the HDF5 signature.
+fn file_starts_with_hdf5_signature(path: &Path) -> bool {
+    let mut head = [0u8; 8];
+    matches!(
+        fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)),
+        Ok(())
+    ) && head == [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a]
+}
+
 /// An HTML page's own `<meta charset=...>` (or the older
 /// `<meta http-equiv content="text/html; charset=...">`), from the first 4 KiB,
 /// when it names something other than UTF-8.
@@ -101491,6 +104777,7 @@ fn dispatch_reader(
             | InputFormat::Html
             | InputFormat::Markdown
             | InputFormat::NetCdf
+            | InputFormat::Hdf5
     ) {
         match format {
             InputFormat::Sqlite => columns_from_sqlite(read_path, args.nrows, args.samples)?,
@@ -101509,6 +104796,9 @@ fn dispatch_reader(
             }
             InputFormat::NetCdf => {
                 columns_from_netcdf(read_path, &file_stem, args.nrows, args.samples)?
+            }
+            InputFormat::Hdf5 => {
+                columns_from_hdf5(read_path, &file_stem, args.nrows, args.samples)?
             }
             _ => unreachable!("handled by the outer matches! guard"),
         }
@@ -101594,7 +104884,8 @@ fn dispatch_reader(
             | InputFormat::RData
             | InputFormat::Html
             | InputFormat::Markdown
-            | InputFormat::NetCdf => {
+            | InputFormat::NetCdf
+            | InputFormat::Hdf5 => {
                 unreachable!("handled above")
             }
             InputFormat::DeltaTable | InputFormat::IcebergTable => {

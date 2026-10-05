@@ -9,6 +9,7 @@ logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SAS Transport (XPORT), SPSS,
 Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
 vCard, iCalendar, Jupyter notebooks (.ipynb), PDF page text, VCF/BED/GFF/
 FASTA/FASTQ/SAM genomics text, Weka ARFF, R serialized data (`.rds`/`.RData`),
+NetCDF (classic and NetCDF-4), HDF5 and MATLAB v7.3 `.mat` files,
 and the tables inside HTML and Markdown documents — any of
 them gzip-, zstd-, bzip2- or xz-compressed too — plus
 Delta Lake and Apache Iceberg tables (a directory profiled as one
@@ -119,6 +120,8 @@ full, honest numbers.
 | R data | `.rds`, `.rda`, `.RData` (gzip/bzip2/xz-compressed or not; or an `RDX`/`X\n` header) | `--features rdata` | one table per `save()` object (a `saveRDS` file's one object takes the file name); data frames, matrices, 1-D tables, vectors and lists; factors/Date/POSIXct/`integer64` read as what they are, `label`/`labels` attributes become description and value labels; XDR, native and text serializations, versions 2 and 3, ALTREP - see "Gap audit 8" |
 | HTML | `.html`, `.htm`, `.xhtml` (or a doctype/`<html>`) | `--features html` | one table per data `<table>` (named for its `<caption>`/`id`, else `table_N`); `colspan`/`rowspan` expanded, `<thead>`/`<th>` header, entities decoded; an outer layout table is skipped; only a file that holds a table is claimed - see "Gap audit 8" |
 | Markdown | `.md`, `.markdown` | `--features markdown` | one table per GFM pipe table (named for the heading above it, else `table_N`); `\|` escapes, short rows padded, fenced code skipped; cell text kept as written |
+| NetCDF classic | `.nc`, `.cdf`, `.netcdf` (CDF-1/2/5, by the `CDF` magic) | `--features netcdf` | variables grouped by their dimensions into tidy tables, one row per grid cell, a column per dimension (its coordinate variable) and per variable; `_FillValue`/`missing_value`/NaN are missing, `scale_factor`/`add_offset` and CF time units are applied, `long_name` is the description, `flag_values` the value labels; record variables interleaved, `char` arrays are strings - see "Gap audit 9" |
+| HDF5 | `.h5`, `.hdf5`, `.hdf`, `.he5`, `.mat`; also NetCDF-4 `.nc` (by the `\x89HDF` signature) | `--features hdf5` | one table per dataset, named for its path (a 1-D dataset is `value`, a 2-D one `col_j`, three or more axes `dim_k` + `value`, a compound its fields); a NetCDF-4 file reads exactly like classic NetCDF through its dimension scales; a MATLAB v7.3 `.mat` is turned the right way round, its char arrays are strings - see "Gap audit 9" |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -18211,6 +18214,145 @@ reader on real files, plus a bug the real files found.
   reports `0.0` for a column with a real gap (three decimals below 0.05%, at
   least 0.001), at all three places `missing_pct` is computed. No committed
   fixture changed; a CSV regression test pins it.
+
+## Gap audit 9: NetCDF and HDF5
+
+The scientific array formats, each checked against the libraries that
+write and read them (netCDF4-python, xarray, h5py, hdf5storage) on files
+they produced.
+
+- **One layer for both (`scidata_support`).** A NetCDF or HDF5 file holds
+  variables: arrays with a shape, named dimensions (NetCDF always, HDF5
+  through dimension scales) and attributes. The natural table is the one
+  `xarray.Dataset.to_dataframe()` makes, so that is what both readers
+  produce (`plan`): variables with the same dimensions share a table
+  (`time_lat_lon`), one row per grid cell, a column per dimension holding
+  its coordinate (the coordinate variable of the same name, else the plain
+  index) and a column per variable; a variable with other dimensions gets
+  its own table, scalars share `scalars`, and a file with one table takes
+  the file's name. What the file declares is applied and named in the
+  column's notes: `_FillValue`, `missing_value` and NaN are missing,
+  `scale_factor`/`add_offset` unpack a packed variable (the result rounded
+  to 14 significant digits, since `raw * scale + offset` has arithmetic
+  noise in its last digits, while a stored double is kept exactly), and a CF
+  time axis (`days since 1970-01-01`) becomes dates in the standard
+  calendars and in the fixed-length ones climate models write (`noleap` /
+  `365_day`, `all_leap` / `366_day`, `360_day`: the month lengths are walked
+  directly, checked against cftime); a `julian` or other calendar keeps the
+  numbers and says so in the notes.
+  `long_name` (else `title`, `description`, `standard_name`) is the
+  description, `units` goes in the notes, and `flag_values`/`flag_meanings`
+  become value labels. Rows come a block at a time (16,384) through each
+  variable's own reader, so memory is one block however large the grid is
+  (a 63 MB compressed grid of 10 million cells profiles in the same memory
+  as a small one, bar the per-column statistics); `--nrows` stops reading
+  early, and the SQL path streams the same blocks.
+- **NetCDF classic (`--features netcdf`).** `netcdf_support` reads CDF-1,
+  CDF-2 (64-bit offsets) and CDF-5 (64-bit data, unsigned and 64-bit
+  integers), straight from the NetCDF Classic Format Specification: the
+  header lists, big-endian data padded to four bytes, and record variables
+  (first dimension unlimited) interleaved one record after another with
+  each `recsize` bytes apart - the record size is the sum of the padded
+  slabs except for a file with a single record variable, which isn't
+  padded. A `char` array is text: its last dimension is the string length.
+  Verified against xarray on files netCDF4-python wrote in all three
+  versions (a packed `short` with fill value, a CF time axis, a flag
+  variable, a `char` matrix, a scalar, a record variable written in
+  pieces) and on real files: xarray's `air_temperature.nc` (7 MB),
+  `rasm.nc` (16 MB, `noleap` calendar) and a 9 MB ROMS output: 8.3, 22.2 and
+  15.5 million cells, every one equal, table by table (xarray broadcasts a
+  non-index coordinate such as `xc` into every table, this tool keeps it in
+  its own, so the checker compares each table against just its variables).
+  The checker groups a `char` variable differently from this tool in one
+  fixture (xarray joins characters into a string before grouping); the
+  integration test pins that table.
+- **HDF5 (`--features hdf5`).** `hdf5_support` is a hand-rolled reader of
+  the HDF Group's file format: the superblock (versions 0-3, any offset and
+  length size), object headers v1 and v2 with continuation chunks, groups
+  old-style (symbol table: v1 B-tree, local heap, `SNOD` nodes) and
+  new-style (link messages, dense storage in a fractal heap indexed by a v2
+  B-tree), and datasets with compact, contiguous and chunked storage.
+  Chunks are found through a v1 B-tree or any layout 4/5 index: single
+  chunk, implicit, fixed array, extensible array (the index block, secondary
+  blocks, and paged data blocks) and v2 B-tree. The deflate, shuffle and
+  Fletcher-32 filters are applied; datatypes are integers, floats (half,
+  single, double), fixed and variable-length strings, enums, arrays,
+  compounds (nested ones by dotted name), object references (read as the
+  path they point at) and opaque bytes; variable-length data comes from the
+  global heap; attributes are read compact and dense. A dataset becomes a
+  table named for its path (`group1/deep/leaf`): a compound is its fields,
+  a 1-D dataset a `value` column, a 2-D numeric dataset one column per
+  column (up to 4,096, as for a NumPy array), three or more axes one row per
+  cell with `dim_k` indices and `value`. An object reachable by two names
+  (a hard link) is one table, named by the first of the group's links in
+  creation order (or alphabetical when the group doesn't track it). An
+  empty string and a NaN are missing, as everywhere here; a chunk that was
+  never written reads as the dataset's fill value.
+- **NetCDF-4 is the same layer on HDF5.** The `DIMENSION_LIST` and
+  `DIMENSION_SCALE` attributes give each variable its named dimensions, a
+  scale that is only a dimension (`This is a netCDF dimension but not a
+  netCDF variable`) is not a table, the last dimension of a `char` variable
+  is its string length, and types carry NetCDF's names (`short`, `float`,
+  `double`...), so a NetCDF-4 file made from the same variables reads as the
+  same dictionary as its classic twin: the committed
+  `edge_netcdf4_basic.nc` and `edge_netcdf4_classic_model.nc` are
+  compared with `edge_netcdf_classic.nc` for equality, down to the
+  statistics. Variables keep the order they were defined in (the group's
+  link creation order). Groups are flattened into one namespace by dimension
+  names (a disclosed simplification: two groups' variables over
+  equally-named, equal-length dimensions share a table). Compression
+  (zlib, shuffle), Fletcher-32, chunking, unlimited dimensions written in
+  pieces, variable-length strings and arrays, enums and compound types are
+  read; verified against xarray cell by cell.
+- **MATLAB v7.3 `.mat`.** An HDF5 file whose datasets carry
+  `MATLAB_class`. MATLAB stores column-major, so a dataset's dimensions are
+  the matrix's reversed: a 3x4 matrix is three rows of four columns, a 1x5
+  vector one row, a 3x1 vector one column (a vector too long to be a row of
+  columns, past 4,096, is a column of values). A `char` array is one string
+  per row (UTF-16 units), a complex array has `real` and `imag` columns,
+  and an empty array, a cell array and MATLAB's `#refs#` bookkeeping group
+  aren't data. Verified against hdf5storage's files read back through h5py.
+  Not read: v5 `.mat` (a different format), structs and sparse matrices,
+  function handles and objects.
+- **Verification.** `h5check.py` (a throwaway script, not committed)
+  compares every dataset of an HDF5 file with h5py's own read - values,
+  columns and row counts - through the SQL path: the earliest and latest
+  file formats (HDF5 2.0's latest format writes version 5 chunked
+  layouts), 30-dataset groups in both group styles,
+  nine chunk-index shapes, a 700,000-chunk extensible array that needs
+  secondary blocks and paged data blocks, fill values, enums, vlen strings,
+  compounds and references: all match. Three real bugs came out of it:
+  the extensible-array header has six length fields before the index block
+  address (not five); the v2 B-tree header read two bytes short; and the
+  page-init flags of a paged extensible-array data block are one bit per
+  page packed contiguously, MSB first, in a bitmap sized as if each data
+  block took whole bytes (a fixed array's flags are MSB-first too). A
+  fixed-array page flag read LSB-first skipped every page and returned
+  fill values, silently, which is why every layout is compared value by
+  value and not just by shape. Hostile input: every length, address and
+  count is checked against the file before anything is allocated, walks are
+  bounded (nesting, objects, chunks), and 5,600 mutated files on a debug
+  build (overflow checks on, nine rounds) found a shuffle filter whose
+  element size claimed four billion bytes (a hang) and a chunk offset that
+  overflowed (a panic); both are fixed. The last three rounds (2,800 files)
+  ended with no panic and two slow runs, which are not hangs: see the next
+  item. Chunks are cached by coordinate (at most
+  256 MB or 65,536 chunks); a first version's linear cache scan took
+  minutes on 700,000 tiny chunks and now takes 1.3 s.
+- **A declared shape is trusted.** A chunked dataset whose chunks were never
+  written (and a contiguous one with no data address) reads as its fill
+  value, as HDF5 defines it, so a file that declares a grid of billions of
+  cells costs time in proportion to that grid, with flat memory. A mutated
+  file can declare one; `--nrows` bounds it. Object-header checksums are not
+  verified (h5py does).
+- **Disclosed.** Not read, each a clear error: the SZIP, N-bit,
+  scale-offset, LZF, Blosc and Zstandard filters (named in the message),
+  virtual datasets, a shared-message table, huge objects and filtered blocks
+  in a fractal heap, and datatype classes outside the ones above (time, and
+  HDF5 2.0's complex class). A complex pair stored as a compound
+  (`real`/`imag`) is just a compound. HDF5's `h5py.Empty` null dataspace is a
+  zero-row table. A 2,500-column matrix costs about 400 KB of statistics
+  per column, as a 2,500-column CSV does.
 
 ## Known limitations / roadmap
 

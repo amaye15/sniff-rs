@@ -18301,7 +18301,13 @@ fn a_column_with_a_few_missing_values_is_nullable_not_not_null() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(any(feature = "rdata", feature = "html", feature = "markdown"))]
+#[cfg(any(
+    feature = "rdata",
+    feature = "html",
+    feature = "markdown",
+    feature = "netcdf",
+    feature = "hdf5"
+))]
 fn tables_of(doc: &serde_json::Value) -> Vec<String> {
     doc["tables"].as_object().unwrap().keys().cloned().collect()
 }
@@ -18725,6 +18731,47 @@ fn netcdf_applies_what_the_file_declares() {
 
 #[cfg(feature = "netcdf")]
 #[test]
+fn netcdf_decodes_fixed_length_calendars_and_leaves_julian_raw() {
+    // Dates checked against cftime: a noleap year has no Feb 29, a 360_day
+    // month is thirty days, an all_leap year always has one.
+    let doc = run_json("edge_netcdf_calendars.nc", &["--samples", "6"]);
+    assert_eq!(
+        sample_names(&doc, "noleap_t", "noleap_t"),
+        [
+            "2000-01-01 00:00:00",
+            "2000-03-01 00:00:00",
+            "2000-03-02 00:00:00",
+            "2001-01-01 00:00:00",
+            "2002-01-02 12:00:00",
+            "2004-01-01 00:00:00"
+        ]
+    );
+    assert_eq!(
+        sample_names(&doc, "360_day_t", "360_day_t"),
+        [
+            "2000-01-01 00:00:00",
+            "2000-01-30 00:00:00",
+            "2000-02-01 00:00:00",
+            "2000-12-30 00:00:00",
+            "2001-01-01 00:00:00",
+            "2002-01-01 06:00:00"
+        ]
+    );
+    assert_eq!(
+        sample_names(&doc, "all_leap_t", "all_leap_t")[2],
+        "2000-02-28 12:00:00"
+    );
+    // The Julian calendar isn't decoded: the numbers stay, and say why.
+    let julian = column(table(&doc, "julian_t"), "julian_t");
+    assert_eq!(julian["ideal_type"], "i64");
+    assert!(
+        julian["notes"].as_str().unwrap().contains("isn't decoded"),
+        "{julian}"
+    );
+}
+
+#[cfg(feature = "netcdf")]
+#[test]
 fn netcdf_record_variables_interleave_with_padding() {
     // Four record variables of different widths (a 3-byte slab is padded to
     // 4), and a file whose single record variable is packed without padding.
@@ -18780,4 +18827,268 @@ fn netcdf_nrows_bounds_the_rows_and_a_cut_file_is_refused() {
         "{stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// HDF5, NetCDF-4 and MATLAB v7.3
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "hdf5")]
+fn stat(doc: &serde_json::Value, tbl: &str, col: &str, key: &str) -> f64 {
+    column(table(doc, tbl), col)["numeric_stats"][key]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{tbl}.{col} has no {key}"))
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn hdf5_datasets_become_tables_named_for_their_paths() {
+    let doc = run_json("edge_hdf5_earliest.h5", &[]);
+    assert_eq!(doc["format"], "hdf5");
+    let names = tables_of(&doc);
+    // One object with two names (a hard link) is one table.
+    assert!(names.contains(&"floats".to_string()), "{names:?}");
+    assert!(!names.contains(&"hardlink".to_string()), "{names:?}");
+    assert!(names.contains(&"group1/deep/leaf".to_string()), "{names:?}");
+    assert_eq!(table(&doc, "floats")[0]["row_count"], 7);
+    // A matrix is columns; three or more axes are one row per cell.
+    assert_eq!(
+        col_names(&doc, "ints2d"),
+        ["col_0", "col_1", "col_2", "col_3"]
+    );
+    assert_eq!(table(&doc, "ints2d")[0]["row_count"], 5);
+    assert_eq!(
+        col_names(&doc, "cube"),
+        ["dim_0", "dim_1", "dim_2", "value"]
+    );
+    assert_eq!(table(&doc, "cube")[0]["row_count"], 24);
+    assert_eq!(stat(&doc, "cube", "value", "max"), 11.5);
+    // A compound is its fields, a nested one by dotted name; NaN is missing.
+    assert_eq!(col_names(&doc, "table"), ["id", "score", "name", "flag"]);
+    assert_eq!(column(table(&doc, "table"), "score")["missing_pct"], 25.0);
+    assert_eq!(col_names(&doc, "nested"), ["p.x", "p.y", "tag"]);
+    // An array inside a compound stays whole, as JSON text.
+    assert_eq!(sample_names(&doc, "arr_in_compound", "v"), ["[0,0,0]"]);
+    // Enums read as their names, strings as text; an empty string is missing.
+    assert_eq!(
+        sample_names(&doc, "colors", "value"),
+        ["red", "blue", "green"]
+    );
+    assert_eq!(
+        sample_names(&doc, "fixed_strings", "value"),
+        ["alpha", "be", "gamma"]
+    );
+    let vl = column(table(&doc, "vlen_strings"), "value");
+    assert_eq!(vl["missing_pct"], 20.0);
+    assert_eq!(sample_names(&doc, "vlen_strings", "value")[1], "héllo");
+    // An object reference reads as the path it points at.
+    assert_eq!(
+        sample_names(&doc, "refs", "value"),
+        ["floats", "group1/inner"]
+    );
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn hdf5_reads_every_storage_layout_and_filter() {
+    let doc = run_json("edge_hdf5_earliest.h5", &[]);
+    // chunked + shuffle + gzip, chunked + fletcher32, chunked, compact
+    assert_eq!(table(&doc, "chunked_gzip")[0]["row_count"], 300);
+    assert_eq!(
+        column(table(&doc, "chunked_gzip"), "col_6")["numeric_stats"]["count"],
+        300
+    );
+    assert_eq!(stat(&doc, "chunked_fletcher", "value", "max"), 999.0);
+    assert_eq!(stat(&doc, "chunked_plain", "col_9", "max"), 499.0);
+    assert_eq!(stat(&doc, "compact", "value", "max"), 4.0);
+    // A chunk that was never written reads as the dataset's fill value.
+    let sparse = sample_names(&doc, "sparse_fill", "col_0");
+    assert!(
+        sparse.contains(&"7".to_string()) && sparse.contains(&"-9".to_string()),
+        "{sparse:?}"
+    );
+    // A half-precision float, and a dataset with no elements.
+    assert_eq!(
+        sample_names(&doc, "halffloat", "value"),
+        ["1.5", "2.25", "-0.5"]
+    );
+    assert_eq!(table(&doc, "empty")[0]["row_count"], 0);
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn hdf5_newer_file_formats_read_the_same_as_the_oldest() {
+    // The same data written with the earliest and the latest file format
+    // (v2 object headers, new-style groups, v5 chunked layouts).
+    let old = run_json("edge_hdf5_earliest.h5", &[]);
+    let new = run_json("edge_hdf5_latest.h5", &[]);
+    for name in tables_of(&old) {
+        assert_eq!(table(&new, &name), table(&old, &name), "{name}");
+    }
+    assert!(tables_of(&new).len() > tables_of(&old).len());
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn hdf5_groups_with_many_links_list_every_dataset() {
+    // 30 datasets in one group: old-style B-tree and symbol-table nodes in
+    // one file, dense link storage (a fractal heap and a v2 B-tree) in the
+    // other.
+    for file in ["edge_hdf5_many_links.h5", "edge_hdf5_latest.h5"] {
+        let doc = run_json(file, &[]);
+        for i in 0..30 {
+            let t = format!("many/d{i:02}");
+            assert_eq!(table(&doc, &t)[0]["row_count"], 3, "{file} {t}");
+            assert_eq!(stat(&doc, &t, "value", "min"), f64::from(i), "{file} {t}");
+        }
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn hdf5_reads_every_kind_of_chunk_index() {
+    let doc = run_json("edge_hdf5_chunk_indexes.h5", &[]);
+    let rows = |t: &str| table(&doc, t)[0]["row_count"].as_u64().unwrap();
+    // single chunk
+    assert_eq!(rows("single"), 100);
+    assert_eq!(stat(&doc, "single", "value", "max"), 99.0);
+    // fixed array, paged (3,000 chunks)
+    assert_eq!(rows("fixed"), 6000);
+    assert_eq!(stat(&doc, "fixed", "value", "max"), 5999.0);
+    assert_eq!(stat(&doc, "fixed", "value", "mean"), 2999.5);
+    assert_eq!(stat(&doc, "fixed_gz", "col_49", "max"), 4999.0);
+    // extensible array: in the index block, and in secondary blocks
+    assert_eq!(stat(&doc, "extens", "col_39", "max"), 2399.0);
+    assert_eq!(rows("extens_blocks"), 2000);
+    assert!((stat(&doc, "extens_blocks", "value", "mean") - 49.5).abs() < 1e-9);
+    assert_eq!(stat(&doc, "extens_gz", "col_29", "max"), 2099.0);
+    // version 2 B-tree, implicit
+    assert_eq!(stat(&doc, "btree2", "col_49", "max"), 2999.0);
+    assert_eq!(stat(&doc, "implicit", "col_19", "max"), 399.0);
+    // only some chunks written: the rest is the fill value
+    assert_eq!(rows("sparse"), 20000);
+    assert_eq!(stat(&doc, "sparse", "value", "min"), -1.0);
+    assert_eq!(stat(&doc, "sparse", "value", "max"), 9.0);
+    assert!((stat(&doc, "sparse", "value", "mean") + 0.975).abs() < 1e-9);
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn hdf5_nrows_bounds_the_rows_and_damage_is_an_error() {
+    let doc = run_json("edge_hdf5_chunk_indexes.h5", &["--nrows", "5"]);
+    assert_eq!(table(&doc, "fixed")[0]["row_count"], 5);
+    let dir = std::env::temp_dir().join(format!("sniff-rs-h5-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Found by content, not by name.
+    let bytes = std::fs::read(fixture("edge_hdf5_earliest.h5")).unwrap();
+    let plain = dir.join("no_extension");
+    std::fs::write(&plain, &bytes).unwrap();
+    let out = std::process::Command::new(bin())
+        .args([plain.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(d["format"], "hdf5");
+    // Cut short, or only the signature: an error, never a panic.
+    for (name, data) in [
+        ("cut.h5", &bytes[..bytes.len() / 2]),
+        ("sig.h5", &bytes[..8]),
+    ] {
+        let p = dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        let stderr = run_fails(&[p.to_str().unwrap(), "-", "--output-format", "json"]);
+        assert!(!stderr.contains("panicked"), "{name}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(all(feature = "hdf5", feature = "netcdf"))]
+#[test]
+fn netcdf4_reads_like_the_classic_file_it_was_made_from() {
+    // The same variables as edge_netcdf_classic.nc, stored as HDF5 with
+    // dimension scales: the same dictionary, down to the unpacked values.
+    let classic = run_json("edge_netcdf_classic.nc", &[]);
+    for file in ["edge_netcdf4_basic.nc", "edge_netcdf4_classic_model.nc"] {
+        let doc = run_json(file, &[]);
+        assert_eq!(doc["tables"], classic["tables"], "{file}");
+    }
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn netcdf4_compressed_chunked_variables_and_cf_times() {
+    let doc = run_json("edge_netcdf4_zlib.nc", &[]);
+    let t = "edge_netcdf4_zlib";
+    assert_eq!(table(&doc, t)[0]["row_count"], 10000);
+    assert_eq!(
+        sample_names(&doc, t, "time")[..2],
+        ["2001-05-06 12:00:00", "2001-05-06 18:00:00"]
+    );
+    // zlib + shuffle + a _FillValue: 15 cells are missing
+    assert_eq!(column(table(&doc, t), "v")["missing_pct"], 0.2);
+    // zlib + fletcher32, chunked unlike the first
+    assert_eq!(stat(&doc, t, "w", "max"), 41999.0);
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn netcdf4_groups_strings_and_user_defined_types() {
+    let doc = run_json("edge_netcdf4_groups.nc", &[]);
+    assert_eq!(tables_of(&doc), ["m", "m_k", "n", "pts", "z"]);
+    // variables of a subgroup, by their own dimensions
+    assert_eq!(col_names(&doc, "m_k"), ["m", "k", "reading"]);
+    assert_eq!(table(&doc, "m_k")[0]["row_count"], 6);
+    assert_eq!(stat(&doc, "z", "c", "min"), -5.0);
+    // strings (an empty one is missing), an enum, a variable-length type
+    let n = table(&doc, "n");
+    assert_eq!(column(n, "names")["missing_pct"], 25.0);
+    assert_eq!(sample_names(&doc, "n", "lvl"), ["low", "mid", "high"]);
+    assert_eq!(sample_names(&doc, "n", "rag"), ["[0]", "[0,1]", "[0,1,2]"]);
+    // a compound type is its fields
+    assert_eq!(col_names(&doc, "pts"), ["lat", "lon", "tag"]);
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn matlab_v73_matrices_are_rows_and_char_arrays_are_strings() {
+    let doc = run_json("edge_matlab73_basic.mat", &[]);
+    let names = tables_of(&doc);
+    // a cell array and MATLAB's bookkeeping group aren't data
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("cellv") || n.contains("refs")),
+        "{names:?}"
+    );
+    // MATLAB stores column-major: a 3x4 matrix is three rows of four
+    assert_eq!(col_names(&doc, "A"), ["col_0", "col_1", "col_2", "col_3"]);
+    assert_eq!(table(&doc, "A")[0]["row_count"], 3);
+    assert_eq!(sample_names(&doc, "A", "col_1"), ["1.5", "7.5", "13.5"]);
+    // a 1x5 vector is one row; a 3x1 vector is one column
+    assert_eq!(table(&doc, "v")[0]["row_count"], 1);
+    assert_eq!(col_names(&doc, "v").len(), 5);
+    assert_eq!(table(&doc, "w")[0]["row_count"], 3);
+    assert_eq!(sample_names(&doc, "name", "value"), ["hello"]);
+    // complex numbers: a real and an imaginary column
+    assert_eq!(col_names(&doc, "c"), ["real", "imag"]);
+    assert_eq!(table(&doc, "c")[0]["row_count"], 2);
+    assert_eq!(
+        col_names(&doc, "cube"),
+        ["dim_0", "dim_1", "dim_2", "value"]
+    );
+
+    let more = run_json("edge_matlab73_more.mat", &[]);
+    // every row of a char matrix is a string; text is UTF-16
+    assert_eq!(sample_names(&more, "M", "value"), ["abc", "de", "fgh"]);
+    assert_eq!(sample_names(&more, "uni", "value"), ["héllo→"]);
+    // an empty array holds nothing; a long vector is a column, not 5,000
+    assert!(!tables_of(&more).contains(&"empty".to_string()));
+    assert_eq!(table(&more, "wide")[0]["row_count"], 5000);
+    assert_eq!(table(&more, "big")[0]["row_count"], 6000);
+    assert_eq!(sample_names(&more, "i64", "col_0"), ["1099511627776"]);
 }

@@ -7,6 +7,13 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- NetCDF (`--features netcdf` for classic CDF-1/2/5; `--features hdf5` for
+  NetCDF-4, and HDF5 and MATLAB v7.3 `.mat` files): variables become tidy
+  tables, one row per grid cell, with fill values missing, packed values
+  unpacked and CF times as dates (standard, `noleap`, `all_leap` and
+  `360_day` calendars); NetCDF-4 reads exactly like its classic twin. HDF5 is a hand-rolled reader (both object-header and group
+  styles, every chunk index, deflate/shuffle/Fletcher-32, compounds, enums,
+  variable-length data); checked against xarray, netCDF4 and h5py.
 - Weka ARFF (`.arff`): dense, sparse and weighted rows, quoted values and
   `?` missing, read through a streamed TSV conversion; checked against
   liac-arff and scipy. Relational attributes are refused.
