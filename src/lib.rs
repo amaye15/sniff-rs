@@ -117233,6 +117233,333 @@ mod knowledge_graph {
         )
     }
 
+    // ---- Exports ----
+
+    /// The formats `graph --export` writes besides `graph.json`.
+    pub(crate) const EXPORT_FORMATS: [&str; 4] = ["graphml", "dot", "cypher", "html"];
+
+    /// The file an export is written to.
+    pub(crate) fn export_file_name(kind: &str) -> String {
+        format!("graph.{}", if kind == "cypher" { "cypher" } else { kind })
+    }
+
+    fn xml_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// GraphML: nodes and links with their attributes. Undirected by
+    /// default; a foreign key's link says `directed="true"`.
+    fn render_graphml(kg: &KnowledgeGraph) -> String {
+        let degrees = kg.degrees();
+        let mut out = String::from(concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">\n",
+            "  <key id=\"label\" for=\"node\" attr.name=\"label\" attr.type=\"string\"/>\n",
+            "  <key id=\"type\" for=\"node\" attr.name=\"type\" attr.type=\"string\"/>\n",
+            "  <key id=\"file_type\" for=\"node\" attr.name=\"file_type\" attr.type=\"string\"/>\n",
+            "  <key id=\"source_file\" for=\"node\" attr.name=\"source_file\" attr.type=\"string\"/>\n",
+            "  <key id=\"community\" for=\"node\" attr.name=\"community\" attr.type=\"int\"/>\n",
+            "  <key id=\"degree\" for=\"node\" attr.name=\"degree\" attr.type=\"int\"/>\n",
+            "  <key id=\"relation\" for=\"edge\" attr.name=\"relation\" attr.type=\"string\"/>\n",
+            "  <key id=\"confidence\" for=\"edge\" attr.name=\"confidence\" attr.type=\"string\"/>\n",
+            "  <key id=\"score\" for=\"edge\" attr.name=\"score\" attr.type=\"double\"/>\n",
+            "  <key id=\"weight\" for=\"edge\" attr.name=\"weight\" attr.type=\"double\"/>\n",
+            "  <key id=\"evidence\" for=\"edge\" attr.name=\"evidence\" attr.type=\"string\"/>\n",
+            "  <graph id=\"G\" edgedefault=\"undirected\">\n"
+        ));
+        for (i, n) in kg.nodes.iter().enumerate() {
+            out.push_str(&format!("    <node id=\"n{i}\">\n"));
+            for (k, v) in [
+                ("label", n.label.as_str()),
+                ("type", n.node_type.as_str()),
+                ("file_type", n.file_type.as_str()),
+                ("source_file", n.source_file.as_deref().unwrap_or("")),
+            ] {
+                if !v.is_empty() {
+                    out.push_str(&format!("      <data key=\"{k}\">{}</data>\n", xml_escape(v)));
+                }
+            }
+            out.push_str(&format!(
+                "      <data key=\"community\">{}</data>\n      <data key=\"degree\">{}</data>\n    </node>\n",
+                n.community, degrees[i]
+            ));
+        }
+        for (i, e) in kg.edges.iter().enumerate() {
+            out.push_str(&format!(
+                "    <edge id=\"e{i}\" source=\"n{}\" target=\"n{}\"{}>\n      <data key=\"relation\">{}</data>\n      <data key=\"confidence\">{}</data>\n      <data key=\"score\">{}</data>\n      <data key=\"weight\">{}</data>\n      <data key=\"evidence\">{}</data>\n    </edge>\n",
+                e.source,
+                e.target,
+                if e.directed { " directed=\"true\"" } else { "" },
+                e.relation.as_str(),
+                e.confidence.as_str(),
+                round3(e.score),
+                round3(e.weight),
+                xml_escape(&e.evidence.join("; ")),
+            ));
+        }
+        out.push_str("  </graph>\n</graphml>\n");
+        out
+    }
+
+    fn dot_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' | '\r' => out.push(' '),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Graphviz DOT, an undirected graph; a foreign key's link carries
+    /// `dir=forward`. Nodes are colored by community, shaped by kind.
+    fn render_dot(kg: &KnowledgeGraph) -> String {
+        const PALETTE: [&str; 12] = [
+            "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1",
+            "#ff9da7", "#9c755f", "#bab0ac", "#86bcb6", "#d37295",
+        ];
+        let mut out = String::from("graph knowledge {\n  overlap=false;\n  node [style=filled, fontsize=10];\n");
+        for (i, n) in kg.nodes.iter().enumerate() {
+            let shape = match n.node_type {
+                NodeType::File => "box",
+                NodeType::Table => "box3d",
+                NodeType::Entity => "ellipse",
+                NodeType::Schema => "hexagon",
+                NodeType::Folder => "folder",
+            };
+            out.push_str(&format!(
+                "  n{i} [label=\"{}\", shape={shape}, fillcolor=\"{}\"];\n",
+                dot_escape(&n.label),
+                PALETTE[n.community % PALETTE.len()]
+            ));
+        }
+        for e in &kg.edges {
+            out.push_str(&format!(
+                "  n{} -- n{} [label=\"{}\", color=\"{}\"{}];\n",
+                e.source,
+                e.target,
+                e.relation.as_str(),
+                match e.confidence {
+                    Conf::Extracted => "#333333",
+                    Conf::Inferred => "#999999",
+                    Conf::Ambiguous => "#cc6666",
+                },
+                if e.directed { ", dir=forward" } else { "" }
+            ));
+        }
+        out.push_str("}\n");
+        out
+    }
+
+    fn cypher_string(s: &str) -> String {
+        let mut out = String::from("'");
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                '\n' | '\r' => out.push(' '),
+                c => out.push(c),
+            }
+        }
+        out.push('\'');
+        out
+    }
+
+    /// Cypher `CREATE` statements for Neo4j and compatible stores: a node
+    /// per node (labeled by its kind) and a relationship per link.
+    fn render_cypher(kg: &KnowledgeGraph) -> String {
+        let degrees = kg.degrees();
+        let mut out = String::from("// Generated by sniff-rs graph. Run with cypher-shell or paste into the Neo4j browser.\n");
+        for (i, n) in kg.nodes.iter().enumerate() {
+            let label = match n.node_type {
+                NodeType::File => "File",
+                NodeType::Table => "Table",
+                NodeType::Entity => "Entity",
+                NodeType::Schema => "Schema",
+                NodeType::Folder => "Folder",
+            };
+            out.push_str(&format!(
+                "CREATE (n{i}:{label} {{id: {}, label: {}, file_type: {}, community: {}, degree: {}}})\n",
+                cypher_string(&n.id),
+                cypher_string(&n.label),
+                cypher_string(&n.file_type),
+                n.community,
+                degrees[i]
+            ));
+        }
+        for e in &kg.edges {
+            out.push_str(&format!(
+                "CREATE (n{})-[:{} {{confidence: {}, score: {}, weight: {}, evidence: {}}}]->(n{})\n",
+                e.source,
+                e.relation.as_str().to_ascii_uppercase(),
+                cypher_string(e.confidence.as_str()),
+                round3(e.score),
+                round3(e.weight),
+                cypher_string(&e.evidence.join("; ")),
+                e.target
+            ));
+        }
+        out.push_str(";\n");
+        out
+    }
+
+    /// The most nodes the HTML viewer draws: a force layout in a browser
+    /// tab is readable up to about this many.
+    const HTML_MAX_NODES: usize = 1200;
+
+    /// One self-contained HTML page - the graph's data and a small force
+    /// layout, no network needed: drag to pan, wheel to zoom, hover a node
+    /// for its details, type to find one, click a relation to hide it.
+    fn render_html(kg: &KnowledgeGraph) -> String {
+        let degrees = kg.content_degrees();
+        let mut order: Vec<usize> = (0..kg.nodes.len()).collect();
+        order.sort_by(|a, b| degrees[*b].cmp(&degrees[*a]).then(a.cmp(b)));
+        order.truncate(HTML_MAX_NODES);
+        let mut keep: Vec<usize> = order;
+        keep.sort_unstable();
+        let index: HashMap<usize, usize> = keep.iter().enumerate().map(|(k, &i)| (i, k)).collect();
+        let nodes: Vec<JsonValue> = keep
+            .iter()
+            .map(|&i| {
+                let n = &kg.nodes[i];
+                JsonValue::Array(vec![
+                    JsonValue::from(n.label.clone()),
+                    JsonValue::from(n.node_type.as_str()),
+                    JsonValue::from(n.file_type.clone()),
+                    JsonValue::from(n.community),
+                    JsonValue::from(degrees[i]),
+                ])
+            })
+            .collect();
+        let links: Vec<JsonValue> = kg
+            .edges
+            .iter()
+            .filter(|e| index.contains_key(&e.source) && index.contains_key(&e.target))
+            .filter(|e| !(e.relation == Relation::Contains))
+            .map(|e| {
+                JsonValue::Array(vec![
+                    JsonValue::from(index[&e.source]),
+                    JsonValue::from(index[&e.target]),
+                    JsonValue::from(e.relation.as_str()),
+                    JsonValue::from(e.confidence.as_str()),
+                    JsonValue::from(round3(e.weight)),
+                ])
+            })
+            .collect();
+        let data = JsonValue::Array(vec![JsonValue::Array(nodes), JsonValue::Array(links)])
+            .to_string()
+            .replace("</", "<\\/");
+        let shown = if kg.nodes.len() > HTML_MAX_NODES {
+            format!(
+                "the {HTML_MAX_NODES} most connected of {} nodes",
+                kg.nodes.len()
+            )
+        } else {
+            format!("all {} nodes", kg.nodes.len())
+        };
+        HTML_VIEWER
+            .replace("__TITLE__", &xml_escape(&kg.input))
+            .replace("__SHOWN__", &shown)
+            .replace("__DATA__", &data)
+    }
+
+    /// The viewer page; `__TITLE__`, `__SHOWN__` and `__DATA__` are filled
+    /// in. Data is `[[label, type, file_type, community, degree]...]` and
+    /// `[[source, target, relation, confidence, weight]...]`.
+    const HTML_VIEWER: &str = r##"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Knowledge graph: __TITLE__</title>
+<style>
+:root{--bg:#fff;--fg:#1c1c1e;--muted:#6b6b70;--panel:#f4f4f6;--line:#d4d4d8}
+@media (prefers-color-scheme:dark){:root{--bg:#161618;--fg:#ececf0;--muted:#a0a0a8;--panel:#232326;--line:#3a3a40}}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+#bar{position:fixed;top:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line);z-index:2}
+#bar h1{font-size:15px;margin:0 8px 0 0}#bar .muted{color:var(--muted)}
+input[type=search]{padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);min-width:160px}
+.rel{padding:2px 8px;border:1px solid var(--line);border-radius:12px;cursor:pointer;user-select:none;font-size:12px}
+.rel.off{opacity:.35;text-decoration:line-through}
+canvas{position:fixed;top:0;left:0;width:100%;height:100%}
+#tip{position:fixed;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;max-width:360px;display:none;z-index:3}
+</style></head><body>
+<div id="bar"><h1>__TITLE__</h1><span class="muted">__SHOWN__</span><input id="q" type="search" placeholder="find a node"><span id="rels"></span></div>
+<canvas id="c"></canvas><div id="tip"></div>
+<script>
+const D=__DATA__, N=D[0].map((n,i)=>({i,label:n[0],type:n[1],ft:n[2],comm:n[3],deg:n[4],x:0,y:0,vx:0,vy:0})), E=D[1].map(l=>({s:N[l[0]],t:N[l[1]],rel:l[2],conf:l[3],w:l[4]}));
+const cv=document.getElementById('c'),cx=cv.getContext('2d'),tip=document.getElementById('tip'),q=document.getElementById('q');
+let W,H,sc=1,ox=0,oy=0,hover=null,hidden=new Set(),found=null,alpha=1;
+const pal=['#4e79a7','#f28e2b','#e15759','#76b7b2','#59a14f','#edc948','#b07aa1','#ff9da7','#9c755f','#bab0ac','#86bcb6','#d37295'];
+function size(){W=cv.width=innerWidth*devicePixelRatio;H=cv.height=innerHeight*devicePixelRatio;cv.style.width=innerWidth+'px';cv.style.height=innerHeight+'px'}
+addEventListener('resize',size);size();
+N.forEach((n,k)=>{const a=k*2.399963,r=14*Math.sqrt(k+1);n.x=r*Math.cos(a);n.y=r*Math.sin(a)});
+const rels=[...new Set(E.map(e=>e.rel))].sort();
+rels.forEach(r=>{const b=document.createElement('span');b.className='rel';b.textContent=r;b.onclick=()=>{hidden.has(r)?hidden.delete(r):hidden.add(r);b.classList.toggle('off');alpha=Math.max(alpha,.3)};document.getElementById('rels').appendChild(b)});
+function step(){
+  const cell=60,g=new Map();
+  for(const n of N){const k=Math.floor(n.x/cell)+','+Math.floor(n.y/cell);(g.get(k)||g.set(k,[]).get(k)).push(n)}
+  for(const n of N){const cx0=Math.floor(n.x/cell),cy0=Math.floor(n.y/cell);
+    for(let a=-1;a<=1;a++)for(let b=-1;b<=1;b++){const c=g.get((cx0+a)+','+(cy0+b));if(!c)continue;
+      for(const m of c){if(m===n)continue;let dx=n.x-m.x,dy=n.y-m.y,d=dx*dx+dy*dy+.01;if(d<cell*cell){const f=60/d;n.vx+=dx*f;n.vy+=dy*f}}}}
+  for(const e of E){if(hidden.has(e.rel))continue;const dx=e.t.x-e.s.x,dy=e.t.y-e.s.y,d=Math.sqrt(dx*dx+dy*dy)+.01,f=(d-40)*.02*Math.min(2,e.w+.2);
+    e.s.vx+=dx/d*f;e.s.vy+=dy/d*f;e.t.vx-=dx/d*f;e.t.vy-=dy/d*f}
+  for(const n of N){n.vx-=n.x*.002;n.vy-=n.y*.002;n.x+=n.vx*alpha;n.y+=n.vy*alpha;n.vx*=.6;n.vy*=.6}
+  alpha=Math.max(.02,alpha*.992)}
+function rad(n){return 3+Math.min(10,Math.sqrt(n.deg))}
+function draw(){
+  cx.setTransform(1,0,0,1,0,0);cx.clearRect(0,0,W,H);
+  cx.setTransform(sc*devicePixelRatio,0,0,sc*devicePixelRatio,W/2+ox*devicePixelRatio,H/2+oy*devicePixelRatio);
+  const dark=matchMedia('(prefers-color-scheme:dark)').matches;
+  for(const e of E){if(hidden.has(e.rel))continue;
+    cx.strokeStyle=e.conf==='EXTRACTED'?(dark?'#8a8a92':'#555'):(dark?'#55555b':'#bbb');cx.lineWidth=(e.conf==='EXTRACTED'?1.2:.7)/sc;
+    cx.beginPath();cx.moveTo(e.s.x,e.s.y);cx.lineTo(e.t.x,e.t.y);cx.stroke()}
+  for(const n of N){cx.fillStyle=pal[n.comm%pal.length];cx.globalAlpha=found&&!found.has(n)?.15:1;
+    cx.beginPath();if(n.type==='file'||n.type==='table'){cx.rect(n.x-rad(n),n.y-rad(n),2*rad(n),2*rad(n))}else if(n.type==='entity'){cx.arc(n.x,n.y,rad(n),0,7)}else{cx.moveTo(n.x,n.y-rad(n));cx.lineTo(n.x+rad(n),n.y);cx.lineTo(n.x,n.y+rad(n));cx.lineTo(n.x-rad(n),n.y)}
+    cx.fill();if(n===hover){cx.strokeStyle=dark?'#fff':'#000';cx.lineWidth=2/sc;cx.stroke()}}
+  cx.globalAlpha=1}
+function loop(){step();draw();requestAnimationFrame(loop)}
+loop();
+function at(ev){const x=(ev.clientX-innerWidth/2-ox)/sc,y=(ev.clientY-innerHeight/2-oy)/sc;let best=null,bd=1e9;
+  for(const n of N){const d=Math.hypot(n.x-x,n.y-y);if(d<rad(n)+4/sc&&d<bd){best=n;bd=d}}return best}
+let drag=null;
+cv.onmousedown=e=>{drag={x:e.clientX-ox,y:e.clientY-oy}};
+addEventListener('mouseup',()=>drag=null);
+addEventListener('mousemove',e=>{if(drag){ox=e.clientX-drag.x;oy=e.clientY-drag.y;return}
+  hover=at(e);if(hover){const nb=E.filter(x=>!hidden.has(x.rel)&&(x.s===hover||x.t===hover)).length;
+    tip.style.display='block';tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';
+    tip.textContent=hover.label+' · '+hover.ft+' · '+nb+' links · community '+hover.comm}else tip.style.display='none'});
+cv.onwheel=e=>{e.preventDefault();const k=Math.exp(-e.deltaY*.0015),px=e.clientX-innerWidth/2,py=e.clientY-innerHeight/2;
+  ox=px-(px-ox)*k;oy=py-(py-oy)*k;sc*=k};
+q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>n.label.toLowerCase().includes(t))):null};
+</script></body></html>
+"##;
+
+    /// One export, as text.
+    pub(crate) fn render_export(kg: &KnowledgeGraph, kind: &str) -> Result<String> {
+        match kind {
+            "graphml" => Ok(render_graphml(kg)),
+            "dot" => Ok(render_dot(kg)),
+            "cypher" => Ok(render_cypher(kg)),
+            "html" => Ok(render_html(kg)),
+            other => bail!(
+                "unknown export format {other:?} (expected {})",
+                EXPORT_FORMATS.join(", ")
+            ),
+        }
+    }
+
     /// Weighted PageRank over the content links (structural and derived
     /// links left out), scaled so the average node is 1.0: a node is
     /// important when important nodes link to it, not merely when it has
@@ -118439,12 +118766,17 @@ OPTIONS:
                                 name it)
         --cache-dir <DIR>       Keep the cache in DIR (also with OUTPUT_DIR
                                 "-", which has none by default)
+        --export <LIST>         Also write graph.graphml, graph.dot,
+                                graph.cypher (Neo4j) or graph.html (a
+                                self-contained viewer): any of graphml,
+                                dot, cypher, html, comma-separated
         --folders               Add a node per directory, so files kept in
                                 one folder pull together when nothing else
                                 links them
         --include <GLOB>        Only files matching GLOB (repeatable)
         --exclude <GLOB>        Skip files matching GLOB (repeatable)
-        --output-format <FMT>   With OUTPUT_DIR "-": json (default) or md
+        --output-format <FMT>   With OUTPUT_DIR "-": json (default), md,
+                                graphml, dot, cypher or html
     -h, --help                  Print this help
 "#;
 
@@ -118458,6 +118790,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut jobs: Option<usize> = None;
     let mut no_cache = false;
     let mut folders = false;
+    let mut exports: Vec<String> = Vec::new();
     let mut cache_dir_arg: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0;
@@ -118513,6 +118846,20 @@ fn run_graph(raw: &[String]) -> Result<()> {
                     }
                     folders = true;
                 }
+                "export" => {
+                    for kind in value(&mut i)?.split(',') {
+                        let kind = kind.trim().to_ascii_lowercase();
+                        if !knowledge_graph::EXPORT_FORMATS.contains(&kind.as_str()) {
+                            bail!(
+                                "unknown --export format {kind:?} (expected {})",
+                                knowledge_graph::EXPORT_FORMATS.join(", ")
+                            );
+                        }
+                        if !exports.contains(&kind) {
+                            exports.push(kind);
+                        }
+                    }
+                }
                 "cache-dir" => cache_dir_arg = Some(PathBuf::from(value(&mut i)?)),
                 "jobs" => {
                     let raw_value = value(&mut i)?;
@@ -118552,11 +118899,26 @@ fn run_graph(raw: &[String]) -> Result<()> {
             "--obsidian with OUTPUT_DIR \"-\" has nowhere to put the vault - pass --obsidian-dir <DIR>"
         );
     }
+    // With OUTPUT_DIR "-": json, md, or one of the export formats.
+    let mut stdout_export: Option<String> = None;
     let stdout_format = match output_format.as_deref().map(str::to_lowercase).as_deref() {
         None | Some("json") => GraphFormat::Json,
         Some("md") | Some("markdown") => GraphFormat::Md,
-        Some(other) => bail!("unrecognized --output-format '{other}' (expected json or md)"),
+        Some(other) if knowledge_graph::EXPORT_FORMATS.contains(&other) => {
+            stdout_export = Some(other.to_string());
+            GraphFormat::Json
+        }
+        Some(other) => bail!(
+            "unrecognized --output-format '{other}' (expected json, md, {})",
+            knowledge_graph::EXPORT_FORMATS.join(", ")
+        ),
     };
+    if to_stdout && !exports.is_empty() {
+        bail!(
+            "--export writes files next to graph.json; with OUTPUT_DIR \"-\" use --output-format {} instead",
+            knowledge_graph::EXPORT_FORMATS.join("|")
+        );
+    }
 
     if no_cache && cache_dir_arg.is_some() {
         bail!("--no-cache and --cache-dir contradict each other");
@@ -118614,9 +118976,12 @@ fn run_graph(raw: &[String]) -> Result<()> {
     );
 
     if to_stdout {
-        let rendered = match stdout_format {
-            GraphFormat::Json => json_support::to_pretty_string(&knowledge_graph::to_json(&kg)),
-            GraphFormat::Md => knowledge_graph::render_report(&kg),
+        let rendered = match (&stdout_export, stdout_format) {
+            (Some(kind), _) => knowledge_graph::render_export(&kg, kind)?,
+            (None, GraphFormat::Json) => {
+                json_support::to_pretty_string(&knowledge_graph::to_json(&kg))
+            }
+            (None, GraphFormat::Md) => knowledge_graph::render_report(&kg),
         };
         print!("{rendered}");
         if !rendered.ends_with('\n') {
@@ -118643,6 +119008,11 @@ fn run_graph(raw: &[String]) -> Result<()> {
     fs::write(&report_path, knowledge_graph::render_report(&kg))
         .with_context(|| format!("failed to write {report_path:?}"))?;
     let mut status = format!("{summary} -> {}", dir.display());
+    for kind in &exports {
+        let path = dir.join(knowledge_graph::export_file_name(kind));
+        fs::write(&path, knowledge_graph::render_export(&kg, kind)?)
+            .with_context(|| format!("failed to write {path:?}"))?;
+    }
     if obsidian || obsidian_dir.is_some() {
         let vault = obsidian_dir.unwrap_or_else(|| dir.join("obsidian"));
         let notes = knowledge_graph::write_obsidian(&kg, &vault)?;
