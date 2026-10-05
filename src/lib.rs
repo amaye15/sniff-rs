@@ -67688,6 +67688,11 @@ mod pdf_support {
         }
     }
 
+    /// A PDF's document-information strings (`author`, `title`, ...).
+    pub(crate) fn pdf_document_info(path: &Path) -> Result<Vec<(String, String)>> {
+        Ok(PdfReader::open(path)?.document_info(path))
+    }
+
     /// A PDF's interactive-form field values as one record, one column
     /// per fully qualified field name - the way a filled-in form is one
     /// row of data. `None` when the file has no form fields.
@@ -68598,6 +68603,36 @@ mod pdf_support {
             {
                 self.trailer.insert(b"ID".to_vec(), id.clone());
             }
+            // `/Info`: the document-information dictionary (author, ...).
+            if let Some(info) = trailer.get(b"Info".as_slice())
+                && !matches!(info, PdfObj::Null)
+                && !self.trailer.contains_key(b"Info".as_slice())
+            {
+                self.trailer.insert(b"Info".to_vec(), info.clone());
+            }
+        }
+
+        /// The document-information strings a person typed or a tool
+        /// stamped - author and the like - as (key, text), in a fixed
+        /// order. Best-effort: nothing resolvable is an empty list.
+        fn document_info(&mut self, path: &Path) -> Vec<(String, String)> {
+            let Some(info) = self.trailer.get(b"Info".as_slice()).cloned() else {
+                return Vec::new();
+            };
+            let Some(PdfObj::Dict(d)) = self.resolve_plain(&info, path).ok().flatten() else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            for key in ["Author", "Title", "Subject", "Creator", "Producer"] {
+                if let Some(PdfObj::Str(c)) = d.get(key.as_bytes()) {
+                    let text = decode_text_string(c);
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        out.push((key.to_ascii_lowercase(), text.to_string()));
+                    }
+                }
+            }
+            out
         }
 
         /// Reads one classic `xref` subsection run at the current position
@@ -77677,6 +77712,17 @@ fn pdf_form_profiles(path: &Path, n_samples: usize) -> Result<Option<Vec<ColumnP
 #[cfg(not(feature = "pdf"))]
 fn pdf_form_profiles(_path: &Path, _n_samples: usize) -> Result<Option<Vec<ColumnProfile>>> {
     Ok(None)
+}
+
+/// A PDF's document-information strings, for the knowledge graph.
+#[cfg(feature = "pdf")]
+fn pdf_document_info(path: &Path) -> Vec<(String, String)> {
+    pdf_support::pdf_document_info(path).unwrap_or_default()
+}
+
+#[cfg(not(feature = "pdf"))]
+fn pdf_document_info(_path: &Path) -> Vec<(String, String)> {
+    Vec::new()
 }
 
 #[cfg(not(feature = "pdf"))]
@@ -112147,6 +112193,10 @@ mod knowledge_graph {
         /// A 128-bit hash of the file's bytes, set for files that share a
         /// size with another file (the only ones that can be copies).
         pub(crate) hash: Option<(u64, u64)>,
+        /// What the file says about who made it: `author` and
+        /// `organization` entries from a PDF's information dictionary or
+        /// an office document's properties.
+        pub(crate) meta: Vec<(String, String)>,
     }
 
     pub(crate) struct CollectOptions {
@@ -112778,6 +112828,22 @@ mod knowledge_graph {
         if let Some(e) = &f.error {
             o.insert("error".to_string(), JsonValue::from(e.clone()));
         }
+        if !f.meta.is_empty() {
+            o.insert(
+                "meta".to_string(),
+                JsonValue::Array(
+                    f.meta
+                        .iter()
+                        .map(|(k, v)| {
+                            JsonValue::Array(vec![
+                                JsonValue::from(k.clone()),
+                                JsonValue::from(v.clone()),
+                            ])
+                        })
+                        .collect(),
+                ),
+            );
+        }
         if let Some((a, b)) = f.hash {
             o.insert("hash".to_string(), JsonValue::from(format!("{a:016x}{b:016x}")));
         }
@@ -112826,6 +112892,17 @@ mod knowledge_graph {
             error: v.get("error").and_then(|e| e.as_str()).map(str::to_string),
             fixed_schema: v.get("fixed_schema")?.as_bool()?,
             truncated_scan: v.get("truncated_scan")?.as_bool()?,
+            meta: match v.get("meta") {
+                None => Vec::new(),
+                Some(m) => m
+                    .as_array()?
+                    .iter()
+                    .map(|p| {
+                        let p = p.as_array()?;
+                        Some((p.first()?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string()))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            },
             hash: match v.get("hash") {
                 None => None,
                 Some(h) => {
@@ -112890,6 +112967,100 @@ mod knowledge_graph {
         opts: &CollectOptions,
         known: &Arc<KnownFiles>,
     ) -> KgFile {
+        let mut file = read_one_inner(root, path, opts, known);
+        if file.kind != FileKind::Failed {
+            file.meta = file_metadata(path, &extension_of(&file.name));
+        }
+        file
+    }
+
+    /// Who made the file, from its own properties: a PDF's information
+    /// dictionary, or the core properties of an office document.
+    fn file_metadata(path: &Path, ext: &str) -> Vec<(String, String)> {
+        let mut raw: Vec<(String, String)> = Vec::new();
+        if ext == "pdf" {
+            raw = pdf_document_info(path);
+        } else {
+            raw.extend(package_metadata(path, ext));
+        }
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (k, v) in raw {
+            let kind = match k.as_str() {
+                "author" | "last_modified_by" | "creator" => "author",
+                "company" | "organization" => "organization",
+                _ => continue,
+            };
+            // A PDF's "creator" is the authoring program, not a person.
+            if ext == "pdf" && k == "creator" {
+                continue;
+            }
+            if !out.iter().any(|(ok, ov)| ok == kind && ov == &v) {
+                out.push((kind.to_string(), v));
+            }
+        }
+        out
+    }
+
+    /// Author, last editor and company from the properties parts of an
+    /// OOXML (`docProps/core.xml`, `docProps/app.xml`) or ODF (`meta.xml`)
+    /// package.
+    #[cfg(any(feature = "xlsx", feature = "npy"))]
+    fn package_metadata(path: &Path, ext: &str) -> Vec<(String, String)> {
+        let ooxml = matches!(
+            ext,
+            "docx" | "docm" | "dotx" | "dotm" | "pptx" | "pptm" | "potx" | "potm" | "ppsx"
+                | "xlsx" | "xlsm" | "xltx" | "xltm"
+        );
+        let odf = matches!(ext, "ods" | "odt" | "odp");
+        if !ooxml && !odf {
+            return Vec::new();
+        }
+        let Ok(mut zip) = zip_support::ZipArchive::open(path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let tag = |xml: &str, name: &str, key: &str, out: &mut Vec<(String, String)>| {
+            let open = format!("<{name}>");
+            let close = format!("</{name}>");
+            if let Some(a) = xml.find(&open)
+                && let Some(b) = xml[a + open.len()..].find(&close)
+            {
+                let text = xml_unescape_text(&xml[a + open.len()..a + open.len() + b]);
+                let text = text.trim();
+                if !text.is_empty() {
+                    out.push((key.to_string(), text.to_string()));
+                }
+            }
+        };
+        if ooxml {
+            if let Ok(bytes) = zip.read("docProps/core.xml") {
+                let xml = String::from_utf8_lossy(&bytes);
+                tag(&xml, "dc:creator", "author", &mut out);
+                tag(&xml, "cp:lastModifiedBy", "last_modified_by", &mut out);
+            }
+            if let Ok(bytes) = zip.read("docProps/app.xml") {
+                let xml = String::from_utf8_lossy(&bytes);
+                tag(&xml, "Company", "company", &mut out);
+            }
+        } else if let Ok(bytes) = zip.read("meta.xml") {
+            let xml = String::from_utf8_lossy(&bytes);
+            tag(&xml, "dc:creator", "last_modified_by", &mut out);
+            tag(&xml, "meta:initial-creator", "author", &mut out);
+        }
+        out
+    }
+
+    #[cfg(not(any(feature = "xlsx", feature = "npy")))]
+    fn package_metadata(_path: &Path, _ext: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    fn read_one_inner(
+        root: &Path,
+        path: &Path,
+        opts: &CollectOptions,
+        known: &Arc<KnownFiles>,
+    ) -> KgFile {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -112915,6 +113086,7 @@ mod knowledge_graph {
             fixed_schema: false,
             truncated_scan: false,
             hash: None,
+            meta: Vec::new(),
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -113294,6 +113466,8 @@ mod knowledge_graph {
         Table,
         Entity,
         Schema,
+        /// A directory of the input (only with `--folders`).
+        Folder,
     }
 
     impl NodeType {
@@ -113303,6 +113477,7 @@ mod knowledge_graph {
                 NodeType::Table => "table",
                 NodeType::Entity => "entity",
                 NodeType::Schema => "schema",
+                NodeType::Folder => "folder",
             }
         }
 
@@ -113312,6 +113487,7 @@ mod knowledge_graph {
                 "table" => Some(NodeType::Table),
                 "entity" => Some(NodeType::Entity),
                 "schema" => Some(NodeType::Schema),
+                "folder" => Some(NodeType::Folder),
                 _ => None,
             }
         }
@@ -113332,10 +113508,14 @@ mod knowledge_graph {
         SharesKey,
         /// A file whose bytes are identical to another's.
         DuplicateOf,
+        /// A file whose own properties name a person or organization.
+        Metadata,
+        /// A file or folder sitting in a folder (only with `--folders`).
+        InFolder,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 10] = [
+        pub(crate) const ALL: [Relation; 12] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -113346,6 +113526,8 @@ mod knowledge_graph {
             Relation::SameName,
             Relation::SharesKey,
             Relation::DuplicateOf,
+            Relation::Metadata,
+            Relation::InFolder,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -113360,6 +113542,8 @@ mod knowledge_graph {
                 Relation::SameName => "same_name",
                 Relation::SharesKey => "shares_key",
                 Relation::DuplicateOf => "duplicate_of",
+                Relation::Metadata => "metadata",
+                Relation::InFolder => "in_folder",
             }
         }
 
@@ -113371,7 +113555,7 @@ mod knowledge_graph {
         /// to anything else. Degree rankings ("god nodes") and the
         /// isolated-file check leave it out.
         pub(crate) fn structural(self) -> bool {
-            matches!(self, Relation::Contains)
+            matches!(self, Relation::Contains | Relation::InFolder)
         }
 
         /// A link implied by two others (two tables referencing one
@@ -113640,6 +113824,21 @@ mod knowledge_graph {
     /// the same order always produce the same nodes, links, and
     /// communities.
     pub(crate) fn build(input: String, files: Vec<KgFile>) -> KnowledgeGraph {
+        build_with(input, files, &BuildOptions::default())
+    }
+
+    /// What a build adds beyond the content links.
+    #[derive(Default)]
+    pub(crate) struct BuildOptions {
+        /// Folder nodes, so files in one directory pull together.
+        pub(crate) folders: bool,
+    }
+
+    pub(crate) fn build_with(
+        input: String,
+        files: Vec<KgFile>,
+        opts: &BuildOptions,
+    ) -> KnowledgeGraph {
         let mut b = Builder {
             nodes: Vec::new(),
             edges: Vec::new(),
@@ -113733,6 +113932,10 @@ mod knowledge_graph {
         let unresolved = link_references(&mut b, &files, &contents, &file_node);
         link_same_names(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
+        link_metadata(&mut b, &files, &file_node);
+        if opts.folders {
+            link_folders(&mut b, &files, &file_node);
+        }
         let doc_terms = link_similar(&mut b, &files, &contents, &file_node);
         link_schemas_and_joins(&mut b, &files, &table_nodes);
 
@@ -114125,6 +114328,149 @@ mod knowledge_graph {
                         "byte-identical to {:?} ({size} bytes)",
                         files[anchor].rel
                     )],
+                );
+            }
+        }
+    }
+
+    /// Weight of a folder link in community detection: enough that files
+    /// in one directory pull together when nothing else links them, not
+    /// enough to override what the content says.
+    const FOLDER_WEIGHT: f64 = 0.3;
+
+    /// `in_folder`: a node per directory holding at least two files (in
+    /// itself or below), linked from the files and subfolders in it. Never
+    /// the input's own top directory, which would hold everything.
+    fn link_folders(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        let mut count: BTreeMap<String, usize> = BTreeMap::new();
+        for f in files {
+            let mut end = 0;
+            while let Some(i) = f.rel[end..].find('/') {
+                end += i;
+                *count.entry(f.rel[..end].to_string()).or_insert(0) += 1;
+                end += 1;
+            }
+        }
+        let mut node_of: HashMap<&str, usize> = HashMap::new();
+        for (dir, n) in &count {
+            if *n < 2 {
+                continue;
+            }
+            let label = format!("{}/", dir.rsplit('/').next().unwrap_or(dir));
+            let mut attrs = json_support::Map::new();
+            attrs.insert("files".to_string(), JsonValue::from(*n));
+            let node = b.add_node(
+                format!("folder:{dir}"),
+                label,
+                NodeType::Folder,
+                "folder".to_string(),
+                Some(dir.clone()),
+                attrs,
+            );
+            node_of.insert(dir.as_str(), node);
+        }
+        for (fi, f) in files.iter().enumerate() {
+            if let Some((dir, _)) = f.rel.rsplit_once('/')
+                && let Some(&node) = node_of.get(dir)
+            {
+                b.add_edge(
+                    file_node[fi],
+                    node,
+                    Relation::InFolder,
+                    Conf::Extracted,
+                    1.0,
+                    FOLDER_WEIGHT,
+                    vec![format!("in folder {dir:?}")],
+                );
+            }
+        }
+        for (&dir, &node) in &node_of {
+            if let Some((parent, _)) = dir.rsplit_once('/')
+                && let Some(&pnode) = node_of.get(parent)
+            {
+                b.add_edge(
+                    node,
+                    pnode,
+                    Relation::InFolder,
+                    Conf::Extracted,
+                    1.0,
+                    FOLDER_WEIGHT,
+                    vec![format!("folder {dir:?} is in {parent:?}")],
+                );
+            }
+        }
+    }
+
+    /// Names too generic to say who made a file.
+    const GENERIC_AUTHORS: [&str; 16] = [
+        "admin",
+        "administrator",
+        "user",
+        "owner",
+        "unknown",
+        "author",
+        "anonymous",
+        "guest",
+        "microsoft",
+        "microsoft office user",
+        "office user",
+        "none",
+        "null",
+        "n/a",
+        "pc",
+        "system",
+    ];
+
+    /// `metadata`: files whose own properties name the same person or
+    /// organization. Each becomes an entity node its files link to,
+    /// INFERRED (the same name is not proof of the same person). A name
+    /// shared by a large share of the input is a default or a tool, not a
+    /// link, and is left out.
+    fn link_metadata(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        let mut by: BTreeMap<(String, String), (String, Vec<usize>)> = BTreeMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            for (kind, value) in &f.meta {
+                let norm = value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                if norm.chars().count() < 3
+                    || GENERIC_AUTHORS.contains(&norm.as_str())
+                    || norm.chars().all(|c| c.is_ascii_digit() || c.is_ascii_punctuation())
+                {
+                    continue;
+                }
+                let slot = by
+                    .entry((kind.clone(), norm))
+                    .or_insert_with(|| (value.clone(), Vec::new()));
+                if !slot.1.contains(&fi) {
+                    slot.1.push(fi);
+                }
+            }
+        }
+        let too_common = (files.len() / 20).max(12);
+        for ((kind, norm), (display, members)) in by {
+            if members.len() < 2 || members.len() > too_common {
+                continue;
+            }
+            let mut attrs = json_support::Map::new();
+            attrs.insert("entity_kind".to_string(), JsonValue::from(kind.clone()));
+            attrs.insert("files".to_string(), JsonValue::from(members.len()));
+            let node = b.add_node(
+                format!("{kind}:{norm}"),
+                display,
+                NodeType::Entity,
+                kind.clone(),
+                None,
+                attrs,
+            );
+            let weight = 2.0 / (1.0 + members.len() as f64).ln();
+            for fi in members {
+                b.add_edge(
+                    file_node[fi],
+                    node,
+                    Relation::Metadata,
+                    Conf::Inferred,
+                    0.5,
+                    weight,
+                    vec![format!("the file's own properties name this {kind}")],
                 );
             }
         }
@@ -115677,6 +116023,7 @@ mod knowledge_graph {
                 NodeType::Table => "table",
                 NodeType::Entity => "entity",
                 NodeType::Schema => "schema",
+                NodeType::Folder => "folder",
             }
         }))
     }
@@ -115979,6 +116326,7 @@ mod knowledge_graph {
             NodeType::File | NodeType::Table => format!("`{}` ({})", md(&n.id), n.file_type),
             NodeType::Entity => format!("`{}` ({})", md(&n.label), n.file_type),
             NodeType::Schema => format!("`{}`", md(&n.label)),
+            NodeType::Folder => format!("`{}` (folder)", md(&n.label)),
         }
     }
 
@@ -116470,6 +116818,15 @@ mod knowledge_graph {
                     "schemas/{}",
                     sanitize_component(n.label.strip_prefix("schema: ").unwrap_or(&n.label))
                 ),
+                NodeType::Folder => {
+                    let parts: Vec<String> = n
+                        .id
+                        .trim_start_matches("folder:")
+                        .split('/')
+                        .map(sanitize_component)
+                        .collect();
+                    format!("folders/{}", parts.join("/"))
+                }
             };
             let mut path = base.clone();
             let mut k = 2;
@@ -116564,6 +116921,7 @@ mod knowledge_graph {
                     note.push_str(&format!("  - entity/{}\n", tag_part(&n.file_type)))
                 }
                 NodeType::Schema => note.push_str("  - schema\n"),
+                NodeType::Folder => note.push_str("  - folder\n"),
             }
             note.push_str(&format!("  - node/{}\n", n.node_type.as_str()));
             note.push_str(&format!("  - community/{}\n", n.community));
@@ -116597,6 +116955,11 @@ mod knowledge_graph {
                 NodeType::Schema => {
                     if let Some(t) = n.attrs.get("tables").and_then(JsonValue::as_u64) {
                         facts.push(format!("shared by {t} tables"));
+                    }
+                }
+                NodeType::Folder => {
+                    if let Some(t) = n.attrs.get("files").and_then(JsonValue::as_u64) {
+                        facts.push(format!("holds {t} files"));
                     }
                 }
             }
@@ -116868,6 +117231,113 @@ mod knowledge_graph {
                     .collect()
             )
         )
+    }
+
+    /// Weighted PageRank over the content links (structural and derived
+    /// links left out), scaled so the average node is 1.0: a node is
+    /// important when important nodes link to it, not merely when it has
+    /// many links - a document linked by several hubs outranks a file in
+    /// a long tail. Damping 0.85; a node with no links spreads its mass
+    /// evenly.
+    pub(crate) fn node_importance(kg: &KnowledgeGraph) -> Vec<f64> {
+        let n = kg.nodes.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut out_w = vec![0.0f64; n];
+        let mut arcs: Vec<(usize, usize, f64)> = Vec::new();
+        for e in &kg.edges {
+            if e.relation.structural() || e.relation.derived() || e.source == e.target {
+                continue;
+            }
+            arcs.push((e.source, e.target, e.weight));
+            arcs.push((e.target, e.source, e.weight));
+            out_w[e.source] += e.weight;
+            out_w[e.target] += e.weight;
+        }
+        let d = 0.85;
+        let mut rank = vec![1.0 / n as f64; n];
+        for _ in 0..100 {
+            let dangling: f64 = (0..n).filter(|&i| out_w[i] == 0.0).map(|i| rank[i]).sum();
+            let base = (1.0 - d) / n as f64 + d * dangling / n as f64;
+            let mut next = vec![base; n];
+            for &(a, b, w) in &arcs {
+                next[b] += d * rank[a] * w / out_w[a];
+            }
+            let delta: f64 = next.iter().zip(&rank).map(|(x, y)| (x - y).abs()).sum();
+            rank = next;
+            if delta < 1e-9 {
+                break;
+            }
+        }
+        let total: f64 = rank.iter().sum();
+        rank.iter().map(|r| r / total * n as f64).collect()
+    }
+
+    /// Nodes whose removal splits the content graph: every path between
+    /// some pair of other nodes runs through them (Tarjan's cut vertices,
+    /// iterative). Structural and derived links are left out.
+    pub(crate) fn cut_vertices(kg: &KnowledgeGraph) -> Vec<bool> {
+        let n = kg.nodes.len();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for e in &kg.edges {
+            if e.relation.structural() || e.relation.derived() || e.source == e.target {
+                continue;
+            }
+            adj[e.source].push(e.target);
+            adj[e.target].push(e.source);
+        }
+        for a in &mut adj {
+            a.sort_unstable();
+            a.dedup();
+        }
+        let mut disc = vec![0usize; n];
+        let mut low = vec![0usize; n];
+        let mut is_cut = vec![false; n];
+        let mut time = 0usize;
+        for root in 0..n {
+            if disc[root] != 0 || adj[root].is_empty() {
+                continue;
+            }
+            time += 1;
+            disc[root] = time;
+            low[root] = time;
+            let mut root_children = 0;
+            // (node, parent, next neighbor index)
+            let mut stack: Vec<(usize, usize, usize)> = vec![(root, usize::MAX, 0)];
+            while let Some(&mut (u, parent, ref mut next)) = stack.last_mut() {
+                if *next < adj[u].len() {
+                    let v = adj[u][*next];
+                    *next += 1;
+                    if v == parent {
+                        continue;
+                    }
+                    if disc[v] == 0 {
+                        time += 1;
+                        disc[v] = time;
+                        low[v] = time;
+                        if u == root {
+                            root_children += 1;
+                        }
+                        stack.push((v, u, 0));
+                    } else {
+                        low[u] = low[u].min(disc[v]);
+                    }
+                } else {
+                    stack.pop();
+                    if let Some(&(p, _, _)) = stack.last() {
+                        low[p] = low[p].min(low[u]);
+                        if p != root && low[u] >= disc[p] {
+                            is_cut[p] = true;
+                        }
+                    }
+                }
+            }
+            if root_children > 1 {
+                is_cut[root] = true;
+            }
+        }
+        is_cut
     }
 
     fn node_json(kg: &KnowledgeGraph, i: usize, degree: usize) -> JsonValue {
@@ -117223,6 +117693,8 @@ mod knowledge_graph {
         input: &Path,
     ) -> Result<String> {
         let degrees = kg.content_degrees();
+        let importance = node_importance(kg);
+        let cut = cut_vertices(kg);
         let mut order: Vec<usize> = (0..kg.nodes.len()).collect();
         order.sort_by(|a, b| {
             degrees[*b]
@@ -117241,7 +117713,17 @@ mod knowledge_graph {
                     JsonValue::Array(
                         order
                             .iter()
-                            .map(|i| node_json(kg, *i, degrees[*i]))
+                            .map(|i| {
+                                let mut node = node_json(kg, *i, degrees[*i]);
+                                if let JsonValue::Object(m) = &mut node {
+                                    m.insert(
+                                        "importance".to_string(),
+                                        JsonValue::from(round3(importance[*i])),
+                                    );
+                                    m.insert("cut_vertex".to_string(), JsonValue::from(cut[*i]));
+                                }
+                                node
+                            })
                             .collect(),
                     ),
                 );
@@ -117278,7 +117760,7 @@ mod knowledge_graph {
             }
             GraphFormat::Md => {
                 let mut out = String::from(
-                    "# Most connected nodes\n\nDegree counts distinct neighbors over every link but a file's own tables (joins, shared schemas, references, mentions, similarity, names).\n\n| Node | Type | Degree | Community |\n|---|---|---|---|\n",
+                    "# Most connected nodes\n\nDegree counts distinct neighbors over every link but a file's own tables (joins, shared schemas, references, mentions, similarity, names). Importance is weighted PageRank over the same links (1.00 is average): high for what important nodes link to, not just what has many links. Cut marks a node every path between some other pair runs through.\n\n| Node | Type | Degree | Importance | Cut | Community |\n|---|---|---|---|---|---|\n",
                 );
                 let data: Vec<usize> = order
                     .iter()
@@ -117288,16 +117770,18 @@ mod knowledge_graph {
                 for i in data.iter().take(MAX_TOC_ENTRIES) {
                     let n = &kg.nodes[*i];
                     out.push_str(&format!(
-                        "| `{}` | {} | {} | {} |\n",
+                        "| `{}` | {} | {} | {:.2} | {} | {} |\n",
                         md(&n.id),
                         n.file_type,
                         degrees[*i],
+                        importance[*i],
+                        if cut[*i] { "yes" } else { "" },
                         n.community
                     ));
                 }
                 if data.len() > MAX_TOC_ENTRIES {
                     out.push_str(&format!(
-                        "| …and {} more | | | |\n",
+                        "| …and {} more | | | | | |\n",
                         data.len() - MAX_TOC_ENTRIES
                     ));
                 }
@@ -117798,6 +118282,7 @@ mod knowledge_graph {
                 fixed_schema: false,
                 truncated_scan: false,
                 hash: None,
+                meta: Vec::new(),
             }
         }
 
@@ -117954,6 +118439,9 @@ OPTIONS:
                                 name it)
         --cache-dir <DIR>       Keep the cache in DIR (also with OUTPUT_DIR
                                 "-", which has none by default)
+        --folders               Add a node per directory, so files kept in
+                                one folder pull together when nothing else
+                                links them
         --include <GLOB>        Only files matching GLOB (repeatable)
         --exclude <GLOB>        Skip files matching GLOB (repeatable)
         --output-format <FMT>   With OUTPUT_DIR "-": json (default) or md
@@ -117969,6 +118457,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut output_format: Option<String> = None;
     let mut jobs: Option<usize> = None;
     let mut no_cache = false;
+    let mut folders = false;
     let mut cache_dir_arg: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0;
@@ -118017,6 +118506,12 @@ fn run_graph(raw: &[String]) -> Result<()> {
                         bail!("--no-cache takes no value");
                     }
                     no_cache = true;
+                }
+                "folders" => {
+                    if inline_value.is_some() {
+                        bail!("--folders takes no value");
+                    }
+                    folders = true;
                 }
                 "cache-dir" => cache_dir_arg = Some(PathBuf::from(value(&mut i)?)),
                 "jobs" => {
@@ -118102,7 +118597,11 @@ fn run_graph(raw: &[String]) -> Result<()> {
     if files.is_empty() {
         bail!("no files found under {input:?}");
     }
-    let kg = knowledge_graph::build(name, files);
+    let kg = knowledge_graph::build_with(
+        name,
+        files,
+        &knowledge_graph::BuildOptions { folders },
+    );
     let summary = format!(
         "{} files, {} nodes, {} links, {} communities",
         kg.nodes
