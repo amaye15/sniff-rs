@@ -109651,9 +109651,9 @@ fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
                         "extracted" => Some(knowledge_graph::Conf::Extracted),
                         "inferred" => Some(knowledge_graph::Conf::Inferred),
                         "any" | "ambiguous" => None,
-                        other => bail!(
-                            "--confidence must be extracted, inferred or any, got {other:?}"
-                        ),
+                        other => {
+                            bail!("--confidence must be extracted, inferred or any, got {other:?}")
+                        }
                     };
                 }
                 "min-score" => {
@@ -109683,12 +109683,10 @@ fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
                 }
                 "top" => {
                     let v = value(&mut i)?;
-                    top = Some(
-                        v.parse()
-                            .ok()
-                            .filter(|n: &usize| *n > 0)
-                            .ok_or_else(|| anyhow!("--top must be a positive integer, got {v:?}"))?,
-                    );
+                    top =
+                        Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| {
+                            anyhow!("--top must be a positive integer, got {v:?}")
+                        })?);
                 }
                 "sort" => {
                     let v = value(&mut i)?;
@@ -112572,14 +112570,20 @@ mod knowledge_graph {
                 break;
             }
             total += n as u64;
-            let mut chunks = buf[..n].chunks_exact(8);
-            for c in &mut chunks {
-                let w = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+            let whole = n - n % 8;
+            let mut at = 0;
+            while at < whole {
+                let mut word = [0u8; 8];
+                word.copy_from_slice(&buf[at..at + 8]);
+                let w = u64::from_le_bytes(word);
                 a = (a ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
                 b = (b.rotate_left(17) ^ w).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+                at += 8;
             }
-            for &x in chunks.remainder() {
-                a = (a ^ u64::from(x)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+            for &x in &buf[whole..n] {
+                a = (a ^ u64::from(x))
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .rotate_left(29);
                 b = (b.rotate_left(17) ^ u64::from(x)).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
             }
         }
@@ -112638,7 +112642,10 @@ mod knowledge_graph {
         key.insert("size".to_string(), JsonValue::from(size));
         key.insert("mtime_ns".to_string(), JsonValue::from(mtime));
         key.insert("samples".to_string(), JsonValue::from(opts.samples));
-        key.insert("names".to_string(), JsonValue::from(format!("{names:016x}")));
+        key.insert(
+            "names".to_string(),
+            JsonValue::from(format!("{names:016x}")),
+        );
         let key = JsonValue::Object(key);
         let entry_path = dir.join(cache_entry_name(&rel));
         let cached = fs::read_to_string(&entry_path)
@@ -112745,7 +112752,10 @@ mod knowledge_graph {
             "sketch".to_string(),
             JsonValue::Array(c.sketch.iter().map(|h| JsonValue::from(*h)).collect()),
         );
-        o.insert("sketch_values".to_string(), JsonValue::from(c.sketch_values));
+        o.insert(
+            "sketch_values".to_string(),
+            JsonValue::from(c.sketch_values),
+        );
         o.insert("text_chars".to_string(), JsonValue::from(c.text_chars));
         o.insert(
             "unmapped_chars".to_string(),
@@ -112997,7 +113007,10 @@ mod knowledge_graph {
             );
         }
         if let Some((a, b)) = f.hash {
-            o.insert("hash".to_string(), JsonValue::from(format!("{a:016x}{b:016x}")));
+            o.insert(
+                "hash".to_string(),
+                JsonValue::from(format!("{a:016x}{b:016x}")),
+            );
         }
         o.insert("fixed_schema".to_string(), JsonValue::from(f.fixed_schema));
         o.insert(
@@ -113051,7 +113064,10 @@ mod knowledge_graph {
                     .iter()
                     .map(|p| {
                         let p = p.as_array()?;
-                        Some((p.first()?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string()))
+                        Some((
+                            p.first()?.as_str()?.to_string(),
+                            p.get(1)?.as_str()?.to_string(),
+                        ))
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
@@ -113160,8 +113176,19 @@ mod knowledge_graph {
     fn package_metadata(path: &Path, ext: &str) -> Vec<(String, String)> {
         let ooxml = matches!(
             ext,
-            "docx" | "docm" | "dotx" | "dotm" | "pptx" | "pptm" | "potx" | "potm" | "ppsx"
-                | "xlsx" | "xlsm" | "xltx" | "xltm"
+            "docx"
+                | "docm"
+                | "dotx"
+                | "dotm"
+                | "pptx"
+                | "pptm"
+                | "potx"
+                | "potm"
+                | "ppsx"
+                | "xlsx"
+                | "xlsm"
+                | "xltx"
+                | "xltm"
         );
         let odf = matches!(ext, "ods" | "odt" | "odp");
         if !ooxml && !odf {
@@ -113980,10 +114007,20 @@ mod knowledge_graph {
     }
 
     /// What a build adds beyond the content links.
-    #[derive(Default)]
     pub(crate) struct BuildOptions {
         /// Folder nodes, so files in one directory pull together.
         pub(crate) folders: bool,
+        /// Community resolution (see `louvain`); 1.0 is standard.
+        pub(crate) resolution: f64,
+    }
+
+    impl Default for BuildOptions {
+        fn default() -> Self {
+            BuildOptions {
+                folders: false,
+                resolution: 1.0,
+            }
+        }
     }
 
     pub(crate) fn build_with(
@@ -114113,6 +114150,7 @@ mod knowledge_graph {
                 .iter()
                 .map(|e| (e.source, e.target, e.weight))
                 .collect::<Vec<_>>(),
+            opts.resolution,
         );
         let communities =
             communities_from(&mut b.nodes, &membership, &doc_terms, &file_node, &b.edges);
@@ -114582,10 +114620,16 @@ mod knowledge_graph {
         let mut by: BTreeMap<(String, String), (String, Vec<usize>)> = BTreeMap::new();
         for (fi, f) in files.iter().enumerate() {
             for (kind, value) in &f.meta {
-                let norm = value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                let norm = value
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
                 if norm.chars().count() < 3
                     || GENERIC_AUTHORS.contains(&norm.as_str())
-                    || norm.chars().all(|c| c.is_ascii_digit() || c.is_ascii_punctuation())
+                    || norm
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c.is_ascii_punctuation())
                 {
                     continue;
                 }
@@ -115018,12 +115062,17 @@ mod knowledge_graph {
             found.sort_by(|x, y| {
                 x.conf
                     .cmp(&y.conf)
-                    .then_with(|| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| {
+                        y.score
+                            .partial_cmp(&x.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| x.evidence.cmp(&y.evidence))
             });
             let confidence = found[0].conf;
             let score = found.iter().map(|f| f.score).fold(0.0, f64::max);
-            let mut evidence: Vec<String> = found.iter().take(5).map(|f| f.evidence.clone()).collect();
+            let mut evidence: Vec<String> =
+                found.iter().take(5).map(|f| f.evidence.clone()).collect();
             if found.len() > 5 {
                 evidence.push(format!("+{} more column pairs", found.len() - 5));
             }
@@ -115232,10 +115281,7 @@ mod knowledge_graph {
                     true
                 } else {
                     distinct >= 20.0
-                        && matches!(
-                            base,
-                            JoinBase::PlainString | JoinBase::OtherSemantic(_)
-                        )
+                        && matches!(base, JoinBase::PlainString | JoinBase::OtherSemantic(_))
                 };
                 if by_value {
                     for &h in &content.sketch {
@@ -115343,7 +115389,10 @@ mod knowledge_graph {
         // Columns by the table a foreign key of that name would point at.
         let mut by_fk: HashMap<(u8, &str), Vec<usize>> = HashMap::new();
         for (i, c) in list.iter().enumerate() {
-            by_canon.entry((c.class, c.canon.as_str())).or_default().push(i);
+            by_canon
+                .entry((c.class, c.canon.as_str()))
+                .or_default()
+                .push(i);
             for f in &c.fk_forms {
                 by_fk.entry((c.class, f.as_str())).or_default().push(i);
             }
@@ -115535,9 +115584,9 @@ mod knowledge_graph {
 
     /// When two tables both reference the same owner through the same key
     /// (`orders.customer_id` and `invoices.customer_id`, both into
-    /// `customers`), the direct link between them is real - the join works
-    /// - but it is derived from the two references, not a relationship of
-    /// its own. Counting it as one turns every star schema into a clique,
+    /// `customers`), the direct link between them is real, because the join
+    /// works. But it comes from the two references and is not a relationship
+    /// of its own. Counting it as one turns every star schema into a clique,
     /// so it is relabelled `shares_key` (kept, weighted low, left out of
     /// degree counts) and the hub keeps its spokes.
     fn relabel_shared_keys(
@@ -115682,7 +115731,10 @@ mod knowledge_graph {
                 return false;
             }
             return has_key_marker(&a.canon)
-                || idx.name_tables.get(&a.canon).is_some_and(|ts| ts.len() == 2)
+                || idx
+                    .name_tables
+                    .get(&a.canon)
+                    .is_some_and(|ts| ts.len() == 2)
                 || a.owner_forms.iter().any(|f| stems_a.contains(f))
                 || a.owner_forms.iter().any(|f| stems_b.contains(f));
         }
@@ -115799,16 +115851,15 @@ mod knowledge_graph {
             || ba.is_identifier_domain()
             || bb.is_identifier_domain();
         let pair = format!("{ta}.{} ↔ {tb}.{}", ca.name, cb.name);
-        let make = |conf: Conf, score: f64, evidence: String, referencing_a: Option<bool>| {
-            ColumnJoin {
+        let make =
+            |conf: Conf, score: f64, evidence: String, referencing_a: Option<bool>| ColumnJoin {
                 conf,
                 score,
                 evidence,
                 referencing_a,
                 canon_a: canon_a.clone(),
                 canon_b: canon_b.clone(),
-            }
-        };
+            };
         if let Some(rel) = related
             .then(|| join_candidate(ta, ca, tb, cb, false, idx))
             .flatten()
@@ -115925,7 +115976,10 @@ mod knowledge_graph {
     /// deterministic: nodes are visited in index order every pass, a node
     /// only moves for a strictly better gain, and ties go to the lowest
     /// community index. Returns each node's community.
-    pub(crate) fn louvain(n: usize, edges: &[(usize, usize, f64)]) -> Vec<usize> {
+    /// Louvain communities. `resolution` scales how much the null model
+    /// counts against joining: 1.0 is standard modularity, lower finds
+    /// fewer, larger communities, higher finds more, smaller ones.
+    pub(crate) fn louvain(n: usize, edges: &[(usize, usize, f64)], resolution: f64) -> Vec<usize> {
         struct G {
             n: usize,
             adj: Vec<Vec<(usize, f64)>>,
@@ -115951,7 +116005,7 @@ mod knowledge_graph {
                 self_w,
             }
         }
-        fn one_level(g: &G) -> (Vec<usize>, bool) {
+        fn one_level(g: &G, resolution: f64) -> (Vec<usize>, bool) {
             let k: Vec<f64> = (0..g.n)
                 .map(|i| g.adj[i].iter().map(|(_, w)| w).sum::<f64>() + 2.0 * g.self_w[i])
                 .collect();
@@ -115977,10 +116031,10 @@ mod knowledge_graph {
                     }
                     tot[ci] -= k[i];
                     let mut best = ci;
-                    let mut best_gain = neigh[ci] - tot[ci] * k[i] / m2;
+                    let mut best_gain = neigh[ci] - resolution * tot[ci] * k[i] / m2;
                     touched.sort_unstable();
                     for &c in &touched {
-                        let gain = neigh[c] - tot[c] * k[i] / m2;
+                        let gain = neigh[c] - resolution * tot[c] * k[i] / m2;
                         if gain > best_gain + 1e-12 {
                             best = c;
                             best_gain = gain;
@@ -116036,7 +116090,7 @@ mod knowledge_graph {
         let mut membership: Vec<usize> = (0..n).collect();
         let mut g = from_edges(n, edges);
         for _level in 0..32 {
-            let (comm, improved) = one_level(&g);
+            let (comm, improved) = one_level(&g, resolution);
             for m in membership.iter_mut() {
                 *m = comm[*m];
             }
@@ -116076,12 +116130,37 @@ mod knowledge_graph {
                 degree[e.target] += 1;
             }
         }
+        // How many communities each word turns up in: a word in most of
+        // them says nothing about any one.
+        let spread: HashMap<String, usize> = {
+            let mut m: HashMap<String, usize> = HashMap::new();
+            for members in &list {
+                let mut words: HashSet<&str> = HashSet::new();
+                for n in members {
+                    if let Some(terms) = terms_of_node.get(n) {
+                        words.extend(terms.iter().take(20).map(|(t, _)| t.as_str()));
+                    }
+                }
+                for w in words {
+                    *m.entry(w.to_string()).or_insert(0) += 1;
+                }
+            }
+            m
+        };
+        let n_communities = list.len();
         let mut out = Vec::with_capacity(list.len());
         for (id, members) in list.into_iter().enumerate() {
             for m in &members {
                 nodes[*m].community = id;
             }
-            let label = community_label(nodes, &members, &terms_of_node, &degree);
+            let label = community_label(
+                nodes,
+                &members,
+                &terms_of_node,
+                &degree,
+                &spread,
+                n_communities,
+            );
             out.push(Community { label, members });
         }
         out
@@ -116092,6 +116171,8 @@ mod knowledge_graph {
         members: &[usize],
         terms_of_node: &HashMap<usize, &Vec<(String, f64)>>,
         degree: &[usize],
+        spread: &HashMap<String, usize>,
+        n_communities: usize,
     ) -> String {
         let mut sum: HashMap<&str, (f64, usize)> = HashMap::new();
         let mut docs = 0;
@@ -116108,23 +116189,48 @@ mod knowledge_graph {
             }
         }
         let min_docs = if docs >= 2 { 2 } else { 1 };
+        // A word's weight here, discounted by how many communities share
+        // it: what sets this group apart, not what the whole input says.
         let mut ranked: Vec<(&str, f64)> = sum
             .into_iter()
             .filter(|(_, (_, c))| *c >= min_docs)
-            .map(|(t, (w, _))| (t, w))
+            .map(|(t, (w, _))| {
+                let in_communities = spread.get(t).copied().unwrap_or(1).max(1);
+                (
+                    t,
+                    w * (1.0 + n_communities as f64 / in_communities as f64).ln(),
+                )
+            })
             .collect();
         ranked.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(b.0))
         });
-        if !ranked.is_empty() {
-            return ranked
-                .iter()
-                .take(3)
-                .map(|(t, _)| *t)
-                .collect::<Vec<_>>()
-                .join(" · ");
+        // With folder nodes, the folder holding the most files names the
+        // group before its words do.
+        let folder = members
+            .iter()
+            .filter(|m| nodes[**m].node_type == NodeType::Folder)
+            .max_by(|a, b| {
+                let files = |i: &usize| {
+                    nodes[*i]
+                        .attrs
+                        .get("files")
+                        .and_then(JsonValue::as_u64)
+                        .unwrap_or(0)
+                };
+                files(a).cmp(&files(b)).then_with(|| b.cmp(a))
+            })
+            .map(|m| nodes[*m].source_file.clone().unwrap_or_default());
+        let words: Vec<&str> = ranked.iter().take(3).map(|(t, _)| *t).collect();
+        if let Some(folder) = folder.filter(|f| !f.is_empty()) {
+            let mut parts = vec![format!("{folder}/")];
+            parts.extend(words.iter().take(2).map(|w| w.to_string()));
+            return parts.join(" · ");
+        }
+        if !words.is_empty() {
+            return words.join(" · ");
         }
         let hub = members
             .iter()
@@ -116971,12 +117077,11 @@ mod knowledge_graph {
                     sanitize_component(n.label.strip_prefix("schema: ").unwrap_or(&n.label))
                 ),
                 NodeType::Folder => {
-                    let parts: Vec<String> = n
-                        .id
-                        .trim_start_matches("folder:")
-                        .split('/')
-                        .map(sanitize_component)
-                        .collect();
+                    let parts: Vec<String> =
+                        n.id.trim_start_matches("folder:")
+                            .split('/')
+                            .map(sanitize_component)
+                            .collect();
                     format!("folders/{}", parts.join("/"))
                 }
             };
@@ -117439,7 +117544,10 @@ mod knowledge_graph {
                 ("source_file", n.source_file.as_deref().unwrap_or("")),
             ] {
                 if !v.is_empty() {
-                    out.push_str(&format!("      <data key=\"{k}\">{}</data>\n", xml_escape(v)));
+                    out.push_str(&format!(
+                        "      <data key=\"{k}\">{}</data>\n",
+                        xml_escape(v)
+                    ));
                 }
             }
             out.push_str(&format!(
@@ -117481,10 +117589,12 @@ mod knowledge_graph {
     /// `dir=forward`. Nodes are colored by community, shaped by kind.
     fn render_dot(kg: &KnowledgeGraph) -> String {
         const PALETTE: [&str; 12] = [
-            "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1",
-            "#ff9da7", "#9c755f", "#bab0ac", "#86bcb6", "#d37295",
+            "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
+            "#9c755f", "#bab0ac", "#86bcb6", "#d37295",
         ];
-        let mut out = String::from("graph knowledge {\n  overlap=false;\n  node [style=filled, fontsize=10];\n");
+        let mut out = String::from(
+            "graph knowledge {\n  overlap=false;\n  node [style=filled, fontsize=10];\n",
+        );
         for (i, n) in kg.nodes.iter().enumerate() {
             let shape = match n.node_type {
                 NodeType::File => "box",
@@ -117535,7 +117645,9 @@ mod knowledge_graph {
     /// per node (labeled by its kind) and a relationship per link.
     fn render_cypher(kg: &KnowledgeGraph) -> String {
         let degrees = kg.degrees();
-        let mut out = String::from("// Generated by sniff-rs graph. Run with cypher-shell or paste into the Neo4j browser.\n");
+        let mut out = String::from(
+            "// Generated by sniff-rs graph. Run with cypher-shell or paste into the Neo4j browser.\n",
+        );
         for (i, n) in kg.nodes.iter().enumerate() {
             let label = match n.node_type {
                 NodeType::File => "File",
@@ -117826,10 +117938,18 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
     /// links whose confidence or score moved, files that changed group,
     /// and files that gained or lost every link.
     pub(crate) fn diff_graphs(old: &KnowledgeGraph, new: &KnowledgeGraph) -> GraphDiff {
-        let old_ids: HashMap<&str, usize> =
-            old.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
-        let new_ids: HashMap<&str, usize> =
-            new.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+        let old_ids: HashMap<&str, usize> = old
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
+            .collect();
+        let new_ids: HashMap<&str, usize> = new
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
+            .collect();
         let mut d = GraphDiff {
             nodes_added: new
                 .nodes
@@ -117903,7 +118023,9 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         for (i, n) in old.nodes.iter().enumerate() {
             let _ = i;
             if let Some(&j) = new_ids.get(n.id.as_str()) {
-                *overlap.entry((n.community, new.nodes[j].community)).or_insert(0) += 1;
+                *overlap
+                    .entry((n.community, new.nodes[j].community))
+                    .or_insert(0) += 1;
             }
         }
         let mut best: HashMap<usize, (usize, usize)> = HashMap::new();
@@ -117985,7 +118107,8 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         for (r, a, b) in &d.relation_counts {
             out.push_str(&format!("| {r} | {a} | {b} |\n"));
         }
-        let ids = |v: &[String]| -> Vec<String> { v.iter().map(|x| format!("`{}`", md(x))).collect() };
+        let ids =
+            |v: &[String]| -> Vec<String> { v.iter().map(|x| format!("`{}`", md(x))).collect() };
         diff_section(&mut out, "Nodes added", &ids(&d.nodes_added));
         diff_section(&mut out, "Nodes removed", &ids(&d.nodes_removed));
         let link = |l: &(String, String, String, String, String)| {
@@ -118013,7 +118136,16 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
             "Links changed",
             &d.links_changed
                 .iter()
-                .map(|l| format!("`{}` — {} — `{}`: {} → {}", md(&l.0), l.2, md(&l.1), l.3, l.4))
+                .map(|l| {
+                    format!(
+                        "`{}` — {} — `{}`: {} → {}",
+                        md(&l.0),
+                        l.2,
+                        md(&l.1),
+                        l.3,
+                        l.4
+                    )
+                })
                 .collect::<Vec<_>>(),
         );
         diff_section(
@@ -118024,13 +118156,22 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 .map(|m| format!("`{}`: {} → {}", md(&m.0), md(&m.1), md(&m.2)))
                 .collect::<Vec<_>>(),
         );
-        diff_section(&mut out, "Files that lost every link", &ids(&d.became_isolated));
-        diff_section(&mut out, "Files that gained a link", &ids(&d.no_longer_isolated));
+        diff_section(
+            &mut out,
+            "Files that lost every link",
+            &ids(&d.became_isolated),
+        );
+        diff_section(
+            &mut out,
+            "Files that gained a link",
+            &ids(&d.no_longer_isolated),
+        );
         out
     }
 
     pub(crate) fn render_graph_diff_json(old: &Path, new: &Path, d: &GraphDiff) -> String {
-        let strs = |v: &[String]| JsonValue::Array(v.iter().cloned().map(JsonValue::from).collect());
+        let strs =
+            |v: &[String]| JsonValue::Array(v.iter().cloned().map(JsonValue::from).collect());
         let links = |v: &[(String, String, String, String, String)], last: &str| {
             JsonValue::Array(
                 v.iter()
@@ -118047,13 +118188,22 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
             )
         };
         let mut doc = json_support::Map::new();
-        doc.insert("old".to_string(), JsonValue::from(old.display().to_string()));
-        doc.insert("new".to_string(), JsonValue::from(new.display().to_string()));
+        doc.insert(
+            "old".to_string(),
+            JsonValue::from(old.display().to_string()),
+        );
+        doc.insert(
+            "new".to_string(),
+            JsonValue::from(new.display().to_string()),
+        );
         doc.insert("identical".to_string(), JsonValue::from(d.is_empty()));
         doc.insert("nodes_added".to_string(), strs(&d.nodes_added));
         doc.insert("nodes_removed".to_string(), strs(&d.nodes_removed));
         doc.insert("links_added".to_string(), links(&d.links_added, "evidence"));
-        doc.insert("links_removed".to_string(), links(&d.links_removed, "evidence"));
+        doc.insert(
+            "links_removed".to_string(),
+            links(&d.links_removed, "evidence"),
+        );
         doc.insert(
             "links_changed".to_string(),
             JsonValue::Array(
@@ -118087,7 +118237,10 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
             ),
         );
         doc.insert("became_isolated".to_string(), strs(&d.became_isolated));
-        doc.insert("no_longer_isolated".to_string(), strs(&d.no_longer_isolated));
+        doc.insert(
+            "no_longer_isolated".to_string(),
+            strs(&d.no_longer_isolated),
+        );
         doc.insert(
             "relation_counts".to_string(),
             JsonValue::Array(
@@ -118486,11 +118639,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                         if at.is_empty() {
                             continue;
                         }
-                        out.push_str(&format!(
-                            "\n## {} hops away ({})\n\n",
-                            d,
-                            at.len()
-                        ));
+                        out.push_str(&format!("\n## {} hops away ({})\n\n", d, at.len()));
                         for (o, _, via) in at.iter().take(MAX_TOC_ENTRIES) {
                             out.push_str(&format!(
                                 "- {} (through `{}`)\n",
@@ -118674,7 +118823,10 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         match format {
             GraphFormat::Json => {
                 let mut doc = json_support::Map::new();
-                doc.insert("from".to_string(), JsonValue::from(kg.nodes[from].id.clone()));
+                doc.insert(
+                    "from".to_string(),
+                    JsonValue::from(kg.nodes[from].id.clone()),
+                );
                 doc.insert("to".to_string(), JsonValue::from(kg.nodes[to].id.clone()));
                 let mut all = Vec::new();
                 for r in routes {
@@ -118895,10 +119047,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     ));
                 }
                 if data.len() > cap {
-                    out.push_str(&format!(
-                        "| …and {} more | | | | | |\n",
-                        data.len() - cap
-                    ));
+                    out.push_str(&format!("| …and {} more | | | | | |\n", data.len() - cap));
                 }
                 let entities: Vec<usize> = order
                     .iter()
@@ -119095,7 +119244,14 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         fn describe(p: &PendingJoin) -> String {
             format!(
                 "{}->{} dir={} key={:?} shared={:?} {:?} {:?} {:.6} {:?}",
-                p.from, p.to, p.directed, p.key, p.shared_key, p.relation, p.confidence, p.score,
+                p.from,
+                p.to,
+                p.directed,
+                p.key,
+                p.shared_key,
+                p.relation,
+                p.confidence,
+                p.score,
                 p.evidence
             )
         }
@@ -119134,9 +119290,14 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     .collect();
                 let mut index_tables: BTreeMap<String, Vec<ColumnProfile>> = BTreeMap::new();
                 for (n, c) in &owned {
-                    index_tables
-                        .entry(n.clone())
-                        .or_insert_with(|| c.iter().map(|x| ColumnProfile { content: None, ..x.clone() }).collect());
+                    index_tables.entry(n.clone()).or_insert_with(|| {
+                        c.iter()
+                            .map(|x| ColumnProfile {
+                                content: None,
+                                ..x.clone()
+                            })
+                            .collect()
+                    });
                 }
                 let idx = LinkIndex::build(&index_tables);
                 let sigs: Vec<Vec<ColSig>> = tables
@@ -119180,7 +119341,10 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     "round {round}: tables {:?}\nmissing from the candidates: {missing:#?}\nextra: {extra:#?}",
                     owned
                         .iter()
-                        .map(|t| (&t.0, t.1.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()))
+                        .map(|t| (
+                            &t.0,
+                            t.1.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+                        ))
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(got, want);
@@ -119190,7 +119354,9 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         #[test]
         fn near_duplicate_groups_match_a_pairwise_scan() {
             let mut rng = Lcg(77);
-            let names = ["id", "name", "email", "amount", "date", "zip", "city", "code", "x", "y", "z", "w"];
+            let names = [
+                "id", "name", "email", "amount", "date", "zip", "city", "code", "x", "y", "z", "w",
+            ];
             for round in 0..300 {
                 let n = 2 + rng.below(40);
                 let sets: Vec<BTreeSet<String>> = (0..n)
@@ -119282,8 +119448,8 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 edges.push((a, b, 1.0));
             }
             edges.push((2, 3, 0.1));
-            let first = louvain(7, &edges);
-            assert_eq!(first, louvain(7, &edges));
+            let first = louvain(7, &edges, 1.0);
+            assert_eq!(first, louvain(7, &edges, 1.0));
             assert_eq!(first[0], first[1]);
             assert_eq!(first[1], first[2]);
             assert_eq!(first[3], first[4]);
@@ -119558,6 +119724,9 @@ OPTIONS:
                                 graph.cypher (Neo4j) or graph.html (a
                                 self-contained viewer): any of graphml,
                                 dot, cypher, html, comma-separated
+        --resolution <X>        How fine the communities are: 1.0 is
+                                standard, lower gives fewer larger groups,
+                                higher gives more smaller ones
         --folders               Add a node per directory, so files kept in
                                 one folder pull together when nothing else
                                 links them
@@ -119578,6 +119747,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut jobs: Option<usize> = None;
     let mut no_cache = false;
     let mut folders = false;
+    let mut resolution = 1.0f64;
     let mut exports: Vec<String> = Vec::new();
     let mut cache_dir_arg: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
@@ -119633,6 +119803,16 @@ fn run_graph(raw: &[String]) -> Result<()> {
                         bail!("--folders takes no value");
                     }
                     folders = true;
+                }
+                "resolution" => {
+                    let v = value(&mut i)?;
+                    resolution = v
+                        .parse()
+                        .ok()
+                        .filter(|x: &f64| x.is_finite() && *x > 0.0)
+                        .ok_or_else(|| {
+                            anyhow!("--resolution must be a positive number, got {v:?}")
+                        })?;
                 }
                 "export" => {
                     for kind in value(&mut i)?.split(',') {
@@ -119727,8 +119907,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let cache_dir = if no_cache {
         None
     } else {
-        cache_dir_arg
-            .or_else(|| dir.as_ref().map(|d| d.join(knowledge_graph::CACHE_DIR)))
+        cache_dir_arg.or_else(|| dir.as_ref().map(|d| d.join(knowledge_graph::CACHE_DIR)))
     };
     if let Some(c) = &cache_dir {
         fs::create_dir_all(c).with_context(|| format!("failed to create {c:?}"))?;
@@ -119750,7 +119929,10 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let kg = knowledge_graph::build_with(
         name,
         files,
-        &knowledge_graph::BuildOptions { folders },
+        &knowledge_graph::BuildOptions {
+            folders,
+            resolution,
+        },
     );
     let summary = format!(
         "{} files, {} nodes, {} links, {} communities",
