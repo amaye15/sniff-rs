@@ -109332,6 +109332,42 @@ fn run_diff(raw: &[String]) -> Result<()> {
     if args.format.is_some() && args.old_path != Path::new("-") && args.new_path != Path::new("-") {
         bail!("`diff --format` applies only to a \"-\" (stdin) input, and neither side is one");
     }
+    // Two knowledge graphs (`sniff-rs graph` output) compare as graphs.
+    if args.old_path.is_file()
+        && args.new_path.is_file()
+        && knowledge_graph::looks_like_graph_json(&args.old_path)
+        && knowledge_graph::looks_like_graph_json(&args.new_path)
+    {
+        if args.resolution_sql.is_some() || args.fail_on_breaking {
+            bail!(
+                "--resolution-sql and --fail-on-breaking apply to schema dictionaries, not to two graph.json files"
+            );
+        }
+        let old = knowledge_graph::from_json(&args.old_path)?;
+        let new = knowledge_graph::from_json(&args.new_path)?;
+        let d = knowledge_graph::diff_graphs(&old, &new);
+        let rendered = match output_format {
+            DiffOutputFormat::Markdown => {
+                knowledge_graph::render_graph_diff_md(&args.old_path, &args.new_path, &d)
+            }
+            DiffOutputFormat::Json => {
+                knowledge_graph::render_graph_diff_json(&args.old_path, &args.new_path, &d)
+            }
+        };
+        match args.output_path.as_deref() {
+            Some(p) if p != Path::new("-") => {
+                fs::write(p, &rendered).with_context(|| format!("failed to write {p:?}"))?;
+                eprintln!("graph drift -> {}", p.display());
+            }
+            _ => {
+                print!("{rendered}");
+                if !rendered.ends_with('\n') {
+                    println!();
+                }
+            }
+        }
+        return Ok(());
+    }
     let old_tables = load_diff_input(&args.old_path, &args.format)?;
     let new_tables = load_diff_input(&args.new_path, &args.format)?;
     let report = diff_dictionaries(&old_tables, &new_tables);
@@ -117558,6 +117594,345 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 EXPORT_FORMATS.join(", ")
             ),
         }
+    }
+
+    // ---- Graph drift ----
+
+    /// What changed between two builds of a graph.
+    pub(crate) struct GraphDiff {
+        pub(crate) nodes_added: Vec<String>,
+        pub(crate) nodes_removed: Vec<String>,
+        /// (source, target, relation, confidence, evidence)
+        pub(crate) links_added: Vec<(String, String, String, String, String)>,
+        pub(crate) links_removed: Vec<(String, String, String, String, String)>,
+        /// (source, target, relation, old, new) where a link's confidence
+        /// or score moved.
+        pub(crate) links_changed: Vec<(String, String, String, String, String)>,
+        /// (node, old community label, new community label) for files
+        /// whose group changed.
+        pub(crate) moved: Vec<(String, String, String)>,
+        pub(crate) became_isolated: Vec<String>,
+        pub(crate) no_longer_isolated: Vec<String>,
+        pub(crate) relation_counts: Vec<(String, usize, usize)>,
+        pub(crate) communities: (usize, usize),
+    }
+
+    impl GraphDiff {
+        pub(crate) fn is_empty(&self) -> bool {
+            self.nodes_added.is_empty()
+                && self.nodes_removed.is_empty()
+                && self.links_added.is_empty()
+                && self.links_removed.is_empty()
+                && self.links_changed.is_empty()
+                && self.moved.is_empty()
+        }
+    }
+
+    type LinkKey = (String, String, Relation);
+
+    fn link_map(kg: &KnowledgeGraph) -> BTreeMap<LinkKey, &KgEdge> {
+        let mut out = BTreeMap::new();
+        for e in &kg.edges {
+            let (a, b) = (&kg.nodes[e.source].id, &kg.nodes[e.target].id);
+            let key = if a <= b {
+                (a.clone(), b.clone(), e.relation)
+            } else {
+                (b.clone(), a.clone(), e.relation)
+            };
+            out.entry(key).or_insert(e);
+        }
+        out
+    }
+
+    /// Compares two knowledge graphs: nodes and links gained and lost,
+    /// links whose confidence or score moved, files that changed group,
+    /// and files that gained or lost every link.
+    pub(crate) fn diff_graphs(old: &KnowledgeGraph, new: &KnowledgeGraph) -> GraphDiff {
+        let old_ids: HashMap<&str, usize> =
+            old.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+        let new_ids: HashMap<&str, usize> =
+            new.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+        let mut d = GraphDiff {
+            nodes_added: new
+                .nodes
+                .iter()
+                .filter(|n| !old_ids.contains_key(n.id.as_str()))
+                .map(|n| n.id.clone())
+                .collect(),
+            nodes_removed: old
+                .nodes
+                .iter()
+                .filter(|n| !new_ids.contains_key(n.id.as_str()))
+                .map(|n| n.id.clone())
+                .collect(),
+            links_added: Vec::new(),
+            links_removed: Vec::new(),
+            links_changed: Vec::new(),
+            moved: Vec::new(),
+            became_isolated: Vec::new(),
+            no_longer_isolated: Vec::new(),
+            relation_counts: Vec::new(),
+            communities: (old.communities.len(), new.communities.len()),
+        };
+        let (lo, ln) = (link_map(old), link_map(new));
+        let brief = |e: &KgEdge| e.evidence.first().cloned().unwrap_or_default();
+        for (k, e) in &ln {
+            match lo.get(k) {
+                None => d.links_added.push((
+                    k.0.clone(),
+                    k.1.clone(),
+                    k.2.as_str().to_string(),
+                    e.confidence.as_str().to_string(),
+                    brief(e),
+                )),
+                Some(o) => {
+                    if o.confidence != e.confidence || (o.score - e.score).abs() >= 0.1 {
+                        d.links_changed.push((
+                            k.0.clone(),
+                            k.1.clone(),
+                            k.2.as_str().to_string(),
+                            format!("{} {:.2}", o.confidence.as_str(), o.score),
+                            format!("{} {:.2}", e.confidence.as_str(), e.score),
+                        ));
+                    }
+                }
+            }
+        }
+        for (k, e) in &lo {
+            if !ln.contains_key(k) {
+                d.links_removed.push((
+                    k.0.clone(),
+                    k.1.clone(),
+                    k.2.as_str().to_string(),
+                    e.confidence.as_str().to_string(),
+                    brief(e),
+                ));
+            }
+        }
+        for r in Relation::ALL {
+            let (a, b) = (
+                old.edges.iter().filter(|e| e.relation == r).count(),
+                new.edges.iter().filter(|e| e.relation == r).count(),
+            );
+            if a != 0 || b != 0 {
+                d.relation_counts.push((r.as_str().to_string(), a, b));
+            }
+        }
+        // A file's group: each old community is matched to the new one it
+        // overlaps most (by shared node ids); a file moved when its new
+        // community is not its old community's match.
+        let mut overlap: HashMap<(usize, usize), usize> = HashMap::new();
+        for (i, n) in old.nodes.iter().enumerate() {
+            let _ = i;
+            if let Some(&j) = new_ids.get(n.id.as_str()) {
+                *overlap.entry((n.community, new.nodes[j].community)).or_insert(0) += 1;
+            }
+        }
+        let mut best: HashMap<usize, (usize, usize)> = HashMap::new();
+        for (&(oc, nc), &count) in &overlap {
+            let slot = best.entry(oc).or_insert((nc, count));
+            if count > slot.1 || (count == slot.1 && nc < slot.0) {
+                *slot = (nc, count);
+            }
+        }
+        for n in &old.nodes {
+            if n.node_type != NodeType::File {
+                continue;
+            }
+            let Some(&j) = new_ids.get(n.id.as_str()) else {
+                continue;
+            };
+            let nn = &new.nodes[j];
+            if best.get(&n.community).map(|b| b.0) != Some(nn.community) {
+                d.moved.push((
+                    n.id.clone(),
+                    old.communities[n.community].label.clone(),
+                    new.communities[nn.community].label.clone(),
+                ));
+            }
+        }
+        let (dold, dnew) = (old.content_degrees(), new.content_degrees());
+        for n in &old.nodes {
+            if n.node_type != NodeType::File {
+                continue;
+            }
+            let Some(&j) = new_ids.get(n.id.as_str()) else {
+                continue;
+            };
+            let oi = old_ids[n.id.as_str()];
+            match (dold[oi] == 0, dnew[j] == 0) {
+                (false, true) => d.became_isolated.push(n.id.clone()),
+                (true, false) => d.no_longer_isolated.push(n.id.clone()),
+                _ => {}
+            }
+        }
+        d
+    }
+
+    fn diff_section(out: &mut String, title: &str, rows: &[String]) {
+        if rows.is_empty() {
+            return;
+        }
+        out.push_str(&format!("\n## {title} ({})\n\n", rows.len()));
+        for r in rows.iter().take(MAX_TOC_ENTRIES) {
+            out.push_str(&format!("- {r}\n"));
+        }
+        if rows.len() > MAX_TOC_ENTRIES {
+            out.push_str(&format!("- …and {} more\n", rows.len() - MAX_TOC_ENTRIES));
+        }
+    }
+
+    pub(crate) fn render_graph_diff_md(old: &Path, new: &Path, d: &GraphDiff) -> String {
+        let mut out = format!(
+            "# Knowledge graph drift\n\n`{}` → `{}`\n\n",
+            md(&old.display().to_string()),
+            md(&new.display().to_string())
+        );
+        if d.is_empty() {
+            out.push_str("No differences: the two graphs have the same nodes and links.\n");
+            return out;
+        }
+        out.push_str(&format!(
+            "{} node(s) added, {} removed · {} link(s) added, {} removed, {} changed · {} file(s) moved group · communities {} → {}\n",
+            d.nodes_added.len(),
+            d.nodes_removed.len(),
+            d.links_added.len(),
+            d.links_removed.len(),
+            d.links_changed.len(),
+            d.moved.len(),
+            d.communities.0,
+            d.communities.1
+        ));
+        out.push_str("\n| Relation | Old | New |\n|---|---|---|\n");
+        for (r, a, b) in &d.relation_counts {
+            out.push_str(&format!("| {r} | {a} | {b} |\n"));
+        }
+        let ids = |v: &[String]| -> Vec<String> { v.iter().map(|x| format!("`{}`", md(x))).collect() };
+        diff_section(&mut out, "Nodes added", &ids(&d.nodes_added));
+        diff_section(&mut out, "Nodes removed", &ids(&d.nodes_removed));
+        let link = |l: &(String, String, String, String, String)| {
+            format!(
+                "`{}` — {} — `{}` [{}] {}",
+                md(&l.0),
+                l.2,
+                md(&l.1),
+                l.3,
+                md(&l.4)
+            )
+        };
+        diff_section(
+            &mut out,
+            "Links added",
+            &d.links_added.iter().map(link).collect::<Vec<_>>(),
+        );
+        diff_section(
+            &mut out,
+            "Links removed",
+            &d.links_removed.iter().map(link).collect::<Vec<_>>(),
+        );
+        diff_section(
+            &mut out,
+            "Links changed",
+            &d.links_changed
+                .iter()
+                .map(|l| format!("`{}` — {} — `{}`: {} → {}", md(&l.0), l.2, md(&l.1), l.3, l.4))
+                .collect::<Vec<_>>(),
+        );
+        diff_section(
+            &mut out,
+            "Files that moved group",
+            &d.moved
+                .iter()
+                .map(|m| format!("`{}`: {} → {}", md(&m.0), md(&m.1), md(&m.2)))
+                .collect::<Vec<_>>(),
+        );
+        diff_section(&mut out, "Files that lost every link", &ids(&d.became_isolated));
+        diff_section(&mut out, "Files that gained a link", &ids(&d.no_longer_isolated));
+        out
+    }
+
+    pub(crate) fn render_graph_diff_json(old: &Path, new: &Path, d: &GraphDiff) -> String {
+        let strs = |v: &[String]| JsonValue::Array(v.iter().cloned().map(JsonValue::from).collect());
+        let links = |v: &[(String, String, String, String, String)], last: &str| {
+            JsonValue::Array(
+                v.iter()
+                    .map(|l| {
+                        let mut m = json_support::Map::new();
+                        m.insert("source".to_string(), JsonValue::from(l.0.clone()));
+                        m.insert("target".to_string(), JsonValue::from(l.1.clone()));
+                        m.insert("relation".to_string(), JsonValue::from(l.2.clone()));
+                        m.insert("confidence".to_string(), JsonValue::from(l.3.clone()));
+                        m.insert(last.to_string(), JsonValue::from(l.4.clone()));
+                        JsonValue::Object(m)
+                    })
+                    .collect(),
+            )
+        };
+        let mut doc = json_support::Map::new();
+        doc.insert("old".to_string(), JsonValue::from(old.display().to_string()));
+        doc.insert("new".to_string(), JsonValue::from(new.display().to_string()));
+        doc.insert("identical".to_string(), JsonValue::from(d.is_empty()));
+        doc.insert("nodes_added".to_string(), strs(&d.nodes_added));
+        doc.insert("nodes_removed".to_string(), strs(&d.nodes_removed));
+        doc.insert("links_added".to_string(), links(&d.links_added, "evidence"));
+        doc.insert("links_removed".to_string(), links(&d.links_removed, "evidence"));
+        doc.insert(
+            "links_changed".to_string(),
+            JsonValue::Array(
+                d.links_changed
+                    .iter()
+                    .map(|l| {
+                        let mut m = json_support::Map::new();
+                        m.insert("source".to_string(), JsonValue::from(l.0.clone()));
+                        m.insert("target".to_string(), JsonValue::from(l.1.clone()));
+                        m.insert("relation".to_string(), JsonValue::from(l.2.clone()));
+                        m.insert("old".to_string(), JsonValue::from(l.3.clone()));
+                        m.insert("new".to_string(), JsonValue::from(l.4.clone()));
+                        JsonValue::Object(m)
+                    })
+                    .collect(),
+            ),
+        );
+        doc.insert(
+            "moved".to_string(),
+            JsonValue::Array(
+                d.moved
+                    .iter()
+                    .map(|m| {
+                        let mut o = json_support::Map::new();
+                        o.insert("node".to_string(), JsonValue::from(m.0.clone()));
+                        o.insert("old_community".to_string(), JsonValue::from(m.1.clone()));
+                        o.insert("new_community".to_string(), JsonValue::from(m.2.clone()));
+                        JsonValue::Object(o)
+                    })
+                    .collect(),
+            ),
+        );
+        doc.insert("became_isolated".to_string(), strs(&d.became_isolated));
+        doc.insert("no_longer_isolated".to_string(), strs(&d.no_longer_isolated));
+        doc.insert(
+            "relation_counts".to_string(),
+            JsonValue::Array(
+                d.relation_counts
+                    .iter()
+                    .map(|(r, a, b)| {
+                        let mut m = json_support::Map::new();
+                        m.insert("relation".to_string(), JsonValue::from(r.clone()));
+                        m.insert("old".to_string(), JsonValue::from(*a));
+                        m.insert("new".to_string(), JsonValue::from(*b));
+                        JsonValue::Object(m)
+                    })
+                    .collect(),
+            ),
+        );
+        doc.insert(
+            "communities".to_string(),
+            JsonValue::Array(vec![
+                JsonValue::from(d.communities.0),
+                JsonValue::from(d.communities.1),
+            ]),
+        );
+        json_support::to_pretty_string(&JsonValue::Object(doc))
     }
 
     /// Weighted PageRank over the content links (structural and derived
