@@ -112121,6 +112121,12 @@ mod knowledge_graph {
         pub(crate) include: Vec<String>,
         pub(crate) exclude: Vec<String>,
         pub(crate) progress: bool,
+        /// Worker threads reading files; `None` is the machine's
+        /// available parallelism.
+        pub(crate) jobs: Option<usize>,
+        /// Where per-file results are cached between runs; `None` reads
+        /// every file every time.
+        pub(crate) cache_dir: Option<PathBuf>,
     }
 
     /// Formats whose columns are fixed by the format itself rather than
@@ -112201,22 +112207,31 @@ mod knowledge_graph {
                 .filter_map(|p| p.file_name().and_then(|n| n.to_str())),
         ));
         let mut out = Vec::with_capacity(paths.len());
-        for path in &paths {
-            let file = read_one(&root, path, opts, &known);
-            if opts.progress {
-                let status = match file.kind {
-                    FileKind::Data => format!("profiled ({})", file.file_type),
-                    FileKind::Text => format!("scanned as text ({})", file.file_type),
-                    FileKind::Binary => "no readable content (node only)".to_string(),
-                    FileKind::Failed => format!(
-                        "failed ({})",
-                        file.error.as_deref().unwrap_or("unknown error")
-                    ),
-                };
-                eprintln!("{}: {status}", path.display());
-            }
-            out.push(file);
-        }
+        // Files are read on a pool of worker threads and handed back in
+        // path order, so the progress lines and the graph itself are the
+        // same at any job count.
+        run_batch_jobs(
+            &paths,
+            opts.jobs,
+            true,
+            |path| (read_one(&root, path, opts, &known), false),
+            |i, file| {
+                if opts.progress {
+                    let status = match file.kind {
+                        FileKind::Data => format!("profiled ({})", file.file_type),
+                        FileKind::Text => format!("scanned as text ({})", file.file_type),
+                        FileKind::Binary => "no readable content (node only)".to_string(),
+                        FileKind::Failed => format!(
+                            "failed ({})",
+                            file.error.as_deref().unwrap_or("unknown error")
+                        ),
+                    };
+                    eprintln!("{}: {status}", paths[i].display());
+                }
+                out.push(file);
+                Ok(())
+            },
+        )?;
         let name = input
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -116170,6 +116185,8 @@ OPTIONS:
                                 OUTPUT_DIR/obsidian
         --obsidian-dir <DIR>    Write the vault to DIR (implies --obsidian)
         --samples <N>           Sample values per column (default: 3)
+        --jobs <N>              Worker threads reading files (default: all
+                                cores); the graph is the same at any count
         --include <GLOB>        Only files matching GLOB (repeatable)
         --exclude <GLOB>        Skip files matching GLOB (repeatable)
         --output-format <FMT>   With OUTPUT_DIR "-": json (default) or md
@@ -116183,6 +116200,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut include: Vec<String> = Vec::new();
     let mut exclude: Vec<String> = Vec::new();
     let mut output_format: Option<String> = None;
+    let mut jobs: Option<usize> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0;
     while i < raw.len() {
@@ -116225,6 +116243,18 @@ fn run_graph(raw: &[String]) -> Result<()> {
                             anyhow!("--samples must be a positive integer, got {raw_value:?}")
                         })?;
                 }
+                "jobs" => {
+                    let raw_value = value(&mut i)?;
+                    jobs = Some(
+                        raw_value
+                            .parse()
+                            .ok()
+                            .filter(|n: &usize| *n > 0)
+                            .ok_or_else(|| {
+                                anyhow!("--jobs must be a positive integer, got {raw_value:?}")
+                            })?,
+                    );
+                }
                 "include" => include.push(value(&mut i)?),
                 "exclude" => exclude.push(value(&mut i)?),
                 "output-format" => output_format = Some(value(&mut i)?),
@@ -116264,6 +116294,8 @@ fn run_graph(raw: &[String]) -> Result<()> {
             include,
             exclude,
             progress: true,
+            jobs,
+            cache_dir: None,
         },
     )?;
     if files.is_empty() {
@@ -116358,6 +116390,8 @@ fn load_knowledge_graph_input(
                 include: Vec::new(),
                 exclude: Vec::new(),
                 progress: false,
+                jobs: None,
+                cache_dir: None,
             },
         )?;
         if files.is_empty() {
