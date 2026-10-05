@@ -113237,10 +113237,13 @@ mod knowledge_graph {
         SharesIds,
         SimilarTo,
         SameName,
+        /// Two tables that both reference the same owner through the same
+        /// key: a real join, but derived from those two references.
+        SharesKey,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 8] = [
+        pub(crate) const ALL: [Relation; 9] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -113249,6 +113252,7 @@ mod knowledge_graph {
             Relation::SharesIds,
             Relation::SimilarTo,
             Relation::SameName,
+            Relation::SharesKey,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -113261,6 +113265,7 @@ mod knowledge_graph {
                 Relation::SharesIds => "shares_identifiers",
                 Relation::SimilarTo => "similar_to",
                 Relation::SameName => "same_name",
+                Relation::SharesKey => "shares_key",
             }
         }
 
@@ -113273,6 +113278,13 @@ mod knowledge_graph {
         /// isolated-file check leave it out.
         pub(crate) fn structural(self) -> bool {
             matches!(self, Relation::Contains)
+        }
+
+        /// A link implied by two others (two tables referencing one
+        /// owner): real, kept, and left out of degree counts so a hub
+        /// with forty spokes doesn't read as forty-one mutual hubs.
+        pub(crate) fn derived(self) -> bool {
+            matches!(self, Relation::SharesKey)
         }
     }
 
@@ -113323,6 +113335,10 @@ mod knowledge_graph {
         pub(crate) score: f64,
         pub(crate) weight: f64,
         pub(crate) evidence: Vec<String>,
+        /// The link points from `source` to `target` (a foreign key from
+        /// the referencing table to the referenced one); every other link
+        /// is undirected.
+        pub(crate) directed: bool,
     }
 
     pub(crate) struct Community {
@@ -113340,11 +113356,12 @@ mod knowledge_graph {
     }
 
     impl KnowledgeGraph {
-        /// Distinct neighbors of every node, over non-structural links.
+        /// Distinct neighbors of every node, over non-structural,
+        /// non-derived links.
         pub(crate) fn content_degrees(&self) -> Vec<usize> {
             let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); self.nodes.len()];
             for e in &self.edges {
-                if e.relation.structural() || e.source == e.target {
+                if e.relation.structural() || e.relation.derived() || e.source == e.target {
                     continue;
                 }
                 neighbors[e.source].insert(e.target);
@@ -113494,6 +113511,7 @@ mod knowledge_graph {
                 score,
                 weight,
                 evidence,
+                directed: false,
             });
         }
     }
@@ -114204,51 +114222,11 @@ mod knowledge_graph {
                     .collect()
             })
             .collect();
-        let mut parent: Vec<usize> = (0..tables.len()).collect();
-        fn find(parent: &mut [usize], x: usize) -> usize {
-            let mut r = x;
-            while parent[r] != r {
-                r = parent[r];
-            }
-            let mut c = x;
-            while parent[c] != r {
-                let next = parent[c];
-                parent[c] = r;
-                c = next;
-            }
-            r
-        }
-        let mut best_similarity = vec![0.0f64; tables.len()];
-        for i in 0..tables.len() {
-            for j in i + 1..tables.len() {
-                let (a, c) = (&canon[i], &canon[j]);
-                if a.is_empty() || c.is_empty() {
-                    continue;
-                }
-                let (small, large) = if a.len() <= c.len() {
-                    (a.len(), c.len())
-                } else {
-                    (c.len(), a.len())
-                };
-                if (small as f64) < DUPLICATE_SCHEMA_SIMILARITY * large as f64 {
-                    continue;
-                }
-                let shared = a.intersection(c).count() as f64;
-                let jac = shared / (a.len() as f64 + c.len() as f64 - shared);
-                if jac >= DUPLICATE_SCHEMA_SIMILARITY {
-                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                    if ri != rj {
-                        parent[ri.max(rj)] = ri.min(rj);
-                    }
-                    best_similarity[i] = best_similarity[i].max(jac);
-                    best_similarity[j] = best_similarity[j].max(jac);
-                }
-            }
-        }
+        let (parent_roots, best_similarity) =
+            near_duplicate_groups(&canon, DUPLICATE_SCHEMA_SIMILARITY);
         let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for i in 0..tables.len() {
-            let r = find(&mut parent, i);
-            groups.entry(r).or_default().push(i);
+        for (i, r) in parent_roots.iter().enumerate() {
+            groups.entry(*r).or_default().push(i);
         }
         let mut group_of = vec![usize::MAX; tables.len()];
         for (gid, members) in &groups {
@@ -114335,53 +114313,782 @@ mod knowledge_graph {
         }
         let link_index = LinkIndex::build(&index_tables);
         drop(index_tables);
-        for i in 0..tables.len() {
-            for j in i + 1..tables.len() {
-                if group_of[i] != usize::MAX && group_of[i] == group_of[j] {
-                    continue;
+        // Only the table pairs whose names or values point at a join are
+        // looked at (`join_candidates`), not every pair of tables.
+        let sigs: Vec<Vec<ColSig>> = tables
+            .iter()
+            .map(|(_, _, _, cols)| cols.iter().map(col_sig).collect())
+            .collect();
+        let stems: Vec<Vec<String>> = tables
+            .iter()
+            .map(|(_, _, name, _)| table_stem_forms(name))
+            .collect();
+        let plans = join_candidates(&tables, &group_of, &link_index);
+        let mut pending = evaluate_joins(&tables, &sigs, &stems, &link_index, plans);
+        add_declared_joins(&tables, &mut pending);
+        relabel_shared_keys(&mut pending, &tables);
+        for e in pending {
+            let weight = match (e.relation, e.confidence) {
+                (Relation::SharesKey, _) => SHARES_KEY_WEIGHT,
+                (_, Conf::Extracted) => 3.0,
+                _ => 1.0,
+            };
+            b.add_edge(
+                e.from,
+                e.to,
+                e.relation,
+                e.confidence,
+                (e.score * 1000.0).round() / 1000.0,
+                weight,
+                e.evidence,
+            );
+            if e.directed {
+                b.edges.last_mut().expect("just pushed").directed = true;
+            }
+        }
+    }
+
+    /// Looks at each planned table pair and returns the joins found, one
+    /// per pair, in pair order.
+    fn evaluate_joins(
+        tables: &[(usize, usize, &str, &Vec<ColumnProfile>)],
+        sigs: &[Vec<ColSig>],
+        stems: &[Vec<String>],
+        link_index: &LinkIndex,
+        plans: BTreeMap<(usize, usize), PairPlan>,
+    ) -> Vec<PendingJoin> {
+        let mut pending: Vec<PendingJoin> = Vec::new();
+        for ((i, j), plan) in plans {
+            let by_value = plan.by_value;
+            let (na, _, ta, cols_a) = tables[i];
+            let (nb, _, tb, cols_b) = tables[j];
+            if na == nb {
+                continue;
+            }
+            let mut found: Vec<ColumnJoin> = Vec::new();
+            let mut look = |xa: usize, xb: usize| {
+                if let Some(link) = column_join(
+                    (ta, &cols_a[xa], &sigs[i][xa], &stems[i]),
+                    (tb, &cols_b[xb], &sigs[j][xb], &stems[j]),
+                    by_value,
+                    link_index,
+                ) {
+                    found.push(link);
                 }
-                let (na, _, ta, cols_a) = tables[i];
-                let (nb, _, tb, cols_b) = tables[j];
-                if na == nb {
-                    continue;
+            };
+            if by_value {
+                for xa in 0..cols_a.len() {
+                    for xb in 0..cols_b.len() {
+                        look(xa, xb);
+                    }
                 }
-                let mut found: Vec<(Conf, f64, String)> = Vec::new();
-                for ca in cols_a {
-                    for cb in cols_b {
-                        if let Some(link) = column_join(ta, ca, tb, cb, &link_index) {
-                            found.push(link);
+            } else {
+                for &(xa, xb) in &plan.cols {
+                    look(xa as usize, xb as usize);
+                }
+            }
+            if found.is_empty() {
+                continue;
+            }
+            found.sort_by(|x, y| {
+                x.conf
+                    .cmp(&y.conf)
+                    .then_with(|| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| x.evidence.cmp(&y.evidence))
+            });
+            let confidence = found[0].conf;
+            let score = found.iter().map(|f| f.score).fold(0.0, f64::max);
+            let mut evidence: Vec<String> = found.iter().take(5).map(|f| f.evidence.clone()).collect();
+            if found.len() > 5 {
+                evidence.push(format!("+{} more column pairs", found.len() - 5));
+            }
+            // Which side references the other, when the best column pair
+            // says so; and the key the two share by name, if they do.
+            let (from, to, key) = match found[0].referencing_a {
+                Some(true) => (na, nb, found[0].canon_b.clone()),
+                Some(false) => (nb, na, found[0].canon_a.clone()),
+                None => (na, nb, String::new()),
+            };
+            let shared_key = if found[0].canon_a == found[0].canon_b {
+                found[0].canon_a.clone()
+            } else {
+                String::new()
+            };
+            pending.push(PendingJoin {
+                from,
+                to,
+                directed: found[0].referencing_a.is_some(),
+                key,
+                shared_key,
+                relation: Relation::Joins,
+                confidence,
+                score,
+                evidence,
+            });
+        }
+        pending
+    }
+
+    /// Weight of a `shares_key` link in community detection: a fraction of
+    /// a direct join's, since it is derived from two joins to one owner.
+    const SHARES_KEY_WEIGHT: f64 = 0.5;
+
+    /// A join between two tables, before it is added to the graph.
+    struct PendingJoin {
+        /// Node of the referencing side when `directed`, else either.
+        from: usize,
+        to: usize,
+        directed: bool,
+        /// The canonical name of the referenced column, when `directed`.
+        key: String,
+        /// The canonical column name both tables share, if the best pair
+        /// matched by name.
+        shared_key: String,
+        relation: Relation,
+        confidence: Conf,
+        score: f64,
+        evidence: Vec<String>,
+    }
+
+    /// Tables whose column-name sets are `threshold`-similar or more
+    /// (Jaccard), joined transitively: each table's group (the lowest table
+    /// index in it) and the best similarity it reached. Found with prefix
+    /// filtering - two sets can only be similar enough if their rarest
+    /// names overlap - so a folder of thousands of tables is not compared
+    /// pair by pair. Tables with identical name sets are one class, linked
+    /// at once.
+    fn near_duplicate_groups(sets: &[BTreeSet<String>], threshold: f64) -> (Vec<usize>, Vec<f64>) {
+        let n = sets.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            let mut r = x;
+            while parent[r] != r {
+                r = parent[r];
+            }
+            let mut c = x;
+            while parent[c] != r {
+                let next = parent[c];
+                parent[c] = r;
+                c = next;
+            }
+            r
+        }
+        let mut best = vec![0.0f64; n];
+        let mut classes: BTreeMap<&BTreeSet<String>, Vec<usize>> = BTreeMap::new();
+        for (i, s) in sets.iter().enumerate() {
+            if !s.is_empty() {
+                classes.entry(s).or_default().push(i);
+            }
+        }
+        let classes: Vec<(&BTreeSet<String>, Vec<usize>)> = classes.into_iter().collect();
+        for (_, members) in &classes {
+            if members.len() > 1 {
+                for &m in &members[1..] {
+                    let (a, b) = (find(&mut parent, members[0]), find(&mut parent, m));
+                    if a != b {
+                        parent[a.max(b)] = a.min(b);
+                    }
+                }
+                for &m in members {
+                    best[m] = 1.0;
+                }
+            }
+        }
+        let mut df: HashMap<&str, usize> = HashMap::new();
+        for (set, _) in &classes {
+            for t in set.iter() {
+                *df.entry(t.as_str()).or_insert(0) += 1;
+            }
+        }
+        // Each class's names, rarest first.
+        let ordered: Vec<Vec<&str>> = classes
+            .iter()
+            .map(|(set, _)| {
+                let mut v: Vec<&str> = set.iter().map(String::as_str).collect();
+                v.sort_by(|a, b| df[a].cmp(&df[b]).then_with(|| a.cmp(b)));
+                v
+            })
+            .collect();
+        let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (ci, toks) in ordered.iter().enumerate() {
+            let len = toks.len();
+            let prefix = len - ((threshold * len as f64).ceil() as usize).min(len) + 1;
+            let mut seen: HashSet<usize> = HashSet::new();
+            for t in &toks[..prefix.min(len)] {
+                if let Some(list) = index.get(t) {
+                    for &cj in list {
+                        if !seen.insert(cj) {
+                            continue;
+                        }
+                        let (a, c) = (classes[ci].0, classes[cj].0);
+                        let (small, large) = if a.len() <= c.len() {
+                            (a.len(), c.len())
+                        } else {
+                            (c.len(), a.len())
+                        };
+                        if (small as f64) < threshold * large as f64 {
+                            continue;
+                        }
+                        let shared = a.intersection(c).count() as f64;
+                        let jac = shared / (a.len() as f64 + c.len() as f64 - shared);
+                        if jac >= threshold {
+                            let (ri, rj) = (
+                                find(&mut parent, classes[ci].1[0]),
+                                find(&mut parent, classes[cj].1[0]),
+                            );
+                            if ri != rj {
+                                parent[ri.max(rj)] = ri.min(rj);
+                            }
+                            for &m in classes[ci].1.iter().chain(classes[cj].1.iter()) {
+                                best[m] = best[m].max(jac);
+                            }
                         }
                     }
                 }
-                if found.is_empty() {
-                    continue;
-                }
-                found.sort_by(|x, y| {
-                    x.0.cmp(&y.0)
-                        .then_with(|| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .then_with(|| x.2.cmp(&y.2))
-                });
-                let confidence = found[0].0;
-                let score = found.iter().map(|f| f.1).fold(0.0, f64::max);
-                let mut evidence: Vec<String> = found.iter().take(5).map(|f| f.2.clone()).collect();
-                if found.len() > 5 {
-                    evidence.push(format!("+{} more column pairs", found.len() - 5));
-                }
-                b.add_edge(
-                    na,
-                    nb,
-                    Relation::Joins,
-                    confidence,
-                    (score * 1000.0).round() / 1000.0,
-                    if confidence == Conf::Extracted {
-                        3.0
-                    } else {
-                        1.0
-                    },
-                    evidence,
-                );
+            }
+            for t in &toks[..prefix.min(len)] {
+                index.entry(t).or_default().push(ci);
             }
         }
+        let roots = (0..n).map(|i| find(&mut parent, i)).collect();
+        (roots, best)
+    }
+
+    /// What to look at between two tables: every column pair when a shared
+    /// value proposed them (a value can match under any names), else only
+    /// the column pairs whose names proposed them.
+    #[derive(Default)]
+    struct PairPlan {
+        by_value: bool,
+        cols: Vec<(u32, u32)>,
+    }
+
+    /// The most columns one value hash may appear in before it stops
+    /// proposing pairs: a value held by hundreds of columns (a small
+    /// counter, a common word) says nothing about any two of them.
+    const MAX_HASH_POSTING: usize = 64;
+
+    /// The most columns one name group may hold before it stops pairing
+    /// every member with every other: past that, a name is shared by so
+    /// many tables that it names a convention. The tables that own the
+    /// key still pair with all of them.
+    const MAX_NAME_GROUP: usize = 512;
+
+    /// Table pairs `(i, j)`, `i < j`, in different schema groups, that can
+    /// hold a join, in ascending order. Two ways make a column pair
+    /// worth looking at: a name signal (`name_candidates`), or - for
+    /// identifier columns and text columns with plenty of distinct values,
+    /// which join under any name - a shared value-sketch hash. Every
+    /// other pair is rejected by `column_join` anyway, so it is never
+    /// built.
+    fn join_candidates(
+        tables: &[(usize, usize, &str, &Vec<ColumnProfile>)],
+        group_of: &[usize],
+        idx: &LinkIndex,
+    ) -> BTreeMap<(usize, usize), PairPlan> {
+        let mut out: BTreeMap<(usize, usize), PairPlan> = BTreeMap::new();
+        let skip = |a: usize, b: usize| {
+            a == b || (group_of[a] != usize::MAX && group_of[a] == group_of[b])
+        };
+        // (hash, table)
+        let mut entries: Vec<(u64, u32)> = Vec::new();
+        let mut joinable: BTreeSet<(u32, u32)> = BTreeSet::new();
+        for (ti, (_, _, _, cols)) in tables.iter().enumerate() {
+            for (ci, c) in cols.iter().enumerate() {
+                if !joinable_column(c) {
+                    continue;
+                }
+                joinable.insert((ti as u32, ci as u32));
+                let (Some(content), Some(base)) = (&c.content, join_base(&c.ideal_type)) else {
+                    continue;
+                };
+                let distinct = content.distinct_estimate();
+                let by_value = if base.is_identifier_domain() {
+                    true
+                } else {
+                    distinct >= 20.0
+                        && matches!(
+                            base,
+                            JoinBase::PlainString | JoinBase::OtherSemantic(_)
+                        )
+                };
+                if by_value {
+                    for &h in &content.sketch {
+                        entries.push((h, ti as u32));
+                    }
+                }
+            }
+        }
+        entries.sort_unstable();
+        entries.dedup();
+        let mut i = 0;
+        while i < entries.len() {
+            let mut j = i;
+            while j < entries.len() && entries[j].0 == entries[i].0 {
+                j += 1;
+            }
+            let posting = &entries[i..j];
+            if (2..=MAX_HASH_POSTING).contains(&posting.len()) {
+                for x in 0..posting.len() {
+                    for y in x + 1..posting.len() {
+                        let (a, b) = (posting[x].1 as usize, posting[y].1 as usize);
+                        if !skip(a, b) {
+                            out.entry((a.min(b), a.max(b))).or_default().by_value = true;
+                        }
+                    }
+                }
+            }
+            i = j;
+        }
+        drop(entries);
+        for ((ta, ca), (tb, cb)) in name_candidates(tables, &joinable, idx) {
+            if skip(ta, tb) {
+                continue;
+            }
+            let (key, pair) = if ta < tb {
+                ((ta, tb), (ca, cb))
+            } else {
+                ((tb, ta), (cb, ca))
+            };
+            out.entry(key).or_default().cols.push(pair);
+        }
+        for plan in out.values_mut() {
+            plan.cols.sort_unstable();
+            plan.cols.dedup();
+        }
+        out
+    }
+
+    /// A column that can be one end of a measured join: a key-domain value
+    /// type that isn't a flag or a small category.
+    fn joinable_column(c: &ColumnProfile) -> bool {
+        if matches!(c.ideal_type.as_str(), "enum / category" | "bool") {
+            return false;
+        }
+        join_base(&c.ideal_type).is_some_and(|b| b.is_key_domain())
+    }
+
+    /// Table pairs among `cols` (table, column) whose names could make
+    /// them a join: the same name, a bare key and the name of a foreign
+    /// key to that table, a role-prefixed copy of another table's key, or
+    /// the same noun. The name signals `join_candidate` weighs, applied to
+    /// every joinable column - only columns of a compatible kind (numbers
+    /// with numbers, text and identifiers with each other) are paired.
+    fn name_candidates(
+        tables: &[(usize, usize, &str, &Vec<ColumnProfile>)],
+        cols: &BTreeSet<(u32, u32)>,
+        idx: &LinkIndex,
+    ) -> Vec<((usize, u32), (usize, u32))> {
+        if cols.is_empty() {
+            return Vec::new();
+        }
+        struct Col {
+            table: usize,
+            col: u32,
+            /// 0: integers, 1: text and identifiers.
+            class: u8,
+            canon: String,
+            nouns: Vec<String>,
+            fk_forms: Vec<String>,
+        }
+        let list: Vec<Col> = cols
+            .iter()
+            .filter_map(|&(t, c)| {
+                let col = &tables[t as usize].3[c as usize];
+                let canon = canon_name(&col.name);
+                if canon.is_empty() {
+                    return None;
+                }
+                let class = u8::from(join_base(&col.ideal_type)? != JoinBase::Int);
+                let sig = col_sig(col);
+                Some(Col {
+                    table: t as usize,
+                    col: c,
+                    class,
+                    nouns: sig.nouns,
+                    fk_forms: sig.fk_forms,
+                    canon,
+                })
+            })
+            .collect();
+        // Columns by (class, canonical name), and by (class, noun) with the
+        // names under each noun.
+        let mut by_canon: HashMap<(u8, &str), Vec<usize>> = HashMap::new();
+        let mut by_noun: HashMap<(u8, &str), BTreeMap<&str, Vec<usize>>> = HashMap::new();
+        // Columns by the table a foreign key of that name would point at.
+        let mut by_fk: HashMap<(u8, &str), Vec<usize>> = HashMap::new();
+        for (i, c) in list.iter().enumerate() {
+            by_canon.entry((c.class, c.canon.as_str())).or_default().push(i);
+            for f in &c.fk_forms {
+                by_fk.entry((c.class, f.as_str())).or_default().push(i);
+            }
+            for n in &c.nouns {
+                by_noun
+                    .entry((c.class, n.as_str()))
+                    .or_default()
+                    .entry(c.canon.as_str())
+                    .or_default()
+                    .push(i);
+            }
+        }
+        let mut out: Vec<((usize, u32), (usize, u32))> = Vec::new();
+        let at = |i: usize| (list[i].table, list[i].col);
+        // The same name, under the rules `join_candidate` applies: a
+        // surrogate key's name is every table's own, so it only pairs
+        // through identical values (never by name); a key-marked name pairs
+        // every table that holds it (past `MAX_NAME_GROUP`, only the
+        // tables it belongs to pair with the rest); any other name pairs
+        // only with the table that owns it - one named for it, or the one
+        // table that leads with it when it is a name of just two tables.
+        for (&(_, name), group) in &by_canon {
+            if is_surrogate_key_name(name) {
+                continue;
+            }
+            let marked = has_key_marker(name);
+            if marked && group.len() <= MAX_NAME_GROUP {
+                for x in 0..group.len() {
+                    for y in x + 1..group.len() {
+                        out.push((at(group[x]), at(group[y])));
+                    }
+                }
+                continue;
+            }
+            let lead_owner: Option<&str> =
+                if idx.name_tables.get(name).is_some_and(|ts| ts.len() == 2) || marked {
+                    match idx.lead_tables.get(name).map(Vec::as_slice) {
+                        Some([t]) if !idx.owned_names.contains(name) => Some(t.as_str()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            for &o in group.iter().filter(|&&g| {
+                let t = list[g].table;
+                owns_key(tables[t].2, name) || Some(tables[t].2) == lead_owner
+            }) {
+                for &g in group {
+                    out.push((at(o), at(g)));
+                }
+            }
+        }
+        // The same noun under different names (`customer`, `customer_id`).
+        for names in by_noun.values() {
+            if names.len() < 2 {
+                continue;
+            }
+            let groups: Vec<&Vec<usize>> = names.values().collect();
+            let total: usize = groups.iter().map(|g| g.len()).sum();
+            if total > MAX_NAME_GROUP {
+                continue;
+            }
+            for x in 0..groups.len() {
+                for y in x + 1..groups.len() {
+                    for &a in groups[x] {
+                        for &b in groups[y] {
+                            out.push((at(a), at(b)));
+                        }
+                    }
+                }
+            }
+        }
+        // A bare key against the foreign keys named for its table.
+        for c in &list {
+            if !matches!(c.canon.as_str(), "id" | "uuid" | "guid" | "pk" | "key") {
+                continue;
+            }
+            for form in table_stem_forms(tables[c.table].2) {
+                if let Some(group) = by_fk.get(&(c.class, form.as_str())) {
+                    if group.len() > MAX_NAME_GROUP {
+                        continue;
+                    }
+                    for &g in group {
+                        out.push(((c.table, c.col), at(g)));
+                    }
+                }
+            }
+        }
+        // A role-prefixed key: `manager_staff_id` ends with `staff_id`.
+        for c in &list {
+            let mut rest = c.canon.as_str();
+            while let Some((_, tail)) = rest.split_once('_') {
+                rest = tail;
+                if !rest.contains('_') {
+                    break;
+                }
+                if let Some(group) = by_canon.get(&(c.class, rest))
+                    && group.len() <= MAX_NAME_GROUP
+                {
+                    for &g in group {
+                        out.push(((c.table, c.col), at(g)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Adds every declared foreign key (a SQLite `REFERENCES` clause) as a
+    /// directed, extracted join: an edge already found between the same two
+    /// tables is upgraded in place, one the heuristics missed is added.
+    /// A key to a table outside the file, or to its own table, adds
+    /// nothing (the graph links tables, so a loop has nowhere to go).
+    fn add_declared_joins(
+        tables: &[(usize, usize, &str, &Vec<ColumnProfile>)],
+        pending: &mut Vec<PendingJoin>,
+    ) {
+        let mut by_file: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (ti, (_, fi, _, _)) in tables.iter().enumerate() {
+            by_file.entry(*fi).or_default().push(ti);
+        }
+        // (referencing node, referenced node) -> declared evidence, in
+        // table order.
+        let mut declared: Vec<((usize, usize), String, Vec<String>)> = Vec::new();
+        for (node, fi, tname, cols) in tables.iter() {
+            for col in cols.iter() {
+                for r in &col.references {
+                    let Some(&target) = by_file[fi]
+                        .iter()
+                        .find(|&&t| tables[t].2.eq_ignore_ascii_case(&r.table))
+                    else {
+                        continue;
+                    };
+                    let tnode = tables[target].0;
+                    if tnode == *node {
+                        continue;
+                    }
+                    let mut text = format!(
+                        "declared foreign key: {tname}.{} → {}.{}",
+                        col.name, tables[target].2, r.column
+                    );
+                    if !r.composite.is_empty() {
+                        text.push_str(" (one column pair of a composite key)");
+                    }
+                    let key = canon_name(&r.column);
+                    match declared.iter_mut().find(|d| d.0 == (*node, tnode)) {
+                        Some(d) => d.2.push(text),
+                        None => declared.push(((*node, tnode), key, vec![text])),
+                    }
+                }
+            }
+        }
+        for ((from, to), key, mut evidence) in declared {
+            if evidence.len() > 5 {
+                let more = evidence.len() - 5;
+                evidence.truncate(5);
+                evidence.push(format!("+{more} more declared key columns"));
+            }
+            match pending
+                .iter_mut()
+                .find(|p| (p.from, p.to) == (from, to) || (p.from, p.to) == (to, from))
+            {
+                Some(p) => {
+                    let mut merged = evidence;
+                    merged.extend(p.evidence.iter().take(5).cloned());
+                    p.from = from;
+                    p.to = to;
+                    p.directed = true;
+                    p.key = key;
+                    p.relation = Relation::Joins;
+                    p.confidence = Conf::Extracted;
+                    p.score = 1.0;
+                    p.evidence = merged;
+                }
+                None => pending.push(PendingJoin {
+                    from,
+                    to,
+                    directed: true,
+                    key,
+                    shared_key: String::new(),
+                    relation: Relation::Joins,
+                    confidence: Conf::Extracted,
+                    score: 1.0,
+                    evidence,
+                }),
+            }
+        }
+    }
+
+    /// When two tables both reference the same owner through the same key
+    /// (`orders.customer_id` and `invoices.customer_id`, both into
+    /// `customers`), the direct link between them is real - the join works
+    /// - but it is derived from the two references, not a relationship of
+    /// its own. Counting it as one turns every star schema into a clique,
+    /// so it is relabelled `shares_key` (kept, weighted low, left out of
+    /// degree counts) and the hub keeps its spokes.
+    fn relabel_shared_keys(
+        pending: &mut [PendingJoin],
+        tables: &[(usize, usize, &str, &Vec<ColumnProfile>)],
+    ) {
+        // (owner node, key) -> referencing nodes.
+        let mut spokes: HashMap<(usize, String), BTreeSet<usize>> = HashMap::new();
+        for p in pending.iter() {
+            if p.directed && p.relation == Relation::Joins && !p.key.is_empty() {
+                spokes
+                    .entry((p.to, p.key.clone()))
+                    .or_default()
+                    .insert(p.from);
+            }
+        }
+        let name_of = |node: usize| -> &str {
+            tables
+                .iter()
+                .find(|t| t.0 == node)
+                .map(|t| t.2)
+                .unwrap_or("")
+        };
+        let mut relabel: Vec<(usize, usize, String)> = Vec::new();
+        for (idx, p) in pending.iter().enumerate() {
+            if p.relation != Relation::Joins || p.shared_key.is_empty() {
+                continue;
+            }
+            // A shared owner both ends point at, through this very key.
+            for ((hub, key), members) in &spokes {
+                if *key == p.shared_key && members.contains(&p.from) && members.contains(&p.to) {
+                    relabel.push((idx, *hub, key.clone()));
+                    break;
+                }
+            }
+        }
+        for (idx, hub, key) in relabel {
+            let hub_name = name_of(hub).to_string();
+            let p = &mut pending[idx];
+            p.relation = Relation::SharesKey;
+            p.directed = false;
+            p.evidence.insert(
+                0,
+                format!("both tables reference {hub_name}.{key}, which owns the key"),
+            );
+        }
+    }
+
+    /// What a column's name says about what it can join, worked out once.
+    struct ColSig {
+        canon: String,
+        /// The noun the name stands for once a key suffix is dropped
+        /// (`customers`, `customer_id` -> customer, customers, ...).
+        nouns: Vec<String>,
+        /// Nouns a table a foreign key names could be called: the stem of
+        /// `customer_id`, and its last segment (`parent_user_id` -> user).
+        fk_forms: Vec<String>,
+        /// A bare surrogate key (`id`, `uuid`, ...).
+        bare_id: bool,
+        /// Names of the table this column could be the key of
+        /// (`customer_id` -> customer, customers).
+        owner_forms: Vec<String>,
+        /// The join domain of the column's values; `None` for a flag, a
+        /// small category, or anything with no single domain.
+        base: Option<JoinBase>,
+    }
+
+    fn col_sig(c: &ColumnProfile) -> ColSig {
+        let canon = canon_name(&c.name);
+        let stem = strip_id_suffix(&canon);
+        let mut fk_forms = Vec::new();
+        if stem != canon {
+            fk_forms.extend(singular_forms(stem));
+            if let Some((_, entity)) = stem.rsplit_once('_') {
+                fk_forms.extend(singular_forms(entity));
+            }
+        }
+        let mut owner_forms: Vec<String> = Vec::new();
+        for s in owner_stems(&canon) {
+            for f in singular_forms(s) {
+                if !owner_forms.contains(&f) {
+                    owner_forms.push(f);
+                }
+            }
+        }
+        let base = if matches!(c.ideal_type.as_str(), "enum / category" | "bool") {
+            None
+        } else {
+            join_base(&c.ideal_type)
+        };
+        ColSig {
+            base,
+            nouns: singular_forms(stem),
+            bare_id: matches!(canon.as_str(), "id" | "uuid" | "guid" | "pk" | "key"),
+            fk_forms,
+            owner_forms,
+            canon,
+        }
+    }
+
+    /// Every name a table could be called for what it holds, as singular
+    /// forms (`dim_customers` -> customers, customer).
+    fn table_stem_forms(name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for stem in table_stems(name) {
+            for f in singular_forms(&stem) {
+                if !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether two columns' names could make them a join - the same name,
+    /// the same noun, a foreign key to the other's table, a role-prefixed
+    /// copy of a key, or two identifiers of one kind. Everything
+    /// `join_candidate` accepts passes (it also applies stricter rules of
+    /// its own); a pair that fails can only join by its values.
+    fn names_related(
+        a: &ColSig,
+        stems_a: &[String],
+        ba: &JoinBase,
+        b: &ColSig,
+        stems_b: &[String],
+        bb: &JoinBase,
+        idx: &LinkIndex,
+    ) -> bool {
+        if a.canon.is_empty() || b.canon.is_empty() {
+            return false;
+        }
+        let identifiers = ba == bb && ba.is_identifier_domain();
+        if identifiers {
+            return true;
+        }
+        if a.canon == b.canon {
+            // The same name joins only as a key: a surrogate key's name is
+            // every table's own, and any other name needs a key marker, a
+            // table it belongs to, or to be one of just two (see
+            // `join_candidate`).
+            if is_surrogate_key_name(&a.canon) {
+                return false;
+            }
+            return has_key_marker(&a.canon)
+                || idx.name_tables.get(&a.canon).is_some_and(|ts| ts.len() == 2)
+                || a.owner_forms.iter().any(|f| stems_a.contains(f))
+                || a.owner_forms.iter().any(|f| stems_b.contains(f));
+        }
+        if a.nouns.iter().any(|n| b.nouns.contains(n)) {
+            return true;
+        }
+        if (a.bare_id && b.fk_forms.iter().any(|f| stems_a.contains(f)))
+            || (b.bare_id && a.fk_forms.iter().any(|f| stems_b.contains(f)))
+        {
+            return true;
+        }
+        let role = |long: &str, short: &str| {
+            long.len() > short.len()
+                && long.ends_with(short)
+                && long.as_bytes()[long.len() - short.len() - 1] == b'_'
+                && short.contains('_')
+                && has_key_marker(short)
+        };
+        role(&a.canon, &b.canon) || role(&b.canon, &a.canon)
+    }
+
+    /// One column pair's join: how it was found, how sure, which side (if
+    /// either) refers to the other, and the pair's canonical names.
+    struct ColumnJoin {
+        conf: Conf,
+        score: f64,
+        evidence: String,
+        /// `Some(true)`: the first column's table references the second's.
+        referencing_a: Option<bool>,
+        canon_a: String,
+        canon_b: String,
     }
 
     /// One column pair's join, if the evidence supports it. The naming
@@ -114396,19 +115103,13 @@ mod knowledge_graph {
     /// running from 0 or 1, and an integer column with an ordinary name
     /// (a count or a measurement overlaps others by coincidence).
     fn column_join(
-        ta: &str,
-        ca: &ColumnProfile,
-        tb: &str,
-        cb: &ColumnProfile,
+        (ta, ca, sig_a, stems_a): (&str, &ColumnProfile, &ColSig, &[String]),
+        (tb, cb, sig_b, stems_b): (&str, &ColumnProfile, &ColSig, &[String]),
+        value_only_ok: bool,
         idx: &LinkIndex,
-    ) -> Option<(Conf, f64, String)> {
-        for c in [ca, cb] {
-            if matches!(c.ideal_type.as_str(), "enum / category" | "bool") {
-                return None;
-            }
-        }
-        let (ba, bb) = (join_base(&ca.ideal_type)?, join_base(&cb.ideal_type)?);
-        if !join_compatible(&ba, &bb) {
+    ) -> Option<ColumnJoin> {
+        let (ba, bb) = (sig_a.base.as_ref()?, sig_b.base.as_ref()?);
+        if !join_compatible(ba, bb) {
             return None;
         }
         let stats = |c: &ColumnProfile| {
@@ -114420,6 +115121,33 @@ mod knowledge_graph {
         if matches!(sa, Some((0, _))) || matches!(sb, Some((0, _))) {
             return None;
         }
+        let uniqueness =
+            |s: Option<(u64, f64)>| s.map_or(0.0, |(n, d)| (d / n.max(1) as f64).min(1.0));
+        let key_by_values = uniqueness(sa).max(uniqueness(sb)) >= 0.9;
+        let distinct = |s: Option<(u64, f64)>, min: f64| s.is_some_and(|(_, d)| d >= min);
+        let string_like = |b: &JoinBase| {
+            matches!(
+                b,
+                JoinBase::PlainString
+                    | JoinBase::Uuid
+                    | JoinBase::Ulid
+                    | JoinBase::Email
+                    | JoinBase::OtherSemantic(_)
+            )
+        };
+        // A join is either one the names suggest (checked, with the
+        // values, below) or one only the values show: text columns whose
+        // distinct values mostly line up.
+        let related = names_related(sig_a, stems_a, ba, sig_b, stems_b, bb, idx);
+        let by_values_only = value_only_ok
+            && string_like(ba)
+            && string_like(bb)
+            && key_by_values
+            && distinct(sa, 20.0)
+            && distinct(sb, 20.0);
+        if !related && !by_values_only {
+            return None;
+        }
         let measured = match (&ca.content, &cb.content) {
             (Some(x), Some(y)) => {
                 let (xa, xb) = content_scan::containment_estimates(x, y);
@@ -114427,40 +115155,68 @@ mod knowledge_graph {
             }
             _ => None,
         };
-        let uniqueness =
-            |s: Option<(u64, f64)>| s.map_or(0.0, |(n, d)| (d / n.max(1) as f64).min(1.0));
-        let key_by_values = uniqueness(sa).max(uniqueness(sb)) >= 0.9;
-        let distinct = |s: Option<(u64, f64)>, min: f64| s.is_some_and(|(_, d)| d >= min);
+        // Measured and nothing in common: no rule below keeps such a pair.
+        if measured.is_some_and(|m| m <= 0.0) {
+            return None;
+        }
         let sequential = sequential_ints(ca) || sequential_ints(cb);
-        let (canon_a, canon_b) = (canon_name(&ca.name), canon_name(&cb.name));
-        let key_named = is_key_like_name(&canon_a)
-            || is_key_like_name(&canon_b)
+        let (canon_a, canon_b) = (&sig_a.canon, &sig_b.canon);
+        let key_named = is_key_like_name(canon_a)
+            || is_key_like_name(canon_b)
             || ba.is_identifier_domain()
             || bb.is_identifier_domain();
         let pair = format!("{ta}.{} ↔ {tb}.{}", ca.name, cb.name);
-        if let Some(rel) = join_candidate(ta, ca, tb, cb, false, idx) {
+        let make = |conf: Conf, score: f64, evidence: String, referencing_a: Option<bool>| {
+            ColumnJoin {
+                conf,
+                score,
+                evidence,
+                referencing_a,
+                canon_a: canon_a.clone(),
+                canon_b: canon_b.clone(),
+            }
+        };
+        if let Some(rel) = related
+            .then(|| join_candidate(ta, ca, tb, cb, false, idx))
+            .flatten()
+        {
+            let orientation = rel.reference.as_ref().and_then(|r| {
+                if ta == tb {
+                    None
+                } else if r.referencing_table == ta {
+                    Some(true)
+                } else if r.referencing_table == tb {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
             let fk = rel.reference.is_some();
             if matches!(ba, JoinBase::Date | JoinBase::Time) && !fk {
                 return None;
             }
             if fk {
-                return Some(match measured {
-                    Some(m) if m > 0.0 => (
+                return match measured {
+                    Some(m) if m > 0.0 => Some(make(
                         Conf::Extracted,
                         m,
                         format!("{pair}: foreign-key naming, {} of values shared", pct(m)),
-                    ),
-                    Some(_) => (
+                        orientation,
+                    )),
+                    // Measured, and nothing in common: the data disproves
+                    // the naming, so there is no join to report.
+                    Some(_) => None,
+                    None => Some(make(
                         Conf::Inferred,
-                        0.5,
-                        format!("{pair}: foreign-key naming, but no values in common"),
-                    ),
-                    None => (Conf::Inferred, 0.7, format!("{pair}: foreign-key naming")),
-                });
+                        0.7,
+                        format!("{pair}: foreign-key naming"),
+                        orientation,
+                    )),
+                };
             }
             let naming = if canon_a == canon_b {
                 "same name".to_string()
-            } else if same_noun(strip_id_suffix(&canon_a), strip_id_suffix(&canon_b)) {
+            } else if same_noun(strip_id_suffix(canon_a), strip_id_suffix(canon_b)) {
                 "similar names".to_string()
             } else {
                 format!("both {}", ba.label())
@@ -114474,10 +115230,11 @@ mod knowledge_graph {
                     && !sequential
                     && int_ok
                 {
-                    return Some((
+                    return Some(make(
                         Conf::Extracted,
                         m,
                         format!("{pair}: {naming}, {} of values shared", pct(m)),
+                        orientation.or_else(|| contained_side(ca, cb)),
                     ));
                 }
                 return None;
@@ -114485,35 +115242,46 @@ mod knowledge_graph {
             // No scan data (a dictionary input): a same-named key-like
             // column is a guess, labelled as one.
             if key_named && canon_a == canon_b {
-                return Some((Conf::Inferred, 0.6, format!("{pair}: same key-like name")));
+                return Some(make(
+                    Conf::Inferred,
+                    0.6,
+                    format!("{pair}: same key-like name"),
+                    orientation,
+                ));
             }
             return None;
         }
         let m = measured?;
-        let string_like = |b: &JoinBase| {
-            matches!(
-                b,
-                JoinBase::PlainString
-                    | JoinBase::Uuid
-                    | JoinBase::Ulid
-                    | JoinBase::Email
-                    | JoinBase::OtherSemantic(_)
-            )
-        };
-        if m >= 0.6
-            && string_like(&ba)
-            && string_like(&bb)
-            && key_by_values
-            && distinct(sa, 20.0)
-            && distinct(sb, 20.0)
-        {
-            return Some((
+        if m >= 0.6 && by_values_only {
+            return Some(make(
                 Conf::Extracted,
                 m,
                 format!("{pair}: {} of values shared (names differ)", pct(m)),
+                contained_side(ca, cb),
             ));
         }
         None
+    }
+
+    /// Which of two columns' values sit inside the other's: the contained
+    /// side references the other when that other is unique (a key). `None`
+    /// when both directions hold, neither does, or the referenced side
+    /// isn't unique - the data never guesses a direction it can't see.
+    fn contained_side(ca: &ColumnProfile, cb: &ColumnProfile) -> Option<bool> {
+        let (x, y) = (ca.content.as_ref()?, cb.content.as_ref()?);
+        let (a_in_b, b_in_a) = content_scan::containment_estimates(x, y);
+        let unique = |c: &ColumnContent| {
+            c.sketch_values > 0 && c.distinct_estimate() / c.sketch_values as f64 >= 0.9
+        };
+        let (a_refs, b_refs) = (
+            a_in_b >= 0.95 && unique(y) && x.distinct_estimate() >= 2.0,
+            b_in_a >= 0.95 && unique(x) && y.distinct_estimate() >= 2.0,
+        );
+        match (a_refs, b_refs) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
     }
 
     // ---- Communities ----
@@ -114870,6 +115638,9 @@ mod knowledge_graph {
                     "evidence".to_string(),
                     JsonValue::Array(e.evidence.iter().cloned().map(JsonValue::from).collect()),
                 );
+                if e.directed {
+                    m.insert("directed".to_string(), JsonValue::from(true));
+                }
                 JsonValue::Object(m)
             })
             .collect();
@@ -115021,6 +115792,10 @@ mod knowledge_graph {
                         .collect()
                 })
                 .unwrap_or_default();
+            let directed = v
+                .get("directed")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
             edges.push(KgEdge {
                 source,
                 target,
@@ -115029,6 +115804,7 @@ mod knowledge_graph {
                 score,
                 weight,
                 evidence,
+                directed,
             });
         }
         let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -115104,7 +115880,7 @@ mod knowledge_graph {
             }
             let rank = match e.relation {
                 Relation::References => 0,
-                Relation::Joins | Relation::SharesIds => 1,
+                Relation::Joins | Relation::SharesIds | Relation::SharesKey => 1,
                 Relation::SimilarTo => 3,
                 _ => 4,
             };
@@ -116420,6 +117196,276 @@ mod knowledge_graph {
             (0..n).map(|i| format!("{prefix}{i}")).collect()
         }
 
+        struct Lcg(u64);
+
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 33
+            }
+
+            fn below(&mut self, n: usize) -> usize {
+                self.next() as usize % n
+            }
+        }
+
+        /// A random set of tables with names, key-like columns, shared
+        /// value pools and near-copies, shaped like the inputs the join
+        /// finder sees.
+        fn random_tables(rng: &mut Lcg) -> Vec<(String, Vec<ColumnProfile>)> {
+            const TABLES: [&str; 11] = [
+                "customers",
+                "orders",
+                "order_items",
+                "users",
+                "staff",
+                "dim_customer",
+                "products",
+                "categories",
+                "shippers",
+                "departments",
+                "events",
+            ];
+            const COLUMNS: [&str; 24] = [
+                "id",
+                "uuid",
+                "customer_id",
+                "customers",
+                "customer",
+                "order_id",
+                "user_id",
+                "users_id",
+                "name",
+                "email",
+                "contact_email",
+                "code",
+                "country_code",
+                "parent_user_id",
+                "manager_staff_id",
+                "staff_id",
+                "sku",
+                "amount",
+                "Customer ID",
+                "CustomerId",
+                "dept_name",
+                "department",
+                "ShipVia",
+                "shippers_id",
+            ];
+            const UUIDS: [&str; 6] = [
+                "550e8400-e29b-41d4-a716-446655440000",
+                "6fa459ea-ee8a-3ca4-894e-db77e160355e",
+                "16fd2706-8baf-433b-82eb-8c7fada847da",
+                "9b2d3c3e-4a1f-4a57-9c1e-0d7e1f9a2b10",
+                "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                "1b4e28ba-2fa1-11d2-883f-0016d3cca427",
+            ];
+            let n_tables = 6 + rng.below(30);
+            let mut tables: Vec<(String, Vec<ColumnProfile>)> = Vec::new();
+            for t in 0..n_tables {
+                if t > 2 && rng.below(4) == 0 {
+                    // A near-copy of an earlier table.
+                    let from = rng.below(tables.len());
+                    let copy = tables[from].1.clone();
+                    tables.push((format!("{}_{t}", tables[from].0), copy));
+                    continue;
+                }
+                let name = TABLES[rng.below(TABLES.len())].to_string();
+                let mut cols: Vec<ColumnProfile> = Vec::new();
+                for _ in 0..2 + rng.below(6) {
+                    let cname = COLUMNS[rng.below(COLUMNS.len())];
+                    if cols.iter().any(|c| c.name == cname) {
+                        continue;
+                    }
+                    let kind = rng.below(7);
+                    let (ideal, values): (&str, Vec<String>) = match kind {
+                        0 | 1 => {
+                            let k = 3 + rng.below(40);
+                            let sparse = rng.below(3) == 0;
+                            (
+                                "i64",
+                                (1..=k)
+                                    .map(|i| if sparse { i * 7 } else { i }.to_string())
+                                    .collect(),
+                            )
+                        }
+                        2 | 3 => {
+                            let prefix = ["a", "b", "c"][rng.below(3)];
+                            ("String", strings(prefix, 5 + rng.below(60)))
+                        }
+                        4 => (
+                            "UUID",
+                            (0..2 + rng.below(5))
+                                .map(|_| UUIDS[rng.below(UUIDS.len())].to_string())
+                                .collect(),
+                        ),
+                        5 => (
+                            "Email",
+                            (0..2 + rng.below(5))
+                                .map(|_| format!("u{}@example.com", rng.below(8)))
+                                .collect(),
+                        ),
+                        _ => ("f64", vec!["1.5".to_string(), "2.5".to_string()]),
+                    };
+                    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+                    let mut col = profile(cname, ideal, &refs);
+                    col.sample_values = values.iter().take(3).cloned().collect();
+                    cols.push(col);
+                }
+                if cols.is_empty() {
+                    cols.push(profile("id", "i64", &["1", "2", "3"]));
+                }
+                tables.push((name, cols));
+            }
+            tables
+        }
+
+        fn describe(p: &PendingJoin) -> String {
+            format!(
+                "{}->{} dir={} key={:?} shared={:?} {:?} {:?} {:.6} {:?}",
+                p.from, p.to, p.directed, p.key, p.shared_key, p.relation, p.confidence, p.score,
+                p.evidence
+            )
+        }
+
+        #[test]
+        fn join_candidates_miss_no_join_a_scan_of_every_pair_finds() {
+            // `KG_DIFF_ROUNDS` / `KG_DIFF_SEED` run a longer search.
+            let rounds: usize = std::env::var("KG_DIFF_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(400);
+            let seed: u64 = std::env::var("KG_DIFF_SEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0x5eed);
+            let mut rng = Lcg(seed);
+            for round in 0..rounds {
+                let owned = random_tables(&mut rng);
+                let tables: Vec<(usize, usize, &str, &Vec<ColumnProfile>)> = owned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, c))| (i, i, n.as_str(), c))
+                    .collect();
+                let canon: Vec<BTreeSet<String>> = tables
+                    .iter()
+                    .map(|t| t.3.iter().map(|c| canon_name(&c.name)).collect())
+                    .collect();
+                let (roots, _) = near_duplicate_groups(&canon, DUPLICATE_SCHEMA_SIMILARITY);
+                let mut size: HashMap<usize, usize> = HashMap::new();
+                for r in &roots {
+                    *size.entry(*r).or_insert(0) += 1;
+                }
+                let group_of: Vec<usize> = roots
+                    .iter()
+                    .map(|r| if size[r] > 1 { *r } else { usize::MAX })
+                    .collect();
+                let mut index_tables: BTreeMap<String, Vec<ColumnProfile>> = BTreeMap::new();
+                for (n, c) in &owned {
+                    index_tables
+                        .entry(n.clone())
+                        .or_insert_with(|| c.iter().map(|x| ColumnProfile { content: None, ..x.clone() }).collect());
+                }
+                let idx = LinkIndex::build(&index_tables);
+                let sigs: Vec<Vec<ColSig>> = tables
+                    .iter()
+                    .map(|t| t.3.iter().map(col_sig).collect())
+                    .collect();
+                let stems: Vec<Vec<String>> =
+                    tables.iter().map(|t| table_stem_forms(t.2)).collect();
+                let mut all: BTreeMap<(usize, usize), PairPlan> = BTreeMap::new();
+                for i in 0..tables.len() {
+                    for j in i + 1..tables.len() {
+                        if group_of[i] == usize::MAX || group_of[i] != group_of[j] {
+                            all.insert(
+                                (i, j),
+                                PairPlan {
+                                    by_value: true,
+                                    cols: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                }
+                let want: Vec<String> = evaluate_joins(&tables, &sigs, &stems, &idx, all)
+                    .iter()
+                    .map(describe)
+                    .collect();
+                let got: Vec<String> = evaluate_joins(
+                    &tables,
+                    &sigs,
+                    &stems,
+                    &idx,
+                    join_candidates(&tables, &group_of, &idx),
+                )
+                .iter()
+                .map(describe)
+                .collect();
+                let missing: Vec<&String> = want.iter().filter(|w| !got.contains(w)).collect();
+                let extra: Vec<&String> = got.iter().filter(|g| !want.contains(g)).collect();
+                assert!(
+                    missing.is_empty() && extra.is_empty(),
+                    "round {round}: tables {:?}\nmissing from the candidates: {missing:#?}\nextra: {extra:#?}",
+                    owned
+                        .iter()
+                        .map(|t| (&t.0, t.1.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(got, want);
+            }
+        }
+
+        #[test]
+        fn near_duplicate_groups_match_a_pairwise_scan() {
+            let mut rng = Lcg(77);
+            let names = ["id", "name", "email", "amount", "date", "zip", "city", "code", "x", "y", "z", "w"];
+            for round in 0..300 {
+                let n = 2 + rng.below(40);
+                let sets: Vec<BTreeSet<String>> = (0..n)
+                    .map(|_| {
+                        let len = rng.below(8);
+                        (0..len)
+                            .map(|_| names[rng.below(names.len())].to_string())
+                            .collect()
+                    })
+                    .collect();
+                let (roots, best) = near_duplicate_groups(&sets, 0.8);
+                // The pairwise scan this replaced.
+                let mut parent: Vec<usize> = (0..n).collect();
+                fn find(parent: &mut [usize], mut x: usize) -> usize {
+                    while parent[x] != x {
+                        x = parent[x];
+                    }
+                    x
+                }
+                let mut want_best = vec![0.0f64; n];
+                for i in 0..n {
+                    for j in i + 1..n {
+                        let (a, c) = (&sets[i], &sets[j]);
+                        if a.is_empty() || c.is_empty() {
+                            continue;
+                        }
+                        let shared = a.intersection(c).count() as f64;
+                        let jac = shared / (a.len() as f64 + c.len() as f64 - shared);
+                        if jac >= 0.8 {
+                            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                            if ri != rj {
+                                parent[ri.max(rj)] = ri.min(rj);
+                            }
+                            want_best[i] = want_best[i].max(jac);
+                            want_best[j] = want_best[j].max(jac);
+                        }
+                    }
+                }
+                let want_roots: Vec<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
+                assert_eq!(roots, want_roots, "round {round}: groups for {sets:?}");
+                assert_eq!(best, want_best, "round {round}: similarity for {sets:?}");
+            }
+        }
+
         #[test]
         #[cfg(any(feature = "xlsx", feature = "npy"))]
         fn ooxml_paragraphs_read_runs_tabs_entities_and_skip_fallbacks() {
@@ -116489,7 +117535,34 @@ mod knowledge_graph {
             let mut tables = BTreeMap::new();
             tables.insert(ta.to_string(), vec![ca.clone()]);
             tables.insert(tb.to_string(), vec![cb.clone()]);
-            column_join(ta, ca, tb, cb, &LinkIndex::build(&tables))
+            let (sig_a, sig_b) = (col_sig(ca), col_sig(cb));
+            let (stems_a, stems_b) = (table_stem_forms(ta), table_stem_forms(tb));
+            column_join(
+                (ta, ca, &sig_a, &stems_a),
+                (tb, cb, &sig_b, &stems_b),
+                true,
+                &LinkIndex::build(&tables),
+            )
+            .map(|j| (j.conf, j.score, j.evidence))
+        }
+
+        #[test]
+        fn a_foreign_key_name_with_no_shared_values_is_not_a_join() {
+            // The naming says "foreign key", the data says otherwise: two
+            // disjoint ID spaces.
+            let customers: Vec<String> = (1..=30).map(|i| i.to_string()).collect();
+            let orders: Vec<String> = (1001..=1030).map(|i| i.to_string()).collect();
+            let id = profile(
+                "id",
+                "i64",
+                &customers.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let customer_id = profile(
+                "customer_id",
+                "i64",
+                &orders.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            assert!(join_pair("customers", &id, "orders", &customer_id).is_none());
         }
 
         #[test]
