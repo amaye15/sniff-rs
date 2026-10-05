@@ -17295,7 +17295,7 @@ mod rdata_support {
                 RObj::Str(..) => "character vector",
                 RObj::Raw(..) => "raw vector",
                 RObj::List(..) => "list",
-                RObj::Other(label, _) => *label,
+                RObj::Other(label, _) => label,
             }
         }
 

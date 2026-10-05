@@ -7,6 +7,18 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- Weka ARFF (`.arff`): dense, sparse and weighted rows, quoted values and
+  `?` missing, read through a streamed TSV conversion; checked against
+  liac-arff and scipy. Relational attributes are refused.
+- R data (`.rds`, `.rda`, `.RData`; `--features rdata`): R's XDR, native and
+  text serializations (versions 2 and 3, ALTREP), as one table per saved
+  object: data frames, matrices, tables, vectors and lists; factors, Dates
+  and POSIXct, `integer64`, and haven/Hmisc labels read as what they are.
+  Checked against pyreadr's R-written files and real package datasets.
+- HTML and Markdown tables (`--features html`, `markdown`): one table per
+  data `<table>` (spans expanded, entities decoded, layout tables skipped)
+  or GFM pipe table; only a file that holds a table is claimed. Checked
+  against lxml on Wikipedia pages and the GFM spec.
 - `--encoding <name>` and byte-order-mark handling for every text format:
   UTF-8/UTF-16/UTF-32 BOMs are honored, and UTF-16/32 or any single-byte
   code page (windows-125x, ISO-8859-x, cp437/cp866, koi8, macintosh;
@@ -103,6 +115,9 @@ All notable changes to sniff-rs are documented here. Format follows
   files.
 
 ### Fixed
+- A column with a few missing values (under 0.05%) reported `missing_pct`
+  `0.0`, lost its "has missing values" note, and was declared `NOT NULL` in
+  SQL, so the first NULL failed the load. It now reports the real share.
 - A UTF-8 byte-order mark no longer ends up inside the first YAML key or
   makes JSON, JSONL, XML, INI and vCard files fail.
 - `--help` and the docs disagreed on `explain`/`path` argument order and on

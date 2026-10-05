@@ -7,8 +7,10 @@ Parquet, Arrow IPC/Feather, Avro, Excel, SQLite, MessagePack, TOML, YAML,
 CBOR, INI, XML, fixed-width text, NumPy, Common/Combined Log Format access
 logs, RFC 3164/5424 syslog, dBase, Stata, SAS7BDAT, SAS Transport (XPORT), SPSS, ORC, BSON,
 Property List (plist), JSON5/JSONC, HAR (HTTP Archive), GeoJSON, MBOX,
-vCard, iCalendar, Jupyter notebooks (.ipynb), and PDF page text — any of
-them gzip- or zstd-compressed too — plus
+vCard, iCalendar, Jupyter notebooks (.ipynb), PDF page text, VCF/BED/GFF/
+FASTA/FASTQ/SAM genomics text, Weka ARFF, R serialized data (`.rds`/`.RData`),
+and the tables inside HTML and Markdown documents — any of
+them gzip-, zstd-, bzip2- or xz-compressed too — plus
 Delta Lake and Apache Iceberg tables (a directory profiled as one
 logical table by resolving its own transaction log / metadata chain) —
 and writes Markdown, this tool's own rich JSON, json-schema.org-standard
@@ -113,6 +115,10 @@ full, honest numbers.
 | PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode), breaking words and lines where the glyphs are drawn and letting marked-content `/ActualText` stand in for the glyphs it covers; comment/note annotation text lands in an `annotations` column, and a filled-in AcroForm becomes a second `<file>_form` table (one record, one column per field) - see the Dependency footprint section |
 | Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
 | Apache Iceberg | *(directory)* | `--features iceberg` | also detected from directory structure (a `metadata/` subdirectory with a real `*.metadata.json` file); resolves the current metadata.json's own snapshot to a manifest-list (Avro) naming manifest files (Avro) naming live Parquet data files, then profiles them the same "one merged table" way - see "Lakehouse table formats" below |
+| Weka ARFF | `.arff` (or an `@relation` first line) | *(default)* | `@attribute` names are the header; dense, sparse (`{0 1, 3 b}`) and weighted (`, {0.5}`) rows; `?` is missing and a quoted `'?'` stays data; a value left out of a sparse row is `0` (numeric) or the first label (nominal); relational attributes are refused - see "Gap audit 8" |
+| R data | `.rds`, `.rda`, `.RData` (gzip/bzip2/xz-compressed or not; or an `RDX`/`X\n` header) | `--features rdata` | one table per `save()` object (a `saveRDS` file's one object takes the file name); data frames, matrices, 1-D tables, vectors and lists; factors/Date/POSIXct/`integer64` read as what they are, `label`/`labels` attributes become description and value labels; XDR, native and text serializations, versions 2 and 3, ALTREP - see "Gap audit 8" |
+| HTML | `.html`, `.htm`, `.xhtml` (or a doctype/`<html>`) | `--features html` | one table per data `<table>` (named for its `<caption>`/`id`, else `table_N`); `colspan`/`rowspan` expanded, `<thead>`/`<th>` header, entities decoded; an outer layout table is skipped; only a file that holds a table is claimed - see "Gap audit 8" |
+| Markdown | `.md`, `.markdown` | `--features markdown` | one table per GFM pipe table (named for the heading above it, else `table_N`); `\|` escapes, short rows padded, fenced code skipped; cell text kept as written |
 
 `--features full` enables all of the above. `--format <name>` overrides
 extension-based detection when a file is misnamed or ambiguous — fixed-width
@@ -18103,6 +18109,108 @@ accepts. Fixtures: `edge_{fasta,fastq,sam}_biopython_*`,
 Disclosed: a FASTA chromosome becomes one row holding the whole sequence
 (250 MB for human chr1) - the table reader keeps that record in memory;
 SAM `tags` stay one text column; protein vs DNA isn't told apart.
+
+## Gap audit 8: ARFF, R data, HTML/Markdown tables, and a rounding bug
+
+The next four items on the queue, each checked against an independent
+reader on real files, plus a bug the real files found.
+
+- **Weka ARFF (`.arff`).** Converted to a temporary TSV like FASTA/FASTQ
+  (`convert_arff_text`, run by `convert_sequence_text`; `format` stays `arff`).
+  The `@attribute` names are the header, so ARFF needs no feature flag. A row
+  is dense, sparse (`{0 1, 3 "a b"}`) or weighted (`, {0.5}`, dropped); an
+  unquoted `?` is an empty field and a quoted `'?'` stays data (the format's
+  missing tokens are empty, as for FASTA). Quotes are `'` or `"` with backslash
+  escapes, `%` starts a comment only at the start of a line, and a value left out of
+  a sparse row takes its Weka meaning: `0` for a number, the first declared
+  label for a nominal, missing for a string or date. A relational attribute
+  (whole nested data sets per value) is refused with a message; a field count
+  that doesn't match the declared attributes names its line. Sniffed from an
+  `@relation` first line. Verified against liac-arff (dense, sparse) and
+  scipy.io.arff (its own test files: iris, missing values, quoted nominals,
+  dates), cell by cell through the SQL path; where they disagree with Weka's
+  grammar (scipy refuses string attributes and date formats, liac-arff has no
+  dates or weights) the fixtures name the case. Disclosed: a quoted value's
+  leading/trailing spaces are trimmed by the table reader (as for every CSV).
+- **R serialized data (`--features rdata`).** `rdata_support` reads R's own
+  serialization (serialize.c): the XDR (`X`), native-binary (`B`) and decimal
+  text (`A`) wires, versions 2 and 3, behind the `RDX2/3` magic of a `save()`
+  file or bare for `saveRDS()`. Compression (gzip, bzip2, xz - R's defaults) is
+  peeled by the container layer, which now also sniffs these extensions
+  (`container_from_magic` skips its data-extension guard for them, since an `.rds`
+  is a data-format name and still normally compressed). Items are read into a
+  small tree (`RObj`); a function, environment or S4 object is read to get past
+  it (bytecode and environments included - the stream has no length prefix to skip
+  with) and dropped. ALTREP compact sequences, wrappers and deferred strings
+  (R 3.5+) are rebuilt (`r_double_string` reproduces `as.character` of a double:
+  15 significant digits, `1e+05` over `100000`). What becomes a table: a data
+  frame of any class (tibble, data.table), a matrix or 1-D table with its
+  dimnames, an atomic vector (with `names`), and a list (equal-length vectors
+  make a table, else one row). A data frame's row names become a `row_names`
+  column unless they are 1..n. A factor reads as its labels (`current_type
+  factor`), `Date` and `POSIXct` as dates and datetimes (POSIXct in UTC with a
+  note naming the column's zone; one fraction width per column so format
+  detection doesn't split), `difftime` with its units noted, `integer64` (bit64)
+  as integers, and `NA` is missing while `NaN`/`Inf` are values. The `label` and
+  `labels` attributes haven/Hmisc attach become the column's description and
+  value labels, as for Stata. A list column keeps each element as JSON text
+  (always an array, so a cell holding one value has the same shape). An object
+  that isn't data, or an array of three axes, is a disclosed placeholder
+  column, not an error. R can't be read incrementally (a factor's levels and a
+  frame's names follow the data), so an object is read whole: memory is about
+  the decompressed size (336,776 rows by 19 columns: 1.5 s, 96 MB). Hostile
+  input is bounded: nesting past 200 levels, a vector claiming more values than
+  the file holds, and an array whose `dim` disagrees with its data are errors or
+  plain vectors, never an allocation or a panic (3,300 mutated files on a debug
+  build, one `dim` panic found and fixed). Verified against pyreadr on all 40 R-written
+  files of its test data (v2 and v3, gzip/bzip2/xz, dates, time zones, matrices,
+  tables, ALTREP) and on the real ggplot2/nycflights13/MASS datasets (336k-row
+  flights, 53k-row diamonds, starwars's list columns). R itself isn't
+  installed here, so the text and native-binary wires are checked against an
+  independent writer (`edge_rdata_written_*`) rather than R. Not read: S4/R6
+  slots as columns, POSIXlt, nested data frames in lists beyond JSON text,
+  3+-axis arrays, ALTREP deferred strings of other types, memory-mapped ALTREP.
+- **HTML and Markdown tables (`--features html`, `markdown`).**
+  `doctable_support` finds the tables inside a document. HTML is a forgiving
+  tokenizer (comments, doctype, CDATA, `<script>`/`<style>`/`<title>` raw
+  text; implied `</td>`/`</tr>`; HTML 4's 252 entities, numeric references with
+  the C1 block read as Windows-1252, no-break spaces collapsed) feeding a stack
+  of table contexts: `colspan` and `rowspan` expand into the grid a browser
+  draws (a spanning cell appears in each column), the header is the `<thead>`
+  rows or the leading all-`<th>` rows (several joined as `top / bottom`), and a
+  table with neither gets `column_N` and keeps its first row as data - guessing
+  that a first row "looks like" a header is what this tool doesn't do. A table
+  containing another table is page layout and is skipped; a table with no data
+  rows is dropped. `<meta charset>` is honoured (`html_declared_encoding`), a
+  doctype/`<html>` root is sniffed ahead of XML, and spans and nesting are bounded
+  (4 million extra cells, 256 levels) so a few kilobytes of markup can't claim
+  gigabytes. Markdown is GFM pipe tables: a header row, a delimiter row of the
+  same width, body rows to the first blank line or other block; `\|` is a pipe,
+  short rows are padded, long ones cut, fenced code is skipped, the heading
+  above names the table, and cell text is kept as written (`**bold**` stays).
+  Cells have no native null, so an empty cell or a `MISSING_SENTINELS` token
+  reads as missing, exactly as in a CSV. A document with exactly one table
+  takes the file's name. Because `.md` and `.html` files are everywhere, they
+  are claimed only when they hold a table (`doc_has_table`): a README or a page
+  with none is an error for one file (`has no HTML tables`) and is skipped in a
+  directory walk like any unrecognized file; `--format html|markdown` skips the
+  check. Verified against lxml on eight Wikipedia pages (periodic table, FIFA,
+  ISO 3166, Nobel laureates, city lists: 101 tables, every width, row count
+  and first-column value matches; the cell text differs only where `<br>`/`<li>`
+  separate words, where this reader puts a space, as a browser shows it) and
+  against the GFM spec's table examples (including the unequal-width delimiter
+  that isn't a table, and a short row). 1,400 mutated documents, debug build, no
+  panic. Disclosed: no JavaScript-built tables; inline Markdown is not
+  rendered; an HTML table whose header is a plain first row of `<td>` needs
+  `column_N` renaming by hand.
+- **A rounding bug the real files found.** `weather.rda` (4 `NA`s in 26,115
+  wind speeds) loaded into SQLite with `NOT NULL constraint failed`: one
+  decimal rounds 0.015% missing to `0.0`, which the rest of the tool reads as
+  "never missing" - the column lost its "has missing values" note and was
+  declared `NOT NULL`. This was in every format. `missing_percent` now never
+  reports `0.0` for a column with a real gap (three decimals below 0.05%, at
+  least 0.001), at all three places `missing_pct` is computed. No committed
+  fixture changed; a CSV regression test pins it.
 
 ## Known limitations / roadmap
 

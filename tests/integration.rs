@@ -18301,7 +18301,7 @@ fn a_column_with_a_few_missing_values_is_nullable_not_not_null() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "rdata")]
+#[cfg(any(feature = "rdata", feature = "html", feature = "markdown"))]
 fn tables_of(doc: &serde_json::Value) -> Vec<String> {
     doc["tables"].as_object().unwrap().keys().cloned().collect()
 }
