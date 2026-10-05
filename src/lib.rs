@@ -359,6 +359,13 @@ mod json_support {
             }
         }
 
+        pub(crate) fn as_bool(&self) -> Option<bool> {
+            match self {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            }
+        }
+
         pub(crate) fn as_f64(&self) -> Option<f64> {
             match self {
                 Value::Number(n) => n.as_f64(),
@@ -110741,6 +110748,25 @@ mod content_scan {
             }
         }
 
+        pub(crate) fn parse(s: &str) -> Option<EntityKind> {
+            [
+                EntityKind::Email,
+                EntityKind::Domain,
+                EntityKind::Url,
+                EntityKind::Doi,
+                EntityKind::Isbn,
+                EntityKind::Uuid,
+                EntityKind::Ip,
+                EntityKind::Vin,
+                EntityKind::Iban,
+                EntityKind::Card,
+                EntityKind::Code,
+                EntityKind::Id,
+            ]
+            .into_iter()
+            .find(|k| k.as_str() == s)
+        }
+
         /// Recognized by a grammar or checksum, not a shape guess.
         pub(crate) fn is_validated(self) -> bool {
             !matches!(self, EntityKind::Code | EntityKind::Id)
@@ -112053,6 +112079,10 @@ mod knowledge_graph {
     /// never profiles its own `graph.json`), and a re-run may clear it.
     pub(crate) const MARKER_FILE: &str = ".sniff-rs-graph";
 
+    /// Where per-file results are kept between runs, inside the output
+    /// directory.
+    pub(crate) const CACHE_DIR: &str = ".sniff-rs-cache";
+
     /// Directories that are never user content: version-control
     /// internals, caches, and editor state.
     const SKIP_DIRS: [&str; 7] = [
@@ -112206,6 +112236,18 @@ mod knowledge_graph {
                 .iter()
                 .filter_map(|p| p.file_name().and_then(|n| n.to_str())),
         ));
+        // What a cached result also depends on: the file names a text may
+        // refer to. A file added, removed or renamed re-reads everything.
+        let names = {
+            let mut h = FNV_OFFSET;
+            for p in &paths {
+                if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                    h = fnv64_extend(h, n.as_bytes());
+                    h = fnv64_extend(h, &[0]);
+                }
+            }
+            h
+        };
         let mut out = Vec::with_capacity(paths.len());
         // Files are read on a pool of worker threads and handed back in
         // path order, so the progress lines and the graph itself are the
@@ -112214,7 +112256,7 @@ mod knowledge_graph {
             &paths,
             opts.jobs,
             true,
-            |path| (read_one(&root, path, opts, &known), false),
+            |path| (read_one_cached(&root, path, opts, &known, names), false),
             |i, file| {
                 if opts.progress {
                     let status = match file.kind {
@@ -112232,11 +112274,483 @@ mod knowledge_graph {
                 Ok(())
             },
         )?;
+        if let Some(dir) = &opts.cache_dir {
+            let keep: HashSet<String> = paths
+                .iter()
+                .map(|p| cache_entry_name(&display_rel(&root, p)))
+                .collect();
+            prune_cache(dir, &keep);
+        }
         let name = input
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| input.display().to_string());
         Ok((name, out))
+    }
+
+    // ---- Per-file cache ----
+
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    fn fnv64_extend(mut h: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// The cache's own format version; bumped when an entry's shape
+    /// changes.
+    const CACHE_FORMAT: u64 = 1;
+
+    fn display_rel(root: &Path, path: &Path) -> String {
+        if root.as_os_str().is_empty() {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            relative_display_path(root, path)
+        }
+    }
+
+    fn cache_entry_name(rel: &str) -> String {
+        format!("{:016x}.json", fnv64_extend(FNV_OFFSET, rel.as_bytes()))
+    }
+
+    fn mtime_ns(path: &Path) -> Option<u64> {
+        let t = fs::metadata(path).ok()?.modified().ok()?;
+        let d = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(d.as_secs() * 1_000_000_000 + u64::from(d.subsec_nanos()))
+    }
+
+    /// What identifies the running build: a rebuilt binary may read a file
+    /// differently, so its cached results are not trusted.
+    fn build_stamp() -> &'static str {
+        static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        STAMP.get_or_init(|| {
+            let exe = std::env::current_exe()
+                .ok()
+                .and_then(|p| fs::metadata(p).ok());
+            let (len, mtime) = exe
+                .map(|m| {
+                    (
+                        m.len(),
+                        m.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_nanos()),
+                    )
+                })
+                .unwrap_or((0, 0));
+            format!("{}-{len}-{mtime}", env!("CARGO_PKG_VERSION"))
+        })
+    }
+
+    fn read_one_cached(
+        root: &Path,
+        path: &Path,
+        opts: &CollectOptions,
+        known: &Arc<KnownFiles>,
+        names: u64,
+    ) -> KgFile {
+        let Some(dir) = &opts.cache_dir else {
+            return read_one(root, path, opts, known);
+        };
+        let rel = display_rel(root, path);
+        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let Some(mtime) = mtime_ns(path) else {
+            return read_one(root, path, opts, known);
+        };
+        let mut key = json_support::Map::new();
+        key.insert("format".to_string(), JsonValue::from(CACHE_FORMAT));
+        key.insert("build".to_string(), JsonValue::from(build_stamp()));
+        key.insert("rel".to_string(), JsonValue::from(rel.clone()));
+        key.insert("size".to_string(), JsonValue::from(size));
+        key.insert("mtime_ns".to_string(), JsonValue::from(mtime));
+        key.insert("samples".to_string(), JsonValue::from(opts.samples));
+        key.insert("names".to_string(), JsonValue::from(format!("{names:016x}")));
+        let key = JsonValue::Object(key);
+        let entry_path = dir.join(cache_entry_name(&rel));
+        if let Some(file) = fs::read_to_string(&entry_path)
+            .ok()
+            .and_then(|text| json_support::from_str(&text).ok())
+            .and_then(|doc| {
+                (doc.get("key") == Some(&key))
+                    .then(|| doc.get("file").and_then(file_from_json))
+                    .flatten()
+            })
+        {
+            return file;
+        }
+        let file = read_one(root, path, opts, known);
+        let mut doc = json_support::Map::new();
+        doc.insert("key".to_string(), key);
+        doc.insert("file".to_string(), file_to_json(&file));
+        // Written beside the entry and renamed, so a reader never sees half
+        // a file; a failed write only costs the next run a re-read.
+        let tmp = entry_path.with_extension(format!("tmp{}", std::process::id()));
+        if fs::write(&tmp, JsonValue::Object(doc).to_string()).is_ok()
+            && fs::rename(&tmp, &entry_path).is_err()
+        {
+            let _ = fs::remove_file(&tmp);
+        }
+        file
+    }
+
+    /// Removes cache entries no file of this run owns (a file that was
+    /// deleted or renamed), and any leftover partial writes.
+    fn prune_cache(dir: &Path, keep: &HashSet<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !keep.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    fn f64_json(x: f64) -> JsonValue {
+        JsonValue::from(if x.is_finite() { x } else { 0.0 })
+    }
+
+    fn str_array(items: &[String]) -> JsonValue {
+        JsonValue::Array(items.iter().map(|s| JsonValue::from(s.clone())).collect())
+    }
+
+    fn strings_of(v: Option<&JsonValue>) -> Vec<String> {
+        v.and_then(JsonValue::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn content_to_json(c: &ColumnContent) -> JsonValue {
+        let mut o = json_support::Map::new();
+        o.insert(
+            "entities".to_string(),
+            JsonValue::Array(
+                c.entities
+                    .iter()
+                    .map(|(k, v, n)| {
+                        JsonValue::Array(vec![
+                            JsonValue::from(k.as_str()),
+                            JsonValue::from(v.clone()),
+                            JsonValue::from(u64::from(*n)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+        o.insert(
+            "entities_truncated".to_string(),
+            JsonValue::from(c.entities_truncated),
+        );
+        o.insert(
+            "terms".to_string(),
+            JsonValue::Array(
+                c.terms
+                    .iter()
+                    .map(|(t, n)| {
+                        JsonValue::Array(vec![
+                            JsonValue::from(t.clone()),
+                            JsonValue::from(u64::from(*n)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+        o.insert("refs".to_string(), str_array(&c.refs));
+        o.insert(
+            "sketch".to_string(),
+            JsonValue::Array(c.sketch.iter().map(|h| JsonValue::from(*h)).collect()),
+        );
+        o.insert("sketch_values".to_string(), JsonValue::from(c.sketch_values));
+        o.insert("text_chars".to_string(), JsonValue::from(c.text_chars));
+        o.insert(
+            "unmapped_chars".to_string(),
+            JsonValue::from(c.unmapped_chars),
+        );
+        JsonValue::Object(o)
+    }
+
+    fn content_from_json(v: &JsonValue) -> Option<ColumnContent> {
+        let entities = v
+            .get("entities")?
+            .as_array()?
+            .iter()
+            .map(|e| {
+                let e = e.as_array()?;
+                Some((
+                    EntityKind::parse(e.first()?.as_str()?)?,
+                    e.get(1)?.as_str()?.to_string(),
+                    u32::try_from(e.get(2)?.as_u64()?).ok()?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let terms = v
+            .get("terms")?
+            .as_array()?
+            .iter()
+            .map(|t| {
+                let t = t.as_array()?;
+                Some((
+                    t.first()?.as_str()?.to_string(),
+                    u32::try_from(t.get(1)?.as_u64()?).ok()?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let sketch = v
+            .get("sketch")?
+            .as_array()?
+            .iter()
+            .map(JsonValue::as_u64)
+            .collect::<Option<Vec<_>>>()?;
+        Some(ColumnContent {
+            entities,
+            entities_truncated: v.get("entities_truncated")?.as_bool()?,
+            terms,
+            refs: strings_of(v.get("refs")),
+            sketch,
+            sketch_values: v.get("sketch_values")?.as_u64()?,
+            text_chars: v.get("text_chars")?.as_u64()?,
+            unmapped_chars: v.get("unmapped_chars")?.as_u64()?,
+        })
+    }
+
+    fn column_to_json(c: &ColumnProfile) -> JsonValue {
+        let mut o = json_support::Map::new();
+        o.insert("name".to_string(), JsonValue::from(c.name.clone()));
+        o.insert(
+            "current_type".to_string(),
+            JsonValue::from(c.current_type.clone()),
+        );
+        o.insert(
+            "ideal_type".to_string(),
+            JsonValue::from(c.ideal_type.clone()),
+        );
+        o.insert(
+            "description".to_string(),
+            JsonValue::from(c.description.clone()),
+        );
+        o.insert("missing_pct".to_string(), f64_json(c.missing_pct));
+        o.insert("sample_values".to_string(), str_array(&c.sample_values));
+        o.insert("notes".to_string(), JsonValue::from(c.notes.clone()));
+        o.insert("row_count".to_string(), JsonValue::from(c.row_count));
+        if let Some(n) = &c.numeric_stats {
+            let mut m = json_support::Map::new();
+            m.insert("count".to_string(), JsonValue::from(n.count));
+            for (k, x) in [
+                ("min", n.min),
+                ("max", n.max),
+                ("mean", n.mean),
+                ("stddev", n.stddev),
+                ("median", n.median),
+            ] {
+                m.insert(k.to_string(), f64_json(x));
+            }
+            m.insert(
+                "percentiles".to_string(),
+                JsonValue::Array(
+                    n.percentiles
+                        .iter()
+                        .map(|(l, x)| {
+                            JsonValue::Array(vec![JsonValue::from(l.clone()), f64_json(*x)])
+                        })
+                        .collect(),
+                ),
+            );
+            o.insert("numeric_stats".to_string(), JsonValue::Object(m));
+        }
+        if let Some(c) = &c.content {
+            o.insert("content".to_string(), content_to_json(c));
+        }
+        if !c.references.is_empty() {
+            o.insert(
+                "references".to_string(),
+                JsonValue::Array(
+                    c.references
+                        .iter()
+                        .map(|r| {
+                            let mut m = json_support::Map::new();
+                            m.insert("table".to_string(), JsonValue::from(r.table.clone()));
+                            m.insert("column".to_string(), JsonValue::from(r.column.clone()));
+                            m.insert(
+                                "composite".to_string(),
+                                JsonValue::Array(
+                                    r.composite
+                                        .iter()
+                                        .map(|(a, b)| {
+                                            JsonValue::Array(vec![
+                                                JsonValue::from(a.clone()),
+                                                JsonValue::from(b.clone()),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                            JsonValue::Object(m)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(s) = &c.value_sketch {
+            o.insert("value_sketch".to_string(), s.to_json());
+        }
+        JsonValue::Object(o)
+    }
+
+    fn column_from_json(v: &JsonValue) -> Option<ColumnProfile> {
+        let numeric_stats = match v.get("numeric_stats") {
+            None => None,
+            Some(n) => Some(NumericStats {
+                count: n.get("count")?.as_u64()?,
+                min: n.get("min")?.as_f64()?,
+                max: n.get("max")?.as_f64()?,
+                mean: n.get("mean")?.as_f64()?,
+                stddev: n.get("stddev")?.as_f64()?,
+                median: n.get("median")?.as_f64()?,
+                percentiles: n
+                    .get("percentiles")?
+                    .as_array()?
+                    .iter()
+                    .map(|p| {
+                        let p = p.as_array()?;
+                        Some((p.first()?.as_str()?.to_string(), p.get(1)?.as_f64()?))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            }),
+        };
+        let references = match v.get("references") {
+            None => Vec::new(),
+            Some(r) => r
+                .as_array()?
+                .iter()
+                .map(|r| {
+                    Some(ColumnRef {
+                        table: r.get("table")?.as_str()?.to_string(),
+                        column: r.get("column")?.as_str()?.to_string(),
+                        composite: r
+                            .get("composite")?
+                            .as_array()?
+                            .iter()
+                            .map(|p| {
+                                let p = p.as_array()?;
+                                Some((
+                                    p.first()?.as_str()?.to_string(),
+                                    p.get(1)?.as_str()?.to_string(),
+                                ))
+                            })
+                            .collect::<Option<Vec<_>>>()?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        };
+        Some(ColumnProfile {
+            name: v.get("name")?.as_str()?.to_string(),
+            current_type: v.get("current_type")?.as_str()?.to_string(),
+            ideal_type: v.get("ideal_type")?.as_str()?.to_string(),
+            description: v.get("description")?.as_str()?.to_string(),
+            missing_pct: v.get("missing_pct")?.as_f64()?,
+            sample_values: strings_of(v.get("sample_values")),
+            notes: v.get("notes")?.as_str()?.to_string(),
+            row_count: usize::try_from(v.get("row_count")?.as_u64()?).ok()?,
+            numeric_stats,
+            content: match v.get("content") {
+                None => None,
+                Some(c) => Some(Box::new(content_from_json(c)?)),
+            },
+            references,
+            value_sketch: match v.get("value_sketch") {
+                None => None,
+                Some(s) => Some(ValueSketch::from_json(s)?),
+            },
+            temporal_format: None,
+        })
+    }
+
+    fn file_to_json(f: &KgFile) -> JsonValue {
+        let mut o = json_support::Map::new();
+        o.insert("rel".to_string(), JsonValue::from(f.rel.clone()));
+        o.insert("name".to_string(), JsonValue::from(f.name.clone()));
+        o.insert(
+            "file_type".to_string(),
+            JsonValue::from(f.file_type.clone()),
+        );
+        o.insert("kind".to_string(), JsonValue::from(f.kind.as_str()));
+        o.insert("size".to_string(), JsonValue::from(f.size));
+        o.insert(
+            "tables".to_string(),
+            JsonValue::Array(
+                f.tables
+                    .iter()
+                    .map(|(name, cols)| {
+                        JsonValue::Array(vec![
+                            JsonValue::from(name.clone()),
+                            JsonValue::Array(cols.iter().map(column_to_json).collect()),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+        if let Some(t) = &f.text {
+            o.insert("text".to_string(), content_to_json(t));
+        }
+        if let Some(e) = &f.error {
+            o.insert("error".to_string(), JsonValue::from(e.clone()));
+        }
+        o.insert("fixed_schema".to_string(), JsonValue::from(f.fixed_schema));
+        o.insert(
+            "truncated_scan".to_string(),
+            JsonValue::from(f.truncated_scan),
+        );
+        JsonValue::Object(o)
+    }
+
+    fn file_from_json(v: &JsonValue) -> Option<KgFile> {
+        let kind = match v.get("kind")?.as_str()? {
+            "data" => FileKind::Data,
+            "text" => FileKind::Text,
+            "binary" => FileKind::Binary,
+            "failed" => FileKind::Failed,
+            _ => return None,
+        };
+        let tables = v
+            .get("tables")?
+            .as_array()?
+            .iter()
+            .map(|t| {
+                let t = t.as_array()?;
+                let cols = t
+                    .get(1)?
+                    .as_array()?
+                    .iter()
+                    .map(column_from_json)
+                    .collect::<Option<Vec<_>>>()?;
+                Some((t.first()?.as_str()?.to_string(), cols))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(KgFile {
+            rel: v.get("rel")?.as_str()?.to_string(),
+            name: v.get("name")?.as_str()?.to_string(),
+            file_type: v.get("file_type")?.as_str()?.to_string(),
+            kind,
+            size: v.get("size")?.as_u64()?,
+            tables,
+            text: match v.get("text") {
+                None => None,
+                Some(t) => Some(content_from_json(t)?),
+            },
+            error: v.get("error").and_then(|e| e.as_str()).map(str::to_string),
+            fixed_schema: v.get("fixed_schema")?.as_bool()?,
+            truncated_scan: v.get("truncated_scan")?.as_bool()?,
+        })
     }
 
     fn extension_of(name: &str) -> String {
@@ -116187,6 +116701,15 @@ OPTIONS:
         --samples <N>           Sample values per column (default: 3)
         --jobs <N>              Worker threads reading files (default: all
                                 cores); the graph is the same at any count
+        --no-cache              Read every file again. By default each
+                                file's result is kept in
+                                OUTPUT_DIR/.sniff-rs-cache, and a re-run
+                                reads only files whose size or modified
+                                time changed (adding, removing or renaming
+                                any file re-reads all, since a text may
+                                name it)
+        --cache-dir <DIR>       Keep the cache in DIR (also with OUTPUT_DIR
+                                "-", which has none by default)
         --include <GLOB>        Only files matching GLOB (repeatable)
         --exclude <GLOB>        Skip files matching GLOB (repeatable)
         --output-format <FMT>   With OUTPUT_DIR "-": json (default) or md
@@ -116201,6 +116724,8 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut exclude: Vec<String> = Vec::new();
     let mut output_format: Option<String> = None;
     let mut jobs: Option<usize> = None;
+    let mut no_cache = false;
+    let mut cache_dir_arg: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0;
     while i < raw.len() {
@@ -116243,6 +116768,13 @@ fn run_graph(raw: &[String]) -> Result<()> {
                             anyhow!("--samples must be a positive integer, got {raw_value:?}")
                         })?;
                 }
+                "no-cache" => {
+                    if inline_value.is_some() {
+                        bail!("--no-cache takes no value");
+                    }
+                    no_cache = true;
+                }
+                "cache-dir" => cache_dir_arg = Some(PathBuf::from(value(&mut i)?)),
                 "jobs" => {
                     let raw_value = value(&mut i)?;
                     jobs = Some(
@@ -116287,6 +116819,31 @@ fn run_graph(raw: &[String]) -> Result<()> {
         Some(other) => bail!("unrecognized --output-format '{other}' (expected json or md)"),
     };
 
+    if no_cache && cache_dir_arg.is_some() {
+        bail!("--no-cache and --cache-dir contradict each other");
+    }
+    // The output directory is settled (and checked) before any file is
+    // read, so a folder this tool didn't write is refused up front, and
+    // the per-file cache has somewhere to live.
+    let dir = if to_stdout {
+        None
+    } else {
+        let d = match &output {
+            Some(d) => d.clone(),
+            None => default_graph_dir(&input)?,
+        };
+        knowledge_graph::prepare_generated_dir(&d)?;
+        Some(d)
+    };
+    let cache_dir = if no_cache {
+        None
+    } else {
+        cache_dir_arg
+            .or_else(|| dir.as_ref().map(|d| d.join(knowledge_graph::CACHE_DIR)))
+    };
+    if let Some(c) = &cache_dir {
+        fs::create_dir_all(c).with_context(|| format!("failed to create {c:?}"))?;
+    }
     let (name, files) = knowledge_graph::collect(
         &input,
         &knowledge_graph::CollectOptions {
@@ -116295,7 +116852,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
             exclude,
             progress: true,
             jobs,
-            cache_dir: None,
+            cache_dir,
         },
     )?;
     if files.is_empty() {
@@ -116332,11 +116889,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let dir = match output {
-        Some(d) => d,
-        None => default_graph_dir(&input)?,
-    };
-    knowledge_graph::prepare_generated_dir(&dir)?;
+    let dir = dir.expect("a graph directory was chosen above unless the output is stdout");
     let graph_path = dir.join("graph.json");
     fs::write(
         &graph_path,
