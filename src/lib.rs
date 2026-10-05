@@ -109587,11 +109587,26 @@ struct GraphArgs {
     /// with, and `load_graph_input` says so on stderr rather than
     /// silently ignoring the flag.
     samples: Option<usize>,
+    /// `--relation` / `--confidence` / `--min-score`: which links a
+    /// knowledge-graph query looks at.
+    filter: knowledge_graph::GraphFilter,
+    /// `--depth`: how many hops `explain` follows (1 is direct links).
+    depth: usize,
+    /// `--paths`: how many routes `path` lists.
+    paths: usize,
+    /// `--top`: how many rows `rank` lists.
+    top: Option<usize>,
+    /// `--sort importance`: `rank` orders by PageRank, not by degree.
+    by_importance: bool,
 }
 
 fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
     let mut output_format = "md".to_string();
     let mut samples: Option<usize> = None;
+    let mut filter = knowledge_graph::GraphFilter::default();
+    let (mut depth, mut paths): (usize, usize) = (1, 1);
+    let mut top: Option<usize> = None;
+    let mut by_importance = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0;
     while i < raw.len() {
@@ -109626,6 +109641,63 @@ fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
                     }
                     samples = Some(parsed);
                 }
+                "relation" => {
+                    let list = knowledge_graph::GraphFilter::parse_relations(&value(&mut i)?)?;
+                    filter.relations.get_or_insert_with(Vec::new).extend(list);
+                }
+                "confidence" => {
+                    let v = value(&mut i)?;
+                    filter.min_confidence = match v.to_ascii_lowercase().as_str() {
+                        "extracted" => Some(knowledge_graph::Conf::Extracted),
+                        "inferred" => Some(knowledge_graph::Conf::Inferred),
+                        "any" | "ambiguous" => None,
+                        other => bail!(
+                            "--confidence must be extracted, inferred or any, got {other:?}"
+                        ),
+                    };
+                }
+                "min-score" => {
+                    let v = value(&mut i)?;
+                    filter.min_score = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|x: &f64| x.is_finite())
+                            .ok_or_else(|| anyhow!("--min-score must be a number, got {v:?}"))?,
+                    );
+                }
+                "depth" => {
+                    let v = value(&mut i)?;
+                    depth = v
+                        .parse()
+                        .ok()
+                        .filter(|n: &usize| (1..=6).contains(n))
+                        .ok_or_else(|| anyhow!("--depth must be 1 to 6, got {v:?}"))?;
+                }
+                "paths" => {
+                    let v = value(&mut i)?;
+                    paths = v
+                        .parse()
+                        .ok()
+                        .filter(|n: &usize| (1..=20).contains(n))
+                        .ok_or_else(|| anyhow!("--paths must be 1 to 20, got {v:?}"))?;
+                }
+                "top" => {
+                    let v = value(&mut i)?;
+                    top = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|n: &usize| *n > 0)
+                            .ok_or_else(|| anyhow!("--top must be a positive integer, got {v:?}"))?,
+                    );
+                }
+                "sort" => {
+                    let v = value(&mut i)?;
+                    by_importance = match v.to_ascii_lowercase().as_str() {
+                        "degree" => false,
+                        "importance" => true,
+                        other => bail!("--sort must be degree or importance, got {other:?}"),
+                    };
+                }
                 other => bail!("unrecognized flag --{other}"),
             }
         } else {
@@ -109644,7 +109716,38 @@ fn parse_graph_args(raw: &[String], help_text: &str) -> Result<GraphArgs> {
         output: None,
         format: GraphFormat::parse(&output_format)?,
         samples,
+        filter,
+        depth,
+        paths,
+        top,
+        by_importance,
     })
+}
+
+/// The options only a knowledge-graph query understands, refused (rather
+/// than silently ignored) when the input is a dictionary or a data file.
+fn reject_graph_only_options(args: &GraphArgs, which: &[&str]) -> Result<()> {
+    let mut used = Vec::new();
+    if !args.filter.is_default() {
+        used.push("--relation/--confidence/--min-score");
+    }
+    if which.contains(&"explain") && args.depth != 1 {
+        used.push("--depth");
+    }
+    if which.contains(&"path") && args.paths != 1 {
+        used.push("--paths");
+    }
+    if which.contains(&"rank") && (args.top.is_some() || args.by_importance) {
+        used.push("--top/--sort");
+    }
+    if used.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{} apply to a knowledge graph (a directory or a graph.json from `sniff-rs graph`); {:?} is a table-level input",
+        used.join(" and "),
+        args.input
+    );
 }
 
 /// Split a subcommand's trailing positionals into its required args plus
@@ -110071,15 +110174,17 @@ fn run_explain(raw: &[String]) -> Result<()> {
     let (positionals, output) = split_graph_rest(&args.rest, 1, "<INPUT> <COLUMN> [OUTPUT_PATH]")?;
     args.output = output;
     let column_spec = positionals[0].clone();
-    if let Some(kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+    if let Some(mut kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+        args.filter.apply(&mut kg);
         let node = knowledge_graph::resolve_node(&kg, &column_spec)?;
-        let rendered = knowledge_graph::render_explain(&kg, node, &args.format)?;
+        let rendered = knowledge_graph::render_explain(&kg, node, &args.format, args.depth)?;
         return emit_graph_output(
             &rendered,
             &args.output,
             &format!("{} explained", kg.nodes[node].id),
         );
     }
+    reject_graph_only_options(&args, &["explain"])?;
     let tables = load_graph_input(&args.input, args.samples)?;
     let graph = build_table_graph(&tables);
     let (table, idx) = resolve_graph_column(&tables, &column_spec)?;
@@ -110214,7 +110319,8 @@ fn run_path(raw: &[String]) -> Result<()> {
     )?;
     args.output = output;
     let (from, to) = (positionals[0].clone(), positionals[1].clone());
-    if let Some(kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+    if let Some(mut kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+        args.filter.apply(&mut kg);
         let (a, b) = (
             knowledge_graph::resolve_node(&kg, &from)?,
             knowledge_graph::resolve_node(&kg, &to)?,
@@ -110222,16 +110328,17 @@ fn run_path(raw: &[String]) -> Result<()> {
         if a == b {
             bail!("{from:?} and {to:?} are the same node - a path needs two different ones");
         }
-        let hops = knowledge_graph::shortest_path(&kg, a, b).ok_or_else(|| {
-            anyhow!(
+        let routes = knowledge_graph::ranked_paths(&kg, a, b, args.paths);
+        if routes.is_empty() {
+            bail!(
                 "no path between {:?} and {:?} ({} nodes, {} links) - they sit in parts of the graph nothing connects",
                 kg.nodes[a].id,
                 kg.nodes[b].id,
                 kg.nodes.len(),
                 kg.edges.len()
-            )
-        })?;
-        let rendered = knowledge_graph::render_path(&kg, a, b, &hops, &args.format)?;
+            );
+        }
+        let rendered = knowledge_graph::render_paths(&kg, a, b, &routes, &args.format)?;
         return emit_graph_output(
             &rendered,
             &args.output,
@@ -110241,6 +110348,7 @@ fn run_path(raw: &[String]) -> Result<()> {
     if from == to {
         bail!("{from:?} and {to:?} are the same table - a join path needs two different tables");
     }
+    reject_graph_only_options(&args, &["path"])?;
     let tables = load_graph_input(&args.input, args.samples)?;
     for name in [&from, &to] {
         if !tables.contains_key(name) {
@@ -110657,8 +110765,15 @@ fn run_rank(raw: &[String]) -> Result<()> {
     let (positionals, output) = split_graph_rest(&args.rest, 0, "<INPUT> [OUTPUT_PATH]")?;
     debug_assert!(positionals.is_empty());
     args.output = output;
-    if let Some(kg) = load_knowledge_graph_input(&args.input, args.samples)? {
-        let rendered = knowledge_graph::render_rank(&kg, &args.format, &args.input)?;
+    if let Some(mut kg) = load_knowledge_graph_input(&args.input, args.samples)? {
+        args.filter.apply(&mut kg);
+        let rendered = knowledge_graph::render_rank(
+            &kg,
+            &args.format,
+            &args.input,
+            args.top,
+            args.by_importance,
+        )?;
         return emit_graph_output(
             &rendered,
             &args.output,
@@ -110669,6 +110784,7 @@ fn run_rank(raw: &[String]) -> Result<()> {
             ),
         );
     }
+    reject_graph_only_options(&args, &["rank"])?;
     let tables = load_graph_input(&args.input, args.samples)?;
     let graph = build_table_graph(&tables);
     let components = connected_components(&graph);
@@ -117596,6 +117712,68 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         }
     }
 
+    // ---- Query filters ----
+
+    /// Which links a query looks at: only some relations, only links at
+    /// least as sure as a confidence tier, only links scoring at least
+    /// so much. The graph is trimmed before the query runs, so every
+    /// answer - what a node connects to, the route between two nodes,
+    /// importance, cut nodes - is about the links that were kept.
+    #[derive(Default, Clone)]
+    pub(crate) struct GraphFilter {
+        pub(crate) relations: Option<Vec<Relation>>,
+        /// The weakest tier kept: `Extracted` keeps only extracted links,
+        /// `Inferred` keeps extracted and inferred.
+        pub(crate) min_confidence: Option<Conf>,
+        pub(crate) min_score: Option<f64>,
+    }
+
+    impl GraphFilter {
+        pub(crate) fn is_default(&self) -> bool {
+            self.relations.is_none() && self.min_confidence.is_none() && self.min_score.is_none()
+        }
+
+        /// A comma-separated list of relation names (`joins,references`).
+        pub(crate) fn parse_relations(list: &str) -> Result<Vec<Relation>> {
+            let mut out = Vec::new();
+            for name in list.split(',') {
+                let name = name.trim().to_ascii_lowercase();
+                if name.is_empty() {
+                    continue;
+                }
+                match Relation::parse(&name) {
+                    Some(r) => {
+                        if !out.contains(&r) {
+                            out.push(r);
+                        }
+                    }
+                    None => bail!(
+                        "unknown relation {name:?} (expected {})",
+                        Relation::ALL
+                            .iter()
+                            .map(|r| r.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
+            Ok(out)
+        }
+
+        pub(crate) fn apply(&self, kg: &mut KnowledgeGraph) {
+            if self.is_default() {
+                return;
+            }
+            kg.edges.retain(|e| {
+                self.relations
+                    .as_ref()
+                    .is_none_or(|rs| rs.contains(&e.relation))
+                    && self.min_confidence.is_none_or(|c| e.confidence <= c)
+                    && self.min_score.is_none_or(|m| e.score >= m)
+            });
+        }
+    }
+
     // ---- Graph drift ----
 
     /// What changed between two builds of a graph.
@@ -118068,10 +118246,46 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
 
     /// `explain` over a knowledge graph: the node, then every link it
     /// has, grouped by relation, strongest first.
+    /// Nodes within `depth` hops of `i` over the content links, nearest
+    /// first: (node, distance, the neighbor it was reached through).
+    fn neighborhood(kg: &KnowledgeGraph, i: usize, depth: usize) -> Vec<(usize, usize, usize)> {
+        let inc = kg.incidence();
+        let mut seen: HashMap<usize, usize> = HashMap::new();
+        seen.insert(i, 0);
+        let mut out = Vec::new();
+        let mut frontier: Vec<(usize, usize)> = vec![(i, i)];
+        for d in 1..=depth {
+            let mut next: Vec<(usize, usize)> = Vec::new();
+            for &(node, via) in &frontier {
+                for &ei in &inc[node] {
+                    let e = &kg.edges[ei];
+                    if e.relation.structural() || e.source == e.target {
+                        continue;
+                    }
+                    let other = if e.source == node { e.target } else { e.source };
+                    if seen.contains_key(&other) {
+                        continue;
+                    }
+                    seen.insert(other, d);
+                    let reached_via = if d == 1 { other } else { via };
+                    out.push((other, d, reached_via));
+                    next.push((other, reached_via));
+                }
+            }
+            frontier = next;
+        }
+        out.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| kg.nodes[a.0].id.cmp(&kg.nodes[b.0].id))
+        });
+        out
+    }
+
     pub(crate) fn render_explain(
         kg: &KnowledgeGraph,
         i: usize,
         format: &GraphFormat,
+        depth: usize,
     ) -> Result<String> {
         let degrees = kg.content_degrees();
         let inc = kg.incidence();
@@ -118111,6 +118325,30 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     }
                 }
                 doc.insert("node".to_string(), node);
+                if depth > 1 {
+                    doc.insert(
+                        "neighborhood".to_string(),
+                        JsonValue::Array(
+                            neighborhood(kg, i, depth)
+                                .iter()
+                                .filter(|(_, d, _)| *d > 1)
+                                .map(|(o, d, via)| {
+                                    let mut m = json_support::Map::new();
+                                    m.insert(
+                                        "node".to_string(),
+                                        JsonValue::from(kg.nodes[*o].id.clone()),
+                                    );
+                                    m.insert("distance".to_string(), JsonValue::from(*d));
+                                    m.insert(
+                                        "via".to_string(),
+                                        JsonValue::from(kg.nodes[*via].id.clone()),
+                                    );
+                                    JsonValue::Object(m)
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
                 doc.insert(
                     "connections".to_string(),
                     JsonValue::Array(
@@ -118216,9 +118454,11 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     ));
                     for (_, conf, _, _, other, direction, ei) in group.iter().take(MAX_TOC_ENTRIES)
                     {
-                        let arrow = match (*direction, rel) {
-                            ("in", Relation::References) => "referenced by ",
-                            ("in", Relation::Contains) => "part of ",
+                        let arrow = match (*direction, rel, kg.edges[*ei].directed) {
+                            ("in", Relation::References, _) => "referenced by ",
+                            ("in", Relation::Contains, _) => "part of ",
+                            ("out", Relation::Joins, true) => "references → ",
+                            ("in", Relation::Joins, true) => "referenced by ← ",
                             _ => "",
                         };
                         let o = &kg.nodes[*other];
@@ -118238,21 +118478,73 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     }
                     rel_start = rel_end;
                 }
+                if depth > 1 {
+                    let near = neighborhood(kg, i, depth);
+                    for d in 2..=depth {
+                        let at: Vec<&(usize, usize, usize)> =
+                            near.iter().filter(|x| x.1 == d).collect();
+                        if at.is_empty() {
+                            continue;
+                        }
+                        out.push_str(&format!(
+                            "\n## {} hops away ({})\n\n",
+                            d,
+                            at.len()
+                        ));
+                        for (o, _, via) in at.iter().take(MAX_TOC_ENTRIES) {
+                            out.push_str(&format!(
+                                "- {} (through `{}`)\n",
+                                node_ref(&kg.nodes[*o]),
+                                md(&kg.nodes[*via].id)
+                            ));
+                        }
+                        if at.len() > MAX_TOC_ENTRIES {
+                            out.push_str(&format!(
+                                "- …and {} more (--output-format json lists them all)\n",
+                                at.len() - MAX_TOC_ENTRIES
+                            ));
+                        }
+                    }
+                }
                 Ok(out)
             }
         }
     }
 
-    /// Cheapest path between two nodes: every hop costs the same, plus a
-    /// little more for an INFERRED or AMBIGUOUS link and for passing
-    /// through an identifier many files share - so the path prefers
-    /// specific, extracted links when two paths are otherwise equally
-    /// short. Ties break by node order, so the answer is stable.
-    pub(crate) fn shortest_path(kg: &KnowledgeGraph, from: usize, to: usize) -> Option<Vec<usize>> {
+    /// What one hop costs: every hop the same, plus a little more for an
+    /// INFERRED or AMBIGUOUS link and for passing through an identifier
+    /// many files share - so a route prefers specific, extracted links when
+    /// two are otherwise equally short.
+    fn hop_cost(kg: &KnowledgeGraph, degrees: &[usize], e: &KgEdge, next: usize, to: usize) -> u64 {
+        let mut cost = 1000u64
+            + match e.confidence {
+                Conf::Extracted => 0,
+                Conf::Inferred => 250,
+                Conf::Ambiguous => 500,
+            };
+        if e.relation.derived() {
+            cost += 200;
+        }
+        if next != to && kg.nodes[next].node_type == NodeType::Entity {
+            cost += 20 * degrees[next].min(50) as u64;
+        }
+        cost
+    }
+
+    /// Cheapest route between two nodes, as edge indices, never using a
+    /// banned edge or stepping on a banned node. Ties break by node order,
+    /// so the answer is stable.
+    fn cheapest_route(
+        kg: &KnowledgeGraph,
+        inc: &[Vec<usize>],
+        degrees: &[usize],
+        from: usize,
+        to: usize,
+        banned_edges: &HashSet<usize>,
+        banned_nodes: &HashSet<usize>,
+    ) -> Option<Vec<usize>> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
-        let inc = kg.incidence();
-        let degrees = kg.content_degrees();
         let mut dist = vec![u64::MAX; kg.nodes.len()];
         let mut prev: Vec<Option<usize>> = vec![None; kg.nodes.len()];
         let mut heap = BinaryHeap::new();
@@ -118266,21 +118558,15 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 break;
             }
             for &ei in &inc[node] {
-                let e = &kg.edges[ei];
-                let next = if e.source == node { e.target } else { e.source };
-                if next == node {
+                if banned_edges.contains(&ei) {
                     continue;
                 }
-                let mut cost = 1000u64
-                    + match e.confidence {
-                        Conf::Extracted => 0,
-                        Conf::Inferred => 250,
-                        Conf::Ambiguous => 500,
-                    };
-                if next != to && kg.nodes[next].node_type == NodeType::Entity {
-                    cost += 20 * degrees[next].min(50) as u64;
+                let e = &kg.edges[ei];
+                let next = if e.source == node { e.target } else { e.source };
+                if next == node || banned_nodes.contains(&next) {
+                    continue;
                 }
-                let nd = d + cost;
+                let nd = d + hop_cost(kg, degrees, e, next, to);
                 if nd < dist[next] {
                     dist[next] = nd;
                     prev[next] = Some(ei);
@@ -118301,6 +118587,123 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         }
         hops.reverse();
         Some(hops)
+    }
+
+    /// Up to `k` different routes between two nodes, cheapest first, none
+    /// repeating a node (Yen's algorithm over `cheapest_route`).
+    pub(crate) fn ranked_paths(
+        kg: &KnowledgeGraph,
+        from: usize,
+        to: usize,
+        k: usize,
+    ) -> Vec<Vec<usize>> {
+        let inc = kg.incidence();
+        let degrees = kg.content_degrees();
+        let none = HashSet::new();
+        let Some(first) = cheapest_route(kg, &inc, &degrees, from, to, &none, &none) else {
+            return Vec::new();
+        };
+        let cost = |hops: &[usize]| -> u64 {
+            let mut cur = from;
+            let mut total = 0;
+            for &ei in hops {
+                let e = &kg.edges[ei];
+                let next = if e.source == cur { e.target } else { e.source };
+                total += hop_cost(kg, &degrees, e, next, to);
+                cur = next;
+            }
+            total
+        };
+        // The node reached after each hop prefix.
+        let nodes_of = |hops: &[usize]| -> Vec<usize> {
+            let mut out = vec![from];
+            let mut cur = from;
+            for &ei in hops {
+                let e = &kg.edges[ei];
+                cur = if e.source == cur { e.target } else { e.source };
+                out.push(cur);
+            }
+            out
+        };
+        let mut found: Vec<Vec<usize>> = vec![first];
+        let mut candidates: Vec<(u64, Vec<usize>)> = Vec::new();
+        while found.len() < k {
+            let last = found.last().expect("non-empty").clone();
+            let last_nodes = nodes_of(&last);
+            for i in 0..last.len() {
+                let spur = last_nodes[i];
+                let root = &last[..i];
+                let mut banned_edges: HashSet<usize> = HashSet::new();
+                for p in &found {
+                    if p.len() > i && p[..i] == *root {
+                        banned_edges.insert(p[i]);
+                    }
+                }
+                let banned_nodes: HashSet<usize> = last_nodes[..i].iter().copied().collect();
+                if let Some(tail) =
+                    cheapest_route(kg, &inc, &degrees, spur, to, &banned_edges, &banned_nodes)
+                {
+                    let mut hops = root.to_vec();
+                    hops.extend(tail);
+                    if !found.contains(&hops) && !candidates.iter().any(|c| c.1 == hops) {
+                        candidates.push((cost(&hops), hops));
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                break;
+            }
+            candidates.sort();
+            found.push(candidates.remove(0).1);
+        }
+        found
+    }
+
+    /// Several routes as one report; one route reads exactly as
+    /// `render_path` does.
+    pub(crate) fn render_paths(
+        kg: &KnowledgeGraph,
+        from: usize,
+        to: usize,
+        routes: &[Vec<usize>],
+        format: &GraphFormat,
+    ) -> Result<String> {
+        if routes.len() == 1 {
+            return render_path(kg, from, to, &routes[0], format);
+        }
+        match format {
+            GraphFormat::Json => {
+                let mut doc = json_support::Map::new();
+                doc.insert("from".to_string(), JsonValue::from(kg.nodes[from].id.clone()));
+                doc.insert("to".to_string(), JsonValue::from(kg.nodes[to].id.clone()));
+                let mut all = Vec::new();
+                for r in routes {
+                    let one = render_path(kg, from, to, r, format)?;
+                    all.push(json_support::from_str(&one).map_err(|e| anyhow!("{e}"))?);
+                }
+                doc.insert("paths".to_string(), JsonValue::Array(all));
+                Ok(json_support::to_pretty_string(&JsonValue::Object(doc)))
+            }
+            GraphFormat::Md => {
+                let mut out = format!(
+                    "# {} routes: {} → {}\n\n",
+                    routes.len(),
+                    md(&kg.nodes[from].label),
+                    md(&kg.nodes[to].label)
+                );
+                for (n, r) in routes.iter().enumerate() {
+                    let one = render_path(kg, from, to, r, format)?;
+                    let body = one.split_once("\n\n").map_or(one.as_str(), |x| x.1);
+                    out.push_str(&format!(
+                        "## Route {} ({} hop{})\n\n{body}\n",
+                        n + 1,
+                        r.len(),
+                        if r.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                Ok(out)
+            }
+        }
     }
 
     pub(crate) fn render_path(
@@ -118393,15 +118796,25 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         kg: &KnowledgeGraph,
         format: &GraphFormat,
         input: &Path,
+        top: Option<usize>,
+        by_importance: bool,
     ) -> Result<String> {
+        let cap = top.unwrap_or(MAX_TOC_ENTRIES);
         let degrees = kg.content_degrees();
         let importance = node_importance(kg);
         let cut = cut_vertices(kg);
         let mut order: Vec<usize> = (0..kg.nodes.len()).collect();
         order.sort_by(|a, b| {
-            degrees[*b]
-                .cmp(&degrees[*a])
-                .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+            if by_importance {
+                importance[*b]
+                    .partial_cmp(&importance[*a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+            } else {
+                degrees[*b]
+                    .cmp(&degrees[*a])
+                    .then_with(|| kg.nodes[*a].id.cmp(&kg.nodes[*b].id))
+            }
         });
         match format {
             GraphFormat::Json => {
@@ -118469,7 +118882,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     .copied()
                     .filter(|i| matches!(kg.nodes[*i].node_type, NodeType::File | NodeType::Table))
                     .collect();
-                for i in data.iter().take(MAX_TOC_ENTRIES) {
+                for i in data.iter().take(cap) {
                     let n = &kg.nodes[*i];
                     out.push_str(&format!(
                         "| `{}` | {} | {} | {:.2} | {} | {} |\n",
@@ -118481,10 +118894,10 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                         n.community
                     ));
                 }
-                if data.len() > MAX_TOC_ENTRIES {
+                if data.len() > cap {
                     out.push_str(&format!(
                         "| …and {} more | | | | | |\n",
-                        data.len() - MAX_TOC_ENTRIES
+                        data.len() - cap
                     ));
                 }
                 let entities: Vec<usize> = order
