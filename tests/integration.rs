@@ -18158,3 +18158,503 @@ fn fastq_gz_reads_through_the_wrapper() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn arff_reads_nominal_numeric_and_missing_values() {
+    let doc = run_json("edge_arff_weather.arff", &[]);
+    assert_eq!(doc["format"], "arff");
+    let t = "edge_arff_weather";
+    assert_eq!(
+        col_names(&doc, t),
+        ["outlook", "temperature", "humidity", "windy", "play"]
+    );
+    assert_eq!(table(&doc, t)[0]["row_count"], 8);
+    // `?` is missing: one outlook and one temperature.
+    assert_eq!(column(table(&doc, t), "outlook")["missing_pct"], 12.5);
+    assert_eq!(column(table(&doc, t), "temperature")["ideal_type"], "i64");
+    assert_eq!(column(table(&doc, t), "windy")["ideal_type"], "bool");
+}
+
+#[test]
+fn arff_quoted_names_values_escapes_and_a_quoted_question_mark() {
+    let doc = run_json("edge_arff_quoted_and_types.arff", &[]);
+    let t = "edge_arff_quoted_and_types";
+    assert_eq!(
+        col_names(&doc, t),
+        [
+            "customer id",
+            "name",
+            "signup date",
+            "score",
+            "plan type",
+            "note"
+        ]
+    );
+    assert_eq!(
+        column(table(&doc, t), "signup date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    let sql = run_sql("edge_arff_quoted_and_types.arff", &[]);
+    // A comma inside quotes, a backslash-escaped quote, a quoted '?'.
+    assert!(sql.contains("'Smith, Jane'"), "{sql}");
+    assert!(sql.contains("'said ''hi'''"), "{sql}");
+    assert!(sql.contains("'?'"), "{sql}");
+}
+
+#[test]
+fn arff_sparse_rows_fill_in_weka_defaults() {
+    let sql = run_sql("edge_arff_sparse.arff", &[]);
+    // Row 3 is `{0 3}`: every other value is the default - 0 for a number,
+    // the first label for a nominal.
+    assert!(sql.contains("(3, 0, 0, 0, 'spam', 'x')"), "{sql}");
+    // Row 4 has an explicit `?`.
+    assert!(sql.contains("(0, 7, NULL, 0, 'spam', 'y')"), "{sql}");
+}
+
+#[test]
+fn arff_instance_weights_are_dropped() {
+    let doc = run_json("edge_arff_weighted.arff", &[]);
+    assert_eq!(col_names(&doc, "edge_arff_weighted"), ["a", "b", "c"]);
+    assert_eq!(table(&doc, "edge_arff_weighted")[0]["row_count"], 4);
+    let sql = run_sql("edge_arff_sparse_weighted.arff", &[]);
+    assert!(
+        sql.contains("(1, 'u', 10)") && sql.contains("(0, 'u', 0)"),
+        "{sql}"
+    );
+}
+
+#[test]
+fn arff_without_an_extension_is_sniffed_from_at_relation() {
+    let dir = std::env::temp_dir().join(format!("sniff-rs-arff-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("weather_data");
+    std::fs::copy(fixture("edge_arff_weather.arff"), &path).unwrap();
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["format"], "arff");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_arff_row_with_the_wrong_number_of_values_names_its_line() {
+    let path = fixture("malformed_arff_short_row.arff");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(
+        stderr.contains("line 6") && stderr.contains("1 values but 2 attributes"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_relational_arff_attribute_is_refused_clearly() {
+    let path = fixture("malformed_arff_relational.arff");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("relational ARFF attributes"), "{stderr}");
+}
+
+#[test]
+fn a_column_with_a_few_missing_values_is_nullable_not_not_null() {
+    // 1 missing in 4,000 is 0.025%: one decimal used to round that to 0.0,
+    // which dropped the "has missing values" note and declared the column
+    // NOT NULL, so the first NULL broke the load.
+    let dir = std::env::temp_dir().join(format!("sniff-rs-rare-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rare.csv");
+    let mut text = String::from("id,speed\n");
+    for i in 0..4000 {
+        if i == 1234 {
+            text.push_str(&format!("{i},\n"));
+        } else {
+            text.push_str(&format!("{i},{}\n", f64::from(i) / 4.0));
+        }
+    }
+    std::fs::write(&path, text).unwrap();
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let speed = column(table(&doc, "rare"), "speed");
+    assert_eq!(speed["missing_pct"], 0.025);
+    assert!(
+        speed["notes"]
+            .as_str()
+            .unwrap()
+            .contains("has missing values"),
+        "{speed}"
+    );
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "sql"])
+        .output()
+        .unwrap();
+    let sql = String::from_utf8_lossy(&out.stdout);
+    assert!(sql.contains("\"speed\" DOUBLE PRECISION\n"), "{sql}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(any(feature = "rdata", feature = "html", feature = "markdown"))]
+fn tables_of(doc: &serde_json::Value) -> Vec<String> {
+    doc["tables"].as_object().unwrap().keys().cloned().collect()
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_data_frame_keeps_na_nan_inf_factors_and_logicals() {
+    let doc = run_json("edge_rdata_pyreadr_one.Rds", &[]);
+    assert_eq!(doc["format"], "rdata");
+    let t = "edge_rdata_pyreadr_one";
+    let tab = table(&doc, t);
+    assert_eq!(tab[0]["row_count"], 6);
+    // num = c(1, 2, 3, Inf, NA, NaN): the NA is missing, Inf and NaN aren't.
+    let num = column(tab, "num");
+    assert_eq!(num["current_type"], "double");
+    assert_eq!(num["missing_pct"], 16.7);
+    assert!(
+        num["notes"].as_str().unwrap().contains("non-finite"),
+        "{num}"
+    );
+    assert_eq!(column(tab, "int")["current_type"], "integer");
+    assert_eq!(column(tab, "fac")["current_type"], "factor");
+    assert_eq!(column(tab, "log")["ideal_type"], "bool");
+    assert_eq!(column(tab, "tstamp1")["current_type"], "POSIXct");
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_serialization_version_3_reads_like_version_2() {
+    let v2 = run_json("edge_rdata_pyreadr_one.Rds", &[]);
+    let v3 = run_json("edge_rdata_pyreadr_one_v3.Rds", &[]);
+    let cols = |d: &serde_json::Value, t: &str| {
+        table(d, t)
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].clone(),
+                    c["current_type"].clone(),
+                    c["sample_values"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        cols(&v2, "edge_rdata_pyreadr_one"),
+        cols(&v3, "edge_rdata_pyreadr_one_v3")
+    );
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_save_file_is_one_table_per_object_and_compression_is_transparent() {
+    let gz = run_json("edge_rdata_pyreadr_two.RData", &[]);
+    assert_eq!(tables_of(&gz), ["char", "df1", "df2", "mylist"]);
+    for name in ["bzip2", "xz", "v3"] {
+        // (Same data, though the bzip2 file's timestamps were saved as text.)
+        let other = run_json(&format!("edge_rdata_pyreadr_two_{name}.RData"), &[]);
+        assert_eq!(tables_of(&gz), tables_of(&other), "{name}");
+        assert_eq!(col_names(&gz, "df1"), col_names(&other, "df1"), "{name}");
+        assert_eq!(table(&gz, "df2"), table(&other, "df2"), "{name}");
+    }
+    // A bare character vector is a one-column table; a plain list is one row.
+    assert_eq!(col_names(&gz, "char"), ["value"]);
+    assert_eq!(table(&gz, "mylist")[0]["row_count"], 1);
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_dates_and_datetimes_are_real_dates_with_the_time_zone_disclosed() {
+    let doc = run_json("edge_rdata_pyreadr_dates.rds", &[]);
+    let d = column(table(&doc, "edge_rdata_pyreadr_dates"), "d");
+    assert_eq!(d["current_type"], "Date");
+    assert_eq!(d["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(d["missing_pct"], 25.0);
+    assert_eq!(
+        sample_names(&doc, "edge_rdata_pyreadr_dates", "d")[0],
+        "2019-07-14"
+    );
+    let tz = run_json("edge_rdata_pyreadr_tzone.RData", &[]);
+    let ts = column(table(&tz, "df3"), "tstampa");
+    assert_eq!(ts["current_type"], "POSIXct");
+    assert!(ts["notes"].as_str().unwrap().contains("UTC"), "{ts}");
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_matrices_tables_and_vectors_read_with_their_dimnames() {
+    let m = run_json("edge_rdata_pyreadr_matrix_dimnames.rds", &[]);
+    assert_eq!(
+        col_names(&m, "edge_rdata_pyreadr_matrix_dimnames"),
+        ["row_names", "V1", "V2", "V3"]
+    );
+    let v = run_json("edge_rdata_pyreadr_array_onedim_named.rds", &[]);
+    assert_eq!(
+        col_names(&v, "edge_rdata_pyreadr_array_onedim_named"),
+        ["row_names", "value"]
+    );
+    let f = run_json("edge_rdata_pyreadr_matrix_factor.rds", &[]);
+    assert_eq!(
+        column(table(&f, "edge_rdata_pyreadr_matrix_factor"), "V1")["current_type"],
+        "factor"
+    );
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_row_names_that_are_not_1_to_n_become_a_column() {
+    let doc = run_json("edge_rdata_pyreadr_one_rownames.Rds", &[]);
+    let names = col_names(&doc, "edge_rdata_pyreadr_one_rownames");
+    assert_eq!(names[0], "row_names");
+    let plain = run_json("edge_rdata_pyreadr_one.Rds", &[]);
+    assert_eq!(col_names(&plain, "edge_rdata_pyreadr_one")[0], "num");
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_altrep_sequences_wrappers_and_deferred_strings_read() {
+    let seq = run_json("edge_rdata_pyreadr_altrep_intseq.rdata", &[]);
+    let vec = column(table(&seq, "df"), "vec");
+    assert_eq!(vec["row_count"], 10);
+    assert_eq!(vec["numeric_stats"]["min"], 1.0);
+    assert_eq!(vec["numeric_stats"]["max"], 10.0);
+    let wrap = run_json("edge_rdata_pyreadr_altrep_wrapreal.rdata", &[]);
+    assert_eq!(col_names(&wrap, "stderror"), ["logbeta", "logmu"]);
+    let def = run_json("edge_rdata_pyreadr_altrep_defstr.rds", &[]);
+    assert_eq!(
+        sample_names(&def, "edge_rdata_pyreadr_altrep_defstr", "value"),
+        ["14901"]
+    );
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_text_native_and_xdr_serializations_of_one_frame_agree() {
+    let xdr = run_json("edge_rdata_written_xdr.rds", &[]);
+    let t = "edge_rdata_written_xdr";
+    let cols = |d: &serde_json::Value, t: &str| {
+        table(d, t)
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].clone(),
+                    c["current_type"].clone(),
+                    c["missing_pct"].clone(),
+                    c["sample_values"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for wire in ["native", "ascii"] {
+        let other = run_json(&format!("edge_rdata_written_{wire}.rds"), &[]);
+        assert_eq!(
+            cols(&xdr, t),
+            cols(&other, &format!("edge_rdata_written_{wire}")),
+            "{wire}"
+        );
+    }
+    // The text wire carries escapes: a newline, a UTF-8 character as octal bytes.
+    let sql = run_sql("edge_rdata_written_ascii.rds", &[]);
+    assert!(sql.contains("café") && sql.contains("a\nb"), "{sql}");
+    assert!(sql.contains("(NULL, NULL, NULL, 'lo', NULL)"), "{sql}");
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_list_columns_are_json_text_and_load_into_sql() {
+    let doc = run_json("edge_rdata_dplyr_starwars.rda", &[]);
+    let films = column(table(&doc, "starwars"), "films");
+    assert_eq!(films["current_type"], "list");
+    let sql = run_sql("edge_rdata_dplyr_starwars.rda", &["--nrows", "3"]);
+    assert!(sql.contains("\"A New Hope\""), "{sql}");
+    // Every cell of a list column is an array, even one holding one value.
+    let vehicles = sample_names(&doc, "starwars", "vehicles");
+    assert!(vehicles.iter().all(|v| v.starts_with('[')), "{vehicles:?}");
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn an_r_array_of_three_axes_is_a_disclosed_placeholder() {
+    let doc = run_json("edge_rdata_pyreadr_array_3d.rds", &[]);
+    let col = &table(&doc, "edge_rdata_pyreadr_array_3d")[0];
+    assert!(
+        col["notes"].as_str().unwrap().contains("isn't tabular"),
+        "{col}"
+    );
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn an_r_file_without_an_extension_is_sniffed_through_its_compression() {
+    let dir = std::env::temp_dir().join(format!("sniff-rs-rds-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("saved_object");
+    std::fs::copy(fixture("edge_rdata_pyreadr_one.Rds"), &path).unwrap();
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["format"], "rdata");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "rdata")]
+#[test]
+fn r_text_that_is_not_serialized_data_is_refused() {
+    let dir = std::env::temp_dir().join(format!("sniff-rs-rdsbad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("not_r.rds");
+    std::fs::write(&path, b"this is not R data at all").unwrap();
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("isn't R serialized data"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "html")]
+#[test]
+fn html_page_gives_one_table_per_data_table_with_spans_expanded() {
+    let doc = run_json("edge_html_tables.html", &[]);
+    assert_eq!(doc["format"], "html");
+    // The layout table around the first one, and the script/comment tables,
+    // aren't data; the caption names its table, the others are numbered.
+    assert_eq!(
+        tables_of(&doc),
+        ["Sales & costs by region", "table_2", "table_3"]
+    );
+    let sales = "Sales & costs by region";
+    assert_eq!(col_names(&doc, sales), ["Region", "2024 / Q1", "2024 / Q2"]);
+    assert_eq!(table(&doc, sales)[0]["row_count"], 4);
+    // `n/a` is a missing-value token, as in a CSV.
+    assert_eq!(column(table(&doc, sales), "2024 / Q1")["missing_pct"], 25.0);
+    let joined = column(table(&doc, "table_2"), "Joined");
+    assert_eq!(joined["ideal_type"], "NaiveDate / DateTime");
+    // No <th> and no <thead>: columns are numbered and the first row is data.
+    assert_eq!(col_names(&doc, "table_3"), ["column_1", "column_2"]);
+    assert_eq!(table(&doc, "table_3")[0]["row_count"], 3);
+}
+
+#[cfg(feature = "html")]
+#[test]
+fn html_cells_decode_entities_drop_tags_and_repeat_spanned_cells() {
+    let sql = run_sql("edge_html_tables.html", &[]);
+    assert!(sql.contains("'South — coastal'"), "{sql}");
+    assert!(sql.contains("('East (new)', '<5', '45 %')"), "{sql}");
+    assert!(sql.contains("('West', 'no data', 'no data')"), "{sql}");
+    assert!(sql.contains("'Germany (west)'"), "{sql}");
+    // rowspan carries "shared" into the next row.
+    assert!(sql.contains("('b', 'shared')"), "{sql}");
+    // Script, style and comment contents are never read.
+    assert!(
+        !sql.contains("not data") && !sql.contains("nor this"),
+        "{sql}"
+    );
+}
+
+#[cfg(feature = "html")]
+#[test]
+fn html_declares_its_own_encoding_in_a_meta_tag() {
+    let sql = run_sql("edge_html_windows1252_meta.html", &[]);
+    assert!(
+        sql.contains("'crème brûlée'") && sql.contains("'4,50 €'"),
+        "{sql}"
+    );
+}
+
+#[cfg(feature = "markdown")]
+#[test]
+fn markdown_tables_are_named_for_their_heading() {
+    let doc = run_json("edge_markdown_tables.md", &[]);
+    assert_eq!(doc["format"], "markdown");
+    assert_eq!(tables_of(&doc), ["Benchmarks", "Platforms"]);
+    assert_eq!(col_names(&doc, "Benchmarks"), ["Format", "Rows/s", "Notes"]);
+    // `1,200` and `980` are numbers; `n/a` is missing.
+    let rows = column(table(&doc, "Benchmarks"), "Rows/s");
+    assert_eq!(rows["ideal_type"], "i64");
+    assert_eq!(rows["missing_pct"], 33.3);
+    // The table inside the code fence isn't read.
+    assert!(!tables_of(&doc).iter().any(|t| t.contains("code")));
+}
+
+#[cfg(feature = "markdown")]
+#[test]
+fn markdown_escaped_pipes_pad_short_rows_and_no_outer_pipes() {
+    let sql = run_sql("edge_markdown_tables.md", &[]);
+    assert!(sql.contains("'has `a | b` pipes'"), "{sql}");
+    // A row with one cell is padded with a missing one.
+    assert!(sql.contains("('Plan 9', NULL)"), "{sql}");
+    assert!(sql.contains("('Windows', FALSE)"), "{sql}");
+}
+
+#[cfg(any(feature = "html", feature = "markdown"))]
+#[test]
+fn a_page_or_readme_without_a_table_is_not_data() {
+    let path = fixture("edge_html_no_tables.html");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("no HTML tables"), "{stderr}");
+    let path = fixture("edge_markdown_no_tables.md");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("no Markdown pipe tables"), "{stderr}");
+}
+
+#[cfg(all(feature = "html", feature = "markdown"))]
+#[test]
+fn a_directory_walk_skips_documents_without_tables() {
+    let dir = std::env::temp_dir().join(format!("sniff-rs-docs-{}", std::process::id()));
+    let out = dir.join("out");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(fixture("edge_markdown_no_tables.md"), dir.join("README.md")).unwrap();
+    std::fs::copy(fixture("edge_html_no_tables.html"), dir.join("index.html")).unwrap();
+    std::fs::copy(fixture("edge_markdown_tables.md"), dir.join("notes.md")).unwrap();
+    let result = Command::new(bin())
+        .args([
+            dir.to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(out.join("notes.md.dictionary.json").exists());
+    assert!(!out.join("README.md.dictionary.json").exists());
+    assert!(!out.join("index.html.dictionary.json").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "html")]
+#[test]
+fn an_html_page_without_an_extension_is_sniffed_from_its_doctype() {
+    let dir = std::env::temp_dir().join(format!("sniff-rs-htmlsniff-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("page");
+    std::fs::copy(fixture("edge_html_tables.html"), &path).unwrap();
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["format"], "html");
+    let _ = std::fs::remove_dir_all(&dir);
+}

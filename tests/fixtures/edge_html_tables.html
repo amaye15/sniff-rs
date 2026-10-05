@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Quarterly figures</title>
+<style>table { border: 1px solid; } /* <table><tr><td>not data</td></tr></table> */</style>
+<script>var fake = "<table><tr><td>nor this</td></tr></table>";</script>
+</head>
+<body>
+<!-- <table><tr><td>a comment, not data</td></tr></table> -->
+<h1>Report</h1>
+
+<table class="layout"><tr><td>
+  <table id="sales">
+    <caption>Sales &amp; costs by region</caption>
+    <thead>
+      <tr><th rowspan="2">Region</th><th colspan="2">2024</th></tr>
+      <tr><th>Q1</th><th>Q2</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>North</td><td>1,200</td><td>1,350</td></tr>
+      <tr><td>South &mdash; coastal</td><td>n/a</td><td>980</td></tr>
+      <tr><td>East<br>(new)</td><td>&lt;5</td><td>45&nbsp;%</td></tr>
+      <tr><td>West</td><td colspan="2">no data</td></tr>
+    </tbody>
+  </table>
+</td></tr></table>
+
+<table>
+  <tr><th>Code</th><th>Name</th><th>Joined</th></tr>
+  <tr><td>FR</td><td><a href="/fr?x=1&amp;y=2">France</a></td><td>2001-03-04</td></tr>
+  <tr><td>DE</td><td><b>Germany</b> <i>(west)</i></td><td>2002-11-30</td></tr>
+  <tr><td>ES<td>Spain<td>2003-01-15
+</table>
+
+<table>
+  <tr><td>a</td><td rowspan="2">shared</td></tr>
+  <tr><td>b</td></tr>
+  <tr><td>c</td><td>d</td></tr>
+</table>
+</body>
+</html>
