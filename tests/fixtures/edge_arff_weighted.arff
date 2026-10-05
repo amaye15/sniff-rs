@@ -1,0 +1,9 @@
+@relation weighted
+@attribute a numeric
+@attribute b {u, v}
+@attribute c numeric
+@data
+1,u,10, {0.5}
+2,v,20, {2}
+3,u,?, {1.0}
+4,v,40

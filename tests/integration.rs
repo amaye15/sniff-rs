@@ -18158,3 +18158,104 @@ fn fastq_gz_reads_through_the_wrapper() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn arff_reads_nominal_numeric_and_missing_values() {
+    let doc = run_json("edge_arff_weather.arff", &[]);
+    assert_eq!(doc["format"], "arff");
+    let t = "edge_arff_weather";
+    assert_eq!(
+        col_names(&doc, t),
+        ["outlook", "temperature", "humidity", "windy", "play"]
+    );
+    assert_eq!(table(&doc, t)[0]["row_count"], 8);
+    // `?` is missing: one outlook and one temperature.
+    assert_eq!(column(table(&doc, t), "outlook")["missing_pct"], 12.5);
+    assert_eq!(column(table(&doc, t), "temperature")["ideal_type"], "i64");
+    assert_eq!(column(table(&doc, t), "windy")["ideal_type"], "bool");
+}
+
+#[test]
+fn arff_quoted_names_values_escapes_and_a_quoted_question_mark() {
+    let doc = run_json("edge_arff_quoted_and_types.arff", &[]);
+    let t = "edge_arff_quoted_and_types";
+    assert_eq!(
+        col_names(&doc, t),
+        [
+            "customer id",
+            "name",
+            "signup date",
+            "score",
+            "plan type",
+            "note"
+        ]
+    );
+    assert_eq!(
+        column(table(&doc, t), "signup date")["ideal_type"],
+        "NaiveDate / DateTime"
+    );
+    let sql = run_sql("edge_arff_quoted_and_types.arff", &[]);
+    // A comma inside quotes, a backslash-escaped quote, a quoted '?'.
+    assert!(sql.contains("'Smith, Jane'"), "{sql}");
+    assert!(sql.contains("'said ''hi'''"), "{sql}");
+    assert!(sql.contains("'?'"), "{sql}");
+}
+
+#[test]
+fn arff_sparse_rows_fill_in_weka_defaults() {
+    let sql = run_sql("edge_arff_sparse.arff", &[]);
+    // Row 3 is `{0 3}`: every other value is the default - 0 for a number,
+    // the first label for a nominal.
+    assert!(sql.contains("(3, 0, 0, 0, 'spam', 'x')"), "{sql}");
+    // Row 4 has an explicit `?`.
+    assert!(sql.contains("(0, 7, NULL, 0, 'spam', 'y')"), "{sql}");
+}
+
+#[test]
+fn arff_instance_weights_are_dropped() {
+    let doc = run_json("edge_arff_weighted.arff", &[]);
+    assert_eq!(col_names(&doc, "edge_arff_weighted"), ["a", "b", "c"]);
+    assert_eq!(table(&doc, "edge_arff_weighted")[0]["row_count"], 4);
+    let sql = run_sql("edge_arff_sparse_weighted.arff", &[]);
+    assert!(
+        sql.contains("(1, 'u', 10)") && sql.contains("(0, 'u', 0)"),
+        "{sql}"
+    );
+}
+
+#[test]
+fn arff_without_an_extension_is_sniffed_from_at_relation() {
+    let dir = std::env::temp_dir().join(format!("sniff-rs-arff-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("weather_data");
+    std::fs::copy(fixture("edge_arff_weather.arff"), &path).unwrap();
+    let out = Command::new(bin())
+        .args([path.to_str().unwrap(), "-", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["format"], "arff");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_arff_row_with_the_wrong_number_of_values_names_its_line() {
+    let path = fixture("malformed_arff_short_row.arff");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(
+        stderr.contains("line 6") && stderr.contains("1 values but 2 attributes"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_relational_arff_attribute_is_refused_clearly() {
+    let path = fixture("malformed_arff_relational.arff");
+    let stderr = run_fails(&[path.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(stderr.contains("relational ARFF attributes"), "{stderr}");
+}

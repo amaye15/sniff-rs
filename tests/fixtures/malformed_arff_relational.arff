@@ -1,0 +1,7 @@
+@relation nested
+@attribute id numeric
+@attribute bag relational
+@attribute x numeric
+@end bag
+@data
+1,"2"

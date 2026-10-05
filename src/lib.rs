@@ -3432,7 +3432,7 @@ INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SAS Transport (.xpt), SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
 HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
-text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, or a Delta Lake/Apache Iceberg
+text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, Weka ARFF, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3510,7 +3510,7 @@ OPTIONS:
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
                                  sas7bdat, xport, spss, orc, bson, plist, json5, har, geojson,
-                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, icalendar, ipynb, or pdf - single-file mode only. Run
+                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, arff, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -9752,16 +9752,17 @@ fn table_extras(path: &Path, args: &Args, format: InputFormat, dialect: CsvDiale
 fn is_sequence_format(format: InputFormat) -> bool {
     matches!(
         format,
-        InputFormat::Fasta | InputFormat::Fastq | InputFormat::Sam
+        InputFormat::Fasta | InputFormat::Fastq | InputFormat::Arff | InputFormat::Sam
     )
 }
 
 /// The missing-value tokens a converted sequence format fixes for itself:
 /// SAM's `*`, and nothing at all for FASTA/FASTQ (a sequence or quality
-/// string like `NA` or `?` is data).
+/// string like `NA` or `?` is data) or ARFF (the converter has already
+/// turned an unquoted `?` into an empty field, so a quoted `'?'` stays data).
 fn format_missing_tokens(format: InputFormat) -> Option<&'static [&'static str]> {
     match format {
-        InputFormat::Fasta | InputFormat::Fastq => Some(&[]),
+        InputFormat::Fasta | InputFormat::Fastq | InputFormat::Arff => Some(&[]),
         InputFormat::Sam => Some(&["*"]),
         _ => None,
     }
@@ -9836,6 +9837,7 @@ fn resolve_csv_dialect(
             | InputFormat::Bed
             | InputFormat::Fasta
             | InputFormat::Fastq
+            | InputFormat::Arff
             | InputFormat::Sam
             | InputFormat::Gff
     ) {
@@ -75838,6 +75840,9 @@ enum InputFormat {
     Fastq,
     /// Text SAM alignments: eleven fixed columns plus the optional tags.
     Sam,
+    /// Weka ARFF: `@attribute` declarations, then dense or sparse rows
+    /// (converted to a temporary TSV).
+    Arff,
     /// A Delta Lake table directory (`_delta_log/` present) - detected
     /// directly from the input path being such a directory, never from an
     /// extension or `--format` (a Delta table has no file extension of its
@@ -75921,6 +75926,7 @@ impl InputFormat {
             InputFormat::Gff => "gff",
             InputFormat::Fasta => "fasta",
             InputFormat::Fastq => "fastq",
+            InputFormat::Arff => "arff",
             InputFormat::Sam => "sam",
             InputFormat::Vcard => "vcard",
             InputFormat::Ical => "icalendar",
@@ -76265,6 +76271,13 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
     FormatInfo {
         name: "fastq",
         extensions: &["fq", "fastq"],
+        feature: None,
+        compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "arff",
+        extensions: &["arff"],
         feature: None,
         compiled_in: true,
         directory: false,
@@ -76677,6 +76690,16 @@ fn sniff_sequence_text(head: &[u8]) -> Option<InputFormat> {
         .split(|&c| c == b'\n')
         .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
         .collect();
+    // ARFF: the first line that isn't blank or a `%` comment is `@relation`.
+    if let Some(first) = lines.iter().find(|l| {
+        let t = l.trim_ascii();
+        !t.is_empty() && t[0] != b'%'
+    }) {
+        let t = first.trim_ascii();
+        if t.len() > 9 && t[..9].eq_ignore_ascii_case(b"@relation") && t[9].is_ascii_whitespace() {
+            return Some(InputFormat::Arff);
+        }
+    }
     let is_residues = |l: &[u8]| {
         !l.is_empty()
             && l.iter()
@@ -77013,6 +77036,7 @@ fn detect_format(
             "gff" | "gff3" | "gtf" => Ok(InputFormat::Gff),
             "fasta" | "fa" => Ok(InputFormat::Fasta),
             "fastq" | "fq" => Ok(InputFormat::Fastq),
+            "arff" => Ok(InputFormat::Arff),
             "sam" => Ok(InputFormat::Sam),
             "icalendar" | "ical" | "ics" => Ok(InputFormat::Ical),
             "ipynb" => Ok(InputFormat::Ipynb),
@@ -77103,6 +77127,7 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "gff" | "gff3" | "gtf" => InputFormat::Gff,
         "fa" | "fasta" | "fna" | "faa" | "ffn" | "frn" | "fas" | "fsa" => InputFormat::Fasta,
         "fq" | "fastq" => InputFormat::Fastq,
+        "arff" => InputFormat::Arff,
         "sam" => InputFormat::Sam,
         "ics" => InputFormat::Ical,
         "ipynb" => InputFormat::Ipynb,
@@ -80863,6 +80888,7 @@ fn sql_load_hint(
         | InputFormat::Bed
         | InputFormat::Fasta
         | InputFormat::Fastq
+        | InputFormat::Arff
         | InputFormat::Sam
         | InputFormat::Gff => {
             s.push_str(&format!(
@@ -81107,6 +81133,7 @@ fn render_sql_staging(
             | InputFormat::Bed
             | InputFormat::Fasta
             | InputFormat::Fastq
+            | InputFormat::Arff
             | InputFormat::Sam
             | InputFormat::Gff
     ) {
@@ -81887,6 +81914,7 @@ fn render_sql_inline_flat(
                 | InputFormat::Bed
                 | InputFormat::Fasta
                 | InputFormat::Fastq
+                | InputFormat::Arff
                 | InputFormat::Sam
                 | InputFormat::Gff
         ) {
@@ -81903,6 +81931,7 @@ fn render_sql_inline_flat(
                 | InputFormat::Bed
                 | InputFormat::Fasta
                 | InputFormat::Fastq
+                | InputFormat::Arff
                 | InputFormat::Sam
                 | InputFormat::Gff
                 | InputFormat::FixedWidth
@@ -81928,6 +81957,7 @@ fn render_sql_inline_flat(
                     | InputFormat::Bed
                     | InputFormat::Fasta
                     | InputFormat::Fastq
+                    | InputFormat::Arff
                     | InputFormat::Sam
                     | InputFormat::Gff
                     | InputFormat::FixedWidth
@@ -83067,6 +83097,7 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::Bed
             | InputFormat::Fasta
             | InputFormat::Fastq
+            | InputFormat::Arff
             | InputFormat::Sam
             | InputFormat::Gff
             | InputFormat::FixedWidth
@@ -94129,6 +94160,7 @@ fn is_text_format(format: &InputFormat) -> bool {
             | InputFormat::Bed
             | InputFormat::Fasta
             | InputFormat::Fastq
+            | InputFormat::Arff
             | InputFormat::Sam
             | InputFormat::Gff
             | InputFormat::Json
@@ -94461,6 +94493,320 @@ fn try_detect_and_normalize(
     }
 }
 
+/// One `@attribute` of an ARFF header.
+struct ArffAttribute {
+    name: Vec<u8>,
+    /// What a value left out of a sparse row means: `0` for a number, the
+    /// first declared label for a nominal. A string or date has no such
+    /// value, so it reads as missing.
+    sparse_default: Vec<u8>,
+}
+
+/// Reads one ARFF token at `*pos`: a `'`- or `"`-quoted string (with
+/// backslash escapes) or an unquoted run. An unquoted token ends at a comma
+/// (and, for a name, whitespace) and is trimmed. Returns the bytes and
+/// whether it was quoted, so a quoted `'?'` can stay data.
+fn arff_token(s: &[u8], pos: &mut usize, stop_at_ws: bool) -> Result<(Vec<u8>, bool)> {
+    let mut i = *pos;
+    if matches!(s.get(i), Some(b'\'' | b'"')) {
+        let quote = s[i];
+        i += 1;
+        let mut out = Vec::new();
+        loop {
+            match s.get(i) {
+                None => bail!("an ARFF value opens a quote that never closes"),
+                Some(b'\\') => {
+                    i += 1;
+                    match s.get(i) {
+                        None => bail!("an ARFF value ends in a backslash"),
+                        Some(b'n') => out.push(b'\n'),
+                        Some(b't') => out.push(b'\t'),
+                        Some(b'r') => out.push(b'\r'),
+                        Some(&c) => out.push(c),
+                    }
+                    i += 1;
+                }
+                Some(&c) if c == quote => {
+                    i += 1;
+                    break;
+                }
+                Some(&c) => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        *pos = i;
+        return Ok((out, true));
+    }
+    let start = i;
+    while i < s.len() && s[i] != b',' && !(stop_at_ws && s[i].is_ascii_whitespace()) {
+        i += 1;
+    }
+    *pos = i;
+    Ok((s[start..i].trim_ascii().to_vec(), false))
+}
+
+/// The values of one dense ARFF row (or a nominal domain), `None` for an
+/// unquoted `?`.
+fn arff_dense_values(s: &[u8]) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < s.len() && s[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let (value, quoted) = arff_token(s, &mut i, false)?;
+        out.push(if !quoted && value == b"?" {
+            None
+        } else {
+            Some(value)
+        });
+        while i < s.len() && s[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match s.get(i) {
+            None => break,
+            Some(b',') => i += 1, // a comma at the end means one more, empty, value
+            Some(_) => bail!("text follows a closing quote in an ARFF row"),
+        }
+    }
+    Ok(out)
+}
+
+/// A sparse ARFF row, `{0 1, 3 "a b"}`, as (index, value) pairs. An optional
+/// instance weight after it (`, {0.5}`) is dropped.
+fn arff_sparse_values(s: &[u8]) -> Result<Vec<(usize, Option<Vec<u8>>)>> {
+    // The closing brace is the first one outside a quote.
+    let mut i = 1;
+    let mut quote = 0u8;
+    let mut close = None;
+    while i < s.len() {
+        let c = s[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 1;
+            } else if c == quote {
+                quote = 0;
+            }
+        } else if c == b'\'' || c == b'"' {
+            quote = c;
+        } else if c == b'}' {
+            close = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(close) = close else {
+        bail!("a sparse ARFF row has no closing brace");
+    };
+    let rest = s[close + 1..].trim_ascii();
+    let weight = rest.strip_prefix(b",").map(<[u8]>::trim_ascii);
+    if !(rest.is_empty() || weight.is_some_and(|w| w.starts_with(b"{") && w.ends_with(b"}"))) {
+        bail!("text follows a sparse ARFF row");
+    }
+    let body = &s[1..close];
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < body.len() && body[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= body.len() {
+            break; // `{}`: every value is its default
+        }
+        let start = i;
+        while i < body.len() && body[i].is_ascii_digit() {
+            i += 1;
+        }
+        let index: usize = std::str::from_utf8(&body[start..i])
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .ok_or_else(|| anyhow!("a sparse ARFF entry doesn't start with an attribute index"))?;
+        while i < body.len() && body[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let (value, quoted) = arff_token(body, &mut i, false)?;
+        out.push((
+            index,
+            if !quoted && value == b"?" {
+                None
+            } else {
+                Some(value)
+            },
+        ));
+        while i < body.len() && body[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match body.get(i) {
+            None => break,
+            Some(b',') => i += 1,
+            Some(_) => bail!("a sparse ARFF entry has text after its value"),
+        }
+    }
+    Ok(out)
+}
+
+/// Rewrites a Weka ARFF file as a tab-separated table: the `@attribute`
+/// names are the header, and dense, sparse and weighted rows become rows. An
+/// unquoted `?` is missing (an empty field); a value left out of a sparse row
+/// takes its Weka meaning (see [`ArffAttribute::sparse_default`]). Relational
+/// attributes, whose values are whole nested data sets, are refused.
+fn convert_arff_text(src: &Path) -> Result<TempFile> {
+    use std::io::{BufRead, Write};
+
+    let input = fs::File::open(src).with_context(|| format!("failed to open {src:?}"))?;
+    let mut input = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, input);
+    let mut tmp = TempFile::new()?;
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, tmp.as_file_mut());
+    let clean = |v: &[u8]| -> Vec<u8> {
+        v.iter()
+            .filter(|&&c| c != b'\r')
+            .map(|&c| if matches!(c, b'\t' | b'\n') { b' ' } else { c })
+            .collect()
+    };
+
+    let mut attributes: Vec<ArffAttribute> = Vec::new();
+    let mut in_data = false;
+    let mut line: Vec<u8> = Vec::new();
+    let mut line_no = 0usize;
+    loop {
+        line.clear();
+        let n = input
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("failed to read {src:?}"))?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
+        let mut text = line.as_slice();
+        if line_no == 1 {
+            text = text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(text);
+        }
+        let text = text.trim_ascii();
+        if text.is_empty() || text[0] == b'%' {
+            continue;
+        }
+        if !in_data {
+            let lower = text.to_ascii_lowercase();
+            if lower.starts_with(b"@relation") {
+                continue;
+            }
+            if lower.starts_with(b"@data") {
+                if attributes.is_empty() {
+                    bail!("{src:?} has an @data section but no @attribute declarations");
+                }
+                let header: Vec<Vec<u8>> = attributes.iter().map(|a| clean(&a.name)).collect();
+                out.write_all(&header.join(&b'\t'))?;
+                out.write_all(b"\n")?;
+                in_data = true;
+                continue;
+            }
+            if lower.starts_with(b"@attribute") {
+                let mut pos = b"@attribute".len();
+                while pos < text.len() && text[pos].is_ascii_whitespace() {
+                    pos += 1;
+                }
+                let (name, _) = arff_token(text, &mut pos, true)
+                    .with_context(|| format!("line {line_no} of {src:?}"))?;
+                let kind = text[pos..].trim_ascii();
+                let lower_kind = kind.to_ascii_lowercase();
+                let sparse_default = if kind.starts_with(b"{") {
+                    let Some(end) = kind.iter().rposition(|&c| c == b'}') else {
+                        bail!(
+                            "line {line_no} of {src:?}: a nominal attribute has no closing brace"
+                        );
+                    };
+                    let labels = arff_dense_values(&kind[1..end])
+                        .with_context(|| format!("line {line_no} of {src:?}"))?;
+                    labels.into_iter().next().flatten().unwrap_or_default()
+                } else if lower_kind.starts_with(b"numeric")
+                    || lower_kind.starts_with(b"real")
+                    || lower_kind.starts_with(b"integer")
+                {
+                    b"0".to_vec()
+                } else if lower_kind.starts_with(b"string") || lower_kind.starts_with(b"date") {
+                    Vec::new()
+                } else if lower_kind.starts_with(b"relational") {
+                    bail!(
+                        "line {line_no} of {src:?}: relational ARFF attributes hold whole nested data sets, which have no one-value-per-column reading"
+                    );
+                } else {
+                    bail!(
+                        "line {line_no} of {src:?}: unrecognized ARFF attribute type {:?}",
+                        String::from_utf8_lossy(kind)
+                    );
+                };
+                attributes.push(ArffAttribute {
+                    name,
+                    sparse_default,
+                });
+                continue;
+            }
+            bail!(
+                "line {line_no} of {src:?} is neither a declaration nor a comment before @data: {:?}",
+                String::from_utf8_lossy(&text[..text.len().min(40)])
+            );
+        }
+
+        // A data row.
+        let width = attributes.len();
+        let row: Vec<Option<Vec<u8>>> = if text[0] == b'{' {
+            let mut row: Vec<Option<Vec<u8>>> = attributes
+                .iter()
+                .map(|a| (!a.sparse_default.is_empty()).then(|| a.sparse_default.clone()))
+                .collect();
+            let mut last = None;
+            for (index, value) in
+                arff_sparse_values(text).with_context(|| format!("line {line_no} of {src:?}"))?
+            {
+                if index >= width {
+                    bail!(
+                        "line {line_no} of {src:?}: sparse index {index} but only {width} attributes are declared"
+                    );
+                }
+                if last.is_some_and(|l| index <= l) {
+                    bail!("line {line_no} of {src:?}: sparse indices must increase");
+                }
+                last = Some(index);
+                row[index] = value;
+            }
+            row
+        } else {
+            let mut row =
+                arff_dense_values(text).with_context(|| format!("line {line_no} of {src:?}"))?;
+            // Weka's instance weight: one more value, `{0.5}`, at the end.
+            if row.len() == width + 1
+                && matches!(row.last(), Some(Some(w)) if w.starts_with(b"{") && w.ends_with(b"}"))
+            {
+                row.pop();
+            }
+            if row.len() != width {
+                bail!(
+                    "line {line_no} of {src:?} has {} values but {width} attributes are declared",
+                    row.len()
+                );
+            }
+            row
+        };
+        for (i, value) in row.iter().enumerate() {
+            if i > 0 {
+                out.write_all(b"\t")?;
+            }
+            if let Some(v) = value {
+                out.write_all(&clean(v))?;
+            }
+        }
+        out.write_all(b"\n")?;
+    }
+    if !in_data {
+        bail!("{src:?} has no @data section");
+    }
+    out.flush()?;
+    drop(out);
+    Ok(tmp)
+}
+
 /// Rewrites a FASTA, FASTQ or text SAM file as a tab-separated table with a
 /// header row, streaming, so the CSV reader (and the inline-SQL second pass)
 /// handle it like any other table. Works on bytes - the table reader is what
@@ -94476,6 +94822,10 @@ fn try_detect_and_normalize(
 ///   are dropped.
 fn convert_sequence_text(format: InputFormat, src: &Path) -> Result<TempFile> {
     use std::io::{BufRead, Write};
+
+    if matches!(format, InputFormat::Arff) {
+        return convert_arff_text(src);
+    }
 
     fn trim_eol(mut line: &[u8]) -> &[u8] {
         while let [rest @ .., b'\n' | b'\r'] = line {
@@ -96464,6 +96814,7 @@ fn dispatch_reader(
             | InputFormat::Bed
             | InputFormat::Fasta
             | InputFormat::Fastq
+            | InputFormat::Arff
             | InputFormat::Sam
             | InputFormat::Gff => {
                 let dialect = resolve_csv_dialect(read_path, args, format, true);
@@ -98720,7 +99071,7 @@ fn run_directory_combined(args: &Args, output_format: &OutputFormat, dir: &Path)
                 // would actually have to load from disk.
                 let delim = if matches!(
                     format,
-                    InputFormat::Tsv | InputFormat::Vcf | InputFormat::Bed | InputFormat::Fasta | InputFormat::Fastq | InputFormat::Sam | InputFormat::Gff
+                    InputFormat::Tsv | InputFormat::Vcf | InputFormat::Bed | InputFormat::Fasta | InputFormat::Fastq | InputFormat::Arff | InputFormat::Sam | InputFormat::Gff
                 ) {
                     '\t'
                 } else {
@@ -103782,6 +104133,7 @@ mod knowledge_graph {
                 | InputFormat::Bed
                 | InputFormat::Fasta
                 | InputFormat::Fastq
+                | InputFormat::Arff
                 | InputFormat::Sam
                 | InputFormat::Gff
                 | InputFormat::Vcard
@@ -118784,5 +119136,57 @@ mod geometry_tests {
             let _ = is_wkb_hex(s);
             let _ = is_gpkg_hex(s);
         }
+    }
+}
+
+#[cfg(test)]
+mod arff_tests {
+    use super::*;
+
+    fn dense(s: &str) -> Vec<Option<String>> {
+        arff_dense_values(s.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|v| v.map(|b| String::from_utf8(b).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn dense_values_handle_quotes_escapes_and_missing() {
+        assert_eq!(
+            dense(r#"1, 'a, b', "c\"d", ?, '?', x y"#),
+            [
+                Some("1".into()),
+                Some("a, b".into()),
+                Some("c\"d".into()),
+                None,
+                Some("?".into()),
+                Some("x y".into()),
+            ]
+        );
+        // A trailing comma is one more, empty, value.
+        assert_eq!(
+            dense("1,2,"),
+            [Some("1".into()), Some("2".into()), Some(String::new())]
+        );
+        assert!(arff_dense_values(b"'unterminated").is_err());
+        assert!(arff_dense_values(b"'a' b").is_err());
+    }
+
+    #[test]
+    fn sparse_values_read_index_value_pairs_and_skip_a_weight() {
+        let row = arff_sparse_values(br#"{0 1, 3 "a, b", 5 ?}, {0.5}"#).unwrap();
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0], (0, Some(b"1".to_vec())));
+        assert_eq!(row[1], (3, Some(b"a, b".to_vec())));
+        assert_eq!(row[2], (5, None));
+        assert!(arff_sparse_values(b"{}").unwrap().is_empty());
+        assert!(arff_sparse_values(b"{0 1").is_err());
+        assert!(arff_sparse_values(b"{0 1} junk").is_err());
+        // A brace inside a quoted value doesn't close the row.
+        assert_eq!(
+            arff_sparse_values(br#"{1 "}"}"#).unwrap(),
+            [(1, Some(b"}".to_vec()))]
+        );
     }
 }

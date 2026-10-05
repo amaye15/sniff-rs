@@ -1,0 +1,12 @@
+@relation sparse_docs
+@attribute id numeric
+@attribute word_a numeric
+@attribute word_b numeric
+@attribute word_c numeric
+@attribute label {spam, ham}
+@attribute category {x, y, z}
+@data
+{0 1, 1 3, 4 ham}
+{0 2, 3 5, 5 z}
+{0 3}
+{1 7, 2 ?, 4 spam, 5 y}

@@ -1,0 +1,14 @@
+@RELATION 'mixed types'
+
+@ATTRIBUTE 'customer id' INTEGER
+@ATTRIBUTE name STRING
+@attribute "signup date" DATE "yyyy-MM-dd HH:mm:ss"
+@attribute score NUMERIC
+@attribute 'plan type' {'free tier', 'pro, annual', basic}
+@attribute note string
+
+@DATA
+1,'Smith, Jane','2024-01-15 09:30:00',4.5,'free tier','said \'hi\''
+2,"O'Brien",'2024-02-20 14:00:00',?,'pro, annual','tab\there'
+3,'Zoë Müller','2024-03-01 00:00:00',3,basic,'?'
+4,?,?,0.25,?,?
