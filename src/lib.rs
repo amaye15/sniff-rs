@@ -112144,6 +112144,9 @@ mod knowledge_graph {
         /// Columns fixed by the format, not authored: never schema-linked.
         pub(crate) fixed_schema: bool,
         pub(crate) truncated_scan: bool,
+        /// A 128-bit hash of the file's bytes, set for files that share a
+        /// size with another file (the only ones that can be copies).
+        pub(crate) hash: Option<(u64, u64)>,
     }
 
     pub(crate) struct CollectOptions {
@@ -112248,6 +112251,7 @@ mod knowledge_graph {
             }
             h
         };
+        let candidates = same_size_paths(&paths);
         let mut out = Vec::with_capacity(paths.len());
         // Files are read on a pool of worker threads and handed back in
         // path order, so the progress lines and the graph itself are the
@@ -112256,7 +112260,12 @@ mod knowledge_graph {
             &paths,
             opts.jobs,
             true,
-            |path| (read_one_cached(&root, path, opts, &known, names), false),
+            |path| {
+                (
+                    read_one_cached(&root, path, opts, &known, names, candidates.contains(path)),
+                    false,
+                )
+            },
             |i, file| {
                 if opts.progress {
                     let status = match file.kind {
@@ -112347,20 +112356,78 @@ mod knowledge_graph {
         })
     }
 
+    /// A 128-bit hash of a file's bytes (two independent 64-bit mixes), for
+    /// finding byte-identical copies together with the size.
+    fn file_hash(path: &Path) -> Option<(u64, u64)> {
+        use std::io::Read;
+        let mut f = fs::File::open(path).ok()?;
+        let mut buf = vec![0u8; 1 << 16];
+        let (mut a, mut b) = (0x243f_6a88_85a3_08d3u64, 0x1319_8a2e_0370_7344u64);
+        let mut total = 0u64;
+        loop {
+            let n = f.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            let mut chunks = buf[..n].chunks_exact(8);
+            for c in &mut chunks {
+                let w = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+                a = (a ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+                b = (b.rotate_left(17) ^ w).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+            }
+            for &x in chunks.remainder() {
+                a = (a ^ u64::from(x)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+                b = (b.rotate_left(17) ^ u64::from(x)).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+            }
+        }
+        // Fold in the length, so a file and the same file padded with
+        // zeros of the right amount can't collide by construction.
+        Some((a ^ total.rotate_left(32), b ^ total))
+    }
+
+    /// Files that share a size with another file, by path: the only
+    /// candidates for byte-identical copies.
+    fn same_size_paths(paths: &[PathBuf]) -> HashSet<PathBuf> {
+        let mut by_size: HashMap<u64, Vec<&PathBuf>> = HashMap::new();
+        for p in paths {
+            if let Ok(m) = fs::metadata(p)
+                && m.len() > 0
+            {
+                by_size.entry(m.len()).or_default().push(p);
+            }
+        }
+        by_size
+            .into_values()
+            .filter(|v| v.len() > 1)
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     fn read_one_cached(
         root: &Path,
         path: &Path,
         opts: &CollectOptions,
         known: &Arc<KnownFiles>,
         names: u64,
+        may_be_copy: bool,
     ) -> KgFile {
         let Some(dir) = &opts.cache_dir else {
-            return read_one(root, path, opts, known);
+            let mut file = read_one(root, path, opts, known);
+            if may_be_copy {
+                file.hash = file_hash(path);
+            }
+            return file;
         };
         let rel = display_rel(root, path);
         let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let Some(mtime) = mtime_ns(path) else {
-            return read_one(root, path, opts, known);
+            let mut file = read_one(root, path, opts, known);
+            if may_be_copy {
+                file.hash = file_hash(path);
+            }
+            return file;
         };
         let mut key = json_support::Map::new();
         key.insert("format".to_string(), JsonValue::from(CACHE_FORMAT));
@@ -112372,28 +112439,34 @@ mod knowledge_graph {
         key.insert("names".to_string(), JsonValue::from(format!("{names:016x}")));
         let key = JsonValue::Object(key);
         let entry_path = dir.join(cache_entry_name(&rel));
-        if let Some(file) = fs::read_to_string(&entry_path)
+        let cached = fs::read_to_string(&entry_path)
             .ok()
             .and_then(|text| json_support::from_str(&text).ok())
             .and_then(|doc| {
                 (doc.get("key") == Some(&key))
                     .then(|| doc.get("file").and_then(file_from_json))
                     .flatten()
-            })
-        {
-            return file;
+            });
+        let hit = cached.is_some();
+        let mut file = cached.unwrap_or_else(|| read_one(root, path, opts, known));
+        // A hash is only worked out for files that share a size with
+        // another, so a cached file may not have one yet.
+        let hashed_now = may_be_copy && file.hash.is_none();
+        if hashed_now {
+            file.hash = file_hash(path);
         }
-        let file = read_one(root, path, opts, known);
-        let mut doc = json_support::Map::new();
-        doc.insert("key".to_string(), key);
-        doc.insert("file".to_string(), file_to_json(&file));
-        // Written beside the entry and renamed, so a reader never sees half
-        // a file; a failed write only costs the next run a re-read.
-        let tmp = entry_path.with_extension(format!("tmp{}", std::process::id()));
-        if fs::write(&tmp, JsonValue::Object(doc).to_string()).is_ok()
-            && fs::rename(&tmp, &entry_path).is_err()
-        {
-            let _ = fs::remove_file(&tmp);
+        if !hit || hashed_now {
+            let mut doc = json_support::Map::new();
+            doc.insert("key".to_string(), key);
+            doc.insert("file".to_string(), file_to_json(&file));
+            // Written beside the entry and renamed, so a reader never sees
+            // half a file; a failed write only costs the next run a re-read.
+            let tmp = entry_path.with_extension(format!("tmp{}", std::process::id()));
+            if fs::write(&tmp, JsonValue::Object(doc).to_string()).is_ok()
+                && fs::rename(&tmp, &entry_path).is_err()
+            {
+                let _ = fs::remove_file(&tmp);
+            }
         }
         file
     }
@@ -112705,6 +112778,9 @@ mod knowledge_graph {
         if let Some(e) = &f.error {
             o.insert("error".to_string(), JsonValue::from(e.clone()));
         }
+        if let Some((a, b)) = f.hash {
+            o.insert("hash".to_string(), JsonValue::from(format!("{a:016x}{b:016x}")));
+        }
         o.insert("fixed_schema".to_string(), JsonValue::from(f.fixed_schema));
         o.insert(
             "truncated_scan".to_string(),
@@ -112750,6 +112826,19 @@ mod knowledge_graph {
             error: v.get("error").and_then(|e| e.as_str()).map(str::to_string),
             fixed_schema: v.get("fixed_schema")?.as_bool()?,
             truncated_scan: v.get("truncated_scan")?.as_bool()?,
+            hash: match v.get("hash") {
+                None => None,
+                Some(h) => {
+                    let h = h.as_str()?;
+                    if h.len() != 32 {
+                        return None;
+                    }
+                    Some((
+                        u64::from_str_radix(h.get(..16)?, 16).ok()?,
+                        u64::from_str_radix(h.get(16..)?, 16).ok()?,
+                    ))
+                }
+            },
         })
     }
 
@@ -112825,6 +112914,7 @@ mod knowledge_graph {
             error: None,
             fixed_schema: false,
             truncated_scan: false,
+            hash: None,
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -113240,10 +113330,12 @@ mod knowledge_graph {
         /// Two tables that both reference the same owner through the same
         /// key: a real join, but derived from those two references.
         SharesKey,
+        /// A file whose bytes are identical to another's.
+        DuplicateOf,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 9] = [
+        pub(crate) const ALL: [Relation; 10] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -113253,6 +113345,7 @@ mod knowledge_graph {
             Relation::SimilarTo,
             Relation::SameName,
             Relation::SharesKey,
+            Relation::DuplicateOf,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -113266,6 +113359,7 @@ mod knowledge_graph {
                 Relation::SimilarTo => "similar_to",
                 Relation::SameName => "same_name",
                 Relation::SharesKey => "shares_key",
+                Relation::DuplicateOf => "duplicate_of",
             }
         }
 
@@ -113638,6 +113732,7 @@ mod knowledge_graph {
         link_entities(&mut b, &files, &contents, &file_node);
         let unresolved = link_references(&mut b, &files, &contents, &file_node);
         link_same_names(&mut b, &files, &file_node);
+        link_duplicates(&mut b, &files, &file_node);
         let doc_terms = link_similar(&mut b, &files, &contents, &file_node);
         link_schemas_and_joins(&mut b, &files, &table_nodes);
 
@@ -113999,6 +114094,38 @@ mod knowledge_graph {
                         )],
                     );
                 }
+            }
+        }
+    }
+
+    /// `duplicate_of`: files with identical bytes (same size and 128-bit
+    /// hash). A group links as a star around its first file by path, so a
+    /// hundred copies cost a hundred links, not five thousand.
+    fn link_duplicates(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        let mut groups: BTreeMap<(u64, (u64, u64)), Vec<usize>> = BTreeMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            if let (Some(h), true) = (f.hash, f.size > 0) {
+                groups.entry((f.size, h)).or_default().push(fi);
+            }
+        }
+        for ((size, _), members) in groups {
+            if members.len() < 2 {
+                continue;
+            }
+            let anchor = members[0];
+            for &m in &members[1..] {
+                b.add_edge(
+                    file_node[m],
+                    file_node[anchor],
+                    Relation::DuplicateOf,
+                    Conf::Extracted,
+                    1.0,
+                    2.0,
+                    vec![format!(
+                        "byte-identical to {:?} ({size} bytes)",
+                        files[anchor].rel
+                    )],
+                );
             }
         }
     }
@@ -115148,8 +115275,16 @@ mod knowledge_graph {
         if !related && !by_values_only {
             return None;
         }
+        // Overlap is only a measurement when each side has two or more
+        // distinct values: a column holding one value (a one-row table)
+        // can neither confirm nor refute a join.
+        let measurable = |c: &ColumnProfile| {
+            c.content
+                .as_ref()
+                .is_some_and(|x| x.distinct_estimate() >= 2.0)
+        };
         let measured = match (&ca.content, &cb.content) {
-            (Some(x), Some(y)) => {
+            (Some(x), Some(y)) if measurable(ca) && measurable(cb) => {
                 let (xa, xb) = content_scan::containment_estimates(x, y);
                 Some(xa.max(xb))
             }
@@ -115239,9 +115374,11 @@ mod knowledge_graph {
                 }
                 return None;
             }
-            // No scan data (a dictionary input): a same-named key-like
-            // column is a guess, labelled as one.
-            if key_named && canon_a == canon_b {
+            // No scan data at all (a dictionary input): a same-named
+            // key-like column is a guess, labelled as one. (A column too
+            // thin to measure doesn't get this: a name alone is not
+            // evidence once the data was there to check.)
+            if ca.content.is_none() && cb.content.is_none() && key_named && canon_a == canon_b {
                 return Some(make(
                     Conf::Inferred,
                     0.6,
@@ -115880,6 +116017,7 @@ mod knowledge_graph {
             }
             let rank = match e.relation {
                 Relation::References => 0,
+                Relation::DuplicateOf => 0,
                 Relation::Joins | Relation::SharesIds | Relation::SharesKey => 1,
                 Relation::SimilarTo => 3,
                 _ => 4,
@@ -116173,6 +116311,38 @@ mod knowledge_graph {
             .copied()
             .filter(|i| content_degree[*i] == 0)
             .collect();
+        let dups: Vec<&KgEdge> = kg
+            .edges
+            .iter()
+            .filter(|e| e.relation == Relation::DuplicateOf)
+            .collect();
+        if !dups.is_empty() {
+            let mut by_anchor: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for e in &dups {
+                by_anchor.entry(e.target).or_default().push(e.source);
+            }
+            let wasted: u64 = dups
+                .iter()
+                .map(|e| attr_f64(&kg.nodes[e.source], "size_bytes").unwrap_or(0.0) as u64)
+                .sum();
+            out.push_str(&format!(
+                "\n## Duplicate files\n\n{} copies in {} group(s) are byte-identical to another file ({} bytes in the copies):\n\n",
+                dups.len(),
+                by_anchor.len(),
+                wasted
+            ));
+            for (anchor, copies) in by_anchor.iter().take(20) {
+                out.push_str(&format!(
+                    "- {} — {} cop{}\n",
+                    node_ref(&kg.nodes[*anchor]),
+                    copies.len(),
+                    if copies.len() == 1 { "y" } else { "ies" }
+                ));
+            }
+            if by_anchor.len() > 20 {
+                out.push_str(&format!("- …and {} more groups\n", by_anchor.len() - 20));
+            }
+        }
         if !isolated.is_empty() {
             out.push_str(&format!("\n## Isolated files\n\n{} file(s) share nothing detectable with any other file:\n\n", isolated.len()));
             for i in isolated.iter().take(40) {
@@ -117627,6 +117797,7 @@ mod knowledge_graph {
                 error: None,
                 fixed_schema: false,
                 truncated_scan: false,
+                hash: None,
             }
         }
 
